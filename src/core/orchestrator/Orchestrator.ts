@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
+import { withProjectContextServiceConfig } from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
@@ -465,6 +466,14 @@ export class Orchestrator {
     this.config = options.config;
     this.promptTemplate = options.promptTemplate;
     this.providerGateStore = options.providerGateStore ?? new FileProviderGateStore(options.config.workspace.stateDir);
+  }
+
+  private configForIssue(issue: Pick<Issue, "projectContextId">): ServiceConfig {
+    return withProjectContextServiceConfig(this.config, issue.projectContextId);
+  }
+
+  private configForEntry(entry: RunningEntry): ServiceConfig {
+    return this.configForIssue(entry.issue);
   }
 
   async start(): Promise<void> {
@@ -943,12 +952,12 @@ export class Orchestrator {
     if (!this.options.lifecycleStore) {
       throw new SymphonyError("invalid_request", "Issue breakdown planning requires a lifecycle store");
     }
-    if (this.availableSlots() <= 0) {
-      throw new SymphonyError("conflict", "No agent slots are available for issue breakdown planning");
-    }
     const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
     const issue = refreshed[0];
     if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    if (this.availableSlots(issue) <= 0) {
+      throw new SymphonyError("conflict", "No agent slots are available for issue breakdown planning");
+    }
     if (this.running.has(issue.id)) throw new SymphonyError("conflict", "Issue already has a running Symphony agent");
     if (this.isMergeConflictState(issue.state)) {
       throw new SymphonyError("conflict", "Merge conflict states are only eligible for conflict-fix workers");
@@ -989,13 +998,14 @@ export class Orchestrator {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
     const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
+    const config = this.configForIssue(issue);
     const publisher =
       this.options.completionReportPublisher ??
-      createGitHubPullRequestClientForCapability(this.config, "github.publication");
+      createGitHubPullRequestClientForCapability(config, "github.publication");
     const result = await new CompletionReportService({
-      config: this.config,
+      config,
       lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
       ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
       ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
       pullRequestPublisher: publisher,
@@ -1008,10 +1018,11 @@ export class Orchestrator {
     if (!this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
     const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
+    const config = this.configForIssue(issue);
     const result = await new CompletionReportService({
-      config: this.config,
+      config,
       lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
       ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
       ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
     }).recordPublicationApprovalTerminal({ approval: request, issue });
@@ -1152,12 +1163,12 @@ export class Orchestrator {
       await this.recoverPendingPublicationApprovalHandoffs();
       const workerCandidates = await this.options.tracker.fetchCandidateIssues();
       for (const issue of sortIssuesForDispatch(workerCandidates)) {
-        if (this.availableSlots() <= 0) break;
+        if (this.availableSlots(issue) <= 0) break;
         await this.tryDispatchWorkerIssue(issue, null);
       }
       const reviewerCandidates = await this.options.tracker.fetchIssuesByStates(this.config.reviewLoop.reviewStates);
       for (const issue of sortIssuesForDispatch(reviewerCandidates)) {
-        if (this.availableSlots() <= 0) break;
+        if (this.availableSlots(issue) <= 0) break;
         await this.tryDispatchReviewerIssue(issue);
       }
       await this.reconcileMergePolicyIssues();
@@ -1231,20 +1242,20 @@ export class Orchestrator {
       this.options.logger.warn("pending publication approval recovery issue refresh failed", { error: errorMessage(error) });
     }
     const issuesById = new Map(latestIssues.map((issue) => [issue.id, issue]));
-    const service = new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-      writebackProcessor: this.options.writeback,
-      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      pullRequestPublisher:
-        this.options.completionReportPublisher ??
-        createGitHubPullRequestClientForCapability(this.config, "github.publication"),
-      operatorApproval: this.options.operatorApproval,
-    });
-
     for (const lifecycle of candidates) {
       const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
+      const config = this.configForIssue(issue);
+      const service = new CompletionReportService({
+        config,
+        lifecycleStore: this.options.lifecycleStore,
+        writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+        writebackProcessor: this.options.writeback,
+        ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+        pullRequestPublisher:
+          this.options.completionReportPublisher ??
+          createGitHubPullRequestClientForCapability(config, "github.publication"),
+        operatorApproval: this.options.operatorApproval,
+      });
       try {
         const result = await service.recoverPendingPublicationApproval({ issue, lifecycle });
         if (result.recovered) {
@@ -1346,38 +1357,41 @@ export class Orchestrator {
     allowExistingClaim = false,
     runPhase: AgentRunPhase = "implementation",
   ): boolean {
+    const config = this.configForIssue(issue);
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
     if (!issue.assignedToWorker) return false;
-    if (isStateIn(issue.state, this.config.tracker.handoffStates)) return false;
-    if (isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
-    if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
-    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
+    if (isStateIn(issue.state, config.tracker.handoffStates)) return false;
+    if (isStateIn(issue.state, config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(issue.state, config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(issue.state, config.tracker.terminalStates)) return false;
     if (!this.isWorkerStateActiveForRunPhase(issue, runPhase)) return false;
     if (!this.passesLabelGuardrails(issue)) return false;
     if (issue.state.toLowerCase() === "todo") {
-      if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
+      if (hasOpenBlocker(issue, config.tracker.terminalStates)) return false;
     }
-    return this.hasStateSlot(issue.state);
+    return this.hasStateSlot(issue);
   }
 
   private isWorkerStateActiveForRunPhase(issue: Issue, runPhase: AgentRunPhase): boolean {
+    const config = this.configForIssue(issue);
     if (runPhase === "merge_conflict_resolution") return this.isMergeConflictState(issue.state);
     if (this.isMergeConflictState(issue.state)) return false;
-    return isStateIn(issue.state, this.config.tracker.activeStates);
+    return isStateIn(issue.state, config.tracker.activeStates);
   }
 
   private shouldDispatchReviewer(issue: Issue, allowExistingClaim = false): boolean {
+    const config = this.configForIssue(issue);
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
-    if (!isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
-    if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
-    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
+    if (!isStateIn(issue.state, config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(issue.state, config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(issue.state, config.tracker.terminalStates)) return false;
     if (!this.passesLabelGuardrails(issue)) return false;
-    if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
-    return this.hasStateSlot(issue.state);
+    if (hasOpenBlocker(issue, config.tracker.terminalStates)) return false;
+    return this.hasStateSlot(issue);
   }
 
   private async lifecycleAllowsDispatch(
@@ -1385,17 +1399,18 @@ export class Orchestrator {
     role: AgentRunRole,
     runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
   ): Promise<boolean> {
+    const config = this.configForIssue(issue);
     const store = this.options.lifecycleStore;
     if (!store) return true;
     const lifecycle = await store.get(issue.id);
     if (!lifecycle) return true;
 
-    const phase = phaseForIssueState(issue.state, this.config);
+    const phase = phaseForIssueState(issue.state, config);
     const conflict = lifecycle.mergeConflict;
     if (
       conflict &&
-      this.config.mergePolicy.conflictsState !== null &&
-      isStateIn(issue.state, [this.config.mergePolicy.conflictsState]) &&
+      config.mergePolicy.conflictsState !== null &&
+      isStateIn(issue.state, [config.mergePolicy.conflictsState]) &&
       (conflict.status === "blocked" || conflict.resolutionStatus === "blocked")
     ) {
       const blockedReason =
@@ -1448,22 +1463,22 @@ export class Orchestrator {
     if (
       role === "worker" &&
       runPhase === "implementation" &&
-      lifecycle.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns
+      lifecycle.incompleteTurnCount >= config.reviewLoop.maxIncompleteTurns
     ) {
       await this.escalateLifecycleBlocked(
         issue,
         lifecycle,
         lifecycle.summaryPointers.lastRunId ?? issue.id,
-        `max incomplete turns reached (${lifecycle.incompleteTurnCount}/${this.config.reviewLoop.maxIncompleteTurns})`,
+        `max incomplete turns reached (${lifecycle.incompleteTurnCount}/${config.reviewLoop.maxIncompleteTurns})`,
       );
       return false;
     }
-    if (role === "reviewer" && lifecycle.reviewRound >= this.config.reviewLoop.maxReviewRounds) {
+    if (role === "reviewer" && lifecycle.reviewRound >= config.reviewLoop.maxReviewRounds) {
       await this.escalateLifecycleBlocked(
         issue,
         lifecycle,
         lifecycle.summaryPointers.lastRunId ?? issue.id,
-        `max review rounds reached (${lifecycle.reviewRound}/${this.config.reviewLoop.maxReviewRounds})`,
+        `max review rounds reached (${lifecycle.reviewRound}/${config.reviewLoop.maxReviewRounds})`,
       );
       return false;
     }
@@ -1472,14 +1487,15 @@ export class Orchestrator {
   }
 
   private passesLabelGuardrails(issue: Issue): boolean {
+    const config = this.configForIssue(issue);
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
-    if (this.config.agent.requireLabels.some((label) => !labels.has(label))) return false;
-    if (this.config.agent.excludeLabels.some((label) => labels.has(label))) return false;
+    if (config.agent.requireLabels.some((label) => !labels.has(label))) return false;
+    if (config.agent.excludeLabels.some((label) => labels.has(label))) return false;
     return true;
   }
 
   private async tryDispatchWorkerIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
-    if (this.availableSlots() <= 0) return false;
+    if (this.availableSlots(issue) <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     const initialRunPhase = this.isMergeConflictState(issue.state) ? "merge_conflict_resolution" : "implementation";
     if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase)) return false;
@@ -1498,7 +1514,7 @@ export class Orchestrator {
 
     const latest = refreshed[0];
     if (!latest) return false;
-    if (this.availableSlots() <= 0) return false;
+    if (this.availableSlots(latest) <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     const latestRunPhase = this.isMergeConflictState(latest.state) ? "merge_conflict_resolution" : "implementation";
     if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase)) return false;
@@ -1538,7 +1554,7 @@ export class Orchestrator {
   }
 
   private async tryDispatchReviewerIssue(issue: Issue, allowExistingClaim = false): Promise<boolean> {
-    if (this.availableSlots() <= 0) return false;
+    if (this.availableSlots(issue) <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     if (!this.shouldDispatchReviewer(issue, allowExistingClaim)) return false;
     if (!(await this.lifecycleAllowsDispatch(issue, "reviewer"))) return false;
@@ -1557,7 +1573,7 @@ export class Orchestrator {
 
     const latest = refreshed[0];
     if (!latest) return false;
-    if (this.availableSlots() <= 0) return false;
+    if (this.availableSlots(latest) <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     if (!this.shouldDispatchReviewer(latest, allowExistingClaim)) return false;
     if (!(await this.lifecycleAllowsDispatch(latest, "reviewer"))) return false;
@@ -1729,6 +1745,7 @@ export class Orchestrator {
       await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, 1));
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, 1));
 
+      const runConfig = this.configForEntry(entry);
       if (entry.runPhase === "issue_breakdown") {
         entry.turnCount = 1;
         const prompt = await this.renderIssueBreakdownPrompt(entry, attempt);
@@ -1746,7 +1763,7 @@ export class Orchestrator {
         await this.discoverPullRequestForEntry(entry, workspace);
       }
 
-      for (let turnNumber = 1; turnNumber <= this.config.agent.maxTurns; turnNumber += 1) {
+      for (let turnNumber = 1; turnNumber <= runConfig.agent.maxTurns; turnNumber += 1) {
         if (entry.abortController.signal.aborted) throw new SymphonyError("agent_error", "Run was cancelled");
         if (turnNumber > 1 && !harnessSupportsContinuation(this.options.harness)) {
           throw new SymphonyError(
@@ -2401,26 +2418,27 @@ export class Orchestrator {
         ),
         "run failed",
       );
+      const runConfig = this.configForEntry(entry);
       const sdkErrorFailures = await this.consecutiveSdkErrorFailures(entry.issue);
-      if (sdkErrorFailures >= 1 + this.config.agent.maxSdkErrorRetries) {
+      if (sdkErrorFailures >= 1 + runConfig.agent.maxSdkErrorRetries) {
         await this.escalateEntryBlocked(
           entry,
-          `consecutive Cursor SDK wait errors reached limit (${sdkErrorFailures} failures; max_sdk_error_retries=${this.config.agent.maxSdkErrorRetries})`,
+          `consecutive Cursor SDK wait errors reached limit (${sdkErrorFailures} failures; max_sdk_error_retries=${runConfig.agent.maxSdkErrorRetries})`,
         );
         this.claimed.delete(issueId);
         return;
       }
       const infraFailures = await this.consecutiveInfraFailures(entry.issue);
-      if (infraFailures >= this.config.agent.maxInfraFailures) {
+      if (infraFailures >= runConfig.agent.maxInfraFailures) {
         await this.escalateEntryBlocked(
           entry,
-          `consecutive harness infrastructure failures reached limit (${infraFailures} failures; max_infra_failures=${this.config.agent.maxInfraFailures})`,
+          `consecutive harness infrastructure failures reached limit (${infraFailures} failures; max_infra_failures=${runConfig.agent.maxInfraFailures})`,
         );
         this.claimed.delete(issueId);
         return;
       }
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
-      const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
+      const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), runConfig.agent.maxRetryBackoffMs);
       this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error, entry.runPhase);
     }
   }
@@ -2608,7 +2626,7 @@ export class Orchestrator {
           return;
         }
       }
-      if (this.availableSlots() <= 0) {
+      if (this.availableSlots(issue) <= 0) {
         if (retry.runPhase === "issue_breakdown") {
           await this.recordPlanningDispatchRetry(issue, retry, "no available orchestrator slots");
         } else {
@@ -2684,15 +2702,16 @@ export class Orchestrator {
     attempt: number | null,
     turnNumber: number,
   ) {
+    const config = this.configForEntry(entry);
     return {
       issue: entry.issue,
       role: entry.role,
       runPhase: entry.runPhase,
       attempt,
       workspace,
-      config: this.config,
+      config,
       turnNumber,
-      ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: this.config.issueBreakdown.cursorMode } : {}),
+      ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: config.issueBreakdown.cursorMode } : {}),
       abortSignal: entry.abortController.signal,
       logger: this.options.logger,
     };
@@ -3102,11 +3121,12 @@ export class Orchestrator {
     const branchName = workspace.gitBranchName ?? entry.issue.branchName;
     if (!branchName) return;
 
+    const config = this.configForEntry(entry);
     let pullRequest: DiscoveredPullRequest | null;
     try {
       const client =
         this.options.pullRequestClient ??
-        createGitHubPullRequestClientForCapability(this.config, "github.discovery");
+        createGitHubPullRequestClientForCapability(config, "github.discovery");
       pullRequest = await client.findOpenPullRequestByBranch({ branchName });
     } catch (error) {
       this.options.logger.warn("pull request discovery failed", {
@@ -3513,13 +3533,14 @@ export class Orchestrator {
   private async loadWorkerReviewEvidencePrompt(entry: RunningEntry): Promise<string | null> {
     if (!this.options.lifecycleStore) return null;
     try {
+      const config = this.configForEntry(entry);
       const client =
         this.options.pullRequestReviewClient ??
-        createGitHubPullRequestClientForCapability(this.config, "github.review_evidence_read");
+        createGitHubPullRequestClientForCapability(config, "github.review_evidence_read");
       const service = new PullRequestReviewEvidenceService({
         lifecycleStore: this.options.lifecycleStore,
         client,
-        fullHistoryThreshold: this.config.reviewLoop.prReviewEvidenceLimit,
+        fullHistoryThreshold: config.reviewLoop.prReviewEvidenceLimit,
       });
       const context = await service.prepareWorkerPromptContext(entry.issue);
       return context === null ? null : formatWorkerReviewEvidencePrompt(context);
@@ -3533,17 +3554,15 @@ export class Orchestrator {
     }
   }
 
-  private availableSlots(): number {
-    return Math.max(this.config.agent.maxConcurrentAgents - this.running.size, 0);
+  private availableSlots(issue: Issue): number {
+    return Math.max(this.configForIssue(issue).agent.maxConcurrentAgents - this.running.size, 0);
   }
 
-  private hasStateSlot(state: string): boolean {
-    const stateLimit = this.config.agent.maxConcurrentAgentsByState.get(state.toLowerCase());
+  private hasStateSlot(issue: Issue): boolean {
+    const stateLimit = this.configForIssue(issue).agent.maxConcurrentAgentsByState.get(issue.state.toLowerCase());
     if (!stateLimit) return true;
-    const runningInState = [...this.running.values()].filter(
-      (entry) => entry.issue.state.toLowerCase() === state.toLowerCase(),
-    ).length;
-    return runningInState < stateLimit;
+    const count = [...this.running.values()].filter((entry) => entry.issue.state.toLowerCase() === issue.state.toLowerCase()).length;
+    return count < stateLimit;
   }
 
   private activeRuntimeSeconds(now: number): number {

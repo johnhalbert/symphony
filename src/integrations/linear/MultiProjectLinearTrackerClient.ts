@@ -25,7 +25,10 @@ export class MultiProjectLinearTrackerClient implements TrackerClient, TrackerWr
   }
 
   async fetchIssuesByStates(stateNames: string[]): Promise<Issue[]> {
-    return this.collectIssues((context, client) => client.fetchIssuesByStates(stateNames), "drop");
+    return this.collectIssues(
+      (context, client) => client.fetchIssuesByStates(filterStateNamesForContext(context, stateNames)),
+      "drop",
+    );
   }
 
   async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {
@@ -167,4 +170,48 @@ export class MultiProjectLinearTrackerClient implements TrackerClient, TrackerWr
       trackerProjectSlug: context.tracker.projectSlug,
     };
   }
+}
+
+function filterStateNamesForContext(context: ProjectContextConfig, stateNames: readonly string[]): string[] {
+  const allowed = configuredStateNameKeys(context);
+  return uniqueStateNames(stateNames.filter((state) => allowed.has(state.toLowerCase())));
+}
+
+function configuredStateNameKeys(context: ProjectContextConfig): Set<string> {
+  return new Set(configuredStateNames(context).map((state) => state.toLowerCase()));
+}
+
+function configuredStateNames(context: ProjectContextConfig): string[] {
+  const issueBoardStates = Object.values(context.raw.issue_board?.columns ?? {}).flatMap((states) =>
+    Array.isArray(states) ? states.filter(isNonEmptyString) : [],
+  );
+  return uniqueStateNames([
+    ...context.tracker.activeStates,
+    ...context.tracker.handoffStates,
+    ...context.tracker.terminalStates,
+    ...context.reviewLoop.reviewStates,
+    ...context.reviewLoop.blockedStates,
+    ...(context.reviewLoop.reviewPassState === null ? [] : [context.reviewLoop.reviewPassState]),
+    ...context.mergePolicy.sourceStates,
+    ...(context.mergePolicy.conflictsState === null ? [] : [context.mergePolicy.conflictsState]),
+    context.mergePolicy.doneState,
+    context.writeback.dispatchState,
+    ...issueBoardStates,
+  ].filter(isNonEmptyString));
+}
+
+function uniqueStateNames(values: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }

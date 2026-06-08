@@ -271,6 +271,91 @@ describe("completion report MCP handoff", () => {
     expect(authorizations).toEqual(["Bearer publication-token", "Bearer publication-token"]);
   });
 
+  it("uses the issue project context GitHub publication profile for default PR publication", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    const workspace = await initPublishRepo(root, { remote: true });
+    await writeFile(path.join(workspace, "docs-feature.txt"), "changed\n", "utf8");
+    await writeFile(workflowPath, workflowWithProjectContextPublicationProfile(stateDir), "utf8");
+    vi.stubEnv("DOCS_GITHUB_PUBLICATION_TOKEN", "docs-publication-token");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-docs-publication-profile",
+      sessionId: "agent-1:run-docs-publication-profile",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: workspace,
+      gitBranchName: "symphony/TEST-1",
+      repoPath: workspace,
+      baseRef: "main",
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1", projectContextId: "docs" }),
+      activeRunId: "run-docs-publication-profile",
+      role: "worker",
+      token: "handoff-token",
+      expectedToken: "handoff-token",
+      sessionId: "agent-1:run-docs-publication-profile",
+      workspacePath: workspace,
+      workspace: {
+        path: workspace,
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: workspace,
+        baseRef: "main",
+        projectContextId: "docs",
+      },
+      phase: "implementation",
+    });
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
+      const url = new URL(String(input));
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      if (init?.method === "POST") {
+        return jsonResponse(
+          {
+            html_url: "https://github.com/acme/docs-site/pull/43",
+            number: 43,
+            head: {
+              ref: "symphony/TEST-1",
+              sha: "remote-created-sha",
+              repo: { pushed_at: "2026-01-01T00:00:01Z" },
+            },
+          },
+          201,
+        );
+      }
+      expect(url.pathname).toBe("/repos/acme/docs-site/pulls");
+      return jsonResponse([]);
+    });
+
+    const result = await submitCompletionReportFromMcp(report("docs-publication-profile-idem"), {
+      workflowPath,
+      contextFile,
+    });
+
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      pullRequest: {
+        url: "https://github.com/acme/docs-site/pull/43",
+        number: 43,
+        branch: "symphony/TEST-1",
+      },
+    });
+    expect(authorizations).toEqual(["Bearer docs-publication-token", "Bearer docs-publication-token"]);
+  });
+
   it("exposes a documented stdio MCP tool and submits without caller-supplied run identity", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
@@ -473,6 +558,69 @@ credential_profiles:
   roles:
     service:
       github.publication: publication
+---
+Work on {{ issue.identifier }}.
+`;
+}
+
+function workflowWithProjectContextPublicationProfile(stateDir: string): string {
+  return `---
+tracker:
+  kind: linear
+  api_key: linear-test-key
+  project_slug: TEST
+  active_states:
+    - Todo
+    - In Progress
+  handoff_states:
+    - Human Review
+writeback:
+  enabled: true
+  mode: dry_run
+  dispatch_state: In Progress
+review_loop:
+  review_states:
+    - In Review
+workspace:
+  root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  state_dir: "${slash(stateDir)}"
+github:
+  owner: acme
+  repo: symphony
+  token: legacy-github-token
+  api_base_url: https://api.github.test
+  publish_pull_requests: true
+  pr_handoff:
+    enabled: true
+    target_state: Human Review
+    no_ci:
+      allowed: true
+      evidence: No CI configured in MCP test
+project_contexts:
+  - id: docs
+    tracker:
+      project_slug: DOCS
+    github:
+      owner: acme
+      repo: docs-site
+      token: docs-legacy-github-token
+      api_base_url: https://api.github.test
+      publish_pull_requests: true
+      pr_handoff:
+        enabled: true
+        target_state: Human Review
+        no_ci:
+          allowed: true
+          evidence: No CI configured in MCP test
+    credential_profiles:
+      profiles:
+        docs-publication:
+          value: $DOCS_GITHUB_PUBLICATION_TOKEN
+          capabilities:
+            - github.publication
+      roles:
+        service:
+          github.publication: docs-publication
 ---
 Work on {{ issue.identifier }}.
 `;

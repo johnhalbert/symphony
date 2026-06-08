@@ -108,6 +108,44 @@ describe("FileWritebackOutboxStore", () => {
     ]));
   });
 
+  it("stores overlapping idempotency keys independently per project context", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const operation = {
+      idempotencyKey: "transition:issue-1:dispatch",
+      kind: "transition" as const,
+      issueId: "issue-1",
+      payload: { toState: "In Progress" },
+    };
+
+    await store.enqueueOnce({ ...operation, projectContextId: "docs" });
+    await store.enqueueOnce({ ...operation, projectContextId: "symphony" });
+
+    await expect(store.get(operation.idempotencyKey, "docs")).resolves.toMatchObject({ projectContextId: "docs", status: "pending" });
+    await expect(store.get(operation.idempotencyKey, "symphony")).resolves.toMatchObject({ projectContextId: "symphony", status: "pending" });
+    await expect(store.list()).resolves.toHaveLength(2);
+  });
+
+  it("processes requested overlapping idempotency keys by scoped operation identity", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    const operation = {
+      idempotencyKey: "transition:issue-1:dispatch",
+      kind: "transition" as const,
+      issueId: "issue-1",
+      payload: { toState: "In Progress" },
+    };
+
+    await store.enqueueOnce({ ...operation, projectContextId: "docs" });
+    await store.enqueueOnce({ ...operation, projectContextId: "symphony" });
+
+    await processor.processDue({ operations: [{ idempotencyKey: operation.idempotencyKey, projectContextId: "docs" }] });
+
+    expect(writer.transitions).toEqual([expect.objectContaining({ projectContextId: "docs" })]);
+    await expect(store.get(operation.idempotencyKey, "docs")).resolves.toMatchObject({ status: "succeeded" });
+    await expect(store.get(operation.idempotencyKey, "symphony")).resolves.toMatchObject({ status: "pending" });
+  });
+
   it("tracks projection revisions for successful outbox writes only", async () => {
     const store = new FileWritebackOutboxStore(root);
     const events: Array<{ source: string; revision: number }> = [];

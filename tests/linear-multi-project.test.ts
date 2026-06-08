@@ -112,6 +112,56 @@ describe("MultiProjectLinearTrackerClient", () => {
     );
   });
 
+  it("filters state fetches to the states configured for each project context", async () => {
+    const config = multiProjectConfig();
+    const requests: Array<{ slug: string; states: string[] }> = [];
+    const client = new MultiProjectLinearTrackerClient(config, (contextConfig) => {
+      const slug = contextConfig.tracker.projectSlug;
+      return {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates(stateNames: string[]) {
+          requests.push({ slug, states: [...stateNames] });
+          return stateNames.map((state) => baseIssue(`${slug}-${state}`, state));
+        },
+        async fetchIssueStatesByIds() {
+          return [];
+        },
+        async fetchWorkflowStatesByTeam() {
+          return [];
+        },
+        async transitionIssueState() {
+          return { status: "applied" as const };
+        },
+        async createIssueComment() {
+          return { status: "applied" as const };
+        },
+      } as never;
+    });
+
+    const issues = await client.fetchIssuesByStates([
+      "Eng In Progress",
+      "Docs Review",
+      "Eng Review",
+      "Docs Conflict Repair",
+      "Not A Real State",
+    ]);
+
+    expect(requests).toEqual([
+      { slug: "ENG", states: ["Eng In Progress", "Eng Review"] },
+      { slug: "DOCS", states: ["Docs Review", "Docs Conflict Repair"] },
+    ]);
+    expect(issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ state: "Eng In Progress", projectContextId: "symphony" }),
+        expect.objectContaining({ state: "Eng Review", projectContextId: "symphony" }),
+        expect.objectContaining({ state: "Docs Review", projectContextId: "docs" }),
+        expect.objectContaining({ state: "Docs Conflict Repair", projectContextId: "docs" }),
+      ]),
+    );
+  });
+
   it("drops ambiguous candidate issues that resolve to multiple project contexts", async () => {
     const config = multiProjectConfig();
     const client = new MultiProjectLinearTrackerClient(config, () => ({

@@ -10,6 +10,7 @@ import type {
   PullRequestMergeResult,
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
+import { withProjectContextServiceConfig } from "../config/ProjectContexts.js";
 import type { ResolvedCredential } from "../config/CredentialProfiles.js";
 import { SymphonyError } from "../errors.js";
 import type { Logger } from "../logging/StructuredLogger.js";
@@ -114,7 +115,7 @@ export class MergePolicyService {
   constructor(private readonly options: MergePolicyServiceOptions) {}
 
   async reconcileIssue(issue: Issue): Promise<MergePolicyResult> {
-    const config = this.options.config;
+    const config = withProjectContextServiceConfig(this.options.config, issue.projectContextId);
     if (config.mergePolicy.mode !== "gated") return { status: "skipped", reason: "merge policy is not gated" };
     if (!config.writeback.enabled || config.writeback.mode !== "live" || !this.options.writeback) {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service-owned writeback");

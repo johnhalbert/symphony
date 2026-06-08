@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
+import { withProjectContextServiceConfig } from "../config/ProjectContexts.js";
 import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import {
@@ -44,7 +45,7 @@ export async function submitReviewFeedbackFromMcp(input: unknown, options: {
   const loader = new WorkflowLoader(options.workflowPath);
   try {
     const loaded = await loader.load();
-    const config = loaded.serviceConfig;
+    const config = withProjectContextServiceConfig(loaded.serviceConfig, loadedContext.issue.projectContextId);
     const service = new PullRequestReviewFeedbackService({
       config,
       lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),

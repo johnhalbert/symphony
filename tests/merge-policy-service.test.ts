@@ -82,6 +82,72 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.merge?.doneTransitionOperationKey).toBe("transition:issue-1:merge:issue-1:head-sha-1:Done");
   });
 
+  it("uses the issue project context merge policy when the top-level merge policy is disabled", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: {
+          kind: "linear",
+          api_key: "$LINEAR_API_KEY",
+          project_slug: "TEST",
+          active_states: ["Todo", "In Progress"],
+        },
+        workspace: { root },
+        writeback: { enabled: true, mode: "live" },
+        review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge", blocked_states: ["Blocked"] },
+        merge_policy: { mode: "disabled" },
+        github: { owner: "acme", repo: "symphony" },
+        project_contexts: [
+          {
+            id: "docs",
+            tracker: { project_slug: "DOCS" },
+            github: { owner: "acme", repo: "docs-site" },
+            merge_policy: {
+              mode: "gated",
+              source_states: ["Docs Ready to Merge"],
+              done_state: "Docs Done",
+              merge_method: "squash",
+              required_checks: ["test"],
+            },
+          },
+        ],
+      },
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret", GITHUB_TOKEN: "github-secret" },
+    );
+    const currentIssue = issue({
+      state: "Docs Ready to Merge",
+      labels: ["dogfood-ready"],
+      projectContextId: "docs",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const writer = new MemoryWriter(currentIssue);
+    const client = new FakeMergeClient();
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+
+    expect(result.status).toBe("merged");
+    expect(client.mergeCalls).toBe(1);
+    expect(currentIssue.state).toBe("Docs Done");
+    expect(writer.transitions).toEqual([
+      expect.objectContaining({ projectContextId: "docs", fromStates: ["Docs Ready to Merge"], toState: "Docs Done" }),
+    ]);
+  });
+
   it("supersedes a stale PR head and routes the issue back to implementation", async () => {
     const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });

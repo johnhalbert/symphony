@@ -529,7 +529,7 @@ describe("web history/transcript durable projection writes", () => {
     }
   });
 
-  it("rebuilds dashboard and sidebar rows with durable running runs and lifecycle-only issues omitted by the tracker board", async () => {
+  it("rebuilds dashboard and sidebar rows with runtime-authoritative running agents and lifecycle-only issues omitted by the tracker board", async () => {
     const projectionWriter = statefulProjectionWriter();
     const runningRun = runFixture({
       runId: "run-active-only",
@@ -571,6 +571,7 @@ describe("web history/transcript durable projection writes", () => {
       expect(routeSidebar).toBeDefined();
 
       const routeDashboardPayload = routeDashboard.payload as {
+        agentUsageLabel: string;
         runningAgents: Array<{ id: string; issue: string; state: string; tokens: string }>;
         totals: Record<string, number>;
       };
@@ -578,14 +579,13 @@ describe("web history/transcript durable projection writes", () => {
         runningAgents: Array<{ id: string; issue: string; state: string; tokens: string }>;
         totals: Record<string, number>;
       };
-      expect(routeDashboardPayload.runningAgents).toMatchObject([
-        { id: "run-active-only", issue: "TEST-RUN-ONLY", state: "running", tokens: "25" },
-      ]);
+      expect(routeDashboardPayload.agentUsageLabel).toBe("0 agents");
+      expect(routeDashboardPayload.runningAgents).toEqual([]);
       expect(routeDashboardPayload.totals).toMatchObject({ progress: 1, review: 1, open: 2, all: 2 });
-      expect(routeDashboard.sourceCursors).toMatchObject({ issueCount: 2, openIssueCount: 2, runningAgentCount: 1 });
+      expect(routeDashboard.sourceCursors).toMatchObject({ issueCount: 2, openIssueCount: 2, runningAgentCount: 0 });
       expect(routeSidebarPayload.runningAgents).toMatchObject(routeDashboardPayload.runningAgents);
       expect(routeSidebarPayload.totals).toMatchObject(routeDashboardPayload.totals);
-      expect(routeSidebar.sourceCursors).toMatchObject({ runningAgentCount: 1 });
+      expect(routeSidebar.sourceCursors).toMatchObject({ runningAgentCount: 0 });
 
       projectionWriter.clearRows();
       const result = await server.rebuildDurableWebProjections({

@@ -11,6 +11,7 @@ import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
 import { StructuredLogger } from "../logging/StructuredLogger.js";
+import { withProjectContextServiceConfig } from "../config/ProjectContexts.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
 import { SymphonyError } from "../errors.js";
 import { FileOperatorApprovalStore, OperatorApprovalService } from "../approval/OperatorApprovalService.js";
@@ -52,7 +53,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
   const loader = new WorkflowLoader(options.workflowPath);
   try {
     const loaded = await loader.load();
-    const config = loaded.serviceConfig;
+    const config = withProjectContextServiceConfig(loaded.serviceConfig, loadedContext.issue.projectContextId);
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);

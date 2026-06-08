@@ -142,6 +142,83 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.running).toBe(0);
   });
 
+  it("uses project-context agent config when preparing worker turns", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: {
+          kind: "linear",
+          api_key: "$LINEAR_API_KEY",
+          project_slug: "TEST",
+          active_states: ["Todo", "In Progress"],
+        },
+        workspace: { root },
+        polling: { interval_ms: 60_000 },
+        agent: { max_concurrent_agents: 2, max_turns: 1 },
+        project_contexts: [
+          {
+            id: "docs",
+            tracker: { project_slug: "DOCS", active_states: ["Todo", "In Progress"] },
+            agent: { max_turns: 2 },
+          },
+        ],
+      },
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const candidate = issue({
+      id: "issue-docs-1",
+      identifier: "DOCS-1",
+      state: "Todo",
+      branchName: "symphony/docs/DOCS-1",
+      projectContextId: "docs",
+      assignedToWorker: true,
+    });
+    let refreshes = 0;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return refreshes >= 2 ? [] : [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        refreshes += 1;
+        if (refreshes >= 2) return [{ ...candidate, state: "Done" }];
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runs: AgentRunContext[] = [];
+    const harness: AgentHarness = {
+      id: "project-context-agent-limits",
+      capabilities: { continuation: true },
+      async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
+        runs.push(ctx);
+        yield { type: "session_started", sessionId: `docs-${ctx.turnNumber}` };
+        yield { type: "completed", message: `turn ${ctx.turnNumber} complete` };
+      },
+    };
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => runs.length === 1, "docs worker first turn");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "docs worker completion");
+    await orchestrator.stop();
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.turnNumber).toBe(1);
+    expect(runs[0]?.config.agent.maxTurns).toBe(2);
+    expect(runs[0]?.issue.projectContextId).toBe("docs");
+  });
+
   it("runs dashboard operator chat through the configured harness and persists assistant output", async () => {
     const config = testConfig(root);
     const logger = new StructuredLogger(() => undefined);

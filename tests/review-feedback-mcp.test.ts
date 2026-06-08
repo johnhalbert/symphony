@@ -134,6 +134,52 @@ describe("review feedback MCP handoff", () => {
     });
   });
 
+  it("uses the issue project context GitHub review profile for review feedback submission", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-feedback-context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await writeFile(workflowPath, workflowWithProjectContext(stateDir), "utf8");
+    await seedLifecycle(lifecycleStore, issue({ state: "In Review", branchName: "symphony/TEST-1", projectContextId: "docs" }));
+    await writeReviewFeedbackMcpContext(contextFile, {
+      issue: issue({ state: "In Review", branchName: "symphony/TEST-1", projectContextId: "docs" }),
+      activeRunId: "review-run-1",
+      role: "reviewer",
+      token: null,
+      expectedToken: null,
+      reviewer: "reviewer-agent:review-run-1",
+      phase: "review",
+    });
+    vi.stubEnv("DOCS_GITHUB_REVIEW_TOKEN", "docs-review-token");
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
+      const url = new URL(String(input));
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      expect(url.pathname).toBe("/repos/acme/docs-site/pulls/42/reviews");
+      return new Response(
+        JSON.stringify({
+          id: 9002,
+          html_url: "https://github.com/acme/docs-site/pull/42#pullrequestreview-9002",
+          comments: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+
+    const result = await submitReviewFeedbackFromMcp(
+      { kind: "review", event: "APPROVE", body: "Docs review okay.", idempotencyKey: "docs-feedback-1" },
+      { workflowPath, contextFile },
+    );
+
+    expect(authorizations).toEqual(["Bearer docs-review-token"]);
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      reviewUrl: "https://github.com/acme/docs-site/pull/42#pullrequestreview-9002",
+      pullRequest: { number: 42, url: "https://github.com/acme/symphony/pull/42", headSha: "abc123" },
+    });
+  });
+
   it("sanitizes GitHub token material from write errors", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
@@ -205,9 +251,12 @@ async function listToolsViaServer(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function seedLifecycle(lifecycleStore: FileIssueLifecycleStore): Promise<void> {
+async function seedLifecycle(
+  lifecycleStore: FileIssueLifecycleStore,
+  activeIssue = issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+): Promise<void> {
   const report = completionReportRecord();
-  await lifecycleStore.ensureIssue(issue({ state: "In Review", branchName: "symphony/TEST-1" }), {
+  await lifecycleStore.ensureIssue(activeIssue, {
     phase: "review",
     lastCompletionReportId: report.id,
     completionReports: [report],
@@ -262,6 +311,52 @@ review_loop:
 workspace:
   root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
   state_dir: "${slash(stateDir)}"
+---
+Work on {{ issue.identifier }}.
+`;
+}
+
+function workflowWithProjectContext(stateDir: string): string {
+  return `---
+tracker:
+  kind: linear
+  api_key: linear-test-key
+  project_slug: TEST
+  active_states:
+    - Todo
+    - In Progress
+  handoff_states:
+    - In Review
+github:
+  owner: acme
+  repo: symphony
+  token: github-secret
+  api_base_url: https://api.github.test
+review_loop:
+  review_states:
+    - In Review
+  review_pass_state: Ready to Merge
+workspace:
+  root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  state_dir: "${slash(stateDir)}"
+project_contexts:
+  - id: docs
+    tracker:
+      project_slug: DOCS
+    github:
+      owner: acme
+      repo: docs-site
+      token: docs-legacy-token
+      api_base_url: https://api.github.test
+    credential_profiles:
+      profiles:
+        docs-review:
+          value: $DOCS_GITHUB_REVIEW_TOKEN
+          capabilities:
+            - github.review_feedback_write
+      roles:
+        reviewer:
+          github.review_feedback_write: docs-review
 ---
 Work on {{ issue.identifier }}.
 `;

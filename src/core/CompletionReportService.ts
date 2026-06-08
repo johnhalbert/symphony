@@ -815,9 +815,14 @@ export class CompletionReportService {
         "Publication approval requires a writeback processor to apply pending Linear audit before waiting",
       );
     }
-    await processor.processDue({ idempotencyKeys: operations.map((operation) => operation.idempotencyKey) });
+    await processor.processDue({
+      operations: operations.map((operation) => ({
+        idempotencyKey: operation.idempotencyKey,
+        projectContextId: operation.projectContextId ?? null,
+      })),
+    });
     for (const operation of operations) {
-      const record = await this.options.writebackOutbox.get(operation.idempotencyKey);
+      const record = await this.options.writebackOutbox.get(operation.idempotencyKey, operation.projectContextId);
       if (!record || !SETTLED_WRITEBACK_STATUSES.has(record.status)) {
         throw new SymphonyError("tracker_error", "Pending publication approval writeback did not complete", {
           idempotencyKey: operation.idempotencyKey,
