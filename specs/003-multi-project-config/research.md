@@ -69,3 +69,28 @@
 **Alternatives considered**:
 
 - Add a config-merge or schema composition dependency. Rejected because existing parsing patterns in `src/core/config/Config.ts` are sufficient.
+
+## Protected-surface inventory and current single-project assumptions
+
+The current implementation has several project-specific assumptions that must be converted carefully rather than changed opportunistically:
+
+- `src/core/config/Config.ts` currently normalizes one top-level `tracker`, `workspace`, `github`, `review_loop`, `issue_breakdown`, `agent`, and `credential_profiles` set into one `ServiceConfig`.
+- `src/app/RuntimeDependencies.ts` and `src/integrations/linear/LinearCredentialResolver.ts` currently construct one Linear tracker/writeback client flow from that single config view.
+- `src/integrations/linear/LinearTrackerClient.ts` scopes candidate discovery, state refresh, transitions, comments, and issue creation to one `tracker.projectSlug`.
+- `src/core/workspace/WorkspaceManager.ts` derives workspace identity from the issue identifier, which becomes a collision risk when two contexts can contain the same issue identifier.
+- `src/core/persistence/RunTranscriptStore.ts`, `src/app/WebProjectionContext.ts`, and `src/app/http.ts` build or resolve aliases from issue id, issue identifier, and workspace key without project-context namespacing.
+
+These are protected multi-system surfaces because they cross configuration, tracker routing, workspace ownership, durable persistence, and operator-facing reads. Multi-project work should treat the following as the minimum review surface:
+
+- configuration parsing and legacy compatibility (`src/core/config/**`)
+- tracker client and credential resolution (`src/integrations/linear/**`)
+- workspace keying and metadata (`src/core/workspace/**`)
+- run/lifecycle/writeback persistence and replay (`src/core/persistence/**`, `src/core/writeback/**`, `src/core/approval/**`)
+- operator projections and HTTP alias resolution (`src/app/**`)
+- orchestration and dispatch handoff boundaries (`src/core/orchestrator/**`, `src/core/harness/**`)
+
+Protected or out-of-scope surfaces for the initial feature:
+
+- `hermes/upstream-src/**` remains vendored and should not be modified for this feature.
+- operator-managed secret stores, credential values, and external project state remain outside repo-authored migration work.
+- existing dirty workspaces and protected-branch publication behavior stay service-owned and must continue to fail closed on ambiguous routing.
