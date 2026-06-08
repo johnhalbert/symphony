@@ -3095,7 +3095,12 @@ export class Orchestrator {
     try {
       const client =
         this.options.pullRequestClient ??
-        createGitHubPullRequestClientForCapability(this.config, "github.discovery");
+        createGitHubPullRequestClientForCapability(
+          this.config,
+          "github.discovery",
+          undefined,
+          entry.issue.projectContextId,
+        );
       pullRequest = await client.findOpenPullRequestByBranch({ branchName });
     } catch (error) {
       this.options.logger.warn("pull request discovery failed", {
@@ -3504,7 +3509,12 @@ export class Orchestrator {
     try {
       const client =
         this.options.pullRequestReviewClient ??
-        createGitHubPullRequestClientForCapability(this.config, "github.review_evidence_read");
+        createGitHubPullRequestClientForCapability(
+          this.config,
+          "github.review_evidence_read",
+          undefined,
+          entry.issue.projectContextId,
+        );
       const service = new PullRequestReviewEvidenceService({
         lifecycleStore: this.options.lifecycleStore,
         client,

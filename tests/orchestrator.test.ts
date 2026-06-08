@@ -4946,21 +4946,56 @@ describe("Orchestrator", () => {
     });
   });
 
-  it("lazy-resolves worker GitHub discovery credentials when no discovery client override is injected", async () => {
+  it("lazy-resolves worker GitHub discovery credentials from the active project context when no discovery client override is injected", async () => {
     const config = githubProfileConfig(root, {
       profiles: {
-        discovery: { value: "$GITHUB_DISCOVERY_TOKEN", capabilities: ["github.discovery"] },
+        "docs-discovery": { value: "$DOCS_GITHUB_DISCOVERY_TOKEN", capabilities: ["github.discovery"] },
       },
-      roles: {
-        worker: {
-          "github.discovery": "discovery",
-        },
-      },
+      roles: {},
       env: {
-        GITHUB_DISCOVERY_TOKEN: "discovery-secret",
+        DOCS_GITHUB_DISCOVERY_TOKEN: "docs-discovery-secret",
+        DOCS_GITHUB_TOKEN: "docs-legacy-token",
       },
+      projectContexts: [
+        {
+          id: "docs",
+          label: "Documentation Site",
+          tracker: {
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "DOCS",
+          },
+          workspace: {
+            root: root,
+            source: {
+              kind: "git_worktree",
+              repository: ".",
+              base_ref: "origin/main",
+              branch_template: "symphony/{{ issue.identifier }}",
+              cleanup: "refuse_dirty",
+            },
+          },
+          github: {
+            owner: "acme-docs",
+            repo: "docs-site",
+            token: "$DOCS_GITHUB_TOKEN",
+            api_base_url: "https://api.github.test",
+          },
+          credential_profiles: {
+            roles: {
+              worker: {
+                "github.discovery": "docs-discovery",
+              },
+            },
+          },
+        },
+      ],
     });
-    const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      branchName: "symphony/TEST-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -4972,15 +5007,18 @@ describe("Orchestrator", () => {
         return [candidate];
       },
     };
-    const authorizations: string[] = [];
+    const calls: Array<{ pathname: string; authorization: string }> = [];
     vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
-      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
       const url = new URL(String(input));
-      expect(url.pathname).toBe("/repos/acme/symphony/pulls");
+      calls.push({
+        pathname: url.pathname,
+        authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+      });
+      expect(url.pathname).toBe("/repos/acme-docs/docs-site/pulls");
       return new Response(
         JSON.stringify([
           {
-            html_url: "https://github.com/acme/symphony/pull/42",
+            html_url: "https://github.com/acme-docs/docs-site/pull/42",
             number: 42,
             head: { ref: "symphony/TEST-1", sha: "abc123", repo: { pushed_at: "2026-01-01T00:00:01Z" } },
           },
@@ -5000,11 +5038,17 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    await (orchestrator as any).discoverPullRequestForEntry(
+      { issue: candidate, lifecycle: null },
+      { path: root, workspaceKey: candidate.identifier, createdNow: false },
+    );
 
-    expect(authorizations).toEqual(["Bearer discovery-secret", "Bearer discovery-secret"]);
+    expect(calls).toEqual([
+      {
+        pathname: "/repos/acme-docs/docs-site/pulls",
+        authorization: "Bearer docs-discovery-secret",
+      },
+    ]);
   });
 
   it("injects PR review evidence into the next worker prompt after requested changes", async () => {
@@ -5251,25 +5295,60 @@ describe("Orchestrator", () => {
     });
   });
 
-  it("lazy-resolves reviewer GitHub review-evidence credentials for worker feedback prompts", async () => {
+  it("lazy-resolves reviewer GitHub review-evidence credentials from the active project context for worker feedback prompts", async () => {
     const config = githubProfileConfig(root, {
       profiles: {
-        "review-read": {
-          value: "$GITHUB_REVIEW_READ_TOKEN",
+        "docs-review-read": {
+          value: "$DOCS_GITHUB_REVIEW_READ_TOKEN",
           capabilities: ["github.review_evidence_read"],
         },
       },
-      roles: {
-        reviewer: {
-          "github.review_evidence_read": "review-read",
-        },
-      },
+      roles: {},
       env: {
-        GITHUB_REVIEW_READ_TOKEN: "review-read-secret",
+        DOCS_GITHUB_REVIEW_READ_TOKEN: "docs-review-read-secret",
+        DOCS_GITHUB_TOKEN: "docs-legacy-token",
       },
+      projectContexts: [
+        {
+          id: "docs",
+          label: "Documentation Site",
+          tracker: {
+            api_key: "$LINEAR_API_KEY",
+            project_slug: "DOCS",
+          },
+          workspace: {
+            root: root,
+            source: {
+              kind: "git_worktree",
+              repository: ".",
+              base_ref: "origin/main",
+              branch_template: "symphony/{{ issue.identifier }}",
+              cleanup: "refuse_dirty",
+            },
+          },
+          github: {
+            owner: "acme-docs",
+            repo: "docs-site",
+            token: "$DOCS_GITHUB_TOKEN",
+            api_base_url: "https://api.github.test",
+          },
+          credential_profiles: {
+            roles: {
+              reviewer: {
+                "github.review_evidence_read": "docs-review-read",
+              },
+            },
+          },
+        },
+      ],
     });
     config.reviewLoop.continuationHistoryThreshold = 5;
-    const candidate = issue({ state: "In Progress", branchName: null });
+    const candidate = issue({
+      state: "In Progress",
+      branchName: null,
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -5289,12 +5368,13 @@ describe("Orchestrator", () => {
       lastCompletionReportId: "completion-report:issue-1:idem-1",
       completionReports: [completionReportRecord(candidate)],
     });
-    const calls: Array<{ pathname: string; authorization: string }> = [];
+    const calls: Array<{ pathname: string; authorization: string; body: unknown | null }> = [];
     vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
       const url = new URL(String(input));
       calls.push({
         pathname: url.pathname,
         authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+        body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
       });
       if (url.pathname === "/graphql") {
         return jsonResponse({
@@ -5314,7 +5394,7 @@ describe("Orchestrator", () => {
         return jsonResponse([
           {
             id: 1001,
-            html_url: "https://github.com/acme/symphony/pull/42#pullrequestreview-1001",
+            html_url: "https://github.com/acme-docs/docs-site/pull/42#pullrequestreview-1001",
             state: "CHANGES_REQUESTED",
             body: "Please address the reviewer-owned evidence path.",
             user: { login: "reviewer-a" },
@@ -5337,18 +5417,25 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    const prompt = await (orchestrator as any).loadWorkerReviewEvidencePrompt({ issue: candidate });
 
-    expect(calls.map((call) => call.authorization)).toEqual([
-      "Bearer review-read-secret",
-      "Bearer review-read-secret",
-      "Bearer review-read-secret",
-      "Bearer review-read-secret",
-    ]);
-    expect(harness.runs[0]?.prompt).toContain("PR review feedback to address");
-    expect(harness.runs[0]?.prompt).toContain("Please address the reviewer-owned evidence path.");
+    expect(calls.map((call) => call.authorization)).toEqual(Array(calls.length).fill("Bearer docs-review-read-secret"));
+    expect(calls.filter((call) => call.pathname !== "/graphql").map((call) => call.pathname)).toEqual(
+      expect.arrayContaining([
+        "/repos/acme-docs/docs-site/pulls/42/reviews",
+        "/repos/acme-docs/docs-site/pulls/42/comments",
+        "/repos/acme-docs/docs-site/issues/42/comments",
+      ]),
+    );
+    expect(calls.find((call) => call.pathname === "/graphql")?.body).toMatchObject({
+      variables: {
+        owner: "acme-docs",
+        repo: "docs-site",
+        number: 42,
+      },
+    });
+    expect(prompt).toContain("PR review feedback to address");
+    expect(prompt).toContain("Please address the reviewer-owned evidence path.");
   });
 
   it("injects the latest fail verdict findings and workspace context into the next worker prompt", async () => {
@@ -6582,6 +6669,8 @@ function githubProfileConfig(
     profiles: Record<string, { value: string; capabilities: string[] }>;
     roles: { worker?: Record<string, string>; reviewer?: Record<string, string> };
     env: Record<string, string>;
+    projectContexts?: Array<Record<string, unknown>>;
+    github?: Record<string, unknown>;
   },
 ) {
   return parseServiceConfig(
@@ -6601,16 +6690,18 @@ function githubProfileConfig(
         max_concurrent_agents: 2,
         max_turns: 1,
       },
-      github: {
-        owner: "acme",
-        repo: "symphony",
-        token: "legacy-github-token",
-        api_base_url: "https://api.github.test",
-      },
+      github:
+        input.github ?? {
+          owner: "acme",
+          repo: "symphony",
+          token: "legacy-github-token",
+          api_base_url: "https://api.github.test",
+        },
       credential_profiles: {
         profiles: input.profiles,
         roles: input.roles,
       },
+      ...(input.projectContexts === undefined ? {} : { project_contexts: input.projectContexts }),
     },
     path.join(workspaceRoot, "WORKFLOW.md"),
     {
