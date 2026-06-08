@@ -9,6 +9,7 @@ import {
   type CredentialProfileRegistry,
 } from "./CredentialProfiles.js";
 import {
+  DEFAULT_PROJECT_CONTEXT_ID,
   normalizeProjectContextRegistry,
   rawProjectContextsSchema,
   type NormalizedProjectContext,
@@ -601,10 +602,23 @@ export function resolveProjectContextForConfig(
   config: ServiceConfig,
   projectContextId?: string | null,
 ): NormalizedProjectContext {
-  if (projectContextId === undefined || projectContextId === null) {
+  if (
+    projectContextId === undefined ||
+    projectContextId === null ||
+    projectContextId === DEFAULT_PROJECT_CONTEXT_ID
+  ) {
     return defaultProjectContextForConfig(config);
   }
-  return config.projectContexts.byId.get(projectContextId) ?? defaultProjectContextForConfig(config);
+
+  const context = config.projectContexts.byId.get(projectContextId);
+  if (context) {
+    return context;
+  }
+
+  throw new SymphonyError(
+    "config_validation_error",
+    `Project context "${projectContextId}" was not found in the loaded workflow config. Persisted non-default project context ids must resolve exactly; only the legacy "${DEFAULT_PROJECT_CONTEXT_ID}" compatibility context may fall back.`,
+  );
 }
 
 export function serviceConfigForProjectContext(

@@ -524,6 +524,23 @@ describe("CompletionReportService", () => {
     config.github.token = "github-token";
     config.github.operatorApproval!.requiredForPublication = true;
     config.github.operatorApproval!.pollIntervalMs = 5;
+    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+    if (!defaultContext) throw new Error("missing default project context");
+    config.projectContexts.byId.set("docs", {
+      ...defaultContext,
+      id: "docs",
+      label: "Documentation Site",
+      github: {
+        ...defaultContext.github,
+        publishPullRequests: true,
+        operatorApproval: {
+          requiredForPublication: true,
+          pollIntervalMs: defaultContext.github.operatorApproval?.pollIntervalMs ?? 5,
+          rejectPolicy: defaultContext.github.operatorApproval?.rejectPolicy ?? "cancel",
+          timeoutMs: defaultContext.github.operatorApproval?.timeoutMs ?? null,
+        },
+      },
+    });
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);
@@ -753,11 +770,63 @@ describe("CompletionReportService", () => {
     ).toBe(true);
   });
 
+  it("fails closed when a persisted non-default completion-report context no longer exists", async () => {
+    const publisher = new FakePublisher({
+      url: "https://github.com/acme-docs/docs-site/pull/42",
+      number: 42,
+      headBranch: "symphony/DOCS-1",
+      headSha: "docs-head-sha",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      action: "created",
+      evidenceCursor: "idem-missing-context",
+    });
+    const { config, service, outbox, runStore } = fixture({ publisher });
+    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+    if (!defaultContext) throw new Error("missing default project context");
+    config.projectContexts.byId.set("docs", {
+      ...defaultContext,
+      id: "docs",
+      label: "Documentation Site",
+      github: {
+        ...defaultContext.github,
+        owner: "acme-docs",
+        repo: "docs-site",
+        publishPullRequests: true,
+      },
+      reviewLoop: {
+        ...defaultContext.reviewLoop,
+        reviewStates: ["Docs Review"],
+      },
+    });
+    config.projectContexts.byId.delete("docs");
+
+    await startRun(runStore);
+    const docsIssue = issue({
+      state: "In Progress",
+      branchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+
+    await expect(
+      service.submitCompletionReport(
+        report({ idempotencyKey: "missing-context-report", branchName: "symphony/DOCS-1" }),
+        contextWithWorkspace({ issue: docsIssue }),
+      ),
+    ).rejects.toMatchObject({
+      code: "config_validation_error",
+      message: expect.stringContaining('Project context "docs" was not found'),
+    });
+    expect(publisher.inputs).toHaveLength(0);
+    expect(await outbox.list()).toHaveLength(0);
+  });
+
   function fixture(options: { publisher?: CompletionReportPullRequestPublisher; configure?: (config: ReturnType<typeof testConfig>) => void } = {}) {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
     config.reviewLoop.reviewStates = ["In Review"];
+
     if (options.publisher) {
       config.github.publishPullRequests = true;
       config.github.prHandoff.enabled = true;

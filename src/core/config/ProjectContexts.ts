@@ -634,12 +634,13 @@ function normalizeWorkspaceConfig(
   const sourceRepositoryValue = resolveNormalizedConfigString(raw?.source?.repository, env);
   const sourceRepository =
     sourceRepositoryValue === null ? undefined : resolveRepositoryValue(sourceRepositoryValue, workflowDir, env);
+  const sourceBaseRef = resolveNormalizedConfigString(raw?.source?.base_ref, env) ?? undefined;
 
   if (input.requireGitWorktreeDetails && sourceKind === "git_worktree") {
     if (!sourceRepository) {
       throw contextConfigError(input.contextId, "workspace.source.repository is required for git_worktree");
     }
-    if (!raw?.source?.base_ref) {
+    if (!sourceBaseRef) {
       throw contextConfigError(input.contextId, "workspace.source.base_ref is required for git_worktree");
     }
   }
@@ -652,7 +653,7 @@ function normalizeWorkspaceConfig(
       ...(sourcePath === undefined ? {} : { path: sourcePath }),
       ...(sourceRepository === undefined ? {} : { repository: sourceRepository }),
       ...(raw?.source?.ref === undefined ? {} : { ref: raw.source.ref }),
-      ...(raw?.source?.base_ref === undefined ? {} : { baseRef: raw.source.base_ref }),
+      ...(sourceBaseRef === undefined ? {} : { baseRef: sourceBaseRef }),
       ...(raw?.source?.branch_template === undefined ? {} : { branchTemplate: raw.source.branch_template }),
       ...(sourceCachePath === undefined ? {} : { cachePath: sourceCachePath }),
       ...(raw?.source?.cleanup === undefined ? {} : { cleanup: raw.source.cleanup }),

@@ -2152,6 +2152,89 @@ describe("project context redaction", () => {
       },
       expectedMessage: "project context docs-site: workspace.source.repository is required for git_worktree",
     },
+    {
+      label: "git_worktree source with unset env placeholder base ref",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "../docs-site",
+                base_ref: "$DOCS_BASE_REF",
+              },
+            },
+          },
+        ],
+      },
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+      },
+      expectedMessage: "project context docs-site: workspace.source.base_ref is required for git_worktree",
+    },
+    {
+      label: "git_worktree source with empty env placeholder base ref",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "../docs-site",
+                base_ref: "$DOCS_BASE_REF",
+              },
+            },
+          },
+        ],
+      },
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+        DOCS_BASE_REF: "",
+      },
+      expectedMessage: "project context docs-site: workspace.source.base_ref is required for git_worktree",
+    },
   ])("rejects enabled project contexts with $label", ({ rawConfig, env, expectedMessage }) => {
     expect(() => parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env)).toThrowError(expectedMessage);
   });

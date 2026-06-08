@@ -147,6 +147,9 @@ function addRequiredParseDependencies(env: Record<string, string>, config: Servi
   const sourceRepositoryRef = envReference(raw.workspace?.source?.repository);
   if (sourceRepositoryRef) env[sourceRepositoryRef] = config.workspace.source.repository ?? "";
 
+  const sourceBaseRefRef = envReference(raw.workspace?.source?.base_ref);
+  if (sourceBaseRefRef) env[sourceBaseRefRef] = config.workspace.source.baseRef ?? "";
+
   const sourceCachePathRef = envReference(raw.workspace?.source?.cache_path);
   if (sourceCachePathRef) env[sourceCachePathRef] = config.workspace.source.cachePath ?? "";
 }

@@ -84,6 +84,30 @@ describe("OperatorApprovalService", () => {
     });
   });
 
+  it("fails closed when approval policy is requested for a missing non-default project context", () => {
+    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+    if (!defaultContext) throw new Error("missing default project context");
+    config.projectContexts.byId.set("docs", {
+      ...defaultContext,
+      id: "docs",
+      label: "Documentation Site",
+      github: {
+        ...defaultContext.github,
+        publishPullRequests: true,
+        operatorApproval: {
+          requiredForPublication: true,
+          pollIntervalMs: defaultContext.github.operatorApproval?.pollIntervalMs ?? 50,
+          rejectPolicy: "fail",
+          timeoutMs: defaultContext.github.operatorApproval?.timeoutMs ?? null,
+        },
+      },
+    });
+    config.projectContexts.byId.delete("docs");
+
+    expect(() => service.isRequired("docs")).toThrowError(/Project context "docs" was not found/);
+    expect(() => service.rejectPolicyForProjectContext("docs")).toThrowError(/Project context "docs" was not found/);
+  });
+
   it("dedupes pending approvals by run and evidence cursor", async () => {
     const first = service.waitForPublicationApproval(request());
     const pending = await waitForPending();

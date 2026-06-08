@@ -78,7 +78,19 @@ describe("ReviewVerdictService", () => {
   });
 
   it("persists non-default project context on fail verdict writebacks", async () => {
-    const { service, lifecycleStore, outbox } = fixture();
+    const { config, service, lifecycleStore, outbox } = fixture();
+    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+    if (!defaultContext) throw new Error("missing default project context");
+    config.projectContexts.byId.set("docs", {
+      ...defaultContext,
+      id: "docs",
+      label: "Documentation Site",
+      reviewLoop: {
+        ...defaultContext.reviewLoop,
+        reviewStates: ["In Review"],
+        reviewPassState: "Ready to Merge",
+      },
+    });
     const docsIssue = issue({
       state: "In Review",
       branchName: "symphony/DOCS-1",
@@ -420,6 +432,42 @@ describe("ReviewVerdictService", () => {
       projectContextId: "docs",
       projectContextLabel: "Documentation Site",
     });
+  });
+
+  it("fails closed when a persisted non-default review-verdict context no longer exists", async () => {
+    const { config, service, lifecycleStore, outbox } = fixture();
+    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+    if (!defaultContext) throw new Error("missing default project context");
+    config.projectContexts.byId.set("docs", {
+      ...defaultContext,
+      id: "docs",
+      label: "Documentation Site",
+      reviewLoop: {
+        ...defaultContext.reviewLoop,
+        reviewStates: ["Docs Review"],
+        reviewPassState: "Docs Ready to Merge",
+      },
+    });
+    config.projectContexts.byId.delete("docs");
+
+    const docsIssue = issue({
+      state: "Docs Review",
+      branchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, {
+      phase: "review",
+      reviewRound: 1,
+      summaryPointers: { prUrl: "https://github.com/acme-docs/docs-site/pull/42", prNumber: 42, prHeadSha: "docs-head-sha" },
+      reviewFeedback: [approvalFeedback({ pullRequest: { url: "https://github.com/acme-docs/docs-site/pull/42", number: 42, headSha: "docs-head-sha", branch: "symphony/DOCS-1" } })],
+    });
+
+    await expect(service.submitReviewVerdict(passVerdict(), context({ issue: docsIssue, phase: "review" }))).rejects.toMatchObject({
+      code: "config_validation_error",
+      message: expect.stringContaining('Project context "docs" was not found'),
+    });
+    expect(await outbox.list()).toHaveLength(0);
   });
 
   function fixture() {

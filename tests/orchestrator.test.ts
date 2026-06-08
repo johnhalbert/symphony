@@ -2415,7 +2415,7 @@ describe("Orchestrator", () => {
   it("does not stall-cancel lifecycle-only pending publication approval handoffs", async () => {
     const config = testConfig(root);
     config.reviewLoop.blockedStates = ["Blocked"];
-    (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = { stall_timeout_ms: 1 };
+    (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = { stall_timeout_ms: 20 };
     const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -2447,17 +2447,28 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
       await waitFor(() => typeof orchestrator.snapshot().running[0]?.runId === "string", "worker run start");
       const runId = orchestrator.snapshot().running[0]?.runId ?? "";
-      await lifecycleStore.ensureIssue(
-        candidate,
-        pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
-      );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          await lifecycleStore.ensureIssue(
+            candidate,
+            pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
+          );
+          break;
+        } catch (error) {
+          if (!(error instanceof Error) || !("code" in error) || error.code !== "EPERM" || attempt === 4) {
+            throw error;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
       await runStore.updateRun(runId, {
         metadata: {
           pendingApprovalRequestId: null,
           pendingApprovalRequestedAt: null,
         },
       });
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 30));
 
       await orchestrator.refreshNow();
 
@@ -3940,6 +3951,13 @@ describe("Orchestrator", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
+    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+    if (!defaultContext) throw new Error("missing default project context");
+    config.projectContexts.byId.set("docs", {
+      ...defaultContext,
+      id: "docs",
+      label: "Documentation Site",
+    });
     const candidate = issue({
       state: "Blocked",
       labels: ["dogfood-ready"],
@@ -4062,6 +4080,13 @@ describe("Orchestrator", () => {
       config.github.repo = "symphony";
       config.github.token = "github-token";
       config.workspace.source.baseRef = "main";
+      const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+      if (!defaultContext) throw new Error("missing default project context");
+      config.projectContexts.byId.set("docs", {
+        ...defaultContext,
+        id: "docs",
+        label: "Documentation Site",
+      });
       const candidate = issue({
         state: "Blocked",
         labels: ["dogfood-ready"],
