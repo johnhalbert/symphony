@@ -69,3 +69,20 @@
 **Alternatives considered**:
 
 - Add a config-merge or schema composition dependency. Rejected because existing parsing patterns in `src/core/config/Config.ts` are sufficient.
+
+## Phase 1 protected-surface inventory note
+
+Current single-project assumptions that downstream multi-project work must unwind carefully:
+
+- `src/core/config/Config.ts` normalizes one top-level `tracker`, `workspace`, `github`, `review_loop`, `issue_breakdown`, and protected-path set into `ServiceConfig`, so multi-project support starts by introducing a context registry without breaking the legacy single-project compatibility view.
+- `src/integrations/linear/LinearTrackerClient.ts` scopes candidate polling and state refresh queries to one `tracker.projectSlug` per client instance, which makes tracker client creation a primary context-resolution seam.
+- `src/core/workspace/WorkspaceManager.ts` derives `workspaceKey` from `issue.identifier` (plus `-planning` for planning workspaces) and resolves one workspace root/state directory from `options.workspace`, so duplicate issue identifiers across contexts will collide unless workspace identity becomes context-qualified.
+- `src/core/orchestrator/Orchestrator.ts` accepts one `TrackerClient`, one `WorkspaceManager`, and records one issue/workspace tuple per dispatch, which means routing must stay service-owned and become explicit before polling, workspace creation, or handoff.
+- `src/core/persistence/RunTranscriptStore.ts` persists `WorkspaceRecord` and `RunRecord` entries keyed by issue/workspace metadata without a project-context discriminator today, so future durable attribution needs to extend runs, workspaces, and replay paths together.
+- `src/app/webProjection.ts` and related projection indexing build operator-facing aliases from `issueIdentifier`, `workspaceKey`, and `runId`, so duplicate identifiers across Linear projects will require context-aware aliases in board, history, detail, and transcript views.
+- `tests/helpers.ts` is the shared test-fixture seam for future config and tracker coverage, so Phase 1 adds reusable multi-project workflow, tracker, and issue builders there before behavior-changing implementation starts.
+
+Protected-surface constraints for downstream implementation:
+
+- Project-context resolution, workspace selection, writeback targeting, lifecycle transitions, and MCP handoff validation remain Symphony-owned service decisions; agents only receive already-resolved metadata.
+- `hermes/upstream-src/**` does not require changes for this feature. Phase 1 inventory found no setup or routing prerequisite that depends on modifying vendored Hermes sources.
