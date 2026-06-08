@@ -178,8 +178,8 @@ Repo-local reviewer-verifiable governance closure now lives in `docs/smoke/eng-3
 
 - `WORKFLOW.md:29-35` remains the governing rule that worker/reviewer runs must treat a fenced JSON `Issue Contract` as authoritative.
 - `specs/003-multi-project-config/tasks.md:9` remains the governing rule that every split child issue retains that fenced JSON contract shape.
-- `docs/smoke/eng-347-governance-ledger.md` now mirrors the ENG-347 feature contract with `REQ-FEATURE-001` and `REQ-FEATURE-002`, records the child-issue inventory/order/completion ledger for `ENG-348`, `ENG-349`, and `ENG-356` through `ENG-364`, and provides fenced JSON contract mirrors for each child issue.
-- The same ledger now maps `FR-001` through `FR-025` and `SC-001` through `SC-009` to current repo-local code, tests, docs, and validation artifacts so the reviewer can verify closure from the worktree alone.
+- `docs/smoke/eng-347-governance-ledger.md` now mirrors the authoritative ENG-347 feature contract exactly (`contractVersion` `2026-06-07.1` with the original `REQ-FEATURE-001` / `REQ-FEATURE-002` texts), records the complete repo-visible child-issue inventory/order/completion ledger for `ENG-348`, `ENG-349`, and `ENG-356` through `ENG-364`, and explains that the remaining Phase 3-8 tasks stayed parent-scoped on `ENG-347` rather than separate child refs.
+- The same ledger now re-verifies the current local/origin child refs and maps `FR-001` through `FR-025` and `SC-001` through `SC-009` to current repo-local code, tests, docs, and validation artifacts so the reviewer can verify closure from the worktree alone.
 
 ## T105 — Promotion Notes / Remaining Risks
 

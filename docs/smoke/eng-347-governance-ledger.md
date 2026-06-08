@@ -1,6 +1,6 @@
 # ENG-347 Governance and Proof Ledger
 
-Captured on `2026-06-08T17:04:19Z` for `specs/003-multi-project-config` on branch `sinfonista/eng-347-implement-multi-project-configuration`.
+Captured on `2026-06-08T18:10:45Z` for `specs/003-multi-project-config` on branch `sinfonista/eng-347-implement-multi-project-configuration`.
 
 ## Purpose
 
@@ -22,22 +22,29 @@ This ledger is the repo-local counterpart to the governance rules in `WORKFLOW.m
 - Validation packet: `docs/smoke/eng-347-final-validation.md:23-192`
 - Contract-shape helper used by the test suite: `tests/helpers.ts:51-133`
 
+## Child issue derivation scope
+
+- `specs/003-multi-project-config/tasks.md` remains the authoritative full feature plan across Phases 1 through 8.
+- `specs/003-multi-project-config/tasks.md:9` narrows the child-issue governance requirement to tasks or phase buckets that were actually split into child issues.
+- The complete repo-visible child issue set for this feature is exhausted by the matching `sinfonista/eng-3*` local/origin refs for `ENG-348`, `ENG-349`, and `ENG-356` through `ENG-364`; no additional child phase/task refs exist in this worktree.
+- The remaining Phase 3 through Phase 8 tasks (`T009-T105`) stayed parent-scoped on `ENG-347` and therefore close through the FR/SC proof ledger later in this file plus `docs/smoke/eng-347-final-validation.md`, not through separate child-issue rows.
+
 ## ENG-347 feature issue-contract mirror
 
 ```json
 {
   "schemaVersion": 1,
-  "contractVersion": "2026-06-08.1",
+  "contractVersion": "2026-06-07.1",
   "requirements": [
     {
       "id": "REQ-FEATURE-001",
-      "requirement": "Close the multi-project configuration feature from current repo-local artifacts by mapping the implemented behavior and validation packet to FR-001 through FR-025 and SC-001 through SC-009.",
-      "proofHint": "See the FR/SC proof ledger in this file plus docs/smoke/eng-347-final-validation.md."
+      "requirement": "Complete the multi-project configuration feature by delivering the child phase issues derived from specs/003-multi-project-config/tasks.md.",
+      "proofHint": "Reference completed child issues and validation evidence from the feature task plan."
     },
     {
       "id": "REQ-FEATURE-002",
-      "requirement": "Preserve reviewer-verifiable governance evidence for the tasks.md-derived implementation issues by keeping a repo-local child-issue inventory/order/completion ledger and valid fenced JSON contract mirrors for each split child issue.",
-      "proofHint": "See the child-issue ledger and child contract mirrors in this file."
+      "requirement": "Preserve Symphony issue-contract governance: every child implementation issue must keep a valid fenced JSON issue contract with non-empty stable requirements.",
+      "proofHint": "Confirm child issues retain schemaVersion, contractVersion, and requirements entries before promotion."
     }
   ]
 }
@@ -45,7 +52,7 @@ This ledger is the repo-local counterpart to the governance rules in `WORKFLOW.m
 
 ## Child-issue inventory / order / completion ledger
 
-The refs below are visible in the local repository via `git for-each-ref refs/remotes/origin/sinfonista/eng-3*`. Their exact tip SHAs are retained as branch records even though the current ENG-347 feature branch does not preserve those tip commits as direct ancestors; the durable completion signal for review is therefore the current worktree artifact set cited in the `Completion evidence` column.
+The table below records the complete repo-visible child issue set for this feature. Matching local/origin refs were re-verified via `git for-each-ref --sort=refname --format='%(refname:short)|%(objectname:short)|%(subject)' refs/heads/sinfonista/eng-3* refs/remotes/origin/sinfonista/eng-3*`. No additional child phase/task refs exist beyond the 11 entries below. The remaining `tasks.md` items stayed parent-scoped on `ENG-347`, so their closure evidence appears in the FR/SC proof ledger rather than in separate child rows.
 
 | Order | Issue | Planned scope | Ref / branch evidence | Order evidence | Completion evidence |
 | --- | --- | --- | --- | --- | --- |
@@ -56,10 +63,10 @@ The refs below are visible in the local repository via `git for-each-ref refs/re
 | 5 | ENG-358 | `T003` add multi-project tracker and issue fixture builders | `origin/sinfonista/eng-358-t003-add-multi-project-tracker-and-issue-fixture-builders@3e7fd46` | `tasks.md:17`, `tasks.md:254` | `tests/helpers.ts:1-49` |
 | 6 | ENG-359 | `T004` add protected-surface inventory note | `origin/sinfonista/eng-359-t004-add-protected-surface-inventory-note@8df43a4` | `tasks.md:18`, `tasks.md:254` | `specs/003-multi-project-config/research.md:73-96` |
 | 7 | ENG-360 | `T005` verify no implementation dependency under `hermes/upstream-src/**` | `origin/sinfonista/eng-360-t005-verify-no-hermes-upstream-implementation-dependency@1a080b8` | `tasks.md:19`, `tasks.md:254` | `specs/003-multi-project-config/research.md:92-96`; `docs/smoke/eng-347-final-validation.md:160-173` |
-| 8 | ENG-361 | `T006` config contract tests for ids / duplicates / validation | `origin/sinfonista/eng-361-t006-add-project-context-config-contract-tests@4baa858` | `tasks.md:29`, `tasks.md:255` | `tests/workflow.test.ts:1410-1501`; `docs/smoke/eng-347-final-validation.md:33-42` |
-| 9 | ENG-362 | `T007` redaction tests for context summaries and validation errors | `origin/sinfonista/eng-362-t007-add-project-context-redaction-tests@dea0082` | `tasks.md:30`, `tasks.md:255` | `tests/workflow.test.ts:1410-1501`; `tests/credential-profiles.test.ts:181-183,289-329,379-380`; `docs/smoke/eng-347-final-validation.md:148-158` |
-| 10 | ENG-363 | `T008` normalization + durable attribution contract tests | `origin/sinfonista/eng-363-t008-add-project-context-normalization-and-durable@b29f994` | `tasks.md:31`, `tasks.md:255-256` | `src/core/config/ProjectContexts.ts:18-115`; `src/core/persistence/IssueLifecycleStore.ts`; `src/core/writeback/WritebackOutbox.ts`; `src/core/approval/OperatorApprovalService.ts`; `docs/smoke/eng-347-final-validation.md:82-108` |
-| 11 | ENG-364 | `T021` Postgres migration tests for project-context attribution | `origin/sinfonista/eng-364-t021-add-postgres-migration-tests-for-project-context@353dafe` | `tasks.md:44`, `tasks.md:255` | `tests/postgres-schema.test.ts:41-44,171-191`; `docs/smoke/eng-347-final-validation.md:82-91` |
+| 8 | ENG-361 | `T006` config contract tests for ids / duplicates / validation | `origin/sinfonista/eng-361-t006-add-project-context-config-contract-tests@878c3dc` | `tasks.md:29`, `tasks.md:255` | `tests/workflow.test.ts:1410-1501`; `docs/smoke/eng-347-final-validation.md:33-42` |
+| 9 | ENG-362 | `T007` redaction tests for context summaries and validation errors | `origin/sinfonista/eng-362-t007-add-project-context-redaction-tests@b14a8b0` | `tasks.md:30`, `tasks.md:255` | `tests/workflow.test.ts:1410-1501`; `tests/credential-profiles.test.ts:181-183,289-329,379-380`; `docs/smoke/eng-347-final-validation.md:148-158` |
+| 10 | ENG-363 | `T008` normalization + durable attribution contract tests | `origin/sinfonista/eng-363-t008-add-project-context-normalization-and-durable@d8c97d2` | `tasks.md:31`, `tasks.md:255-256` | `src/core/config/ProjectContexts.ts:18-115`; `src/core/persistence/IssueLifecycleStore.ts`; `src/core/writeback/WritebackOutbox.ts`; `src/core/approval/OperatorApprovalService.ts`; `docs/smoke/eng-347-final-validation.md:82-108` |
+| 11 | ENG-364 | `T021` Postgres migration tests for project-context attribution | `origin/sinfonista/eng-364-t021-add-postgres-migration-tests-for-project-context@b46d704` | `tasks.md:44`, `tasks.md:255` | `tests/postgres-schema.test.ts:41-44,171-191`; `docs/smoke/eng-347-final-validation.md:82-91` |
 
 ## Child issue-contract mirrors
 
