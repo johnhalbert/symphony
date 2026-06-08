@@ -1,4 +1,5 @@
 import path from "node:path";
+import YAML from "yaml";
 import type { RawWorkflowConfig, ServiceConfig } from "../src/core/config/Config.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
@@ -125,6 +126,10 @@ export interface MultiProjectWorkflowConfigOverrides {
   topLevel?: Partial<RawWorkflowConfig>;
 }
 
+export interface MultiProjectWorkflowDocumentOverrides extends MultiProjectWorkflowConfigOverrides {
+  promptTemplate?: string;
+}
+
 export interface TrackerIssueFixtureOverrides extends Partial<Issue> {
   projectContextId?: string;
   projectContextLabel?: string;
@@ -139,6 +144,13 @@ export interface TrackerClientFixtureOptions {
   issues?: TrackerIssueFixture[];
 }
 
+/**
+ * Build a single multi-project workflow context fixture with safe defaults.
+ *
+ * Downstream tests can override tracker/workspace fields or explicitly omit the
+ * project slug and workspace source to exercise negative validation paths
+ * without embedding real credential values in fixture data.
+ */
 export function projectContextFixture(overrides: ProjectContextFixtureOverrides = {}): TestProjectContextFixture {
   const {
     id = "symphony",
@@ -210,6 +222,13 @@ export function projectContextFixture(overrides: ProjectContextFixtureOverrides 
   };
 }
 
+/**
+ * Build a reusable raw workflow config fixture for multi-project tests.
+ *
+ * The top-level tracker keeps a placeholder API key token while per-context
+ * defaults focus on routing metadata and workspace shape so tests can compose
+ * multiple project contexts without introducing secret-bearing values.
+ */
 export function multiProjectWorkflowConfig(
   overrides: MultiProjectWorkflowConfigOverrides = {},
 ): TestMultiProjectWorkflowConfig {
@@ -266,6 +285,24 @@ export function multiProjectWorkflowConfig(
   };
 }
 
+/**
+ * Build a reusable WORKFLOW.md fixture for downstream multi-project loader tests.
+ *
+ * This keeps the top-level API key placeholder in YAML front matter while
+ * reusing the safe per-context defaults from multiProjectWorkflowConfig().
+ */
+export function multiProjectWorkflowDocument(
+  overrides: MultiProjectWorkflowDocumentOverrides = {},
+): string {
+  const {
+    promptTemplate = "Work on {{ issue.identifier }}.",
+    ...configOverrides
+  } = overrides;
+  const frontMatter = YAML.stringify(multiProjectWorkflowConfig(configOverrides)).trimEnd();
+
+  return `---\n${frontMatter}\n---\n${promptTemplate}\n`;
+}
+
 export function trackerIssue(overrides: TrackerIssueFixtureOverrides = {}): TrackerIssueFixture {
   const projectContextId = overrides.projectContextId ?? "symphony";
   const projectContextLabel = overrides.projectContextLabel ?? titleCaseId(projectContextId);
@@ -297,7 +334,7 @@ export function trackerIssue(overrides: TrackerIssueFixtureOverrides = {}): Trac
     linearProjectIdentity: {
       kind: "linear",
       slug: linearProjectSlug,
-      id: overrides.linearProjectId ?? `linear-project-${projectContextId}`,
+      id: overrides.linearProjectId === undefined ? `linear-project-${projectContextId}` : overrides.linearProjectId,
     },
     routingSource: overrides.routingSource ?? "candidate_poll",
     resolvedAt: overrides.resolvedAt ?? "2026-01-01T00:00:00Z",

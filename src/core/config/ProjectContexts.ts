@@ -293,7 +293,16 @@ export interface ProjectContextPublicMetadata {
   workspace: {
     root: string;
     stateDir: string;
-    source: WorkspaceSourceConfig;
+    source: {
+      kind: WorkspaceSourceConfig["kind"];
+      pathConfigured: boolean;
+      repositoryConfigured: boolean;
+      refConfigured: boolean;
+      baseRefConfigured: boolean;
+      branchTemplateConfigured: boolean;
+      cachePathConfigured: boolean;
+      cleanup: WorkspaceSourceConfig["cleanup"] | null;
+    };
   };
   github: {
     owner: string | null;
@@ -311,7 +320,14 @@ export interface ProjectContextPublicMetadata {
   agent: AgentConfig;
   credentialProfiles: ProjectContextCredentialAssignments;
   linearProjectIdentity: ProjectContextLinearProjectIdentity;
-  codebaseIdentity: ProjectContextCodebaseIdentity;
+  codebaseIdentity: {
+    sourceKind: WorkspaceSourceConfig["kind"];
+    workspaceRoot: string;
+    stateDir: string;
+    repositoryConfigured: boolean;
+    pathConfigured: boolean;
+    baseRefConfigured: boolean;
+  };
 }
 
 interface PublicGitHubAppMetadata {
@@ -520,7 +536,16 @@ export function projectContextPublicMetadata(context: NormalizedProjectContext):
     workspace: {
       root: context.workspace.root,
       stateDir: context.workspace.stateDir,
-      source: { ...context.workspace.source },
+      source: {
+        kind: context.workspace.source.kind,
+        pathConfigured: context.workspace.source.path !== undefined,
+        repositoryConfigured: context.workspace.source.repository !== undefined,
+        refConfigured: context.workspace.source.ref !== undefined,
+        baseRefConfigured: context.workspace.source.baseRef !== undefined,
+        branchTemplateConfigured: context.workspace.source.branchTemplate !== undefined,
+        cachePathConfigured: context.workspace.source.cachePath !== undefined,
+        cleanup: context.workspace.source.cleanup ?? null,
+      },
     },
     github: {
       owner: context.github.owner,
@@ -538,7 +563,14 @@ export function projectContextPublicMetadata(context: NormalizedProjectContext):
     agent: context.agent,
     credentialProfiles: context.credentialProfiles,
     linearProjectIdentity: context.linearProjectIdentity,
-    codebaseIdentity: context.codebaseIdentity,
+    codebaseIdentity: {
+      sourceKind: context.codebaseIdentity.sourceKind,
+      workspaceRoot: context.codebaseIdentity.workspaceRoot,
+      stateDir: context.codebaseIdentity.stateDir,
+      repositoryConfigured: context.codebaseIdentity.repository !== null,
+      pathConfigured: context.codebaseIdentity.path !== null,
+      baseRefConfigured: context.codebaseIdentity.baseRef !== null,
+    },
   };
 }
 
