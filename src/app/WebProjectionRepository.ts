@@ -155,10 +155,14 @@ export class WebHistoryProjectionRepository {
 
   readGlobalCollection(
     limits: WebHistoryProjectionLimits,
-    options: WebProjectionReadOptions = {},
+    options: WebProjectionReadOptions & { projectContextId?: string | null } = {},
   ): Promise<WebProjectionReadResult<ReturnType<typeof projectWebHistory>>> {
     return this.reads.read(
-      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: webHistoryProjectionScopeKey(limits) },
+      {
+        projectionName: "history_projection",
+        scopeKind: "global_collection",
+        scopeKey: webHistoryProjectionScopeKey(limits, options.projectContextId ?? null),
+      },
       options,
     );
   }
@@ -217,8 +221,12 @@ export function createWebProjectionReadRepositories(
   };
 }
 
-export function webHistoryProjectionScopeKey(limits: WebHistoryProjectionLimits): string {
-  return `global:session:${limits.sessionLimit}:timeline:${limits.timelineLimit}`;
+export function webHistoryProjectionScopeKey(
+  limits: WebHistoryProjectionLimits,
+  projectContextId: string | null = null,
+): string {
+  const base = `global:session:${limits.sessionLimit}:timeline:${limits.timelineLimit}`;
+  return projectContextId && projectContextId.trim().length > 0 ? `${base}:project:${projectContextId.trim()}` : base;
 }
 
 export function webTranscriptProjectionScopeKey(page: WebTranscriptProjectionPageSelector): string {

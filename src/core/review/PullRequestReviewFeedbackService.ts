@@ -173,8 +173,26 @@ export class PullRequestReviewFeedbackService {
   }
 
   private async requireLifecycle(context: ReviewFeedbackActiveContext): Promise<IssueLifecycleRecord> {
-    const lifecycle = await this.options.lifecycleStore.get(context.issue.id);
-    if (!lifecycle) throw new SymphonyError("invalid_request", "Review feedback requires an existing issue lifecycle");
+    const requestedProjectContextId = context.issue.projectContextId ?? null;
+    const lifecycle = await this.options.lifecycleStore.get(context.issue.id, requestedProjectContextId);
+    if (!lifecycle) {
+      const fallback =
+        (await this.options.lifecycleStore.get(context.issue.id)) ??
+        (await this.options.lifecycleStore.get(context.issue.identifier));
+      const fallbackProjectContextId = fallback?.projectContextId ?? fallback?.summaryPointers.projectContextId ?? null;
+      if (
+        fallback &&
+        requestedProjectContextId !== null &&
+        fallbackProjectContextId !== null &&
+        fallbackProjectContextId !== requestedProjectContextId
+      ) {
+        throw new SymphonyError(
+          "invalid_request",
+          "Review feedback project context does not match the active reviewer issue context",
+        );
+      }
+      throw new SymphonyError("invalid_request", "Review feedback requires an existing issue lifecycle");
+    }
     if (lifecycle.issueId !== context.issue.id && lifecycle.issueIdentifier !== context.issue.identifier) {
       throw new SymphonyError("invalid_request", "Review feedback issue does not match the lifecycle record");
     }
@@ -200,6 +218,18 @@ export class PullRequestReviewFeedbackService {
     }
     if (!sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
       throw new SymphonyError("invalid_request", "Review feedback requires the issue to be in a review state");
+    }
+    const issueProjectContextId = context.issue.projectContextId ?? null;
+    const lifecycleProjectContextId = lifecycle.projectContextId ?? lifecycle.summaryPointers.projectContextId ?? null;
+    if (
+      issueProjectContextId !== null &&
+      lifecycleProjectContextId !== null &&
+      issueProjectContextId !== lifecycleProjectContextId
+    ) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Review feedback project context does not match the active reviewer issue context",
+      );
     }
   }
 

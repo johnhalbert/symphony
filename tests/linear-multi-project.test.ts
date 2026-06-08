@@ -4,9 +4,9 @@ import { withProjectContextServiceConfig } from "../src/core/config/ProjectConte
 import { MultiProjectLinearTrackerClient } from "../src/integrations/linear/MultiProjectLinearTrackerClient.js";
 import type { Issue } from "../src/core/types.js";
 
-function baseIssue(identifier: string, state = "Todo"): Issue {
+function baseIssue(identifier: string, state = "Todo", id = `${identifier.toLowerCase()}-id`): Issue {
   return {
-    id: `${identifier.toLowerCase()}-id`,
+    id,
     identifier,
     title: identifier,
     description: null,
@@ -75,6 +75,129 @@ describe("MultiProjectLinearTrackerClient", () => {
         expect.objectContaining({ identifier: "ENG-1", projectContextId: "symphony", trackerProjectSlug: "ENG" }),
         expect.objectContaining({ identifier: "DOCS-1", projectContextId: "docs", trackerProjectSlug: "DOCS" }),
       ]),
+    );
+  });
+
+  it("drops ambiguous candidate issues that resolve to multiple project contexts", async () => {
+    const config = multiProjectConfig();
+    const client = new MultiProjectLinearTrackerClient(config, () => ({
+      async fetchCandidateIssues() {
+        return [baseIssue("ENG-1", "Todo", "shared-issue-id")];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [];
+      },
+      async fetchWorkflowStatesByTeam() {
+        return [];
+      },
+      async transitionIssueState() {
+        return { status: "applied" as const };
+      },
+      async createIssueComment() {
+        return { status: "applied" as const };
+      },
+    }) as never);
+
+    await expect(client.fetchCandidateIssues()).resolves.toEqual([]);
+  });
+
+  it("fails closed when a direct issue refresh is ambiguous across project contexts", async () => {
+    const config = multiProjectConfig();
+    const client = new MultiProjectLinearTrackerClient(config, () => ({
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [baseIssue("ENG-1", "Todo", "shared-issue-id")];
+      },
+      async fetchWorkflowStatesByTeam() {
+        return [];
+      },
+      async transitionIssueState() {
+        return { status: "applied" as const };
+      },
+      async createIssueComment() {
+        return { status: "applied" as const };
+      },
+    }) as never);
+
+    await expect(client.fetchIssueStatesByIds(["shared-issue-id"])).rejects.toThrow(/Ambiguous project context resolution/);
+  });
+
+  it("routes tracker writes through the resolved project context and rejects missing context in multi-project mode", async () => {
+    const config = multiProjectConfig();
+    const calls: string[] = [];
+    const client = new MultiProjectLinearTrackerClient(config, (contextConfig) => {
+      const slug = contextConfig.tracker.projectSlug;
+      return {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [];
+        },
+        async fetchWorkflowStatesByTeam() {
+          return [];
+        },
+        async transitionIssueState(input: { projectContextId?: string | null }) {
+          calls.push(`transition:${slug}:${input.projectContextId}`);
+          return { status: "applied" as const };
+        },
+        async createIssueComment(input: { projectContextId?: string | null }) {
+          calls.push(`comment:${slug}:${input.projectContextId}`);
+          return { status: "applied" as const };
+        },
+        async createIssueFromPlan(input: { projectContextId?: string | null }) {
+          calls.push(`create:${slug}:${input.projectContextId}`);
+          return { status: "applied" as const };
+        },
+        async createIssueRelation(input: { projectContextId?: string | null }) {
+          calls.push(`relation:${slug}:${input.projectContextId}`);
+          return { status: "applied" as const };
+        },
+      } as never;
+    });
+
+    await client.transitionIssueState({ issueId: "issue-1", projectContextId: "symphony", toState: "In Progress" });
+    await client.createIssueComment({ issueId: "issue-1", projectContextId: "docs", body: "hello", dedupeKey: "comment-1" });
+    await client.createIssueFromPlan({
+      parentIssueId: "issue-1",
+      projectContextId: "docs",
+      title: "Child",
+      description: "desc",
+      acceptanceCriteria: [],
+      requestedLabels: [],
+      dependencies: [],
+      dedupeKey: "create-1",
+      payloadHash: "hash-1",
+    });
+    await client.createIssueRelation({
+      sourceIssueId: "issue-1",
+      targetIssueId: "issue-2",
+      projectContextId: "symphony",
+      type: "blocks",
+      dedupeKey: "relation-1",
+      dependency: "Child",
+    });
+
+    expect(calls).toEqual([
+      "transition:ENG:symphony",
+      "comment:DOCS:docs",
+      "create:DOCS:docs",
+      "relation:ENG:symphony",
+    ]);
+
+    expect(() => client.createIssueComment({ issueId: "issue-1", body: "oops", dedupeKey: "comment-2" })).toThrow(
+      /requires an explicit project context/,
     );
   });
 

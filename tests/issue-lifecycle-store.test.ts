@@ -25,7 +25,7 @@ describe("FileIssueLifecycleStore", () => {
 
   it("persists lifecycle records across store instances", async () => {
     const store = new FileIssueLifecycleStore(root);
-    const first = await store.ensureIssue(issue(), {
+    const first = await store.ensureIssue(issue({ projectContextId: "docs", projectContextLabel: "Docs", trackerProjectSlug: "DOCS" }), {
       phase: "review",
       reviewRound: 2,
       incompleteTurnCount: 1,
@@ -42,6 +42,9 @@ describe("FileIssueLifecycleStore", () => {
         prNumber: 7,
         ciStatus: "pending",
         lastPushedAt: "2026-01-01T00:00:00.000Z",
+        projectContextId: "docs",
+        projectContextLabel: "Docs",
+        trackerProjectSlug: "DOCS",
       },
       summaryReferences: [
         {
@@ -64,6 +67,9 @@ describe("FileIssueLifecycleStore", () => {
     expect(found).toMatchObject({
       issueId: "issue-1",
       issueIdentifier: "TEST-1",
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      trackerProjectSlug: "DOCS",
       phase: "review",
       reviewRound: 2,
       incompleteTurnCount: 1,
@@ -91,6 +97,9 @@ describe("FileIssueLifecycleStore", () => {
         prNumber: 7,
         ciStatus: "pending",
         lastPushedAt: "2026-01-01T00:00:00.000Z",
+        projectContextId: "docs",
+        projectContextLabel: "Docs",
+        trackerProjectSlug: "DOCS",
       },
     });
   });

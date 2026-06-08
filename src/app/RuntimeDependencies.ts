@@ -35,19 +35,20 @@ export function createRuntimeWritebackProcessor(
     config.writeback.mode === "dry_run",
     {
       getConfig,
-      resolveIssue: (issueId) => resolveIssueForBreakdownFreshness(issueId, getConfig, fetchImpl),
+      resolveIssue: (issueId, projectContextId) => resolveIssueForBreakdownFreshness(issueId, projectContextId, getConfig, fetchImpl),
     },
   );
 }
 
 export async function resolveIssueForBreakdownFreshness(
   issueId: string,
+  projectContextId: string | null | undefined,
   getConfig: () => ServiceConfig,
   fetchImpl?: FetchLike,
 ): Promise<IssueBreakdownIssueLookupResult> {
   try {
     const tracker = createRuntimeTrackerClient(getConfig(), fetchImpl);
-    const issue = (await tracker.fetchIssueStatesByIds([issueId]))[0];
+    const issue = (await tracker.fetchIssueStatesByIds([issueId])).find((candidate) => candidate.projectContextId === (projectContextId ?? candidate.projectContextId));
     return issue ? { status: "ok", issue } : { status: "not_found" };
   } catch (error) {
     return { status: "transient_error", message: errorMessage(error) };

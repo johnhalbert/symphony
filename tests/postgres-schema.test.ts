@@ -38,6 +38,10 @@ const projectionBuildModesMigrationUrl = new URL(
   "../migrations/postgres/0006_projection_build_modes.sql",
   import.meta.url,
 );
+const projectContextAttributionMigrationUrl = new URL(
+  "../migrations/postgres/0007_project_context_attribution.sql",
+  import.meta.url,
+);
 const readmeUrl = new URL("../migrations/postgres/README.md", import.meta.url);
 const stateOwnershipUrl = new URL("../docs/state-ownership-and-migration.md", import.meta.url);
 const publishedOwnedStateChecksumSha256 = "8e10c03c6cfa34e9672e350c59ff4998459989529a82c98cbd9f714469799298";
@@ -76,6 +80,10 @@ const requiredLookupIndexes = [
   "writeback_operation_state_idx",
   "approval_request_state_idx",
   "projection_revision_reads_idx",
+  "workspace_project_context_lookup_idx",
+  "issue_project_context_lookup_idx",
+  "run_session_project_context_issue_idx",
+  "run_session_project_context_workspace_idx",
 ] as const;
 
 const requiredProjectionLookupIndexes = [
@@ -131,6 +139,10 @@ async function projectionBuildModesMigrationSql(): Promise<string> {
   return readFile(projectionBuildModesMigrationUrl, "utf8");
 }
 
+async function projectContextAttributionMigrationSql(): Promise<string> {
+  return readFile(projectContextAttributionMigrationUrl, "utf8");
+}
+
 async function configuredMigrationSql(): Promise<string> {
   const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
   return migrations.map((migration) => migration.sql).join("\n");
@@ -163,17 +175,20 @@ describe("Postgres Symphony-owned state migration", () => {
       "0004_run_activity_canonical_channels",
       "0005_projection_source_freshness",
       "0006_projection_build_modes",
+      "0007_project_context_attribution",
     ]);
     const ownedState = migrations.find((migration) => migration.id === "0002_symphony_owned_state");
     const projectionFreshness = migrations.find((migration) => migration.id === "0003_projection_freshness_indexes");
     const canonicalChannels = migrations.find((migration) => migration.id === "0004_run_activity_canonical_channels");
     const projectionSourceFreshness = migrations.find((migration) => migration.id === "0005_projection_source_freshness");
     const projectionBuildModes = migrations.find((migration) => migration.id === "0006_projection_build_modes");
+    const projectContextAttribution = migrations.find((migration) => migration.id === "0007_project_context_attribution");
     expect(ownedState?.filePath).toBe(fileURLToPath(ownedStateMigrationUrl));
     expect(projectionFreshness?.filePath).toBe(fileURLToPath(projectionFreshnessMigrationUrl));
     expect(canonicalChannels?.filePath).toBe(fileURLToPath(canonicalChannelMigrationUrl));
     expect(projectionSourceFreshness?.filePath).toBe(fileURLToPath(projectionSourceFreshnessMigrationUrl));
     expect(projectionBuildModes?.filePath).toBe(fileURLToPath(projectionBuildModesMigrationUrl));
+    expect(projectContextAttribution?.filePath).toBe(fileURLToPath(projectContextAttributionMigrationUrl));
     expect(sha256(ownedState?.sql ?? "")).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.checksumSha256).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_session");
@@ -187,6 +202,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(canonicalChannels?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionSourceFreshness?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionBuildModes?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
+    expect(projectContextAttribution?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
   });
 
   it("delivers projection updated_at columns and freshness indexes through the follow-up migration", async () => {
@@ -243,6 +259,24 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain("check (build_mode in ('bootstrap', 'incremental', 'rebuild'))");
     expect(normalized).toContain("create index if not exists projection_revision_build_mode_idx");
     expect(normalized).toContain("on symphony.projection_revision (build_mode, projection_name, updated_at desc, generated_at desc)");
+  });
+
+  it("delivers project-context attribution columns and lookup indexes through a checksum-safe follow-up migration", async () => {
+    const normalized = normalizedSql(await projectContextAttributionMigrationSql());
+
+    for (const fragment of [
+      "alter table symphony.workspace add column if not exists project_context_id text",
+      "add column if not exists project_context_label text",
+      "add column if not exists tracker_project_slug text",
+      "alter table symphony.issue add column if not exists project_context_id text",
+      "alter table symphony.run_session add column if not exists project_context_id text",
+      "create index if not exists workspace_project_context_lookup_idx",
+      "create index if not exists issue_project_context_lookup_idx",
+      "create index if not exists run_session_project_context_issue_idx",
+      "create index if not exists run_session_project_context_workspace_idx",
+    ]) {
+      expect(normalized).toContain(fragment);
+    }
   });
 
 
@@ -350,11 +384,13 @@ describe("Postgres Symphony-owned state migration", () => {
       "migrations/postgres/0004_run_activity_canonical_channels.sql",
       "migrations/postgres/0005_projection_source_freshness.sql",
       "migrations/postgres/0006_projection_build_modes.sql",
+      "migrations/postgres/0007_project_context_attribution.sql",
       "checksum-stable",
       "projection `updated_at` freshness columns",
       "canonical run activity channel names",
       "projection_revision.source_freshness",
       "projection_revision.build_mode",
+      "project-context attribution columns",
     ]) {
       expect(ownership, `missing ownership guide fragment: ${fragment}`).toContain(fragment);
     }
@@ -478,6 +514,7 @@ describe("Postgres Symphony-owned state migration", () => {
           "0004_run_activity_canonical_channels",
           "0005_projection_source_freshness",
           "0006_projection_build_modes",
+          "0007_project_context_attribution",
         ]);
 
         const tableCount = await psql(
@@ -491,6 +528,7 @@ describe("Postgres Symphony-owned state migration", () => {
           expect(indexes).toContain(indexName);
         }
         await expectProjectionFreshnessCatalog(containerName);
+        await expectProjectContextAttributionCatalog(containerName);
 
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
         await expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName);
@@ -541,6 +579,7 @@ describe("Postgres Symphony-owned state migration", () => {
           "0004_run_activity_canonical_channels",
           "0005_projection_source_freshness",
           "0006_projection_build_modes",
+          "0007_project_context_attribution",
         ]);
         expect(await appliedMigrationIds(containerName)).toEqual([
           "0001_migration_foundation",
@@ -549,11 +588,13 @@ describe("Postgres Symphony-owned state migration", () => {
           "0004_run_activity_canonical_channels",
           "0005_projection_source_freshness",
           "0006_projection_build_modes",
+          "0007_project_context_attribution",
         ]);
         expect(await appliedMigrationChecksum(containerName, "0002_symphony_owned_state")).toBe(
           publishedOwnedStateChecksumSha256,
         );
         await expectProjectionFreshnessCatalog(containerName);
+        await expectProjectContextAttributionCatalog(containerName);
         await expectLegacyRunActivityChannelsMigrated(containerName);
         await expectLegacyProjectionSourceFreshnessMigrated(containerName);
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
@@ -1014,6 +1055,66 @@ async function expectProjectionFreshnessCatalog(containerName: string): Promise<
       "updated_at desc",
     );
   }
+}
+
+async function expectProjectContextAttributionCatalog(containerName: string): Promise<void> {
+  const columnMetadata = await psql(
+    containerName,
+    String.raw`
+      select coalesce(
+        jsonb_object_agg(table_name, jsonb_agg(column_name order by column_name)),
+        '{}'::jsonb
+      )::text
+      from (
+        select table_name, column_name
+        from information_schema.columns
+        where table_schema = 'symphony'
+          and table_name in ('workspace', 'issue', 'run_session')
+          and column_name in ('project_context_id', 'project_context_label', 'tracker_project_slug')
+        order by table_name, column_name
+      ) attributed_columns;
+    `,
+  );
+  const columns = JSON.parse(columnMetadata.trim()) as Record<string, string[]>;
+  expect(columns).toEqual({
+    issue: ['project_context_id', 'project_context_label', 'tracker_project_slug'],
+    run_session: ['project_context_id', 'project_context_label', 'tracker_project_slug'],
+    workspace: ['project_context_id', 'project_context_label', 'tracker_project_slug'],
+  });
+
+  const indexMetadata = await psql(
+    containerName,
+    String.raw`
+      select coalesce(jsonb_object_agg(indexname, indexdef order by indexname), '{}'::jsonb)::text
+      from pg_indexes
+      where schemaname = 'symphony'
+        and indexname in (
+          'workspace_project_context_lookup_idx',
+          'issue_project_context_lookup_idx',
+          'run_session_project_context_issue_idx',
+          'run_session_project_context_workspace_idx'
+        );
+    `,
+  );
+  const indexes = JSON.parse(indexMetadata.trim()) as Record<string, string>;
+  expect(Object.keys(indexes).sort()).toEqual([
+    'issue_project_context_lookup_idx',
+    'run_session_project_context_issue_idx',
+    'run_session_project_context_workspace_idx',
+    'workspace_project_context_lookup_idx',
+  ]);
+  expect(indexes.workspace_project_context_lookup_idx?.toLowerCase()).toContain(
+    '(project_context_id, issue_identifier, updated_at desc)',
+  );
+  expect(indexes.issue_project_context_lookup_idx?.toLowerCase()).toContain(
+    '(tracker_source, project_context_id, issue_identifier, updated_at desc)',
+  );
+  expect(indexes.run_session_project_context_issue_idx?.toLowerCase()).toContain(
+    '(project_context_id, issue_identifier, started_at desc)',
+  );
+  expect(indexes.run_session_project_context_workspace_idx?.toLowerCase()).toContain(
+    '(project_context_id, workspace_key, started_at desc)',
+  );
 }
 
 function sqlStringList(values: readonly string[]): string {

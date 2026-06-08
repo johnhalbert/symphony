@@ -91,6 +91,9 @@ export interface WebTranscriptActiveTailModel {
 
 export interface WebTranscriptProjectionPayload {
   schemaVersion: typeof WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION;
+  projectContextId: string | null;
+  projectContextLabel: string | null;
+  trackerProjectSlug: string | null;
   messages: TranscriptMessage[];
   page: WebTranscriptWindowPageModel;
   window: WebTranscriptWindowModel;
@@ -150,6 +153,9 @@ export function projectWebTranscriptWindow(
   const recovery = { strategy: "refetch" as const, reason: "tail-gap" as const, href: refetchHref };
   return {
     schemaVersion: WEB_TRANSCRIPT_PROJECTION_SCHEMA_VERSION,
+    projectContextId: cleanString(options.run?.projectContextId),
+    projectContextLabel: cleanString(options.run?.projectContextLabel),
+    trackerProjectSlug: cleanString(options.run?.trackerProjectSlug),
     messages: [...messages],
     page: pageModel,
     window,
@@ -243,7 +249,15 @@ function webTranscriptWindowPageModel(page: TranscriptPage): WebTranscriptWindow
 function webTranscriptRefetchHref(run: RunRecord | null): string | null {
   if (!run) return null;
   const transcriptId = run.sessionId?.trim() || run.runId;
-  return `/api/v1/web/sessions/${encodeURIComponent(transcriptId)}/transcript?refresh=1`;
+  const projectContextId = cleanString(run.projectContextId);
+  const query = projectContextId === null ? "refresh=1" : `refresh=1&projectContextId=${encodeURIComponent(projectContextId)}`;
+  return `/api/v1/web/sessions/${encodeURIComponent(transcriptId)}/transcript?${query}`;
+}
+
+function cleanString(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function finiteNumberOrNull(value: unknown): number | null {

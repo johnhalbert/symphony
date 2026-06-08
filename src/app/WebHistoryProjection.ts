@@ -91,6 +91,9 @@ export interface WebRunSessionModel {
     baseRef: string | null;
     branch: string | null;
   };
+  projectContextId: string | null;
+  projectContextLabel: string | null;
+  trackerProjectSlug: string | null;
   pullRequest: {
     url: string | null;
     number: number | null;
@@ -344,6 +347,9 @@ export function projectRunSession(run: RunRecord): WebRunSessionModel {
       baseRef: cleanString(run.baseRef),
       branch: cleanString(run.gitBranchName),
     },
+    projectContextId: cleanString(run.projectContextId),
+    projectContextLabel: cleanString(run.projectContextLabel),
+    trackerProjectSlug: cleanString(run.trackerProjectSlug),
     pullRequest: {
       url: cleanString(run.prUrl),
       number: typeof run.prNumber === "number" ? run.prNumber : null,
@@ -378,11 +384,24 @@ export function projectRunSession(run: RunRecord): WebRunSessionModel {
     },
     providerLimit: projectProviderLimit(run.providerLimit),
     links: {
-      issue: `/api/v1/web/issues/${encodeURIComponent(run.issueIdentifier)}`,
+      issue: webHistoryIssueHref(run.issueIdentifier, run.projectContextId),
       run: `/api/v1/runs/${encodeURIComponent(run.runId)}`,
-      transcript: `/api/v1/web/sessions/${encodeURIComponent(run.runId)}/transcript`,
+      transcript: webHistoryTranscriptHref(run.runId, run.projectContextId),
     },
   };
+}
+
+function webHistoryIssueHref(issueIdentifier: string, projectContextId: string | null | undefined): string {
+  return `/api/v1/web/issues/${encodeURIComponent(issueIdentifier)}${projectContextQuerySuffix(projectContextId)}`;
+}
+
+function webHistoryTranscriptHref(runId: string, projectContextId: string | null | undefined): string {
+  return `/api/v1/web/sessions/${encodeURIComponent(runId)}/transcript${projectContextQuerySuffix(projectContextId)}`;
+}
+
+function projectContextQuerySuffix(projectContextId: string | null | undefined): string {
+  const normalized = cleanString(projectContextId);
+  return normalized === null ? "" : `?projectContextId=${encodeURIComponent(normalized)}`;
 }
 
 function projectTimelineEvent(item: WebHistoryActivityItem): TimelineEvent {

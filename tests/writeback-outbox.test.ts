@@ -78,6 +78,35 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.transitions).toHaveLength(1);
   });
 
+  it("forwards project context ids to tracker writer inputs", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+
+    await processor.enqueueAndProcess({
+      idempotencyKey: "transition:issue-1:dispatch:docs",
+      kind: "transition",
+      issueId: "issue-1",
+      projectContextId: "docs",
+      payload: { toState: "In Progress" },
+    });
+    await processor.enqueueAndProcess({
+      idempotencyKey: "comment:issue-1:docs",
+      kind: "comment",
+      issueId: "issue-1",
+      projectContextId: "docs",
+      payload: { body: "hello", dedupeKey: "comment-docs" },
+    });
+
+    expect(writer.transitions[0]).toMatchObject({ projectContextId: "docs" });
+    expect(writer.comments[0]).toMatchObject({ projectContextId: "docs" });
+
+    const records = await store.list();
+    expect(records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "transition", projectContextId: "docs" }),
+      expect.objectContaining({ kind: "comment", projectContextId: "docs" }),
+    ]));
+  });
 
   it("tracks projection revisions for successful outbox writes only", async () => {
     const store = new FileWritebackOutboxStore(root);

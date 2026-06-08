@@ -53,6 +53,9 @@ export interface IssueModel {
   assignee: string;
   agent: string | null;
   project: string;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  trackerProjectSlug?: string | null;
   cycle: string;
   activity: IssueActivityModel[];
   pr: string | null;
@@ -720,6 +723,9 @@ export function projectIssueModel(
     assignee: firstNonEmpty(issue.assigneeId) ?? "unassigned",
     agent: agentIdFromInputs(card, operatorLiveness),
     project: projectAttributionLabel(details, card),
+    projectContextId: issue.projectContextId ?? details.workspace.projectContextId ?? null,
+    projectContextLabel: issue.projectContextLabel ?? details.workspace.projectContextLabel ?? null,
+    trackerProjectSlug: issue.trackerProjectSlug ?? details.workspace.trackerProjectSlug ?? null,
     cycle: "",
     activity: projectIssueActivity(details, card, operatorLiveness),
     pr: formatPullRequest(pullRequest, card?.metadata ?? null),

@@ -50,6 +50,9 @@ describe("projectWebHistory", () => {
   it("projects durable run-session metadata and redacts public diagnostics", () => {
     const sourceRun = run({
       runId: "run-secure",
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      trackerProjectSlug: "DOCS",
       sessionId: "session-secure",
       agentId: "agent-secure",
       role: "reviewer",
@@ -228,10 +231,13 @@ describe("projectWebHistory", () => {
           runPhase: "issue_breakdown",
         },
       },
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      trackerProjectSlug: "DOCS",
       links: {
-        issue: "/api/v1/web/issues/TEST-1",
+        issue: "/api/v1/web/issues/TEST-1?projectContextId=docs",
         run: "/api/v1/runs/run-secure",
-        transcript: "/api/v1/web/sessions/run-secure/transcript",
+        transcript: "/api/v1/web/sessions/run-secure/transcript?projectContextId=docs",
       },
     });
     expect(session.runSession).not.toHaveProperty("prompt");

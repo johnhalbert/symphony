@@ -57,6 +57,9 @@ describe("StatusServer durable API", () => {
       turnNumber: 1,
       prompt: "work",
       workspaceKey: "TEST-1",
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      trackerProjectSlug: "DOCS",
       workspacePath: path.join(config.workspace.root, "TEST-1"),
       gitBranchName: "symphony/TEST-1",
       repoPath: "/repo",
@@ -626,6 +629,9 @@ describe("StatusServer durable API", () => {
       prompt: "Build web history",
       cursorModel: "claude-sonnet-4",
       workspaceKey: "TEST-1",
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      trackerProjectSlug: "DOCS",
       workspacePath: path.join(config.workspace.root, "TEST-1"),
       gitBranchName: "symphony/TEST-1",
       repoPath: "/repo",
@@ -678,6 +684,9 @@ describe("StatusServer durable API", () => {
             runtime: { model: string | null };
             cursor: { model: string | null };
             workspace: { key: string; path: string; repoPath: string | null; baseRef: string | null; branch: string | null };
+            projectContextId: string | null;
+            projectContextLabel: string | null;
+            trackerProjectSlug: string | null;
             links: { run: string; transcript: string };
           };
         }>;
@@ -724,7 +733,13 @@ describe("StatusServer durable API", () => {
           runtime: { model: "claude-sonnet-4" },
           cursor: { model: "claude-sonnet-4" },
           workspace: { key: "TEST-1", repoPath: "/repo", baseRef: "main", branch: "symphony/TEST-1" },
-          links: { run: "/api/v1/runs/web-run-1", transcript: "/api/v1/web/sessions/web-run-1/transcript" },
+          projectContextId: "docs",
+          projectContextLabel: "Docs",
+          trackerProjectSlug: "DOCS",
+          links: {
+            run: "/api/v1/runs/web-run-1",
+            transcript: "/api/v1/web/sessions/web-run-1/transcript?projectContextId=docs",
+          },
         },
       });
 
@@ -792,6 +807,9 @@ describe("StatusServer durable API", () => {
         prompt: `work ${issueIdentifier}`,
         promptCharCount: `work ${issueIdentifier}`.length,
         cursorModel: "gpt-test",
+        projectContextId: index % 2 === 0 ? "docs" : "eng",
+        projectContextLabel: index % 2 === 0 ? "Docs" : "Engineering",
+        trackerProjectSlug: index % 2 === 0 ? "DOCS" : "ENG",
         workspaceKey: issueIdentifier,
         workspacePath: path.join(config.workspace.root, issueIdentifier),
         gitBranchName: `symphony/${issueIdentifier}`,
@@ -896,6 +914,17 @@ describe("StatusServer durable API", () => {
       expect(cappedBody.sessions).toHaveLength(500);
       expect(cappedBody.timeline).toHaveLength(500);
       expect(cappedBody.sessions.find((session) => session.id === "run-history-boundary")).toBeUndefined();
+
+      const { response: filteredResponse, body: filteredBody } = await fetchHistory(
+        "?projectContextId=docs&sessionLimit=2&timelineLimit=4",
+      );
+      expect(filteredResponse.status).toBe(200);
+      expect(filteredBody.sessions.map((session) => session.id)).toEqual([
+        "run-history-500",
+        "run-history-498",
+      ]);
+      expect(filteredBody.timeline).toHaveLength(4);
+      expect(filteredBody.timeline.every((item) => ["run-history-500", "run-history-498", "run-history-496", "run-history-494"].includes(item.sess))).toBe(true);
 
       for (const query of ["?sessionLimit=&timelineLimit=bogus", "?sessionLimit=0&timelineLimit=-3"]) {
         const { response, body } = await fetchHistory(query);

@@ -23,7 +23,7 @@ describe("TransitionPolicy review-loop planners", () => {
     const config = reviewLoopConfig();
     const operations = planCompletionReportAcceptedWritebacks(
       {
-        issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+        issue: issue({ state: "In Progress", branchName: "symphony/TEST-1", projectContextId: "docs" }),
         runId: "run-1",
         sessionId: "session-1",
         workspacePath: "/tmp/workspace",
@@ -36,6 +36,7 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(operations[0]).toMatchObject({
       idempotencyKey: "comment:issue-1:run-1:completion-report-accepted",
       kind: "comment",
+      projectContextId: "docs",
       payload: {
         dedupeKey: "run-1:completion-report-accepted",
       },
@@ -46,6 +47,7 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(operations[1]).toMatchObject({
       idempotencyKey: "transition:issue-1:run-1:completion-report-accepted:In Review",
       kind: "transition",
+      projectContextId: "docs",
       payload: {
         fromStates: ["In Progress", "Blocked"],
         toState: "In Review",

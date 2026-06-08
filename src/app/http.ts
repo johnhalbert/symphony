@@ -46,6 +46,7 @@ import type {
   IssueReviewVerdictRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
 import { latestCurrentApprovalPassVerdict } from "../core/persistence/IssueLifecycleStore.js";
+import { normalizeProjectContextId, projectScopedKey } from "../core/config/ProjectContexts.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
 import type { OperatorApprovalService, OperatorApprovalRecord } from "../core/approval/OperatorApprovalService.js";
 import { OPERATOR_REJECTED_PUBLICATION_ERROR, approvalResolve } from "../core/approval/OperatorApprovalService.js";
@@ -579,8 +580,10 @@ export class StatusServer {
       const webIssueMatch = /^\/api\/v1\/web\/issues\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && webIssueMatch) {
         const issueId = decodeURIComponent(webIssueMatch[1] ?? "");
+        const projectContextId = parseProjectContextIdQuery(url);
         const detail = await this.fetchWebIssueDetail(
           issueId,
+          projectContextId,
           isWebProjectionRefreshRequested(url.searchParams.get("refresh")),
           {
             includeTranscript: parseBooleanWebQueryParam(url.searchParams, "includeTranscript"),
@@ -593,8 +596,10 @@ export class StatusServer {
       const boardIssueMatch = /^\/api\/v1\/board\/issues\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && boardIssueMatch) {
         const issueId = decodeURIComponent(boardIssueMatch[1] ?? "");
+        const projectContextId = parseProjectContextIdQuery(url);
         const detail = await this.fetchBoardIssueDetail(
           issueId,
+          projectContextId,
           isWebProjectionRefreshRequested(url.searchParams.get("refresh")),
         );
         sendJson(response, 200, detail);
@@ -729,6 +734,7 @@ export class StatusServer {
           return;
         }
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
+        const projectContextId = parseProjectContextIdQuery(url);
         if (!this.options.runStore) {
           if (requestedFullTranscript) {
             sendJson(
@@ -774,7 +780,7 @@ export class StatusServer {
           );
           return;
         }
-        const run = await resolveWebTranscriptRun(this.options.runStore, sessionIdOrRunId);
+        const run = await resolveWebTranscriptRun(this.options.runStore, sessionIdOrRunId, projectContextId);
         if (!run) {
           sendJson(
             response,
@@ -1057,17 +1063,19 @@ export class StatusServer {
       const issueRunsMatch = /^\/api\/v1\/issues\/([^/]+)\/runs$/.exec(url.pathname);
       if (request.method === "GET" && issueRunsMatch) {
         const issueId = decodeURIComponent(issueRunsMatch[1] ?? "");
+        const projectContextId = parseProjectContextIdQuery(url);
         const snapshot = this.options.orchestrator.snapshot();
-        const live = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
-        const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const liveCandidate = this.options.orchestrator.getIssueDetails(issueId);
+        const live = matchesProjectContext(liveCandidate, projectContextId) ? liveCandidate : null;
+        const workspace = await this.options.runStore?.findWorkspace(issueId, projectContextId);
+        const latestRun = await this.options.runStore?.latestRunForIssue(issueId, { projectContextId });
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
-        const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
+        const runs = (await this.options.runStore?.listRunsForIssue(issueId, projectContextId)) ?? [];
         const lifecycle = sanitizeStatusLifecycle({
           live,
           workspace,
           latestRun,
-          lifecycle: await this.options.lifecycleStore?.get(issueId),
+          lifecycle: await this.options.lifecycleStore?.get(issueId, projectContextId),
         });
         const enrichedRuns = await Promise.all(
           runs.map(async (run) => ({
@@ -1149,16 +1157,18 @@ export class StatusServer {
       const issueMatch = /^\/api\/v1\/issues\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && issueMatch) {
         const issueId = decodeURIComponent(issueMatch[1] ?? "");
+        const projectContextId = parseProjectContextIdQuery(url);
         const snapshot = this.options.orchestrator.snapshot();
-        const live = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
-        const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const liveCandidate = this.options.orchestrator.getIssueDetails(issueId);
+        const live = matchesProjectContext(liveCandidate, projectContextId) ? liveCandidate : null;
+        const workspace = await this.options.runStore?.findWorkspace(issueId, projectContextId);
+        const latestRun = await this.options.runStore?.latestRunForIssue(issueId, { projectContextId });
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const lifecycle = sanitizeStatusLifecycle({
           live,
           workspace,
           latestRun,
-          lifecycle: await this.options.lifecycleStore?.get(issueId),
+          lifecycle: await this.options.lifecycleStore?.get(issueId, projectContextId),
         });
         if (!live && !workspace && !latestRun && !lifecycle) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
@@ -1274,7 +1284,7 @@ export class StatusServer {
       const workspaceMatch = /^\/api\/v1\/workspaces\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && workspaceMatch) {
         const workspaceKey = decodeURIComponent(workspaceMatch[1] ?? "");
-        const workspace = await this.options.runStore?.findWorkspace(workspaceKey);
+        const workspace = await this.options.runStore?.findWorkspace(workspaceKey, parseProjectContextIdQuery(url));
         if (!workspace) throw new SymphonyError("not_found", `Workspace not found: ${workspaceKey}`);
         sendJson(response, 200, workspace);
         return;
@@ -1417,7 +1427,7 @@ export class StatusServer {
         lifecycleRecords: activitySources.lifecycleRecords,
         writebackOutbox: this.options.writebackOutbox,
         writebackOperations: activitySources.writebackOperations,
-        query: { issue: null, offset: 0, limit: 20 },
+        query: { issue: null, projectContextId: null, offset: 0, limit: 20 },
         includeTranscriptEvents: false,
       });
       const dashboard = projectWebDashboard({
@@ -1457,7 +1467,7 @@ export class StatusServer {
         lifecycleRecords: activitySources.lifecycleRecords,
         writebackOutbox: this.options.writebackOutbox,
         writebackOperations: activitySources.writebackOperations,
-        query: { issue: null, offset: 0, limit: WEB_SIDEBAR_HISTORY_TIMELINE_LIMIT },
+        query: { issue: null, projectContextId: null, offset: 0, limit: WEB_SIDEBAR_HISTORY_TIMELINE_LIMIT },
         includeTranscriptEvents: false,
       });
       const dashboardActivity = previewActivityFeed(historyActivity, 20);
@@ -1499,7 +1509,7 @@ export class StatusServer {
         lifecycleRecords: activitySources.lifecycleRecords,
         writebackOutbox: this.options.writebackOutbox,
         writebackOperations: activitySources.writebackOperations,
-        query: { issue: null, offset: 0, limit: limits.timelineLimit },
+        query: { issue: null, projectContextId: null, offset: 0, limit: limits.timelineLimit },
         includeTranscriptEvents: false,
       });
       const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot });
@@ -1508,6 +1518,7 @@ export class StatusServer {
           sourceIndex,
           limits,
           activityCount: activityFeed.activity.length,
+          projectContextId: null,
         }),
         entries,
       );
@@ -1802,12 +1813,13 @@ export class StatusServer {
       sourceIndex: BuiltWebProjectionSourceIndex | null;
       limits: { sessionLimit: number; timelineLimit: number };
       activityCount: number;
+      projectContextId: string | null;
     },
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "history_projection",
       scopeKind: "global_collection",
-      scopeKey: historyProjectionScopeKey(input.limits),
+      scopeKey: historyProjectionScopeKey(input.limits, input.projectContextId),
       payload: history,
       sourceRevisions: statusServerProjectionSourceRevisions(input.sourceIndex, this.options),
       sourceFreshness: statusServerProjectionSourceFreshness(input.sourceIndex),
@@ -1818,6 +1830,7 @@ export class StatusServer {
         timelineCount: history.timeline.length,
         activityCount: input.activityCount,
         defaultSessionId: history.defaultSessionId,
+        projectContextId: input.projectContextId,
         runIds: history.sessions.map((session) => session.runSession.runId),
       },
       fields: {
@@ -1877,6 +1890,7 @@ export class StatusServer {
 
   private async fetchWebIssueDetail(
     issueId: string,
+    projectContextId: string | null,
     forceRefresh: boolean,
     options: { includeTranscript?: boolean; transcriptUrl?: URL } = {},
   ): Promise<WebProjectionJsonResponse<WebIssueDetailModel | null>> {
@@ -1885,6 +1899,7 @@ export class StatusServer {
       const durableDetail = await this.buildDurableWebIssueDetailFromIssueBoard(
         durableRead.record.payload,
         issueId,
+        projectContextId,
         durableRead.record,
         options,
       );
@@ -1901,7 +1916,7 @@ export class StatusServer {
     }
 
     try {
-      const detail = await this.fetchBoardIssueDetail(issueId, forceRefresh);
+      const detail = await this.fetchBoardIssueDetail(issueId, projectContextId, forceRefresh);
       const issueActivityKey =
         detail.issueDetails.issue.identifier ??
         detail.issueDetails.issue.id ??
@@ -1916,7 +1931,7 @@ export class StatusServer {
         runs: detailRuns,
         lifecycleStore: this.options.lifecycleStore,
         writebackOutbox: this.options.writebackOutbox,
-        query: { issue: issueActivityKey, offset: 0, limit: 50 },
+        query: { issue: issueActivityKey, projectContextId, offset: 0, limit: 50 },
         includeTranscriptEvents: false,
       });
       const transcript =
@@ -1935,10 +1950,11 @@ export class StatusServer {
   private async buildDurableWebIssueDetailFromIssueBoard(
     board: WebIssueBoardModel,
     issueId: string,
+    projectContextId: string | null,
     record: ProjectionPayloadRecord<WebIssueBoardModel>,
     options: { includeTranscript?: boolean; transcriptUrl?: URL } = {},
   ): Promise<WebIssueDetailModel | null> {
-    const issue = durableWebIssueFromIssueBoard(board, issueId);
+    const issue = durableWebIssueFromIssueBoard(board, issueId, projectContextId);
     if (!issue) return null;
 
     const issueActivityKey = issue.id || issueId;
@@ -1953,7 +1969,7 @@ export class StatusServer {
       runs: detailRuns,
       lifecycleStore: this.options.lifecycleStore,
       writebackOutbox: this.options.writebackOutbox,
-      query: { issue: issueActivityKey, offset: 0, limit: 50 },
+      query: { issue: issueActivityKey, projectContextId: issue.projectContextId ?? null, offset: 0, limit: 50 },
       includeTranscriptEvents: false,
     });
     const transcript =
@@ -2011,7 +2027,7 @@ export class StatusServer {
       lifecycleRecords: activitySources.lifecycleRecords,
       writebackOutbox: this.options.writebackOutbox,
       writebackOperations: activitySources.writebackOperations,
-      query: { issue: null, offset: 0, limit: 20 },
+      query: { issue: null, projectContextId: null, offset: 0, limit: 20 },
       includeTranscriptEvents: false,
     });
     const dashboard = projectWebDashboard({
@@ -2341,7 +2357,7 @@ export class StatusServer {
       lifecycleRecords: activitySources.lifecycleRecords,
       writebackOutbox: this.options.writebackOutbox,
       writebackOperations: activitySources.writebackOperations,
-      query: { issue: null, offset: 0, limit: WEB_SIDEBAR_HISTORY_TIMELINE_LIMIT },
+      query: { issue: null, projectContextId: null, offset: 0, limit: WEB_SIDEBAR_HISTORY_TIMELINE_LIMIT },
       includeTranscriptEvents: false,
     });
     const dashboardActivity = previewActivityFeed(historyActivity, 20);
@@ -2367,7 +2383,11 @@ export class StatusServer {
 
   private async fetchWebHistory(forceRefresh: boolean, url: URL): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebHistory>>> {
     const limits = parseWebHistoryLimits(url);
-    const durableHistory = await this.webProjectionRepositories.history.readGlobalCollection(limits, { forceRefresh });
+    const projectContextId = parseProjectContextIdQuery(url);
+    const durableHistory = await this.webProjectionRepositories.history.readGlobalCollection(limits, {
+      forceRefresh,
+      projectContextId,
+    });
     if (durableHistory.status === "hit" && durableHistory.record) {
       return webProjectionJsonResponse(
         applyWebHistoryRuntimeLiveness(durableHistory.record.payload, this.options.orchestrator.snapshot()),
@@ -2382,17 +2402,26 @@ export class StatusServer {
       sourceIndex,
       Math.max(limits.sessionLimit, limits.timelineLimit),
     );
-    const runs = selectRecentRuns(activitySources.runs, limits.sessionLimit);
-    const activityRuns = selectRecentRuns(activitySources.runs, limits.timelineLimit);
+    const filteredRuns = projectContextId
+      ? activitySources.runs.filter((run) => matchesProjectContext(run, projectContextId))
+      : activitySources.runs;
+    const filteredLifecycleRecords = projectContextId
+      ? activitySources.lifecycleRecords.filter((record) => matchesProjectContext(record, projectContextId))
+      : activitySources.lifecycleRecords;
+    const filteredWritebackOperations = projectContextId
+      ? activitySources.writebackOperations.filter((operation) => matchesProjectContext(operation, projectContextId))
+      : activitySources.writebackOperations;
+    const runs = selectRecentRuns(filteredRuns, limits.sessionLimit);
+    const activityRuns = selectRecentRuns(filteredRuns, limits.timelineLimit);
     const activityFeed = await buildActivityFeed({
       generatedAt: snapshot.generatedAt,
       runStore: this.options.runStore,
       runs: activityRuns,
       lifecycleStore: this.options.lifecycleStore,
-      lifecycleRecords: activitySources.lifecycleRecords,
+      lifecycleRecords: filteredLifecycleRecords,
       writebackOutbox: this.options.writebackOutbox,
-      writebackOperations: activitySources.writebackOperations,
-      query: { issue: null, offset: 0, limit: limits.timelineLimit },
+      writebackOperations: filteredWritebackOperations,
+      query: { issue: null, projectContextId, offset: 0, limit: limits.timelineLimit },
       includeTranscriptEvents: false,
     });
     const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot });
@@ -2400,6 +2429,7 @@ export class StatusServer {
       sourceIndex,
       limits,
       activityCount: activityFeed.activity.length,
+      projectContextId,
     });
     return webProjectionJsonResponse(history, durableHistory);
   }
@@ -2439,6 +2469,7 @@ export class StatusServer {
       sourceIndex: BuiltWebProjectionSourceIndex | null;
       limits: { sessionLimit: number; timelineLimit: number };
       activityCount: number;
+      projectContextId: string | null;
     },
   ): Promise<void> {
     await this.persistProjection(this.webHistoryProjectionWriteInput(history, input));
@@ -2589,7 +2620,7 @@ export class StatusServer {
     });
   }
 
-  private async fetchBoardIssueDetail(issueId: string, forceRefresh: boolean) {
+  private async fetchBoardIssueDetail(issueId: string, projectContextId: string | null, forceRefresh: boolean) {
     const { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
     let board: IssueBoardResponse | null = null;
     let trackerFailure: SymphonyError | null = null;
@@ -2607,10 +2638,11 @@ export class StatusServer {
       });
     }
 
-    const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), [issueId])) ?? null;
+    const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), issueRequestKeys(issueId, projectContextId))) ?? null;
     const detail = await buildBoardIssueDetail({
       requestKey: issueId,
       card,
+      projectContextId,
       sourceIndex,
       mutationsConfigured: Boolean(this.options.openWorkspaceToken),
       runStore: this.options.runStore,
@@ -3424,8 +3456,11 @@ function isDurableProjectionName(value: string): value is DurableProjectionName 
   return (DURABLE_PROJECTION_NAMES as readonly string[]).includes(value);
 }
 
-function historyProjectionScopeKey(limits: { sessionLimit: number; timelineLimit: number }): string {
-  return webHistoryProjectionScopeKey(limits);
+function historyProjectionScopeKey(
+  limits: { sessionLimit: number; timelineLimit: number },
+  projectContextId: string | null = null,
+): string {
+  return webHistoryProjectionScopeKey(limits, projectContextId);
 }
 
 function transcriptProjectionScopeKey(run: RunRecord, page: TranscriptPage): string {
@@ -4041,14 +4076,20 @@ function durableProjectionReadHeaders(read: DurableProjectionReadResult<unknown>
   return headers;
 }
 
-function durableWebIssueFromIssueBoard(board: WebIssueBoardModel, issueId: string): IssueModel | null {
-  const issue = board.issues.find((candidate) => webIssueModelMatches(candidate, issueId)) ?? null;
+function durableWebIssueFromIssueBoard(
+  board: WebIssueBoardModel,
+  issueId: string,
+  projectContextId: string | null,
+): IssueModel | null {
+  const issue = board.issues.find((candidate) => webIssueModelMatches(candidate, issueId, projectContextId)) ?? null;
   return issue ? cloneJson(issue) : null;
 }
 
-function webIssueModelMatches(issue: IssueModel, issueId: string): boolean {
+function webIssueModelMatches(issue: IssueModel, issueId: string, projectContextId: string | null = null): boolean {
   const requested = issueId.trim().toLowerCase();
-  return issue.id.trim().toLowerCase() === requested;
+  if (issue.id.trim().toLowerCase() !== requested) return false;
+  if (!projectContextId) return true;
+  return (issue.projectContextId ?? null) === projectContextId;
 }
 
 function cloneJson<T>(value: T): T {
@@ -4720,6 +4761,7 @@ interface IssueBoardTrackerCache {
 
 interface ActivityQuery {
   issue: string | null;
+  projectContextId: string | null;
   offset: number;
   limit: number;
 }
@@ -4732,6 +4774,9 @@ interface ActivityItem {
   issue: {
     id: string;
     identifier: string;
+    projectContextId: string | null;
+    projectContextLabel: string | null;
+    trackerProjectSlug: string | null;
   };
   run: {
     runId: string;
@@ -4741,6 +4786,9 @@ interface ActivityItem {
     status: RunRecord["status"];
     agentId: string | null;
     sessionId: string | null;
+    projectContextId: string | null;
+    projectContextLabel: string | null;
+    trackerProjectSlug: string | null;
   } | null;
   transcript: {
     sequence: number;
@@ -4909,6 +4957,7 @@ function acceptedBoardCard(card: IssueBoardCard): IssueBoardCard {
 async function buildBoardIssueDetail(input: {
   requestKey: string;
   card: IssueBoardCard | null;
+  projectContextId: string | null;
   sourceIndex: BuiltWebProjectionSourceIndex;
   mutationsConfigured: boolean;
   runStore: RunTranscriptStore | undefined;
@@ -5036,6 +5085,38 @@ function parseBooleanWebQueryParam(searchParams: URLSearchParams, name: string):
   return value === "1" || value === "true" || value === "yes";
 }
 
+function parseProjectContextIdQuery(url: URL): string | null {
+  const raw = url.searchParams.get("projectContextId")?.trim();
+  if (!raw) return null;
+  try {
+    return normalizeProjectContextId(raw);
+  } catch (error) {
+    throw new SymphonyError("invalid_request", errorMessage(error));
+  }
+}
+
+function issueRequestKeys(issueId: string, projectContextId: string | null | undefined): string[] {
+  const keys = [issueId];
+  const normalized = projectContextId?.trim();
+  if (normalized) keys.unshift(projectScopedKey(normalized, issueId));
+  return keys;
+}
+
+function readProjectContextId(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as { projectContextId?: unknown; issueDetails?: { projectContextId?: unknown } | null };
+  const direct = typeof record.projectContextId === "string" ? record.projectContextId.trim() : "";
+  if (direct.length > 0) return direct;
+  const nested = typeof record.issueDetails?.projectContextId === "string" ? record.issueDetails.projectContextId.trim() : "";
+  return nested.length > 0 ? nested : null;
+}
+
+function matchesProjectContext(value: unknown, projectContextId: string | null | undefined): boolean {
+  const requested = projectContextId?.trim();
+  if (!requested) return true;
+  return readProjectContextId(value) === requested;
+}
+
 function parsePositiveIntegerQueryParam(searchParams: URLSearchParams, name: string, defaultValue: number, maxValue: number): number {
   const parsed = parseIntegerQueryParam(searchParams, name);
   if (parsed === null || parsed < 1) return defaultValue;
@@ -5072,7 +5153,8 @@ async function buildActivityFeed(input: {
   const includeTranscriptEvents = input.includeTranscriptEvents ?? true;
   const lifecycleRecords = input.lifecycleRecords ?? (await input.lifecycleStore?.list()) ?? [];
   const issueFilter = input.query.issue;
-  const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter)) : allRuns;
+  const projectContextId = input.query.projectContextId;
+  const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter, projectContextId)) : allRuns;
   const activity: ActivityItem[] = [];
   let transcriptEventsConsidered = 0;
   let transcriptEventsTotal = 0;
@@ -5104,7 +5186,9 @@ async function buildActivityFeed(input: {
 
   const writebackOperations = input.writebackOperations ?? (await input.writebackOutbox?.list()) ?? [];
   const filteredWritebackOperations = issueFilter
-    ? writebackOperations.filter((operation) => writebackOperationMatchesIssue(operation, issueFilter, allRuns, lifecycleRecords))
+    ? writebackOperations.filter((operation) =>
+        writebackOperationMatchesIssue(operation, issueFilter, projectContextId, allRuns, lifecycleRecords),
+      )
     : writebackOperations;
   writebackOperationsConsidered = filteredWritebackOperations.length;
   activity.push(...filteredWritebackOperations.map((operation) => activityItemForWritebackOperation(operation, allRuns, lifecycleRecords)));
@@ -5136,6 +5220,7 @@ async function buildActivityFeed(input: {
     },
     filter: {
       issue: input.query.issue,
+      projectContextId: input.query.projectContextId,
     },
   };
 }
@@ -5199,6 +5284,9 @@ function activityItemForWritebackOperation(
     issue: {
       id: operation.issueId,
       identifier: issueIdentifier,
+      projectContextId: operation.projectContextId ?? run?.projectContextId ?? lifecycle?.projectContextId ?? null,
+      projectContextLabel: run?.projectContextLabel ?? lifecycle?.projectContextLabel ?? null,
+      trackerProjectSlug: run?.trackerProjectSlug ?? lifecycle?.trackerProjectSlug ?? null,
     },
     run: run ? activityRun(run) : null,
     transcript: null,
@@ -5257,6 +5345,9 @@ function activityIssue(run: RunRecord): ActivityItem["issue"] {
   return {
     id: run.issueId,
     identifier: run.issueIdentifier,
+    projectContextId: run.projectContextId ?? null,
+    projectContextLabel: run.projectContextLabel ?? null,
+    trackerProjectSlug: run.trackerProjectSlug ?? null,
   };
 }
 
@@ -5270,16 +5361,22 @@ function activityRun(run: RunRecord): ActivityItem["run"] {
     status: run.status,
     agentId: run.agentId,
     sessionId: run.sessionId,
+    projectContextId: run.projectContextId ?? null,
+    projectContextLabel: run.projectContextLabel ?? null,
+    trackerProjectSlug: run.trackerProjectSlug ?? null,
   };
 }
 
 function activityLinks(run: RunRecord, event: TranscriptEvent | null): ActivityItem["links"] {
+  const query = run.projectContextId ? `projectContextId=${encodeURIComponent(run.projectContextId)}` : "";
+  const queryPrefix = query.length > 0 ? `?${query}` : "";
+  const transcriptQuery = event
+    ? `${query.length > 0 ? `${query}&` : ""}offset=${Math.max(event.sequence - 1, 0)}&limit=1`
+    : null;
   return {
-    issue: `/api/v1/board/issues/${encodeURIComponent(run.issueIdentifier)}`,
+    issue: `/api/v1/board/issues/${encodeURIComponent(run.issueIdentifier)}${queryPrefix}`,
     run: `/api/v1/runs/${encodeURIComponent(run.runId)}`,
-    transcript: event
-      ? `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript?offset=${Math.max(event.sequence - 1, 0)}&limit=1`
-      : null,
+    transcript: event ? `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript?${transcriptQuery}` : null,
   };
 }
 
@@ -5626,24 +5723,30 @@ function hasBoardKey(target: Set<string>, keys: Array<string | null | undefined>
 }
 
 function boardCardKeys(card: IssueBoardCard): string[] {
-  return [card.key, card.issueId, card.issueIdentifier].filter((value): value is string => value !== null && value !== undefined);
+  const keys = [card.key, card.issueId, card.issueIdentifier].filter((value): value is string => value !== null && value !== undefined);
+  const projectContextId = card.issueDetails.issue.projectContextId ?? card.issueDetails.workspace.projectContextId ?? null;
+  if (!projectContextId) return keys;
+  return [...new Set(keys.flatMap((key) => [projectScopedKey(projectContextId, key), key]))];
 }
 
-function activityRunMatchesIssue(run: RunRecord, issue: string): boolean {
+function activityRunMatchesIssue(run: RunRecord, issue: string, projectContextId: string | null = null): boolean {
+  if (!matchesProjectContext(run, projectContextId)) return false;
   return run.issueId === issue || run.issueIdentifier === issue;
 }
 
 function writebackOperationMatchesIssue(
   operation: WritebackOperation,
   issue: string,
+  projectContextId: string | null,
   runs: readonly RunRecord[],
   lifecycles: readonly IssueLifecycleRecord[],
 ): boolean {
-  if (operation.issueId === issue) return true;
+  if (matchesProjectContext(operation, projectContextId) && operation.issueId === issue) return true;
   const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
-  if (run && activityRunMatchesIssue(run, issue)) return true;
+  if (run && activityRunMatchesIssue(run, issue, projectContextId)) return true;
   return lifecycles.some(
     (lifecycle) =>
+      matchesProjectContext(lifecycle, projectContextId) &&
       (lifecycle.issueId === operation.issueId || lifecycle.issueIdentifier === operation.issueId) &&
       (lifecycle.issueId === issue || lifecycle.issueIdentifier === issue),
   );
@@ -6114,11 +6217,15 @@ async function runOperatorLiveness(
   return null;
 }
 
-async function resolveWebTranscriptRun(runStore: RunTranscriptStore, sessionIdOrRunId: string): Promise<RunRecord | null> {
+async function resolveWebTranscriptRun(
+  runStore: RunTranscriptStore,
+  sessionIdOrRunId: string,
+  projectContextId: string | null = null,
+): Promise<RunRecord | null> {
   const directRun = await runStore.getRun(sessionIdOrRunId);
-  if (directRun) return directRun;
+  if (directRun && matchesProjectContext(directRun, projectContextId)) return directRun;
   const runs = (await runStore.listRuns()).sort(compareRunChronology);
-  return runs.find((run) => run.sessionId === sessionIdOrRunId) ?? null;
+  return runs.find((run) => run.sessionId === sessionIdOrRunId && matchesProjectContext(run, projectContextId)) ?? null;
 }
 
 async function readBoundedWebTranscript(runStore: RunTranscriptStore, runId: string, url?: URL): Promise<TranscriptEvent[]> {
@@ -7122,6 +7229,7 @@ function parseActivityQuery(url: URL): ActivityQuery {
   const issue = url.searchParams.get("issue");
   return {
     issue: issue && issue.length > 0 ? issue : null,
+    projectContextId: parseProjectContextIdQuery(url),
     offset: Number.isFinite(offset) ? Math.max(Math.floor(offset), 0) : 0,
     limit: Number.isFinite(limit) ? Math.min(Math.max(Math.floor(limit), 1), 100) : 50,
   };

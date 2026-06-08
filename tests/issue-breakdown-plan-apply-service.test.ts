@@ -29,6 +29,37 @@ import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 
+describe("IssueBreakdownPlanApplyService project-context propagation", () => {
+  it("copies the parent project context into child issue breakdown writebacks", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-breakdown-project-context-"));
+    try {
+      const config = testConfig(root);
+      config.issueBreakdown.applyToLinear.enabled = true;
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const candidate = issue({ projectContextId: "docs", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+      const plan = await submitTwoChildPlan(config, lifecycleStore, candidate);
+
+      const childOperations = planIssueBreakdownApplicationWritebacks(candidate, plan) as IssueCreateWriteback[];
+      expect(childOperations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ projectContextId: "docs" }),
+        expect.objectContaining({ projectContextId: "docs" }),
+      ]));
+
+      const planWithRefs = {
+        ...plan,
+        createdIssueRefs: childOperations.map((operation) => createdIssueRef(operation)),
+      };
+      const finalOperations = planIssueBreakdownFinalizationWritebacks(candidate, planWithRefs);
+      expect(finalOperations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "issue_relation", projectContextId: "docs" }),
+        expect.objectContaining({ kind: "comment", projectContextId: "docs" }),
+      ]));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("IssueBreakdownPlanApplyService", () => {
   let root: string;
 

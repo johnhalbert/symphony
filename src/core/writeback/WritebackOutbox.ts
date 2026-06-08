@@ -18,6 +18,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "transition";
       issueId: string;
+      projectContextId?: string | null;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -34,6 +35,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "comment";
       issueId: string;
+      projectContextId?: string | null;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -50,6 +52,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "issue_create";
       issueId: string;
+      projectContextId?: string | null;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -77,6 +80,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "issue_relation";
       issueId: string;
+      projectContextId?: string | null;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -128,7 +132,7 @@ export type IssueBreakdownIssueLookupResult =
 
 export type IssueBreakdownFreshnessGuard = {
   getConfig: () => ServiceConfig;
-  resolveIssue: (issueId: string) => Promise<IssueBreakdownIssueLookupResult>;
+  resolveIssue: (issueId: string, projectContextId?: string | null) => Promise<IssueBreakdownIssueLookupResult>;
 };
 
 export type ProcessDueOptions = {
@@ -406,7 +410,7 @@ export class WritebackProcessor {
         return { status: "blocked", message: "issue breakdown writeback requires freshness guard" };
       }
       const config = this.issueBreakdownFreshnessGuard.getConfig();
-      const lookup = await this.issueBreakdownFreshnessGuard.resolveIssue(record.issueId);
+      const lookup = await this.issueBreakdownFreshnessGuard.resolveIssue(record.issueId, record.projectContextId ?? null);
       if (lookup.status === "transient_error") {
         return { status: "retry", message: `issue breakdown freshness lookup failed: ${lookup.message}` };
       }
@@ -438,6 +442,7 @@ export class WritebackProcessor {
     if (record.kind === "transition") {
       return this.writer.transitionIssueState({
         issueId: record.issueId,
+        projectContextId: record.projectContextId ?? null,
         toState: record.payload.toState,
         ...(record.payload.fromStates === undefined ? {} : { fromStates: record.payload.fromStates }),
         ...(record.payload.reason === undefined ? {} : { reason: record.payload.reason }),
@@ -446,6 +451,7 @@ export class WritebackProcessor {
     if (record.kind === "comment") {
       return this.writer.createIssueComment({
         issueId: record.issueId,
+        projectContextId: record.projectContextId ?? null,
         body: record.payload.body,
         dedupeKey: record.payload.dedupeKey,
       });
@@ -457,6 +463,7 @@ export class WritebackProcessor {
       return this.writer.createIssueRelation({
         sourceIssueId: record.payload.sourceIssueId,
         targetIssueId: record.payload.targetIssueId,
+        projectContextId: record.projectContextId ?? null,
         type: record.payload.type,
         dedupeKey: record.payload.dedupeKey,
         planId: record.payload.planId,
@@ -468,6 +475,7 @@ export class WritebackProcessor {
     }
     return this.writer.createIssueFromPlan({
       parentIssueId: record.payload.parentIssueId,
+      projectContextId: record.projectContextId ?? null,
       planId: record.payload.planId,
       proposedIssueIndex: record.payload.proposedIssueIndex,
       title: record.payload.title,

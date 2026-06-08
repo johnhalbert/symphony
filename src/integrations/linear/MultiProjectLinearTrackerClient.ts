@@ -12,6 +12,8 @@ import type {
 import type { Issue } from "../../core/types.js";
 import { LinearTrackerClient, type LinearWorkflowTeamStates } from "./LinearTrackerClient.js";
 
+type IssueCollectionAmbiguityMode = "drop" | "throw";
+
 export class MultiProjectLinearTrackerClient implements TrackerClient, TrackerWriter {
   constructor(
     private readonly config: ServiceConfig,
@@ -19,37 +21,15 @@ export class MultiProjectLinearTrackerClient implements TrackerClient, TrackerWr
   ) {}
 
   async fetchCandidateIssues(): Promise<Issue[]> {
-    const issues = await Promise.all(
-      this.projectContexts().map(async (context) =>
-        (await this.clientFactoryFor(context).fetchCandidateIssues()).map((issue) => this.decorateIssue(issue, context)),
-      ),
-    );
-    return issues.flat();
+    return this.collectIssues((context, client) => client.fetchCandidateIssues(), "drop");
   }
 
   async fetchIssuesByStates(stateNames: string[]): Promise<Issue[]> {
-    const issues = await Promise.all(
-      this.projectContexts().map(async (context) =>
-        (await this.clientFactoryFor(context).fetchIssuesByStates(stateNames)).map((issue) => this.decorateIssue(issue, context)),
-      ),
-    );
-    return issues.flat();
+    return this.collectIssues((context, client) => client.fetchIssuesByStates(stateNames), "drop");
   }
 
   async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {
-    const issues = await Promise.all(
-      this.projectContexts().map(async (context) =>
-        (await this.clientFactoryFor(context).fetchIssueStatesByIds(issueIds)).map((issue) => this.decorateIssue(issue, context)),
-      ),
-    );
-    const seen = new Set<string>();
-    return issues
-      .flat()
-      .filter((issue) => {
-        if (seen.has(issue.id)) return false;
-        seen.add(issue.id);
-        return true;
-      });
+    return this.collectIssues((context, client) => client.fetchIssueStatesByIds(issueIds), "throw");
   }
 
   async fetchWorkflowStatesByTeam(): Promise<LinearWorkflowTeamStates[]> {
@@ -75,19 +55,19 @@ export class MultiProjectLinearTrackerClient implements TrackerClient, TrackerWr
   }
 
   transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
-    return this.defaultClient().transitionIssueState(input);
+    return this.clientForWriteInput(input.projectContextId).transitionIssueState(input);
   }
 
   createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
-    return this.defaultClient().createIssueComment(input);
+    return this.clientForWriteInput(input.projectContextId).createIssueComment(input);
   }
 
   createIssueFromPlan(input: TrackerIssueCreateInput): Promise<TrackerWriteResult> {
-    return this.defaultClient().createIssueFromPlan?.(input) ?? Promise.resolve({ status: "skipped" });
+    return this.clientForWriteInput(input.projectContextId).createIssueFromPlan?.(input) ?? Promise.resolve({ status: "skipped" });
   }
 
   createIssueRelation(input: TrackerIssueRelationInput): Promise<TrackerWriteResult> {
-    return this.defaultClient().createIssueRelation?.(input) ?? Promise.resolve({ status: "skipped" });
+    return this.clientForWriteInput(input.projectContextId).createIssueRelation?.(input) ?? Promise.resolve({ status: "skipped" });
   }
 
   private projectContexts(): ProjectContextConfig[] {
@@ -95,8 +75,84 @@ export class MultiProjectLinearTrackerClient implements TrackerClient, TrackerWr
     return contexts.length > 0 ? contexts : [defaultProjectContext(this.config)];
   }
 
-  private defaultClient(): LinearTrackerClient {
-    return this.clientFactoryFor(defaultProjectContext(this.config));
+  private async collectIssues(
+    fetcher: (context: ProjectContextConfig, client: LinearTrackerClient) => Promise<Issue[]>,
+    ambiguityMode: IssueCollectionAmbiguityMode,
+  ): Promise<Issue[]> {
+    const issues = await Promise.all(
+      this.projectContexts().map(async (context) =>
+        (await fetcher(context, this.clientFactoryFor(context))).map((issue) => this.decorateIssue(issue, context)),
+      ),
+    );
+    return this.resolveCollectedIssues(issues.flat(), ambiguityMode);
+  }
+
+  private resolveCollectedIssues(issues: Issue[], ambiguityMode: IssueCollectionAmbiguityMode): Issue[] {
+    const grouped = new Map<string, Issue[]>();
+    for (const issue of issues) {
+      const bucket = grouped.get(issue.id);
+      if (bucket) {
+        bucket.push(issue);
+      } else {
+        grouped.set(issue.id, [issue]);
+      }
+    }
+
+    const resolved: Issue[] = [];
+    const ambiguities: string[] = [];
+    for (const group of grouped.values()) {
+      const resolution = this.resolveIssueGroup(group);
+      if (resolution.status === "resolved") {
+        resolved.push(resolution.issue);
+        continue;
+      }
+      ambiguities.push(resolution.message);
+    }
+
+    if (ambiguityMode === "throw" && ambiguities.length > 0) {
+      throw new Error(`Ambiguous project context resolution for Linear issues: ${ambiguities.join("; ")}`);
+    }
+
+    return resolved;
+  }
+
+  private resolveIssueGroup(issues: Issue[]): { status: "resolved"; issue: Issue } | { status: "ambiguous"; message: string } {
+    const byContext = new Map<string, Issue>();
+    for (const issue of issues) {
+      const contextId = issue.projectContextId?.trim();
+      if (!contextId) {
+        return { status: "ambiguous", message: `${issue.identifier ?? issue.id} (${issue.id}) has no resolved project context` };
+      }
+      if (!byContext.has(contextId)) byContext.set(contextId, issue);
+    }
+
+    const resolved = [...byContext.values()];
+    if (resolved.length === 1) return { status: "resolved", issue: resolved[0]! };
+
+    const issue = resolved[0]!;
+    const contexts = resolved.map((candidate) => candidate.projectContextId ?? "<missing>").sort().join(", ");
+    return {
+      status: "ambiguous",
+      message: `${issue.identifier ?? issue.id} (${issue.id}) matched multiple project contexts: ${contexts}`,
+    };
+  }
+
+  private clientForWriteInput(projectContextId: string | null | undefined): LinearTrackerClient {
+    return this.clientFactoryFor(this.projectContextForWrite(projectContextId));
+  }
+
+  private projectContextForWrite(projectContextId: string | null | undefined): ProjectContextConfig {
+    const contexts = this.projectContexts();
+    const resolvedId = projectContextId?.trim();
+    if (resolvedId) {
+      const match = contexts.find((context) => context.id === resolvedId);
+      if (!match) {
+        throw new Error(`Unknown or disabled project context for tracker writeback: ${resolvedId}`);
+      }
+      return match;
+    }
+    if (contexts.length === 1) return contexts[0]!;
+    throw new Error(`Tracker writeback requires an explicit project context when ${contexts.length} project contexts are enabled`);
   }
 
   private clientFactoryFor(context: ProjectContextConfig): LinearTrackerClient {

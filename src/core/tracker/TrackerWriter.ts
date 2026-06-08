@@ -1,5 +1,6 @@
 export interface TrackerTransitionInput {
   issueId: string;
+  projectContextId?: string | null;
   toState: string;
   fromStates?: string[];
   reason?: string;
@@ -7,12 +8,14 @@ export interface TrackerTransitionInput {
 
 export interface TrackerCommentInput {
   issueId: string;
+  projectContextId?: string | null;
   body: string;
   dedupeKey: string;
 }
 
 export interface TrackerIssueCreateInput {
   parentIssueId: string;
+  projectContextId?: string | null;
   planId?: string;
   proposedIssueIndex?: number;
   title: string;
@@ -27,6 +30,7 @@ export interface TrackerIssueCreateInput {
 export interface TrackerIssueRelationInput {
   sourceIssueId: string;
   targetIssueId: string;
+  projectContextId?: string | null;
   type: "blocks";
   dedupeKey: string;
   planId?: string;

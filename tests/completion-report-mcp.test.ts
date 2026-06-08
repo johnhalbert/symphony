@@ -34,6 +34,55 @@ describe("completion report MCP handoff", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it("rejects completion reports when the MCP workspace context disagrees with the active issue context", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-ctx-mismatch",
+      sessionId: "agent-1:run-ctx-mismatch",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1", projectContextId: "docs" }),
+      activeRunId: "run-ctx-mismatch",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-ctx-mismatch",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+        projectContextId: "eng",
+      },
+      phase: "implementation",
+    });
+
+    await expect(submitCompletionReportFromMcp(report(), { workflowPath, contextFile })).rejects.toThrow(
+      "Completion report project context does not match the active worker workspace context",
+    );
+  });
+
   it("submits a worker completion report through CompletionReportService before review writeback", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");

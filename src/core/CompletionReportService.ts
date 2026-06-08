@@ -607,6 +607,18 @@ export class CompletionReportService {
     if (report.issueId !== context.issue.id && report.issueId !== context.issue.identifier) {
       throw new SymphonyError("invalid_request", "Completion report issue does not match the active worker issue");
     }
+    const issueProjectContextId = context.issue.projectContextId ?? null;
+    const workspaceProjectContextId = context.workspace?.projectContextId ?? null;
+    if (
+      issueProjectContextId !== null &&
+      workspaceProjectContextId !== null &&
+      issueProjectContextId !== workspaceProjectContextId
+    ) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Completion report project context does not match the active worker workspace context",
+      );
+    }
   }
 
   private validateIssueIsAcceptingReports(context: CompletionReportActiveContext, lifecyclePhase: IssueLifecyclePhase): void {

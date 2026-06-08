@@ -525,7 +525,14 @@ export class FileIssueLifecycleStore {
 
   async get(issueIdOrIdentifier: string, projectContextId?: string | null): Promise<IssueLifecycleRecord | null> {
     const direct = await readLifecycleJsonIfExists(this.recordPath(issueIdOrIdentifier));
-    if (direct) return direct;
+    if (
+      direct &&
+      (projectContextId === undefined ||
+        projectContextId === null ||
+        (direct.projectContextId ?? direct.summaryPointers.projectContextId ?? null) === projectContextId)
+    ) {
+      return direct;
+    }
     const records = await this.list();
     return (
       records.find(
@@ -934,6 +941,9 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
   const normalized = {
     issueId: value.issueId,
     issueIdentifier: value.issueIdentifier,
+    projectContextId: optionalNullableString(value.projectContextId, filePath, "projectContextId"),
+    projectContextLabel: optionalNullableString(value.projectContextLabel, filePath, "projectContextLabel"),
+    trackerProjectSlug: optionalNullableString(value.trackerProjectSlug, filePath, "trackerProjectSlug"),
     phase: value.phase,
     reviewRound: nonNegativeInteger(value.reviewRound, filePath, "reviewRound"),
     incompleteTurnCount: nonNegativeInteger(value.incompleteTurnCount, filePath, "incompleteTurnCount"),
@@ -1001,6 +1011,9 @@ function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecy
     ciStatus: optionalNullableString(value.ciStatus, filePath, "summaryPointers.ciStatus"),
     lastPushedAt: optionalNullableString(value.lastPushedAt, filePath, "summaryPointers.lastPushedAt"),
     lastEvidenceCursor: optionalNullableString(value.lastEvidenceCursor, filePath, "summaryPointers.lastEvidenceCursor"),
+    projectContextId: optionalNullableString(value.projectContextId, filePath, "summaryPointers.projectContextId"),
+    projectContextLabel: optionalNullableString(value.projectContextLabel, filePath, "summaryPointers.projectContextLabel"),
+    trackerProjectSlug: optionalNullableString(value.trackerProjectSlug, filePath, "summaryPointers.trackerProjectSlug"),
   };
 }
 

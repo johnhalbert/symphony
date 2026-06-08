@@ -1515,11 +1515,14 @@ describe("projectWebTranscript", () => {
     const payload = projectWebTranscriptWindow(
       transcriptPage({ offset: 25, limit: 100, nextOffset: 125, total: 250, windowKind: "page" }),
       [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "paged message" }],
-      { run: runRecord({ status: "succeeded" }), kind: "page", requestedPage: { offset: 25, limit: 100 }, tailLimit: 500 },
+      { run: runRecord({ status: "succeeded", projectContextId: "docs", projectContextLabel: "Docs", trackerProjectSlug: "DOCS" }), kind: "page", requestedPage: { offset: 25, limit: 100 }, tailLimit: 500 },
     );
 
     expect(payload).toMatchObject({
       schemaVersion: 1,
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      trackerProjectSlug: "DOCS",
       messages: [{ kind: "assistant", text: "paged message" }],
       page: {
         offset: 25,
@@ -1545,7 +1548,7 @@ describe("projectWebTranscript", () => {
     const payload = projectWebTranscriptWindow(
       transcriptPage({ offset: 100, limit: 500, nextOffset: null, total: 101, windowKind: "tail" }),
       [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "tail message" }],
-      { run: runRecord({ status: "running" }), kind: "tail", requestedPage: null, tailLimit: 500 },
+      { run: runRecord({ status: "running", projectContextId: "docs" }), kind: "tail", requestedPage: null, tailLimit: 500 },
     );
 
     expect(payload.window).toMatchObject({ kind: "tail", requested: { offset: null, limit: 500 }, tailLimit: 500 });
@@ -1555,7 +1558,7 @@ describe("projectWebTranscript", () => {
       runStatus: "running",
       tailLimit: 500,
       afterSequence: 101,
-      refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1",
+      refetchHref: "/api/v1/web/sessions/session-1/transcript?refresh=1&projectContextId=docs",
     });
     expect(payload.activeTail.gapFallback).toEqual(payload.recovery);
   });

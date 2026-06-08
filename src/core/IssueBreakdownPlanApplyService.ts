@@ -206,6 +206,7 @@ export function planIssueBreakdownApplicationWritebacks(
       idempotencyKey: `issue-create:${issue.id}:${plan.id}:${index}:${payloadHash}`,
       kind: "issue_create",
       issueId: issue.id,
+      projectContextId: issue.projectContextId ?? null,
       runId: plan.runId,
       payload: {
         parentIssueId: issue.id,
@@ -237,6 +238,7 @@ export function planIssueBreakdownFinalizationWritebacks(
       idempotencyKey: `issue-relation:${issue.id}:${plan.id}:${relation.sourceProposedIssueIndex}:${relation.targetProposedIssueIndex}`,
       kind: "issue_relation",
       issueId: issue.id,
+      projectContextId: issue.projectContextId ?? null,
       runId: plan.runId,
       payload: {
         planId: plan.id,
@@ -256,6 +258,7 @@ export function planIssueBreakdownFinalizationWritebacks(
     idempotencyKey: `comment:${issue.id}:issue-breakdown:${plan.id}:children`,
     kind: "comment",
     issueId: issue.id,
+    projectContextId: issue.projectContextId ?? null,
     runId: plan.runId,
     payload: {
       issueBreakdownPlanId: plan.id,

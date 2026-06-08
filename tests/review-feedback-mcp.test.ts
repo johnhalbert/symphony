@@ -41,6 +41,43 @@ describe("review feedback MCP handoff", () => {
     expect(output).toContain("idempotencyKey");
   });
 
+  it("rejects review feedback when the MCP issue context disagrees with the active lifecycle context", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-feedback-context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    const seededReport = completionReportRecord();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review", branchName: "symphony/TEST-1", projectContextId: "docs" }), {
+      phase: "review",
+      lastCompletionReportId: seededReport.id,
+      completionReports: [seededReport],
+      summaryPointers: { lastRunId: "review-run-1" },
+    });
+    await writeReviewFeedbackMcpContext(contextFile, {
+      issue: issue({ state: "In Review", branchName: "symphony/TEST-1", projectContextId: "eng" }),
+      activeRunId: "review-run-1",
+      role: "reviewer",
+      token: null,
+      expectedToken: null,
+      reviewer: "reviewer-1",
+      phase: "review",
+    });
+    vi.stubGlobal("fetch", async () =>
+      new Response(JSON.stringify({ id: 1, html_url: "https://github.com/acme/symphony/pull/42#pullrequestreview-1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(
+      submitReviewFeedbackFromMcp(
+        { kind: "review", event: "APPROVE", body: "Looks good.", idempotencyKey: "approve-mismatch" },
+        { workflowPath, contextFile },
+      ),
+    ).rejects.toThrow("Review feedback project context does not match the active reviewer issue context");
+  });
+
   it("submits PR review feedback and returns durable structured URLs without exposing tokens", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");

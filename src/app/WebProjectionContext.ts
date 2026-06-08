@@ -1,4 +1,5 @@
 import type { RuntimeSnapshot } from "../core/orchestrator/Orchestrator.js";
+import { projectScopedKey } from "../core/config/ProjectContexts.js";
 import type { Issue, IssueBoardColumnId, IssueBoardColumnMapping, TrackerStateLists } from "../core/types.js";
 import { errorMessage } from "../core/errors.js";
 import type { IssueLifecycleRecord, IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
@@ -17,6 +18,7 @@ export type WebProjectionCacheKeyValue =
   | undefined;
 
 export interface WebProjectionIssueKeyAliasInput {
+  projectContextId?: WebProjectionAliasValue;
   issueId?: WebProjectionAliasValue;
   issueIdentifier?: WebProjectionAliasValue;
   workspaceKey?: WebProjectionAliasValue;
@@ -427,9 +429,18 @@ export function webProjectionIssueKeyAliases(...inputs: readonly WebProjectionIs
   const aliases: string[] = [];
   const seen = new Set<string>();
   for (const input of inputs) {
+    const projectContextId = normalizeWebProjectionAlias(input.projectContextId);
     for (const field of WEB_PROJECTION_ISSUE_KEY_ALIAS_FIELDS) {
       const normalized = normalizeWebProjectionAlias(input[field]);
-      if (normalized !== null && !seen.has(normalized)) {
+      if (normalized === null) continue;
+      if (projectContextId !== null) {
+        const scoped = projectScopedKey(projectContextId, normalized);
+        if (!seen.has(scoped)) {
+          seen.add(scoped);
+          aliases.push(scoped);
+        }
+      }
+      if (!seen.has(normalized)) {
         seen.add(normalized);
         aliases.push(normalized);
       }
@@ -629,7 +640,11 @@ function trackerIssueSourceIndexFromFailure(
 function buildIssueAliasMap(issues: readonly Issue[]): ReadonlyMap<string, Issue> {
   const byAlias = new Map<string, Issue>();
   for (const issue of issues) {
-    for (const alias of webProjectionIssueKeyAliases({ issueId: issue.id, issueIdentifier: issue.identifier })) {
+    for (const alias of webProjectionIssueKeyAliases({
+      projectContextId: issue.projectContextId,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+    })) {
       if (!byAlias.has(alias)) byAlias.set(alias, issue);
     }
   }
@@ -699,6 +714,7 @@ function buildWorkspaceSourceIndex(workspaces: readonly WorkspaceRecord[]): WebP
   const workspaceByIssueKey = new Map<string, WorkspaceRecord>();
   for (const workspace of [...workspaces].sort(compareWorkspacePreference)) {
     for (const alias of webProjectionIssueKeyAliases({
+      projectContextId: workspace.projectContextId,
       issueId: workspace.issueId,
       issueIdentifier: workspace.issueIdentifier,
       workspaceKey: workspace.workspaceKey,
@@ -712,7 +728,11 @@ function buildWorkspaceSourceIndex(workspaces: readonly WorkspaceRecord[]): WebP
 function buildLifecycleSourceIndex(lifecycles: readonly IssueLifecycleRecord[]): WebProjectionLifecycleSourceIndex<IssueLifecycleRecord> {
   const lifecycleByIssueKey = new Map<string, IssueLifecycleRecord>();
   for (const lifecycle of [...lifecycles].sort(compareLifecyclePreference)) {
-    for (const alias of webProjectionIssueKeyAliases({ issueId: lifecycle.issueId, issueIdentifier: lifecycle.issueIdentifier })) {
+    for (const alias of webProjectionIssueKeyAliases({
+      projectContextId: lifecycle.projectContextId,
+      issueId: lifecycle.issueId,
+      issueIdentifier: lifecycle.issueIdentifier,
+    })) {
       if (!lifecycleByIssueKey.has(alias)) lifecycleByIssueKey.set(alias, lifecycle);
     }
   }
@@ -738,6 +758,7 @@ function buildWritebackSourceIndex(
 
 function issueAliasesForRun(run: RunRecord): string[] {
   return webProjectionIssueKeyAliases({
+    projectContextId: run.projectContextId,
     issueId: run.issueId,
     issueIdentifier: run.issueIdentifier,
     workspaceKey: run.workspaceKey,
@@ -751,7 +772,9 @@ function issueAliasesForWriteback(
   runIndex: WebProjectionRunSourceIndex<RunRecord>,
   lifecycleIndex: WebProjectionLifecycleSourceIndex<IssueLifecycleRecord>,
 ): string[] {
-  const aliases = new Set<string>(webProjectionAliasesFromValues([operation.issueId]));
+  const aliases = new Set<string>(
+    webProjectionIssueKeyAliases({ projectContextId: operation.projectContextId, issueId: operation.issueId }),
+  );
   const addAliases = (values: readonly string[]) => values.forEach((alias) => aliases.add(alias));
   const operationRun = operation.runId ? runIndex.runById.get(operation.runId) : null;
   if (operationRun) addAliases(issueAliasesForRun(operationRun));
@@ -759,7 +782,13 @@ function issueAliasesForWriteback(
 
   const lifecycle = lifecycleIndex.lifecycleByIssueKey.get(operation.issueId);
   if (lifecycle) {
-    addAliases(webProjectionIssueKeyAliases({ issueId: lifecycle.issueId, issueIdentifier: lifecycle.issueIdentifier }));
+    addAliases(
+      webProjectionIssueKeyAliases({
+        projectContextId: lifecycle.projectContextId,
+        issueId: lifecycle.issueId,
+        issueIdentifier: lifecycle.issueIdentifier,
+      }),
+    );
     for (const run of runIndex.runsByIssueKey.get(lifecycle.issueId) ?? []) addAliases(issueAliasesForRun(run));
     for (const run of runIndex.runsByIssueKey.get(lifecycle.issueIdentifier) ?? []) addAliases(issueAliasesForRun(run));
   }

@@ -197,6 +197,9 @@ export function toIssueStatusView(issue: Issue): IssueStatusView {
     blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
+    projectContextId: issue.projectContextId ?? null,
+    projectContextLabel: issue.projectContextLabel ?? null,
+    trackerProjectSlug: issue.trackerProjectSlug ?? null,
   };
 }
 
@@ -210,6 +213,9 @@ export interface Workspace {
   gitBranchName?: string;
   repoPath?: string;
   baseRef?: string;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  trackerProjectSlug?: string | null;
 }
 
 export type AgentRunRole = "worker" | "reviewer";
