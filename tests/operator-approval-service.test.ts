@@ -69,6 +69,21 @@ describe("OperatorApprovalService", () => {
     await expect(runStore.getRun("run-1")).resolves.toMatchObject({ pendingApprovalRequestId: null });
   });
 
+  it("backfills default project context attribution for legacy approval records", async () => {
+    const pending = await service.requestPublicationApproval(request());
+    const recordPath = path.join(config.workspace.stateDir, "approval-requests", `${pending.requestId}.json`);
+    const raw = JSON.parse(await (await import("node:fs/promises")).readFile(recordPath, "utf8")) as Record<string, unknown>;
+    delete raw.projectContextId;
+    delete raw.projectContextLabel;
+    await (await import("node:fs/promises")).writeFile(recordPath, `${JSON.stringify(raw, null, 2)}
+`, "utf8");
+
+    await expect(store.get(pending.requestId)).resolves.toMatchObject({
+      projectContextId: "default",
+      projectContextLabel: "Default",
+    });
+  });
+
   it("dedupes pending approvals by run and evidence cursor", async () => {
     const first = service.waitForPublicationApproval(request());
     const pending = await waitForPending();

@@ -4,6 +4,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
 import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
+import { DEFAULT_PROJECT_CONTEXT_ID, DEFAULT_PROJECT_CONTEXT_LABEL } from "../config/ProjectContexts.js";
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 import { isRunActivityCommandPolicyDecisionPayload } from "../runActivity/RunActivityEvent.js";
 import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
@@ -95,6 +96,8 @@ export interface WorkspaceRecord {
   repoPath?: string;
   baseRef?: string;
   gitBranchName?: string;
+  projectContextId?: string;
+  projectContextLabel?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -110,6 +113,8 @@ export interface RunMetadata {
   gitBranchName?: string | null;
   repoPath?: string | null;
   baseRef?: string | null;
+  projectContextId?: string;
+  projectContextLabel?: string | null;
   cancellationRequestedAt?: string | null;
   cancellationSource?: PersistedRunCancellationSource | null;
   cancellationReason?: string | null;
@@ -167,6 +172,8 @@ export interface RunRecord {
   gitBranchName?: string | null;
   repoPath?: string | null;
   baseRef?: string | null;
+  projectContextId?: string;
+  projectContextLabel?: string | null;
   status: RunStatus;
   startedAt: string;
   updatedAt: string;
@@ -295,6 +302,8 @@ export interface StartRunInput {
   gitBranchName?: string;
   repoPath?: string;
   baseRef?: string;
+  projectContextId?: string;
+  projectContextLabel?: string | null;
 }
 
 export interface UpdateRunInput {
@@ -336,16 +345,20 @@ export class FileRunTranscriptStore {
   async upsertWorkspace(record: WorkspaceRecord): Promise<void> {
     await fs.mkdir(this.workspacesDir(), { recursive: true });
     const existing = await this.getWorkspace(record.workspaceKey);
-    await writeJson(this.workspacePath(record.workspaceKey), {
-      ...record,
-      createdAt: existing?.createdAt ?? record.createdAt,
-      updatedAt: record.updatedAt,
-    });
+    await writeJson(
+      this.workspacePath(record.workspaceKey),
+      normalizeWorkspaceRecord({
+        ...record,
+        createdAt: existing?.createdAt ?? record.createdAt,
+        updatedAt: record.updatedAt,
+      }),
+    );
     this.notifyProjectionChanged("workspaces");
   }
 
   async getWorkspace(workspaceKey: string): Promise<WorkspaceRecord | null> {
-    return readJsonIfExists<WorkspaceRecord>(this.workspacePath(workspaceKey));
+    const record = await readJsonIfExists<WorkspaceRecord>(this.workspacePath(workspaceKey));
+    return record ? normalizeWorkspaceRecord(record) : null;
   }
 
   async deleteWorkspace(workspaceKey: string): Promise<void> {
@@ -361,7 +374,7 @@ export class FileRunTranscriptStore {
     const records = await Promise.all(
       entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<WorkspaceRecord>(path.join(this.workspacesDir(), entry))),
     );
-    return records.filter((record): record is WorkspaceRecord => record !== null);
+    return records.filter((record): record is WorkspaceRecord => record !== null).map((record) => normalizeWorkspaceRecord(record));
   }
 
   async findWorkspace(issueIdOrIdentifierOrKey: string): Promise<WorkspaceRecord | null> {
@@ -413,6 +426,12 @@ export class FileRunTranscriptStore {
       ...(input.gitBranchName === undefined ? {} : { gitBranchName: input.gitBranchName }),
       ...(input.repoPath === undefined ? {} : { repoPath: input.repoPath }),
       ...(input.baseRef === undefined ? {} : { baseRef: input.baseRef }),
+      projectContextId: input.projectContextId ?? existing?.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID,
+      ...(input.projectContextLabel !== undefined
+        ? { projectContextLabel: input.projectContextLabel }
+        : existing?.projectContextLabel !== undefined
+          ? { projectContextLabel: existing.projectContextLabel }
+          : { projectContextLabel: defaultProjectContextLabel(input.projectContextId ?? existing?.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID) }),
       status: existing?.status ?? "running",
       startedAt: existing?.startedAt ?? now,
       updatedAt: now,
@@ -688,6 +707,8 @@ function promptPreview(prompt: string): string {
 
 function normalizeRunRecord(record: RunRecord): RunRecord {
   const runPhase = record.runPhase ?? defaultRunPhase(record.role);
+  const projectContextId = record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+  const projectContextLabel = record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
   const harnessId =
     record.harnessId ??
     (record.cursorModel !== undefined ||
@@ -701,6 +722,8 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
     ...record,
     runPhase,
     runKind: record.runKind ?? runKindForPhase(runPhase),
+    projectContextId,
+    ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
     ...(harnessId === undefined ? {} : { harnessId }),
     ...(record.runtimeModel !== undefined
       ? {}
@@ -728,6 +751,20 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
   };
 }
 
+function normalizeWorkspaceRecord(record: WorkspaceRecord): WorkspaceRecord {
+  const projectContextId = record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+  const projectContextLabel = record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  return {
+    ...record,
+    projectContextId,
+    ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+  };
+}
+
+function defaultProjectContextLabel(projectContextId: string): string | null {
+  return projectContextId === DEFAULT_PROJECT_CONTEXT_ID ? DEFAULT_PROJECT_CONTEXT_LABEL : null;
+}
+
 function defaultRunPhase(role: PersistedRunRole): AgentRunPhase {
   if (role === "planner") return "issue_breakdown";
   return role === "reviewer" ? "review" : "implementation";
@@ -746,6 +783,8 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.gitBranchName === undefined ? {} : { gitBranchName: metadata.gitBranchName }),
     ...(metadata.repoPath === undefined ? {} : { repoPath: metadata.repoPath }),
     ...(metadata.baseRef === undefined ? {} : { baseRef: metadata.baseRef }),
+    ...(metadata.projectContextId === undefined ? {} : { projectContextId: metadata.projectContextId }),
+    ...(metadata.projectContextLabel === undefined ? {} : { projectContextLabel: metadata.projectContextLabel }),
     ...(metadata.cancellationRequestedAt === undefined ? {} : { cancellationRequestedAt: metadata.cancellationRequestedAt }),
     ...(metadata.cancellationSource === undefined ? {} : { cancellationSource: metadata.cancellationSource }),
     ...(metadata.cancellationReason === undefined ? {} : { cancellationReason: metadata.cancellationReason }),

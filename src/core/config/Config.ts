@@ -8,6 +8,11 @@ import {
   rawCredentialProfilesSchema,
   type CredentialProfileRegistry,
 } from "./CredentialProfiles.js";
+import {
+  normalizeProjectContextRegistry,
+  rawProjectContextsSchema,
+  type ProjectContextRegistry,
+} from "./ProjectContexts.js";
 
 const stringArray = z.array(z.string());
 
@@ -305,6 +310,7 @@ const rawConfigSchema = z
       .passthrough()
       .optional(),
     credential_profiles: rawCredentialProfilesSchema.optional(),
+    project_contexts: rawProjectContextsSchema.optional(),
   })
   .passthrough();
 
@@ -569,6 +575,7 @@ export interface ServiceConfig {
   writeback: WritebackConfig;
   github: GitHubConfig;
   credentialProfiles: CredentialProfileRegistry;
+  projectContexts: ProjectContextRegistry;
   reviewLoop: ReviewLoopConfig;
   mergePolicy: MergePolicyConfig;
   issueBoard: IssueBoardConfig;
@@ -630,96 +637,44 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
 
   const raw = parsed.data;
   const workflowDir = path.dirname(path.resolve(workflowPath));
-  const trackerKind = raw.tracker?.kind ?? "linear";
-  if (trackerKind !== "linear") {
-    throw new SymphonyError("unsupported_tracker_kind", `Unsupported tracker kind: ${trackerKind}`);
+  const projectContextNormalization = normalizeProjectContextRegistry({
+    rawProjectContexts: raw.project_contexts,
+    rawDefaults: {
+      ...(raw.tracker === undefined ? {} : { tracker: raw.tracker }),
+      ...(raw.workspace === undefined ? {} : { workspace: raw.workspace }),
+      ...(raw.github === undefined ? {} : { github: raw.github }),
+      ...(raw.review_loop === undefined ? {} : { review_loop: raw.review_loop }),
+      ...(raw.issue_breakdown === undefined ? {} : { issue_breakdown: raw.issue_breakdown }),
+      ...(raw.agent === undefined ? {} : { agent: raw.agent }),
+      ...(raw.credential_profiles?.roles === undefined
+        ? {}
+        : {
+            credential_profiles: {
+              roles: raw.credential_profiles.roles,
+            },
+          }),
+    },
+    workflowDir,
+    env,
+    defaultIssueBreakdownPrompt: DEFAULT_ISSUE_BREAKDOWN_PROMPT,
+  });
+  const projectContexts = projectContextNormalization.registry;
+  const defaultProjectContext = projectContexts.byId.get(projectContexts.defaultContextId);
+  if (!defaultProjectContext) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `Normalized default project context "${projectContexts.defaultContextId}" was not found`,
+    );
   }
 
-  const trackerApiKey =
-    resolveConfigString(raw.tracker?.api_key, env) ?? resolveConfigString("$LINEAR_API_KEY", env) ?? "";
-  if (trackerApiKey.length === 0) {
-    throw new SymphonyError("missing_tracker_api_key", "Linear API key is required");
-  }
-
-  const projectSlug = resolveConfigString(raw.tracker?.project_slug, env) ?? "";
-  if (projectSlug.length === 0) {
-    throw new SymphonyError("missing_tracker_project_slug", "Linear project slug is required");
-  }
-  const trackerAssignee =
-    resolveConfigString(raw.tracker?.assignee, env) ?? resolveConfigString("$LINEAR_ASSIGNEE", env) ?? "";
-
-  const workspaceRoot = resolvePathValue(raw.workspace?.root ?? "symphony_workspaces", workflowDir, env);
-  const workspaceStateDir = resolvePathValue(raw.workspace?.state_dir ?? ".symphony", workspaceRoot, env);
-  const sourceKind = raw.workspace?.source?.kind ?? "none";
-  const sourcePath =
-    raw.workspace?.source?.path === undefined
-      ? undefined
-      : resolvePathValue(raw.workspace.source.path, workflowDir, env);
-  const sourceCachePath =
-    raw.workspace?.source?.cache_path === undefined
-      ? undefined
-      : resolvePathValue(raw.workspace.source.cache_path, workflowDir, env);
-  const sourceRepository =
-    raw.workspace?.source?.repository === undefined
-      ? undefined
-      : resolveRepositoryValue(raw.workspace.source.repository, workflowDir, env);
-
-  if (sourceKind === "git_worktree") {
-    if (!raw.workspace?.source?.repository) {
-      throw new SymphonyError("config_validation_error", "workspace.source.repository is required for git_worktree");
-    }
-    if (!raw.workspace?.source?.base_ref) {
-      throw new SymphonyError("config_validation_error", "workspace.source.base_ref is required for git_worktree");
-    }
-  }
-  const issueBreakdownWorkspaceMode = raw.issue_breakdown?.workspace_mode ?? "none";
-  if (issueBreakdownWorkspaceMode === "readonly_checkout") {
-    if (sourceKind !== "git_worktree") {
-      throw new SymphonyError(
-        "config_validation_error",
-        "issue_breakdown.workspace_mode readonly_checkout requires workspace.source.kind git_worktree",
-      );
-    }
-    if (process.platform === "win32") {
-      throw new SymphonyError(
-        "config_validation_error",
-        "issue_breakdown.workspace_mode readonly_checkout is not supported on Windows; use workspace_mode none",
-      );
-    }
-  }
-
-  const workspaceSource: WorkspaceSourceConfig = {
-    kind: sourceKind,
-    ...(sourcePath === undefined ? {} : { path: sourcePath }),
-    ...(sourceRepository === undefined ? {} : { repository: sourceRepository }),
-    ...(raw.workspace?.source?.ref === undefined ? {} : { ref: raw.workspace.source.ref }),
-    ...(raw.workspace?.source?.base_ref === undefined ? {} : { baseRef: raw.workspace.source.base_ref }),
-    ...(raw.workspace?.source?.branch_template === undefined
-      ? {}
-      : { branchTemplate: raw.workspace.source.branch_template }),
-    ...(sourceCachePath === undefined ? {} : { cachePath: sourceCachePath }),
-    ...(raw.workspace?.source?.cleanup === undefined ? {} : { cleanup: raw.workspace.source.cleanup }),
-  };
-
-  const agentHarness = normalizeAgentHarness(raw.agent?.harness);
-  const agentMaxTurns = raw.agent?.max_turns ?? 20;
-  const activeStates = raw.tracker?.active_states ?? DEFAULT_ACTIVE_STATES;
-  const handoffStates = raw.tracker?.handoff_states ?? [];
-  const terminalStates = raw.tracker?.terminal_states ?? DEFAULT_TERMINAL_STATES;
-  const githubOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.owner, env));
-  const githubRepo = normalizeOptionalConfigString(resolveConfigString(raw.github?.repo, env));
-  const githubToken = normalizeOptionalConfigString(
-    resolveConfigString(raw.github?.token, env) ?? resolveConfigString("$GITHUB_TOKEN", env),
-  );
-  const githubApp = normalizeGitHubAppConfig(raw.github?.app, workflowDir, env);
-  const githubHeadOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.head_owner, env)) ?? githubOwner;
-  const publishPullRequests = raw.github?.publish_pull_requests ?? false;
-  const githubOperatorApproval = {
-    requiredForPublication: raw.github?.operator_approval?.required_for_publication ?? false,
-    rejectPolicy: raw.github?.operator_approval?.reject_policy ?? "cancel",
-    pollIntervalMs: raw.github?.operator_approval?.poll_interval_ms ?? 2_000,
-    timeoutMs: raw.github?.operator_approval?.timeout_ms ?? null,
-  };
+  const activeStates = defaultProjectContext.tracker.activeStates;
+  const handoffStates = defaultProjectContext.tracker.handoffStates;
+  const terminalStates = defaultProjectContext.tracker.terminalStates;
+  const reviewStates = defaultProjectContext.reviewLoop.reviewStates;
+  const blockedStates = defaultProjectContext.reviewLoop.blockedStates;
+  const reviewPassState = defaultProjectContext.reviewLoop.reviewPassState;
+  const publishPullRequests = defaultProjectContext.github.publishPullRequests;
+  const pullRequestHandoff = defaultProjectContext.github.prHandoff;
   const cursorModel = raw.cursor?.model ?? DEFAULT_CURSOR_MODEL;
   const cursorModelParams = normalizeCursorModelParams(raw.cursor?.model_params);
   const cursorAllowLargeContext = raw.cursor?.allow_large_context ?? false;
@@ -734,7 +689,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       : resolvePathValue(raw.hermes.templates_dir, workflowDir, env);
   const hermesStateDir =
     raw.hermes?.state_dir === undefined
-      ? path.join(workspaceStateDir, "hermes")
+      ? path.join(defaultProjectContext.workspace.stateDir, "hermes")
       : resolvePathValue(raw.hermes.state_dir, workflowDir, env);
   const legacyHermesAcpBinaryPath = normalizeOptionalConfigString(
     resolveConfigString(raw.hermes?.acp_binary_path ?? raw.hermes?.binary_path, env),
@@ -794,19 +749,23 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     env,
     workflowDir,
     fallbacks: {
-      githubToken,
-      linearApiKey: trackerApiKey,
+      githubToken: defaultProjectContext.github.token,
+      linearApiKey: defaultProjectContext.tracker.apiKey,
       cursorRuntimeApiKey,
       openWorkspaceToken: serverOpenWorkspaceToken,
     },
-  });
-  const reviewStates = raw.review_loop?.review_states ?? handoffStates;
-  const blockedStates = raw.review_loop?.blocked_states ?? [];
-  const reviewPassState = raw.review_loop?.review_pass_state ?? null;
-  const pullRequestHandoff = normalizePullRequestHandoff(raw, {
-    publishPullRequests,
-    handoffStates,
-    reviewStates,
+    contextRoles: projectContextNormalization.contextRoleAssignments,
+    contextFallbacks: new Map(
+      projectContexts.contexts.map((context) => [
+        context.id,
+        {
+          githubToken: context.github.token,
+          linearApiKey: context.tracker.apiKey,
+          cursorRuntimeApiKey,
+          openWorkspaceToken: serverOpenWorkspaceToken,
+        },
+      ]),
+    ),
   });
   const mergePolicy = normalizeMergePolicy(raw, reviewPassState);
   validateStateBuckets({
@@ -838,24 +797,11 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   return {
     workflowPath: path.resolve(workflowPath),
     workflowDir,
-    tracker: {
-      kind: "linear",
-      endpoint: raw.tracker?.endpoint ?? "https://api.linear.app/graphql",
-      apiKey: trackerApiKey,
-      projectSlug,
-      assignee: trackerAssignee.length === 0 ? null : trackerAssignee,
-      activeStates,
-      handoffStates,
-      terminalStates,
-    },
+    tracker: defaultProjectContext.tracker,
     polling: {
       intervalMs: raw.polling?.interval_ms ?? 30_000,
     },
-    workspace: {
-      root: workspaceRoot,
-      stateDir: workspaceStateDir,
-      source: workspaceSource,
-    },
+    workspace: defaultProjectContext.workspace,
     hooks: {
       afterCreate: raw.hooks?.after_create ?? null,
       beforeRun: raw.hooks?.before_run ?? null,
@@ -863,18 +809,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       beforeRemove: raw.hooks?.before_remove ?? null,
       timeoutMs: raw.hooks?.timeout_ms ?? 60_000,
     },
-    agent: {
-      harness: agentHarness,
-      maxConcurrentAgents: raw.agent?.max_concurrent_agents ?? 10,
-      maxTurns: agentMaxTurns,
-      maxRetryBackoffMs: raw.agent?.max_retry_backoff_ms ?? 300_000,
-      maxSdkErrorRetries: raw.agent?.max_sdk_error_retries ?? 2,
-      maxInfraFailures: raw.agent?.max_infra_failures ?? 3,
-      maxConcurrentAgentsByState: normalizeStateLimitMap(raw.agent?.max_concurrent_agents_by_state),
-      requireLabels: normalizeLabels(raw.agent?.require_labels),
-      excludeLabels: normalizeLabels(raw.agent?.exclude_labels),
-      protectedPaths: raw.agent?.protected_paths ?? [],
-    },
+    agent: defaultProjectContext.agent,
     cursor: {
       model: cursorModel,
       mode: raw.cursor?.mode ?? null,
@@ -935,31 +870,10 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       dispatchState: raw.writeback?.dispatch_state ?? "In Progress",
       maxBackoffMs: raw.writeback?.max_backoff_ms ?? 300_000,
     },
-    github: {
-      owner: githubOwner,
-      repo: githubRepo,
-      token: githubToken,
-      app: githubApp,
-      headOwner: githubHeadOwner,
-      apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(raw.github?.api_base_url, env)) ?? "https://api.github.com",
-      publishPullRequests,
-      operatorApproval: githubOperatorApproval,
-      prHandoff: pullRequestHandoff,
-    },
+    github: defaultProjectContext.github,
     credentialProfiles,
-    reviewLoop: {
-      reviewStates,
-      blockedStates,
-      reviewPassState,
-      reviewerPromptTemplate: raw.review_loop?.reviewer_prompt ?? null,
-      reviewerPromptExtensions: normalizePromptExtensions(raw.review_loop?.reviewer_prompt_extensions),
-      workerPromptExtensions: normalizePromptExtensions(raw.review_loop?.worker_prompt_extensions),
-      maxReviewRounds: raw.review_loop?.max_review_rounds ?? 3,
-      maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
-      continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
-      transcriptHistoryLimit: raw.review_loop?.transcript_history_limit ?? raw.review_loop?.continuation_history_threshold ?? 5,
-      prReviewEvidenceLimit: raw.review_loop?.pr_review_evidence_limit ?? 5,
-    },
+    projectContexts,
+    reviewLoop: defaultProjectContext.reviewLoop,
     mergePolicy,
     issueBoard: {
       columns: issueBoard,
@@ -969,22 +883,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       summarizationEnabled: raw.continuation_context?.summarization_enabled ?? false,
     },
     database,
-    issueBreakdown: {
-      enabled: raw.issue_breakdown?.enabled ?? false,
-      cursorMode: raw.issue_breakdown?.cursor_mode ?? "plan",
-      promptTemplate: raw.issue_breakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
-      planningLabels: normalizeLabels(raw.issue_breakdown?.planning_labels),
-      applyToLinear: {
-        enabled: raw.issue_breakdown?.apply_to_linear?.enabled ?? false,
-        mode: raw.issue_breakdown?.apply_to_linear?.mode ?? "child_issues",
-      },
-      workspaceMode: issueBreakdownWorkspaceMode,
-      maxPlanningFailures: raw.issue_breakdown?.max_planning_failures ?? 3,
-      maxPlanningDispatchRetries:
-        raw.issue_breakdown?.max_planning_dispatch_retries ?? raw.issue_breakdown?.max_planning_failures ?? 3,
-      planningRetryBaseMs: raw.issue_breakdown?.planning_retry_base_ms ?? 5_000,
-      planningRetryMaxMs: raw.issue_breakdown?.planning_retry_max_ms ?? 60_000,
-    },
+    issueBreakdown: defaultProjectContext.issueBreakdown,
     raw,
   };
 }

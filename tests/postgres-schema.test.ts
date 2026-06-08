@@ -38,6 +38,10 @@ const projectionBuildModesMigrationUrl = new URL(
   "../migrations/postgres/0006_projection_build_modes.sql",
   import.meta.url,
 );
+const projectContextAttributionMigrationUrl = new URL(
+  "../migrations/postgres/0007_project_context_attribution.sql",
+  import.meta.url,
+);
 const readmeUrl = new URL("../migrations/postgres/README.md", import.meta.url);
 const stateOwnershipUrl = new URL("../docs/state-ownership-and-migration.md", import.meta.url);
 const publishedOwnedStateChecksumSha256 = "8e10c03c6cfa34e9672e350c59ff4998459989529a82c98cbd9f714469799298";
@@ -74,8 +78,13 @@ const requiredLookupIndexes = [
   "chat_message_ordering_idx",
   "chat_message_event_range_idx",
   "writeback_operation_state_idx",
+  "writeback_operation_project_context_idx",
   "approval_request_state_idx",
+  "approval_request_project_context_idx",
   "projection_revision_reads_idx",
+  "workspace_project_context_idx",
+  "issue_project_context_idx",
+  "run_session_project_context_idx",
 ] as const;
 
 const requiredProjectionLookupIndexes = [
@@ -93,9 +102,13 @@ const requiredProjectionLookupIndexes = [
   "transcript_projection_scope_revision_idx",
   "transcript_projection_revision_reads_idx",
   "transcript_projection_session_reads_idx",
+  "issue_board_projection_project_context_idx",
+  "history_projection_project_context_idx",
+  "transcript_projection_project_context_idx",
   "orchestrator_chat_projection_scope_revision_idx",
   "orchestrator_chat_projection_revision_reads_idx",
   "orchestrator_chat_projection_issue_idx",
+  "orchestrator_chat_projection_project_context_idx",
 ] as const;
 
 const projectionFreshnessIndexes = [
@@ -131,6 +144,10 @@ async function projectionBuildModesMigrationSql(): Promise<string> {
   return readFile(projectionBuildModesMigrationUrl, "utf8");
 }
 
+async function projectContextAttributionMigrationSql(): Promise<string> {
+  return readFile(projectContextAttributionMigrationUrl, "utf8");
+}
+
 async function configuredMigrationSql(): Promise<string> {
   const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
   return migrations.map((migration) => migration.sql).join("\n");
@@ -163,17 +180,20 @@ describe("Postgres Symphony-owned state migration", () => {
       "0004_run_activity_canonical_channels",
       "0005_projection_source_freshness",
       "0006_projection_build_modes",
+      "0007_project_context_attribution",
     ]);
     const ownedState = migrations.find((migration) => migration.id === "0002_symphony_owned_state");
     const projectionFreshness = migrations.find((migration) => migration.id === "0003_projection_freshness_indexes");
     const canonicalChannels = migrations.find((migration) => migration.id === "0004_run_activity_canonical_channels");
     const projectionSourceFreshness = migrations.find((migration) => migration.id === "0005_projection_source_freshness");
     const projectionBuildModes = migrations.find((migration) => migration.id === "0006_projection_build_modes");
+    const projectContextAttribution = migrations.find((migration) => migration.id === "0007_project_context_attribution");
     expect(ownedState?.filePath).toBe(fileURLToPath(ownedStateMigrationUrl));
     expect(projectionFreshness?.filePath).toBe(fileURLToPath(projectionFreshnessMigrationUrl));
     expect(canonicalChannels?.filePath).toBe(fileURLToPath(canonicalChannelMigrationUrl));
     expect(projectionSourceFreshness?.filePath).toBe(fileURLToPath(projectionSourceFreshnessMigrationUrl));
     expect(projectionBuildModes?.filePath).toBe(fileURLToPath(projectionBuildModesMigrationUrl));
+    expect(projectContextAttribution?.filePath).toBe(fileURLToPath(projectContextAttributionMigrationUrl));
     expect(sha256(ownedState?.sql ?? "")).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.checksumSha256).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_session");
@@ -187,6 +207,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(canonicalChannels?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionSourceFreshness?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionBuildModes?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
+    expect(projectContextAttribution?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
   });
 
   it("delivers projection updated_at columns and freshness indexes through the follow-up migration", async () => {
@@ -209,6 +230,34 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain(
       "on symphony.orchestrator_chat_projection (issue_key, revision desc, updated_at desc)",
     );
+  });
+
+  it("delivers default-context attribution columns and indexes through a follow-up migration", async () => {
+    const normalized = normalizedSql(await projectContextAttributionMigrationSql());
+
+    for (const fragment of [
+      "alter table symphony.workspace add column if not exists project_context_id text not null default 'default'",
+      "alter table symphony.issue add column if not exists project_context_id text not null default 'default'",
+      "alter table symphony.run_session add column if not exists project_context_id text not null default 'default'",
+      "alter table symphony.writeback_operation add column if not exists project_context_id text not null default 'default'",
+      "alter table symphony.approval_request add column if not exists project_context_id text not null default 'default'",
+      "alter table symphony.issue_board_projection add column if not exists project_context_id text not null default 'default'",
+      "alter table symphony.history_projection add column if not exists project_context_id text not null default 'default'",
+      "alter table symphony.transcript_projection add column if not exists project_context_id text not null default 'default'",
+      "alter table symphony.orchestrator_chat_projection add column if not exists project_context_id text not null default 'default'",
+      "add column if not exists project_context_label text",
+      "create index if not exists workspace_project_context_idx",
+      "create index if not exists issue_project_context_idx",
+      "create index if not exists run_session_project_context_idx",
+      "create index if not exists writeback_operation_project_context_idx",
+      "create index if not exists approval_request_project_context_idx",
+      "create index if not exists issue_board_projection_project_context_idx",
+      "create index if not exists history_projection_project_context_idx",
+      "create index if not exists transcript_projection_project_context_idx",
+      "create index if not exists orchestrator_chat_projection_project_context_idx",
+    ]) {
+      expect(normalized).toContain(fragment);
+    }
   });
 
   it("delivers canonical run activity channels through a checksum-safe follow-up migration", async () => {
@@ -273,11 +322,20 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain("on symphony.chat_message (thread_key, message_index)");
     expect(normalized).toContain("on symphony.chat_message (run_id, event_sequence_start, event_sequence_end)");
     expect(normalized).toContain("on symphony.writeback_operation (status, next_attempt_at, created_at)");
+    expect(normalized).toContain("on symphony.writeback_operation (project_context_id, created_at desc)");
     expect(normalized).toContain("on symphony.approval_request (status, expires_at, requested_at)");
+    expect(normalized).toContain("on symphony.approval_request (project_context_id, requested_at desc)");
+    expect(normalized).toContain("on symphony.workspace (project_context_id, updated_at desc)");
+    expect(normalized).toContain("on symphony.issue (project_context_id, updated_at desc)");
+    expect(normalized).toContain("on symphony.run_session (project_context_id, started_at desc)");
     expect(normalized).toContain("on symphony.projection_revision (projection_name, scope_kind, scope_key, revision desc, updated_at desc, generated_at desc)");
     expect(normalized).toContain("on symphony.dashboard_projection (scope_key, revision desc, updated_at desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.issue_board_projection (project_context_id, revision desc, updated_at desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.history_projection (project_context_id, revision desc, updated_at desc, generated_at desc)");
     expect(normalized).toContain("on symphony.transcript_projection (run_id, revision desc, updated_at desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.transcript_projection (project_context_id, revision desc, updated_at desc, generated_at desc)");
     expect(normalized).toContain("on symphony.orchestrator_chat_projection (scope_key, conversation_key, revision desc, updated_at desc, generated_at desc)");
+    expect(normalized).toContain("on symphony.orchestrator_chat_projection (project_context_id, revision desc, updated_at desc, generated_at desc)");
   });
 
   it("declares run activity and chat message fields for replay, reconstruction, and idempotency", async () => {

@@ -79,6 +79,29 @@ describe("FileWritebackOutboxStore", () => {
   });
 
 
+  it("backfills default project context attribution for legacy writeback operations", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const record = await store.enqueueOnce({
+      idempotencyKey: "comment:issue-1:legacy-context",
+      kind: "comment",
+      issueId: "issue-1",
+      payload: { body: "legacy", dedupeKey: "legacy-context" },
+    });
+
+    const [entry] = await readdir(path.join(root, "writeback"));
+    const recordPath = path.join(root, "writeback", entry!);
+    const raw = JSON.parse(await nodeFs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+    delete raw.projectContextId;
+    delete raw.projectContextLabel;
+    await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}
+`, "utf8");
+
+    await expect(new FileWritebackOutboxStore(root).get(record.idempotencyKey)).resolves.toMatchObject({
+      projectContextId: "default",
+      projectContextLabel: "Default",
+    });
+  });
+
   it("tracks projection revisions for successful outbox writes only", async () => {
     const store = new FileWritebackOutboxStore(root);
     const events: Array<{ source: string; revision: number }> = [];

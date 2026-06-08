@@ -4,10 +4,11 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import YAML from "yaml";
 import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Config.js";
+import { projectContextRegistryPublicMetadata } from "../src/core/config/ProjectContexts.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
 import { WorkflowLoader, parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
-import { issue } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, projectContextFixture } from "./helpers.js";
 
 describe("workflow loading and prompt rendering", () => {
   it("parses YAML front matter and markdown body", () => {
@@ -128,6 +129,158 @@ Work on {{ issue.identifier }}.`,
       canceled: ["Cancelled", "Canceled", "Duplicate"],
     });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
+  });
+
+  it("surfaces a legacy default project context when explicit contexts are absent", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.projectContexts.defaultContextId).toBe("default");
+    expect(config.projectContexts.contexts).toHaveLength(1);
+    expect(config.projectContexts.contexts[0]).toMatchObject({
+      id: "default",
+      label: "Default",
+      source: "legacy_default",
+      linearProjectIdentity: {
+        kind: "linear",
+        slug: "TEST",
+      },
+      codebaseIdentity: {
+        sourceKind: "none",
+      },
+    });
+    expect(config.tracker).toEqual(config.projectContexts.contexts[0]?.tracker);
+    expect(config.issueBreakdown).toEqual(config.projectContexts.contexts[0]?.issueBreakdown);
+  });
+
+  it("parses explicit project contexts with scoped credential overrides and legacy fallbacks", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          credential_profiles: {
+            profiles: {
+              "shared-gh": { value: "$SHARED_GITHUB_TOKEN", capabilities: ["github.discovery"] },
+              "docs-gh": { value: "$DOCS_GITHUB_TOKEN", capabilities: ["github.discovery"] },
+            },
+            roles: {
+              worker: {
+                "github.discovery": "shared-gh",
+              },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+            credential_profiles: {
+              roles: {
+                worker: {
+                  "github.discovery": "docs-gh",
+                },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+        SHARED_GITHUB_TOKEN: "shared-gh-secret",
+        DOCS_GITHUB_TOKEN: "docs-gh-secret",
+      },
+    );
+
+    expect(config.projectContexts.defaultContextId).toBe("symphony");
+    expect(config.tracker.projectSlug).toBe("SYMPHONY");
+    expect(config.projectContexts.contexts.map((context) => context.id)).toEqual(["symphony", "docs"]);
+    expect(config.projectContexts.byId.get("docs")?.codebaseIdentity.repository).toBe(path.resolve("/repo/../docs-site"));
+    expect(config.credentialProfiles.resolveForRole("worker", "github.discovery", "symphony")).toMatchObject({
+      source: "profile",
+      profileName: "shared-gh",
+      value: "shared-gh-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("worker", "github.discovery", "docs")).toMatchObject({
+      source: "profile",
+      profileName: "docs-gh",
+      value: "docs-gh-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("worker", "linear.tracker", "symphony")).toMatchObject({
+      source: "legacy",
+      profileName: null,
+      value: "linear-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("worker", "linear.tracker", "docs")).toMatchObject({
+      source: "legacy",
+      profileName: null,
+      value: "docs-linear-secret",
+    });
+  });
+
+  it("redacts secret values from project context public metadata", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: { token: "$ROOT_GITHUB_TOKEN" },
+          credential_profiles: {
+            profiles: {
+              "shared-gh": { value: "$SHARED_GITHUB_TOKEN", capabilities: ["github.discovery"] },
+            },
+            roles: {
+              worker: {
+                "github.discovery": "shared-gh",
+              },
+            },
+          },
+        },
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        ROOT_GITHUB_TOKEN: "root-gh-secret",
+        SHARED_GITHUB_TOKEN: "shared-gh-secret",
+      },
+    );
+
+    const metadata = projectContextRegistryPublicMetadata(config.projectContexts);
+    const serialized = JSON.stringify(metadata);
+    expect(serialized).not.toContain("root-gh-secret");
+    expect(serialized).not.toContain("shared-gh-secret");
+    expect(metadata[0]?.github.tokenPresent).toBe(true);
+    expect(metadata[0]?.credentialProfiles.worker["github.discovery"]).toBe("shared-gh");
+  });
+
+  it("rejects enabled project contexts without workspace source configuration", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY" },
+          project_contexts: [
+            {
+              id: "docs",
+              tracker: { project_slug: "DOCS" },
+            },
+          ],
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("project context docs: enabled project contexts require workspace.source.kind other than none");
   });
 
   it("parses database-only config for migration commands without requiring tracker credentials", () => {

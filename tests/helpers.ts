@@ -57,6 +57,9 @@ type TestReviewLoopConfig = NonNullable<RawWorkflowConfig["review_loop"]>;
 type TestIssueBreakdownConfig = NonNullable<RawWorkflowConfig["issue_breakdown"]>;
 type TestAgentConfig = NonNullable<RawWorkflowConfig["agent"]>;
 type TestCredentialProfilesConfig = NonNullable<RawWorkflowConfig["credential_profiles"]>;
+type TestPollingConfig = NonNullable<RawWorkflowConfig["polling"]>;
+type TestProjectContextConfig = NonNullable<NonNullable<RawWorkflowConfig["project_contexts"]>[number]>;
+type TestProjectContextCredentialProfilesConfig = NonNullable<TestProjectContextConfig["credential_profiles"]>;
 
 export type TestProjectRoutingSource =
   | "candidate_poll"
@@ -65,22 +68,18 @@ export type TestProjectRoutingSource =
   | "operator_request"
   | "replay";
 
-export interface TestProjectContextFixture {
-  id: string;
-  label?: string;
-  enabled?: boolean;
-  tracker?: TestTrackerConfig;
-  workspace?: TestWorkspaceConfig;
-  github?: TestGitHubConfig;
-  review_loop?: TestReviewLoopConfig;
-  issue_breakdown?: TestIssueBreakdownConfig;
-  agent?: TestAgentConfig;
-  credential_profiles?: TestCredentialProfilesConfig;
-}
+export type TestProjectContextFixture = TestProjectContextConfig;
 
-export interface TestMultiProjectWorkflowConfig extends RawWorkflowConfig {
+export type TestMultiProjectWorkflowConfig = Omit<
+  RawWorkflowConfig,
+  "tracker" | "workspace" | "polling" | "agent" | "project_contexts"
+> & {
+  tracker: TestTrackerConfig;
+  workspace: TestWorkspaceConfig;
+  polling: TestPollingConfig;
+  agent: TestAgentConfig;
   project_contexts: TestProjectContextFixture[];
-}
+};
 
 export interface TrackerIssueFixture extends Issue {
   projectContextId: string;
@@ -118,7 +117,7 @@ export interface ProjectContextFixtureOverrides {
   review_loop?: Partial<TestReviewLoopConfig>;
   issue_breakdown?: Partial<TestIssueBreakdownConfig>;
   agent?: Partial<TestAgentConfig>;
-  credential_profiles?: TestCredentialProfilesConfig;
+  credential_profiles?: TestProjectContextCredentialProfilesConfig;
 }
 
 export interface MultiProjectWorkflowConfigOverrides {

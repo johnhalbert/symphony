@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
+import { DEFAULT_PROJECT_CONTEXT_ID, DEFAULT_PROJECT_CONTEXT_LABEL } from "../config/ProjectContexts.js";
 import { SymphonyError } from "../errors.js";
 import type { RunTranscriptStore, TranscriptEvent } from "../persistence/RunTranscriptStore.js";
 
@@ -36,6 +37,8 @@ export interface OperatorApprovalRecord {
   resolvedBy: "operator" | "system" | null;
   decision: OperatorApprovalDecision | null;
   staleReason: string | null;
+  projectContextId?: string;
+  projectContextLabel?: string | null;
 }
 
 export interface OperatorApprovalResolution {
@@ -49,6 +52,8 @@ export interface OperatorApprovalRequestInput {
   runId: string;
   evidenceCursor: string;
   action: OperatorApprovalAction;
+  projectContextId?: string;
+  projectContextLabel?: string | null;
 }
 
 export const OPERATOR_REJECTED_PUBLICATION_ERROR = "Operator rejected push/PR publication";
@@ -63,6 +68,7 @@ export class FileOperatorApprovalStore {
 
     const requestedAt = new Date().toISOString();
     const requestId = requestIdFor(dedupeKey(input.runId, input.evidenceCursor));
+    const projectContextId = input.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
     const record: OperatorApprovalRecord = {
       requestId,
       status: "pending",
@@ -78,13 +84,18 @@ export class FileOperatorApprovalStore {
       resolvedBy: null,
       decision: null,
       staleReason: null,
+      projectContextId,
+      ...(input.projectContextLabel === undefined
+        ? { projectContextLabel: defaultProjectContextLabel(projectContextId) }
+        : { projectContextLabel: input.projectContextLabel }),
     };
     await this.write(record);
     return { record, created: true };
   }
 
   async get(requestId: string): Promise<OperatorApprovalRecord | null> {
-    return readJsonIfExists<OperatorApprovalRecord>(this.recordPath(requestId));
+    const record = await readJsonIfExists<OperatorApprovalRecord>(this.recordPath(requestId));
+    return record ? normalizeOperatorApprovalRecord(record) : null;
   }
 
   async getByDedupe(runId: string, evidenceCursor: string): Promise<OperatorApprovalRecord | null> {
@@ -113,7 +124,7 @@ export class FileOperatorApprovalStore {
       const records = await Promise.all(
         entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<OperatorApprovalRecord>(path.join(this.recordsDir(), entry))),
       );
-      return records.filter((record): record is OperatorApprovalRecord => record !== null);
+      return records.filter((record): record is OperatorApprovalRecord => record !== null).map((record) => normalizeOperatorApprovalRecord(record));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
@@ -478,6 +489,20 @@ function dedupeKey(runId: string, evidenceCursor: string): string {
 
 function requestIdFor(value: string): string {
   return `approval_${createHash("sha256").update(value).digest("hex").slice(0, 16)}`;
+}
+
+function normalizeOperatorApprovalRecord(record: OperatorApprovalRecord): OperatorApprovalRecord {
+  const projectContextId = record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+  const projectContextLabel = record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  return {
+    ...record,
+    projectContextId,
+    ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+  };
+}
+
+function defaultProjectContextLabel(projectContextId: string): string | null {
+  return projectContextId === DEFAULT_PROJECT_CONTEXT_ID ? DEFAULT_PROJECT_CONTEXT_LABEL : null;
 }
 
 function latestPending(records: OperatorApprovalRecord[]): OperatorApprovalRecord | null {
