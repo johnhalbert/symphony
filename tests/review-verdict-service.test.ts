@@ -77,6 +77,30 @@ describe("ReviewVerdictService", () => {
     });
   });
 
+  it("persists non-default project context on fail verdict writebacks", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+    const docsIssue = issue({
+      state: "In Review",
+      branchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, {
+      phase: "review",
+      reviewRound: 0,
+    });
+
+    await service.submitReviewVerdict(
+      failVerdict({ idempotencyKey: "verdict-docs-1" }),
+      context({ issue: docsIssue }),
+    );
+
+    const operations = await outbox.list();
+    expect(operations).toHaveLength(2);
+    expect(operations.every((operation) => operation.projectContextId === "docs")).toBe(true);
+    expect(operations.every((operation) => operation.projectContextLabel === "Documentation Site")).toBe(true);
+  });
+
   it("increments review rounds on each accepted fail verdict", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {

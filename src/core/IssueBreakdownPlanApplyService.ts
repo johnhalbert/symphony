@@ -15,6 +15,10 @@ import type {
   WritebackProcessor,
 } from "./writeback/WritebackOutbox.js";
 import { ISSUE_BREAKDOWN_PLAN_STALE_REASON } from "./writeback/WritebackOutbox.js";
+import {
+  stampWritebackProjectContexts,
+  writebackProjectContextFromIssue,
+} from "./writeback/ProjectContextAttribution.js";
 
 export type IssueBreakdownPlanApplyResult =
   | { status: "not_required"; reason: string }
@@ -199,28 +203,31 @@ export function planIssueBreakdownApplicationWritebacks(
   issue: Issue,
   plan: IssueBreakdownPlanRecord,
 ): NewWritebackOperation[] {
-  return plan.proposedIssues.map((proposedIssue, index) => {
-    const payloadHash = proposalHash(proposedIssue);
-    const dedupeKey = `issue-breakdown:${plan.id}:${index}:${payloadHash}`;
-    return {
-      idempotencyKey: `issue-create:${issue.id}:${plan.id}:${index}:${payloadHash}`,
-      kind: "issue_create",
-      issueId: issue.id,
-      runId: plan.runId,
-      payload: {
-        parentIssueId: issue.id,
-        planId: plan.id,
-        proposedIssueIndex: index,
-        title: proposedIssue.title,
-        description: proposedIssue.description,
-        acceptanceCriteria: proposedIssue.acceptanceCriteria,
-        requestedLabels: proposedIssue.labels,
-        dependencies: proposedIssue.dependencies,
-        dedupeKey,
-        payloadHash,
-      },
-    };
-  });
+  return stampWritebackProjectContexts(
+    plan.proposedIssues.map((proposedIssue, index) => {
+      const payloadHash = proposalHash(proposedIssue);
+      const dedupeKey = `issue-breakdown:${plan.id}:${index}:${payloadHash}`;
+      return {
+        idempotencyKey: `issue-create:${issue.id}:${plan.id}:${index}:${payloadHash}`,
+        kind: "issue_create",
+        issueId: issue.id,
+        runId: plan.runId,
+        payload: {
+          parentIssueId: issue.id,
+          planId: plan.id,
+          proposedIssueIndex: index,
+          title: proposedIssue.title,
+          description: proposedIssue.description,
+          acceptanceCriteria: proposedIssue.acceptanceCriteria,
+          requestedLabels: proposedIssue.labels,
+          dependencies: proposedIssue.dependencies,
+          dedupeKey,
+          payloadHash,
+        },
+      };
+    }),
+    writebackProjectContextFromIssue(issue),
+  );
 }
 
 export function planIssueBreakdownFinalizationWritebacks(
@@ -263,7 +270,7 @@ export function planIssueBreakdownFinalizationWritebacks(
       body: renderParentComment(issue, plan),
     },
   });
-  return operations;
+  return stampWritebackProjectContexts(operations, writebackProjectContextFromIssue(issue));
 }
 
 function createdIssueRefFromOperation(operation: WritebackOperation): IssueBreakdownCreatedIssueRef | null {

@@ -9,6 +9,10 @@ import {
   planIssueBreakdownFinalizationWritebacks,
 } from "../src/core/IssueBreakdownPlanApplyService.js";
 import {
+  planCompletionReportAcceptedWritebacks,
+  planRunStartedComment,
+} from "../src/core/writeback/TransitionPolicy.js";
+import {
   issueBreakdownConfigFingerprint,
   issueContentFingerprint,
   IssueBreakdownPlanService,
@@ -100,6 +104,73 @@ describe("FileWritebackOutboxStore", () => {
       projectContextId: "default",
       projectContextLabel: "Default",
     });
+  });
+
+  it("persists non-default project context from planned run-started comments", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const config = reviewLoopWritebackConfig(root);
+    const docsIssue = issue({ state: "In Progress", branchName: "symphony/DOCS-1", projectContextId: "docs", projectContextLabel: "Documentation Site" });
+
+    const operation = planRunStartedComment({
+      issue: docsIssue,
+      runId: "run-docs-started-1",
+      sessionId: "session-docs-started-1",
+      workspacePath: "/tmp/docs-workspace",
+    }, config);
+
+    expect(operation).not.toBeNull();
+    await store.enqueueOnce(operation!);
+
+    await expect(store.get(operation!.idempotencyKey)).resolves.toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+  });
+
+  it("persists non-default project context from planned completion-report accepted writebacks", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const config = reviewLoopWritebackConfig(root);
+    const docsIssue = issue({ state: "In Progress", branchName: "symphony/DOCS-1", projectContextId: "docs", projectContextLabel: "Documentation Site" });
+
+    const operations = planCompletionReportAcceptedWritebacks({
+      issue: docsIssue,
+      runId: "run-docs-completion-1",
+      sessionId: "session-docs-completion-1",
+      workspacePath: "/tmp/docs-workspace",
+    }, config, "Documentation update is ready for review.");
+
+    expect(operations).toHaveLength(2);
+    for (const operation of operations) await store.enqueueOnce(operation);
+
+    const records = await store.list();
+    expect(records).toHaveLength(2);
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectContextId: "docs", projectContextLabel: "Documentation Site" }),
+      ]),
+    );
+    expect(records.every((record) => record.projectContextId === "docs" && record.projectContextLabel === "Documentation Site")).toBe(true);
+  });
+
+  it("persists non-default project context from issue breakdown application and finalization writebacks", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const config = reviewLoopWritebackConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const parentIssue = issue({ state: "In Progress", identifier: "DOCS-1", branchName: "symphony/DOCS-1", projectContextId: "docs", projectContextLabel: "Documentation Site" });
+    const plan = await submitTwoChildPlan(config, lifecycleStore, parentIssue, "plan-docs-context", "run-docs-plan");
+
+    const applicationOps = planIssueBreakdownApplicationWritebacks(parentIssue, plan) as IssueCreateWriteback[];
+    const finalizationOps = planIssueBreakdownFinalizationWritebacks(parentIssue, {
+      ...plan,
+      createdIssueRefs: applicationOps.map((operation) => createdIssueRefForOperation(operation)),
+    });
+
+    for (const operation of [...applicationOps, ...finalizationOps]) await store.enqueueOnce(operation);
+
+    const records = await store.list();
+    expect(records).toHaveLength(applicationOps.length + finalizationOps.length);
+    expect(records.every((record) => record.projectContextId === "docs" && record.projectContextLabel === "Documentation Site")).toBe(true);
   });
 
   it("tracks projection revisions for successful outbox writes only", async () => {
@@ -1283,6 +1354,16 @@ function legacyParentCommentOperation(idempotencyKey: string) {
       dedupeKey: "issue-breakdown-children:plan-1",
     },
   };
+}
+
+function reviewLoopWritebackConfig(workspaceRoot: string): ServiceConfig {
+  const config = testConfig(workspaceRoot);
+  config.writeback.enabled = true;
+  config.writeback.dispatchState = "In Progress";
+  config.reviewLoop.reviewStates = ["In Review"];
+  config.reviewLoop.blockedStates = ["Blocked"];
+  config.reviewLoop.reviewPassState = "Ready to Merge";
+  return config;
 }
 
 function createdIssueRef(): IssueBreakdownCreatedIssueRef {

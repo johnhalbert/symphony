@@ -20,6 +20,11 @@ import type {
 import { OPERATOR_REJECTED_PUBLICATION_ERROR } from "./approval/OperatorApprovalService.js";
 import type { Issue, Workspace } from "./types.js";
 import {
+  mergeWritebackProjectContexts,
+  writebackProjectContextFromIssue,
+  writebackProjectContextFromLifecycle,
+} from "./writeback/ProjectContextAttribution.js";
+import {
   planCompletionReportAcceptedWritebacks,
   planCompletionReportPublicationApprovalPendingWritebacks,
   planCompletionReportPublicationApprovalTerminalWritebacks,
@@ -1089,6 +1094,10 @@ function recoveryContextFor(input: {
   run: ExistingRunRecord;
   config: ServiceConfig;
 }): CompletionReportActiveContext {
+  const projectContext = mergeWritebackProjectContexts(
+    writebackProjectContextFromLifecycle(input.lifecycle),
+    writebackProjectContextFromIssue(input.issue),
+  );
   const branchName =
     input.pendingReport.branchName ??
     input.lifecycle.summaryPointers.gitBranchName ??
@@ -1118,6 +1127,7 @@ function recoveryContextFor(input: {
       identifier: input.pendingReport.issueIdentifier,
       state: input.config.writeback.dispatchState,
       branchName,
+      ...projectContext,
     },
     activeRunId: input.pendingReport.runId,
     role: "worker",
