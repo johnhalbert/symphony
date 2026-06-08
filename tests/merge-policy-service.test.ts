@@ -66,7 +66,7 @@ describe("MergePolicyService", () => {
     });
     expect(currentIssue.state).toBe("Done");
     expect(writer.transitions).toEqual([
-      { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+      { issueId: "issue-1", projectContextId: null, fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
     ]);
     expect(lifecycle?.merge).toMatchObject({
       pullRequest: {
@@ -112,7 +112,7 @@ describe("MergePolicyService", () => {
     expect(currentIssue.state).toBe("In Progress");
     expect(writer.transitions).toEqual([
       {
-        issueId: "issue-1",
+        issueId: "issue-1", projectContextId: null,
         fromStates: ["Ready to Merge", "In Progress"],
         toState: "In Progress",
         reason: "Symphony merge gate head superseded",
@@ -186,7 +186,7 @@ describe("MergePolicyService", () => {
     expect(result.status).toBe("merged");
     expect(client.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-2" });
     expect(writer.transitions).toEqual([
-      { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+      { issueId: "issue-1", projectContextId: null, fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
     ]);
     expect(writer.comments).toEqual([]);
     expect(lifecycle?.reviewRound).toBe(1);
@@ -269,7 +269,7 @@ describe("MergePolicyService", () => {
     expect(client.mergeInput).toBeNull();
     expect(currentIssue.state).toBe("In Progress");
     expect(writer.transitions).toEqual([
-      { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "In Progress", reason: "Symphony merge gate required CI repair" },
+      { issueId: "issue-1", projectContextId: null, fromStates: ["Ready to Merge"], toState: "In Progress", reason: "Symphony merge gate required CI repair" },
     ]);
     expect(lifecycle?.mergeGate).toMatchObject({
       id: "merge-gate:issue-1:pr-42:head-sha-2",
@@ -372,7 +372,7 @@ describe("MergePolicyService", () => {
     expect(currentIssue.state).toBe("In Progress");
     expect(writer.transitions).toEqual([
       {
-        issueId: "issue-1",
+        issueId: "issue-1", projectContextId: null,
         fromStates: ["Ready to Merge"],
         toState: "In Progress",
         reason: "Symphony merge gate required PR repair",
@@ -764,7 +764,7 @@ describe("MergePolicyService", () => {
     expect(client.mergeCalls).toBe(1);
     expect(currentIssue.state).toBe("Done");
     expect(writer.transitions).toEqual([
-      { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+      { issueId: "issue-1", projectContextId: null, fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
     ]);
   });
 
@@ -1154,7 +1154,7 @@ describe("MergePolicyService", () => {
     expect(client.mergeInput).toBeNull();
     expect(writer.transitions).toEqual([
       {
-        issueId: "issue-1",
+        issueId: "issue-1", projectContextId: null,
         fromStates: ["Ready to Merge"],
         toState: "In Progress",
         reason: "Symphony merge gate required CI repair",
@@ -1290,7 +1290,7 @@ describe("MergePolicyService", () => {
     expect(result.status).toBe("repair_dispatched");
     expect(secondWriter.transitions).toEqual([
       {
-        issueId: "issue-1",
+        issueId: "issue-1", projectContextId: null,
         fromStates: ["Ready to Merge"],
         toState: "In Progress",
         reason: "Symphony merge gate required CI repair",
@@ -1353,7 +1353,7 @@ describe("MergePolicyService", () => {
     expect(result.status).toBe("blocked");
     expect(writer.transitions).toEqual([
       {
-        issueId: "issue-1",
+        issueId: "issue-1", projectContextId: null,
         fromStates: ["Ready to Merge"],
         toState: "Blocked",
         reason: "Symphony merge gate repair ceiling reached",
@@ -1659,7 +1659,7 @@ describe("MergePolicyService", () => {
     expect(mergeClient.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-1" });
     expect(mergeWriter.comments).toEqual([]);
     expect(mergeWriter.transitions).toEqual([
-      { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+      { issueId: "issue-1", projectContextId: null, fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
     ]);
     expect(lifecycle?.mergeGate).toMatchObject({
       status: "resolved",
@@ -2115,7 +2115,7 @@ describe("MergePolicyService", () => {
     expect(result.status).toBe("repair_dispatched");
     expect(writer.transitions).toEqual([
       {
-        issueId: "issue-1",
+        issueId: "issue-1", projectContextId: null,
         fromStates: ["In Progress"],
         toState: "In Progress",
         reason: "Symphony merge gate required CI repair",
@@ -2164,7 +2164,7 @@ describe("MergePolicyService", () => {
     expect(client.mergeInput).toBeNull();
     expect(writer.transitions).toEqual([
       {
-        issueId: "issue-1",
+        issueId: "issue-1", projectContextId: null,
         fromStates: ["Ready to Merge"],
         toState: "Blocked",
         reason: "Symphony merge gate repair ceiling reached",
@@ -2369,7 +2369,7 @@ describe("MergePolicyService", () => {
     await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(/Done writeback could not be verified/);
     expect(client.mergeInput).toMatchObject({ expectedHeadSha: "head-sha-1" });
     expect(writer.transitions).toEqual([
-      { issueId: "issue-1", fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+      { issueId: "issue-1", projectContextId: null, fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
     ]);
     expect(currentIssue.state).toBe("Ready to Merge");
   });

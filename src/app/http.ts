@@ -1406,7 +1406,10 @@ export class StatusServer {
     const sourceIndex = projection?.sourceIndex ?? null;
     const issueBoardColumns = projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns();
     const sourceRevisions = statusServerProjectionSourceRevisions(sourceIndex, this.options);
-    const snapshot = sourceIndex?.runtime.snapshot ?? this.options.orchestrator.snapshot();
+    const sourceRuntimeSnapshot = sourceIndex?.runtime.snapshot ?? null;
+    const snapshot = sourceRuntimeSnapshot ?? this.options.orchestrator.snapshot();
+    const projectionRuntime =
+      (snapshot.running?.length ?? 0) > 0 || (snapshot.providerGates?.length ?? 0) > 0 ? snapshot : null;
     let board: IssueBoardResponse | null = null;
 
     if (sourceIndex && statusServerProjectionRebuildNeedsIssueBoard(projectionNames)) {
@@ -1431,7 +1434,7 @@ export class StatusServer {
         includeTranscriptEvents: false,
       });
       const dashboard = projectWebDashboard({
-        runtime: snapshot,
+        runtime: projectionRuntime,
         board,
         activity,
         runs: sourceIndex?.runs.runs ?? activitySources.runs,
@@ -1472,7 +1475,7 @@ export class StatusServer {
       });
       const dashboardActivity = previewActivityFeed(historyActivity, 20);
       const dashboard = projectWebDashboard({
-        runtime: snapshot,
+        runtime: projectionRuntime,
         board,
         activity: dashboardActivity,
         runs: sourceIndex?.runs.runs ?? activitySources.runs,
@@ -1987,18 +1990,7 @@ export class StatusServer {
   private async fetchWebDashboard(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebDashboard>>> {
     const durableDashboard = await this.webProjectionRepositories.dashboard.readCurrent({ forceRefresh });
     if (durableDashboard.status === "hit" && durableDashboard.record) {
-      const dashboard = durableDashboard.record.payload;
-      const snapshot = this.options.orchestrator.snapshot();
-      const runningAgents = projectRunningAgents(snapshot, snapshot.generatedAt);
-      return webProjectionJsonResponse(
-        {
-          ...dashboard,
-          agentUsageLabel: formatAgentUsageLabel(runningAgents.length, dashboard.concurrencyCap),
-          providerGates: projectProviderGates(snapshot),
-          runningAgents,
-        },
-        durableDashboard,
-      );
+      return webProjectionJsonResponse(durableDashboard.record.payload, durableDashboard);
     }
 
     if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
@@ -2007,7 +1999,10 @@ export class StatusServer {
 
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
     const sourceIndex = projection?.sourceIndex ?? null;
-    const snapshot = sourceIndex?.runtime.snapshot ?? this.options.orchestrator.snapshot();
+    const sourceRuntimeSnapshot = sourceIndex?.runtime.snapshot ?? null;
+    const snapshot = sourceRuntimeSnapshot ?? this.options.orchestrator.snapshot();
+    const projectionRuntime =
+      (snapshot.running?.length ?? 0) > 0 || (snapshot.providerGates?.length ?? 0) > 0 ? snapshot : null;
     let board: IssueBoardResponse | null = null;
     if (projection) {
       try {
@@ -2031,7 +2026,7 @@ export class StatusServer {
       includeTranscriptEvents: false,
     });
     const dashboard = projectWebDashboard({
-      runtime: snapshot,
+      runtime: projectionRuntime,
       board,
       activity,
       runs: sourceIndex?.runs.runs ?? activitySources.runs,
@@ -2313,22 +2308,7 @@ export class StatusServer {
   private async fetchWebSidebar(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebSidebar>>> {
     const durableSidebar = await this.webProjectionRepositories.sidebar.readCurrent({ forceRefresh });
     if (durableSidebar.status === "hit" && durableSidebar.record) {
-      const sidebar = durableSidebar.record.payload;
-      const snapshot = this.options.orchestrator.snapshot();
-      const runningAgents = projectRunningAgents(snapshot, snapshot.generatedAt);
-      const normalizedHistory = applyWebHistoryRuntimeLiveness(
-        { sessions: sidebar.sessions, transcriptBySession: {}, timeline: [], defaultSessionId: "" },
-        snapshot,
-      );
-      return webProjectionJsonResponse(
-        {
-          ...sidebar,
-          providerGates: projectProviderGates(snapshot),
-          runningAgents,
-          sessions: normalizedHistory.sessions,
-        },
-        durableSidebar,
-      );
+      return webProjectionJsonResponse(durableSidebar.record.payload, durableSidebar);
     }
 
     if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
@@ -2337,7 +2317,10 @@ export class StatusServer {
 
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
     const sourceIndex = projection?.sourceIndex ?? null;
-    const snapshot = sourceIndex?.runtime.snapshot ?? this.options.orchestrator.snapshot();
+    const sourceRuntimeSnapshot = sourceIndex?.runtime.snapshot ?? null;
+    const snapshot = sourceRuntimeSnapshot ?? this.options.orchestrator.snapshot();
+    const projectionRuntime =
+      (snapshot.running?.length ?? 0) > 0 || (snapshot.providerGates?.length ?? 0) > 0 ? snapshot : null;
     let board: IssueBoardResponse | null = null;
     if (projection) {
       try {
@@ -2362,7 +2345,7 @@ export class StatusServer {
     });
     const dashboardActivity = previewActivityFeed(historyActivity, 20);
     const dashboard = projectWebDashboard({
-      runtime: snapshot,
+      runtime: projectionRuntime,
       board,
       activity: dashboardActivity,
       runs: sourceIndex?.runs.runs ?? activitySources.runs,
@@ -2389,10 +2372,7 @@ export class StatusServer {
       projectContextId,
     });
     if (durableHistory.status === "hit" && durableHistory.record) {
-      return webProjectionJsonResponse(
-        applyWebHistoryRuntimeLiveness(durableHistory.record.payload, this.options.orchestrator.snapshot()),
-        durableHistory,
-      );
+      return webProjectionJsonResponse(durableHistory.record.payload, durableHistory);
     }
 
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
@@ -5154,7 +5134,8 @@ async function buildActivityFeed(input: {
   const lifecycleRecords = input.lifecycleRecords ?? (await input.lifecycleStore?.list()) ?? [];
   const issueFilter = input.query.issue;
   const projectContextId = input.query.projectContextId;
-  const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter, projectContextId)) : allRuns;
+  const contextFilteredRuns = projectContextId ? allRuns.filter((run) => matchesProjectContext(run, projectContextId)) : allRuns;
+  const runs = issueFilter ? contextFilteredRuns.filter((run) => activityRunMatchesIssue(run, issueFilter)) : contextFilteredRuns;
   const activity: ActivityItem[] = [];
   let transcriptEventsConsidered = 0;
   let transcriptEventsTotal = 0;
@@ -5185,11 +5166,11 @@ async function buildActivityFeed(input: {
   }
 
   const writebackOperations = input.writebackOperations ?? (await input.writebackOutbox?.list()) ?? [];
-  const filteredWritebackOperations = issueFilter
-    ? writebackOperations.filter((operation) =>
-        writebackOperationMatchesIssue(operation, issueFilter, projectContextId, allRuns, lifecycleRecords),
-      )
-    : writebackOperations;
+  const filteredWritebackOperations = writebackOperations.filter((operation) =>
+    issueFilter
+      ? writebackOperationMatchesIssue(operation, issueFilter, projectContextId, allRuns, lifecycleRecords)
+      : writebackOperationMatchesProjectContext(operation, projectContextId, allRuns, lifecycleRecords),
+  );
   writebackOperationsConsidered = filteredWritebackOperations.length;
   activity.push(...filteredWritebackOperations.map((operation) => activityItemForWritebackOperation(operation, allRuns, lifecycleRecords)));
 
@@ -5734,6 +5715,24 @@ function activityRunMatchesIssue(run: RunRecord, issue: string, projectContextId
   return run.issueId === issue || run.issueIdentifier === issue;
 }
 
+function writebackOperationMatchesProjectContext(
+  operation: WritebackOperation,
+  projectContextId: string | null,
+  runs: readonly RunRecord[],
+  lifecycles: readonly IssueLifecycleRecord[],
+): boolean {
+  if (matchesProjectContext(operation, projectContextId)) return true;
+  const requested = projectContextId?.trim();
+  if (!requested) return true;
+  const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
+  if (run && matchesProjectContext(run, requested)) return true;
+  return lifecycles.some(
+    (lifecycle) =>
+      matchesProjectContext(lifecycle, requested) &&
+      (lifecycle.issueId === operation.issueId || lifecycle.issueIdentifier === operation.issueId),
+  );
+}
+
 function writebackOperationMatchesIssue(
   operation: WritebackOperation,
   issue: string,
@@ -5741,9 +5740,10 @@ function writebackOperationMatchesIssue(
   runs: readonly RunRecord[],
   lifecycles: readonly IssueLifecycleRecord[],
 ): boolean {
-  if (matchesProjectContext(operation, projectContextId) && operation.issueId === issue) return true;
+  if (!writebackOperationMatchesProjectContext(operation, projectContextId, runs, lifecycles)) return false;
+  if (operation.issueId === issue) return true;
   const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
-  if (run && activityRunMatchesIssue(run, issue, projectContextId)) return true;
+  if (run && activityRunMatchesIssue(run, issue)) return true;
   return lifecycles.some(
     (lifecycle) =>
       matchesProjectContext(lifecycle, projectContextId) &&

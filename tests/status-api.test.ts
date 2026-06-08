@@ -1594,6 +1594,134 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("scopes activity feed by project context even without an issue filter", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-docs",
+      sessionId: "session-docs",
+      agentId: "agent-docs",
+      role: "worker",
+      issueId: "issue-docs",
+      issueIdentifier: "TEST-DOCS",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs prompt",
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      trackerProjectSlug: "DOCS",
+      workspaceKey: "docs:TEST-DOCS",
+      workspacePath: path.join(config.workspace.root, "docs-TEST-DOCS"),
+    });
+    await runStore.startRun({
+      runId: "run-eng",
+      sessionId: "session-eng",
+      agentId: "agent-eng",
+      role: "reviewer",
+      issueId: "issue-eng",
+      issueIdentifier: "TEST-ENG",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "eng prompt",
+      projectContextId: "eng",
+      projectContextLabel: "Engineering",
+      trackerProjectSlug: "ENG",
+      workspaceKey: "eng:TEST-ENG",
+      workspacePath: path.join(config.workspace.root, "eng-TEST-ENG"),
+    });
+    await runStore.appendEvent({
+      runId: "run-docs",
+      at: "2030-01-01T00:01:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "docs progress",
+    });
+    await runStore.appendEvent({
+      runId: "run-eng",
+      at: "2030-01-01T00:02:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "eng progress",
+    });
+
+    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-docs:report",
+      kind: "comment",
+      issueId: "issue-docs",
+      projectContextId: "docs",
+      runId: "run-docs",
+      payload: {
+        body: "docs report",
+        dedupeKey: "report",
+      },
+    });
+    await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-eng:report",
+      kind: "comment",
+      issueId: "issue-eng",
+      projectContextId: "eng",
+      runId: "run-eng",
+      payload: {
+        body: "eng report",
+        dedupeKey: "report",
+      },
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      writebackOutbox,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/activity?projectContextId=docs&limit=20`);
+      const body = (await response.json()) as {
+        activity: Array<{
+          id?: string;
+          kind: string;
+          issue: { identifier: string };
+          run: { runId: string } | null;
+        }>;
+        counts: {
+          distinctRunsConsidered: number;
+          transcriptEventsConsidered: number;
+          transcriptEventsTotal: number;
+          syntheticRunEvents: number;
+          writebackOperationsConsidered: number;
+        };
+        filter: { issue: string | null; projectContextId: string | null };
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.filter).toEqual({ issue: null, projectContextId: "docs" });
+      expect(body.counts).toMatchObject({
+        distinctRunsConsidered: 1,
+        transcriptEventsConsidered: 1,
+        transcriptEventsTotal: 1,
+        syntheticRunEvents: 1,
+        writebackOperationsConsidered: 1,
+      });
+      expect(body.activity.map((item) => item.issue.identifier)).toEqual(["TEST-DOCS", "TEST-DOCS", "TEST-DOCS"]);
+      expect(body.activity.map((item) => item.run?.runId ?? null)).toEqual(["run-docs", "run-docs", "run-docs"]);
+      expect(body.activity.map((item) => item.kind).sort()).toEqual(["run_started", "transcript_event", "writeback_operation"]);
+      expect(body.activity.find((item) => item.id === "writeback:comment:issue-docs:report")).toBeDefined();
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves redacted legacy transcript rows without backfilling counts during GET", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);

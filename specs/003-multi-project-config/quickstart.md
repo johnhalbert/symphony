@@ -85,3 +85,14 @@ After the implementation tasks complete, run:
 ```powershell
 npm test -- tests/workflow.test.ts tests/doctor.test.ts tests/orchestrator.test.ts tests/git-worktree.test.ts tests/status-api.test.ts tests/web-projection.test.ts tests/web-history-projection.test.ts tests/web-transcript-projection.test.ts tests/web-route-contract.test.ts tests/web-projection-context.test.ts tests/completion-report-mcp.test.ts tests/review-verdict-mcp.test.ts tests/review-feedback-mcp.test.ts tests/writeback-outbox.test.ts tests/postgres-schema.test.ts tests/mcp-subprocess-environment.test.ts tests/cursor-harness.test.ts tests/hermes-harness.test.ts tests/hermes-acp-harness.test.ts
 ```
+
+## Promotion Notes
+
+Recorded on `2026-06-08T12:44:00Z`.
+
+- Validation evidence: `docs/smoke/eng-347-final-validation.md`
+- Focused suite packet (T095-T099), quickstart full-validation command, full-repository `npm test`, and `npm run typecheck` all completed successfully.
+- `/api/v1/activity?projectContextId=<id>` now scopes run, transcript, and writeback items even without an `issue` filter, and the status-api regression lives in `tests/status-api.test.ts`.
+- Durable dashboard/history/sidebar route hits now preserve stored read models, while rebuild paths still surface durable running-agent rows when the live snapshot is empty.
+- Remaining reviewer-facing gap: the authoritative fenced JSON ENG-347 issue contract and child-issue inventory/order/completion ledger are still not present in this worktree; see the governance audit in `docs/smoke/eng-347-final-validation.md`.
+- Remaining runtime risk: no live Linear/GitHub multi-context publication/replay flow was exercised in this packet.
