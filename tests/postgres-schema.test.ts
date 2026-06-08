@@ -300,15 +300,24 @@ describe("Postgres Symphony-owned state migration", () => {
     for (const fragment of [
       "alter table symphony.workspace drop constraint if exists workspace_pkey",
       "alter table symphony.workspace add primary key (project_context_id, workspace_key)",
+      "alter table symphony.issue drop constraint if exists issue_pkey",
+      "alter table symphony.issue add primary key (project_context_id, issue_key)",
       "drop index if exists symphony.issue_identifier_unique_idx",
       "create unique index if not exists issue_identifier_unique_idx on symphony.issue (project_context_id, tracker_source, issue_identifier)",
+      "alter table symphony.run_session drop constraint if exists run_session_pkey",
+      "alter table symphony.run_session add primary key (project_context_id, run_id)",
       "alter table symphony.chat_message drop constraint if exists chat_message_thread_key_message_index_key",
       "alter table symphony.chat_message add constraint chat_message_thread_key_message_index_key unique (project_context_id, thread_key, message_index)",
+      "alter table symphony.writeback_operation drop constraint if exists writeback_operation_pkey",
+      "alter table symphony.writeback_operation add primary key (project_context_id, idempotency_key)",
+      "alter table symphony.approval_request drop constraint if exists approval_request_dedupe_key_key",
+      "alter table symphony.approval_request add constraint approval_request_dedupe_key_key unique (project_context_id, dedupe_key)",
     ]) {
       expect(normalized, `missing owned-state project context uniqueness fragment: ${fragment}`).toContain(fragment);
     }
 
     for (const fragment of [
+      "drop index if exists symphony.run_session_lookup_idx",
       "drop index if exists symphony.issue_status_lookup_idx",
       "drop index if exists symphony.issue_phase_lookup_idx",
       "drop index if exists symphony.run_session_issue_status_idx",
@@ -332,6 +341,7 @@ describe("Postgres Symphony-owned state migration", () => {
       "on symphony.issue (project_context_id, tracker_source, issue_identifier)",
       "on symphony.issue (project_context_id, tracker_source, tracker_state, phase, updated_at desc)",
       "on symphony.issue (project_context_id, phase, blocked_reason, updated_at desc)",
+      "on symphony.run_session (project_context_id, session_id, run_id)",
       "on symphony.run_session (project_context_id, issue_key, status, started_at desc)",
       "on symphony.run_session (project_context_id, issue_identifier, started_at desc)",
       "on symphony.run_session (project_context_id, workspace_key, started_at desc)",
@@ -1675,6 +1685,50 @@ async function expectLegacyProjectContextAttributionMigrated(containerName: stri
   );
   expect(normalizedSql(chatMessageConstraint)).toContain("unique (project_context_id, thread_key, message_index)");
 
+  const issuePrimaryKey = await psql(
+    containerName,
+    String.raw`
+      select pg_get_constraintdef(oid)
+      from pg_constraint
+      where conrelid = 'symphony.issue'::regclass
+        and conname = 'issue_pkey';
+    `,
+  );
+  expect(normalizedSql(issuePrimaryKey)).toContain("primary key (project_context_id, issue_key)");
+
+  const runSessionPrimaryKey = await psql(
+    containerName,
+    String.raw`
+      select pg_get_constraintdef(oid)
+      from pg_constraint
+      where conrelid = 'symphony.run_session'::regclass
+        and conname = 'run_session_pkey';
+    `,
+  );
+  expect(normalizedSql(runSessionPrimaryKey)).toContain("primary key (project_context_id, run_id)");
+
+  const writebackPrimaryKey = await psql(
+    containerName,
+    String.raw`
+      select pg_get_constraintdef(oid)
+      from pg_constraint
+      where conrelid = 'symphony.writeback_operation'::regclass
+        and conname = 'writeback_operation_pkey';
+    `,
+  );
+  expect(normalizedSql(writebackPrimaryKey)).toContain("primary key (project_context_id, idempotency_key)");
+
+  const approvalDedupeConstraint = await psql(
+    containerName,
+    String.raw`
+      select pg_get_constraintdef(oid)
+      from pg_constraint
+      where conrelid = 'symphony.approval_request'::regclass
+        and conname = 'approval_request_dedupe_key_key';
+    `,
+  );
+  expect(normalizedSql(approvalDedupeConstraint)).toContain("unique (project_context_id, dedupe_key)");
+
   const indexMetadata = await psql(
     containerName,
     String.raw`
@@ -1682,6 +1736,7 @@ async function expectLegacyProjectContextAttributionMigrated(containerName: stri
       from pg_indexes
       where schemaname = 'symphony'
         and indexname in (
+          'run_session_lookup_idx',
           'issue_status_lookup_idx',
           'issue_phase_lookup_idx',
           'run_session_issue_status_idx',
@@ -1712,6 +1767,7 @@ async function expectLegacyProjectContextAttributionMigrated(containerName: stri
   );
   const indexes = JSON.parse(indexMetadata.trim()) as Record<string, string>;
   for (const [indexName, fragment] of Object.entries({
+    run_session_lookup_idx: "(project_context_id, session_id, run_id)",
     issue_status_lookup_idx: "(project_context_id, tracker_source, tracker_state, phase, updated_at desc)",
     issue_phase_lookup_idx: "(project_context_id, phase, blocked_reason, updated_at desc)",
     run_session_issue_status_idx: "(project_context_id, issue_key, status, started_at desc)",
@@ -2213,13 +2269,14 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           created_at,
           updated_at
         ) values
-          ('symphony', 'issue:context-symphony', 'linear', 'ENG-CTX-101', now(), now()),
-          ('docs', 'issue:context-docs', 'linear', 'ENG-CTX-101', now(), now())
+          ('symphony', 'issue:context-shared', 'linear', 'ENG-CTX-101', now(), now()),
+          ('docs', 'issue:context-shared', 'linear', 'ENG-CTX-101', now(), now())
         returning project_context_id, issue_key
       ), inserted_run as (
         insert into symphony.run_session (
           project_context_id,
           run_id,
+          session_id,
           role,
           issue_key,
           issue_identifier,
@@ -2230,8 +2287,8 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           started_at,
           updated_at
         ) values
-          ('symphony', 'run:context-symphony', 'worker', 'issue:context-symphony', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/symphony/ENG-CTX-101', 1, 'running', now(), now()),
-          ('docs', 'run:context-docs', 'worker', 'issue:context-docs', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/docs/ENG-CTX-101', 1, 'running', now(), now())
+          ('symphony', 'run:context-shared', 'session:context-shared', 'worker', 'issue:context-shared', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/symphony/ENG-CTX-101', 1, 'running', now(), now()),
+          ('docs', 'run:context-shared', 'session:context-shared', 'worker', 'issue:context-shared', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/docs/ENG-CTX-101', 1, 'running', now(), now())
         returning project_context_id, run_id
       ), inserted_chat_message as (
         insert into symphony.chat_message (
@@ -2277,6 +2334,73 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
         from inserted_run runs
         inner join inserted_issue issues on issues.project_context_id = runs.project_context_id
         returning project_context_id, chat_message_id
+      ), inserted_writeback_operation as (
+        insert into symphony.writeback_operation (
+          project_context_id,
+          idempotency_key,
+          kind,
+          issue_key,
+          issue_identifier,
+          run_id,
+          status,
+          created_at,
+          updated_at,
+          next_attempt_at,
+          payload,
+          payload_sha256
+        )
+        select
+          runs.project_context_id,
+          'writeback:context-shared:dispatch',
+          'transition',
+          issues.issue_key,
+          'ENG-CTX-101',
+          runs.run_id,
+          'pending',
+          now(),
+          now(),
+          now(),
+          '{"transition":"dispatch"}'::jsonb,
+          case runs.project_context_id
+            when 'symphony' then 'sha256:context-shared-writeback-symphony'
+            else 'sha256:context-shared-writeback-docs'
+          end
+        from inserted_run runs
+        inner join inserted_issue issues on issues.project_context_id = runs.project_context_id
+        returning project_context_id, idempotency_key
+      ), inserted_approval_request as (
+        insert into symphony.approval_request (
+          project_context_id,
+          request_id,
+          status,
+          issue_key,
+          issue_identifier,
+          run_id,
+          evidence_cursor,
+          dedupe_key,
+          action,
+          requested_at
+        )
+        select
+          runs.project_context_id,
+          case runs.project_context_id
+            when 'symphony' then 'approval:context-symphony:publish:1'
+            else 'approval:context-docs:publish:1'
+          end,
+          'pending',
+          issues.issue_key,
+          'ENG-CTX-101',
+          runs.run_id,
+          case runs.project_context_id
+            when 'symphony' then 'run:context-shared/transcript/1'
+            else 'run:context-shared/transcript/2'
+          end,
+          'approval:context-shared:publish',
+          '{"kind":"publish_pull_request"}'::jsonb,
+          now()
+        from inserted_run runs
+        inner join inserted_issue issues on issues.project_context_id = runs.project_context_id
+        returning project_context_id, request_id
       ), inserted_dashboard_revision as (
         insert into symphony.projection_revision (
           project_context_id,
@@ -2430,6 +2554,8 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
         'issue', (select count(*) from inserted_issue),
         'run_session', (select count(*) from inserted_run),
         'chat_message', (select count(*) from inserted_chat_message),
+        'writeback_operation', (select count(*) from inserted_writeback_operation),
+        'approval_request', (select count(*) from inserted_approval_request),
         'projection_revision', (
           select count(*)
           from (
@@ -2456,6 +2582,8 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
     issue: 2,
     run_session: 2,
     chat_message: 2,
+    writeback_operation: 2,
+    approval_request: 2,
     projection_revision: 12,
     dashboard_projection: 2,
     issue_board_projection: 2,
@@ -2473,7 +2601,12 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
       where schemaname = 'symphony'
         and indexname in (
           'workspace_pkey',
+          'issue_pkey',
           'issue_identifier_unique_idx',
+          'run_session_pkey',
+          'run_session_lookup_idx',
+          'writeback_operation_pkey',
+          'approval_request_dedupe_key_key',
           'projection_revision_current_unique_idx',
           'projection_revision_scope_revision_unique_idx',
           'dashboard_projection_scope_revision_idx',
@@ -2487,8 +2620,17 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
   );
   const indexes = JSON.parse(indexMetadata.trim()) as Record<string, string>;
   expect(indexes.workspace_pkey?.toLowerCase()).toContain("(project_context_id, workspace_key)");
+  expect(indexes.issue_pkey?.toLowerCase()).toContain("(project_context_id, issue_key)");
   expect(indexes.issue_identifier_unique_idx?.toLowerCase()).toContain(
     "(project_context_id, tracker_source, issue_identifier)",
+  );
+  expect(indexes.run_session_pkey?.toLowerCase()).toContain("(project_context_id, run_id)");
+  expect(indexes.run_session_lookup_idx?.toLowerCase()).toContain("(project_context_id, session_id, run_id)");
+  expect(indexes.writeback_operation_pkey?.toLowerCase()).toContain(
+    "(project_context_id, idempotency_key)",
+  );
+  expect(indexes.approval_request_dedupe_key_key?.toLowerCase()).toContain(
+    "(project_context_id, dedupe_key)",
   );
   expect(indexes.projection_revision_current_unique_idx?.toLowerCase()).toContain(
     "(project_context_id, projection_name, scope_kind, scope_key)",
@@ -2561,9 +2703,67 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           updated_at
         ) values (
           'symphony',
+          'issue:context-shared',
+          'linear',
+          'ENG-CTX-102',
+          now(),
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.issue (
+          project_context_id,
+          issue_key,
+          tracker_source,
+          issue_identifier,
+          created_at,
+          updated_at
+        ) values (
+          'symphony',
           'issue:context-symphony-duplicate',
           'linear',
           'ENG-CTX-101',
+          now(),
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.run_session (
+          project_context_id,
+          run_id,
+          session_id,
+          role,
+          issue_key,
+          issue_identifier,
+          workspace_key,
+          workspace_path,
+          turn_number,
+          status,
+          started_at,
+          updated_at
+        ) values (
+          'symphony',
+          'run:context-shared',
+          'session:context-shared-duplicate',
+          'worker',
+          'issue:context-shared',
+          'ENG-CTX-101',
+          'workspace:context-shared',
+          '/tmp/symphony/ENG-CTX-101/duplicate',
+          2,
+          'running',
           now(),
           now()
         );
@@ -2597,9 +2797,9 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           'symphony',
           'message:context-symphony-duplicate:0',
           'thread:context-shared',
-          'issue:context-symphony',
+          'issue:context-shared',
           'ENG-CTX-101',
-          'run:context-symphony',
+          'run:context-shared',
           0,
           'assistant',
           'message',
@@ -2610,6 +2810,72 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           '{"messages":[]}'::jsonb,
           '{"scenario":"duplicate-project-context-chat"}'::jsonb,
           now(),
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.writeback_operation (
+          project_context_id,
+          idempotency_key,
+          kind,
+          issue_key,
+          issue_identifier,
+          run_id,
+          status,
+          created_at,
+          updated_at,
+          next_attempt_at,
+          payload,
+          payload_sha256
+        ) values (
+          'symphony',
+          'writeback:context-shared:dispatch',
+          'transition',
+          'issue:context-shared',
+          'ENG-CTX-101',
+          'run:context-shared',
+          'pending',
+          now(),
+          now(),
+          now(),
+          '{"transition":"dispatch"}'::jsonb,
+          'sha256:context-shared-writeback-duplicate'
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.approval_request (
+          project_context_id,
+          request_id,
+          status,
+          issue_key,
+          issue_identifier,
+          run_id,
+          evidence_cursor,
+          dedupe_key,
+          action,
+          requested_at
+        ) values (
+          'symphony',
+          'approval:context-symphony:publish:duplicate',
+          'pending',
+          'issue:context-shared',
+          'ENG-CTX-101',
+          'run:context-shared',
+          'run:context-shared/transcript/99',
+          'approval:context-shared:publish',
+          '{"kind":"publish_pull_request"}'::jsonb,
           now()
         );
       `,
