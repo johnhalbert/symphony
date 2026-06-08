@@ -149,6 +149,130 @@ describe("FileIssueLifecycleStore", () => {
     });
   });
 
+  it("backfills non-default project context attribution for legacy lifecycle records missing handoff memo pointers", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(issue(), {
+      phase: "review",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      summaryPointers: {
+        workspaceKey: "TEST-1",
+        workspacePath: "/tmp/TEST-1",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "origin/main",
+        lastRunId: "run-1",
+      },
+    });
+
+    const recordPath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const raw = JSON.parse(await nodeFs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+    const handoff = { ...(raw.handoff as Record<string, unknown>) };
+    const memo = { ...(handoff.memo as Record<string, unknown>) };
+    const pointers = { ...(memo.pointers as Record<string, unknown>) };
+    delete pointers.projectContextId;
+    delete pointers.projectContextLabel;
+    memo.pointers = pointers;
+    handoff.memo = memo;
+    raw.handoff = handoff;
+    await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}
+`, "utf8");
+
+    const reloaded = await new FileIssueLifecycleStore(root).get("issue-1");
+    expect(reloaded).toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      summaryPointers: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      },
+      handoff: {
+        memo: {
+          pointers: {
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+          },
+        },
+      },
+    });
+    expect(buildWorkerHandoffPacket(reloaded!, "2026-01-01T00:02:00.000Z")).toMatchObject({
+      memo: {
+        pointers: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+        },
+      },
+      pointers: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      },
+    });
+  });
+
+  it("preserves unlabeled non-default project context attribution when legacy records reload", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(issue(), {
+      phase: "review",
+      projectContextId: "docs",
+      summaryPointers: {
+        workspaceKey: "TEST-1",
+        workspacePath: "/tmp/TEST-1",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "origin/main",
+        lastRunId: "run-1",
+      },
+    });
+
+    const recordPath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const raw = JSON.parse(await nodeFs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+    delete raw.projectContextLabel;
+    const summaryPointers = { ...(raw.summaryPointers as Record<string, unknown>) };
+    delete summaryPointers.projectContextLabel;
+    raw.summaryPointers = summaryPointers;
+    const handoff = { ...(raw.handoff as Record<string, unknown>) };
+    const memo = { ...(handoff.memo as Record<string, unknown>) };
+    const pointers = { ...(memo.pointers as Record<string, unknown>) };
+    delete pointers.projectContextLabel;
+    memo.pointers = pointers;
+    handoff.memo = memo;
+    raw.handoff = handoff;
+    await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}
+`, "utf8");
+
+    const reloaded = await new FileIssueLifecycleStore(root).get("issue-1");
+    expect(reloaded).toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: null,
+      summaryPointers: {
+        projectContextId: "docs",
+        projectContextLabel: null,
+      },
+      handoff: {
+        memo: {
+          pointers: {
+            projectContextId: "docs",
+            projectContextLabel: null,
+          },
+        },
+      },
+    });
+    expect(buildWorkerHandoffPacket(reloaded!, "2026-01-01T00:02:00.000Z")).toMatchObject({
+      memo: {
+        pointers: {
+          projectContextId: "docs",
+          projectContextLabel: null,
+        },
+      },
+      pointers: {
+        projectContextId: "docs",
+        projectContextLabel: null,
+      },
+    });
+  });
+
   it("tracks projection revisions for successful lifecycle writes only", async () => {
     const store = new FileIssueLifecycleStore(root);
     const events: Array<{ source: string; revision: number }> = [];

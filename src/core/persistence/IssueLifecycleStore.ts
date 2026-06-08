@@ -885,7 +885,7 @@ function clip(value: string, maxChars = 500): string {
   return value.length <= maxChars ? value : `${value.slice(0, maxChars - 15)}...[truncated]`;
 }
 
-function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
+function emptySummaryPointers(): IssueLifecycleSummaryPointers {
   return {
     workspaceKey: null,
     workspacePath: null,
@@ -901,6 +901,13 @@ function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
     ciStatus: null,
     lastPushedAt: null,
     lastEvidenceCursor: null,
+    projectContextLabel: null,
+  };
+}
+
+function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
+  return {
+    ...emptySummaryPointers(),
     projectContextId: DEFAULT_PROJECT_CONTEXT_ID,
     projectContextLabel: DEFAULT_PROJECT_CONTEXT_LABEL,
   };
@@ -973,7 +980,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     lastCompletionReportId: nullableString(value.lastCompletionReportId, filePath, "lastCompletionReportId"),
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
-    projectContextId: optionalNullableString(value.projectContextId, filePath, "projectContextId") ?? DEFAULT_PROJECT_CONTEXT_ID,
+    projectContextId: optionalNullableString(value.projectContextId, filePath, "projectContextId") ?? undefined,
     projectContextLabel: optionalNullableString(value.projectContextLabel, filePath, "projectContextLabel") ?? null,
     summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath),
     summaryReferences: normalizeSummaryReferences(value.summaryReferences, filePath),
@@ -994,22 +1001,25 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
   };
   const projectContextId = normalized.projectContextId || normalized.summaryPointers.projectContextId || DEFAULT_PROJECT_CONTEXT_ID;
   const projectContextLabel = normalized.projectContextLabel ?? normalized.summaryPointers.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  const summaryPointers = {
+    ...normalized.summaryPointers,
+    projectContextId,
+    projectContextLabel,
+  };
   return {
     ...normalized,
     projectContextId,
     projectContextLabel,
-    summaryPointers: {
-      ...normalized.summaryPointers,
-      projectContextId,
-      projectContextLabel,
-    },
-    handoff: normalizeHandoffState(value.handoff, { ...normalized, projectContextId, projectContextLabel, summaryPointers: { ...normalized.summaryPointers, projectContextId, projectContextLabel } }, filePath),
+    summaryPointers,
+    handoff: normalizeHandoffState(value.handoff, { ...normalized, projectContextId, projectContextLabel, summaryPointers }, filePath),
   };
 }
 
 function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecycleSummaryPointers {
-  if (!isRecord(value)) return defaultSummaryPointers();
+  if (!isRecord(value)) return emptySummaryPointers();
+  const projectContextId = optionalNullableString(value.projectContextId, filePath, "summaryPointers.projectContextId");
   return {
+    ...emptySummaryPointers(),
     workspaceKey: nullableString(value.workspaceKey, filePath, "summaryPointers.workspaceKey"),
     workspacePath: nullableString(value.workspacePath, filePath, "summaryPointers.workspacePath"),
     branchName: nullableString(value.branchName, filePath, "summaryPointers.branchName"),
@@ -1024,8 +1034,8 @@ function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecy
     ciStatus: optionalNullableString(value.ciStatus, filePath, "summaryPointers.ciStatus"),
     lastPushedAt: optionalNullableString(value.lastPushedAt, filePath, "summaryPointers.lastPushedAt"),
     lastEvidenceCursor: optionalNullableString(value.lastEvidenceCursor, filePath, "summaryPointers.lastEvidenceCursor"),
-    projectContextId: optionalNullableString(value.projectContextId, filePath, "summaryPointers.projectContextId") ?? DEFAULT_PROJECT_CONTEXT_ID,
-    projectContextLabel: optionalNullableString(value.projectContextLabel, filePath, "summaryPointers.projectContextLabel") ?? DEFAULT_PROJECT_CONTEXT_LABEL,
+    projectContextLabel: optionalNullableString(value.projectContextLabel, filePath, "summaryPointers.projectContextLabel") ?? null,
+    ...(projectContextId === null ? {} : { projectContextId }),
   };
 }
 
@@ -1276,9 +1286,18 @@ function normalizeHandoffState(
   if (value === undefined) return buildIssueHandoffState(record);
   if (!isRecord(value)) throw corruptLifecycle(filePath, "handoff is invalid");
   if (value.version !== 1) throw corruptLifecycle(filePath, "handoff.version is invalid");
+  const memo = normalizeLaneMemo(value.memo, filePath);
   return {
     version: 1,
-    memo: normalizeLaneMemo(value.memo, filePath),
+    memo: {
+      ...memo,
+      pointers: {
+        ...memo.pointers,
+        projectContextId: record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID,
+        projectContextLabel:
+          record.projectContextLabel ?? defaultProjectContextLabel(record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID),
+      },
+    },
     lastWorkerOutput: normalizeWorkerOutputContract(value.lastWorkerOutput, filePath),
     lastReviewerOutput: normalizeReviewerOutputContract(value.lastReviewerOutput, filePath),
   };
