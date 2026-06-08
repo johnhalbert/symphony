@@ -41,7 +41,16 @@ export interface ProjectContextPublicMetadata {
   workspace: {
     root: string;
     stateDir: string;
-    source: WorkspaceSourceConfig;
+    source: {
+      kind: WorkspaceSourceConfig["kind"];
+      pathConfigured: boolean;
+      repositoryConfigured: boolean;
+      refConfigured: boolean;
+      baseRefConfigured: boolean;
+      branchTemplateConfigured: boolean;
+      cachePathConfigured: boolean;
+      cleanup: WorkspaceSourceConfig["cleanup"] | null;
+    };
   };
   github: {
     owner: string | null;
@@ -84,7 +93,16 @@ export function projectContextPublicMetadata(context: ProjectContextConfig): Pro
     workspace: {
       root: context.workspace.root,
       stateDir: context.workspace.stateDir,
-      source: { ...context.workspace.source },
+      source: {
+        kind: context.workspace.source.kind,
+        pathConfigured: context.workspace.source.path !== undefined,
+        repositoryConfigured: context.workspace.source.repository !== undefined,
+        refConfigured: context.workspace.source.ref !== undefined,
+        baseRefConfigured: context.workspace.source.baseRef !== undefined,
+        branchTemplateConfigured: context.workspace.source.branchTemplate !== undefined,
+        cachePathConfigured: context.workspace.source.cachePath !== undefined,
+        cleanup: context.workspace.source.cleanup ?? null,
+      },
     },
     github: {
       owner: context.github.owner,

@@ -605,6 +605,10 @@ export interface ServiceConfig {
   raw: RawWorkflowConfig;
 }
 
+interface ParseServiceConfigOptions {
+  allowIncompleteProjectContext?: boolean;
+}
+
 const DEFAULT_ACTIVE_STATES = ["Todo", "In Progress"];
 const DEFAULT_TERMINAL_STATES = ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"];
 const VALID_CURSOR_SETTING_SOURCES = new Set<CursorSettingSource>([
@@ -649,13 +653,19 @@ export function parseDatabaseConfig(rawInput: unknown, workflowPath: string, env
   return normalizeDatabaseConfig(parsed.data, workflowDir, env);
 }
 
-export function parseServiceConfig(rawInput: unknown, workflowPath: string, env = process.env): ServiceConfig {
+export function parseServiceConfig(
+  rawInput: unknown,
+  workflowPath: string,
+  env = process.env,
+  options: ParseServiceConfigOptions = {},
+): ServiceConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
   if (!parsed.success) {
     throw new SymphonyError("config_validation_error", "Workflow config is invalid", parsed.error.flatten());
   }
 
   const raw = parsed.data;
+  const allowIncompleteProjectContext = options.allowIncompleteProjectContext ?? false;
   if (raw.project_contexts?.length) {
     const projectContexts = normalizeExplicitProjectContexts(raw, workflowPath, env);
     const defaultProjectContextId =
@@ -680,12 +690,12 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
 
   const trackerApiKey =
     resolveConfigString(raw.tracker?.api_key, env) ?? resolveConfigString("$LINEAR_API_KEY", env) ?? "";
-  if (trackerApiKey.length === 0) {
+  if (trackerApiKey.length === 0 && !allowIncompleteProjectContext) {
     throw new SymphonyError("missing_tracker_api_key", "Linear API key is required");
   }
 
   const projectSlug = resolveConfigString(raw.tracker?.project_slug, env) ?? "";
-  if (projectSlug.length === 0) {
+  if (projectSlug.length === 0 && !allowIncompleteProjectContext) {
     throw new SymphonyError("missing_tracker_project_slug", "Linear project slug is required");
   }
   const trackerAssignee =
@@ -707,16 +717,26 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       ? undefined
       : resolveRepositoryValue(raw.workspace.source.repository, workflowDir, env);
 
+  if (sourceKind === "copy") {
+    if (!hasResolvedConfigString(raw.workspace?.source?.path, env) && !allowIncompleteProjectContext) {
+      throw new SymphonyError("config_validation_error", "workspace.source.path is required for copy");
+    }
+  }
+  if (sourceKind === "git") {
+    if (!hasResolvedConfigString(raw.workspace?.source?.repository, env) && !allowIncompleteProjectContext) {
+      throw new SymphonyError("config_validation_error", "workspace.source.repository is required for git");
+    }
+  }
   if (sourceKind === "git_worktree") {
-    if (!raw.workspace?.source?.repository) {
+    if (!hasResolvedConfigString(raw.workspace?.source?.repository, env) && !allowIncompleteProjectContext) {
       throw new SymphonyError("config_validation_error", "workspace.source.repository is required for git_worktree");
     }
-    if (!raw.workspace?.source?.base_ref) {
+    if (!hasResolvedConfigString(raw.workspace?.source?.base_ref, env) && !allowIncompleteProjectContext) {
       throw new SymphonyError("config_validation_error", "workspace.source.base_ref is required for git_worktree");
     }
   }
   const issueBreakdownWorkspaceMode = raw.issue_breakdown?.workspace_mode ?? "none";
-  if (issueBreakdownWorkspaceMode === "readonly_checkout") {
+  if (issueBreakdownWorkspaceMode === "readonly_checkout" && !allowIncompleteProjectContext) {
     if (sourceKind !== "git_worktree") {
       throw new SymphonyError(
         "config_validation_error",
@@ -1067,7 +1087,9 @@ function normalizeExplicitProjectContexts(
 
     const enabled = rawProjectContext.enabled ?? true;
     try {
-      const contextConfig = parseServiceConfig(mergedRawForProjectContext(raw, rawProjectContext), workflowPath, env);
+      const contextConfig = parseServiceConfig(mergedRawForProjectContext(raw, rawProjectContext), workflowPath, env, {
+        allowIncompleteProjectContext: !enabled,
+      });
       if (enabled && contextConfig.workspace.source.kind === "none") {
         throw new SymphonyError(
           "config_validation_error",
@@ -1126,6 +1148,11 @@ export function resolveConfigString(value: string | undefined, env: NodeJS.Proce
   const varMatch = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
   if (varMatch) return env[varMatch[1] ?? ""] ?? "";
   return value;
+}
+
+function hasResolvedConfigString(value: string | undefined, env: NodeJS.ProcessEnv): boolean {
+  const resolved = resolveConfigString(value, env);
+  return resolved !== undefined && resolved.trim().length > 0;
 }
 
 export function resolvePathValue(value: string, baseDir: string, env: NodeJS.ProcessEnv): string {

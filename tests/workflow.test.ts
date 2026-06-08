@@ -8,7 +8,7 @@ import { projectContextRegistryPublicMetadata } from "../src/core/config/Project
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
 import { WorkflowLoader, parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
-import { issue, multiProjectWorkflowConfig } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, projectContextFixture } from "./helpers.js";
 
 describe("workflow loading and prompt rendering", () => {
   it("parses YAML front matter and markdown body", () => {
@@ -1413,11 +1413,23 @@ describe("project context redaction", () => {
         topLevel: {
           github: { token: "$ROOT_GITHUB_TOKEN" },
         },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "$DOCS_REPOSITORY",
+            github: { token: "$DOCS_GITHUB_TOKEN" },
+          }),
+        ],
       }),
       "/repo/WORKFLOW.md",
       {
         LINEAR_API_KEY: "linear-secret",
         ROOT_GITHUB_TOKEN: "root-gh-secret",
+        DOCS_GITHUB_TOKEN: "docs-gh-secret",
+        DOCS_REPOSITORY: "https://x-access-token:repo-secret@example.com/org/docs.git",
       },
     );
 
@@ -1432,8 +1444,29 @@ describe("project context redaction", () => {
       tracker: { projectSlug: "SYMPHONY" },
       github: { tokenPresent: true },
     });
+    expect(metadata[1]).toMatchObject({
+      id: "docs",
+      label: "Documentation Site",
+      workspace: {
+        source: {
+          kind: "git_worktree",
+          pathConfigured: false,
+          repositoryConfigured: true,
+          refConfigured: false,
+          baseRefConfigured: true,
+          branchTemplateConfigured: true,
+          cachePathConfigured: false,
+          cleanup: "refuse_dirty",
+        },
+      },
+      github: { tokenPresent: true },
+    });
     expect(serialized).not.toContain("linear-secret");
     expect(serialized).not.toContain("root-gh-secret");
+    expect(serialized).not.toContain("docs-gh-secret");
+    expect(serialized).not.toContain("repo-secret");
+    expect(serialized).not.toContain("x-access-token");
+    expect(serialized).not.toContain("https://x-access-token:repo-secret@example.com/org/docs.git");
   });
 
   it.each([
@@ -1502,5 +1535,130 @@ describe("project context redaction", () => {
     for (const secret of forbiddenSecrets) {
       expect(message).not.toContain(secret);
     }
+  });
+
+  it("allows disabled project contexts to remain incomplete", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "docs",
+            enabled: false,
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+      },
+    );
+
+    expect(config.defaultProjectContextId).toBe("symphony");
+    expect(config.projectContexts).toHaveLength(2);
+    expect(config.projectContexts?.[1]).toMatchObject({
+      id: "docs",
+      label: "docs",
+      enabled: false,
+      tracker: { projectSlug: "" },
+      workspace: { source: { kind: "none" } },
+    });
+  });
+
+  it.each([
+    {
+      label: "copy source without path",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "copy",
+              },
+            },
+          },
+        ],
+      },
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+      },
+      expectedMessage: "project context docs-site: workspace.source.path is required for copy",
+    },
+    {
+      label: "git source without repository",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git",
+              },
+            },
+          },
+        ],
+      },
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+      },
+      expectedMessage: "project context docs-site: workspace.source.repository is required for git",
+    },
+  ])("rejects enabled project contexts with $label", ({ rawConfig, env, expectedMessage }) => {
+    expect(() => parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env)).toThrowError(expectedMessage);
   });
 });
