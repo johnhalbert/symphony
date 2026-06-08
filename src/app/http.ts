@@ -1407,9 +1407,8 @@ export class StatusServer {
     const issueBoardColumns = projection?.issueBoardColumns ?? this.resolveWebProjectionIssueBoardColumns();
     const sourceRevisions = statusServerProjectionSourceRevisions(sourceIndex, this.options);
     const sourceRuntimeSnapshot = sourceIndex?.runtime.snapshot ?? null;
-    const snapshot = sourceRuntimeSnapshot ?? this.options.orchestrator.snapshot();
-    const projectionRuntime =
-      (snapshot.running?.length ?? 0) > 0 || (snapshot.providerGates?.length ?? 0) > 0 ? snapshot : null;
+    const snapshot = this.runtimeProjectionSnapshot(sourceRuntimeSnapshot);
+    const projectionRuntime = snapshot;
     let board: IssueBoardResponse | null = null;
 
     if (sourceIndex && statusServerProjectionRebuildNeedsIssueBoard(projectionNames)) {
@@ -1993,7 +1992,13 @@ export class StatusServer {
   private async fetchWebDashboard(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebDashboard>>> {
     const durableDashboard = await this.webProjectionRepositories.dashboard.readCurrent({ forceRefresh });
     if (durableDashboard.status === "hit" && durableDashboard.record) {
-      return webProjectionJsonResponse(durableDashboard.record.payload, durableDashboard);
+      return webProjectionJsonResponse(
+        this.runtimeAuthoritativeDashboardProjection(
+          durableDashboard.record.payload,
+          this.runtimeProjectionSnapshot(null),
+        ),
+        durableDashboard,
+      );
     }
 
     if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
@@ -2003,10 +2008,10 @@ export class StatusServer {
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
     const sourceIndex = projection?.sourceIndex ?? null;
     const sourceRuntimeSnapshot = sourceIndex?.runtime.snapshot ?? null;
-    const snapshot = sourceRuntimeSnapshot ?? this.options.orchestrator.snapshot();
-    const projectionRuntime =
-      (snapshot.running?.length ?? 0) > 0 || (snapshot.providerGates?.length ?? 0) > 0 ? snapshot : null;
+    const snapshot = this.runtimeProjectionSnapshot(sourceRuntimeSnapshot);
+    const projectionRuntime = snapshot;
     let board: IssueBoardResponse | null = null;
+
     if (projection) {
       try {
         board = await this.buildIssueBoardFromSourceIndex(projection.sourceIndex, projection.issueBoardColumns);
@@ -2311,7 +2316,13 @@ export class StatusServer {
   private async fetchWebSidebar(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebSidebar>>> {
     const durableSidebar = await this.webProjectionRepositories.sidebar.readCurrent({ forceRefresh });
     if (durableSidebar.status === "hit" && durableSidebar.record) {
-      return webProjectionJsonResponse(durableSidebar.record.payload, durableSidebar);
+      return webProjectionJsonResponse(
+        this.runtimeAuthoritativeSidebarProjection(
+          durableSidebar.record.payload,
+          this.runtimeProjectionSnapshot(null),
+        ),
+        durableSidebar,
+      );
     }
 
     if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
@@ -2321,10 +2332,10 @@ export class StatusServer {
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
     const sourceIndex = projection?.sourceIndex ?? null;
     const sourceRuntimeSnapshot = sourceIndex?.runtime.snapshot ?? null;
-    const snapshot = sourceRuntimeSnapshot ?? this.options.orchestrator.snapshot();
-    const projectionRuntime =
-      (snapshot.running?.length ?? 0) > 0 || (snapshot.providerGates?.length ?? 0) > 0 ? snapshot : null;
+    const snapshot = this.runtimeProjectionSnapshot(sourceRuntimeSnapshot);
+    const projectionRuntime = snapshot;
     let board: IssueBoardResponse | null = null;
+
     if (projection) {
       try {
         board = await this.buildIssueBoardFromSourceIndex(projection.sourceIndex, projection.issueBoardColumns);
@@ -2367,6 +2378,36 @@ export class StatusServer {
     return webProjectionJsonResponse(sidebar, durableSidebar);
   }
 
+  private runtimeProjectionSnapshot(snapshot: RuntimeSnapshot | null | undefined): RuntimeSnapshot {
+    return snapshot ?? this.options.orchestrator.snapshot();
+  }
+
+  private runtimeAuthoritativeDashboardProjection(
+    dashboard: ReturnType<typeof projectWebDashboard>,
+    snapshot: RuntimeSnapshot | null | undefined,
+  ): ReturnType<typeof projectWebDashboard> {
+    if (snapshot === null || snapshot === undefined) return dashboard;
+    const runningAgents = projectRunningAgents(snapshot);
+    return {
+      ...dashboard,
+      providerGates: projectProviderGates(snapshot),
+      runningAgents,
+      agentUsageLabel: formatAgentUsageLabel(runningAgents.length, dashboard.concurrencyCap),
+    };
+  }
+
+  private runtimeAuthoritativeSidebarProjection(
+    sidebar: ReturnType<typeof projectWebSidebar>,
+    snapshot: RuntimeSnapshot | null | undefined,
+  ): ReturnType<typeof projectWebSidebar> {
+    if (snapshot === null || snapshot === undefined) return sidebar;
+    return {
+      ...sidebar,
+      providerGates: projectProviderGates(snapshot),
+      runningAgents: projectRunningAgents(snapshot),
+    };
+  }
+
   private async fetchWebHistory(forceRefresh: boolean, url: URL): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebHistory>>> {
     const limits = parseWebHistoryLimits(url);
     const projectContextId = parseProjectContextIdQuery(url);
@@ -2375,7 +2416,10 @@ export class StatusServer {
       projectContextId,
     });
     if (durableHistory.status === "hit" && durableHistory.record) {
-      return webProjectionJsonResponse(durableHistory.record.payload, durableHistory);
+      return webProjectionJsonResponse(
+        applyWebHistoryRuntimeLiveness(durableHistory.record.payload, this.runtimeProjectionSnapshot(null)),
+        durableHistory,
+      );
     }
 
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);

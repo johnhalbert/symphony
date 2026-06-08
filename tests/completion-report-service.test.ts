@@ -543,12 +543,27 @@ describe("CompletionReportService", () => {
     });
     const processedKeyBatches: string[][] = [];
     const writebackProcessor = {
-      async processDue(options: { idempotencyKeys?: readonly string[] } = {}) {
-        const keys = [...(options.idempotencyKeys ?? [])];
+      async processDue(
+        options: {
+          idempotencyKeys?: readonly string[];
+          operations?: readonly { idempotencyKey: string; projectContextId?: string | null }[];
+        } = {},
+      ) {
+        const scopedOperations = [...(options.operations ?? [])];
+        const keys =
+          scopedOperations.length > 0
+            ? scopedOperations.map((operation) => operation.idempotencyKey)
+            : [...(options.idempotencyKeys ?? [])];
         processedKeyBatches.push(keys);
-        for (const key of keys) {
-          const record = await outbox.get(key);
+        for (const operation of scopedOperations) {
+          const record = await outbox.get(operation.idempotencyKey, operation.projectContextId ?? null);
           if (record) await outbox.markSucceeded(record);
+        }
+        if (scopedOperations.length === 0) {
+          for (const key of keys) {
+            const record = await outbox.get(key);
+            if (record) await outbox.markSucceeded(record);
+          }
         }
       },
     };
