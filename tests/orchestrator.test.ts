@@ -297,7 +297,11 @@ describe("Orchestrator", () => {
     config.hermes.model = "config-model-should-not-leak";
     config.hermesAcp.binaryPath = null;
     config.hermesAcp.sourceProfile = null;
-    const candidate = issue({ state: "Todo" });
+    const candidate = issue({
+      state: "Todo",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -354,6 +358,12 @@ describe("Orchestrator", () => {
       runtimeSettingSources: ["host_hermes:PATH:hermes", "source_profile:active", "profile_prefix:symphony"],
       runtimeMode: null,
       runtimeAgentLifecycle: "reuse_by_issue",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    await expect(runStore.getWorkspace(candidate.identifier)).resolves.toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
     });
   });
 

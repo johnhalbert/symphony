@@ -471,7 +471,7 @@ export function normalizeProjectContextRegistry(
         prHandoff: github.prHandoff,
       });
     }
-    const credentialRoles = rawContext.credential_profiles?.roles;
+    const credentialRoles = enabled ? rawContext.credential_profiles?.roles : undefined;
     contextRoleAssignments.set(normalizedId, credentialRoles);
     contexts.push({
       id: normalizedId,
@@ -627,14 +627,16 @@ function normalizeWorkspaceConfig(
   const root = resolvePathValue(raw?.root ?? "symphony_workspaces", workflowDir, env);
   const stateDir = resolvePathValue(raw?.state_dir ?? ".symphony", root, env);
   const sourceKind = raw?.source?.kind ?? "none";
-  const sourcePath = raw?.source?.path === undefined ? undefined : resolvePathValue(raw.source.path, workflowDir, env);
-  const sourceCachePath =
-    raw?.source?.cache_path === undefined ? undefined : resolvePathValue(raw.source.cache_path, workflowDir, env);
+  const sourcePathValue = resolveNormalizedConfigString(raw?.source?.path, env);
+  const sourcePath = sourcePathValue === null ? undefined : resolvePathValue(sourcePathValue, workflowDir, env);
+  const sourceCachePathValue = resolveNormalizedConfigString(raw?.source?.cache_path, env);
+  const sourceCachePath = sourceCachePathValue === null ? undefined : resolvePathValue(sourceCachePathValue, workflowDir, env);
+  const sourceRepositoryValue = resolveNormalizedConfigString(raw?.source?.repository, env);
   const sourceRepository =
-    raw?.source?.repository === undefined ? undefined : resolveRepositoryValue(raw.source.repository, workflowDir, env);
+    sourceRepositoryValue === null ? undefined : resolveRepositoryValue(sourceRepositoryValue, workflowDir, env);
 
   if (input.requireGitWorktreeDetails && sourceKind === "git_worktree") {
-    if (!raw?.source?.repository) {
+    if (!sourceRepository) {
       throw contextConfigError(input.contextId, "workspace.source.repository is required for git_worktree");
     }
     if (!raw?.source?.base_ref) {
@@ -807,7 +809,7 @@ function buildCodebaseLabel(workspace: WorkspaceConfig): string {
   return workspace.root;
 }
 
-function validateWorkspaceSourceForEnabledContext(contextId: string, source: WorkspaceSourceConfig): void {
+function validateWorkspaceSourceForEnabledContext(contextId: string | null, source: WorkspaceSourceConfig): void {
   if (source.kind === "none") {
     throw contextConfigError(contextId, "enabled project contexts require workspace.source.kind other than none");
   }
@@ -1070,6 +1072,10 @@ function resolveConfigString(value: string | undefined, env: NodeJS.ProcessEnv):
   const varMatch = ENV_REFERENCE_PATTERN.exec(value);
   if (varMatch) return env[varMatch[1] ?? ""] ?? "";
   return value;
+}
+
+function resolveNormalizedConfigString(value: string | undefined, env: NodeJS.ProcessEnv): string | null {
+  return normalizeOptionalConfigString(resolveConfigString(value, env));
 }
 
 function resolvePathValue(value: string, baseDir: string, env: NodeJS.ProcessEnv): string {

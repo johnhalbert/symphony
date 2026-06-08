@@ -6,7 +6,7 @@ import type {
   PullRequestReviewFeedbackInput,
   PullRequestReviewFeedbackResult,
 } from "../../integrations/github/GitHubPullRequestClient.js";
-import type { ServiceConfig } from "../config/Config.js";
+import { serviceConfigForProjectContext, type ServiceConfig } from "../config/Config.js";
 import { SymphonyError } from "../errors.js";
 import type {
   CompletionReportPullRequestRef,
@@ -118,6 +118,10 @@ export interface PullRequestReviewFeedbackSubmitResult {
 export class PullRequestReviewFeedbackService {
   constructor(private readonly options: PullRequestReviewFeedbackServiceOptions) {}
 
+  private configForIssue(issue: Issue): ServiceConfig {
+    return serviceConfigForProjectContext(this.options.config, issue.projectContextId);
+  }
+
   async submit_pull_request_review_feedback(
     input: unknown,
     context: ReviewFeedbackActiveContext,
@@ -194,11 +198,12 @@ export class PullRequestReviewFeedbackService {
     if (lifecycle.summaryPointers.lastRunId !== context.activeRunId) {
       throw new SymphonyError("invalid_request", "Review feedback run does not match the active reviewer run");
     }
-    const lifecyclePhase = context.phase ?? lifecycle.phase ?? phaseForIssueState(context.issue.state, this.options.config);
+    const issueConfig = this.configForIssue(context.issue);
+    const lifecyclePhase = context.phase ?? lifecycle.phase ?? phaseForIssueState(context.issue.state, issueConfig);
     if (lifecyclePhase !== "review") {
       throw new SymphonyError("invalid_request", `Review feedback cannot be accepted while lifecycle phase is ${lifecyclePhase}`);
     }
-    if (!sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
+    if (!sameStateIn(context.issue.state, issueConfig.reviewLoop.reviewStates)) {
       throw new SymphonyError("invalid_request", "Review feedback requires the issue to be in a review state");
     }
   }

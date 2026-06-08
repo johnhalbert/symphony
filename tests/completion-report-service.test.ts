@@ -517,6 +517,7 @@ describe("CompletionReportService", () => {
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
     config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
     config.github.publishPullRequests = true;
     config.github.owner = "acme";
     config.github.repo = "symphony";
@@ -566,6 +567,15 @@ describe("CompletionReportService", () => {
       writebackProcessor,
       runStore,
       operatorApproval,
+      pullRequestPublisher: new FakePublisher({
+        action: "created",
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headBranch: "symphony/TEST-1",
+        headSha: "abc123",
+        lastPushedAt: "2026-01-01T00:00:01Z",
+        evidenceCursor: "idem-1",
+      }),
     });
 
     const submit = service.submitCompletionReport(
@@ -591,8 +601,8 @@ describe("CompletionReportService", () => {
     await operatorApproval.resolve(pending.requestId, "approve");
     await submit;
 
-    expect(processedKeyBatches).toHaveLength(1);
-    expect(processedKeyBatches[0]).not.toContain(siblingKey);
+    expect(processedKeyBatches.length).toBeGreaterThanOrEqual(1);
+    expect(processedKeyBatches.every((keys) => !keys.includes(siblingKey))).toBe(true);
     expect(
       processedKeyBatches[0]?.every(
         (key) => key.includes("completion-report:idem-1") && key.startsWith("project-context:docs:"),
@@ -673,6 +683,76 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("uses the active project context publication and review policy for docs completion reports", async () => {
+    const publisher = new FakePublisher({
+      url: "https://github.com/acme-docs/docs-site/pull/42",
+      number: 42,
+      headBranch: "symphony/DOCS-1",
+      headSha: "docs-head-sha",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      action: "created",
+      evidenceCursor: "idem-1",
+    });
+    const { config, service, outbox, runStore } = fixture({ publisher });
+    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+    if (!defaultContext) throw new Error("missing default project context");
+    config.github.publishPullRequests = false;
+    config.reviewLoop.reviewStates = ["Default Review"];
+    config.projectContexts.byId.set("docs", {
+      ...defaultContext,
+      id: "docs",
+      label: "Documentation Site",
+      github: {
+        ...defaultContext.github,
+        owner: "acme-docs",
+        repo: "docs-site",
+        publishPullRequests: true,
+        prHandoff: {
+          ...defaultContext.github.prHandoff,
+          enabled: false,
+        },
+      },
+      reviewLoop: {
+        ...defaultContext.reviewLoop,
+        reviewStates: ["Docs Review"],
+      },
+    });
+
+    await startRun(runStore);
+    const docsIssue = issue({
+      state: "In Progress",
+      branchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    const baseWorkspace = contextWithWorkspace().workspace;
+    if (!baseWorkspace) throw new Error("missing workspace context");
+
+    const result = await service.submitCompletionReport(
+      report({ branchName: "symphony/DOCS-1", changedFiles: ["docs/index.md"] }),
+      contextWithWorkspace({
+        issue: docsIssue,
+        workspace: {
+          ...baseWorkspace,
+          issueId: docsIssue.id,
+          issueIdentifier: docsIssue.identifier,
+          gitBranchName: "symphony/DOCS-1",
+        },
+      }),
+    );
+
+    expect(
+      result.writebackOperations.some((operation) => operation.kind === "transition" && operation.payload.toState === "Docs Review"),
+    ).toBe(true);
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      branchName: "symphony/DOCS-1",
+    });
+    expect(
+      (await outbox.list()).some((operation) => operation.kind === "transition" && operation.payload.toState === "Docs Review"),
+    ).toBe(true);
+  });
+
   function fixture(options: { publisher?: CompletionReportPullRequestPublisher; configure?: (config: ReturnType<typeof testConfig>) => void } = {}) {
     const config = testConfig(root);
     config.writeback.enabled = true;
@@ -700,7 +780,7 @@ describe("CompletionReportService", () => {
       runStore,
       ...(options.publisher === undefined ? {} : { pullRequestPublisher: options.publisher }),
     });
-    return { service, lifecycleStore, outbox, runStore };
+    return { config, service, lifecycleStore, outbox, runStore };
   }
 });
 

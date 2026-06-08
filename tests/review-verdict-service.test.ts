@@ -379,6 +379,49 @@ describe("ReviewVerdictService", () => {
     expect(result?.text).not.toContain("## Symphony Merge Gate Repair");
   });
 
+  it("accepts docs-context pass verdicts from docs review states", async () => {
+    const { config, service, lifecycleStore, outbox } = fixture();
+    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+    if (!defaultContext) throw new Error("missing default project context");
+    config.reviewLoop.reviewStates = ["Default Review"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+    config.projectContexts.byId.set("docs", {
+      ...defaultContext,
+      id: "docs",
+      label: "Documentation Site",
+      reviewLoop: {
+        ...defaultContext.reviewLoop,
+        reviewStates: ["Docs Review"],
+        reviewPassState: "Docs Ready to Merge",
+      },
+    });
+
+    const docsIssue = issue({
+      state: "Docs Review",
+      branchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, {
+      phase: "review",
+      reviewRound: 1,
+      summaryPointers: { prUrl: "https://github.com/acme-docs/docs-site/pull/42", prNumber: 42, prHeadSha: "docs-head-sha" },
+      reviewFeedback: [approvalFeedback({ pullRequest: { url: "https://github.com/acme-docs/docs-site/pull/42", number: 42, headSha: "docs-head-sha", branch: "symphony/DOCS-1" } })],
+    });
+
+    const result = await service.submitReviewVerdict(
+      passVerdict(),
+      context({ issue: docsIssue, phase: "review" }),
+    );
+
+    expect(result.replayed).toBe(false);
+    expect((await outbox.list()).find((operation) => operation.kind === "transition")).toMatchObject({
+      payload: { toState: "Docs Ready to Merge" },
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+  });
+
   function fixture() {
     const config = testConfig(root);
     config.writeback.enabled = true;
@@ -388,7 +431,7 @@ describe("ReviewVerdictService", () => {
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const outbox = new FileWritebackOutboxStore(root);
     const service = new ReviewVerdictService({ config, lifecycleStore, writebackOutbox: outbox });
-    return { service, lifecycleStore, outbox };
+    return { config, service, lifecycleStore, outbox };
   }
 });
 

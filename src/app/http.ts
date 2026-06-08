@@ -279,7 +279,7 @@ export interface StatusServerOptions {
   writebackOutbox?: StatusServerWritebackOutbox;
   operatorApproval?: Pick<
     OperatorApprovalService,
-    "get" | "resolve" | "findPendingForIssue" | "findPendingForRun" | "rejectPolicy" | "isRequired"
+    "get" | "resolve" | "findPendingForIssue" | "findPendingForRun" | "rejectPolicy" | "rejectPolicyForProjectContext" | "isRequired"
   >;
   host: string;
   port: number;
@@ -952,7 +952,7 @@ export class StatusServer {
         if (request.method === "GET") {
           const approval = await this.options.operatorApproval?.get(requestId);
           if (!approval) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
-          sendJson(response, 200, approvalResponse(approval, this.options.operatorApproval?.isRequired() ?? false));
+          sendJson(response, 200, approvalResponse(approval, this.options.operatorApproval?.isRequired(approval.projectContextId) ?? false));
           return;
         }
         if (request.method === "POST") {
@@ -987,12 +987,19 @@ export class StatusServer {
             await this.recordRejectedApprovalRunTerminal(result.request);
           }
           if (decision === "approve" && result.request.status === "approved") {
-            const resumed = await this.options.orchestrator.resumeApprovedPublication(result.request);
-            if (resumed !== true) {
-              throw new SymphonyError(
-                "conflict",
-                "Approved publication could not be resumed from a pending completion report",
-              );
+            const liveWaitingRun = await this.options.runStore?.getRun(result.request.runId);
+            const workerStillWaitingForApproval =
+              this.options.orchestrator.snapshot().counts.running > 0 &&
+              liveWaitingRun?.status === "running" &&
+              (await hasPendingPublicationLifecycle(result.request, this.options.lifecycleStore));
+            if (!workerStillWaitingForApproval) {
+              const resumed = await this.options.orchestrator.resumeApprovedPublication(result.request);
+              if (resumed !== true) {
+                throw new SymphonyError(
+                  "conflict",
+                  "Approved publication could not be resumed from a pending completion report",
+                );
+              }
             }
           }
           if (decision === "reject" && !result.replayed) {
@@ -1001,12 +1008,12 @@ export class StatusServer {
             } catch {
               // The approval decision is already durable; worker exit recovery will retry terminal writeback.
             }
-            if (this.options.operatorApproval?.rejectPolicy === "cancel") {
+            if (this.options.operatorApproval?.rejectPolicyForProjectContext?.(result.request.projectContextId) === "cancel") {
               await this.options.orchestrator.cancelIssue(result.request.issueId);
             }
           }
           sendJson(response, 200, {
-            request: approvalResponse(result.request, this.options.operatorApproval?.isRequired() ?? false),
+            request: approvalResponse(result.request, this.options.operatorApproval?.isRequired(result.request.projectContextId) ?? false),
             replayed: result.replayed,
           });
           return;
@@ -1230,11 +1237,13 @@ export class StatusServer {
             mutationHeader: "X-Symphony-Token",
             pendingApproval: approvalCapability(
               pendingApproval ?? null,
-              this.options.operatorApproval?.isRequired() ?? false,
+              this.options.operatorApproval?.isRequired(pendingApproval?.projectContextId) ?? false,
               this.options.openWorkspaceToken,
             ),
           },
-          pendingApproval: pendingApproval ? approvalResponse(pendingApproval, this.options.operatorApproval?.isRequired() ?? false) : null,
+          pendingApproval: pendingApproval
+            ? approvalResponse(pendingApproval, this.options.operatorApproval?.isRequired(pendingApproval.projectContextId) ?? false)
+            : null,
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
@@ -1352,7 +1361,7 @@ export class StatusServer {
     if (!this.options.runStore) return;
     const existing = await this.options.runStore.getRun(request.runId);
     const completedAt = existing?.completedAt ?? request.resolvedAt ?? new Date().toISOString();
-    const cancelPolicy = this.options.operatorApproval?.rejectPolicy === "cancel";
+    const cancelPolicy = this.options.operatorApproval?.rejectPolicyForProjectContext?.(request.projectContextId) === "cancel";
     await this.options.runStore.updateRun(request.runId, {
       status: cancelPolicy ? "cancelled" : "failed",
       completedAt,

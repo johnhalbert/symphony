@@ -257,6 +257,80 @@ describe("GitHub credential resolver", () => {
     });
   });
 
+  it("resolves publication owner, repo, and credentials from the active project context", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "DEFAULT" },
+        github: { owner: "acme", repo: "symphony", token: "$DEFAULT_GITHUB_TOKEN", publish_pull_requests: false },
+        credential_profiles: {
+          profiles: {
+            "default-publication": {
+              value: "$DEFAULT_PUBLICATION_TOKEN",
+              capabilities: ["github.publication"],
+            },
+            "docs-publication": {
+              value: "$DOCS_PUBLICATION_TOKEN",
+              capabilities: ["github.publication"],
+            },
+          },
+          roles: {
+            service: {
+              "github.publication": "default-publication",
+            },
+          },
+        },
+        project_contexts: [
+          {
+            id: "docs",
+            label: "Documentation Site",
+            tracker: {
+              api_key: "$LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "../docs-site",
+                base_ref: "origin/main",
+              },
+            },
+            github: {
+              owner: "acme-docs",
+              repo: "docs-site",
+              token: "$DOCS_GITHUB_TOKEN",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+            },
+            credential_profiles: {
+              roles: {
+                service: {
+                  "github.publication": "docs-publication",
+                },
+              },
+            },
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        DEFAULT_GITHUB_TOKEN: "default-legacy-token",
+        DEFAULT_PUBLICATION_TOKEN: "default-publication-token",
+        DOCS_GITHUB_TOKEN: "docs-legacy-token",
+        DOCS_PUBLICATION_TOKEN: "docs-publication-token",
+      },
+    );
+
+    const resolved = resolveGitHubClientConfig(config, "github.publication", "docs");
+    expect(resolved.github.owner).toBe("acme-docs");
+    expect(resolved.github.repo).toBe("docs-site");
+    expect(resolved.github.token).toBe("docs-publication-token");
+    expect(resolved.credential).toMatchObject({
+      profileName: "docs-publication",
+      source: "profile",
+    });
+  });
+
   it("rejects wrong-role-only GitHub assignments before legacy fallback", () => {
     for (const capability of githubCapabilities()) {
       const owner = expectedRole(capability);

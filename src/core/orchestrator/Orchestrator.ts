@@ -986,16 +986,15 @@ export class Orchestrator {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
     const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
-    const publisher =
-      this.options.completionReportPublisher ??
-      createGitHubPullRequestClientForCapability(this.config, "github.publication");
     const result = await new CompletionReportService({
       config: this.config,
       lifecycleStore: this.options.lifecycleStore,
       writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
       ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
       ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
-      pullRequestPublisher: publisher,
+      ...(this.options.completionReportPublisher === undefined
+        ? {}
+        : { pullRequestPublisher: this.options.completionReportPublisher }),
     }).resumeApprovedPublication({ approval: request, issue });
     if (!result) return false;
     return true;
@@ -1201,13 +1200,7 @@ export class Orchestrator {
   }
 
   private async recoverPendingPublicationApprovalHandoffs(): Promise<void> {
-    if (
-      !this.config.github.publishPullRequests ||
-      !(this.config.github.operatorApproval?.requiredForPublication ?? false) ||
-      !this.options.lifecycleStore ||
-      !this.options.writeback ||
-      !this.options.operatorApproval
-    ) {
+    if (!this.options.lifecycleStore || !this.options.writeback || !this.options.operatorApproval) {
       return;
     }
 
@@ -1234,9 +1227,9 @@ export class Orchestrator {
       writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
       writebackProcessor: this.options.writeback,
       ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      pullRequestPublisher:
-        this.options.completionReportPublisher ??
-        createGitHubPullRequestClientForCapability(this.config, "github.publication"),
+      ...(this.options.completionReportPublisher === undefined
+        ? {}
+        : { pullRequestPublisher: this.options.completionReportPublisher }),
       operatorApproval: this.options.operatorApproval,
     });
 
@@ -1916,6 +1909,8 @@ export class Orchestrator {
           cursorWorkerAgentLifecycle: this.config.cursor.workerAgentLifecycle,
           workspaceKey: context.workspace.workspaceKey,
           workspacePath: context.workspace.path,
+          ...(entry.issue.projectContextId === undefined ? {} : { projectContextId: entry.issue.projectContextId }),
+          ...(entry.issue.projectContextLabel === undefined ? {} : { projectContextLabel: entry.issue.projectContextLabel }),
           ...(context.workspace.gitBranchName === undefined ? {} : { gitBranchName: context.workspace.gitBranchName }),
           ...(context.workspace.repoPath === undefined ? {} : { repoPath: context.workspace.repoPath }),
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),

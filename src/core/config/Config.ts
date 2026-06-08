@@ -11,6 +11,7 @@ import {
 import {
   normalizeProjectContextRegistry,
   rawProjectContextsSchema,
+  type NormalizedProjectContext,
   type ProjectContextRegistry,
 } from "./ProjectContexts.js";
 
@@ -585,8 +586,46 @@ export interface ServiceConfig {
   raw: RawWorkflowConfig;
 }
 
+function defaultProjectContextForConfig(config: ServiceConfig): NormalizedProjectContext {
+  const context = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+  if (!context) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `Normalized default project context "${config.projectContexts.defaultContextId}" was not found`,
+    );
+  }
+  return context;
+}
+
+export function resolveProjectContextForConfig(
+  config: ServiceConfig,
+  projectContextId?: string | null,
+): NormalizedProjectContext {
+  if (projectContextId === undefined || projectContextId === null) {
+    return defaultProjectContextForConfig(config);
+  }
+  return config.projectContexts.byId.get(projectContextId) ?? defaultProjectContextForConfig(config);
+}
+
+export function serviceConfigForProjectContext(
+  config: ServiceConfig,
+  projectContextId?: string | null,
+): ServiceConfig {
+  const context = resolveProjectContextForConfig(config, projectContextId);
+  return {
+    ...config,
+    tracker: context.tracker,
+    workspace: context.workspace,
+    agent: context.agent,
+    github: context.github,
+    reviewLoop: context.reviewLoop,
+    issueBreakdown: context.issueBreakdown,
+  };
+}
+
 const DEFAULT_ACTIVE_STATES = ["Todo", "In Progress"];
 const DEFAULT_TERMINAL_STATES = ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"];
+
 const VALID_CURSOR_SETTING_SOURCES = new Set<CursorSettingSource>([
   "project",
   "user",
