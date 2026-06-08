@@ -7,6 +7,7 @@ import {
 } from "../CompletionReportService.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
+import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -21,6 +22,7 @@ export const COMPLETION_REPORT_TOOL_NAME = "submit_completion_report";
 
 export interface CompletionReportMcpContextFile {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string | null;
   role: "worker";
   token?: string | null;

@@ -122,33 +122,117 @@ function addRuntimeBaseline(env: Record<string, string>, parentEnv: NodeJS.Proce
 
 function addRequiredParseDependencies(env: Record<string, string>, config: ServiceConfig): void {
   const raw = config.raw;
-  const trackerApiKeyRef = envReference(raw.tracker?.api_key);
+  addTrackerParseDependencies(env, raw.tracker, config.tracker, { includeDefaultApiKeyFallback: true });
+  addWorkspaceParseDependencies(env, raw.workspace, config.workspace);
+  addGitHubParseDependencies(env, raw.github, config.github);
+
+  const rawProjectContexts = raw.project_contexts ?? [];
+  for (const [index, rawContext] of rawProjectContexts.entries()) {
+    const context = config.projectContexts.contexts[index];
+    if (!context) continue;
+    addTrackerParseDependencies(env, rawContext.tracker, context.tracker);
+    addWorkspaceParseDependencies(env, rawContext.workspace, context.workspace);
+    addGitHubParseDependencies(env, rawContext.github, context.github);
+  }
+}
+
+function addTrackerParseDependencies(
+  env: Record<string, string>,
+  rawTracker:
+    | {
+        api_key?: string | undefined;
+        project_slug?: string | undefined;
+        assignee?: string | undefined;
+      }
+    | undefined,
+  tracker: {
+    apiKey: string;
+    projectSlug: string;
+    assignee?: string | null;
+  },
+  options: { includeDefaultApiKeyFallback?: boolean } = {},
+): void {
+  const trackerApiKeyRef = envReference(rawTracker?.api_key);
   if (trackerApiKeyRef) {
-    env[trackerApiKeyRef] = config.tracker.apiKey;
-  } else if (raw.tracker?.api_key === undefined) {
-    env.LINEAR_API_KEY = config.tracker.apiKey;
+    env[trackerApiKeyRef] = tracker.apiKey;
+  } else if (options.includeDefaultApiKeyFallback && rawTracker?.api_key === undefined) {
+    env.LINEAR_API_KEY = tracker.apiKey;
   }
 
-  const trackerProjectSlugRef = envReference(raw.tracker?.project_slug);
-  if (trackerProjectSlugRef) env[trackerProjectSlugRef] = config.tracker.projectSlug;
+  const trackerProjectSlugRef = envReference(rawTracker?.project_slug);
+  if (trackerProjectSlugRef) env[trackerProjectSlugRef] = tracker.projectSlug;
 
-  const trackerAssigneeRef = envReference(raw.tracker?.assignee);
-  if (trackerAssigneeRef) env[trackerAssigneeRef] = config.tracker.assignee ?? "";
+  const trackerAssigneeRef = envReference(rawTracker?.assignee);
+  if (trackerAssigneeRef) env[trackerAssigneeRef] = tracker.assignee ?? "";
+}
 
-  const workspaceRootRef = envReference(raw.workspace?.root);
-  if (workspaceRootRef) env[workspaceRootRef] = config.workspace.root;
+function addWorkspaceParseDependencies(
+  env: Record<string, string>,
+  rawWorkspace:
+    | {
+        root?: string | undefined;
+        state_dir?: string | undefined;
+        source?: {
+          path?: string | undefined;
+          repository?: string | undefined;
+          cache_path?: string | undefined;
+        } | undefined;
+      }
+    | undefined,
+  workspace: {
+    root: string;
+    stateDir: string;
+    source: {
+      path?: string;
+      repository?: string;
+      cachePath?: string;
+    };
+  },
+): void {
+  const workspaceRootRef = envReference(rawWorkspace?.root);
+  if (workspaceRootRef) env[workspaceRootRef] = workspace.root;
 
-  const workspaceStateDirRef = envReference(raw.workspace?.state_dir);
-  if (workspaceStateDirRef) env[workspaceStateDirRef] = config.workspace.stateDir;
+  const workspaceStateDirRef = envReference(rawWorkspace?.state_dir);
+  if (workspaceStateDirRef) env[workspaceStateDirRef] = workspace.stateDir;
 
-  const sourcePathRef = envReference(raw.workspace?.source?.path);
-  if (sourcePathRef) env[sourcePathRef] = config.workspace.source.path ?? "";
+  const sourcePathRef = envReference(rawWorkspace?.source?.path);
+  if (sourcePathRef) env[sourcePathRef] = workspace.source.path ?? "";
 
-  const sourceRepositoryRef = envReference(raw.workspace?.source?.repository);
-  if (sourceRepositoryRef) env[sourceRepositoryRef] = config.workspace.source.repository ?? "";
+  const sourceRepositoryRef = envReference(rawWorkspace?.source?.repository);
+  if (sourceRepositoryRef) env[sourceRepositoryRef] = workspace.source.repository ?? "";
 
-  const sourceCachePathRef = envReference(raw.workspace?.source?.cache_path);
-  if (sourceCachePathRef) env[sourceCachePathRef] = config.workspace.source.cachePath ?? "";
+  const sourceCachePathRef = envReference(rawWorkspace?.source?.cache_path);
+  if (sourceCachePathRef) env[sourceCachePathRef] = workspace.source.cachePath ?? "";
+}
+
+function addGitHubParseDependencies(
+  env: Record<string, string>,
+  rawGithub:
+    | {
+        owner?: string | undefined;
+        repo?: string | undefined;
+        head_owner?: string | undefined;
+        api_base_url?: string | undefined;
+      }
+    | undefined,
+  github: {
+    owner: string | null;
+    repo: string | null;
+    headOwner: string | null;
+    apiBaseUrl: string;
+  },
+): void {
+  const ownerRef = envReference(rawGithub?.owner);
+  if (ownerRef) env[ownerRef] = github.owner ?? "";
+
+  const repoRef = envReference(rawGithub?.repo);
+  if (repoRef) env[repoRef] = github.repo ?? "";
+
+  const headOwnerRef = envReference(rawGithub?.head_owner);
+  if (headOwnerRef) env[headOwnerRef] = github.headOwner ?? "";
+
+  const apiBaseUrlRef = envReference(rawGithub?.api_base_url);
+  if (apiBaseUrlRef) env[apiBaseUrlRef] = github.apiBaseUrl;
 }
 
 function addCommandCapabilitySlice(

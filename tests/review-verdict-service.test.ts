@@ -77,6 +77,25 @@ describe("ReviewVerdictService", () => {
     });
   });
 
+  it("propagates project context onto verdict records, lifecycle state, and writeback operations", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+
+    const result = await service.submitReviewVerdict(failVerdict(), context({ projectContext: docsProjectContext }));
+    const lifecycle = await lifecycleStore.get("issue-1");
+    const operations = await outbox.list();
+
+    expect(result.verdict).toMatchObject({ projectContext: docsProjectContext });
+    expect(lifecycle).toMatchObject({
+      projectContext: docsProjectContext,
+      reviewVerdicts: [expect.objectContaining({ projectContext: docsProjectContext })],
+    });
+    expect(operations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectContext: docsProjectContext }),
+      ]),
+    );
+  });
+
   it("increments review rounds on each accepted fail verdict", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
@@ -556,6 +575,13 @@ function reviewFeedback(overrides: Partial<IssueReviewFeedbackRecord> = {}): Iss
     ...overrides,
   };
 }
+
+const docsProjectContext = {
+  projectContextId: "docs-site",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
 
 function failVerdict(overrides: Partial<ReviewVerdictInput> = {}): ReviewVerdictInput {
   return {

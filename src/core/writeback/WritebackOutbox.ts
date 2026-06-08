@@ -22,7 +22,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "transition";
       issueId: string;
-      projectContext?: ProjectContextResolution;
+      projectContext?: ProjectContextResolution | undefined;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -39,7 +39,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "comment";
       issueId: string;
-      projectContext?: ProjectContextResolution;
+      projectContext?: ProjectContextResolution | undefined;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -56,7 +56,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "issue_create";
       issueId: string;
-      projectContext?: ProjectContextResolution;
+      projectContext?: ProjectContextResolution | undefined;
       runId?: string;
       status: WritebackStatus;
       attempt: number;
@@ -84,7 +84,7 @@ export type WritebackOperation =
       idempotencyKey: string;
       kind: "issue_relation";
       issueId: string;
-      projectContext?: ProjectContextResolution;
+      projectContext?: ProjectContextResolution | undefined;
       runId?: string;
       status: WritebackStatus;
       attempt: number;

@@ -1,4 +1,5 @@
 import type { ServiceConfig } from "../config/Config.js";
+import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import type {
   IssueCompletionReportRecord,
   IssueMergeGateMergeabilityState,
@@ -10,6 +11,7 @@ import type { NewWritebackOperation } from "./WritebackOutbox.js";
 
 export interface RunWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   runId: string;
   sessionId: string | null;
   workspacePath: string | null;
@@ -18,6 +20,7 @@ export interface RunWritebackContext {
 
 export interface ReviewVerdictWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   runId: string;
   reviewer: string | null;
 }
@@ -31,6 +34,7 @@ export interface ReviewVerdictWritebackDetails {
 
 export interface BlockedEscalationWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   runId: string;
   reason: string;
   incompleteTurnCount?: number;
@@ -44,6 +48,7 @@ export interface BlockedEscalationWritebackContext {
 
 export interface MergeCompletedWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   mergeId: string;
   fromState: string;
   doneState: string;
@@ -58,6 +63,7 @@ export interface MergeGateCheckEvidence {
 
 export interface MergeGateWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   gateId: string;
   blockerFingerprint: string | null;
   fromState: string;
@@ -80,6 +86,7 @@ export interface MergeGateWritebackContext {
 
 export interface MergeConflictsWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   mergeId: string;
   fromState: string;
   conflictsState: string;
@@ -95,6 +102,7 @@ export interface MergeConflictsWritebackContext {
 
 export interface MergeGateHeadSupersessionWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   gateId: string;
   fromState: string;
   pullRequest: {
@@ -163,6 +171,7 @@ export function planRunStartedComment(context: RunWritebackContext, config: Serv
     idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-started`,
     kind: "comment",
     issueId: context.issue.id,
+    projectContext: context.projectContext,
     runId: context.runId,
     payload: {
       dedupeKey: `${context.runId}:run-started`,
@@ -185,6 +194,7 @@ export function planRunSucceededWritebacks(context: RunWritebackContext, config:
       idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-succeeded`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: `${context.runId}:run-succeeded`,
@@ -224,6 +234,7 @@ export function planCompletionReportAcceptedWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -246,6 +257,7 @@ export function planCompletionReportAcceptedWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${reviewState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         fromStates: completionReportFromStates,
@@ -276,6 +288,7 @@ export function planPullRequestHandoffWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -304,6 +317,7 @@ export function planPullRequestHandoffWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${targetState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         fromStates: handoffFromStates,
@@ -329,6 +343,7 @@ export function planCompletionReportPublicationApprovalPendingWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -363,6 +378,7 @@ export function planCompletionReportPublicationApprovalPendingWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         fromStates: [config.writeback.dispatchState],
@@ -393,6 +409,7 @@ export function planCompletionReportPublicationApprovalTerminalWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -431,6 +448,7 @@ export function planReviewFailWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -458,6 +476,7 @@ export function planReviewFailWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         fromStates: config.reviewLoop.reviewStates,
@@ -483,6 +502,7 @@ export function planReviewPassWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -509,6 +529,7 @@ export function planReviewPassWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.reviewLoop.reviewPassState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         fromStates: config.reviewLoop.reviewStates,
@@ -542,6 +563,7 @@ export function planBlockedEscalationWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -580,6 +602,7 @@ export function planBlockedEscalationWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         fromStates,
@@ -602,6 +625,7 @@ export function planMergeCompletedWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${context.mergeId}:${context.doneState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: [context.fromState],
         toState: context.doneState,
@@ -642,6 +666,7 @@ export function planMergeGateRepairWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: [context.fromState],
         toState: config.writeback.dispatchState,
@@ -677,6 +702,7 @@ export function planMergeGateBlockedWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: [context.fromState],
         toState: blockedState,
@@ -703,6 +729,7 @@ export function planMergeGateHeadSupersessionWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         dedupeKey: eventKey,
         body: [
@@ -725,6 +752,7 @@ export function planMergeGateHeadSupersessionWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: uniqueStates([context.fromState, config.writeback.dispatchState]),
         toState: config.writeback.dispatchState,
@@ -746,6 +774,7 @@ export function planMergeConflictsWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         dedupeKey: eventKey,
         body: [
@@ -767,6 +796,7 @@ export function planMergeConflictsWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${context.conflictsState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: [context.fromState],
         toState: context.conflictsState,
@@ -782,6 +812,7 @@ export function planRunFailedComment(context: RunWritebackContext, config: Servi
     idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-failed`,
     kind: "comment",
     issueId: context.issue.id,
+    projectContext: context.projectContext,
     runId: context.runId,
     payload: {
       dedupeKey: `${context.runId}:run-failed`,
@@ -796,6 +827,7 @@ export function planRunCancelledComment(context: RunWritebackContext, config: Se
     idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-cancelled`,
     kind: "comment",
     issueId: context.issue.id,
+    projectContext: context.projectContext,
     runId: context.runId,
     payload: {
       dedupeKey: `${context.runId}:run-cancelled`,
@@ -957,6 +989,7 @@ function mergeGateCommentOperation(
     idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
     kind: "comment",
     issueId: context.issue.id,
+    projectContext: context.projectContext,
     payload: {
       dedupeKey: eventKey,
       body: [

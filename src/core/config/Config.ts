@@ -1000,6 +1000,7 @@ function normalizeWorkflowProjectContext(
     merged.issue_breakdown,
     workspace.source.kind,
     contextPath,
+    enabled,
   );
   const agent = normalizeAgentConfigForProjectContext(merged.agent);
 
@@ -1225,9 +1226,10 @@ function normalizeIssueBreakdownConfigForProjectContext(
   rawIssueBreakdown: RawWorkflowConfig["issue_breakdown"],
   sourceKind: WorkspaceSourceConfig["kind"],
   contextPath: string,
+  enabled: boolean,
 ): IssueBreakdownConfig {
   const workspaceMode = rawIssueBreakdown?.workspace_mode ?? "none";
-  if (workspaceMode === "readonly_checkout") {
+  if (enabled && workspaceMode === "readonly_checkout") {
     if (sourceKind !== "git_worktree") {
       throw new SymphonyError(
         "config_validation_error",

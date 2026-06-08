@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
 import {
   normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
   type ProjectContextResolution,
 } from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
@@ -85,7 +86,7 @@ export interface IssueBreakdownPlanRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   summary: string;
   proposedIssues: ProposedIssueRecord[];
   transcriptPointers: string[];
@@ -156,7 +157,7 @@ export interface IssueCompletionReportRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   summary: string;
   validationEvidence: string[];
   acceptanceChecklist: CompletionReportChecklistItem[];
@@ -182,7 +183,7 @@ export interface IssueReviewVerdictRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   verdict: IssueReviewVerdict;
   acceptanceResults: ReviewVerdictAcceptanceResult[];
   findings: string[];
@@ -202,7 +203,7 @@ export interface IssueReviewFeedbackRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   kind: PullRequestReviewFeedbackKind;
   event: PullRequestReviewFeedbackEvent | null;
   body: string;
@@ -292,7 +293,7 @@ export interface IssueMergeConflictResolutionReportRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   resolutionStatus: "resolved" | "still_conflicted" | "blocked";
   summary: string;
   validationEvidence: string[];
@@ -360,7 +361,7 @@ export interface IssueLaneMemo {
   version: 1;
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   updatedAt: string;
   reviewRound: number;
   incompleteTurnCount: number;
@@ -383,7 +384,7 @@ export interface WorkerHandoffPacket {
   version: 1;
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   generatedAt: string;
   memo: IssueLaneMemo;
   lastWorkerOutput: IssueWorkerOutputContract | null;
@@ -394,7 +395,7 @@ export interface WorkerHandoffPacket {
 export interface IssueLifecycleRecord {
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   phase: IssueLifecyclePhase;
   reviewRound: number;
   incompleteTurnCount: number;
@@ -423,7 +424,7 @@ export interface IssueLifecycleRecord {
 }
 
 export interface IssueLifecyclePatch {
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   phase?: IssueLifecyclePhase;
   reviewRound?: number;
   incompleteTurnCount?: number;
@@ -467,7 +468,9 @@ export class FileIssueLifecycleStore {
   async ensureIssue(issue: Pick<Issue, "id" | "identifier">, patch: IssueLifecyclePatch = {}): Promise<IssueLifecycleRecord> {
     const existing = await this.find(issue.id, issue.identifier);
     const now = new Date().toISOString();
-    const projectContext = normalizeProjectContextResolution(patch.projectContext ?? existing?.projectContext);
+    const projectContext = normalizeProjectContextResolution(
+      patch.projectContext ?? existing?.projectContext ?? projectContextResolutionFromIssue(issue),
+    );
     const baseRecord = {
       issueId: issue.id,
       issueIdentifier: issue.identifier,

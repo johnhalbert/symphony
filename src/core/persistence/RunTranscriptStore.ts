@@ -94,7 +94,7 @@ export interface WorkspaceRecord {
   workspaceKey: string;
   issueId: string | null;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   path: string;
   sourceKind: string;
   repoPath?: string;
@@ -150,7 +150,7 @@ export interface RunRecord {
   runKind?: AgentRunKind;
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   attempt: number | null;
   turnNumber: number;
   prompt: string;
@@ -280,7 +280,7 @@ export interface StartRunInput {
   runKind?: AgentRunKind;
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   attempt: number | null;
   turnNumber: number;
   prompt: string;
@@ -343,7 +343,10 @@ export class FileRunTranscriptStore {
   async upsertWorkspace(record: WorkspaceRecord): Promise<void> {
     await fs.mkdir(this.workspacesDir(), { recursive: true });
     const existing = await this.getWorkspace(record.workspaceKey);
-    const normalized = normalizeWorkspaceRecord(record);
+    const normalized = normalizeWorkspaceRecord({
+      ...record,
+      projectContext: record.projectContext ?? existing?.projectContext,
+    });
     await writeJson(this.workspacePath(record.workspaceKey), {
       ...normalized,
       createdAt: existing?.createdAt ?? normalized.createdAt,

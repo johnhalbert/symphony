@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
+import { projectContextResolutionFromIssue } from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
@@ -1698,6 +1699,7 @@ export class Orchestrator {
   private async runWorker(entry: RunningEntry, attempt: number | null): Promise<void> {
     let workspace: Workspace | null = null;
     try {
+      entry.lifecycle ??= await this.options.lifecycleStore?.get(entry.issue.id) ?? null;
       workspace =
         entry.runPhase === "issue_breakdown"
           ? await this.options.workspaceManager.createForPlanning(entry.issue)
@@ -1903,6 +1905,7 @@ export class Orchestrator {
           runKind: runKindForPhase(entry.runPhase),
           issueId: entry.issue.id,
           issueIdentifier: entry.issue.identifier,
+          projectContext: entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
           attempt: context.attempt,
           turnNumber: context.turnNumber,
           prompt: context.prompt,
@@ -1928,6 +1931,7 @@ export class Orchestrator {
             planRunStartedComment(
               {
                 issue: entry.issue,
+                projectContext: entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
                 runId: entry.runId,
                 sessionId: entry.sessionId,
                 workspacePath: entry.workspacePath,
@@ -2680,6 +2684,7 @@ export class Orchestrator {
   ) {
     return {
       issue: entry.issue,
+      projectContext: entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
       role: entry.role,
       runPhase: entry.runPhase,
       attempt,
@@ -3083,7 +3088,10 @@ export class Orchestrator {
   private async updateLifecycle(entry: RunningEntry, patch: IssueLifecyclePatch): Promise<void> {
     const store = this.options.lifecycleStore;
     if (!store) return;
-    entry.lifecycle = await store.updateIssue(entry.issue, patch);
+    entry.lifecycle = await store.updateIssue(entry.issue, {
+      ...patch,
+      projectContext: patch.projectContext ?? entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
+    });
     await appendLaneMemoTelemetry(this.options.runStore, entry.activeRunId, entry.lifecycle, "orchestrator_update");
   }
 

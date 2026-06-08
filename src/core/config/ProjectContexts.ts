@@ -11,6 +11,17 @@ export interface ProjectContextResolution {
   routingSource: string;
 }
 
+export interface ProjectContextIssueLike {
+  projectContext?: Partial<ProjectContextResolution> | null;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  linearProjectSlug?: string | null;
+  routingSource?: string | null;
+  linearProjectIdentity?: {
+    slug?: string | null;
+  } | null;
+}
+
 export interface ProjectContextPublicMetadata {
   id: ProjectContextId;
   label: string;
@@ -111,6 +122,32 @@ export function normalizeProjectContextResolution(
     routingSource:
       normalizeOptionalNonEmptyString(value?.routingSource) ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
   };
+}
+
+export function projectContextResolutionFromIssue(issue: unknown): ProjectContextResolution | null {
+  if (typeof issue !== "object" || issue === null) return null;
+  const value = issue as ProjectContextIssueLike;
+  if (value.projectContext) {
+    return normalizeProjectContextResolution(value.projectContext);
+  }
+
+  const projectContextId = normalizeOptionalNonEmptyString(value.projectContextId);
+  const projectContextLabel = normalizeOptionalNonEmptyString(value.projectContextLabel);
+  const linearProjectSlug =
+    normalizeOptionalNonEmptyString(value.linearProjectSlug) ??
+    normalizeOptionalNonEmptyString(value.linearProjectIdentity?.slug);
+  const routingSource = normalizeOptionalNonEmptyString(value.routingSource);
+
+  if (projectContextId === null && projectContextLabel === null && linearProjectSlug === null && routingSource === null) {
+    return null;
+  }
+
+  return normalizeProjectContextResolution({
+    ...(projectContextId === null ? {} : { projectContextId }),
+    ...(projectContextLabel === null ? {} : { projectContextLabel }),
+    ...(linearProjectSlug === null ? {} : { linearProjectSlug }),
+    ...(routingSource === null ? {} : { routingSource }),
+  });
 }
 
 export function projectContextMetadataForPublicRead(input: {

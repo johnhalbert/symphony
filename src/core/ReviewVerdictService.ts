@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
+import { normalizeProjectContextResolution, projectContextResolutionFromIssue, type ProjectContextResolution } from "./config/ProjectContexts.js";
 import { SymphonyError } from "./errors.js";
 import type {
   CompletionReportPullRequestRef,
@@ -51,6 +52,7 @@ export type ReviewVerdictSubmitterRole = "worker" | "orchestrator" | "reviewer" 
 
 export interface ReviewVerdictActiveContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string;
   role: ReviewVerdictSubmitterRole;
   token?: string | null;
@@ -98,7 +100,10 @@ export class ReviewVerdictService {
     this.validateIssueIsAcceptingVerdicts(context, lifecyclePhase);
     this.validateVerdictPayload(verdict);
 
-    const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, { phase: lifecyclePhase });
+    const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
+      projectContext: resolveReviewVerdictProjectContext(context, existingLifecycle),
+      phase: lifecyclePhase,
+    });
     this.validateReviewFeedbackAlignment(verdict, lifecycle);
     const writebackDetails = {
       idempotencyKey: verdict.idempotencyKey,
@@ -115,6 +120,7 @@ export class ReviewVerdictService {
       runId: verdict.runId,
       issueId: context.issue.id,
       issueIdentifier: context.issue.identifier,
+      projectContext: resolveReviewVerdictProjectContext(context, lifecycle),
       verdict: verdict.verdict,
       acceptanceResults: normalizeAcceptanceResults(verdict.acceptanceResults),
       findings: verdict.findings,
@@ -128,6 +134,7 @@ export class ReviewVerdictService {
         ? planBlockedEscalationWritebacks(
             {
               issue: context.issue,
+              projectContext: resolveReviewVerdictProjectContext(context, lifecycle),
               runId: verdict.runId,
               reason: `max review rounds reached (${reviewRound}/${this.options.config.reviewLoop.maxReviewRounds})`,
               incompleteTurnCount: lifecycle.incompleteTurnCount,
@@ -158,6 +165,7 @@ export class ReviewVerdictService {
     }
 
     const updatedLifecycle = await this.options.lifecycleStore.updateIssue(context.issue, {
+      projectContext: resolveReviewVerdictProjectContext(context, lifecycle),
       phase: verdict.verdict === "pass" ? "passed" : ceilingReached ? "blocked" : "implementation",
       ...(verdict.verdict === "fail" ? { reviewRound } : {}),
       incompleteTurnCount: verdict.verdict === "fail" ? 0 : lifecycle.incompleteTurnCount,
@@ -334,9 +342,19 @@ function normalizeAcceptanceResults(items: ReviewVerdictInput["acceptanceResults
   }));
 }
 
+function resolveReviewVerdictProjectContext(
+  context: ReviewVerdictActiveContext,
+  lifecycle: IssueLifecycleRecord | null | undefined,
+): ProjectContextResolution {
+  return normalizeProjectContextResolution(
+    context.projectContext ?? lifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
+}
+
 function reviewWritebackContext(context: ReviewVerdictActiveContext, runId: string) {
   return {
     issue: context.issue,
+    projectContext: context.projectContext ?? projectContextResolutionFromIssue(context.issue) ?? undefined,
     runId,
     reviewer: context.reviewer ?? null,
   };

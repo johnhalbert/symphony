@@ -9,6 +9,7 @@ import {
   normalizeProjectContextId,
   normalizeProjectContextResolution,
   projectContextMetadataForPublicRead,
+  projectContextResolutionFromIssue,
 } from "../src/core/config/ProjectContexts.js";
 import { multiProjectWorkflowConfig, projectContextFixture } from "./helpers.js";
 
@@ -33,6 +34,22 @@ describe("project context normalization", () => {
       projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
       linearProjectSlug: null,
       routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+    });
+  });
+
+  it("derives normalized project context metadata from routed issue payloads", () => {
+    expect(
+      projectContextResolutionFromIssue({
+        projectContextId: " Docs Site ",
+        projectContextLabel: "Documentation Site",
+        linearProjectIdentity: { slug: "DOCS" },
+        routingSource: " candidate_poll ",
+      }),
+    ).toEqual({
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
     });
   });
 
@@ -96,6 +113,30 @@ describe("project context normalization", () => {
       publicMetadata: {
         linearProjectSlug: "TEST",
       },
+    });
+  });
+
+  it("skips readonly checkout issue-breakdown validation for disabled project contexts", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            enabled: false,
+            workspace: { source: null },
+            issue_breakdown: { workspace_mode: "readonly_checkout" },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+
+    expect(config.projectContexts.byId.get("docs")).toMatchObject({
+      enabled: false,
+      issueBreakdown: { workspaceMode: "readonly_checkout" },
     });
   });
 

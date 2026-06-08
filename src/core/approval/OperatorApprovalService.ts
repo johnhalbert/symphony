@@ -30,7 +30,7 @@ export interface OperatorApprovalRecord {
   status: OperatorApprovalStatus;
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   runId: string;
   evidenceCursor: string;
   dedupeKey: string;
@@ -51,7 +51,7 @@ export interface OperatorApprovalResolution {
 export interface OperatorApprovalRequestInput {
   issueId: string;
   issueIdentifier: string;
-  projectContext?: ProjectContextResolution;
+  projectContext?: ProjectContextResolution | undefined;
   runId: string;
   evidenceCursor: string;
   action: OperatorApprovalAction;

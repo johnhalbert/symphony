@@ -258,6 +258,26 @@ describe("FileIssueLifecycleStore", () => {
   });
 
 
+  it("infers project context from routed issue metadata when ensureIssue patch omits it", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const routedIssue = {
+      ...issue(),
+      projectContextId: " Docs Site ",
+      projectContextLabel: "Documentation Site",
+      linearProjectIdentity: { slug: "DOCS" },
+      routingSource: "candidate_poll",
+    };
+
+    const record = await store.ensureIssue(routedIssue, { phase: "implementation" });
+
+    expect(record.projectContext).toEqual({
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    });
+  });
+
   it("backfills and propagates durable project context attribution", async () => {
     const store = new FileIssueLifecycleStore(root);
     const docsProjectContext = {

@@ -223,6 +223,7 @@ async function writeHandoffMcpContexts(
   if (ctx.role === "worker" && phase === "implementation") {
     await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
       issue: ctx.issue,
+      projectContext: ctx.projectContext,
       activeRunId: input.activeRunId,
       role: "worker",
       token: null,
@@ -237,6 +238,7 @@ async function writeHandoffMcpContexts(
   if (ctx.role === "worker" && phase === "merge_conflict_resolution") {
     await writeMergeConflictResolutionMcpContext(mergeConflictResolutionContextFilePath(ctx), {
       issue: ctx.issue,
+      projectContext: ctx.projectContext,
       activeRunId: input.activeRunId,
       role: "worker",
       token: null,
@@ -251,6 +253,7 @@ async function writeHandoffMcpContexts(
   if (ctx.role === "worker" && phase === "issue_breakdown") {
     await writeIssueBreakdownPlanMcpContext(issueBreakdownPlanContextFilePath(ctx), {
       issue: ctx.issue,
+      projectContext: ctx.projectContext,
       activeRunId: input.activeRunId,
       role: "worker",
       workspacePath: ctx.workspace.path,
@@ -262,6 +265,7 @@ async function writeHandoffMcpContexts(
   if (ctx.role !== "reviewer") return;
   await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
     issue: ctx.issue,
+    projectContext: ctx.projectContext,
     activeRunId: input.activeRunId,
     role: "reviewer",
     token: null,
