@@ -265,24 +265,31 @@ Work on {{ issue.identifier }}.`,
     expect(config.workspace.source.repository).toBe(path.resolve("/repo/../docs-site"));
   });
 
-  it("allows disabled git_worktree contexts to omit repository and base_ref", () => {
+  it("allows disabled git_worktree contexts to keep placeholder workspace, state-bucket, and PR handoff settings", () => {
     const config = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY" },
         project_contexts: [
-          {
+          projectContextFixture({
             id: "staged",
             label: "Staged",
             enabled: false,
-            workspace: {
-              root: "./staged-workspaces",
-              state_dir: "./.staged",
-              source: {
-                kind: "git_worktree",
-                cleanup: "refuse_dirty",
+            repository: null,
+            baseRef: null,
+            workspaceRoot: "./staged-workspaces",
+            stateDir: "./.staged",
+            tracker: {
+              active_states: ["Todo", "In Review"],
+            },
+            review_loop: {
+              review_states: ["In Review"],
+            },
+            github: {
+              pr_handoff: {
+                enabled: true,
               },
             },
-          },
+          }),
           projectContextFixture({
             id: "docs",
             label: "Documentation Site",
@@ -298,6 +305,18 @@ Work on {{ issue.identifier }}.`,
     expect(config.projectContexts.defaultContextId).toBe("docs");
     expect(config.projectContexts.byId.get("staged")).toMatchObject({
       enabled: false,
+      tracker: {
+        activeStates: ["Todo", "In Review"],
+      },
+      reviewLoop: {
+        reviewStates: ["In Review"],
+      },
+      github: {
+        publishPullRequests: false,
+        prHandoff: {
+          enabled: true,
+        },
+      },
       workspace: {
         source: {
           kind: "git_worktree",

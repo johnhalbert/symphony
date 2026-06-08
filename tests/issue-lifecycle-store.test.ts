@@ -273,6 +273,47 @@ describe("FileIssueLifecycleStore", () => {
     });
   });
 
+  it("preserves the issue's project context when ensuring lifecycle without an explicit patch context", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(
+      issue({
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      }),
+      { phase: "review" },
+    );
+
+    const reloaded = await store.get("issue-1");
+    expect(reloaded).toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      summaryPointers: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      },
+      handoff: {
+        memo: {
+          pointers: {
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+          },
+        },
+      },
+    });
+    expect(buildWorkerHandoffPacket(reloaded!, "2026-01-01T00:02:00.000Z")).toMatchObject({
+      memo: {
+        pointers: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+        },
+      },
+      pointers: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      },
+    });
+  });
+
   it("tracks projection revisions for successful lifecycle writes only", async () => {
     const store = new FileIssueLifecycleStore(root);
     const events: Array<{ source: string; revision: number }> = [];

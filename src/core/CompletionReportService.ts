@@ -682,6 +682,7 @@ export class CompletionReportService {
       issueIdentifier: context.issue.identifier,
       runId: context.activeRunId,
       evidenceCursor: report.idempotencyKey,
+      ...writebackProjectContextFromIssue(context.issue),
       action: {
         kind: "push_and_pr",
         branchName: publicationInput.branchName,

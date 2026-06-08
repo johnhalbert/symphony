@@ -458,18 +458,23 @@ export class FileIssueLifecycleStore {
     return this.projectionNotifier.subscribe(listener);
   }
 
-  async ensureIssue(issue: Pick<Issue, "id" | "identifier">, patch: IssueLifecyclePatch = {}): Promise<IssueLifecycleRecord> {
+  async ensureIssue(
+    issue: Pick<Issue, "id" | "identifier" | "projectContextId" | "projectContextLabel">,
+    patch: IssueLifecyclePatch = {},
+  ): Promise<IssueLifecycleRecord> {
     const existing = await this.find(issue.id, issue.identifier);
     const now = new Date().toISOString();
     const projectContextId =
       patch.projectContextId ??
       patch.summaryPointers?.projectContextId ??
+      issue.projectContextId ??
       existing?.projectContextId ??
       existing?.summaryPointers.projectContextId ??
       DEFAULT_PROJECT_CONTEXT_ID;
     const projectContextLabel =
       patch.projectContextLabel ??
       patch.summaryPointers?.projectContextLabel ??
+      issue.projectContextLabel ??
       existing?.projectContextLabel ??
       existing?.summaryPointers.projectContextLabel ??
       defaultProjectContextLabel(projectContextId);

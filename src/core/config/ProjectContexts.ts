@@ -436,25 +436,25 @@ export function normalizeProjectContextRegistry(
     const agent = normalizeAgentConfig(mergeConfigSection(input.rawDefaults.agent, rawContext.agent));
     if (enabled) {
       validateWorkspaceSourceForEnabledContext(normalizedId, workspace.source);
+      validateStateBuckets({
+        contextId: normalizedId,
+        activeStates: tracker.activeStates,
+        handoffStates: tracker.handoffStates,
+        terminalStates: tracker.terminalStates,
+        reviewStates: reviewLoop.reviewStates,
+        blockedStates: reviewLoop.blockedStates,
+        reviewPassState: reviewLoop.reviewPassState,
+      });
+      validatePullRequestHandoffPolicy({
+        contextId: normalizedId,
+        publishPullRequests: github.publishPullRequests,
+        handoffStates: tracker.handoffStates,
+        reviewStates: reviewLoop.reviewStates,
+        blockedStates: reviewLoop.blockedStates,
+        reviewPassState: reviewLoop.reviewPassState,
+        prHandoff: github.prHandoff,
+      });
     }
-    validateStateBuckets({
-      contextId: normalizedId,
-      activeStates: tracker.activeStates,
-      handoffStates: tracker.handoffStates,
-      terminalStates: tracker.terminalStates,
-      reviewStates: reviewLoop.reviewStates,
-      blockedStates: reviewLoop.blockedStates,
-      reviewPassState: reviewLoop.reviewPassState,
-    });
-    validatePullRequestHandoffPolicy({
-      contextId: normalizedId,
-      publishPullRequests: github.publishPullRequests,
-      handoffStates: tracker.handoffStates,
-      reviewStates: reviewLoop.reviewStates,
-      blockedStates: reviewLoop.blockedStates,
-      reviewPassState: reviewLoop.reviewPassState,
-      prHandoff: github.prHandoff,
-    });
     const credentialRoles = rawContext.credential_profiles?.roles;
     contextRoleAssignments.set(normalizedId, credentialRoles);
     contexts.push({

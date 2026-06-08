@@ -8,7 +8,11 @@ import { FileIssueLifecycleStore, buildWorkerHandoffPacket, type IssueMergeGateS
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
-import type { OperatorApprovalRecord } from "../src/core/approval/OperatorApprovalService.js";
+import {
+  FileOperatorApprovalStore,
+  OperatorApprovalService,
+  type OperatorApprovalRecord,
+} from "../src/core/approval/OperatorApprovalService.js";
 import type {
   CompletionReportPullRequestCheckResult,
   CompletionReportPullRequestPublication,
@@ -508,7 +512,7 @@ describe("CompletionReportService", () => {
     expect((await lifecycleStore.get("issue-1"))?.completionReports).toHaveLength(1);
   });
 
-  it("scopes publication approval setup drains to the report writeback keys", async () => {
+  it("scopes publication approval setup drains to the report writeback keys and preserves non-default approval attribution", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
@@ -518,9 +522,12 @@ describe("CompletionReportService", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.github.operatorApproval!.requiredForPublication = true;
+    config.github.operatorApproval!.pollIntervalMs = 5;
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);
+    const approvalStore = new FileOperatorApprovalStore(root);
+    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
     await startRun(runStore);
     const siblingKey = "issue-create:issue-1:plan-1:0:hash";
     await outbox.enqueueOnce({
@@ -558,17 +565,31 @@ describe("CompletionReportService", () => {
       writebackOutbox: outbox,
       writebackProcessor,
       runStore,
-      operatorApproval: {
-        async requestPublicationApproval(input) {
-          return approvalRecord(input.issueId, input.issueIdentifier, input.runId, input.evidenceCursor, input.action);
-        },
-        async waitForPublicationApprovalRequest(record) {
-          return record;
-        },
-      },
+      operatorApproval,
     });
 
-    await service.submitCompletionReport(report(), contextWithWorkspace());
+    const submit = service.submitCompletionReport(
+      report(),
+      contextWithWorkspace({
+        issue: issue({
+          state: "In Progress",
+          branchName: "symphony/TEST-1",
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+        }),
+      }),
+    );
+
+    const pending = await waitForPendingApproval(operatorApproval);
+    await expect(approvalStore.get(pending.requestId)).resolves.toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      issueId: "issue-1",
+      runId: "run-1",
+      evidenceCursor: "idem-1",
+    });
+    await operatorApproval.resolve(pending.requestId, "approve");
+    await submit;
 
     expect(processedKeyBatches).toHaveLength(1);
     expect(processedKeyBatches[0]).not.toContain(siblingKey);
@@ -777,6 +798,15 @@ async function startRun(runStore: FileRunTranscriptStore): Promise<void> {
   });
 }
 
+async function waitForPendingApproval(operatorApproval: OperatorApprovalService): Promise<OperatorApprovalRecord> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const pending = await operatorApproval.findPendingForRun("run-1");
+    if (pending) return pending;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("pending approval was not created");
+}
+
 class FailingOutbox {
   attempted = 0;
 
@@ -816,29 +846,4 @@ class FakePublisher implements CompletionReportPullRequestPublisher {
     this.checkInputs.push(input);
     return this.checks;
   }
-}
-
-function approvalRecord(
-  issueId: string,
-  issueIdentifier: string,
-  runId: string,
-  evidenceCursor: string,
-  action: OperatorApprovalRecord["action"],
-): OperatorApprovalRecord {
-  return {
-    requestId: `approval:${runId}:${evidenceCursor}`,
-    status: "pending",
-    issueId,
-    issueIdentifier,
-    runId,
-    evidenceCursor,
-    dedupeKey: `${runId}:${evidenceCursor}`,
-    action,
-    requestedAt: "2026-01-01T00:00:00.000Z",
-    expiresAt: null,
-    resolvedAt: null,
-    resolvedBy: null,
-    decision: null,
-    staleReason: null,
-  };
 }
