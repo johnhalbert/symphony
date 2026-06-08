@@ -18,6 +18,23 @@ describe("test helper fixtures", () => {
     );
   });
 
+  it("composes custom multi-project context arrays without secret-bearing per-context tracker values", () => {
+    const config = multiProjectWorkflowConfig({
+      projectContexts: [
+        projectContextFixture({ id: "api", label: "API", projectSlug: "API", repository: "../api-repo" }),
+        projectContextFixture({ id: "docs", label: "Docs", projectSlug: "DOCS", repository: "../docs-site" }),
+      ],
+    });
+
+    expect(config.tracker?.api_key).toBe("$LINEAR_API_KEY");
+    expect(config.project_contexts.map((context) => context.id)).toEqual(["api", "docs"]);
+    expect(config.project_contexts.map((context) => context.workspace?.source?.repository)).toEqual([
+      "../api-repo",
+      "../docs-site",
+    ]);
+    expect(config.project_contexts.every((context) => context.tracker?.api_key === undefined)).toBe(true);
+  });
+
   it("can omit project slugs and workspace sources for negative validation fixtures", () => {
     const context = projectContextFixture({
       id: "broken",

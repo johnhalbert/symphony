@@ -140,6 +140,13 @@ export interface TrackerClientFixtureOptions {
   issues?: TrackerIssueFixture[];
 }
 
+/**
+ * Build a single multi-project workflow context fixture with safe defaults.
+ *
+ * Downstream tests can override tracker/workspace fields or explicitly omit the
+ * project slug and workspace source to exercise negative validation paths
+ * without embedding real credential values in fixture data.
+ */
 export function projectContextFixture(overrides: ProjectContextFixtureOverrides = {}): TestProjectContextFixture {
   const {
     id = "symphony",
@@ -211,6 +218,13 @@ export function projectContextFixture(overrides: ProjectContextFixtureOverrides 
   };
 }
 
+/**
+ * Build a reusable raw workflow config fixture for multi-project tests.
+ *
+ * The top-level tracker keeps a placeholder API key token while per-context
+ * defaults focus on routing metadata and workspace shape so tests can compose
+ * multiple project contexts without introducing secret-bearing values.
+ */
 export function multiProjectWorkflowConfig(
   overrides: MultiProjectWorkflowConfigOverrides = {},
 ): TestMultiProjectWorkflowConfig {
