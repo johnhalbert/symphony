@@ -261,17 +261,17 @@ describe("/api/v1/web route contracts", () => {
     };
     const history = {
       sessions: [
-        {
+        historySessionFixture({
           id: "durable-session",
+          issue: "ENG-179",
           title: "Durable session",
           subtitle: "read model",
+          startedAt: "2026-05-31T00:00:00.000Z",
           updatedAt: "2026-05-31T00:00:00.000Z",
           msgCount: 1,
           lastEvent: "done",
           toolCount: 0,
-          state: "finished",
-          runSession: { status: "succeeded" },
-        },
+        }),
       ],
       transcriptBySession: {},
       timeline: [],
@@ -331,6 +331,7 @@ describe("/api/v1/web route contracts", () => {
         detail: "Durable tracker source is current",
       },
     ];
+    const expectedDashboard = { ...dashboard, agentUsageLabel: "0/4 agents" };
     const projectionReader = new RecordingProjectionReader([
       projectionPayloadRecordFixture(
         { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
@@ -366,7 +367,7 @@ describe("/api/v1/web route contracts", () => {
     const baseUrl = baseUrlFor(address);
     try {
       const durableDashboard = await getJson(`${baseUrl}/api/v1/web/dashboard`);
-      expect(durableDashboard.body).toEqual({ ...dashboard, agentUsageLabel: "0/4 agents" });
+      expect(durableDashboard.body).toEqual(expectedDashboard);
       expect(durableDashboard.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(durableDashboard.response.headers.get("x-symphony-projection-cache")).toBe("hit");
       expect(durableDashboard.response.headers.get("x-symphony-projection-name")).toBe("dashboard_projection");
@@ -379,7 +380,6 @@ describe("/api/v1/web route contracts", () => {
       expect(durableIssues.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(durableIssues.response.headers.get("x-symphony-projection-name")).toBe("issue_board_projection");
       expect(headerJson(durableIssues.response, "x-symphony-projection-source-freshness")).toEqual(sourceFreshness);
-
       await expect(getJson(`${baseUrl}/api/v1/web/issues/ENG-179`)).resolves.toMatchObject({
         body: { issue: durableIssue, activity: durableIssue.activity, runs: [], transcript: [] },
       });
@@ -443,17 +443,20 @@ describe("/api/v1/web route contracts", () => {
         })),
       };
     });
-    const historySessions = Array.from({ length: 100 }, (_, index) => ({
-      id: `session-large-${index + 1}`,
-      title: `Large durable session ${index + 1}`,
-      subtitle: `ENG-${1000 + index} · worker-${index % 5}`,
-      updatedAt: new Date(Date.UTC(2026, 4, 31, 2, index % 60, 0)).toISOString(),
-      msgCount: 500 + index,
-      lastEvent: `large event ${index + 1}`,
-      toolCount: index % 7,
-      state: "finished",
-      runSession: { status: "succeeded" },
-    }));
+    const historySessions = Array.from({ length: 100 }, (_, index) =>
+      historySessionFixture({
+        id: `session-large-${index + 1}`,
+        issue: `ENG-${1000 + index}`,
+        title: `Large durable session ${index + 1}`,
+        subtitle: `ENG-${1000 + index} · worker-${index % 5}`,
+        startedAt: new Date(Date.UTC(2026, 4, 31, 1, index % 60, 0)).toISOString(),
+        updatedAt: new Date(Date.UTC(2026, 4, 31, 2, index % 60, 0)).toISOString(),
+        msgCount: 500 + index,
+        lastEvent: `large event ${index + 1}`,
+        toolCount: index % 7,
+        agentId: `worker-${index % 5}`,
+      }),
+    );
     const historyTimeline = Array.from({ length: 250 }, (_, index) => ({
       id: `timeline-large-${index + 1}`,
       sessionId: historySessions[index % historySessions.length]?.id,
@@ -571,6 +574,8 @@ describe("/api/v1/web route contracts", () => {
         },
       ),
     ]);
+    const expectedDashboard = { ...dashboard, agentUsageLabel: "0/72 agents", runningAgents: [] };
+    const expectedSidebar = { ...sidebar, runningAgents: [] };
     const projectionWriter = new RecordingProjectionWriter();
     let contextBuilds = 0;
     const { server, calls } = createStatusServer(root, {
@@ -598,7 +603,7 @@ describe("/api/v1/web route contracts", () => {
 
     try {
       const durableDashboard = await getJson(`${baseUrl}/api/v1/web/dashboard`);
-      expect(durableDashboard.body).toEqual({ ...dashboard, agentUsageLabel: "0/72 agents", runningAgents: [] });
+      expect(durableDashboard.body).toEqual(expectedDashboard);
       expect((durableDashboard.body as { activity: unknown[] }).activity).toHaveLength(250);
       expectProjectionHeaders(durableDashboard.response, {
         name: "dashboard_projection",
@@ -629,7 +634,7 @@ describe("/api/v1/web route contracts", () => {
       });
 
       const durableSidebar = await getJson(`${baseUrl}/api/v1/web/sidebar`);
-      expect(durableSidebar.body).toEqual({ ...sidebar, runningAgents: [] });
+      expect(durableSidebar.body).toEqual(expectedSidebar);
       expect((durableSidebar.body as { reviewIssues: unknown[] }).reviewIssues).toHaveLength(80);
       expectProjectionHeaders(durableSidebar.response, {
         name: "sidebar_projection",
@@ -945,7 +950,6 @@ describe("/api/v1/web route contracts", () => {
       const issues = await getJson(`${baseUrl}/api/v1/web/issues?refresh=true`);
       expect(issues.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
       expect(issues.body).toMatchObject({ issues: [], lanes: { todo: [], progress: [], review: [] } });
-
 
       const history = await getJson(`${baseUrl}/api/v1/web/history?refresh=true`);
       expect(history.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
@@ -2310,6 +2314,130 @@ function runRecordFixture(overrides: Partial<RunRecord> = {}): RunRecord {
     tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     transcriptEventCount: 0,
     ...overrides,
+  };
+}
+
+function historySessionFixture(input: {
+  id: string;
+  issue: string;
+  title: string;
+  updatedAt: string;
+  msgCount: number;
+  lastEvent: string;
+  toolCount: number;
+  subtitle?: string;
+  startedAt?: string;
+  agentId?: string;
+  state?: "running" | "finished" | "error" | "cancelled" | "queued" | "not_live";
+  status?: RunRecord["status"];
+  model?: string;
+}) {
+  const {
+    id,
+    issue,
+    title,
+    updatedAt,
+    msgCount,
+    lastEvent,
+    toolCount,
+    subtitle,
+    startedAt = updatedAt,
+    agentId = "agent-1",
+    state = "finished",
+    status = "succeeded",
+    model = "claude-sonnet-4",
+  } = input;
+  return {
+    id,
+    issue,
+    title,
+    ...(subtitle ? { subtitle } : {}),
+    state,
+    model,
+    startedAt,
+    updatedAt,
+    msgCount,
+    lastEvent,
+    toolCount,
+    runSession: {
+      runId: id,
+      sessionId: id,
+      agentId,
+      role: "worker" as const,
+      runPhase: "implementation" as const,
+      runKind: "implementation" as const,
+      attempt: 1,
+      turnNumber: 1,
+      harnessId: "cursor",
+      status,
+      startedAt,
+      updatedAt,
+      completedAt: status === "running" ? null : updatedAt,
+      error: null,
+      transcriptEventCount: msgCount,
+      tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      runtime: {
+        model,
+        modelParams: [],
+        settingSources: [],
+        mode: null,
+        allowLargeContext: null,
+        agentLifecycle: null,
+      },
+      cursor: {
+        model,
+        modelParams: [],
+        settingSources: [],
+        mode: null,
+        allowLargeContext: null,
+        workerAgentLifecycle: null,
+      },
+      workspace: {
+        key: issue,
+        path: path.join("workspaces", issue),
+        repoPath: "/repo",
+        baseRef: "main",
+        branch: `symphony/${issue}`,
+      },
+      pullRequest: {
+        url: null,
+        number: null,
+        headSha: null,
+        branch: null,
+        ciStatus: null,
+        lastPushedAt: null,
+        lastEvidenceCursor: null,
+      },
+      approval: {
+        pendingRequestId: null,
+        requestedAt: null,
+      },
+      cancellation: {
+        requestedAt: null,
+        source: null,
+        reason: null,
+        outcome: null,
+        harnessStopRequestedAt: null,
+        harnessStopFailedAt: null,
+        harnessStopFailedReason: null,
+        cancelFailed: false,
+        cancelFailedAt: null,
+        cancelFailedReason: null,
+        cancelFailedSource: null,
+      },
+      failure: {
+        kind: null,
+        diagnosticCode: null,
+        diagnosticMessage: null,
+        diagnosticAt: null,
+      },
+      providerLimit: null,
+      links: {
+        issue: `/api/v1/web/issues/${encodeURIComponent(issue)}`,
+        run: `/api/v1/runs/${encodeURIComponent(id)}`,
+        transcript: `/api/v1/web/sessions/${encodeURIComponent(id)}/transcript`,
+      },
+    },
   };
 }
 
