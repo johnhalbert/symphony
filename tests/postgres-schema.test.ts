@@ -202,10 +202,10 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(projectionBuildModes?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
   });
 
-  // T021 is test-first: keep the reserved 0007 contract executable in CI without
-  // pretending the migration already exists. T022 should flip these back to plain
-  // `it(...)` assertions when `0007_project_context_attribution.sql` lands.
-  it.fails("reserves 0007 project-context attribution on the configured migration path before the migration is implemented", async () => {
+  // T021 is test-first: keep the reserved 0007 contract executable in CI so the
+  // focused schema suite fails until `0007_project_context_attribution.sql` lands
+  // with the full project-context attribution contract.
+  it("reserves 0007 project-context attribution on the configured migration path before the migration is implemented", async () => {
     const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
 
     expect(migrations.map((migration) => migration.id)).toEqual([
@@ -279,7 +279,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain("on symphony.projection_revision (build_mode, projection_name, updated_at desc, generated_at desc)");
   });
 
-  it.fails("reserves owned-state project context attribution columns, chat scoping, and replaced read indexes before the migration is implemented", async () => {
+  it("reserves owned-state project context attribution columns, chat scoping, and replaced read indexes before the migration is implemented", async () => {
     const normalized = normalizedSql(await projectContextAttributionMigrationSql());
 
     for (const fragment of [
@@ -310,6 +310,8 @@ describe("Postgres Symphony-owned state migration", () => {
       "alter table symphony.chat_message add constraint chat_message_thread_key_message_index_key unique (project_context_id, thread_key, message_index)",
       "alter table symphony.writeback_operation drop constraint if exists writeback_operation_pkey",
       "alter table symphony.writeback_operation add primary key (project_context_id, idempotency_key)",
+      "alter table symphony.approval_request drop constraint if exists approval_request_pkey",
+      "alter table symphony.approval_request add primary key (project_context_id, request_id)",
       "alter table symphony.approval_request drop constraint if exists approval_request_dedupe_key_key",
       "alter table symphony.approval_request add constraint approval_request_dedupe_key_key unique (project_context_id, dedupe_key)",
     ]) {
@@ -360,7 +362,7 @@ describe("Postgres Symphony-owned state migration", () => {
     }
   });
 
-  it.fails("reserves projection project context attribution columns, dropped/recreated read indexes, and context-scoped unique revisions before the migration is implemented", async () => {
+  it("reserves projection project context attribution columns, dropped/recreated read indexes, and context-scoped unique revisions before the migration is implemented", async () => {
     const normalized = normalizedSql(await projectContextAttributionMigrationSql());
 
     for (const table of [
@@ -1674,6 +1676,48 @@ async function expectLegacyProjectContextAttributionMigrated(containerName: stri
   expect(contextIds.every((value) => typeof value === "string" && value.length > 0)).toBe(true);
   expect(new Set(contextIds).size).toBe(1);
 
+  const runSessionAttribution = JSON.parse(
+    (
+      await psql(
+        containerName,
+        String.raw`
+          select jsonb_build_object(
+            'project_context_id', project_context_id,
+            'project_context_label', project_context_label,
+            'linear_project_identity', linear_project_identity,
+            'codebase_identity', codebase_identity,
+            'routing_source', routing_source
+          )::text
+          from symphony.run_session
+          where run_id = 'run:legacy-context-upgrade';
+        `,
+      )
+    ).trim(),
+  ) as {
+    project_context_id: string | null;
+    project_context_label: string | null;
+    linear_project_identity: Record<string, unknown> | null;
+    codebase_identity: Record<string, unknown> | null;
+    routing_source: string | null;
+  };
+  expect(typeof runSessionAttribution.project_context_id).toBe("string");
+  expect(runSessionAttribution.project_context_id?.length ?? 0).toBeGreaterThan(0);
+  expect(typeof runSessionAttribution.project_context_label).toBe("string");
+  expect(runSessionAttribution.project_context_label?.length ?? 0).toBeGreaterThan(0);
+  expect(runSessionAttribution.linear_project_identity).toBeTruthy();
+  expect(typeof runSessionAttribution.linear_project_identity).toBe("object");
+  expect(Array.isArray(runSessionAttribution.linear_project_identity)).toBe(false);
+  expect(runSessionAttribution.codebase_identity).toBeTruthy();
+  expect(typeof runSessionAttribution.codebase_identity).toBe("object");
+  expect(Array.isArray(runSessionAttribution.codebase_identity)).toBe(false);
+  expect([
+    "candidate_poll",
+    "state_refresh",
+    "legacy_default",
+    "operator_request",
+    "replay",
+  ]).toContain(runSessionAttribution.routing_source);
+
   const chatMessageConstraint = await psql(
     containerName,
     String.raw`
@@ -1717,6 +1761,17 @@ async function expectLegacyProjectContextAttributionMigrated(containerName: stri
     `,
   );
   expect(normalizedSql(writebackPrimaryKey)).toContain("primary key (project_context_id, idempotency_key)");
+
+  const approvalRequestPrimaryKey = await psql(
+    containerName,
+    String.raw`
+      select pg_get_constraintdef(oid)
+      from pg_constraint
+      where conrelid = 'symphony.approval_request'::regclass
+        and conname = 'approval_request_pkey';
+    `,
+  );
+  expect(normalizedSql(approvalRequestPrimaryKey)).toContain("primary key (project_context_id, request_id)");
 
   const approvalDedupeConstraint = await psql(
     containerName,
@@ -2383,10 +2438,7 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
         )
         select
           runs.project_context_id,
-          case runs.project_context_id
-            when 'symphony' then 'approval:context-symphony:publish:1'
-            else 'approval:context-docs:publish:1'
-          end,
+          'approval:context-shared:publish:1',
           'pending',
           issues.issue_key,
           'ENG-CTX-101',
@@ -2593,6 +2645,34 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
     orchestrator_chat_projection: 2,
   });
 
+  const runSessionAttributionColumns = JSON.parse(
+    (
+      await psql(
+        containerName,
+        String.raw`
+          select coalesce(jsonb_object_agg(column_name, udt_name order by column_name), '{}'::jsonb)::text
+          from information_schema.columns
+          where table_schema = 'symphony'
+            and table_name = 'run_session'
+            and column_name in (
+              'project_context_id',
+              'project_context_label',
+              'linear_project_identity',
+              'codebase_identity',
+              'routing_source'
+            );
+        `,
+      )
+    ).trim(),
+  ) as Record<string, string>;
+  expect(runSessionAttributionColumns).toEqual({
+    codebase_identity: 'jsonb',
+    linear_project_identity: 'jsonb',
+    project_context_id: 'text',
+    project_context_label: 'text',
+    routing_source: 'text',
+  });
+
   const indexMetadata = await psql(
     containerName,
     String.raw`
@@ -2606,6 +2686,7 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           'run_session_pkey',
           'run_session_lookup_idx',
           'writeback_operation_pkey',
+          'approval_request_pkey',
           'approval_request_dedupe_key_key',
           'projection_revision_current_unique_idx',
           'projection_revision_scope_revision_unique_idx',
@@ -2629,6 +2710,7 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
   expect(indexes.writeback_operation_pkey?.toLowerCase()).toContain(
     "(project_context_id, idempotency_key)",
   );
+  expect(indexes.approval_request_pkey?.toLowerCase()).toContain("(project_context_id, request_id)");
   expect(indexes.approval_request_dedupe_key_key?.toLowerCase()).toContain(
     "(project_context_id, dedupe_key)",
   );
@@ -2886,6 +2968,37 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
     psql(
       containerName,
       String.raw`
+        insert into symphony.approval_request (
+          project_context_id,
+          request_id,
+          status,
+          issue_key,
+          issue_identifier,
+          run_id,
+          evidence_cursor,
+          dedupe_key,
+          action,
+          requested_at
+        ) values (
+          'symphony',
+          'approval:context-shared:publish:1',
+          'pending',
+          'issue:context-shared',
+          'ENG-CTX-101',
+          'run:context-shared',
+          'run:context-shared/transcript/100',
+          'approval:context-shared:publish:alternate',
+          '{"kind":"publish_pull_request"}'::jsonb,
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
         insert into symphony.projection_revision (
           project_context_id,
           projection_name,
@@ -2904,6 +3017,191 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
       `,
     ),
   ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expectProjectContextScopedProjectionChildDuplicatesRejected(containerName);
+}
+
+async function expectProjectContextScopedProjectionChildDuplicatesRejected(containerName: string): Promise<void> {
+  for (const duplicateInsert of [
+    String.raw`
+      with duplicate_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'symphony',
+          'dashboard_projection',
+          'contract_duplicate_scope',
+          'global',
+          1,
+          now()
+        ) returning projection_revision_id
+      )
+      insert into symphony.dashboard_projection (
+        project_context_id,
+        projection_revision_id,
+        scope_key,
+        revision,
+        payload,
+        generated_at
+      )
+      select 'symphony', projection_revision_id, 'global', 1, '{"contexts":[]}'::jsonb, now()
+      from duplicate_revision;
+    `,
+    String.raw`
+      with duplicate_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'symphony',
+          'issue_board_projection',
+          'contract_duplicate_scope',
+          'default-board',
+          1,
+          now()
+        ) returning projection_revision_id
+      )
+      insert into symphony.issue_board_projection (
+        project_context_id,
+        projection_revision_id,
+        scope_key,
+        revision,
+        payload,
+        generated_at
+      )
+      select 'symphony', projection_revision_id, 'default-board', 1, '{"issues":[]}'::jsonb, now()
+      from duplicate_revision;
+    `,
+    String.raw`
+      with duplicate_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'symphony',
+          'sidebar_projection',
+          'contract_duplicate_scope',
+          'global',
+          1,
+          now()
+        ) returning projection_revision_id
+      )
+      insert into symphony.sidebar_projection (
+        project_context_id,
+        projection_revision_id,
+        scope_key,
+        revision,
+        payload,
+        generated_at
+      )
+      select 'symphony', projection_revision_id, 'global', 1, '{"items":[]}'::jsonb, now()
+      from duplicate_revision;
+    `,
+    String.raw`
+      with duplicate_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'symphony',
+          'history_projection',
+          'contract_duplicate_scope',
+          'global',
+          1,
+          now()
+        ) returning projection_revision_id
+      )
+      insert into symphony.history_projection (
+        project_context_id,
+        projection_revision_id,
+        scope_key,
+        revision,
+        payload,
+        generated_at
+      )
+      select 'symphony', projection_revision_id, 'global', 1, '{"sessions":[]}'::jsonb, now()
+      from duplicate_revision;
+    `,
+    String.raw`
+      with duplicate_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'symphony',
+          'transcript_projection',
+          'contract_duplicate_scope',
+          'transcript:context-shared',
+          1,
+          now()
+        ) returning projection_revision_id
+      )
+      insert into symphony.transcript_projection (
+        project_context_id,
+        projection_revision_id,
+        scope_key,
+        run_id,
+        revision,
+        payload,
+        generated_at
+      )
+      select 'symphony', projection_revision_id, 'transcript:context-shared', 'run:context-shared', 1, '{"messages":[]}'::jsonb, now()
+      from duplicate_revision;
+    `,
+    String.raw`
+      with duplicate_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'symphony',
+          'orchestrator_chat_projection',
+          'contract_duplicate_scope',
+          'global',
+          1,
+          now()
+        ) returning projection_revision_id
+      )
+      insert into symphony.orchestrator_chat_projection (
+        project_context_id,
+        projection_revision_id,
+        scope_key,
+        conversation_key,
+        revision,
+        payload,
+        generated_at
+      )
+      select 'symphony', projection_revision_id, 'global', 'default', 1, '{"messages":[]}'::jsonb, now()
+      from duplicate_revision;
+    `,
+  ]) {
+    await expect(psql(containerName, duplicateInsert)).rejects.toThrow(/duplicate key value violates unique constraint/i);
+  }
 }
 
 async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName: string): Promise<void> {
