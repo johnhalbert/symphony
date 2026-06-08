@@ -97,7 +97,9 @@ export function defaultProjectContextLabel(id: string): string {
 export function normalizeProjectContextResolution(
   value: Partial<ProjectContextResolution> | null | undefined,
 ): ProjectContextResolution {
-  const projectContextId = normalizeOptionalNonEmptyString(value?.projectContextId) ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+  const rawProjectContextId = normalizeOptionalNonEmptyString(value?.projectContextId);
+  const projectContextId =
+    rawProjectContextId === null ? LEGACY_DEFAULT_PROJECT_CONTEXT_ID : normalizeProjectContextId(rawProjectContextId);
   return {
     projectContextId,
     projectContextLabel:

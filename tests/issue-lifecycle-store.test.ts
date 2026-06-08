@@ -261,7 +261,13 @@ describe("FileIssueLifecycleStore", () => {
   it("backfills and propagates durable project context attribution", async () => {
     const store = new FileIssueLifecycleStore(root);
     const docsProjectContext = {
-      projectContextId: "docs",
+      projectContextId: " Docs Site ",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const normalizedDocsProjectContext = {
+      projectContextId: "docs-site",
       projectContextLabel: "Documentation Site",
       linearProjectSlug: "DOCS",
       routingSource: "candidate_poll",
@@ -329,13 +335,13 @@ describe("FileIssueLifecycleStore", () => {
     });
 
     const reloaded = await store.get("TEST-1");
-    expect(reloaded).toMatchObject({ projectContext: docsProjectContext });
-    expect(reloaded?.completionReports[0]).toMatchObject({ projectContext: docsProjectContext });
-    expect(reloaded?.reviewVerdicts[0]).toMatchObject({ projectContext: docsProjectContext });
-    expect(reloaded?.mergeConflictResolutionReports[0]).toMatchObject({ projectContext: docsProjectContext });
-    expect(reloaded?.handoff.memo).toMatchObject({ projectContext: docsProjectContext });
+    expect(reloaded).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.completionReports[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.reviewVerdicts[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.mergeConflictResolutionReports[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.handoff.memo).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(buildWorkerHandoffPacket(reloaded!, "2026-01-01T00:03:00.000Z")).toMatchObject({
-      projectContext: docsProjectContext,
+      projectContext: normalizedDocsProjectContext,
     });
 
     await store.ensureIssue(issue({ id: "issue-legacy", identifier: "LEGACY-1" }), { phase: "implementation" });

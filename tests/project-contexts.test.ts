@@ -16,11 +16,17 @@ describe("project context normalization", () => {
   it("normalizes ids, labels, and default routing metadata", () => {
     expect(normalizeProjectContextId(" Docs Site ")).toBe("docs-site");
     expect(defaultProjectContextLabel("docs-site")).toBe("Docs Site");
-    expect(normalizeProjectContextResolution({ projectContextId: "docs-site", linearProjectSlug: "DOCS" })).toEqual({
+    expect(
+      normalizeProjectContextResolution({
+        projectContextId: " Docs Site ",
+        linearProjectSlug: "DOCS",
+        routingSource: " candidate_poll ",
+      }),
+    ).toEqual({
       projectContextId: "docs-site",
       projectContextLabel: "Docs Site",
       linearProjectSlug: "DOCS",
-      routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+      routingSource: "candidate_poll",
     });
     expect(normalizeProjectContextResolution(undefined)).toEqual({
       projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
