@@ -298,7 +298,7 @@ export function trackerIssue(overrides: TrackerIssueFixtureOverrides = {}): Trac
     linearProjectIdentity: {
       kind: "linear",
       slug: linearProjectSlug,
-      id: overrides.linearProjectId ?? `linear-project-${projectContextId}`,
+      id: overrides.linearProjectId === undefined ? `linear-project-${projectContextId}` : overrides.linearProjectId,
     },
     routingSource: overrides.routingSource ?? "candidate_poll",
     resolvedAt: overrides.resolvedAt ?? "2026-01-01T00:00:00Z",
