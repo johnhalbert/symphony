@@ -1,13 +1,19 @@
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import { SymphonyError } from "../errors.js";
+import { SymphonyError, errorMessage } from "../errors.js";
 import type { IssueBoardColumnId, IssueBoardColumnMapping } from "../types.js";
 import {
   createCredentialProfileRegistry,
   rawCredentialProfilesSchema,
   type CredentialProfileRegistry,
 } from "./CredentialProfiles.js";
+import {
+  DEFAULT_PROJECT_CONTEXT_ID,
+  DEFAULT_PROJECT_CONTEXT_LABEL,
+  normalizeProjectContextId,
+  type ProjectContextConfig,
+} from "./ProjectContexts.js";
 
 const stringArray = z.array(z.string());
 
@@ -304,11 +310,30 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    project_contexts: z
+      .array(
+        z
+          .object({
+            id: z.string(),
+            label: z.string().optional(),
+            enabled: z.boolean().optional(),
+            tracker: z.record(z.string(), z.unknown()).optional(),
+            workspace: z.record(z.string(), z.unknown()).optional(),
+            github: z.record(z.string(), z.unknown()).optional(),
+            review_loop: z.record(z.string(), z.unknown()).optional(),
+            issue_breakdown: z.record(z.string(), z.unknown()).optional(),
+            agent: z.record(z.string(), z.unknown()).optional(),
+          })
+          .passthrough(),
+      )
+      .nonempty()
+      .optional(),
     credential_profiles: rawCredentialProfilesSchema.optional(),
   })
   .passthrough();
 
 export type RawWorkflowConfig = z.infer<typeof rawConfigSchema>;
+export type RawProjectContextConfig = NonNullable<RawWorkflowConfig["project_contexts"]>[number];
 
 export interface TrackerConfig {
   kind: "linear";
@@ -575,6 +600,8 @@ export interface ServiceConfig {
   continuationContext: ContinuationContextConfig;
   database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
+  projectContexts?: ProjectContextConfig[];
+  defaultProjectContextId?: string;
   raw: RawWorkflowConfig;
 }
 
@@ -629,6 +656,22 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   }
 
   const raw = parsed.data;
+  if (raw.project_contexts?.length) {
+    const projectContexts = normalizeExplicitProjectContexts(raw, workflowPath, env);
+    const defaultProjectContextId =
+      projectContexts.find((context) => context.id === DEFAULT_PROJECT_CONTEXT_ID && context.enabled)?.id ??
+      projectContexts.find((context) => context.enabled)?.id ??
+      DEFAULT_PROJECT_CONTEXT_ID;
+    const defaultRawProjectContext =
+      raw.project_contexts.find((context) => normalizeProjectContextId(context.id) === defaultProjectContextId) ??
+      raw.project_contexts[0]!;
+    const defaultContextConfig = parseServiceConfig(mergedRawForProjectContext(raw, defaultRawProjectContext), workflowPath, env);
+    return {
+      ...defaultContextConfig,
+      projectContexts,
+      defaultProjectContextId,
+    };
+  }
   const workflowDir = path.dirname(path.resolve(workflowPath));
   const trackerKind = raw.tracker?.kind ?? "linear";
   if (trackerKind !== "linear") {
@@ -835,7 +878,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     mergePolicy,
   });
 
-  return {
+  const config: ServiceConfig = {
     workflowPath: path.resolve(workflowPath),
     workflowDir,
     tracker: {
@@ -985,8 +1028,97 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       planningRetryBaseMs: raw.issue_breakdown?.planning_retry_base_ms ?? 5_000,
       planningRetryMaxMs: raw.issue_breakdown?.planning_retry_max_ms ?? 60_000,
     },
+    projectContexts: [],
+    defaultProjectContextId: DEFAULT_PROJECT_CONTEXT_ID,
     raw,
   };
+
+  const defaultProjectContext: ProjectContextConfig = {
+    id: DEFAULT_PROJECT_CONTEXT_ID,
+    label: DEFAULT_PROJECT_CONTEXT_LABEL,
+    enabled: true,
+    tracker: config.tracker,
+    workspace: config.workspace,
+    github: config.github,
+    reviewLoop: config.reviewLoop,
+    issueBreakdown: config.issueBreakdown,
+    agent: config.agent,
+    raw: config.raw,
+  };
+
+  config.projectContexts = [defaultProjectContext];
+  return config;
+}
+
+function normalizeExplicitProjectContexts(
+  raw: RawWorkflowConfig,
+  workflowPath: string,
+  env: NodeJS.ProcessEnv,
+): ProjectContextConfig[] {
+  const projectContexts: ProjectContextConfig[] = [];
+  const seenIds = new Set<string>();
+
+  for (const rawProjectContext of raw.project_contexts ?? []) {
+    const normalizedId = normalizeProjectContextId(rawProjectContext.id);
+    if (seenIds.has(normalizedId)) {
+      throw new SymphonyError("config_validation_error", `Duplicate project_contexts id: ${rawProjectContext.id}`);
+    }
+    seenIds.add(normalizedId);
+
+    const enabled = rawProjectContext.enabled ?? true;
+    try {
+      const contextConfig = parseServiceConfig(mergedRawForProjectContext(raw, rawProjectContext), workflowPath, env);
+      if (enabled && contextConfig.workspace.source.kind === "none") {
+        throw new SymphonyError(
+          "config_validation_error",
+          "enabled project contexts require workspace.source.kind other than none",
+        );
+      }
+      projectContexts.push({
+        id: normalizedId,
+        label: rawProjectContext.label?.trim() || rawProjectContext.id.trim(),
+        enabled,
+        tracker: contextConfig.tracker,
+        workspace: contextConfig.workspace,
+        github: contextConfig.github,
+        reviewLoop: contextConfig.reviewLoop,
+        issueBreakdown: contextConfig.issueBreakdown,
+        agent: contextConfig.agent,
+        raw: contextConfig.raw,
+      });
+    } catch (error) {
+      throw new SymphonyError("config_validation_error", `project context ${normalizedId}: ${errorMessage(error)}`, error);
+    }
+  }
+
+  if (!projectContexts.some((context) => context.enabled)) {
+    throw new SymphonyError("config_validation_error", "At least one enabled project context is required");
+  }
+
+  return projectContexts;
+}
+
+function mergedRawForProjectContext(raw: RawWorkflowConfig, projectContext: RawProjectContextConfig): RawWorkflowConfig {
+  const { project_contexts: _projectContexts, ...rootWithoutProjectContexts } = raw;
+  const { id: _id, label: _label, enabled: _enabled, ...projectContextBody } = projectContext;
+  return deepMergeConfigValue(rootWithoutProjectContexts, projectContextBody) as RawWorkflowConfig;
+}
+
+function deepMergeConfigValue(base: unknown, override: unknown): unknown {
+  if (override === undefined) return base;
+  if (Array.isArray(base) || Array.isArray(override)) return override;
+  if (isPlainConfigObject(base) && isPlainConfigObject(override)) {
+    const merged: Record<string, unknown> = { ...base };
+    for (const [key, value] of Object.entries(override)) {
+      merged[key] = key in merged ? deepMergeConfigValue(merged[key], value) : value;
+    }
+    return merged;
+  }
+  return override;
+}
+
+function isPlainConfigObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export function resolveConfigString(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined {

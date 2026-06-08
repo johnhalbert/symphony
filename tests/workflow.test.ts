@@ -4,10 +4,11 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import YAML from "yaml";
 import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Config.js";
+import { projectContextRegistryPublicMetadata } from "../src/core/config/ProjectContexts.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
 import { WorkflowLoader, parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
-import { issue } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig } from "./helpers.js";
 
 describe("workflow loading and prompt rendering", () => {
   it("parses YAML front matter and markdown body", () => {
@@ -1402,5 +1403,104 @@ Work on {{ issue.identifier }}.
     await expect(renderer.render("{{ issue.nope }}", { issue: issue(), attempt: null })).rejects.toBeInstanceOf(
       SymphonyError,
     );
+  });
+});
+
+describe("project context redaction", () => {
+  it("summarizes configured project contexts without leaking secret values", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: { token: "$ROOT_GITHUB_TOKEN" },
+        },
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        ROOT_GITHUB_TOKEN: "root-gh-secret",
+      },
+    );
+
+    const metadata = projectContextRegistryPublicMetadata(config.projectContexts);
+    const serialized = JSON.stringify(metadata);
+
+    expect(config.defaultProjectContextId).toBe("symphony");
+    expect(metadata.map((context) => context.id)).toEqual(["symphony", "docs"]);
+    expect(metadata[0]).toMatchObject({
+      id: "symphony",
+      label: "Symphony",
+      tracker: { projectSlug: "SYMPHONY" },
+      github: { tokenPresent: true },
+    });
+    expect(serialized).not.toContain("linear-secret");
+    expect(serialized).not.toContain("root-gh-secret");
+  });
+
+  it.each([
+    {
+      label: "missing project slug",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        workspace: {
+          source: {
+            kind: "git_worktree",
+            repository: ".",
+            base_ref: "origin/main",
+          },
+        },
+        project_contexts: [
+          {
+            id: "Docs Site",
+            tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+            github: { token: "$DOCS_GITHUB_TOKEN" },
+          },
+        ],
+      },
+      env: {
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+        DOCS_GITHUB_TOKEN: "docs-github-secret",
+      },
+      expectedMessage: "project context docs-site: Linear project slug is required",
+      forbiddenSecrets: ["docs-linear-secret", "docs-github-secret"],
+    },
+    {
+      label: "missing workspace source",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            github: { token: "$DOCS_GITHUB_TOKEN" },
+            workspace: {
+              root: "./docs-workspaces",
+            },
+          },
+        ],
+      },
+      env: {
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+        DOCS_GITHUB_TOKEN: "docs-github-secret",
+      },
+      expectedMessage: "project context docs-site: enabled project contexts require workspace.source.kind other than none",
+      forbiddenSecrets: ["docs-linear-secret", "docs-github-secret"],
+    },
+  ])("reports $label validation errors without leaking secret values", ({ rawConfig, env, expectedMessage, forbiddenSecrets }) => {
+    let thrown: unknown;
+    try {
+      parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SymphonyError);
+    const message = (thrown as Error).message;
+    expect(message).toBe(expectedMessage);
+    for (const secret of forbiddenSecrets) {
+      expect(message).not.toContain(secret);
+    }
   });
 });
