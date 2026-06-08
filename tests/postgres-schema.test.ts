@@ -167,20 +167,17 @@ describe("Postgres Symphony-owned state migration", () => {
       "0004_run_activity_canonical_channels",
       "0005_projection_source_freshness",
       "0006_projection_build_modes",
-      "0007_project_context_attribution",
     ]);
     const ownedState = migrations.find((migration) => migration.id === "0002_symphony_owned_state");
     const projectionFreshness = migrations.find((migration) => migration.id === "0003_projection_freshness_indexes");
     const canonicalChannels = migrations.find((migration) => migration.id === "0004_run_activity_canonical_channels");
     const projectionSourceFreshness = migrations.find((migration) => migration.id === "0005_projection_source_freshness");
     const projectionBuildModes = migrations.find((migration) => migration.id === "0006_projection_build_modes");
-    const projectContextAttribution = migrations.find((migration) => migration.id === "0007_project_context_attribution");
     expect(ownedState?.filePath).toBe(fileURLToPath(ownedStateMigrationUrl));
     expect(projectionFreshness?.filePath).toBe(fileURLToPath(projectionFreshnessMigrationUrl));
     expect(canonicalChannels?.filePath).toBe(fileURLToPath(canonicalChannelMigrationUrl));
     expect(projectionSourceFreshness?.filePath).toBe(fileURLToPath(projectionSourceFreshnessMigrationUrl));
     expect(projectionBuildModes?.filePath).toBe(fileURLToPath(projectionBuildModesMigrationUrl));
-    expect(projectContextAttribution?.filePath).toBe(fileURLToPath(projectContextAttributionMigrationUrl));
     expect(sha256(ownedState?.sql ?? "")).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.checksumSha256).toBe(publishedOwnedStateChecksumSha256);
     expect(ownedState?.sql).toContain("CREATE TABLE IF NOT EXISTS symphony.run_session");
@@ -194,6 +191,26 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(canonicalChannels?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionSourceFreshness?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
     expect(projectionBuildModes?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
+  });
+
+  // T021 is test-first: keep the reserved 0007 contract executable in CI without
+  // pretending the migration already exists. T022 should flip these back to plain
+  // `it(...)` assertions when `0007_project_context_attribution.sql` lands.
+  it.fails("reserves 0007 project-context attribution on the configured migration path before the migration is implemented", async () => {
+    const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
+
+    expect(migrations.map((migration) => migration.id)).toEqual([
+      "0001_migration_foundation",
+      "0002_symphony_owned_state",
+      "0003_projection_freshness_indexes",
+      "0004_run_activity_canonical_channels",
+      "0005_projection_source_freshness",
+      "0006_projection_build_modes",
+      "0007_project_context_attribution",
+    ]);
+
+    const projectContextAttribution = migrations.find((migration) => migration.id === "0007_project_context_attribution");
+    expect(projectContextAttribution?.filePath).toBe(fileURLToPath(projectContextAttributionMigrationUrl));
     expect(projectContextAttribution?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
   });
 
@@ -253,7 +270,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain("on symphony.projection_revision (build_mode, projection_name, updated_at desc, generated_at desc)");
   });
 
-  it("reserves owned-state project context attribution columns and context-scoped uniqueness before the migration is implemented", async () => {
+  it.fails("reserves owned-state project context attribution columns, chat scoping, and replaced read indexes before the migration is implemented", async () => {
     const normalized = normalizedSql(await configuredMigrationSql());
 
     for (const fragment of [
@@ -264,6 +281,7 @@ describe("Postgres Symphony-owned state migration", () => {
       "alter table symphony.run_session add column if not exists linear_project_identity jsonb",
       "alter table symphony.run_session add column if not exists codebase_identity jsonb",
       "alter table symphony.run_session add column if not exists routing_source text",
+      "alter table symphony.chat_message add column if not exists project_context_id text",
       "alter table symphony.writeback_operation add column if not exists project_context_id text",
       "alter table symphony.approval_request add column if not exists project_context_id text",
     ]) {
@@ -275,8 +293,30 @@ describe("Postgres Symphony-owned state migration", () => {
       "alter table symphony.workspace add primary key (project_context_id, workspace_key)",
       "drop index if exists symphony.issue_identifier_unique_idx",
       "create unique index if not exists issue_identifier_unique_idx on symphony.issue (project_context_id, tracker_source, issue_identifier)",
+      "alter table symphony.chat_message drop constraint if exists chat_message_thread_key_message_index_key",
+      "alter table symphony.chat_message add constraint chat_message_thread_key_message_index_key unique (project_context_id, thread_key, message_index)",
     ]) {
       expect(normalized, `missing owned-state project context uniqueness fragment: ${fragment}`).toContain(fragment);
+    }
+
+    for (const fragment of [
+      "drop index if exists symphony.issue_status_lookup_idx",
+      "drop index if exists symphony.issue_phase_lookup_idx",
+      "drop index if exists symphony.run_session_issue_status_idx",
+      "drop index if exists symphony.run_session_identifier_started_idx",
+      "drop index if exists symphony.run_session_workspace_idx",
+      "drop index if exists symphony.chat_message_ordering_idx",
+      "drop index if exists symphony.chat_message_issue_ordering_idx",
+      "drop index if exists symphony.chat_message_run_ordering_idx",
+      "drop index if exists symphony.chat_message_event_range_idx",
+      "drop index if exists symphony.writeback_operation_state_idx",
+      "drop index if exists symphony.writeback_operation_issue_idx",
+      "drop index if exists symphony.writeback_operation_run_idx",
+      "drop index if exists symphony.approval_request_state_idx",
+      "drop index if exists symphony.approval_request_issue_idx",
+      "drop index if exists symphony.approval_request_run_idx",
+    ]) {
+      expect(normalized, `missing owned-state project context index replacement fragment: ${fragment}`).toContain(fragment);
     }
 
     for (const fragment of [
@@ -286,6 +326,10 @@ describe("Postgres Symphony-owned state migration", () => {
       "on symphony.run_session (project_context_id, issue_key, status, started_at desc)",
       "on symphony.run_session (project_context_id, issue_identifier, started_at desc)",
       "on symphony.run_session (project_context_id, workspace_key, started_at desc)",
+      "on symphony.chat_message (project_context_id, thread_key, message_index)",
+      "on symphony.chat_message (project_context_id, issue_key, created_at, message_index)",
+      "on symphony.chat_message (project_context_id, run_id, message_index)",
+      "on symphony.chat_message (project_context_id, run_id, event_sequence_start, event_sequence_end)",
       "on symphony.writeback_operation (project_context_id, status, next_attempt_at, created_at)",
       "on symphony.writeback_operation (project_context_id, issue_key, created_at desc)",
       "on symphony.writeback_operation (project_context_id, run_id, created_at desc)",
@@ -297,7 +341,7 @@ describe("Postgres Symphony-owned state migration", () => {
     }
   });
 
-  it("reserves projection project context attribution columns, context-aware read indexes, and context-scoped unique revisions before the migration is implemented", async () => {
+  it.fails("reserves projection project context attribution columns, dropped/recreated read indexes, and context-scoped unique revisions before the migration is implemented", async () => {
     const normalized = normalizedSql(await configuredMigrationSql());
 
     for (const table of [
@@ -332,6 +376,21 @@ describe("Postgres Symphony-owned state migration", () => {
       "create unique index if not exists orchestrator_chat_projection_scope_revision_idx on symphony.orchestrator_chat_projection (project_context_id, scope_key, conversation_key, revision)",
     ]) {
       expect(normalized, `missing projection context uniqueness fragment: ${fragment}`).toContain(fragment);
+    }
+
+    for (const fragment of [
+      "drop index if exists symphony.projection_revision_reads_idx",
+      "drop index if exists symphony.dashboard_projection_revision_reads_idx",
+      "drop index if exists symphony.issue_board_projection_revision_reads_idx",
+      "drop index if exists symphony.sidebar_projection_revision_reads_idx",
+      "drop index if exists symphony.history_projection_revision_reads_idx",
+      "drop index if exists symphony.history_projection_run_lookup_idx",
+      "drop index if exists symphony.transcript_projection_revision_reads_idx",
+      "drop index if exists symphony.transcript_projection_session_reads_idx",
+      "drop index if exists symphony.orchestrator_chat_projection_revision_reads_idx",
+      "drop index if exists symphony.orchestrator_chat_projection_issue_idx",
+    ]) {
+      expect(normalized, `missing projection context index replacement fragment: ${fragment}`).toContain(fragment);
     }
 
     for (const fragment of [
@@ -640,6 +699,7 @@ describe("Postgres Symphony-owned state migration", () => {
         );
         await seedLegacyRunActivityChannelAliases(containerName);
         await seedLegacyProjectionSourceFreshness(containerName);
+        await seedLegacyProjectContextAttributionRows(containerName);
 
         const result = await applyConfiguredMigrations(connectionString);
         expect(result.skipped).toEqual(["0001_migration_foundation", "0002_symphony_owned_state"]);
@@ -665,6 +725,7 @@ describe("Postgres Symphony-owned state migration", () => {
         await expectProjectionFreshnessCatalog(containerName);
         await expectLegacyRunActivityChannelsMigrated(containerName);
         await expectLegacyProjectionSourceFreshnessMigrated(containerName);
+        await expectLegacyProjectContextAttributionMigrated(containerName);
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
         await expectProjectContextScopedCoexistence(containerName);
       } finally {
@@ -912,6 +973,442 @@ async function seedLegacyProjectionSourceFreshness(containerName: string): Promi
   );
 }
 
+
+async function seedLegacyProjectContextAttributionRows(containerName: string): Promise<void> {
+  const counts = await psql(
+    containerName,
+    String.raw`
+      with inserted_workspace as (
+        insert into symphony.workspace (
+          workspace_key,
+          issue_key,
+          external_issue_id,
+          issue_identifier,
+          path,
+          source_kind,
+          repo_path,
+          base_ref,
+          git_branch_name,
+          branch_name,
+          snapshot,
+          created_at,
+          updated_at
+        ) values (
+          'workspace:legacy-context-upgrade',
+          'issue:legacy-context-upgrade',
+          'legacy-external-context-upgrade',
+          'ENG-CTX-UPGRADE',
+          '/tmp/symphony/ENG-CTX-UPGRADE',
+          'git_worktree',
+          '/tmp/symphony',
+          'main',
+          'sinfonista/eng-ctx-upgrade',
+          'sinfonista/eng-ctx-upgrade',
+          '{"scenario":"legacy-project-context-upgrade"}'::jsonb,
+          now(),
+          now()
+        ) returning workspace_key
+      ), inserted_issue as (
+        insert into symphony.issue (
+          issue_key,
+          tracker_source,
+          external_issue_id,
+          issue_identifier,
+          title_snapshot,
+          description_snapshot,
+          tracker_state,
+          tracker_state_classification,
+          priority_snapshot,
+          labels_snapshot,
+          blockers_snapshot,
+          tracker_url,
+          tracker_created_at,
+          tracker_updated_at,
+          tracker_fetched_at,
+          phase,
+          review_round,
+          incomplete_turn_count,
+          created_at,
+          updated_at
+        ) values (
+          'issue:legacy-context-upgrade',
+          'linear',
+          'legacy-external-context-upgrade',
+          'ENG-CTX-UPGRADE',
+          'Legacy project-context upgrade contract',
+          'Seeds legacy rows so 0007 must backfill project-context attribution before replacing global keys.',
+          'Todo',
+          'backlog',
+          2,
+          '["migration","project-context"]'::jsonb,
+          '[]'::jsonb,
+          'https://linear.app/example/issue/eng-ctx-upgrade',
+          now(),
+          now(),
+          now(),
+          'implementation',
+          0,
+          0,
+          now(),
+          now()
+        ) returning issue_key
+      ), inserted_run as (
+        insert into symphony.run_session (
+          run_id,
+          session_id,
+          agent_id,
+          role,
+          issue_key,
+          external_issue_id,
+          issue_identifier,
+          workspace_key,
+          workspace_path,
+          turn_number,
+          harness_id,
+          status,
+          started_at,
+          updated_at,
+          activity_snapshot,
+          metadata
+        ) values (
+          'run:legacy-context-upgrade',
+          'session:legacy-context-upgrade',
+          'agent:legacy-context-upgrade',
+          'worker',
+          'issue:legacy-context-upgrade',
+          'legacy-external-context-upgrade',
+          'ENG-CTX-UPGRADE',
+          'workspace:legacy-context-upgrade',
+          '/tmp/symphony/ENG-CTX-UPGRADE',
+          1,
+          'hermes',
+          'running',
+          now(),
+          now(),
+          '{"lastTranscriptEventAt":"2026-06-01T00:00:00.000Z"}'::jsonb,
+          '{"scenario":"legacy-project-context-upgrade"}'::jsonb
+        ) returning run_id
+      ), inserted_chat_message as (
+        insert into symphony.chat_message (
+          message_id,
+          thread_key,
+          issue_key,
+          issue_identifier,
+          run_id,
+          session_id,
+          message_index,
+          role,
+          message_kind,
+          status,
+          body,
+          body_preview,
+          body_char_count,
+          event_sequence_start,
+          event_sequence_end,
+          payload,
+          metadata,
+          created_at,
+          updated_at
+        ) values (
+          'message:legacy-context-upgrade:0',
+          'thread:legacy-context-upgrade',
+          'issue:legacy-context-upgrade',
+          'ENG-CTX-UPGRADE',
+          'run:legacy-context-upgrade',
+          'session:legacy-context-upgrade',
+          0,
+          'assistant',
+          'message',
+          'completed',
+          'Legacy project context upgrade message',
+          'Legacy project context upgrade message',
+          38,
+          1,
+          1,
+          '{"messages":[]}'::jsonb,
+          '{"scenario":"legacy-project-context-upgrade"}'::jsonb,
+          now(),
+          now()
+        ) returning chat_message_id
+      ), inserted_writeback as (
+        insert into symphony.writeback_operation (
+          idempotency_key,
+          kind,
+          issue_key,
+          external_issue_id,
+          issue_identifier,
+          run_id,
+          status,
+          created_at,
+          updated_at,
+          next_attempt_at,
+          payload,
+          payload_sha256
+        ) values (
+          'writeback:legacy-context-upgrade:comment:1',
+          'comment',
+          'issue:legacy-context-upgrade',
+          'legacy-external-context-upgrade',
+          'ENG-CTX-UPGRADE',
+          'run:legacy-context-upgrade',
+          'pending',
+          now(),
+          now(),
+          now(),
+          '{"body":"Legacy project context upgrade"}'::jsonb,
+          'sha256:legacy-project-context-upgrade'
+        ) returning idempotency_key
+      ), inserted_approval as (
+        insert into symphony.approval_request (
+          request_id,
+          status,
+          issue_key,
+          external_issue_id,
+          issue_identifier,
+          run_id,
+          evidence_cursor,
+          dedupe_key,
+          action,
+          requested_at
+        ) values (
+          'approval:legacy-context-upgrade:publish:1',
+          'pending',
+          'issue:legacy-context-upgrade',
+          'legacy-external-context-upgrade',
+          'ENG-CTX-UPGRADE',
+          'run:legacy-context-upgrade',
+          'run:legacy-context-upgrade/transcript/1',
+          'approval:legacy-context-upgrade:publish',
+          '{"kind":"publish_pull_request"}'::jsonb,
+          now()
+        ) returning request_id
+      ), dashboard_revision as (
+        insert into symphony.projection_revision (
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'dashboard_projection',
+          'global',
+          'legacy-context-dashboard',
+          7,
+          now()
+        ) returning projection_revision_id
+      ), inserted_dashboard_projection as (
+        insert into symphony.dashboard_projection (
+          projection_revision_id,
+          scope_key,
+          revision,
+          payload,
+          generated_at
+        )
+        select projection_revision_id, 'legacy-context-dashboard', 7, '{"issues":[]}'::jsonb, now()
+        from dashboard_revision
+        returning projection_revision_id
+      ), issue_board_revision as (
+        insert into symphony.projection_revision (
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'issue_board_projection',
+          'board',
+          'legacy-context-board',
+          7,
+          now()
+        ) returning projection_revision_id
+      ), inserted_issue_board_projection as (
+        insert into symphony.issue_board_projection (
+          projection_revision_id,
+          scope_key,
+          revision,
+          payload,
+          generated_at
+        )
+        select projection_revision_id, 'legacy-context-board', 7, '{"issues":[]}'::jsonb, now()
+        from issue_board_revision
+        returning projection_revision_id
+      ), sidebar_revision as (
+        insert into symphony.projection_revision (
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'sidebar_projection',
+          'global',
+          'legacy-context-sidebar',
+          7,
+          now()
+        ) returning projection_revision_id
+      ), inserted_sidebar_projection as (
+        insert into symphony.sidebar_projection (
+          projection_revision_id,
+          scope_key,
+          revision,
+          payload,
+          generated_at
+        )
+        select projection_revision_id, 'legacy-context-sidebar', 7, '{"items":[]}'::jsonb, now()
+        from sidebar_revision
+        returning projection_revision_id
+      ), history_revision as (
+        insert into symphony.projection_revision (
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'history_projection',
+          'issue',
+          'legacy-context-history',
+          7,
+          now()
+        ) returning projection_revision_id
+      ), inserted_history_projection as (
+        insert into symphony.history_projection (
+          projection_revision_id,
+          scope_key,
+          issue_key,
+          run_id,
+          session_id,
+          revision,
+          payload,
+          generated_at
+        )
+        select
+          projection_revision_id,
+          'legacy-context-history',
+          'issue:legacy-context-upgrade',
+          'run:legacy-context-upgrade',
+          'session:legacy-context-upgrade',
+          7,
+          '{"sessions":[]}'::jsonb,
+          now()
+        from history_revision
+        returning projection_revision_id
+      ), transcript_revision as (
+        insert into symphony.projection_revision (
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'transcript_projection',
+          'run',
+          'run:legacy-context-upgrade',
+          7,
+          now()
+        ) returning projection_revision_id
+      ), inserted_transcript_projection as (
+        insert into symphony.transcript_projection (
+          projection_revision_id,
+          scope_key,
+          run_id,
+          session_id,
+          revision,
+          payload,
+          generated_at
+        )
+        select
+          projection_revision_id,
+          'run:legacy-context-upgrade',
+          'run:legacy-context-upgrade',
+          'session:legacy-context-upgrade',
+          7,
+          '{"messages":[]}'::jsonb,
+          now()
+        from transcript_revision
+        returning projection_revision_id
+      ), orchestrator_chat_revision as (
+        insert into symphony.projection_revision (
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'orchestrator_chat_projection',
+          'conversation',
+          'legacy-context-conversation',
+          7,
+          now()
+        ) returning projection_revision_id
+      ), inserted_orchestrator_chat_projection as (
+        insert into symphony.orchestrator_chat_projection (
+          projection_revision_id,
+          scope_key,
+          issue_key,
+          run_id,
+          conversation_key,
+          revision,
+          payload,
+          generated_at
+        )
+        select
+          projection_revision_id,
+          'legacy-context-conversation',
+          'issue:legacy-context-upgrade',
+          'run:legacy-context-upgrade',
+          'default',
+          7,
+          '{"messages":[]}'::jsonb,
+          now()
+        from orchestrator_chat_revision
+        returning projection_revision_id
+      )
+      select jsonb_build_object(
+        'workspace', (select count(*) from inserted_workspace),
+        'issue', (select count(*) from inserted_issue),
+        'run_session', (select count(*) from inserted_run),
+        'chat_message', (select count(*) from inserted_chat_message),
+        'writeback_operation', (select count(*) from inserted_writeback),
+        'approval_request', (select count(*) from inserted_approval),
+        'projection_revision', (
+          select count(*)
+          from (
+            select projection_revision_id from dashboard_revision
+            union all select projection_revision_id from issue_board_revision
+            union all select projection_revision_id from sidebar_revision
+            union all select projection_revision_id from history_revision
+            union all select projection_revision_id from transcript_revision
+            union all select projection_revision_id from orchestrator_chat_revision
+          ) revisions
+        ),
+        'dashboard_projection', (select count(*) from inserted_dashboard_projection),
+        'issue_board_projection', (select count(*) from inserted_issue_board_projection),
+        'sidebar_projection', (select count(*) from inserted_sidebar_projection),
+        'history_projection', (select count(*) from inserted_history_projection),
+        'transcript_projection', (select count(*) from inserted_transcript_projection),
+        'orchestrator_chat_projection', (select count(*) from inserted_orchestrator_chat_projection)
+      )::text;
+    `,
+  );
+
+  expect(JSON.parse(counts.trim())).toEqual({
+    workspace: 1,
+    issue: 1,
+    run_session: 1,
+    chat_message: 1,
+    writeback_operation: 1,
+    approval_request: 1,
+    projection_revision: 6,
+    dashboard_projection: 1,
+    issue_board_projection: 1,
+    sidebar_projection: 1,
+    history_projection: 1,
+    transcript_projection: 1,
+    orchestrator_chat_projection: 1,
+  });
+}
+
 async function expectLegacyRunActivityChannelsMigrated(containerName: string): Promise<void> {
   const channelCounts = await psql(
     containerName,
@@ -1055,6 +1552,190 @@ async function expectLegacyProjectionSourceFreshnessMigrated(containerName: stri
       detail: "legacy workspace source is empty",
     },
   ]);
+}
+
+
+async function expectLegacyProjectContextAttributionMigrated(containerName: string): Promise<void> {
+  const migratedContexts = await psql(
+    containerName,
+    String.raw`
+      select jsonb_build_object(
+        'workspace', (
+          select project_context_id
+          from symphony.workspace
+          where workspace_key = 'workspace:legacy-context-upgrade'
+        ),
+        'issue', (
+          select project_context_id
+          from symphony.issue
+          where issue_key = 'issue:legacy-context-upgrade'
+        ),
+        'run_session', (
+          select project_context_id
+          from symphony.run_session
+          where run_id = 'run:legacy-context-upgrade'
+        ),
+        'chat_message', (
+          select project_context_id
+          from symphony.chat_message
+          where message_id = 'message:legacy-context-upgrade:0'
+        ),
+        'writeback_operation', (
+          select project_context_id
+          from symphony.writeback_operation
+          where idempotency_key = 'writeback:legacy-context-upgrade:comment:1'
+        ),
+        'approval_request', (
+          select project_context_id
+          from symphony.approval_request
+          where request_id = 'approval:legacy-context-upgrade:publish:1'
+        ),
+        'dashboard_projection', (
+          select project_context_id
+          from symphony.dashboard_projection
+          where projection_revision_id = (
+            select projection_revision_id
+            from symphony.projection_revision
+            where projection_name = 'dashboard_projection'
+              and scope_key = 'legacy-context-dashboard'
+          )
+        ),
+        'issue_board_projection', (
+          select project_context_id
+          from symphony.issue_board_projection
+          where projection_revision_id = (
+            select projection_revision_id
+            from symphony.projection_revision
+            where projection_name = 'issue_board_projection'
+              and scope_key = 'legacy-context-board'
+          )
+        ),
+        'sidebar_projection', (
+          select project_context_id
+          from symphony.sidebar_projection
+          where projection_revision_id = (
+            select projection_revision_id
+            from symphony.projection_revision
+            where projection_name = 'sidebar_projection'
+              and scope_key = 'legacy-context-sidebar'
+          )
+        ),
+        'history_projection', (
+          select project_context_id
+          from symphony.history_projection
+          where projection_revision_id = (
+            select projection_revision_id
+            from symphony.projection_revision
+            where projection_name = 'history_projection'
+              and scope_key = 'legacy-context-history'
+          )
+        ),
+        'transcript_projection', (
+          select project_context_id
+          from symphony.transcript_projection
+          where projection_revision_id = (
+            select projection_revision_id
+            from symphony.projection_revision
+            where projection_name = 'transcript_projection'
+              and scope_key = 'run:legacy-context-upgrade'
+          )
+        ),
+        'orchestrator_chat_projection', (
+          select project_context_id
+          from symphony.orchestrator_chat_projection
+          where projection_revision_id = (
+            select projection_revision_id
+            from symphony.projection_revision
+            where projection_name = 'orchestrator_chat_projection'
+              and scope_key = 'legacy-context-conversation'
+          )
+        )
+      )::text;
+    `,
+  );
+  const contexts = JSON.parse(migratedContexts.trim()) as Record<string, string | null>;
+  const contextIds = Object.values(contexts);
+  expect(contextIds.every((value) => typeof value === "string" && value.length > 0)).toBe(true);
+  expect(new Set(contextIds).size).toBe(1);
+
+  const chatMessageConstraint = await psql(
+    containerName,
+    String.raw`
+      select pg_get_constraintdef(oid)
+      from pg_constraint
+      where conrelid = 'symphony.chat_message'::regclass
+        and conname = 'chat_message_thread_key_message_index_key';
+    `,
+  );
+  expect(normalizedSql(chatMessageConstraint)).toContain("unique (project_context_id, thread_key, message_index)");
+
+  const indexMetadata = await psql(
+    containerName,
+    String.raw`
+      select coalesce(jsonb_object_agg(indexname, indexdef order by indexname), '{}'::jsonb)::text
+      from pg_indexes
+      where schemaname = 'symphony'
+        and indexname in (
+          'issue_status_lookup_idx',
+          'issue_phase_lookup_idx',
+          'run_session_issue_status_idx',
+          'run_session_identifier_started_idx',
+          'run_session_workspace_idx',
+          'chat_message_ordering_idx',
+          'chat_message_issue_ordering_idx',
+          'chat_message_run_ordering_idx',
+          'chat_message_event_range_idx',
+          'writeback_operation_state_idx',
+          'writeback_operation_issue_idx',
+          'writeback_operation_run_idx',
+          'approval_request_state_idx',
+          'approval_request_issue_idx',
+          'approval_request_run_idx',
+          'projection_revision_reads_idx',
+          'dashboard_projection_revision_reads_idx',
+          'issue_board_projection_revision_reads_idx',
+          'sidebar_projection_revision_reads_idx',
+          'history_projection_revision_reads_idx',
+          'history_projection_run_lookup_idx',
+          'transcript_projection_revision_reads_idx',
+          'transcript_projection_session_reads_idx',
+          'orchestrator_chat_projection_revision_reads_idx',
+          'orchestrator_chat_projection_issue_idx'
+        );
+    `,
+  );
+  const indexes = JSON.parse(indexMetadata.trim()) as Record<string, string>;
+  for (const [indexName, fragment] of Object.entries({
+    issue_status_lookup_idx: "(project_context_id, tracker_source, tracker_state, phase, updated_at desc)",
+    issue_phase_lookup_idx: "(project_context_id, phase, blocked_reason, updated_at desc)",
+    run_session_issue_status_idx: "(project_context_id, issue_key, status, started_at desc)",
+    run_session_identifier_started_idx: "(project_context_id, issue_identifier, started_at desc)",
+    run_session_workspace_idx: "(project_context_id, workspace_key, started_at desc)",
+    chat_message_ordering_idx: "(project_context_id, thread_key, message_index)",
+    chat_message_issue_ordering_idx: "(project_context_id, issue_key, created_at, message_index)",
+    chat_message_run_ordering_idx: "(project_context_id, run_id, message_index)",
+    chat_message_event_range_idx: "(project_context_id, run_id, event_sequence_start, event_sequence_end)",
+    writeback_operation_state_idx: "(project_context_id, status, next_attempt_at, created_at)",
+    writeback_operation_issue_idx: "(project_context_id, issue_key, created_at desc)",
+    writeback_operation_run_idx: "(project_context_id, run_id, created_at desc)",
+    approval_request_state_idx: "(project_context_id, status, expires_at, requested_at)",
+    approval_request_issue_idx: "(project_context_id, issue_key, requested_at desc)",
+    approval_request_run_idx: "(project_context_id, run_id, requested_at desc)",
+    projection_revision_reads_idx:
+      "(project_context_id, projection_name, scope_kind, scope_key, revision desc, updated_at desc, generated_at desc)",
+    dashboard_projection_revision_reads_idx: "(project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
+    issue_board_projection_revision_reads_idx: "(project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
+    sidebar_projection_revision_reads_idx: "(project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
+    history_projection_revision_reads_idx: "(project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
+    history_projection_run_lookup_idx: "(project_context_id, run_id, session_id, revision desc)",
+    transcript_projection_revision_reads_idx: "(project_context_id, run_id, revision desc, updated_at desc, generated_at desc)",
+    transcript_projection_session_reads_idx: "(project_context_id, session_id, revision desc)",
+    orchestrator_chat_projection_revision_reads_idx:
+      "(project_context_id, scope_key, conversation_key, revision desc, updated_at desc, generated_at desc)",
+    orchestrator_chat_projection_issue_idx: "(project_context_id, issue_key, revision desc)",
+  })) {
+    expect(indexes[indexName]?.toLowerCase(), `missing project-context read index ${indexName}`).toContain(fragment);
+  }
 }
 
 async function expectProjectionFreshnessCatalog(containerName: string): Promise<void> {
@@ -1546,6 +2227,50 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           ('symphony', 'run:context-symphony', 'worker', 'issue:context-symphony', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/symphony/ENG-CTX-101', 1, 'running', now(), now()),
           ('docs', 'run:context-docs', 'worker', 'issue:context-docs', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/docs/ENG-CTX-101', 1, 'running', now(), now())
         returning project_context_id, run_id
+      ), inserted_chat_message as (
+        insert into symphony.chat_message (
+          project_context_id,
+          message_id,
+          thread_key,
+          issue_key,
+          issue_identifier,
+          run_id,
+          message_index,
+          role,
+          message_kind,
+          status,
+          body,
+          body_preview,
+          body_char_count,
+          payload,
+          metadata,
+          created_at,
+          updated_at
+        )
+        select
+          runs.project_context_id,
+          case runs.project_context_id
+            when 'symphony' then 'message:context-symphony:0'
+            else 'message:context-docs:0'
+          end,
+          'thread:context-shared',
+          issues.issue_key,
+          'ENG-CTX-101',
+          runs.run_id,
+          0,
+          'assistant',
+          'message',
+          'completed',
+          'Context-scoped chat message',
+          'Context-scoped chat message',
+          27,
+          '{"messages":[]}'::jsonb,
+          '{"scenario":"project-context-coexistence"}'::jsonb,
+          now(),
+          now()
+        from inserted_run runs
+        inner join inserted_issue issues on issues.project_context_id = runs.project_context_id
+        returning project_context_id, chat_message_id
       ), inserted_dashboard_revision as (
         insert into symphony.projection_revision (
           project_context_id,
@@ -1698,6 +2423,7 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
         'workspace', (select count(*) from inserted_workspace),
         'issue', (select count(*) from inserted_issue),
         'run_session', (select count(*) from inserted_run),
+        'chat_message', (select count(*) from inserted_chat_message),
         'projection_revision', (
           select count(*)
           from (
@@ -1723,6 +2449,7 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
     workspace: 2,
     issue: 2,
     run_session: 2,
+    chat_message: 2,
     projection_revision: 12,
     dashboard_projection: 2,
     issue_board_projection: 2,
@@ -1779,6 +2506,17 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
     "(project_context_id, scope_key, conversation_key, revision)",
   );
 
+  const chatMessageConstraint = await psql(
+    containerName,
+    String.raw`
+      select pg_get_constraintdef(oid)
+      from pg_constraint
+      where conrelid = 'symphony.chat_message'::regclass
+        and conname = 'chat_message_thread_key_message_index_key';
+    `,
+  );
+  expect(normalizedSql(chatMessageConstraint)).toContain("unique (project_context_id, thread_key, message_index)");
+
   await expect(
     psql(
       containerName,
@@ -1820,6 +2558,51 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           'issue:context-symphony-duplicate',
           'linear',
           'ENG-CTX-101',
+          now(),
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.chat_message (
+          project_context_id,
+          message_id,
+          thread_key,
+          issue_key,
+          issue_identifier,
+          run_id,
+          message_index,
+          role,
+          message_kind,
+          status,
+          body,
+          body_preview,
+          body_char_count,
+          payload,
+          metadata,
+          created_at,
+          updated_at
+        ) values (
+          'symphony',
+          'message:context-symphony-duplicate:0',
+          'thread:context-shared',
+          'issue:context-symphony',
+          'ENG-CTX-101',
+          'run:context-symphony',
+          0,
+          'assistant',
+          'message',
+          'completed',
+          'Duplicate context-scoped chat message',
+          'Duplicate context-scoped chat message',
+          37,
+          '{"messages":[]}'::jsonb,
+          '{"scenario":"duplicate-project-context-chat"}'::jsonb,
           now(),
           now()
         );
