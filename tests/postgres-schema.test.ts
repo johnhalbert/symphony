@@ -135,6 +135,10 @@ async function projectionBuildModesMigrationSql(): Promise<string> {
   return readFile(projectionBuildModesMigrationUrl, "utf8");
 }
 
+async function projectContextAttributionMigrationSql(): Promise<string> {
+  return readFile(projectContextAttributionMigrationUrl, "utf8");
+}
+
 async function configuredMigrationSql(): Promise<string> {
   const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
   return migrations.map((migration) => migration.sql).join("\n");
@@ -271,7 +275,7 @@ describe("Postgres Symphony-owned state migration", () => {
   });
 
   it.fails("reserves owned-state project context attribution columns, chat scoping, and replaced read indexes before the migration is implemented", async () => {
-    const normalized = normalizedSql(await configuredMigrationSql());
+    const normalized = normalizedSql(await projectContextAttributionMigrationSql());
 
     for (const fragment of [
       "alter table symphony.workspace add column if not exists project_context_id text",
@@ -342,7 +346,7 @@ describe("Postgres Symphony-owned state migration", () => {
   });
 
   it.fails("reserves projection project context attribution columns, dropped/recreated read indexes, and context-scoped unique revisions before the migration is implemented", async () => {
-    const normalized = normalizedSql(await configuredMigrationSql());
+    const normalized = normalizedSql(await projectContextAttributionMigrationSql());
 
     for (const table of [
       "projection_revision",
