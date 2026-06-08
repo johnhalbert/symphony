@@ -1,3 +1,4 @@
+import { DEFAULT_PROJECT_CONTEXT_ID } from "../config/ProjectContexts.js";
 import type { IssueLifecycleRecord } from "../persistence/IssueLifecycleStore.js";
 import type { Issue } from "../types.js";
 import type { NewWritebackOperation } from "./WritebackOutbox.js";
@@ -45,6 +46,7 @@ export function stampWritebackProjectContext<T extends NewWritebackOperation>(
   if (context.projectContextId === undefined) return operation;
   return {
     ...operation,
+    idempotencyKey: scopeWritebackIdempotencyKey(operation.idempotencyKey, context.projectContextId),
     projectContextId: context.projectContextId,
     ...(context.projectContextLabel === undefined ? {} : { projectContextLabel: context.projectContextLabel }),
   } as T;
@@ -55,6 +57,12 @@ export function stampWritebackProjectContexts<T extends NewWritebackOperation>(
   context: WritebackProjectContext,
 ): T[] {
   return operations.map((operation) => stampWritebackProjectContext(operation, context));
+}
+
+function scopeWritebackIdempotencyKey(idempotencyKey: string, projectContextId: string): string {
+  if (projectContextId === DEFAULT_PROJECT_CONTEXT_ID) return idempotencyKey;
+  const prefix = `project-context:${projectContextId}:`;
+  return idempotencyKey.startsWith(prefix) ? idempotencyKey : `${prefix}${idempotencyKey}`;
 }
 
 function compactProjectContext(

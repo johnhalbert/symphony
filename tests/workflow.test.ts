@@ -324,10 +324,26 @@ Work on {{ issue.identifier }}.`,
             },
           },
         },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+          }),
+        ],
       }),
       "/repo/WORKFLOW.md",
       {
         LINEAR_API_KEY: "linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
         ROOT_GITHUB_TOKEN: "root-gh-secret",
         SHARED_GITHUB_TOKEN: "shared-gh-secret",
       },
@@ -335,10 +351,104 @@ Work on {{ issue.identifier }}.`,
 
     const metadata = projectContextRegistryPublicMetadata(config.projectContexts);
     const serialized = JSON.stringify(metadata);
+    expect(serialized).not.toContain("linear-secret");
+    expect(serialized).not.toContain("docs-linear-secret");
     expect(serialized).not.toContain("root-gh-secret");
     expect(serialized).not.toContain("shared-gh-secret");
     expect(metadata[0]?.github.tokenPresent).toBe(true);
     expect(metadata[0]?.credentialProfiles.worker["github.discovery"]).toBe("shared-gh");
+  });
+
+  it("rejects duplicate project context ids after normalization", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [
+            projectContextFixture({ id: "Docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+            projectContextFixture({
+              id: " docs ",
+              label: "Duplicate Documentation Site",
+              projectSlug: "DOCS_DUPLICATE",
+              repository: "../docs-duplicate-site",
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow('Duplicate project context id after normalization: "docs"');
+  });
+
+  it("rejects project context ids that normalize to empty strings", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [projectContextFixture({ id: "!!!", label: "Broken", projectSlug: "DOCS", repository: "../docs-site" })],
+        }),
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("Project context id must not be empty after normalization");
+  });
+
+  it("rejects enabled project contexts without a Linear API key", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          topLevel: {
+            tracker: { api_key: undefined },
+          },
+          projectContexts: [
+            projectContextFixture({
+              id: "docs",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "../docs-site",
+              tracker: { api_key: undefined },
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        {},
+      ),
+    ).toThrow("project context docs: Linear API key is required");
+  });
+
+  it("rejects enabled project contexts without a Linear project slug and redacts validation errors", () => {
+    const parse = () =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          topLevel: {
+            github: { token: "$ROOT_GITHUB_TOKEN" },
+          },
+          projectContexts: [
+            projectContextFixture({
+              id: "docs",
+              label: "Documentation Site",
+              projectSlug: null,
+              repository: "../docs-site",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        {
+          LINEAR_API_KEY: "linear-secret",
+          DOCS_LINEAR_API_KEY: "docs-linear-secret",
+          ROOT_GITHUB_TOKEN: "root-gh-secret",
+        },
+      );
+
+    expect(parse).toThrow("project context docs: Linear project slug is required");
+    try {
+      parse();
+      throw new Error("expected project context slug validation to throw");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      expect(message).not.toContain("linear-secret");
+      expect(message).not.toContain("docs-linear-secret");
+      expect(message).not.toContain("root-gh-secret");
+    }
   });
 
   it("rejects enabled project contexts without workspace source configuration", () => {

@@ -82,6 +82,72 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.transitions).toHaveLength(1);
   });
 
+  it("scopes non-default project-context writeback idempotency keys so identical logical writes do not collide", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    const config = reviewLoopWritebackConfig(root);
+    const defaultIssue = issue({
+      id: "shared-issue",
+      identifier: "ENG-1",
+      state: "In Progress",
+      branchName: "symphony/ENG-1",
+      projectContextId: "default",
+      projectContextLabel: "Default",
+    });
+    const docsIssue = issue({
+      id: "shared-issue",
+      identifier: "ENG-1",
+      state: "In Progress",
+      branchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+
+    const defaultOperation = planRunStartedComment(
+      {
+        issue: defaultIssue,
+        runId: "shared-run-1",
+        sessionId: "session-default-1",
+        workspacePath: "/tmp/default-workspace",
+      },
+      config,
+    );
+    const docsOperation = planRunStartedComment(
+      {
+        issue: docsIssue,
+        runId: "shared-run-1",
+        sessionId: "session-docs-1",
+        workspacePath: "/tmp/docs-workspace",
+      },
+      config,
+    );
+
+    expect(defaultOperation).not.toBeNull();
+    expect(docsOperation).not.toBeNull();
+    expect(defaultOperation?.idempotencyKey).toBe("comment:shared-issue:shared-run-1:run-started");
+    expect(docsOperation?.idempotencyKey).toBe("project-context:docs:comment:shared-issue:shared-run-1:run-started");
+
+    await processor.enqueueAndProcess(defaultOperation!);
+    await processor.enqueueAndProcess(docsOperation!);
+
+    const records = await store.list();
+    expect(records).toHaveLength(2);
+    expect(records.map((record) => record.idempotencyKey)).toEqual(
+      expect.arrayContaining([
+        "comment:shared-issue:shared-run-1:run-started",
+        "project-context:docs:comment:shared-issue:shared-run-1:run-started",
+      ]),
+    );
+    expect(writer.comments).toHaveLength(2);
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectContextId: "default", projectContextLabel: "Default" }),
+        expect.objectContaining({ projectContextId: "docs", projectContextLabel: "Documentation Site" }),
+      ]),
+    );
+  });
+
 
   it("backfills default project context attribution for legacy writeback operations", async () => {
     const store = new FileWritebackOutboxStore(root);
