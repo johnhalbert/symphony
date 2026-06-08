@@ -253,7 +253,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain("on symphony.projection_revision (build_mode, projection_name, updated_at desc, generated_at desc)");
   });
 
-  it("reserves owned-state project context attribution columns and collision-safe lookup indexes before the migration is implemented", async () => {
+  it("reserves owned-state project context attribution columns and context-scoped uniqueness before the migration is implemented", async () => {
     const normalized = normalizedSql(await configuredMigrationSql());
 
     for (const fragment of [
@@ -268,6 +268,15 @@ describe("Postgres Symphony-owned state migration", () => {
       "alter table symphony.approval_request add column if not exists project_context_id text",
     ]) {
       expect(normalized, `missing owned-state project context fragment: ${fragment}`).toContain(fragment);
+    }
+
+    for (const fragment of [
+      "alter table symphony.workspace drop constraint if exists workspace_pkey",
+      "alter table symphony.workspace add primary key (project_context_id, workspace_key)",
+      "drop index if exists symphony.issue_identifier_unique_idx",
+      "create unique index if not exists issue_identifier_unique_idx on symphony.issue (project_context_id, tracker_source, issue_identifier)",
+    ]) {
+      expect(normalized, `missing owned-state project context uniqueness fragment: ${fragment}`).toContain(fragment);
     }
 
     for (const fragment of [
@@ -288,7 +297,7 @@ describe("Postgres Symphony-owned state migration", () => {
     }
   });
 
-  it("reserves projection project context attribution columns and context-aware read indexes before the migration is implemented", async () => {
+  it("reserves projection project context attribution columns, context-aware read indexes, and context-scoped unique revisions before the migration is implemented", async () => {
     const normalized = normalizedSql(await configuredMigrationSql());
 
     for (const table of [
@@ -303,6 +312,26 @@ describe("Postgres Symphony-owned state migration", () => {
       expect(normalized, `missing projection context column for ${table}`).toContain(
         `alter table symphony.${table} add column if not exists project_context_id text`,
       );
+    }
+
+    for (const fragment of [
+      "drop index if exists symphony.projection_revision_current_unique_idx",
+      "create unique index if not exists projection_revision_current_unique_idx on symphony.projection_revision (project_context_id, projection_name, scope_kind, scope_key) where superseded_at is null",
+      "create unique index if not exists projection_revision_scope_revision_unique_idx on symphony.projection_revision (project_context_id, projection_name, scope_kind, scope_key, revision)",
+      "drop index if exists symphony.dashboard_projection_scope_revision_idx",
+      "create unique index if not exists dashboard_projection_scope_revision_idx on symphony.dashboard_projection (project_context_id, scope_key, revision)",
+      "drop index if exists symphony.issue_board_projection_scope_revision_idx",
+      "create unique index if not exists issue_board_projection_scope_revision_idx on symphony.issue_board_projection (project_context_id, scope_key, revision)",
+      "drop index if exists symphony.sidebar_projection_scope_revision_idx",
+      "create unique index if not exists sidebar_projection_scope_revision_idx on symphony.sidebar_projection (project_context_id, scope_key, revision)",
+      "drop index if exists symphony.history_projection_scope_revision_idx",
+      "create unique index if not exists history_projection_scope_revision_idx on symphony.history_projection (project_context_id, scope_key, revision)",
+      "drop index if exists symphony.transcript_projection_scope_revision_idx",
+      "create unique index if not exists transcript_projection_scope_revision_idx on symphony.transcript_projection (project_context_id, scope_key, revision)",
+      "drop index if exists symphony.orchestrator_chat_projection_scope_revision_idx",
+      "create unique index if not exists orchestrator_chat_projection_scope_revision_idx on symphony.orchestrator_chat_projection (project_context_id, scope_key, conversation_key, revision)",
+    ]) {
+      expect(normalized, `missing projection context uniqueness fragment: ${fragment}`).toContain(fragment);
     }
 
     for (const fragment of [
@@ -570,6 +599,7 @@ describe("Postgres Symphony-owned state migration", () => {
         await expectProjectionFreshnessCatalog(containerName);
 
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
+        await expectProjectContextScopedCoexistence(containerName);
         await expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName);
         await expectDuplicateWorkspaceAndExternalIssueConstraints(containerName);
         await expectPostgresRunActivityAppendStoreAppendAndDuplicatePath(connectionString);
@@ -636,6 +666,7 @@ describe("Postgres Symphony-owned state migration", () => {
         await expectLegacyRunActivityChannelsMigrated(containerName);
         await expectLegacyProjectionSourceFreshnessMigrated(containerName);
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
+        await expectProjectContextScopedCoexistence(containerName);
       } finally {
         await docker(["rm", "-f", containerName]).catch(() => undefined);
       }
@@ -1467,6 +1498,357 @@ async function expectOperationalAndProjectionInsertQueryPaths(containerName: str
     transcript_projection: 1,
     orchestrator_chat_projection: 1,
   });
+}
+
+async function expectProjectContextScopedCoexistence(containerName: string): Promise<void> {
+  const counts = await psql(
+    containerName,
+    String.raw`
+      with inserted_workspace as (
+        insert into symphony.workspace (
+          project_context_id,
+          workspace_key,
+          issue_identifier,
+          path,
+          source_kind,
+          created_at,
+          updated_at
+        ) values
+          ('symphony', 'workspace:context-shared', 'ENG-CTX-101', '/tmp/symphony/ENG-CTX-101', 'git_worktree', now(), now()),
+          ('docs', 'workspace:context-shared', 'ENG-CTX-101', '/tmp/docs/ENG-CTX-101', 'git_worktree', now(), now())
+        returning project_context_id, workspace_key
+      ), inserted_issue as (
+        insert into symphony.issue (
+          project_context_id,
+          issue_key,
+          tracker_source,
+          issue_identifier,
+          created_at,
+          updated_at
+        ) values
+          ('symphony', 'issue:context-symphony', 'linear', 'ENG-CTX-101', now(), now()),
+          ('docs', 'issue:context-docs', 'linear', 'ENG-CTX-101', now(), now())
+        returning project_context_id, issue_key
+      ), inserted_run as (
+        insert into symphony.run_session (
+          project_context_id,
+          run_id,
+          role,
+          issue_key,
+          issue_identifier,
+          workspace_key,
+          workspace_path,
+          turn_number,
+          status,
+          started_at,
+          updated_at
+        ) values
+          ('symphony', 'run:context-symphony', 'worker', 'issue:context-symphony', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/symphony/ENG-CTX-101', 1, 'running', now(), now()),
+          ('docs', 'run:context-docs', 'worker', 'issue:context-docs', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/docs/ENG-CTX-101', 1, 'running', now(), now())
+        returning project_context_id, run_id
+      ), inserted_dashboard_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values
+          ('symphony', 'dashboard_projection', 'global', 'global', 1, now()),
+          ('docs', 'dashboard_projection', 'global', 'global', 1, now())
+        returning project_context_id, projection_revision_id
+      ), inserted_dashboard_projection as (
+        insert into symphony.dashboard_projection (
+          project_context_id,
+          projection_revision_id,
+          scope_key,
+          revision,
+          payload,
+          generated_at
+        )
+        select project_context_id, projection_revision_id, 'global', 1, '{"contexts":[]}'::jsonb, now()
+        from inserted_dashboard_revision
+        returning project_context_id, projection_revision_id
+      ), inserted_issue_board_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values
+          ('symphony', 'issue_board_projection', 'board', 'default-board', 1, now()),
+          ('docs', 'issue_board_projection', 'board', 'default-board', 1, now())
+        returning project_context_id, projection_revision_id
+      ), inserted_issue_board_projection as (
+        insert into symphony.issue_board_projection (
+          project_context_id,
+          projection_revision_id,
+          scope_key,
+          revision,
+          payload,
+          generated_at
+        )
+        select project_context_id, projection_revision_id, 'default-board', 1, '{"issues":[]}'::jsonb, now()
+        from inserted_issue_board_revision
+        returning project_context_id, projection_revision_id
+      ), inserted_sidebar_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values
+          ('symphony', 'sidebar_projection', 'global', 'global', 1, now()),
+          ('docs', 'sidebar_projection', 'global', 'global', 1, now())
+        returning project_context_id, projection_revision_id
+      ), inserted_sidebar_projection as (
+        insert into symphony.sidebar_projection (
+          project_context_id,
+          projection_revision_id,
+          scope_key,
+          revision,
+          payload,
+          generated_at
+        )
+        select project_context_id, projection_revision_id, 'global', 1, '{"items":[]}'::jsonb, now()
+        from inserted_sidebar_revision
+        returning project_context_id, projection_revision_id
+      ), inserted_history_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values
+          ('symphony', 'history_projection', 'global', 'global', 1, now()),
+          ('docs', 'history_projection', 'global', 'global', 1, now())
+        returning project_context_id, projection_revision_id
+      ), inserted_history_projection as (
+        insert into symphony.history_projection (
+          project_context_id,
+          projection_revision_id,
+          scope_key,
+          revision,
+          payload,
+          generated_at
+        )
+        select project_context_id, projection_revision_id, 'global', 1, '{"sessions":[]}'::jsonb, now()
+        from inserted_history_revision
+        returning project_context_id, projection_revision_id
+      ), inserted_transcript_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values
+          ('symphony', 'transcript_projection', 'run', 'transcript:context-shared', 1, now()),
+          ('docs', 'transcript_projection', 'run', 'transcript:context-shared', 1, now())
+        returning project_context_id, projection_revision_id
+      ), inserted_transcript_projection as (
+        insert into symphony.transcript_projection (
+          project_context_id,
+          projection_revision_id,
+          scope_key,
+          run_id,
+          revision,
+          payload,
+          generated_at
+        )
+        select revisions.project_context_id, revisions.projection_revision_id, 'transcript:context-shared', runs.run_id, 1, '{"messages":[]}'::jsonb, now()
+        from inserted_transcript_revision revisions
+        inner join inserted_run runs on runs.project_context_id = revisions.project_context_id
+        returning project_context_id, projection_revision_id
+      ), inserted_orchestrator_chat_revision as (
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values
+          ('symphony', 'orchestrator_chat_projection', 'conversation', 'global', 1, now()),
+          ('docs', 'orchestrator_chat_projection', 'conversation', 'global', 1, now())
+        returning project_context_id, projection_revision_id
+      ), inserted_orchestrator_chat_projection as (
+        insert into symphony.orchestrator_chat_projection (
+          project_context_id,
+          projection_revision_id,
+          scope_key,
+          conversation_key,
+          revision,
+          payload,
+          generated_at
+        )
+        select project_context_id, projection_revision_id, 'global', 'default', 1, '{"messages":[]}'::jsonb, now()
+        from inserted_orchestrator_chat_revision
+        returning project_context_id, projection_revision_id
+      )
+      select jsonb_build_object(
+        'workspace', (select count(*) from inserted_workspace),
+        'issue', (select count(*) from inserted_issue),
+        'run_session', (select count(*) from inserted_run),
+        'projection_revision', (
+          select count(*)
+          from (
+            select projection_revision_id from inserted_dashboard_revision
+            union all select projection_revision_id from inserted_issue_board_revision
+            union all select projection_revision_id from inserted_sidebar_revision
+            union all select projection_revision_id from inserted_history_revision
+            union all select projection_revision_id from inserted_transcript_revision
+            union all select projection_revision_id from inserted_orchestrator_chat_revision
+          ) revisions
+        ),
+        'dashboard_projection', (select count(*) from inserted_dashboard_projection),
+        'issue_board_projection', (select count(*) from inserted_issue_board_projection),
+        'sidebar_projection', (select count(*) from inserted_sidebar_projection),
+        'history_projection', (select count(*) from inserted_history_projection),
+        'transcript_projection', (select count(*) from inserted_transcript_projection),
+        'orchestrator_chat_projection', (select count(*) from inserted_orchestrator_chat_projection)
+      )::text;
+    `,
+  );
+
+  expect(JSON.parse(counts.trim())).toEqual({
+    workspace: 2,
+    issue: 2,
+    run_session: 2,
+    projection_revision: 12,
+    dashboard_projection: 2,
+    issue_board_projection: 2,
+    sidebar_projection: 2,
+    history_projection: 2,
+    transcript_projection: 2,
+    orchestrator_chat_projection: 2,
+  });
+
+  const indexMetadata = await psql(
+    containerName,
+    String.raw`
+      select coalesce(jsonb_object_agg(indexname, indexdef order by indexname), '{}'::jsonb)::text
+      from pg_indexes
+      where schemaname = 'symphony'
+        and indexname in (
+          'workspace_pkey',
+          'issue_identifier_unique_idx',
+          'projection_revision_current_unique_idx',
+          'projection_revision_scope_revision_unique_idx',
+          'dashboard_projection_scope_revision_idx',
+          'issue_board_projection_scope_revision_idx',
+          'sidebar_projection_scope_revision_idx',
+          'history_projection_scope_revision_idx',
+          'transcript_projection_scope_revision_idx',
+          'orchestrator_chat_projection_scope_revision_idx'
+        );
+    `,
+  );
+  const indexes = JSON.parse(indexMetadata.trim()) as Record<string, string>;
+  expect(indexes.workspace_pkey?.toLowerCase()).toContain("(project_context_id, workspace_key)");
+  expect(indexes.issue_identifier_unique_idx?.toLowerCase()).toContain(
+    "(project_context_id, tracker_source, issue_identifier)",
+  );
+  expect(indexes.projection_revision_current_unique_idx?.toLowerCase()).toContain(
+    "(project_context_id, projection_name, scope_kind, scope_key)",
+  );
+  expect(indexes.projection_revision_current_unique_idx?.toLowerCase()).toContain("superseded_at");
+  expect(indexes.projection_revision_scope_revision_unique_idx?.toLowerCase()).toContain(
+    "(project_context_id, projection_name, scope_kind, scope_key, revision)",
+  );
+  for (const indexName of [
+    "dashboard_projection_scope_revision_idx",
+    "issue_board_projection_scope_revision_idx",
+    "sidebar_projection_scope_revision_idx",
+    "history_projection_scope_revision_idx",
+    "transcript_projection_scope_revision_idx",
+  ]) {
+    expect(indexes[indexName]?.toLowerCase(), `missing project_context_id in ${indexName}`).toContain(
+      "(project_context_id, scope_key, revision)",
+    );
+  }
+  expect(indexes.orchestrator_chat_projection_scope_revision_idx?.toLowerCase()).toContain(
+    "(project_context_id, scope_key, conversation_key, revision)",
+  );
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.workspace (
+          project_context_id,
+          workspace_key,
+          issue_identifier,
+          path,
+          source_kind,
+          created_at,
+          updated_at
+        ) values (
+          'symphony',
+          'workspace:context-shared',
+          'ENG-CTX-102',
+          '/tmp/symphony/ENG-CTX-102',
+          'git_worktree',
+          now(),
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.issue (
+          project_context_id,
+          issue_key,
+          tracker_source,
+          issue_identifier,
+          created_at,
+          updated_at
+        ) values (
+          'symphony',
+          'issue:context-symphony-duplicate',
+          'linear',
+          'ENG-CTX-101',
+          now(),
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.projection_revision (
+          project_context_id,
+          projection_name,
+          scope_kind,
+          scope_key,
+          revision,
+          generated_at
+        ) values (
+          'symphony',
+          'dashboard_projection',
+          'global',
+          'global',
+          1,
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
 }
 
 async function expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName: string): Promise<void> {
