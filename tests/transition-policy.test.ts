@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { ServiceConfig } from "../src/core/config/Config.js";
 import type { PullRequestReviewEvidenceItem } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
@@ -226,6 +227,54 @@ describe("TransitionPolicy review-loop planners", () => {
     ).toEqual([]);
   });
 
+  it("uses project-context review and writeback overrides for completion and review planners", () => {
+    const config = multiProjectReviewLoopConfig();
+
+    const completionOperations = planCompletionReportAcceptedWritebacks(
+      {
+        issue: issue({ state: "Docs In Progress", branchName: "docs/TEST-1", projectContextId: "docs" }),
+        runId: "docs-run-1",
+        sessionId: "docs-session-1",
+        workspacePath: "/tmp/docs-workspace",
+      },
+      config,
+      "Completed docs review loop routing.",
+    );
+    expect(commentBody(completionOperations, 0)).toContain("Next state: Docs Review (agent review queue)");
+    expect(completionOperations[1]).toMatchObject({
+      payload: {
+        fromStates: ["Docs In Progress", "Docs Blocked"],
+        toState: "Docs Review",
+      },
+    });
+
+    const reviewFailOperations = planReviewFailWritebacks(
+      { issue: issue({ state: "Docs Review", projectContextId: "docs" }), runId: "docs-review-run", reviewer: "reviewer-1" },
+      config,
+      ["Add docs-specific validation coverage."],
+    );
+    expect(commentBody(reviewFailOperations, 0)).toContain("Next state: Docs In Progress");
+    expect(reviewFailOperations[1]).toMatchObject({
+      payload: {
+        fromStates: ["Docs Review"],
+        toState: "Docs In Progress",
+      },
+    });
+
+    const reviewPassOperations = planReviewPassWritebacks(
+      { issue: issue({ state: "Docs Review", projectContextId: "docs" }), runId: "docs-review-pass", reviewer: "reviewer-1" },
+      config,
+      "Ready for docs merge.",
+    );
+    expect(commentBody(reviewPassOperations, 0)).toContain("Review pass state: Docs Ready");
+    expect(reviewPassOperations[1]).toMatchObject({
+      payload: {
+        fromStates: ["Docs Review"],
+        toState: "Docs Ready",
+      },
+    });
+  });
+
   it("plans blocked escalation comment and transition from active or review states", () => {
     const config = reviewLoopConfig();
     const operations = planBlockedEscalationWritebacks(
@@ -314,6 +363,84 @@ describe("TransitionPolicy review-loop planners", () => {
         config,
       ),
     ).toEqual([]);
+  });
+
+
+  it("uses project-context blocked and merge-repair overrides for lifecycle planners", () => {
+    const config = multiProjectReviewLoopConfig();
+
+    const blockedOperations = planBlockedEscalationWritebacks(
+      {
+        issue: issue({ state: "Docs Review", projectContextId: "docs" }),
+        runId: "docs-blocked-1",
+        reason: "docs review loop ceiling reached",
+      },
+      config,
+    );
+    expect(blockedOperations[1]).toMatchObject({
+      payload: {
+        fromStates: ["Docs In Progress", "Docs Human Review", "Docs Review", "Docs Conflict Repair"],
+        toState: "Docs Blocked",
+      },
+    });
+
+    const repairOperations = planMergeGateRepairWritebacks(
+      {
+        issue: issue({ state: "Docs Ready", projectContextId: "docs" }),
+        gateId: "merge-gate:issue-1:pr-42:docs-head-1",
+        blockerFingerprint: "docs-head-1:test:failure",
+        fromState: "Docs Ready",
+        pullRequest: {
+          number: 42,
+          url: "https://github.com/acme/symphony/pull/42",
+          headSha: "docs-head-1",
+          branch: "docs/TEST-1",
+        },
+        requiredChecks: ["test"],
+        failedChecks: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/docs-test" }],
+        actionableMissingChecks: [],
+        pendingChecks: [],
+        missingChecks: [],
+        reviewRound: 1,
+        maxReviewRounds: 3,
+      },
+      config,
+    );
+    expect(commentBody(repairOperations, 0)).toContain("Next state: Docs In Progress (worker repair queue)");
+    expect(repairOperations[1]).toMatchObject({
+      payload: {
+        toState: "Docs In Progress",
+      },
+    });
+
+    const mergeBlockedOperations = planMergeGateBlockedWritebacks(
+      {
+        issue: issue({ state: "Docs Ready", projectContextId: "docs" }),
+        gateId: "merge-gate:issue-1:pr-42:docs-head-2",
+        blockerFingerprint: "docs-head-2:test:failure",
+        fromState: "Docs Ready",
+        pullRequest: {
+          number: 42,
+          url: "https://github.com/acme/symphony/pull/42",
+          headSha: "docs-head-2",
+          branch: "docs/TEST-1",
+        },
+        requiredChecks: ["test"],
+        failedChecks: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/docs-test" }],
+        actionableMissingChecks: [],
+        pendingChecks: [],
+        missingChecks: [],
+        reviewRound: 2,
+        maxReviewRounds: 3,
+      },
+      config,
+    );
+    expect(commentBody(mergeBlockedOperations, 0)).toContain("Transitioning to blocked state: Docs Blocked");
+    expect(mergeBlockedOperations[1]).toMatchObject({
+      payload: {
+        toState: "Docs Blocked",
+      },
+    });
   });
 
   it("plans merge gate repair writebacks from the merge source state with check evidence", () => {
@@ -457,6 +584,63 @@ function reviewLoopConfig(): ServiceConfig {
   config.reviewLoop.blockedStates = ["Blocked"];
   config.reviewLoop.reviewPassState = "Ready to Merge";
   return config;
+}
+
+function multiProjectReviewLoopConfig(): ServiceConfig {
+  return parseServiceConfig(
+    {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_API_KEY",
+        project_slug: "ENG",
+        active_states: ["In Progress"],
+        handoff_states: ["Human Review"],
+      },
+      workspace: {
+        root: "/tmp/symphony-transition-policy",
+      },
+      writeback: {
+        enabled: true,
+        dispatch_state: "In Progress",
+      },
+      review_loop: {
+        review_states: ["In Review"],
+        blocked_states: ["Blocked"],
+        review_pass_state: "Ready to Merge",
+      },
+      merge_policy: {
+        mode: "gated",
+        conflicts_state: "Conflict Repair",
+      },
+      project_contexts: [
+        {
+          id: "eng",
+          tracker: { project_slug: "ENG" },
+        },
+        {
+          id: "docs",
+          tracker: {
+            project_slug: "DOCS",
+            active_states: ["Docs In Progress"],
+            handoff_states: ["Docs Human Review"],
+          },
+          writeback: {
+            dispatch_state: "Docs In Progress",
+          },
+          review_loop: {
+            review_states: ["Docs Review"],
+            blocked_states: ["Docs Blocked"],
+            review_pass_state: "Docs Ready",
+          },
+          merge_policy: {
+            conflicts_state: "Docs Conflict Repair",
+          },
+        },
+      ],
+    },
+    "/tmp/symphony-transition-policy/WORKFLOW.md",
+    { LINEAR_API_KEY: "linear-test-key" },
+  );
 }
 
 function commentBody(operations: NewWritebackOperation[], index: number): string {

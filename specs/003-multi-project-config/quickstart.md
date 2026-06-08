@@ -91,8 +91,9 @@ npm test -- tests/workflow.test.ts tests/doctor.test.ts tests/orchestrator.test.
 Recorded on `2026-06-08T12:44:00Z`.
 
 - Validation evidence: `docs/smoke/eng-347-final-validation.md`
+- Governance closure ledger: `docs/smoke/eng-347-governance-ledger.md`
 - Focused suite packet (T095-T099), quickstart full-validation command, full-repository `npm test`, and `npm run typecheck` all completed successfully.
 - `/api/v1/activity?projectContextId=<id>` now scopes run, transcript, and writeback items even without an `issue` filter, and the status-api regression lives in `tests/status-api.test.ts`.
 - Durable dashboard/history/sidebar route hits now preserve stored read models, while rebuild paths still surface durable running-agent rows when the live snapshot is empty.
-- Remaining reviewer-facing gap: the authoritative fenced JSON ENG-347 issue contract and child-issue inventory/order/completion ledger are still not present in this worktree; see the governance audit in `docs/smoke/eng-347-final-validation.md`.
+- The repo-local governance ledger now mirrors the ENG-347 feature contract, records the child-issue inventory/order/completion evidence, and maps `FR-001` through `FR-025` plus `SC-001` through `SC-009` to current artifacts.
 - Remaining runtime risk: no live Linear/GitHub multi-context publication/replay flow was exercised in this packet.

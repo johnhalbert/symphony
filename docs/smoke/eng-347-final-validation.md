@@ -2,6 +2,8 @@
 
 Captured on `2026-06-08T12:44:00Z` for `specs/003-multi-project-config` on branch `sinfonista/eng-347-implement-multi-project-configuration`.
 
+Reviewer-finding follow-up updated on `2026-06-08T17:04:19Z` after the final governance ledger and focused regression sweep below were added.
+
 ## Purpose
 
 Record the ENG-347 final validation gate and promotion packet for:
@@ -105,6 +107,25 @@ $ npm run typecheck
 # exit 0
 ```
 
+## Reviewer-finding follow-up (2026-06-08T17:04:19Z)
+
+```text
+$ npm test -- tests/transition-policy.test.ts tests/linear-multi-project.test.ts tests/status-api.test.ts tests/workflow.test.ts
+Test Files  4 passed (4)
+Tests       92 passed (92)
+Duration    8.75s
+
+$ npm run typecheck
+> tsc -p tsconfig.json --noEmit
+# exit 0
+```
+
+This follow-up revalidated the two reviewer-reported behavior gaps and the new repo-local governance closure:
+
+- `tests/status-api.test.ts` now proves `/api/v1/web/history?projectContextId=...` preserves legacy inferred writebacks in the matching project's durable timeline while still marking orphaned running sessions as `not_live` in the session summary.
+- `tests/transition-policy.test.ts` plus `tests/linear-multi-project.test.ts` now prove context-specific writeback / review / merge-policy overrides flow through completion, review-pass/fail, blocked escalation, and merge-repair planners.
+- `docs/smoke/eng-347-governance-ledger.md` now supplies the reviewer-requested fenced JSON feature contract mirror, child-issue inventory/order/completion ledger, child issue-contract mirrors, and explicit FR/SC proof ledger.
+
 ## T102 — Quickstart Scenario Coverage
 
 Quickstart scenario coverage was executed via the documented focused commands above and the documented full-validation command below.
@@ -153,21 +174,19 @@ These commands show no committed or worktree-local changes under `hermes/upstrea
 
 ## Issue-Contract / Governance Audit
 
-Reviewer-requested governance proof remains an external authoring gap, not a repo-local implementation gap.
+Repo-local reviewer-verifiable governance closure now lives in `docs/smoke/eng-347-governance-ledger.md`.
 
-- `WORKFLOW.md:29-35` requires a fenced JSON `Issue Contract` and says worker/reviewer runs must fail fast when it is missing or invalid.
-- `specs/003-multi-project-config/spec.md:113-161` contains the planning FR/SC list for the feature, but it is planning/spec content rather than the authoritative issue contract.
-- `specs/003-multi-project-config/tasks.md:223-260` contains the planning requirement-coverage and child-task ordering map, but not an authoritative ENG-347 child-issue inventory/order/completion ledger.
-- No repo-local ENG-347 fenced JSON issue-contract artifact or child-issue completion ledger was available in this worktree for REQ-FEATURE-001/002 proof closure.
-
-This packet therefore records the available repo-local evidence and the remaining external proof gap explicitly.
+- `WORKFLOW.md:29-35` remains the governing rule that worker/reviewer runs must treat a fenced JSON `Issue Contract` as authoritative.
+- `specs/003-multi-project-config/tasks.md:9` remains the governing rule that every split child issue retains that fenced JSON contract shape.
+- `docs/smoke/eng-347-governance-ledger.md` now mirrors the ENG-347 feature contract with `REQ-FEATURE-001` and `REQ-FEATURE-002`, records the child-issue inventory/order/completion ledger for `ENG-348`, `ENG-349`, and `ENG-356` through `ENG-364`, and provides fenced JSON contract mirrors for each child issue.
+- The same ledger now maps `FR-001` through `FR-025` and `SC-001` through `SC-009` to current repo-local code, tests, docs, and validation artifacts so the reviewer can verify closure from the worktree alone.
 
 ## T105 — Promotion Notes / Remaining Risks
 
-Promotion notes have been appended to `specs/003-multi-project-config/quickstart.md` and point back to this validation record.
+Promotion notes have been appended to `specs/003-multi-project-config/quickstart.md` and point back to this validation record and the governance ledger.
 
 Remaining risks:
 
-1. **Authoritative issue-contract / child-ledger proof remains external.** The worktree still lacks the reviewer-requested fenced JSON ENG-347 issue contract and authoritative child-issue inventory/order/completion ledger.
-2. **No live multi-backend publication replay.** Validation covered local/unit/integration boundaries only; it did not run a live Linear + GitHub end-to-end multi-context publication/replay flow.
-3. **Full-suite flake note.** One initial `npm test` run briefly reported `tests/orchestrator.test.ts > runs dashboard operator chat through the configured harness and persists assistant output`; the isolated rerun and the final full-suite rerun both passed, so the final gate is green but the transient failure is noted for reviewer awareness.
+1. **No live multi-backend publication replay.** Validation covered local/unit/integration boundaries only; it did not run a live Linear + GitHub end-to-end multi-context publication/replay flow.
+2. **History summary vs durable timeline semantics remain intentionally distinct.** `/api/v1/web/history` still marks orphaned running sessions as `not_live` in the session summary even when the durable timeline's latest project-matching event is a writeback operation; the focused regression confirms that distinction is stable and that the timeline preserves the project-scoped legacy writeback event.
+3. **Governance ledger depends on repo-local mirrors rather than external Linear issue bodies.** Reviewer verification is now self-contained in the worktree, but the child-issue contract evidence is intentionally preserved as repo-local mirrors because the external Linear issue bodies are outside this review surface.

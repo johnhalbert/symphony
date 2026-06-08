@@ -2,10 +2,12 @@ import type {
   AgentConfig,
   GitHubConfig,
   IssueBreakdownConfig,
+  MergePolicyConfig,
   RawWorkflowConfig,
   ReviewLoopConfig,
   ServiceConfig,
   TrackerConfig,
+  WritebackConfig,
   WorkspaceConfig,
 } from "./Config.js";
 import type { CredentialProfileRegistry } from "./CredentialProfiles.js";
@@ -19,8 +21,10 @@ export interface ProjectContextConfig {
   enabled: boolean;
   tracker: TrackerConfig;
   workspace: WorkspaceConfig;
+  writeback: WritebackConfig;
   github: GitHubConfig;
   reviewLoop: ReviewLoopConfig;
+  mergePolicy: MergePolicyConfig;
   issueBreakdown: IssueBreakdownConfig;
   agent: AgentConfig;
   credentialProfiles: CredentialProfileRegistry;
@@ -64,8 +68,10 @@ export function defaultProjectContext(config: ServiceConfig): ProjectContextConf
       enabled: true,
       tracker: config.tracker,
       workspace: config.workspace,
+      writeback: config.writeback,
       github: config.github,
       reviewLoop: config.reviewLoop,
+      mergePolicy: config.mergePolicy,
       issueBreakdown: config.issueBreakdown,
       agent: config.agent,
       credentialProfiles: config.credentialProfiles,
@@ -93,8 +99,10 @@ export function withProjectContextServiceConfig(
     ...config,
     tracker: context.tracker,
     workspace: context.workspace,
+    writeback: context.writeback,
     github: context.github,
     reviewLoop: context.reviewLoop,
+    mergePolicy: context.mergePolicy,
     issueBreakdown: context.issueBreakdown,
     agent: context.agent,
     credentialProfiles: context.credentialProfiles,

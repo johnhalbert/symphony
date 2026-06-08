@@ -2392,7 +2392,9 @@ export class StatusServer {
       ? activitySources.lifecycleRecords.filter((record) => matchesProjectContext(record, projectContextId))
       : activitySources.lifecycleRecords;
     const filteredWritebackOperations = projectContextId
-      ? activitySources.writebackOperations.filter((operation) => matchesProjectContext(operation, projectContextId))
+      ? activitySources.writebackOperations.filter((operation) =>
+          writebackOperationMatchesProjectContext(operation, projectContextId, filteredRuns, filteredLifecycleRecords),
+        )
       : activitySources.writebackOperations;
     const runs = selectRecentRuns(filteredRuns, limits.sessionLimit);
     const activityRuns = selectRecentRuns(filteredRuns, limits.timelineLimit);

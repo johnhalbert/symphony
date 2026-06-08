@@ -1722,6 +1722,107 @@ describe("StatusServer durable API", () => {
     }
   });
 
+
+  it("preserves legacy inferred writebacks in project-context-filtered web history", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-history-docs",
+      sessionId: "session-history-docs",
+      agentId: "agent-history-docs",
+      role: "worker",
+      issueId: "issue-history-docs",
+      issueIdentifier: "TEST-HISTORY-DOCS",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs prompt",
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      trackerProjectSlug: "DOCS",
+      workspaceKey: "docs:TEST-HISTORY-DOCS",
+      workspacePath: path.join(config.workspace.root, "docs-TEST-HISTORY-DOCS"),
+    });
+    await runStore.startRun({
+      runId: "run-history-eng",
+      sessionId: "session-history-eng",
+      agentId: "agent-history-eng",
+      role: "worker",
+      issueId: "issue-history-eng",
+      issueIdentifier: "TEST-HISTORY-ENG",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "eng prompt",
+      projectContextId: "eng",
+      projectContextLabel: "Engineering",
+      trackerProjectSlug: "ENG",
+      workspaceKey: "eng:TEST-HISTORY-ENG",
+      workspacePath: path.join(config.workspace.root, "eng-TEST-HISTORY-ENG"),
+    });
+
+    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-history-docs:legacy",
+      kind: "comment",
+      issueId: "issue-history-docs",
+      runId: "run-history-docs",
+      payload: {
+        body: "legacy docs report",
+        dedupeKey: "legacy-docs-report",
+      },
+    });
+    await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-history-eng:legacy",
+      kind: "comment",
+      issueId: "issue-history-eng",
+      runId: "run-history-eng",
+      payload: {
+        body: "legacy eng report",
+        dedupeKey: "legacy-eng-report",
+      },
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      writebackOutbox,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(
+        `http://${address.host}:${address.port}/api/v1/web/history?projectContextId=docs&sessionLimit=5&timelineLimit=10`,
+      );
+      const body = (await response.json()) as {
+        sessions: Array<{ id: string; lastEvent: string }>;
+        timeline: Array<{ sess: string; text: string }>;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.sessions.map((session) => session.id)).toEqual(["run-history-docs"]);
+      expect(body.sessions[0]).toMatchObject({
+        id: "run-history-docs",
+        state: "not_live",
+        lastEvent: "TEST-HISTORY-DOCS not live",
+      });
+      expect(body.timeline.every((item) => item.sess === "run-history-docs")).toBe(true);
+      expect(body.timeline.map((item) => item.text)).toContain("TEST-HISTORY-DOCS comment pending (18 chars)");
+      expect(body.timeline.map((item) => item.text).join(" ")).not.toContain("TEST-HISTORY-ENG");
+
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves redacted legacy transcript rows without backfilling counts during GET", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);

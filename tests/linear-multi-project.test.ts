@@ -28,12 +28,46 @@ function multiProjectConfig(): ServiceConfig {
   return parseServiceConfig(
     {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "DEFAULT" },
+      writeback: { enabled: true, dispatch_state: "In Progress" },
+      review_loop: {
+        review_states: ["In Review"],
+        blocked_states: ["Blocked"],
+        review_pass_state: "Ready to Merge",
+      },
+      merge_policy: {
+        mode: "gated",
+        conflicts_state: "Conflict Repair",
+      },
       workspace: {
         source: { kind: "git_worktree", repository: ".", base_ref: "origin/main" },
       },
       project_contexts: [
-        { id: "symphony", tracker: { project_slug: "ENG" } },
-        { id: "docs", tracker: { project_slug: "DOCS" } },
+        {
+          id: "symphony",
+          tracker: { project_slug: "ENG" },
+          writeback: { dispatch_state: "Eng In Progress" },
+          review_loop: {
+            review_states: ["Eng Review"],
+            blocked_states: ["Eng Blocked"],
+            review_pass_state: "Eng Ready",
+          },
+          merge_policy: {
+            conflicts_state: "Eng Conflict Repair",
+          },
+        },
+        {
+          id: "docs",
+          tracker: { project_slug: "DOCS" },
+          writeback: { dispatch_state: "Docs In Progress" },
+          review_loop: {
+            review_states: ["Docs Review"],
+            blocked_states: ["Docs Blocked"],
+            review_pass_state: "Docs Ready",
+          },
+          merge_policy: {
+            conflicts_state: "Docs Conflict Repair",
+          },
+        },
       ],
     },
     "/repo/WORKFLOW.md",
@@ -206,5 +240,9 @@ describe("MultiProjectLinearTrackerClient", () => {
     const views = config.projectContexts?.map((context) => withProjectContextServiceConfig(config, context)) ?? [];
     expect(views.map((view) => view.tracker.projectSlug)).toEqual(["ENG", "DOCS"]);
     expect(views.map((view) => view.github.repo)).toEqual([null, null]);
+    expect(views.map((view) => view.writeback.dispatchState)).toEqual(["Eng In Progress", "Docs In Progress"]);
+    expect(views.map((view) => view.reviewLoop.reviewStates[0])).toEqual(["Eng Review", "Docs Review"]);
+    expect(views.map((view) => view.reviewLoop.reviewPassState)).toEqual(["Eng Ready", "Docs Ready"]);
+    expect(views.map((view) => view.mergePolicy.conflictsState)).toEqual(["Eng Conflict Repair", "Docs Conflict Repair"]);
   });
 });
