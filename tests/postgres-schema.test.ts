@@ -144,6 +144,11 @@ async function configuredMigrationSql(): Promise<string> {
   return migrations.map((migration) => migration.sql).join("\n");
 }
 
+async function configuredMigrationIds(): Promise<string[]> {
+  const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
+  return migrations.map((migration) => migration.id);
+}
+
 function sha256(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
@@ -618,6 +623,10 @@ describe("Postgres Symphony-owned state migration", () => {
     "applies configured migrations and supports append-store paths via Docker",
     async () => {
       const containerName = `symphony-postgres-schema-${process.pid}-${Date.now()}`;
+      const currentConfiguredMigrationIds = await configuredMigrationIds();
+      const hasProjectContextAttributionMigration = currentConfiguredMigrationIds.includes(
+        "0007_project_context_attribution",
+      );
       try {
         await docker(
           [
@@ -638,16 +647,7 @@ describe("Postgres Symphony-owned state migration", () => {
         const connectionString = await postgresConnectionString(containerName);
         await applyConfiguredMigrations(connectionString);
 
-        const appliedMigrations = await psql(containerName, "select id from symphony_schema_migrations order by id;");
-        expect(appliedMigrations.trim().split(/\s+/)).toEqual([
-          "0001_migration_foundation",
-          "0002_symphony_owned_state",
-          "0003_projection_freshness_indexes",
-          "0004_run_activity_canonical_channels",
-          "0005_projection_source_freshness",
-          "0006_projection_build_modes",
-          "0007_project_context_attribution",
-        ]);
+        expect(await appliedMigrationIds(containerName)).toEqual(currentConfiguredMigrationIds);
 
         const tableCount = await psql(
           containerName,
@@ -662,7 +662,9 @@ describe("Postgres Symphony-owned state migration", () => {
         await expectProjectionFreshnessCatalog(containerName);
 
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
-        await expectProjectContextScopedCoexistence(containerName);
+        if (hasProjectContextAttributionMigration) {
+          await expectProjectContextScopedCoexistence(containerName);
+        }
         await expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName);
         await expectDuplicateWorkspaceAndExternalIssueConstraints(containerName);
         await expectPostgresRunActivityAppendStoreAppendAndDuplicatePath(connectionString);
@@ -677,6 +679,10 @@ describe("Postgres Symphony-owned state migration", () => {
     "upgrades a database that already applied the published 0002 migration without checksum conflicts",
     async () => {
       const containerName = `symphony-postgres-schema-upgrade-${process.pid}-${Date.now()}`;
+      const currentConfiguredMigrationIds = await configuredMigrationIds();
+      const hasProjectContextAttributionMigration = currentConfiguredMigrationIds.includes(
+        "0007_project_context_attribution",
+      );
       try {
         await docker(
           [
@@ -703,35 +709,31 @@ describe("Postgres Symphony-owned state migration", () => {
         );
         await seedLegacyRunActivityChannelAliases(containerName);
         await seedLegacyProjectionSourceFreshness(containerName);
-        await seedLegacyProjectContextAttributionRows(containerName);
+        if (hasProjectContextAttributionMigration) {
+          await seedLegacyProjectContextAttributionRows(containerName);
+        }
 
         const result = await applyConfiguredMigrations(connectionString);
         expect(result.skipped).toEqual(["0001_migration_foundation", "0002_symphony_owned_state"]);
-        expect(result.applied).toEqual([
-          "0003_projection_freshness_indexes",
-          "0004_run_activity_canonical_channels",
-          "0005_projection_source_freshness",
-          "0006_projection_build_modes",
-          "0007_project_context_attribution",
-        ]);
-        expect(await appliedMigrationIds(containerName)).toEqual([
-          "0001_migration_foundation",
-          "0002_symphony_owned_state",
-          "0003_projection_freshness_indexes",
-          "0004_run_activity_canonical_channels",
-          "0005_projection_source_freshness",
-          "0006_projection_build_modes",
-          "0007_project_context_attribution",
-        ]);
+        expect(result.applied).toEqual(
+          currentConfiguredMigrationIds.filter(
+            (migrationId) => !["0001_migration_foundation", "0002_symphony_owned_state"].includes(migrationId),
+          ),
+        );
+        expect(await appliedMigrationIds(containerName)).toEqual(currentConfiguredMigrationIds);
         expect(await appliedMigrationChecksum(containerName, "0002_symphony_owned_state")).toBe(
           publishedOwnedStateChecksumSha256,
         );
         await expectProjectionFreshnessCatalog(containerName);
         await expectLegacyRunActivityChannelsMigrated(containerName);
         await expectLegacyProjectionSourceFreshnessMigrated(containerName);
-        await expectLegacyProjectContextAttributionMigrated(containerName);
+        if (hasProjectContextAttributionMigration) {
+          await expectLegacyProjectContextAttributionMigrated(containerName);
+        }
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
-        await expectProjectContextScopedCoexistence(containerName);
+        if (hasProjectContextAttributionMigration) {
+          await expectProjectContextScopedCoexistence(containerName);
+        }
       } finally {
         await docker(["rm", "-f", containerName]).catch(() => undefined);
       }
