@@ -85,7 +85,16 @@ Current single-project assumptions that downstream multi-project work must unwin
 Protected-surface constraints for downstream implementation:
 
 - Project-context resolution, workspace selection, writeback targeting, lifecycle transitions, and MCP handoff validation remain Symphony-owned service decisions; agents only receive already-resolved metadata.
+- The credential boundary, operator-controlled secret stores, runtime credentials, profile contents, and other private access material remain out of scope for this feature unless a later plan explicitly ratifies a protected-surface change.
+- Existing dirty workspaces, protected branches, and external Linear/GitHub project state remain out of scope for this feature unless a later plan explicitly ratifies a protected-surface change.
 - `hermes/upstream-src/**` does not require changes for this feature. Phase 1 inventory found no setup or routing prerequisite that depends on modifying vendored Hermes sources.
+
+### T005 verification note: no vendored Hermes upstream implementation changes required
+
+- Checked the multi-project task and plan surfaces in `specs/003-multi-project-config/tasks.md` and `specs/003-multi-project-config/plan.md` before foundational implementation proceeds.
+- All implementation-targeted task paths for T006-T105 stay in Symphony-owned surfaces such as `src/core/**`, `src/integrations/**`, `src/app/**`, `tests/**`, `migrations/postgres/**`, `docs/**`, `scripts/**`, and supporting spec artifacts; none names `hermes/upstream-src/**` as an edit target.
+- The only task references to `hermes/upstream-src/**` are safety guardrails: T005 requires this up-front verification, T104 requires a final git-diff audit, and the plan/task constraints explicitly say not to modify vendored Hermes source.
+- Caveat: this verification is scoped to the multi-project feature plan. It does not change any existing vendored-Hermes integration elsewhere in the repository, and follow-on multi-project issues should stay within Symphony-owned surfaces unless a separate issue explicitly authorizes upstream changes.
 
 ## Inspection note: current single-project assumptions (T001)
 
