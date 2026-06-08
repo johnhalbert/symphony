@@ -1264,3 +1264,25 @@ describe("web projection foundation", () => {
     expect(JSON.stringify(durableChat)).not.toContain("assistant");
   });
 });
+
+
+it("projects project context attribution into issue models", () => {
+  const model = projectIssueModel(
+    issueDetails({
+      issue: {
+        ...issueDetails().issue,
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        trackerProjectSlug: "DOCS",
+      },
+      workspace: {
+        ...issueDetails().workspace,
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        trackerProjectSlug: "DOCS",
+      },
+    }),
+  );
+
+  expect(model.project).toBe("Documentation Site");
+});

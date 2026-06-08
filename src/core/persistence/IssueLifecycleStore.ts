@@ -30,6 +30,9 @@ export interface IssueLifecycleSummaryPointers {
   ciStatus: string | null;
   lastPushedAt: string | null;
   lastEvidenceCursor: string | null;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  trackerProjectSlug?: string | null;
 }
 
 export type IssueLifecycleSummaryReferenceKind = "continuation_history" | "issue_breakdown_plan";
@@ -383,6 +386,9 @@ export interface WorkerHandoffPacket {
 export interface IssueLifecycleRecord {
   issueId: string;
   issueIdentifier: string;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  trackerProjectSlug?: string | null;
   phase: IssueLifecyclePhase;
   reviewRound: number;
   incompleteTurnCount: number;
@@ -451,12 +457,15 @@ export class FileIssueLifecycleStore {
     return this.projectionNotifier.subscribe(listener);
   }
 
-  async ensureIssue(issue: Pick<Issue, "id" | "identifier">, patch: IssueLifecyclePatch = {}): Promise<IssueLifecycleRecord> {
-    const existing = await this.find(issue.id, issue.identifier);
+  async ensureIssue(issue: Pick<Issue, "id" | "identifier" | "projectContextId" | "projectContextLabel" | "trackerProjectSlug">, patch: IssueLifecyclePatch = {}): Promise<IssueLifecycleRecord> {
+    const existing = await this.find(issue.id, issue.identifier, issue.projectContextId ?? null);
     const now = new Date().toISOString();
     const baseRecord = {
       issueId: issue.id,
       issueIdentifier: issue.identifier,
+      projectContextId: issue.projectContextId ?? existing?.projectContextId ?? null,
+      projectContextLabel: issue.projectContextLabel ?? existing?.projectContextLabel ?? null,
+      trackerProjectSlug: issue.trackerProjectSlug ?? existing?.trackerProjectSlug ?? null,
       phase: patch.phase ?? existing?.phase ?? "implementation",
       reviewRound: patch.reviewRound ?? existing?.reviewRound ?? 0,
       incompleteTurnCount: patch.incompleteTurnCount ?? existing?.incompleteTurnCount ?? 0,
@@ -479,6 +488,9 @@ export class FileIssueLifecycleStore {
       summaryPointers: {
         ...defaultSummaryPointers(),
         ...existing?.summaryPointers,
+        projectContextId: issue.projectContextId ?? existing?.summaryPointers.projectContextId ?? null,
+        projectContextLabel: issue.projectContextLabel ?? existing?.summaryPointers.projectContextLabel ?? null,
+        trackerProjectSlug: issue.trackerProjectSlug ?? existing?.summaryPointers.trackerProjectSlug ?? null,
         ...patch.summaryPointers,
       },
       summaryReferences: patch.summaryReferences ?? existing?.summaryReferences ?? [],
@@ -505,19 +517,21 @@ export class FileIssueLifecycleStore {
   }
 
   async updateIssue(
-    issue: Pick<Issue, "id" | "identifier">,
+    issue: Pick<Issue, "id" | "identifier" | "projectContextId" | "projectContextLabel" | "trackerProjectSlug">,
     patch: IssueLifecyclePatch,
   ): Promise<IssueLifecycleRecord> {
     return this.ensureIssue(issue, patch);
   }
 
-  async get(issueIdOrIdentifier: string): Promise<IssueLifecycleRecord | null> {
+  async get(issueIdOrIdentifier: string, projectContextId?: string | null): Promise<IssueLifecycleRecord | null> {
     const direct = await readLifecycleJsonIfExists(this.recordPath(issueIdOrIdentifier));
     if (direct) return direct;
     const records = await this.list();
     return (
       records.find(
-        (record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier,
+        (record) =>
+          (projectContextId === undefined || projectContextId === null || (record.projectContextId ?? null) === projectContextId) &&
+          (record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier),
       ) ?? null
     );
   }
@@ -534,10 +548,10 @@ export class FileIssueLifecycleStore {
     return records.filter((record): record is IssueLifecycleRecord => record !== null);
   }
 
-  private async find(issueId: string, issueIdentifier: string): Promise<IssueLifecycleRecord | null> {
-    const direct = await this.get(issueId);
+  private async find(issueId: string, issueIdentifier: string, projectContextId?: string | null): Promise<IssueLifecycleRecord | null> {
+    const direct = await this.get(issueId, projectContextId);
     if (direct) return direct;
-    return this.get(issueIdentifier);
+    return this.get(issueIdentifier, projectContextId);
   }
 
   private async write(record: IssueLifecycleRecord): Promise<void> {
@@ -874,6 +888,9 @@ function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
     ciStatus: null,
     lastPushedAt: null,
     lastEvidenceCursor: null,
+    projectContextId: null,
+    projectContextLabel: null,
+    trackerProjectSlug: null,
   };
 }
 

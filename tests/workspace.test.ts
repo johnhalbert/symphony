@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { parseServiceConfig } from "../src/core/config/Config.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager, assertPathInsideRoot, sanitizeWorkspaceKey } from "../src/core/workspace/WorkspaceManager.js";
 import { issue, testConfig } from "./helpers.js";
@@ -59,4 +60,53 @@ describe("WorkspaceManager", () => {
       await rm(outside, { recursive: true, force: true });
     }
   });
+
+it("namespaces workspace keys by project context", async () => {
+  const config = testConfig(root);
+  const manager = new WorkspaceManager({
+    workspace: config.workspace,
+    hooks: config.hooks,
+    logger: new StructuredLogger(() => undefined),
+  });
+
+  const symphonyWorkspace = await manager.createForIssue(
+    issue({ id: "eng-1", identifier: "ENG-1", projectContextId: "symphony", projectContextLabel: "Symphony" }),
+  );
+  const docsWorkspace = await manager.createForIssue(
+    issue({ id: "docs-1", identifier: "ENG-1", projectContextId: "docs", projectContextLabel: "Docs" }),
+  );
+
+  expect(symphonyWorkspace.workspaceKey).toBe("symphony--ENG-1");
+  expect(docsWorkspace.workspaceKey).toBe("docs--ENG-1");
+  expect(symphonyWorkspace.path).not.toBe(docsWorkspace.path);
+});
+
+it("renders git worktree branch templates with project context values", async () => {
+  const config = parseServiceConfig(
+    {
+      tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "ENG" },
+      workspace: {
+        root: root,
+        source: {
+          kind: "git_worktree",
+          repository: ".",
+          base_ref: "origin/main",
+          branch_template: "symphony/{{ project.id }}/{{ issue.identifier }}",
+        },
+      },
+    },
+    path.join(root, "WORKFLOW.md"),
+    { LINEAR_API_KEY: "secret" },
+  );
+  const manager = new WorkspaceManager({
+    workspace: config.workspace,
+    hooks: config.hooks,
+    logger: new StructuredLogger(() => undefined),
+  });
+  const branchName = await (manager as unknown as { resolveBranchName(issueInput: unknown): Promise<string> }).resolveBranchName(
+    issue({ identifier: "ENG-9", projectContextId: "docs", projectContextLabel: "Docs", trackerProjectSlug: "DOCS" }),
+  );
+  expect(branchName).toBe("symphony/docs/ENG-9");
+});
+
 });

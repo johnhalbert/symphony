@@ -671,6 +671,23 @@ function isOrchestratorConversationMessage(
   return "body" in message && typeof message.body === "string" && "role" in message && typeof message.role === "string";
 }
 
+function projectAttributionLabel(
+  details: IssueDetailsEnvelope,
+  card: IssueBoardCardProjectionInput | null,
+): string {
+  return (
+    firstNonEmpty(
+      details.issue.projectContextLabel,
+      details.issue.projectContextId,
+      details.issue.trackerProjectSlug,
+      details.workspace.projectContextLabel,
+      details.workspace.projectContextId,
+      details.workspace.trackerProjectSlug,
+      card?.metadata?.repoPath,
+    ) ?? ""
+  );
+}
+
 export function projectIssueModel(
   source: IssueBoardCardProjectionInput | IssueDetailsEnvelope,
   options: ProjectIssueModelOptions = {},
@@ -702,7 +719,7 @@ export function projectIssueModel(
     labels: Array.isArray(issue.labels) ? [...issue.labels] : [],
     assignee: firstNonEmpty(issue.assigneeId) ?? "unassigned",
     agent: agentIdFromInputs(card, operatorLiveness),
-    project: "",
+    project: projectAttributionLabel(details, card),
     cycle: "",
     activity: projectIssueActivity(details, card, operatorLiveness),
     pr: formatPullRequest(pullRequest, card?.metadata ?? null),

@@ -24,6 +24,9 @@ export interface Issue {
   blockedBy: IssueBlockerRef[];
   createdAt: string | null;
   updatedAt: string | null;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  trackerProjectSlug?: string | null;
 }
 
 export interface IssueStatusView {
@@ -41,6 +44,9 @@ export interface IssueStatusView {
   blockedBy: IssueBlockerRef[];
   createdAt: string | null;
   updatedAt: string | null;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  trackerProjectSlug?: string | null;
 }
 
 export type IssueDetailsSource = "live" | "durable" | "tracker";
@@ -85,6 +91,9 @@ export interface IssueWorkspaceSummary {
   gitBranchName: string | null;
   repoPath: string | null;
   baseRef: string | null;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  trackerProjectSlug?: string | null;
 }
 
 export interface IssuePullRequestSummary {

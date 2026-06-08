@@ -8,6 +8,11 @@ import {
   rawCredentialProfilesSchema,
   type CredentialProfileRegistry,
 } from "./CredentialProfiles.js";
+import {
+  DEFAULT_PROJECT_CONTEXT_ID,
+  normalizeProjectContextId,
+  type ProjectContextConfig,
+} from "./ProjectContexts.js";
 
 const stringArray = z.array(z.string());
 
@@ -304,11 +309,157 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    project_contexts: z
+      .array(
+        z
+          .object({
+            id: z.string(),
+            label: z.string().optional(),
+            enabled: z.boolean().optional(),
+            tracker: z
+              .object({
+                kind: z.string().optional(),
+                endpoint: z.string().optional(),
+                api_key: z.string().optional(),
+                project_slug: z.string().optional(),
+                assignee: z.string().optional(),
+                active_states: stringArray.optional(),
+                handoff_states: stringArray.optional(),
+                terminal_states: stringArray.optional(),
+              })
+              .passthrough()
+              .optional(),
+            review_loop: z
+              .object({
+                review_states: stringArray.optional(),
+                blocked_states: stringArray.optional(),
+                review_pass_state: z.string().optional(),
+                reviewer_prompt: z.string().optional(),
+                reviewer_prompt_extensions: stringArray.optional(),
+                worker_prompt_extensions: stringArray.optional(),
+                max_review_rounds: z.number().int().positive().optional(),
+                max_incomplete_turns: z.number().int().positive().optional(),
+                continuation_history_threshold: z.number().int().nonnegative().optional(),
+                transcript_history_limit: z.number().int().nonnegative().optional(),
+                pr_review_evidence_limit: z.number().int().positive().optional(),
+              })
+              .passthrough()
+              .optional(),
+            issue_breakdown: z
+              .object({
+                enabled: z.boolean().optional(),
+                cursor_mode: z.enum(["agent", "plan"]).optional(),
+                prompt: z.string().optional(),
+                planning_labels: stringArray.optional(),
+                apply_to_linear: z
+                  .object({
+                    enabled: z.boolean().optional(),
+                    mode: z.enum(["child_issues"]).optional(),
+                  })
+                  .passthrough()
+                  .optional(),
+                workspace_mode: z.enum(["none", "readonly_checkout"]).optional(),
+                max_planning_failures: z.number().int().positive().optional(),
+                max_planning_dispatch_retries: z.number().int().positive().optional(),
+                planning_retry_base_ms: z.number().int().positive().optional(),
+                planning_retry_max_ms: z.number().int().positive().optional(),
+              })
+              .passthrough()
+              .optional(),
+            workspace: z
+              .object({
+                root: z.string().optional(),
+                state_dir: z.string().optional(),
+                source: z
+                  .object({
+                    kind: z.enum(["none", "copy", "git", "git_worktree"]).optional(),
+                    path: z.string().optional(),
+                    repository: z.string().optional(),
+                    ref: z.string().optional(),
+                    base_ref: z.string().optional(),
+                    branch_template: z.string().optional(),
+                    cache_path: z.string().optional(),
+                    cleanup: z.enum(["refuse_dirty", "force"]).optional(),
+                  })
+                  .passthrough()
+                  .optional(),
+              })
+              .passthrough()
+              .optional(),
+            agent: z
+              .object({
+                harness: z.string().optional(),
+                max_concurrent_agents: z.number().int().positive().optional(),
+                max_turns: z.number().int().positive().optional(),
+                max_retry_backoff_ms: z.number().int().positive().optional(),
+                max_sdk_error_retries: z.number().int().nonnegative().optional(),
+                max_infra_failures: z.number().int().positive().optional(),
+                max_concurrent_agents_by_state: z.record(z.string(), z.number()).optional(),
+                require_labels: stringArray.optional(),
+                exclude_labels: stringArray.optional(),
+                protected_paths: stringArray.optional(),
+              })
+              .passthrough()
+              .optional(),
+            github: z
+              .object({
+                owner: z.string().optional(),
+                repo: z.string().optional(),
+                token: z.string().optional(),
+                app: z
+                  .object({
+                    app_id: z.string().optional(),
+                    client_id: z.string().optional(),
+                    installation_id: z.string().optional(),
+                    private_key: z.string().optional(),
+                    private_key_path: z.string().optional(),
+                    token_refresh_buffer_seconds: z.number().int().nonnegative().optional(),
+                  })
+                  .passthrough()
+                  .optional(),
+                head_owner: z.string().optional(),
+                api_base_url: z.string().optional(),
+                publish_pull_requests: z.boolean().optional(),
+                operator_approval: z
+                  .object({
+                    required_for_publication: z.boolean().optional(),
+                    reject_policy: z.enum(["cancel", "fail"]).optional(),
+                    poll_interval_ms: z.number().int().positive().optional(),
+                    timeout_ms: z.number().int().nonnegative().nullable().optional(),
+                  })
+                  .passthrough()
+                  .optional(),
+                pr_handoff: z
+                  .object({
+                    enabled: z.boolean().optional(),
+                    target_state: z.string().optional(),
+                    allow_drafts: z.boolean().optional(),
+                    required_checks: stringArray.optional(),
+                    no_ci: z
+                      .object({
+                        allowed: z.boolean().optional(),
+                        evidence: z.string().optional(),
+                      })
+                      .passthrough()
+                      .optional(),
+                  })
+                  .passthrough()
+                  .optional(),
+              })
+              .passthrough()
+              .optional(),
+            credential_profiles: rawCredentialProfilesSchema.optional(),
+          })
+          .passthrough(),
+      )
+      .nonempty()
+      .optional(),
     credential_profiles: rawCredentialProfilesSchema.optional(),
   })
   .passthrough();
 
 export type RawWorkflowConfig = z.infer<typeof rawConfigSchema>;
+export type RawProjectContextConfig = NonNullable<RawWorkflowConfig["project_contexts"]>[number];
 
 export interface TrackerConfig {
   kind: "linear";
@@ -575,6 +726,8 @@ export interface ServiceConfig {
   continuationContext: ContinuationContextConfig;
   database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
+  projectContexts?: ProjectContextConfig[];
+  defaultProjectContextId?: string;
   raw: RawWorkflowConfig;
 }
 
@@ -629,6 +782,25 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   }
 
   const raw = parsed.data;
+  if (raw.project_contexts?.length) {
+    const projectContexts = normalizeExplicitProjectContexts(raw, workflowPath, env);
+    const defaultProjectContextId =
+      projectContexts.find((context) => context.id === DEFAULT_PROJECT_CONTEXT_ID)?.id ?? projectContexts[0]?.id ?? DEFAULT_PROJECT_CONTEXT_ID;
+    const defaultContextConfig = parseServiceConfig(
+      mergedRawForProjectContext(
+        raw,
+        raw.project_contexts.find((context) => normalizeProjectContextId(context.id) === defaultProjectContextId) ??
+          raw.project_contexts[0]!,
+      ),
+      workflowPath,
+      env,
+    );
+    return {
+      ...defaultContextConfig,
+      projectContexts,
+      defaultProjectContextId,
+    };
+  }
   const workflowDir = path.dirname(path.resolve(workflowPath));
   const trackerKind = raw.tracker?.kind ?? "linear";
   if (trackerKind !== "linear") {
@@ -835,7 +1007,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     mergePolicy,
   });
 
-  return {
+  const config: ServiceConfig = {
     workflowPath: path.resolve(workflowPath),
     workflowDir,
     tracker: {
@@ -985,8 +1157,77 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       planningRetryBaseMs: raw.issue_breakdown?.planning_retry_base_ms ?? 5_000,
       planningRetryMaxMs: raw.issue_breakdown?.planning_retry_max_ms ?? 60_000,
     },
+    projectContexts: [],
+    defaultProjectContextId: DEFAULT_PROJECT_CONTEXT_ID,
     raw,
   };
+  const defaultProjectContext: ProjectContextConfig = {
+    id: DEFAULT_PROJECT_CONTEXT_ID,
+    label: "Default",
+    enabled: true,
+    tracker: config.tracker,
+    workspace: config.workspace,
+    github: config.github,
+    reviewLoop: config.reviewLoop,
+    issueBreakdown: config.issueBreakdown,
+    agent: config.agent,
+    credentialProfiles: config.credentialProfiles,
+    raw: config.raw,
+  };
+  config.projectContexts = [defaultProjectContext];
+  return config;
+}
+
+function normalizeExplicitProjectContexts(
+  raw: RawWorkflowConfig,
+  workflowPath: string,
+  env: NodeJS.ProcessEnv,
+): ProjectContextConfig[] {
+  const seen = new Set<string>();
+  return raw.project_contexts!.map((projectContext) => {
+    const normalizedId = normalizeProjectContextId(projectContext.id);
+    if (seen.has(normalizedId)) {
+      throw new SymphonyError("config_validation_error", `Duplicate project_contexts id: ${projectContext.id}`);
+    }
+    seen.add(normalizedId);
+    const contextConfig = parseServiceConfig(mergedRawForProjectContext(raw, projectContext), workflowPath, env);
+    return {
+      id: normalizedId,
+      label: projectContext.label?.trim() || projectContext.id.trim(),
+      enabled: projectContext.enabled ?? true,
+      tracker: contextConfig.tracker,
+      workspace: contextConfig.workspace,
+      github: contextConfig.github,
+      reviewLoop: contextConfig.reviewLoop,
+      issueBreakdown: contextConfig.issueBreakdown,
+      agent: contextConfig.agent,
+      credentialProfiles: contextConfig.credentialProfiles,
+      raw: contextConfig.raw,
+    };
+  });
+}
+
+function mergedRawForProjectContext(raw: RawWorkflowConfig, projectContext: RawProjectContextConfig): RawWorkflowConfig {
+  const { project_contexts: _projectContexts, ...rootWithoutProjectContexts } = raw;
+  const { id: _id, label: _label, enabled: _enabled, ...projectContextBody } = projectContext;
+  return deepMergeConfigValue(rootWithoutProjectContexts, projectContextBody) as RawWorkflowConfig;
+}
+
+function deepMergeConfigValue(base: unknown, override: unknown): unknown {
+  if (override === undefined) return base;
+  if (Array.isArray(base) || Array.isArray(override)) return override;
+  if (isPlainConfigObject(base) && isPlainConfigObject(override)) {
+    const merged: Record<string, unknown> = { ...base };
+    for (const [key, value] of Object.entries(override)) {
+      merged[key] = key in merged ? deepMergeConfigValue(merged[key], value) : value;
+    }
+    return merged;
+  }
+  return override;
+}
+
+function isPlainConfigObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export function resolveConfigString(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined {

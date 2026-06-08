@@ -95,12 +95,22 @@ export function resolveStatusMutationCredential(config: ServiceConfig): Resolved
 }
 
 export function resolveTrackerStateLists(config: ServiceConfig): TrackerStateLists {
+  const contexts = config.projectContexts ?? [];
+  if (contexts.length === 0) {
+    return {
+      activeStates: config.tracker.activeStates,
+      handoffStates: config.tracker.handoffStates,
+      reviewStates: config.reviewLoop.reviewStates,
+      blockedStates: config.reviewLoop.blockedStates,
+      terminalStates: config.tracker.terminalStates,
+    };
+  }
   return {
-    activeStates: config.tracker.activeStates,
-    handoffStates: config.tracker.handoffStates,
-    reviewStates: config.reviewLoop.reviewStates,
-    blockedStates: config.reviewLoop.blockedStates,
-    terminalStates: config.tracker.terminalStates,
+    activeStates: uniqueStrings(contexts.flatMap((context) => context.tracker.activeStates)),
+    handoffStates: uniqueStrings(contexts.flatMap((context) => context.tracker.handoffStates)),
+    reviewStates: uniqueStrings(contexts.flatMap((context) => context.reviewLoop.reviewStates)),
+    blockedStates: uniqueStrings(contexts.flatMap((context) => context.reviewLoop.blockedStates)),
+    terminalStates: uniqueStrings(contexts.flatMap((context) => context.tracker.terminalStates)),
   };
 }
 
@@ -118,4 +128,8 @@ function enforceCapabilityOwner(
       ", ",
     )}. Configure credential_profiles.roles.${owner}.${capability} or remove the non-owning assignment to use legacy ${legacyFallbackLabel}.`,
   );
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values));
 }

@@ -2,6 +2,7 @@ import type { ServiceConfig, TrackerConfig } from "../../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../../core/config/CredentialProfiles.js";
 import { SymphonyError } from "../../core/errors.js";
 import { LinearTrackerClient } from "./LinearTrackerClient.js";
+import { MultiProjectLinearTrackerClient } from "./MultiProjectLinearTrackerClient.js";
 
 type FetchLike = typeof fetch;
 
@@ -54,6 +55,11 @@ export function createLinearTrackerClientForCapability(
   config: ServiceConfig,
   capability: LinearCredentialCapability,
   fetchImpl?: FetchLike,
-): LinearTrackerClient {
+): LinearTrackerClient | MultiProjectLinearTrackerClient {
+  if ((config.projectContexts ?? []).length > 1) {
+    return new MultiProjectLinearTrackerClient(config, (contextConfig) =>
+      new LinearTrackerClient(resolveLinearClientConfig(contextConfig, capability).tracker, fetchImpl),
+    );
+  }
   return new LinearTrackerClient(resolveLinearClientConfig(config, capability).tracker, fetchImpl);
 }

@@ -1404,3 +1404,100 @@ Work on {{ issue.identifier }}.
     );
   });
 });
+
+
+describe("multi-project workflow config", () => {
+  it("normalizes legacy single-project config into a default project context", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        workspace: { root: "./workspaces" },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.defaultProjectContextId).toBe("default");
+    expect(config.projectContexts).toHaveLength(1);
+    expect(config.projectContexts?.[0]).toMatchObject({
+      id: "default",
+      label: "Default",
+      tracker: { projectSlug: "TEST" },
+      workspace: { root: path.resolve("/repo/workspaces") },
+    });
+  });
+
+  it("parses explicit project contexts with inherited defaults and per-context overrides", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "DEFAULT" },
+        workspace: {
+          root: "./workspaces",
+          source: {
+            kind: "git_worktree",
+            repository: ".",
+            base_ref: "origin/main",
+            branch_template: "symphony/{{ project.id }}/{{ issue.identifier }}",
+          },
+        },
+        github: { owner: "johnhalbert", repo: "symphony" },
+        project_contexts: [
+          {
+            id: "Symphony",
+            label: "Symphony Core",
+            tracker: { project_slug: "ENG" },
+          },
+          {
+            id: "docs-site",
+            tracker: { project_slug: "DOCS" },
+            workspace: {
+              source: {
+                repository: "../docs-site",
+              },
+            },
+            github: { repo: "docs-site" },
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.defaultProjectContextId).toBe("symphony");
+    expect(config.projectContexts?.map((context) => context.id)).toEqual(["symphony", "docs-site"]);
+    expect(config.projectContexts?.[0]).toMatchObject({
+      id: "symphony",
+      label: "Symphony Core",
+      tracker: { projectSlug: "ENG" },
+      github: { repo: "symphony" },
+    });
+    expect(config.projectContexts?.[1]).toMatchObject({
+      id: "docs-site",
+      label: "docs-site",
+      tracker: { projectSlug: "DOCS" },
+      github: { repo: "docs-site" },
+      workspace: { source: { repository: path.resolve("/docs-site") } },
+    });
+    expect(config.tracker.projectSlug).toBe("ENG");
+    expect(config.workspace.source.kind).toBe("git_worktree");
+  });
+
+  it("rejects duplicate project context ids after normalization", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "DEFAULT" },
+          workspace: {
+            source: { kind: "git_worktree", repository: ".", base_ref: "origin/main" },
+          },
+          project_contexts: [
+            { id: "Docs Site", tracker: { project_slug: "DOCS" } },
+            { id: "docs-site", tracker: { project_slug: "DOCS2" } },
+          ],
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("Duplicate project_contexts id");
+  });
+});

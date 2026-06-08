@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { Liquid } from "liquidjs";
 import type { HookConfig, WorkspaceConfig } from "../config/Config.js";
+import { projectScopedKey } from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue, Workspace } from "../types.js";
 import type { Logger } from "../logging/StructuredLogger.js";
@@ -27,6 +28,9 @@ export interface WorkspaceMetadata {
   repoPath?: string;
   baseRef?: string;
   gitBranchName?: string;
+  projectContextId?: string | undefined;
+  projectContextLabel?: string | undefined;
+  trackerProjectSlug?: string | undefined;
 }
 
 export class WorkspaceManager {
@@ -40,7 +44,7 @@ export class WorkspaceManager {
   async createForIssue(issueInput: WorkspaceIssueInput): Promise<Workspace> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
-    const workspaceKey = sanitizeWorkspaceKey(issueIdentifier);
+    const workspaceKey = workspaceKeyForIssue(issue);
     const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
 
@@ -67,6 +71,9 @@ export class WorkspaceManager {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         sourceKind: this.options.workspace.source.kind,
+        projectContextId: issue.projectContextId ?? undefined,
+        projectContextLabel: issue.projectContextLabel ?? undefined,
+        trackerProjectSlug: issue.trackerProjectSlug ?? undefined,
         repoPath: result.repoPath,
         baseRef: result.baseRef,
         gitBranchName: result.branchName,
@@ -95,6 +102,9 @@ export class WorkspaceManager {
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       sourceKind: this.options.workspace.source.kind,
+      projectContextId: issue.projectContextId ?? existing?.projectContextId,
+      projectContextLabel: issue.projectContextLabel ?? existing?.projectContextLabel,
+      trackerProjectSlug: issue.trackerProjectSlug ?? existing?.trackerProjectSlug,
       ...(existing?.repoPath === undefined ? {} : { repoPath: existing.repoPath }),
       ...(existing?.baseRef === undefined ? {} : { baseRef: existing.baseRef }),
       ...(existing?.gitBranchName === undefined ? {} : { gitBranchName: existing.gitBranchName }),
@@ -117,7 +127,7 @@ export class WorkspaceManager {
   async createForPlanning(issueInput: WorkspaceIssueInput): Promise<Workspace> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
-    const workspaceKey = `${sanitizeWorkspaceKey(issueIdentifier)}-planning`;
+    const workspaceKey = `${workspaceKeyForIssue(issue)}-planning`;
     const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
 
@@ -196,6 +206,9 @@ export class WorkspaceManager {
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       sourceKind,
+      projectContextId: issue.projectContextId ?? existing?.projectContextId,
+      projectContextLabel: issue.projectContextLabel ?? existing?.projectContextLabel,
+      trackerProjectSlug: issue.trackerProjectSlug ?? existing?.trackerProjectSlug,
       ...(repoPath === undefined ? {} : { repoPath }),
       ...(baseRef === undefined ? {} : { baseRef }),
     };
@@ -216,7 +229,7 @@ export class WorkspaceManager {
   async removeForPlanning(issueInput: WorkspaceIssueInput): Promise<void> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
-    const workspaceKey = `${sanitizeWorkspaceKey(issueIdentifier)}-planning`;
+    const workspaceKey = `${workspaceKeyForIssue(issue)}-planning`;
     const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
     const metadata = await this.store.getWorkspace(workspaceKey);
@@ -238,7 +251,7 @@ export class WorkspaceManager {
   async removeForIssue(issueInput: WorkspaceIssueInput): Promise<void> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
-    const workspaceKey = sanitizeWorkspaceKey(issueIdentifier);
+    const workspaceKey = workspaceKeyForIssue(issue);
     const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
 
@@ -306,8 +319,8 @@ export class WorkspaceManager {
     await this.store.deleteWorkspace(workspaceKey);
   }
 
-  getPathForIssue(issueIdentifier: string): string {
-    const workspacePath = path.resolve(this.options.workspace.root, sanitizeWorkspaceKey(issueIdentifier));
+  getPathForIssue(issueIdentifier: string, projectContextId?: string | null): string {
+    const workspacePath = path.resolve(this.options.workspace.root, scopedWorkspaceKey(issueIdentifier, projectContextId));
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
     return workspacePath;
   }
@@ -389,6 +402,11 @@ export class WorkspaceManager {
           identifier: issue.identifier,
           branchName: issue.branchName,
         },
+        project: {
+          id: issue.projectContextId ?? null,
+          label: issue.projectContextLabel ?? null,
+          trackerProjectSlug: issue.trackerProjectSlug ?? null,
+        },
       }));
     const trimmed = String(branchName).trim();
     if (trimmed.length === 0) throw new SymphonyError("workspace_error", "Resolved git branch name is empty");
@@ -412,13 +430,32 @@ export interface WorkspaceIssue {
   id: string | null;
   identifier: string;
   branchName: string | null;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  trackerProjectSlug?: string | null;
 }
 
-export type WorkspaceIssueInput = string | Pick<Issue, "id" | "identifier" | "branchName">;
+export type WorkspaceIssueInput = string | Pick<Issue, "id" | "identifier" | "branchName" | "projectContextId" | "projectContextLabel" | "trackerProjectSlug">;
 
 function normalizeIssueInput(input: WorkspaceIssueInput): WorkspaceIssue {
-  if (typeof input === "string") return { id: null, identifier: input, branchName: null };
-  return { id: input.id, identifier: input.identifier, branchName: input.branchName };
+  if (typeof input === "string") return { id: null, identifier: input, branchName: null, projectContextId: null, projectContextLabel: null, trackerProjectSlug: null };
+  return {
+    id: input.id,
+    identifier: input.identifier,
+    branchName: input.branchName,
+    projectContextId: input.projectContextId ?? null,
+    projectContextLabel: input.projectContextLabel ?? null,
+    trackerProjectSlug: input.trackerProjectSlug ?? null,
+  };
+}
+
+function workspaceKeyForIssue(issue: WorkspaceIssue): string {
+  return scopedWorkspaceKey(issue.identifier, issue.projectContextId);
+}
+
+function scopedWorkspaceKey(issueIdentifier: string, projectContextId?: string | null): string {
+  const identifier = sanitizeWorkspaceKey(issueIdentifier);
+  return projectContextId ? sanitizeWorkspaceKey(projectScopedKey(projectContextId, identifier)) : identifier;
 }
 
 export function sanitizeWorkspaceKey(identifier: string): string {

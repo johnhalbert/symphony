@@ -95,6 +95,9 @@ export interface WorkspaceRecord {
   repoPath?: string;
   baseRef?: string;
   gitBranchName?: string;
+  projectContextId?: string | undefined;
+  projectContextLabel?: string | undefined;
+  trackerProjectSlug?: string | undefined;
   createdAt: string;
   updatedAt: string;
 }
@@ -167,6 +170,9 @@ export interface RunRecord {
   gitBranchName?: string | null;
   repoPath?: string | null;
   baseRef?: string | null;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  trackerProjectSlug?: string | null;
   status: RunStatus;
   startedAt: string;
   updatedAt: string;
@@ -295,6 +301,9 @@ export interface StartRunInput {
   gitBranchName?: string;
   repoPath?: string;
   baseRef?: string;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  trackerProjectSlug?: string | null;
 }
 
 export interface UpdateRunInput {
@@ -364,16 +373,17 @@ export class FileRunTranscriptStore {
     return records.filter((record): record is WorkspaceRecord => record !== null);
   }
 
-  async findWorkspace(issueIdOrIdentifierOrKey: string): Promise<WorkspaceRecord | null> {
+  async findWorkspace(issueIdOrIdentifierOrKey: string, projectContextId?: string | null): Promise<WorkspaceRecord | null> {
     const direct = await this.getWorkspace(issueIdOrIdentifierOrKey);
     if (direct) return direct;
     const records = await this.listWorkspaces();
     return (
       records.find(
         (record) =>
-          record.issueId === issueIdOrIdentifierOrKey ||
-          record.issueIdentifier === issueIdOrIdentifierOrKey ||
-          record.workspaceKey === issueIdOrIdentifierOrKey,
+          (projectContextId === undefined || projectContextId === null || (record.projectContextId ?? null) === projectContextId) &&
+          (record.issueId === issueIdOrIdentifierOrKey ||
+            record.issueIdentifier === issueIdOrIdentifierOrKey ||
+            record.workspaceKey === issueIdOrIdentifierOrKey),
       ) ?? null
     );
   }
@@ -413,6 +423,9 @@ export class FileRunTranscriptStore {
       ...(input.gitBranchName === undefined ? {} : { gitBranchName: input.gitBranchName }),
       ...(input.repoPath === undefined ? {} : { repoPath: input.repoPath }),
       ...(input.baseRef === undefined ? {} : { baseRef: input.baseRef }),
+      ...(input.projectContextId === undefined ? {} : { projectContextId: input.projectContextId }),
+      ...(input.projectContextLabel === undefined ? {} : { projectContextLabel: input.projectContextLabel }),
+      ...(input.trackerProjectSlug === undefined ? {} : { trackerProjectSlug: input.trackerProjectSlug }),
       status: existing?.status ?? "running",
       startedAt: existing?.startedAt ?? now,
       updatedAt: now,
@@ -528,18 +541,22 @@ export class FileRunTranscriptStore {
     return record === null ? null : normalizeRunRecord(record);
   }
 
-  async listRunsForIssue(issueIdOrIdentifier: string): Promise<RunRecord[]> {
+  async listRunsForIssue(issueIdOrIdentifier: string, projectContextId?: string | null): Promise<RunRecord[]> {
     const records = await this.listRuns();
     return records
-      .filter((record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier)
+      .filter(
+        (record) =>
+          (projectContextId === undefined || projectContextId === null || (record.projectContextId ?? null) === projectContextId) &&
+          (record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier),
+      )
       .sort(compareRunChronology);
   }
 
   async latestRunForIssue(
     issueIdOrIdentifier: string,
-    options: { role?: PersistedRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind } = {},
+    options: { role?: PersistedRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind; projectContextId?: string | null } = {},
   ): Promise<RunRecord | null> {
-    const records = await this.listRunsForIssue(issueIdOrIdentifier);
+    const records = await this.listRunsForIssue(issueIdOrIdentifier, options.projectContextId);
     const filtered = records.filter(
       (record) =>
         (options.role === undefined || record.role === options.role) &&
@@ -699,6 +716,9 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
   const shouldBackfillCursorRuntime = harnessId === "cursor";
   return {
     ...record,
+    ...(record.projectContextId === undefined ? { projectContextId: null } : {}),
+    ...(record.projectContextLabel === undefined ? { projectContextLabel: null } : {}),
+    ...(record.trackerProjectSlug === undefined ? { trackerProjectSlug: null } : {}),
     runPhase,
     runKind: record.runKind ?? runKindForPhase(runPhase),
     ...(harnessId === undefined ? {} : { harnessId }),

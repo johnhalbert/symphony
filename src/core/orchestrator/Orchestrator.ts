@@ -670,6 +670,9 @@ export class Orchestrator {
             ...(workspace.gitBranchName === undefined ? {} : { gitBranchName: workspace.gitBranchName }),
             ...(workspace.repoPath === undefined ? {} : { repoPath: workspace.repoPath }),
             ...(workspace.baseRef === undefined ? {} : { baseRef: workspace.baseRef }),
+            projectContextId: null,
+            projectContextLabel: null,
+            trackerProjectSlug: null,
           });
           assistant = await store.appendMessage({
             conversationId: command.conversationId,
@@ -1919,6 +1922,9 @@ export class Orchestrator {
           ...(context.workspace.gitBranchName === undefined ? {} : { gitBranchName: context.workspace.gitBranchName }),
           ...(context.workspace.repoPath === undefined ? {} : { repoPath: context.workspace.repoPath }),
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),
+          ...(entry.issue.projectContextId === undefined ? {} : { projectContextId: entry.issue.projectContextId }),
+          ...(entry.issue.projectContextLabel === undefined ? {} : { projectContextLabel: entry.issue.projectContextLabel }),
+          ...(entry.issue.trackerProjectSlug === undefined ? {} : { trackerProjectSlug: entry.issue.trackerProjectSlug }),
         });
         if (entry.runPhase !== "issue_breakdown") {
           await this.discoverPullRequestForEntry(entry, context.workspace);
