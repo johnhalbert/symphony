@@ -10,6 +10,7 @@ import {
   buildMcpSubprocessServerConfig,
   shouldIncludeNodeExecArgv,
 } from "../src/core/harness/McpSubprocessEnvironment.js";
+import { multiProjectWorkflowConfig, projectContextFixture } from "./helpers.js";
 
 describe("MCP subprocess environment", () => {
   it("includes Node execArgv for TypeScript CLI entrypoints only", () => {
@@ -1103,6 +1104,82 @@ describe("MCP subprocess environment", () => {
     expect(expectedDocsContext).toBeDefined();
     expect(childConfig.projectContexts.byId.get("docs")).toMatchObject(expectedDocsContext!);
   });
+
+  it.each([
+    {
+      command: "completion-report-mcp",
+      role: "service",
+      capability: "github.publication",
+      envVar: "GITHUB_PUBLICATION_TOKEN",
+      excludedEnvVar: "GITHUB_FEEDBACK_TOKEN",
+      expectedSecret: "publication-secret",
+      profileName: "publication",
+    },
+    {
+      command: "review-feedback-mcp",
+      role: "reviewer",
+      capability: "github.review_feedback_write",
+      envVar: "GITHUB_FEEDBACK_TOKEN",
+      excludedEnvVar: "GITHUB_PUBLICATION_TOKEN",
+      expectedSecret: "feedback-secret",
+      profileName: "feedback",
+    },
+  ] as const)(
+    "exports default project-context credential profiles through %s and preserves child reparse attribution",
+    ({ command, role, capability, envVar, excludedEnvVar, expectedSecret, profileName }) => {
+      const rawConfig = multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+            github: {
+              owner: "acme",
+              repo: "symphony",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+            },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+                feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+          projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+        ],
+      });
+      const sourceEnv = {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_PUBLICATION_TOKEN: "publication-secret",
+        GITHUB_FEEDBACK_TOKEN: "feedback-secret",
+      };
+      const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+      const env = buildMcpSubprocessEnvironment({
+        config,
+        command,
+        parentEnv: { PATH: "/bin", GITHUB_TOKEN: "decoy-parent-github-secret" },
+      });
+
+      expect(env[envVar]).toBe(expectedSecret);
+      expect(env).not.toHaveProperty(excludedEnvVar);
+      expect(env).not.toHaveProperty("GITHUB_TOKEN");
+
+      const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+      expect(childConfig.credentialProfiles.assignmentRolesFor(capability)).toEqual([role]);
+      expect(childConfig.credentialProfiles.resolveForRole(role, capability)).toMatchObject({
+        source: "profile",
+        profileName,
+        value: expectedSecret,
+      });
+    },
+  );
 
   it("reports missing assigned publication profile secrets without falling back to legacy GITHUB_TOKEN", () => {
     const config = parseServiceConfig(

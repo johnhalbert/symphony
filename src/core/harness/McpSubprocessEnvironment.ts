@@ -2,7 +2,11 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
-import type { GitHubAppConfig, ServiceConfig } from "../config/Config.js";
+import {
+  resolveDefaultProjectContextCredentialProfiles,
+  type GitHubAppConfig,
+  type ServiceConfig,
+} from "../config/Config.js";
 import type { CredentialRole } from "../config/CredentialProfiles.js";
 
 export type McpSubprocessCommand =
@@ -283,7 +287,10 @@ function addGitHubCapabilityEnvironment(
       throw new Error(`${role} ${capability} profile assignment could not be resolved`);
     }
     if (profile.kind === "github_app") {
-      const rawProfile = config.raw.credential_profiles?.profiles?.[profile.name];
+      const rawProfile = resolveDefaultProjectContextCredentialProfiles(
+        config.raw,
+        config.projectContexts.defaultContextId,
+      )?.profiles?.[profile.name];
       if (rawProfile?.kind !== "github_app") {
         throw new Error(`${role} ${capability} GitHub App profile assignment could not be resolved`);
       }

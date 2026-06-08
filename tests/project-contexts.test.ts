@@ -166,4 +166,49 @@ describe("project context normalization", () => {
     expect(config.tracker.projectSlug).toBe("SYMPHONY");
     expect(config.workspace.source?.repository).toMatch(/repo$/i);
   });
+
+  it("projects default-context credential profiles into the legacy service credential registry", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+                feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+          projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-test-key",
+        GITHUB_PUBLICATION_TOKEN: "publication-secret",
+        GITHUB_FEEDBACK_TOKEN: "feedback-secret",
+      },
+    );
+
+    expect(config.credentialProfiles.assignmentRolesFor("github.publication")).toEqual(["service"]);
+    expect(config.credentialProfiles.assignmentRolesFor("github.review_feedback_write")).toEqual(["reviewer"]);
+    expect(config.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      source: "profile",
+      profileName: "publication",
+      value: "publication-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("reviewer", "github.review_feedback_write")).toMatchObject({
+      source: "profile",
+      profileName: "feedback",
+      value: "feedback-secret",
+    });
+  });
 });

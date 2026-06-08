@@ -641,8 +641,21 @@ export interface ServiceConfig {
   raw: RawWorkflowConfig;
 }
 
+export function resolveDefaultProjectContextCredentialProfiles(
+  raw: RawWorkflowConfig,
+  defaultContextId: string,
+): RawWorkflowConfig["credential_profiles"] | undefined {
+  for (const context of raw.project_contexts ?? []) {
+    if (normalizeProjectContextId(context.id) === defaultContextId) {
+      return context.credential_profiles ?? raw.credential_profiles;
+    }
+  }
+  return raw.credential_profiles;
+}
+
 const DEFAULT_ACTIVE_STATES = ["Todo", "In Progress"];
 const DEFAULT_TERMINAL_STATES = ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"];
+
 const VALID_CURSOR_SETTING_SOURCES = new Set<CursorSettingSource>([
   "project",
   "user",
@@ -771,8 +784,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
   const serverWebAssetsRoot = resolveOptionalPathValue(raw.server?.web_assets_root, workflowDir, env);
   const database = normalizeDatabaseConfig(raw, workflowDir, env);
+  const credentialProfilesRaw = resolveDefaultProjectContextCredentialProfiles(raw, defaultContext.id);
   const credentialProfiles = createCredentialProfileRegistry({
-    raw: raw.credential_profiles,
+    raw: credentialProfilesRaw,
     env,
     workflowDir,
     fallbacks: {
@@ -783,6 +797,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     },
   });
   const mergePolicy = normalizeMergePolicy(raw, reviewLoop.reviewPassState);
+
   validateStateBuckets({
     activeStates: tracker.activeStates,
     handoffStates: tracker.handoffStates,
