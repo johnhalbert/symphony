@@ -1961,8 +1961,11 @@ export class StatusServer {
     if (!issue) return null;
 
     const issueActivityKey = issue.id || issueId;
+    const resolvedProjectContextId = issue.projectContextId ?? projectContextId ?? null;
     const issueRuns = this.options.runStore
-      ? (await this.options.runStore.listRuns()).filter((run) => activityRunMatchesIssue(run, issueActivityKey))
+      ? (await this.options.runStore.listRuns()).filter((run) =>
+          activityRunMatchesIssue(run, issueActivityKey, resolvedProjectContextId),
+        )
       : [];
     const detailRuns = selectLatestChronologicalRuns(issueRuns, WEB_ISSUE_DETAIL_RUN_LIMIT);
     const latestRun = detailRuns.at(-1) ?? null;
@@ -1972,7 +1975,7 @@ export class StatusServer {
       runs: detailRuns,
       lifecycleStore: this.options.lifecycleStore,
       writebackOutbox: this.options.writebackOutbox,
-      query: { issue: issueActivityKey, projectContextId: issue.projectContextId ?? null, offset: 0, limit: 50 },
+      query: { issue: issueActivityKey, projectContextId: resolvedProjectContextId, offset: 0, limit: 50 },
       includeTranscriptEvents: false,
     });
     const transcript =
@@ -2618,7 +2621,11 @@ export class StatusServer {
       });
     }
 
-    const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), issueRequestKeys(issueId, projectContextId))) ?? null;
+    const card =
+      board?.issues.find((item) => {
+        if (projectContextId && !matchesProjectContext(item, projectContextId)) return false;
+        return hasBoardKey(new Set(boardCardKeys(item)), issueRequestKeys(issueId, projectContextId));
+      }) ?? null;
     const detail = await buildBoardIssueDetail({
       requestKey: issueId,
       card,
@@ -4947,17 +4954,18 @@ async function buildBoardIssueDetail(input: {
   continuationSummaryAvailable: boolean;
 }) {
   const snapshot = input.sourceIndex.runtime.snapshot;
-  const keys = input.card ? boardCardKeys(input.card) : [input.requestKey];
-  const live = liveIssueByKeys(input.sourceIndex, keys);
-  const workspace = workspaceByKeys(input.sourceIndex, keys);
-  const latestRun = latestRunByKeys(input.sourceIndex, keys);
-  const rawLifecycle = lifecycleByKeys(input.sourceIndex, keys);
+  const resolvedProjectContextId = input.projectContextId ?? readProjectContextId(input.card) ?? null;
+  const keys = input.card ? boardCardKeys(input.card) : issueRequestKeys(input.requestKey, resolvedProjectContextId);
+  const live = valueMatchingProjectContext(liveIssueByKeys(input.sourceIndex, keys), resolvedProjectContextId);
+  const workspace = valueMatchingProjectContext(workspaceByKeys(input.sourceIndex, keys), resolvedProjectContextId);
+  const runs = runsByKeys(input.sourceIndex, keys).filter((run) => matchesProjectContext(run, resolvedProjectContextId));
+  const latestRun = runs.at(-1) ?? null;
+  const rawLifecycle = valueMatchingProjectContext(lifecycleByKeys(input.sourceIndex, keys), resolvedProjectContextId);
   const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
   if (!input.card && !live && !workspace && !latestRun && !lifecycle) return null;
 
   const issueKey = input.card?.issueIdentifier ?? input.card?.issueId ?? input.requestKey;
   const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore, input.sourceIndex.runs);
-  const runs = runsByKeys(input.sourceIndex, keys);
   const enrichedRuns = await Promise.all(
     runs.map(async (run) => ({
       ...publicRunRecord(run),
@@ -5084,17 +5092,45 @@ function issueRequestKeys(issueId: string, projectContextId: string | null | und
 
 function readProjectContextId(value: unknown): string | null {
   if (!value || typeof value !== "object") return null;
-  const record = value as { projectContextId?: unknown; issueDetails?: { projectContextId?: unknown } | null };
-  const direct = typeof record.projectContextId === "string" ? record.projectContextId.trim() : "";
-  if (direct.length > 0) return direct;
-  const nested = typeof record.issueDetails?.projectContextId === "string" ? record.issueDetails.projectContextId.trim() : "";
-  return nested.length > 0 ? nested : null;
+  const record = value as {
+    projectContextId?: unknown;
+    issue?: { projectContextId?: unknown } | null;
+    workspace?: { projectContextId?: unknown } | null;
+    latestRun?: { projectContextId?: unknown } | null;
+    issueDetails?: {
+      projectContextId?: unknown;
+      issue?: { projectContextId?: unknown } | null;
+      workspace?: { projectContextId?: unknown } | null;
+      latestRun?: { projectContextId?: unknown } | null;
+    } | null;
+  };
+  const candidates = [
+    record.projectContextId,
+    record.issue?.projectContextId,
+    record.workspace?.projectContextId,
+    record.latestRun?.projectContextId,
+    record.issueDetails?.projectContextId,
+    record.issueDetails?.issue?.projectContextId,
+    record.issueDetails?.workspace?.projectContextId,
+    record.issueDetails?.latestRun?.projectContextId,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (trimmed.length > 0) return trimmed;
+  }
+  return null;
 }
 
 function matchesProjectContext(value: unknown, projectContextId: string | null | undefined): boolean {
   const requested = projectContextId?.trim();
   if (!requested) return true;
   return readProjectContextId(value) === requested;
+}
+
+function valueMatchingProjectContext<T>(value: T | null, projectContextId: string | null | undefined): T | null {
+  if (!value) return null;
+  return matchesProjectContext(value, projectContextId) ? value : null;
 }
 
 function parsePositiveIntegerQueryParam(searchParams: URLSearchParams, name: string, defaultValue: number, maxValue: number): number {

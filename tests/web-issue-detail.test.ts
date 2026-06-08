@@ -2,14 +2,19 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { StatusServer } from "../src/app/http.js";
+import { StatusServer, type StatusServerProjectionReader } from "../src/app/http.js";
 import {
   projectWebIssueDetail,
   type BoardIssueDetailProjectionInput,
   type IssueBoardCardProjectionInput,
+  type WebIssueBoardModel,
 } from "../src/app/webProjection.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import {
+  type ProjectionPayloadRecord,
+  type ProjectionRevisionSelector,
+} from "../src/core/persistence/ProjectionTransactionService.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore, type RunRecord, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
@@ -241,6 +246,57 @@ function transcriptEvent(overrides: Partial<TranscriptEvent> = {}): TranscriptEv
       result: "read_file result",
     },
     ...overrides,
+  };
+}
+
+function responseTranscriptMessages(transcript: unknown): unknown[] {
+  return typeof transcript === "object" && transcript !== null && "messages" in transcript
+    ? ((transcript as { messages?: unknown[] }).messages ?? [])
+    : ((transcript as unknown[]) ?? []);
+}
+
+function projectionPayloadRecord<TPayload>(
+  selector: ProjectionRevisionSelector,
+  payload: TPayload,
+  sourceRevisions: ProjectionPayloadRecord["revision"]["sourceRevisions"] = [],
+): ProjectionPayloadRecord<TPayload> {
+  const generatedAt = "2026-01-01T00:00:00.000Z";
+  return {
+    revision: {
+      projectionRevisionId: "test-projection-revision",
+      projectionName: selector.projectionName,
+      scopeKind: selector.scopeKind ?? "global",
+      scopeKey: selector.scopeKey ?? "global",
+      revision: 1,
+      buildMode: "bootstrap",
+      sourceRevisions,
+      sourceCursors: {},
+      sourceFreshness: [],
+      contentSha256: null,
+      generatedAt,
+      expiresAt: null,
+      supersededAt: null,
+      createdAt: generatedAt,
+    },
+    payload,
+    payloadSha256: null,
+    rawPayloadRefs: [],
+    generatedAt,
+    expiresAt: null,
+  };
+}
+
+function durableIssueBoardProjectionReader(
+  payload: WebIssueBoardModel,
+  sourceRevisions: ProjectionPayloadRecord["revision"]["sourceRevisions"] = [],
+): StatusServerProjectionReader {
+  return {
+    async readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null> {
+      if (selector.projectionName !== "issue_board_projection") return null;
+      if ((selector.scopeKind ?? "board") !== "board") return null;
+      if ((selector.scopeKey ?? "default-board") !== "default-board") return null;
+      return projectionPayloadRecord(selector, payload as TPayload, sourceRevisions);
+    },
   };
 }
 
@@ -719,6 +775,276 @@ describe("GET /api/v1/web/issues/:issueId", () => {
       expect(cappedTranscriptBody.transcript).toContainEqual(
         expect.objectContaining({ kind: "assistant", text: "latest transcript event" }),
       );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps live web issue detail runs and transcript scoped to the requested project context", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const tracker = new FakeTracker([
+      trackerIssue({
+        id: "issue-docs",
+        identifier: "TEST-CTX",
+        title: "Docs tracker title",
+        description: "Docs tracker detail.",
+        state: "In Progress",
+        projectContextId: "docs",
+        projectContextLabel: "Docs",
+        trackerProjectSlug: "DOCS",
+      }),
+    ]);
+    await runStore.startRun({
+      runId: "run-a-docs",
+      sessionId: "session-docs",
+      agentId: "agent-docs",
+      role: "worker",
+      issueId: "issue-docs",
+      issueIdentifier: "TEST-CTX",
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      trackerProjectSlug: "DOCS",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      cursorModel: "gpt-5-test",
+      workspaceKey: "docs/TEST-CTX",
+      workspacePath: path.join(config.workspace.root, "docs-TEST-CTX"),
+      gitBranchName: "symphony/docs/TEST-CTX",
+      repoPath: "/repo-docs",
+      baseRef: "main",
+    });
+    await runStore.startRun({
+      runId: "run-z-app",
+      sessionId: "session-app",
+      agentId: "agent-app",
+      role: "worker",
+      issueId: "issue-app",
+      issueIdentifier: "TEST-CTX",
+      projectContextId: "app",
+      projectContextLabel: "App",
+      trackerProjectSlug: "APP",
+      attempt: null,
+      turnNumber: 2,
+      prompt: "app work",
+      cursorModel: "gpt-5-test",
+      workspaceKey: "app/TEST-CTX",
+      workspacePath: path.join(config.workspace.root, "app-TEST-CTX"),
+      gitBranchName: "symphony/app/TEST-CTX",
+      repoPath: "/repo-app",
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: "run-a-docs",
+      at: "2026-01-01T00:03:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "docs transcript event",
+    });
+    await runStore.appendEvent({
+      runId: "run-z-app",
+      at: "2026-01-01T00:04:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "app transcript event",
+    });
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      tracker,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(
+        `http://${address.host}:${address.port}/api/v1/web/issues/TEST-CTX?projectContextId=docs&includeTranscript=1`,
+      );
+      const body = (await response.json()) as {
+        issue: { projectContextId: string | null; title: string; trackerProjectSlug?: string | null };
+        runs: Array<{ id: string; issue: string }>;
+        transcript: unknown;
+      };
+      const transcriptMessages = responseTranscriptMessages(body.transcript);
+      const transcriptJson = JSON.stringify(transcriptMessages);
+
+      expect(response.status).toBe(200);
+      expect(body.issue).toMatchObject({
+        projectContextId: "docs",
+        title: "Docs tracker title",
+        trackerProjectSlug: "DOCS",
+      });
+      expect(body.runs).toEqual([
+        expect.objectContaining({ id: "session-docs", issue: "TEST-CTX" }),
+      ]);
+      expect(body.runs.map((run) => run.id)).not.toContain("session-app");
+      expect(transcriptJson).toContain("docs transcript event");
+      expect(transcriptJson).not.toContain("app transcript event");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps durable web issue detail runs and transcript scoped to the requested project context", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const durableBoard: WebIssueBoardModel = {
+      issues: [
+        {
+          id: "TEST-CTX",
+          title: "Docs durable title",
+          status: "progress",
+          priority: 1,
+          labels: ["docs"],
+          assignee: "docs-user",
+          agent: "agent-docs",
+          project: "/repo-docs",
+          projectContextId: "docs",
+          projectContextLabel: "Docs",
+          trackerProjectSlug: "DOCS",
+          cycle: "",
+          activity: [],
+          pr: null,
+          ci: null,
+          workspace: path.join(config.workspace.root, "docs-TEST-CTX"),
+          session: "session-docs",
+          desc: ["Docs durable detail."],
+        },
+        {
+          id: "TEST-CTX",
+          title: "App durable title",
+          status: "progress",
+          priority: 1,
+          labels: ["app"],
+          assignee: "app-user",
+          agent: "agent-app",
+          project: "/repo-app",
+          projectContextId: "app",
+          projectContextLabel: "App",
+          trackerProjectSlug: "APP",
+          cycle: "",
+          activity: [],
+          pr: null,
+          ci: null,
+          workspace: path.join(config.workspace.root, "app-TEST-CTX"),
+          session: "session-app",
+          desc: ["App durable detail."],
+        },
+      ],
+      backlog: [],
+      lanes: { todo: [], progress: [], review: [] },
+      cycleLabel: "",
+      cycleDateRange: "",
+      selectedIssueId: "TEST-CTX",
+    };
+    await runStore.startRun({
+      runId: "run-a-docs",
+      sessionId: "session-docs",
+      agentId: "agent-docs",
+      role: "worker",
+      issueId: "issue-docs",
+      issueIdentifier: "TEST-CTX",
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      trackerProjectSlug: "DOCS",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      cursorModel: "gpt-5-test",
+      workspaceKey: "docs/TEST-CTX",
+      workspacePath: path.join(config.workspace.root, "docs-TEST-CTX"),
+      gitBranchName: "symphony/docs/TEST-CTX",
+      repoPath: "/repo-docs",
+      baseRef: "main",
+    });
+    await runStore.startRun({
+      runId: "run-z-app",
+      sessionId: "session-app",
+      agentId: "agent-app",
+      role: "worker",
+      issueId: "issue-app",
+      issueIdentifier: "TEST-CTX",
+      projectContextId: "app",
+      projectContextLabel: "App",
+      trackerProjectSlug: "APP",
+      attempt: null,
+      turnNumber: 2,
+      prompt: "app work",
+      cursorModel: "gpt-5-test",
+      workspaceKey: "app/TEST-CTX",
+      workspacePath: path.join(config.workspace.root, "app-TEST-CTX"),
+      gitBranchName: "symphony/app/TEST-CTX",
+      repoPath: "/repo-app",
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: "run-a-docs",
+      at: "2026-01-01T00:03:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "docs durable transcript event",
+    });
+    await runStore.appendEvent({
+      runId: "run-z-app",
+      at: "2026-01-01T00:04:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "app durable transcript event",
+    });
+    const durableSourceRevisions: ProjectionPayloadRecord["revision"]["sourceRevisions"] = [
+      { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+      { source: "lifecycleStore", revision: lifecycleStore.projectionRevision(), observedAt: null },
+    ];
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      projectionReader: durableIssueBoardProjectionReader(durableBoard, durableSourceRevisions),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(
+        `http://${address.host}:${address.port}/api/v1/web/issues/TEST-CTX?projectContextId=docs&includeTranscript=1`,
+      );
+      const body = (await response.json()) as {
+        issue: { projectContextId: string | null; title: string; trackerProjectSlug?: string | null };
+        runs: Array<{ id: string; issue: string }>;
+        transcript: unknown;
+      };
+      const transcriptMessages = responseTranscriptMessages(body.transcript);
+      const transcriptJson = JSON.stringify(transcriptMessages);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(body.issue).toMatchObject({
+        projectContextId: "docs",
+        title: "Docs durable title",
+        trackerProjectSlug: "DOCS",
+      });
+      expect(body.runs).toEqual([
+        expect.objectContaining({ id: "session-docs", issue: "TEST-CTX" }),
+      ]);
+      expect(body.runs.map((run) => run.id)).not.toContain("session-app");
+      expect(transcriptJson).toContain("docs durable transcript event");
+      expect(transcriptJson).not.toContain("app durable transcript event");
     } finally {
       await server.stop();
     }
