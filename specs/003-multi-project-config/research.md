@@ -85,6 +85,7 @@ Current single-project assumptions that downstream multi-project work must unwin
 Protected-surface constraints for downstream implementation:
 
 - Project-context resolution, workspace selection, writeback targeting, lifecycle transitions, and MCP handoff validation remain Symphony-owned service decisions; agents only receive already-resolved metadata.
+- The credential boundary, operator-controlled secret stores, runtime credentials, profile contents, and other private access material remain out of scope for this feature unless a later plan explicitly ratifies a protected-surface change.
 - Existing dirty workspaces, protected branches, and external Linear/GitHub project state remain out of scope for this feature unless a later plan explicitly ratifies a protected-surface change.
 - `hermes/upstream-src/**` does not require changes for this feature. Phase 1 inventory found no setup or routing prerequisite that depends on modifying vendored Hermes sources.
 
