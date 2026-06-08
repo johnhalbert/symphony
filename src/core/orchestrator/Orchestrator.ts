@@ -4251,6 +4251,7 @@ function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {
     assignedToWorker: false,
     labels: [],
     blockedBy: [],
+    ...issueProjectContextFields(request.projectContextId, request.projectContextLabel),
     createdAt: null,
     updatedAt: null,
   };
@@ -4280,8 +4281,19 @@ function issueFromPendingPublicationLifecycle(lifecycle: IssueLifecycleRecord, s
     assignedToWorker: false,
     labels: [],
     blockedBy: [],
+    ...issueProjectContextFields(
+      lifecycle.projectContextId ?? lifecycle.summaryPointers.projectContextId,
+      lifecycle.projectContextLabel ?? lifecycle.summaryPointers.projectContextLabel,
+    ),
     createdAt: null,
     updatedAt: null,
+  };
+}
+
+function issueProjectContextFields(projectContextId: string | undefined, projectContextLabel: string | null | undefined) {
+  return {
+    ...(projectContextId === undefined ? {} : { projectContextId }),
+    ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
   };
 }
 

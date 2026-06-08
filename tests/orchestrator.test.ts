@@ -3930,8 +3930,13 @@ describe("Orchestrator", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
-    let currentState = "Blocked";
+    const candidate = issue({
+      state: "Blocked",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -3940,15 +3945,13 @@ describe("Orchestrator", () => {
         return [];
       },
       async fetchIssueStatesByIds() {
-        return [{ ...candidate, state: currentState }];
+        return [];
       },
     };
     const logger = new StructuredLogger(() => undefined);
     const stateDir = config.workspace.stateDir;
     const outboxStore = new FileWritebackOutboxStore(stateDir);
-    const writer = new StateChangingWriter((state) => {
-      currentState = state;
-    });
+    const writer = new StateChangingWriter(() => undefined);
     const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
@@ -3994,9 +3997,24 @@ describe("Orchestrator", () => {
     expect(writer.comments[0]?.body).not.toContain("Publication Approval Not Completed");
     expect(writer.transitions).toHaveLength(1);
     expect(writer.transitions[0]).toMatchObject({ toState: "In Review" });
+    const recoveryOperations = (await outboxStore.list()).filter(
+      (record) => record.runId === "run-1" && record.idempotencyKey.includes("completion-report:idem-1"),
+    );
+    expect(recoveryOperations).toHaveLength(2);
+    expect(
+      recoveryOperations.every(
+        (record) =>
+          record.status === "succeeded" &&
+          record.projectContextId === "docs" &&
+          record.projectContextLabel === "Documentation Site" &&
+          record.idempotencyKey.startsWith("project-context:docs:"),
+      ),
+    ).toBe(true);
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       phase: "review",
       blockedReason: null,
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
       completionReports: [
         expect.objectContaining({
           runId: "run-1",
@@ -4034,7 +4052,13 @@ describe("Orchestrator", () => {
       config.github.repo = "symphony";
       config.github.token = "github-token";
       config.workspace.source.baseRef = "main";
-      const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+      const candidate = issue({
+        state: "Blocked",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/TEST-1",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      });
       const tracker: TrackerClient = {
         async fetchCandidateIssues() {
           return [];
@@ -4043,7 +4067,7 @@ describe("Orchestrator", () => {
           return [];
         },
         async fetchIssueStatesByIds() {
-          return [candidate];
+          return [];
         },
       };
       const logger = new StructuredLogger(() => undefined);
@@ -4078,9 +4102,21 @@ describe("Orchestrator", () => {
       expect(writer.comments[0]?.body).toContain(`Reason: ${staleReason}`);
       expect(writer.comments[0]?.body).toContain("The worker completion report remains stored");
       expect(writer.transitions).toEqual([]);
+      const recoveryOperations = (await outboxStore.list()).filter(
+        (record) => record.runId === "run-1" && record.idempotencyKey.includes(`publication-approval-${status}`),
+      );
+      expect(recoveryOperations).toHaveLength(1);
+      expect(recoveryOperations[0]).toMatchObject({
+        status: "succeeded",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      });
+      expect(recoveryOperations[0]?.idempotencyKey.startsWith("project-context:docs:")).toBe(true);
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "blocked",
         blockedReason: `publication approval ${status}`,
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
       });
     },
   );
@@ -6500,6 +6536,8 @@ function approvalRecordFor(
     resolvedBy: status === "approved" || status === "rejected" ? "operator" : status === "pending" ? null : "system",
     decision: status === "approved" ? "approve" : status === "rejected" ? "reject" : null,
     staleReason,
+    ...(candidate.projectContextId === undefined ? {} : { projectContextId: candidate.projectContextId }),
+    ...(candidate.projectContextLabel === undefined ? {} : { projectContextLabel: candidate.projectContextLabel }),
   };
 }
 

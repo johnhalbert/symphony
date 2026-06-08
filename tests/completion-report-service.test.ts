@@ -593,7 +593,21 @@ describe("CompletionReportService", () => {
 
     expect(processedKeyBatches).toHaveLength(1);
     expect(processedKeyBatches[0]).not.toContain(siblingKey);
-    expect(processedKeyBatches[0]?.every((key) => key.includes("completion-report:idem-1"))).toBe(true);
+    expect(
+      processedKeyBatches[0]?.every(
+        (key) => key.includes("completion-report:idem-1") && key.startsWith("project-context:docs:"),
+      ),
+    ).toBe(true);
+    const processedRecords = await Promise.all((processedKeyBatches[0] ?? []).map((key) => outbox.get(key)));
+    expect(
+      processedRecords.every(
+        (record) =>
+          record !== null &&
+          record.status === "succeeded" &&
+          record.projectContextId === "docs" &&
+          record.projectContextLabel === "Documentation Site",
+      ),
+    ).toBe(true);
     await expect(outbox.get(siblingKey)).resolves.toMatchObject({ status: "pending" });
   });
 

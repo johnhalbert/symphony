@@ -355,15 +355,11 @@ export class CompletionReportService {
     }
 
     const report = completionReportInputFromRecord(existing);
-    const context: CompletionReportActiveContext = {
+    const context = publicationApprovalRecoveryContext({
       issue: input.issue,
-      activeRunId: input.approval.runId,
-      role: "worker",
-      sessionId: null,
-      workspacePath: input.approval.action.workspacePath,
-      workspace: workspaceFromApproval(input.approval, lifecycle),
-      phase: "blocked",
-    };
+      approval: input.approval,
+      lifecycle,
+    });
     const publicationInput = this.buildPublicationInput(report, context, lifecycle);
     const publication = await this.options.pullRequestPublisher.publishPullRequest(publicationInput);
     const result = await this.finalizeCompletionReport({
@@ -400,15 +396,11 @@ export class CompletionReportService {
     }
 
     const report = completionReportInputFromRecord(existing);
-    const context: CompletionReportActiveContext = {
+    const context = publicationApprovalRecoveryContext({
       issue: input.issue,
-      activeRunId: input.approval.runId,
-      role: "worker",
-      sessionId: null,
-      workspacePath: input.approval.action.workspacePath,
-      workspace: workspaceFromApproval(input.approval, lifecycle),
-      phase: "blocked",
-    };
+      approval: input.approval,
+      lifecycle,
+    });
     return this.enqueuePublicationApprovalTerminal(input.approval, report, context, existing.pullRequest);
   }
 
@@ -490,14 +482,14 @@ export class CompletionReportService {
       return { recovered: true, approvalRequest, report: pendingReport, outcome: "pending" };
     }
     if (approvalRequest.status === "approved") {
-      const result = await this.resumeApprovedPublication({ approval: approvalRequest, issue: input.issue });
+      const result = await this.resumeApprovedPublication({ approval: approvalRequest, issue: context.issue });
       if (!result) {
         return { recovered: false, reason: "approval_not_pending", report: pendingReport };
       }
       return { recovered: true, report: pendingReport, outcome: "approved" };
     }
     if (isTerminalApprovalStatus(approvalRequest.status)) {
-      await this.recordPublicationApprovalTerminal({ approval: approvalRequest, issue: input.issue });
+      await this.recordPublicationApprovalTerminal({ approval: approvalRequest, issue: context.issue });
       return { recovered: true, report: pendingReport, outcome: "terminal" };
     }
     return { recovered: false, reason: "approval_not_pending", report: pendingReport };
@@ -1135,6 +1127,30 @@ function recoveryContextFor(input: {
     workspacePath,
     workspace,
     phase: "implementation",
+  };
+}
+
+function publicationApprovalRecoveryContext(input: {
+  issue: Issue;
+  approval: OperatorApprovalRecord;
+  lifecycle: IssueLifecycleRecord;
+}): CompletionReportActiveContext {
+  const projectContext = mergeWritebackProjectContexts(
+    writebackProjectContextFromIssue(input.issue),
+    input.approval,
+    writebackProjectContextFromLifecycle(input.lifecycle),
+  );
+  return {
+    issue: {
+      ...input.issue,
+      ...projectContext,
+    },
+    activeRunId: input.approval.runId,
+    role: "worker",
+    sessionId: null,
+    workspacePath: input.approval.action.workspacePath,
+    workspace: workspaceFromApproval(input.approval, input.lifecycle),
+    phase: "blocked",
   };
 }
 
