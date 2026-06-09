@@ -67,6 +67,8 @@ describe("HermesHarness", () => {
     expect(reviewerOne.map((event) => event.type)).toContain("completed");
     expect(reviewerTwo.map((event) => event.type)).toContain("completed");
     expect(clients).toHaveLength(4);
+    expect(clients[0]?.requests.map((request) => request.method).slice(0, 2)).toEqual(["setup.status", "session.create"]);
+    expect(clients[1]?.requests.map((request) => request.method).slice(0, 2)).toEqual(["setup.status", "session.resume"]);
     expect(clients[0]?.requests.filter((request) => request.method === "session.create")).toHaveLength(1);
     expect(clients[1]?.requests).toContainEqual({
       method: "session.resume",
@@ -131,6 +133,34 @@ describe("HermesHarness", () => {
     await harness.dispose();
     expect(clients[0]?.killed).toContain("hermes.run_finished");
     expect(clients[1]?.killed).toContain("hermes.run_finished");
+  });
+
+  it("stops before creating a session when Hermes setup reports no provider configured", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const harness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
+          setupProviderConfigured: false,
+        });
+        clients.push(client);
+        return client;
+      },
+    });
+
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const events = await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "worker prompt"));
+
+    expect(events.map((event) => event.type)).toEqual(["run_diagnostic", "failed"]);
+    expect(clients[0]?.requests.map((request) => request.method)).toEqual(["setup.status"]);
+    expect(events.find((event) => event.type === "run_diagnostic")).toMatchObject({
+      code: "hermes_run_error",
+      message: expect.stringContaining("no provider configured"),
+    });
   });
 
   it("uses managed Hermes auth for openai-codex without injecting API-key credentials", async () => {
@@ -436,7 +466,7 @@ describe("HermesHarness", () => {
     const first = await iterator.next();
 
     expect(first.value?.type).toBe("session_started");
-    expect(clients[0]?.requests.map((request) => request.method)).toEqual(["session.create", "prompt.submit"]);
+    expect(clients[0]?.requests.map((request) => request.method)).toEqual(["setup.status", "session.create", "prompt.submit"]);
 
     const remaining: AgentEvent[] = [];
     for (;;) {
@@ -605,6 +635,7 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
       providerLimitOnPrompt?: Record<string, unknown>;
       eventsOnPrompt?: GatewayEvent[];
       completedSessionKey?: string;
+      setupProviderConfigured?: boolean;
     } = {},
   ) {
     super();
@@ -629,6 +660,7 @@ class FakeGatewayClient extends EventEmitter implements HermesGatewayClient {
   async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     if (this.closed) throw new Error("gateway exited (0)");
     this.requests.push({ method, params });
+    if (method === "setup.status") return { provider_configured: this.options.setupProviderConfigured ?? true } as T;
     if (method === "session.create") return { session_id: this.sessionId, session_key: `hermes-${this.sessionId}` } as T;
     if (method === "session.resume") {
       return {

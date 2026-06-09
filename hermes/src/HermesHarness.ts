@@ -57,6 +57,7 @@ interface HermesLease {
   gatewaySessionId: string | null;
   hermesSessionKey: string | null;
   gatewaySessionResumed: boolean;
+  gatewaySetupChecked: boolean;
   commandPolicyDecisionJournalPath: string | null;
   disposed: boolean;
 }
@@ -366,6 +367,7 @@ export class HermesHarness implements AgentHarness {
       gatewaySessionId: null,
       hermesSessionKey,
       gatewaySessionResumed: false,
+      gatewaySetupChecked: false,
       commandPolicyDecisionJournalPath: commandPolicyHookOptions?.decisionJournalPath ?? null,
       disposed: false,
     };
@@ -399,6 +401,8 @@ export class HermesHarness implements AgentHarness {
       throw new SymphonyError("agent_error", "Hermes gateway is closed");
     }
     if (lease.gatewaySessionId) return lease.gatewaySessionId;
+
+    await this.ensureGatewaySetup(lease);
 
     if (lease.reusable && lease.hermesSessionKey) {
       try {
@@ -438,6 +442,23 @@ export class HermesHarness implements AgentHarness {
       await this.rememberHermesSessionKey(lease, hermesSessionKey);
     }
     return gatewaySessionId;
+  }
+
+  private async ensureGatewaySetup(lease: HermesLease): Promise<void> {
+    if (lease.gatewaySetupChecked) return;
+    const response = await this.gatewayRequest<{ provider_configured?: unknown }>(
+      lease,
+      "setup.status",
+      {},
+      lease.startupTimeoutMs,
+    );
+    lease.gatewaySetupChecked = true;
+    if (response.provider_configured === false) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `Hermes setup.status reported no provider configured for profile ${lease.profile.profileKey}`,
+      );
+    }
   }
 
   async *runOperatorChat(ctx: OperatorChatRunContext, prompt: string): AsyncIterable<AgentEvent> {
@@ -484,6 +505,7 @@ export class HermesHarness implements AgentHarness {
     }
     lease.gatewaySessionId = null;
     lease.gatewaySessionResumed = false;
+    lease.gatewaySetupChecked = false;
     lease.client.kill(`hermes.${reason}`);
   }
 
@@ -492,6 +514,7 @@ export class HermesHarness implements AgentHarness {
     lease.disposed = true;
     lease.gatewaySessionId = null;
     lease.gatewaySessionResumed = false;
+    lease.gatewaySetupChecked = false;
     this.leases.delete(lease.key);
   }
 
@@ -500,6 +523,7 @@ export class HermesHarness implements AgentHarness {
     lease.disposed = true;
     lease.gatewaySessionId = null;
     lease.gatewaySessionResumed = false;
+    lease.gatewaySetupChecked = false;
     this.leases.delete(lease.key);
     lease.client.kill(`hermes.${reason}`);
   }
