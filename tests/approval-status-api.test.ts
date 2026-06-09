@@ -41,6 +41,12 @@ describe("approval status API", () => {
   let lifecycleStore: FileIssueLifecycleStore;
   let store: FileOperatorApprovalStore;
   let service: OperatorApprovalService;
+  const docsProjectContext = {
+    projectContextId: "docs",
+    projectContextLabel: "Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "candidate_poll",
+  } as const;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-approval-api-"));
@@ -59,6 +65,7 @@ describe("approval status API", () => {
       role: "worker",
       issueId: "issue-1",
       issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
       attempt: null,
       turnNumber: 1,
       prompt: "work",
@@ -102,6 +109,42 @@ describe("approval status API", () => {
       expect(approvedBody.request.status).toBe("approved");
       expect(issueBody.capabilities.pendingApproval.active).toBe(false);
       expect(resumed).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("includes project context on pending approval issue details and capability summaries", async () => {
+    const pending = await createPending("idem-project-context-capability");
+    const server = statusServer({});
+    const address = await server.start();
+
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-1`);
+      const body = (await response.json()) as {
+        capabilities: {
+          pendingApproval: {
+            active: boolean;
+            requestId: string | null;
+            projectContext: typeof docsProjectContext | null;
+          };
+        };
+        pendingApproval: {
+          requestId: string;
+          projectContext: typeof docsProjectContext;
+        } | null;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.capabilities.pendingApproval).toMatchObject({
+        active: true,
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+      expect(body.pendingApproval).toMatchObject({
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
     } finally {
       await server.stop();
     }

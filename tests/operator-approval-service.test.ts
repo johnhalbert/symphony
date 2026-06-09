@@ -23,6 +23,12 @@ describe("OperatorApprovalService", () => {
     linearProjectSlug: "DOCS",
     routingSource: "candidate_poll",
   } as const;
+  const symphonyProjectContext = {
+    projectContextId: "symphony",
+    projectContextLabel: "Symphony",
+    linearProjectSlug: "ENG",
+    routingSource: "candidate_poll",
+  } as const;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-operator-approval-"));
@@ -104,6 +110,53 @@ describe("OperatorApprovalService", () => {
 
     const transcript = await runStore.readTranscript("run-1");
     expect(transcript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
+  });
+
+  it("derives project context when creating a pending approval directly through the store", async () => {
+    const { record } = await store.requestOrGetPending({ ...request(), evidenceCursor: "idem-store-context" }, null);
+
+    expect(record.projectContext).toEqual(docsProjectContext);
+    await expect(store.get(record.requestId)).resolves.toMatchObject({ projectContext: docsProjectContext });
+  });
+
+  it("filters pending approvals by project context when issue identifiers collide", async () => {
+    await runStore.startRun({
+      runId: "run-2",
+      sessionId: "session-2",
+      agentId: "agent-2",
+      role: "worker",
+      issueId: "issue-2",
+      issueIdentifier: "TEST-1",
+      projectContext: symphonyProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace-2",
+    });
+
+    const { record: docsApproval } = await store.requestOrGetPending({ ...request(), evidenceCursor: "idem-docs-context-filter" }, null);
+    const { record: symphonyApproval } = await store.requestOrGetPending(
+      {
+        issueId: "issue-2",
+        issueIdentifier: "TEST-1",
+        runId: "run-2",
+        evidenceCursor: "idem-symphony-context-filter",
+        action: { ...action(), branchName: "symphony/TEST-1-symphony", workspacePath: "/tmp/workspace-2" },
+      },
+      null,
+    );
+
+    await expect(store.findPendingForIssue(["TEST-1"], docsProjectContext)).resolves.toMatchObject({
+      requestId: docsApproval.requestId,
+      issueId: "issue-1",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.findPendingForIssue(["TEST-1"], symphonyProjectContext)).resolves.toMatchObject({
+      requestId: symphonyApproval.requestId,
+      issueId: "issue-2",
+      projectContext: symphonyProjectContext,
+    });
   });
 
   it("repairs run metadata when reusing an existing pending approval", async () => {

@@ -1165,7 +1165,8 @@ export class StatusServer {
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
-        const pendingApprovalCandidate = await this.options.operatorApproval?.findPendingForIssue(keys);
+        const issueProjectContext = latestRun?.projectContext ?? lifecycle?.projectContext ?? workspace?.projectContext;
+        const pendingApprovalCandidate = await this.options.operatorApproval?.findPendingForIssue(keys, issueProjectContext);
         const pendingApproval = pendingApprovalCandidate
           ? await currentPendingPublicationApproval({
               approval: pendingApprovalCandidate,
@@ -4578,6 +4579,7 @@ function approvalCapability(
     requestId: record?.requestId ?? null,
     status: record?.status ?? null,
     action: record?.action ?? null,
+    projectContext: record?.projectContext ?? null,
     requestedAt: record?.requestedAt ?? null,
     resolve: record === null ? null : approvalResolve(record),
     requiresToken: approvalMutationsRequireToken(enabled, openWorkspaceToken),

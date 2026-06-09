@@ -65,10 +65,11 @@ export class FileOperatorApprovalStore {
   async requestOrGetPending(input: OperatorApprovalRequestInput, timeoutMs: number | null): Promise<{ record: OperatorApprovalRecord; created: boolean }> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
     const requestId = requestIdFor(dedupeKey(input.runId, input.evidenceCursor));
+    const projectContext = await this.resolveProjectContext(input.projectContext, input.runId);
     const existing = await this.get(requestId);
     if (existing) {
       return {
-        record: await this.backfillProjectContextOnReplay(existing, input.projectContext),
+        record: await this.backfillProjectContextOnReplay(existing, projectContext),
         created: false,
       };
     }
@@ -79,7 +80,7 @@ export class FileOperatorApprovalStore {
       status: "pending",
       issueId: input.issueId,
       issueIdentifier: input.issueIdentifier,
-      projectContext: normalizeProjectContextResolution(input.projectContext),
+      projectContext,
       runId: input.runId,
       evidenceCursor: input.evidenceCursor,
       dedupeKey: dedupeKey(input.runId, input.evidenceCursor),
@@ -109,12 +110,17 @@ export class FileOperatorApprovalStore {
     return latestPending(records.filter((record) => record.runId === runId));
   }
 
-  async findPendingForIssue(keys: string[]): Promise<OperatorApprovalRecord | null> {
+  async findPendingForIssue(
+    keys: string[],
+    projectContext: ProjectContextResolution | undefined = undefined,
+  ): Promise<OperatorApprovalRecord | null> {
     const normalized = new Set(keys.map((key) => key.toLowerCase()));
     const records = await this.list();
     return latestPending(
       records.filter(
-        (record) => normalized.has(record.issueId.toLowerCase()) || normalized.has(record.issueIdentifier.toLowerCase()),
+        (record) =>
+          (normalized.has(record.issueId.toLowerCase()) || normalized.has(record.issueIdentifier.toLowerCase())) &&
+          matchesProjectContext(record.projectContext, projectContext),
       ),
     );
   }
@@ -228,6 +234,16 @@ export class FileOperatorApprovalStore {
       path.join(this.stateDir, "runs", safeFileName(runId), "meta.json"),
     );
     return run?.projectContext;
+  }
+
+  private async resolveProjectContext(
+    projectContext: ProjectContextResolution | undefined,
+    runId: string,
+  ): Promise<ProjectContextResolution> {
+    if (projectContext) {
+      return normalizeProjectContextResolution(projectContext);
+    }
+    return normalizeProjectContextResolution(await this.readRunProjectContext(runId));
   }
 
   private async write(record: OperatorApprovalRecord): Promise<void> {
@@ -348,8 +364,11 @@ export class OperatorApprovalService {
     return this.options.store.findPendingForRun(runId);
   }
 
-  async findPendingForIssue(keys: string[]): Promise<OperatorApprovalRecord | null> {
-    return this.options.store.findPendingForIssue(keys);
+  async findPendingForIssue(
+    keys: string[],
+    projectContext: ProjectContextResolution | undefined = undefined,
+  ): Promise<OperatorApprovalRecord | null> {
+    return this.options.store.findPendingForIssue(keys, projectContext);
   }
 
   isRequired(): boolean {
@@ -546,6 +565,21 @@ function normalizeOperatorApprovalRecord(record: OperatorApprovalRecord): Operat
 
 function needsProjectContextBackfill(record: Record<string, unknown> | null): boolean {
   return record !== null && (!Object.prototype.hasOwnProperty.call(record, "projectContext") || record.projectContext === null);
+}
+
+function matchesProjectContext(
+  recordProjectContext: ProjectContextResolution | undefined,
+  expectedProjectContext: ProjectContextResolution | undefined,
+): boolean {
+  if (!expectedProjectContext) return true;
+  const normalizedRecord = normalizeProjectContextResolution(recordProjectContext);
+  const normalizedExpected = normalizeProjectContextResolution(expectedProjectContext);
+  return (
+    normalizedRecord.projectContextId === normalizedExpected.projectContextId &&
+    normalizedRecord.projectContextLabel === normalizedExpected.projectContextLabel &&
+    normalizedRecord.linearProjectSlug === normalizedExpected.linearProjectSlug &&
+    normalizedRecord.routingSource === normalizedExpected.routingSource
+  );
 }
 
 function dedupeKey(runId: string, evidenceCursor: string): string {
