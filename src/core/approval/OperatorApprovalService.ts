@@ -65,10 +65,11 @@ export class FileOperatorApprovalStore {
   async requestOrGetPending(input: OperatorApprovalRequestInput, timeoutMs: number | null): Promise<{ record: OperatorApprovalRecord; created: boolean }> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
     const requestId = requestIdFor(dedupeKey(input.runId, input.evidenceCursor));
+    const projectContext = await this.resolveProjectContext(input.projectContext, input.runId);
     const existing = await this.get(requestId);
     if (existing) {
       return {
-        record: await this.backfillProjectContextOnReplay(existing, input.projectContext),
+        record: await this.backfillProjectContextOnReplay(existing, projectContext),
         created: false,
       };
     }
@@ -79,7 +80,7 @@ export class FileOperatorApprovalStore {
       status: "pending",
       issueId: input.issueId,
       issueIdentifier: input.issueIdentifier,
-      projectContext: normalizeProjectContextResolution(input.projectContext),
+      projectContext,
       runId: input.runId,
       evidenceCursor: input.evidenceCursor,
       dedupeKey: dedupeKey(input.runId, input.evidenceCursor),
@@ -97,7 +98,12 @@ export class FileOperatorApprovalStore {
 
   async get(requestId: string): Promise<OperatorApprovalRecord | null> {
     const record = await readJsonIfExists<OperatorApprovalRecord>(this.recordPath(requestId));
-    return record === null ? null : normalizeOperatorApprovalRecord(record);
+    if (record === null) return null;
+    return this.repairProjectContextIfMissing(
+      normalizeOperatorApprovalRecord(record),
+      undefined,
+      record as unknown as Record<string, unknown>,
+    );
   }
 
   async getByDedupe(runId: string, evidenceCursor: string): Promise<OperatorApprovalRecord | null> {
@@ -109,12 +115,17 @@ export class FileOperatorApprovalStore {
     return latestPending(records.filter((record) => record.runId === runId));
   }
 
-  async findPendingForIssue(keys: string[]): Promise<OperatorApprovalRecord | null> {
+  async findPendingForIssue(
+    keys: string[],
+    projectContext: ProjectContextResolution | undefined = undefined,
+  ): Promise<OperatorApprovalRecord | null> {
     const normalized = new Set(keys.map((key) => key.toLowerCase()));
     const records = await this.list();
     return latestPending(
       records.filter(
-        (record) => normalized.has(record.issueId.toLowerCase()) || normalized.has(record.issueIdentifier.toLowerCase()),
+        (record) =>
+          (normalized.has(record.issueId.toLowerCase()) || normalized.has(record.issueIdentifier.toLowerCase())) &&
+          matchesProjectContext(record.projectContext, projectContext),
       ),
     );
   }
@@ -126,7 +137,17 @@ export class FileOperatorApprovalStore {
       const records = await Promise.all(
         entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<OperatorApprovalRecord>(path.join(this.recordsDir(), entry))),
       );
-      return records.filter((record): record is OperatorApprovalRecord => record !== null).map(normalizeOperatorApprovalRecord);
+      return Promise.all(
+        records
+          .filter((record): record is OperatorApprovalRecord => record !== null)
+          .map((record) =>
+            this.repairProjectContextIfMissing(
+              normalizeOperatorApprovalRecord(record),
+              undefined,
+              record as unknown as Record<string, unknown>,
+            ),
+          ),
+      );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
@@ -211,8 +232,9 @@ export class FileOperatorApprovalStore {
   private async repairProjectContextIfMissing(
     existing: OperatorApprovalRecord,
     projectContext: ProjectContextResolution | undefined = undefined,
+    rawRecord: Record<string, unknown> | null | undefined = undefined,
   ): Promise<OperatorApprovalRecord> {
-    const raw = await this.readStoredRecord(existing.requestId);
+    const raw = rawRecord ?? (await this.readStoredRecord(existing.requestId));
     if (!needsProjectContextBackfill(raw)) return existing;
     const runProjectContext = projectContext ?? (await this.readRunProjectContext(existing.runId));
     const repaired = normalizeOperatorApprovalRecord({
@@ -228,6 +250,16 @@ export class FileOperatorApprovalStore {
       path.join(this.stateDir, "runs", safeFileName(runId), "meta.json"),
     );
     return run?.projectContext;
+  }
+
+  private async resolveProjectContext(
+    projectContext: ProjectContextResolution | undefined,
+    runId: string,
+  ): Promise<ProjectContextResolution> {
+    if (projectContext) {
+      return normalizeProjectContextResolution(projectContext);
+    }
+    return normalizeProjectContextResolution(await this.readRunProjectContext(runId));
   }
 
   private async write(record: OperatorApprovalRecord): Promise<void> {
@@ -348,8 +380,11 @@ export class OperatorApprovalService {
     return this.options.store.findPendingForRun(runId);
   }
 
-  async findPendingForIssue(keys: string[]): Promise<OperatorApprovalRecord | null> {
-    return this.options.store.findPendingForIssue(keys);
+  async findPendingForIssue(
+    keys: string[],
+    projectContext: ProjectContextResolution | undefined = undefined,
+  ): Promise<OperatorApprovalRecord | null> {
+    return this.options.store.findPendingForIssue(keys, projectContext);
   }
 
   isRequired(): boolean {
@@ -546,6 +581,14 @@ function normalizeOperatorApprovalRecord(record: OperatorApprovalRecord): Operat
 
 function needsProjectContextBackfill(record: Record<string, unknown> | null): boolean {
   return record !== null && (!Object.prototype.hasOwnProperty.call(record, "projectContext") || record.projectContext === null);
+}
+
+function matchesProjectContext(
+  recordProjectContext: ProjectContextResolution | undefined,
+  expectedProjectContext: ProjectContextResolution | undefined,
+): boolean {
+  if (!expectedProjectContext) return true;
+  return normalizeProjectContextResolution(recordProjectContext).projectContextId === normalizeProjectContextResolution(expectedProjectContext).projectContextId;
 }
 
 function dedupeKey(runId: string, evidenceCursor: string): string {

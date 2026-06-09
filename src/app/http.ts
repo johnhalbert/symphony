@@ -5,6 +5,7 @@ import { constants as fsConstants, promises as fs, type Stats } from "node:fs";
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
+import { projectContextResolutionFromIssue } from "../core/config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
   projectActivityModels,
@@ -1165,7 +1166,8 @@ export class StatusServer {
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
-        const pendingApprovalCandidate = await this.options.operatorApproval?.findPendingForIssue(keys);
+        const issueProjectContext = lifecycle?.projectContext ?? workspace?.projectContext ?? projectContextResolutionFromIssue(live) ?? latestRun?.projectContext;
+        const pendingApprovalCandidate = await this.options.operatorApproval?.findPendingForIssue(keys, issueProjectContext);
         const pendingApproval = pendingApprovalCandidate
           ? await currentPendingPublicationApproval({
               approval: pendingApprovalCandidate,
@@ -4578,6 +4580,7 @@ function approvalCapability(
     requestId: record?.requestId ?? null,
     status: record?.status ?? null,
     action: record?.action ?? null,
+    projectContext: record?.projectContext ?? null,
     requestedAt: record?.requestedAt ?? null,
     resolve: record === null ? null : approvalResolve(record),
     requiresToken: approvalMutationsRequireToken(enabled, openWorkspaceToken),
