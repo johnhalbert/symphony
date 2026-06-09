@@ -2733,15 +2733,22 @@ export class Orchestrator {
     attempt: number | null,
     turnNumber: number,
   ) {
+    const contextId = entry.issue.projectContextId;
+    const config =
+      contextId &&
+      contextId !== this.config.projectContexts.defaultContextId &&
+      this.config.projectContexts.byId.has(contextId)
+        ? serviceConfigForProjectContext(this.config, contextId)
+        : this.config;
     return {
       issue: entry.issue,
       role: entry.role,
       runPhase: entry.runPhase,
       attempt,
       workspace,
-      config: this.config,
+      config,
       turnNumber,
-      ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: this.config.issueBreakdown.cursorMode } : {}),
+      ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: config.issueBreakdown.cursorMode } : {}),
       abortSignal: entry.abortController.signal,
       logger: this.options.logger,
     };

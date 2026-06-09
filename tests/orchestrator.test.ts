@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,6 +22,14 @@ import {
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
+import {
+  completionReportContextFilePath,
+  issueBreakdownPlanContextFilePath,
+  reviewFeedbackContextFilePath,
+  reviewVerdictContextFilePath,
+  transcriptRecallContextFilePath,
+  writeInitialHandoffMcpContexts,
+} from "../src/core/harness/HandoffMcp.js";
 import type {
   AgentEvent,
   AgentHarness,
@@ -830,6 +838,132 @@ describe("Orchestrator", () => {
       runKind: "implementation",
     });
   }, 10_000);
+
+  it("writes docs-context issue-breakdown MCP handoff files under the issue state dir", async () => {
+    const config = testConfig(root);
+    config.continuationContext.searchEnabled = true;
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    const docsStateDir = configureDocsProjectContext(config, root);
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(config.workspace.stateDir),
+      new StateChangingWriter(() => undefined),
+      logger,
+      300_000,
+    );
+    const harness = new HandoffContextHarness({ issueBreakdownLifecycleStore: new FileIssueLifecycleStore(docsStateDir) });
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "docs issue-breakdown dispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "docs issue-breakdown completion");
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    const ctx = harness.runs[0]?.ctx;
+    expect(ctx?.runPhase).toBe("issue_breakdown");
+    expect(harness.preparedContexts[0]?.config.workspace.stateDir).toBe(docsStateDir);
+    expect(ctx?.config.workspace.stateDir).toBe(docsStateDir);
+    await expect(readFile(issueBreakdownPlanContextFilePath(ctx!), "utf8")).resolves.toContain('"activeRunId": null');
+    await expect(readFile(transcriptRecallContextFilePath(ctx!), "utf8")).resolves.toContain('"phase": "issue_breakdown"');
+    await expect(
+      readFile(path.join(config.workspace.stateDir, "issue-breakdown-plan-mcp", `${candidate.id}-1.json`), "utf8"),
+    ).rejects.toThrow();
+    await expect(
+      readFile(path.join(config.workspace.stateDir, "transcript-recall-mcp", `${candidate.id}-worker-1.json`), "utf8"),
+    ).rejects.toThrow();
+  });
+
+  it("writes docs-context implementation MCP handoff files under the issue state dir", async () => {
+    const config = testConfig(root);
+    config.continuationContext.searchEnabled = true;
+    const docsStateDir = configureDocsProjectContext(config, root);
+    const candidate = issue({
+      state: "Todo",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new HandoffContextHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "docs implementation dispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "docs implementation completion");
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    const ctx = harness.runs[0]?.ctx;
+    expect(ctx?.runPhase).toBe("implementation");
+    expect(harness.preparedContexts[0]?.config.workspace.stateDir).toBe(docsStateDir);
+    expect(ctx?.config.workspace.stateDir).toBe(docsStateDir);
+    await expect(readFile(completionReportContextFilePath(ctx!), "utf8")).resolves.toContain('"activeRunId": null');
+    await expect(readFile(transcriptRecallContextFilePath(ctx!), "utf8")).resolves.toContain('"phase": "implementation"');
+    await expect(
+      readFile(path.join(config.workspace.stateDir, "completion-report-mcp", `${candidate.id}-1.json`), "utf8"),
+    ).rejects.toThrow();
+    await expect(
+      readFile(path.join(config.workspace.stateDir, "transcript-recall-mcp", `${candidate.id}-worker-1.json`), "utf8"),
+    ).rejects.toThrow();
+  });
 
   it("does not apply accepted issue breakdown plans during normal dispatch", async () => {
     const config = testConfig(root);
@@ -4434,6 +4568,108 @@ describe("Orchestrator", () => {
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 0 });
   });
 
+  it("writes docs-context reviewer MCP handoff files under the issue state dir", async () => {
+    const config = testConfig(root);
+    config.continuationContext.searchEnabled = true;
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }} as {{ role }}: {{ completionReport.summary }}";
+    const docsStateDir = configureDocsProjectContext(config, root);
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("In Review") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const docsLifecycleStore = new FileIssueLifecycleStore(docsStateDir);
+    const docsRunStore = new FileRunTranscriptStore(docsStateDir);
+    const report = completionReportRecord(candidate);
+    await docsLifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      summaryPointers: {
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+      },
+    });
+    await docsRunStore.startRun({
+      runId: report.runId,
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    await docsRunStore.appendEvent({
+      runId: report.runId,
+      at: "2026-01-01T00:00:02Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Implemented the reviewer dispatch lane.",
+    });
+    const harness = new HandoffContextHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "docs reviewer dispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "docs reviewer completion");
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    const ctx = harness.runs[0]?.ctx;
+    expect(ctx?.role).toBe("reviewer");
+    expect(harness.preparedContexts[0]?.config.workspace.stateDir).toBe(docsStateDir);
+    expect(ctx?.config.workspace.stateDir).toBe(docsStateDir);
+    await expect(readFile(reviewVerdictContextFilePath(ctx!), "utf8")).resolves.toContain('"activeRunId": null');
+    await expect(readFile(reviewFeedbackContextFilePath(ctx!), "utf8")).resolves.toContain('"activeRunId": null');
+    await expect(readFile(transcriptRecallContextFilePath(ctx!), "utf8")).resolves.toContain('"role": "reviewer"');
+    await expect(
+      readFile(path.join(config.workspace.stateDir, "review-verdict-mcp", `${candidate.id}-1.json`), "utf8"),
+    ).rejects.toThrow();
+    await expect(
+      readFile(path.join(config.workspace.stateDir, "review-feedback-mcp", `${candidate.id}-1.json`), "utf8"),
+    ).rejects.toThrow();
+    await expect(
+      readFile(path.join(config.workspace.stateDir, "transcript-recall-mcp", `${candidate.id}-reviewer-1.json`), "utf8"),
+    ).rejects.toThrow();
+  });
+
   it("instructs default reviewer prompts to leave PR feedback before verdict submission", async () => {
     const config = testConfig(root);
     config.tracker.handoffStates = ["In Review"];
@@ -7541,6 +7777,68 @@ class IssueBreakdownAcceptingHarness implements AgentHarness {
     yield { type: "session_started", sessionId: `${runId}-session`, runId };
     if (ctx.runPhase === "issue_breakdown") {
       await new IssueBreakdownPlanService({ config: ctx.config, lifecycleStore: this.lifecycleStore }).submit_issue_breakdown_plan(
+        {
+          runId,
+          issueId: ctx.issue.id,
+          idempotencyKey: `test-plan-${runId}`,
+          summary: "Break implementation into one task.",
+          proposedIssues: [
+            {
+              title: "Create implementation task",
+              description: agentEligibleIssueContract(),
+              acceptanceCriteria: ["Behavior is implemented and tested."],
+              dependencies: [],
+              labels: ["planning"],
+            },
+          ],
+        },
+        {
+          issue: ctx.issue,
+          activeRunId: runId,
+          role: "worker",
+          phase: "issue_breakdown",
+        },
+      );
+    }
+    yield { type: "completed" };
+  }
+}
+
+class HandoffContextHarness implements AgentHarness {
+  readonly id = "handoff-context";
+  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly preparedContexts: AgentRunContext[] = [];
+  readonly reloadedContexts: AgentRunContext[] = [];
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string; runId: string }> = [];
+
+  constructor(
+    private readonly options: {
+      issueBreakdownLifecycleStore?: FileIssueLifecycleStore;
+    } = {},
+  ) {}
+
+  async prepare(ctx: AgentRunContext): Promise<void> {
+    this.preparedContexts.push(ctx);
+    await writeInitialHandoffMcpContexts(ctx);
+  }
+
+  async reload(ctx: AgentRunContext): Promise<void> {
+    this.reloadedContexts.push(ctx);
+    await writeInitialHandoffMcpContexts(ctx);
+  }
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    const runId = `${ctx.runPhase ?? "implementation"}-handoff-context-${this.runs.length + 1}`;
+    this.runs.push({ ctx, prompt, runId });
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    if (ctx.runPhase === "issue_breakdown") {
+      if (!this.options.issueBreakdownLifecycleStore) {
+        throw new Error("issue breakdown lifecycle store is required for planning runs");
+      }
+      await new IssueBreakdownPlanService({
+        config: ctx.config,
+        lifecycleStore: this.options.issueBreakdownLifecycleStore,
+      }).submit_issue_breakdown_plan(
         {
           runId,
           issueId: ctx.issue.id,
