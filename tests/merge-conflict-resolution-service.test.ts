@@ -23,12 +23,13 @@ describe("MergeConflictResolutionService", () => {
 
     const result = await service.submit_merge_conflict_resolution(
       resolutionReport({ resolutionStatus: "resolved", headSha: "head-sha-2" }),
-      context(),
+      context({ projectContext: docsProjectContext }),
     );
 
     expect(result.replayed).toBe(false);
-    expect(result.report.resolutionStatus).toBe("resolved");
     expect(result.report).toMatchObject({
+      resolutionStatus: "resolved",
+      projectContext: docsProjectContext,
       previousHeadSha: "head-sha-1",
       newHeadSha: "head-sha-2",
       baseBranch: "main",
@@ -37,6 +38,7 @@ describe("MergeConflictResolutionService", () => {
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
       phase: "passed",
       blockedReason: null,
+      projectContext: docsProjectContext,
       summaryPointers: {
         prHeadSha: "head-sha-2",
         lastEvidenceCursor: "resolve-1",
@@ -55,6 +57,7 @@ describe("MergeConflictResolutionService", () => {
         {
           id: "merge-conflict-resolution:issue-1:resolve-1",
           resolutionStatus: "resolved",
+          projectContext: docsProjectContext,
         },
       ],
     });
@@ -263,3 +266,10 @@ function mergeConflictRecord(input: { fixTurnCount: number }) {
     blockedReason: null,
   };
 }
+
+const docsProjectContext = {
+  projectContextId: "docs-site",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;

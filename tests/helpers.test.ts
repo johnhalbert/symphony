@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { TrackerIssueFixture } from "./helpers.js";
+import { parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
+import type { TestMultiProjectWorkflowConfig, TrackerIssueFixture } from "./helpers.js";
 import {
   multiProjectWorkflowConfig,
+  multiProjectWorkflowDocument,
   projectContextFixture,
   trackerClientFixture,
   trackerIssue,
@@ -17,6 +19,47 @@ describe("test helper fixtures", () => {
     expect(config.project_contexts[0]?.workspace?.source?.branch_template).toBe(
       "symphony/{{ project.id }}/{{ issue.identifier }}",
     );
+  });
+
+  it("composes custom multi-project context arrays without secret-bearing per-context tracker values", () => {
+    const config = multiProjectWorkflowConfig({
+      projectContexts: [
+        projectContextFixture({ id: "api", label: "API", projectSlug: "API", repository: "../api-repo" }),
+        projectContextFixture({ id: "docs", label: "Docs", projectSlug: "DOCS", repository: "../docs-site" }),
+      ],
+    });
+
+    expect(config.tracker?.api_key).toBe("$LINEAR_API_KEY");
+    expect(config.project_contexts.map((context) => context.id)).toEqual(["api", "docs"]);
+    expect(config.project_contexts.map((context) => context.workspace?.source?.repository)).toEqual([
+      "../api-repo",
+      "../docs-site",
+    ]);
+    expect(config.project_contexts.every((context) => context.tracker?.api_key === undefined)).toBe(true);
+  });
+
+  it("builds reusable multi-project workflow documents for downstream loader tests", () => {
+    const workflow = parseWorkflowFile(
+      multiProjectWorkflowDocument({
+        projectContexts: [
+          projectContextFixture({ id: "api", label: "API", projectSlug: "API", repository: "../api-repo" }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+          }),
+        ],
+        promptTemplate: "Route {{ issue.identifier }}.",
+      }),
+      "/repo/WORKFLOW.md",
+    );
+    const config = workflow.config as TestMultiProjectWorkflowConfig;
+
+    expect(workflow.promptTemplate).toBe("Route {{ issue.identifier }}.");
+    expect(config.tracker?.api_key).toBe("$LINEAR_API_KEY");
+    expect(config.project_contexts.map((context) => context.id)).toEqual(["api", "docs"]);
+    expect(config.project_contexts.every((context) => context.tracker?.api_key === undefined)).toBe(true);
   });
 
   it("can omit project slugs and workspace sources for negative validation fixtures", () => {
