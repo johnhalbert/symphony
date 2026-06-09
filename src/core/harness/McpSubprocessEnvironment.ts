@@ -72,7 +72,7 @@ export function buildMcpSubprocessEnvironment(input: McpSubprocessEnvironmentInp
   const parentEnv = input.parentEnv ?? process.env;
   const env: Record<string, string> = {};
   addRuntimeBaseline(env, parentEnv);
-  addRequiredParseDependencies(env, input.config);
+  addRequiredParseDependencies(env, input.config, parentEnv);
   addCommandCapabilitySlice(env, input.config, input.command, parentEnv);
   return env;
 }
@@ -124,11 +124,18 @@ function addRuntimeBaseline(env: Record<string, string>, parentEnv: NodeJS.Proce
   }
 }
 
-function addRequiredParseDependencies(env: Record<string, string>, config: ServiceConfig): void {
+function addRequiredParseDependencies(
+  env: Record<string, string>,
+  config: ServiceConfig,
+  parentEnv: NodeJS.ProcessEnv,
+): void {
   const raw = config.raw;
   addTrackerParseDependencies(env, raw.tracker, config.tracker, { includeDefaultApiKeyFallback: true });
   addWorkspaceParseDependencies(env, raw.workspace, config.workspace);
-  addGitHubParseDependencies(env, raw.github, config.github);
+
+  if (projectContextsNeedDefaultGitHubParseDependencies(raw)) {
+    addGitHubParseDependenciesFromParentEnv(env, raw.github, parentEnv);
+  }
 
   const rawProjectContexts = raw.project_contexts ?? [];
   for (const [index, rawContext] of rawProjectContexts.entries()) {
@@ -237,6 +244,40 @@ function addGitHubParseDependencies(
 
   const apiBaseUrlRef = envReference(rawGithub?.api_base_url);
   if (apiBaseUrlRef) env[apiBaseUrlRef] = github.apiBaseUrl;
+}
+
+function addGitHubParseDependenciesFromParentEnv(
+  env: Record<string, string>,
+  rawGithub:
+    | {
+        owner?: string | undefined;
+        repo?: string | undefined;
+        head_owner?: string | undefined;
+        api_base_url?: string | undefined;
+      }
+    | undefined,
+  parentEnv: NodeJS.ProcessEnv,
+): void {
+  addEnvReferenceFromParentEnv(env, parentEnv, rawGithub?.owner);
+  addEnvReferenceFromParentEnv(env, parentEnv, rawGithub?.repo);
+  addEnvReferenceFromParentEnv(env, parentEnv, rawGithub?.head_owner);
+  addEnvReferenceFromParentEnv(env, parentEnv, rawGithub?.api_base_url);
+}
+
+function projectContextsNeedDefaultGitHubParseDependencies(raw: ServiceConfig["raw"]): boolean {
+  const defaultGithub = raw.github;
+  const rawProjectContexts = raw.project_contexts ?? [];
+  return rawProjectContexts.some(
+    (rawContext) =>
+      needsInheritedGitHubParseDependency(defaultGithub?.owner, rawContext.github?.owner) ||
+      needsInheritedGitHubParseDependency(defaultGithub?.repo, rawContext.github?.repo) ||
+      needsInheritedGitHubParseDependency(defaultGithub?.head_owner, rawContext.github?.head_owner) ||
+      needsInheritedGitHubParseDependency(defaultGithub?.api_base_url, rawContext.github?.api_base_url),
+  );
+}
+
+function needsInheritedGitHubParseDependency(defaultValue: string | undefined, contextValue: string | undefined): boolean {
+  return envReference(defaultValue) !== null && contextValue === undefined;
 }
 
 function addCommandCapabilitySlice(
@@ -412,4 +453,13 @@ function envReference(value: string | undefined): string | null {
 
 function addIfString(env: Record<string, string>, key: string, value: string | undefined): void {
   if (typeof value === "string") env[key] = value;
+}
+
+function addEnvReferenceFromParentEnv(
+  env: Record<string, string>,
+  parentEnv: NodeJS.ProcessEnv,
+  rawValue: string | undefined,
+): void {
+  const ref = envReference(rawValue);
+  if (ref) env[ref] = parentEnv[ref] ?? "";
 }
