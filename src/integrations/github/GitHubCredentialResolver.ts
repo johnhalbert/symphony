@@ -1,4 +1,5 @@
 import {
+  resolveProjectContextIdForConfig,
   serviceConfigForProjectContext,
   type GitHubConfig,
   type ServiceConfig,
@@ -37,9 +38,10 @@ export function resolveGitHubClientConfig(
     throw new SymphonyError("config_validation_error", `Unsupported GitHub credential capability: ${capability}`);
   }
 
-  const contextualConfig = serviceConfigForProjectContext(config, projectContextId);
-  const assignedRoles = contextualConfig.credentialProfiles.assignmentRolesFor(capability, projectContextId);
-  if (!contextualConfig.credentialProfiles.hasAssignment(role, capability, projectContextId) && assignedRoles.length > 0) {
+  const resolvedProjectContextId = resolveProjectContextIdForConfig(config, projectContextId);
+  const contextualConfig = serviceConfigForProjectContext(config, resolvedProjectContextId);
+  const assignedRoles = contextualConfig.credentialProfiles.assignmentRolesFor(capability, resolvedProjectContextId);
+  if (!contextualConfig.credentialProfiles.hasAssignment(role, capability, resolvedProjectContextId) && assignedRoles.length > 0) {
     throw new SymphonyError(
       "config_validation_error",
       `GitHub credential capability ${capability} is owned by ${role}, but is assigned only to ${assignedRoles.join(
@@ -48,7 +50,7 @@ export function resolveGitHubClientConfig(
     );
   }
 
-  const credential = contextualConfig.credentialProfiles.resolveForRole(role, capability, projectContextId);
+  const credential = contextualConfig.credentialProfiles.resolveForRole(role, capability, resolvedProjectContextId);
   if (credential?.source === "profile" && credential.kind === "github_app") {
     return {
       capability,

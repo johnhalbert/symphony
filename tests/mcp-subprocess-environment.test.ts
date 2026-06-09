@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { parseServiceConfig } from "../src/core/config/Config.js";
+import { parseServiceConfig, serviceConfigForProjectContext } from "../src/core/config/Config.js";
 import {
   buildMcpCliSpawnArgs,
   buildMcpSubprocessEnvironment,
@@ -1006,6 +1006,171 @@ describe("MCP subprocess environment", () => {
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     expect(childConfig.tracker).toMatchObject(config.tracker);
     expect(childConfig.workspace).toEqual(config.workspace);
+  });
+
+  it("carries project-context workspace parse dependencies needed for child config parsing", () => {
+    const rawConfig = {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_API_KEY",
+        project_slug: "DEFAULT",
+      },
+      workspace: {
+        root: "/tmp/default-workspaces",
+        state_dir: "/tmp/default-state",
+        source: {
+          kind: "git_worktree",
+          repository: "../default-site",
+          base_ref: "origin/main",
+        },
+      },
+      github: {
+        owner: "acme",
+        repo: "default-site",
+        publish_pull_requests: false,
+      },
+      project_contexts: [
+        {
+          id: "default",
+          enabled: false,
+          tracker: { project_slug: "LEGACY" },
+          workspace: {
+            source: {
+              kind: "git_worktree",
+              repository: "../legacy-site",
+              base_ref: "origin/main",
+            },
+          },
+        },
+        {
+          id: "docs",
+          tracker: { project_slug: "DOCS" },
+          workspace: {
+            root: "$DOCS_WORKSPACE_ROOT",
+            state_dir: "$DOCS_WORKSPACE_STATE_DIR",
+            source: {
+              kind: "git_worktree",
+              repository: "$DOCS_WORKSPACE_REPOSITORY",
+              base_ref: "$DOCS_WORKSPACE_BASE_REF",
+              cache_path: "$DOCS_WORKSPACE_CACHE_PATH",
+            },
+          },
+        },
+      ],
+    } as const;
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", {
+      LINEAR_API_KEY: "linear-secret",
+      DOCS_WORKSPACE_ROOT: "/tmp/docs-workspaces",
+      DOCS_WORKSPACE_STATE_DIR: "/tmp/docs-state",
+      DOCS_WORKSPACE_REPOSITORY: "/tmp/docs-repo",
+      DOCS_WORKSPACE_BASE_REF: "origin/docs-main",
+      DOCS_WORKSPACE_CACHE_PATH: "/tmp/docs-cache",
+    });
+    const issueConfig = serviceConfigForProjectContext(config, "default");
+
+    expect(config.projectContexts.defaultContextId).toBe("docs");
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "review-verdict-mcp",
+      projectContextId: "default",
+      parentEnv: { PATH: "/bin" },
+    });
+
+    expect(env).toMatchObject({
+      DOCS_WORKSPACE_ROOT: issueConfig.workspace.root,
+      DOCS_WORKSPACE_STATE_DIR: issueConfig.workspace.stateDir,
+      DOCS_WORKSPACE_REPOSITORY: issueConfig.workspace.source.repository,
+      DOCS_WORKSPACE_BASE_REF: issueConfig.workspace.source.baseRef,
+      DOCS_WORKSPACE_CACHE_PATH: issueConfig.workspace.source.cachePath,
+    });
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    expect(serviceConfigForProjectContext(childConfig, "default").workspace).toEqual(issueConfig.workspace);
+  });
+
+  it("uses project-context publication profile assignments for completion-report MCP children", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "DEFAULT" },
+        workspace: {
+          source: {
+            kind: "git_worktree",
+            repository: "../default-site",
+            base_ref: "origin/main",
+          },
+        },
+        github: { owner: "acme", repo: "default-site", token: "$DEFAULT_GITHUB_TOKEN", publish_pull_requests: false },
+        credential_profiles: {
+          profiles: {
+            "docs-publication": {
+              value: "$DOCS_PUBLICATION_TOKEN",
+              capabilities: ["github.publication"],
+            },
+          },
+        },
+        project_contexts: [
+          {
+            id: "default",
+            enabled: false,
+            tracker: { project_slug: "LEGACY" },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "../legacy-site",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "docs",
+            tracker: { project_slug: "DOCS" },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "../docs-site",
+                base_ref: "origin/main",
+              },
+            },
+            github: {
+              owner: "acme-docs",
+              repo: "docs-site",
+              token: "$DOCS_GITHUB_TOKEN",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+            },
+            credential_profiles: {
+              roles: {
+                service: {
+                  "github.publication": "docs-publication",
+                },
+              },
+            },
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        DEFAULT_GITHUB_TOKEN: "default-github-secret",
+        DOCS_GITHUB_TOKEN: "docs-github-secret",
+        DOCS_PUBLICATION_TOKEN: "docs-publication-secret",
+      },
+    );
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "completion-report-mcp",
+      projectContextId: "default",
+      parentEnv: { PATH: "/bin", GITHUB_TOKEN: "decoy-parent-github-secret" },
+    });
+
+    expect(config.projectContexts.defaultContextId).toBe("docs");
+    expect(env).toMatchObject({
+      DOCS_PUBLICATION_TOKEN: "docs-publication-secret",
+    });
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(env).not.toHaveProperty("DOCS_GITHUB_TOKEN");
   });
 
   it("reports missing assigned publication profile secrets without falling back to legacy GITHUB_TOKEN", () => {

@@ -110,6 +110,88 @@ describe("Linear credential resolver", () => {
     expect(resolved.tracker.apiKey).toBe("linear-service-write-secret");
   });
 
+  it("resolves project-context linear credentials from per-context role assignments", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$DEFAULT_LINEAR_TOKEN", project_slug: "DEFAULT" },
+        workspace: {
+          source: {
+            kind: "git_worktree",
+            repository: "../default-site",
+            base_ref: "origin/main",
+          },
+        },
+        credential_profiles: {
+          profiles: {
+            "docs-tracker": {
+              value: "$DOCS_TRACKER_TOKEN",
+              capabilities: ["linear.tracker"],
+            },
+            "docs-writeback": {
+              value: "$DOCS_WRITEBACK_TOKEN",
+              capabilities: ["linear.writeback"],
+            },
+          },
+        },
+        project_contexts: [
+          {
+            id: "default",
+            enabled: false,
+            tracker: { project_slug: "LEGACY" },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "../legacy-site",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "docs",
+            tracker: {
+              api_key: "$DOCS_LINEAR_TOKEN",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "../docs-site",
+                base_ref: "origin/main",
+              },
+            },
+            credential_profiles: {
+              roles: {
+                worker: {
+                  "linear.tracker": "docs-tracker",
+                },
+                service: {
+                  "linear.writeback": "docs-writeback",
+                },
+              },
+            },
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      {
+        DEFAULT_LINEAR_TOKEN: "default-linear-secret",
+        DOCS_LINEAR_TOKEN: "docs-linear-legacy-secret",
+        DOCS_TRACKER_TOKEN: "docs-tracker-secret",
+        DOCS_WRITEBACK_TOKEN: "docs-writeback-secret",
+      },
+    );
+
+    expect(config.projectContexts.defaultContextId).toBe("docs");
+    expect(resolveLinearClientConfig(config, "linear.tracker", "docs")).toMatchObject({
+      tracker: { projectSlug: "DOCS", apiKey: "docs-tracker-secret" },
+      credential: { profileName: "docs-tracker", source: "profile" },
+    });
+    expect(resolveLinearClientConfig(config, "linear.writeback", "docs")).toMatchObject({
+      tracker: { projectSlug: "DOCS", apiKey: "docs-writeback-secret" },
+      credential: { profileName: "docs-writeback", source: "profile" },
+    });
+  });
+
   it("rejects wrong-role-only writeback assignments before legacy fallback", () => {
     const config = parseServiceConfig(
       {

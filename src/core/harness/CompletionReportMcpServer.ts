@@ -62,7 +62,13 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const approvalRequiredForPublication = issueConfig.github.operatorApproval?.requiredForPublication ?? false;
     const writebackProcessor =
       issueConfig.writeback.enabled && approvalRequiredForPublication
-        ? createRuntimeWritebackProcessor(() => issueConfig, logger, undefined, { outboxStore: writebackOutbox, lifecycleStore })
+        ? createRuntimeWritebackProcessor(
+            () => issueConfig,
+            logger,
+            undefined,
+            { outboxStore: writebackOutbox, lifecycleStore },
+            loadedContext.issue.projectContextId,
+          )
         : undefined;
     const operatorApproval = new OperatorApprovalService({
       config,

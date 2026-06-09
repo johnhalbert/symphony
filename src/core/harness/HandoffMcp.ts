@@ -300,6 +300,7 @@ export function completionReportMcpServerConfig(
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
     command: "completion-report-mcp",
+    projectContextId: ctx.issue.projectContextId,
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
@@ -314,6 +315,7 @@ export function mergeConflictResolutionMcpServerConfig(
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
     command: "merge-conflict-resolution-mcp",
+    projectContextId: ctx.issue.projectContextId,
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
@@ -328,6 +330,7 @@ export function issueBreakdownPlanMcpServerConfig(
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
     command: "issue-breakdown-plan-mcp",
+    projectContextId: ctx.issue.projectContextId,
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
@@ -342,6 +345,7 @@ export function reviewVerdictMcpServerConfig(
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
     command: "review-verdict-mcp",
+    projectContextId: ctx.issue.projectContextId,
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
@@ -356,6 +360,7 @@ export function reviewFeedbackMcpServerConfig(
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
     command: "review-feedback-mcp",
+    projectContextId: ctx.issue.projectContextId,
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
@@ -370,6 +375,7 @@ export function transcriptRecallMcpServerConfig(
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
     command: "transcript-recall-mcp",
+    projectContextId: ctx.issue.projectContextId,
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,

@@ -120,7 +120,7 @@ export class MergePolicyService {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service-owned writeback");
     }
 
-    const serviceLinear = resolveLinearClientConfig(config, "linear.writeback").credential;
+    const serviceLinear = resolveLinearClientConfig(config, "linear.writeback", issue.projectContextId).credential;
     if (!serviceLinear) {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service linear.writeback credentials");
     }
