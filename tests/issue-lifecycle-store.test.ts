@@ -276,6 +276,12 @@ describe("FileIssueLifecycleStore", () => {
       linearProjectSlug: "DOCS",
       routingSource: "candidate_poll",
     });
+    expect(record.summaryPointers.projectContext).toEqual({
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    });
   });
 
   it("backfills and propagates durable project context attribution", async () => {
@@ -356,12 +362,16 @@ describe("FileIssueLifecycleStore", () => {
 
     const reloaded = await store.get("TEST-1");
     expect(reloaded).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.summaryPointers).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(reloaded?.completionReports[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(reloaded?.reviewVerdicts[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(reloaded?.mergeConflictResolutionReports[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(reloaded?.handoff.memo).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(buildWorkerHandoffPacket(reloaded!, "2026-01-01T00:03:00.000Z")).toMatchObject({
       projectContext: normalizedDocsProjectContext,
+      pointers: {
+        projectContext: normalizedDocsProjectContext,
+      },
     });
 
     await store.ensureIssue(issue({ id: "issue-legacy", identifier: "LEGACY-1" }), { phase: "implementation" });
@@ -379,6 +389,14 @@ describe("FileIssueLifecycleStore", () => {
         projectContextLabel: "Default",
         linearProjectSlug: null,
         routingSource: "legacy_default",
+      },
+      summaryPointers: {
+        projectContext: {
+          projectContextId: "default",
+          projectContextLabel: "Default",
+          linearProjectSlug: null,
+          routingSource: "legacy_default",
+        },
       },
       handoff: {
         memo: {

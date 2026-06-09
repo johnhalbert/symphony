@@ -21,6 +21,7 @@ export type IssueLifecyclePhase =
   | "unknown";
 
 export interface IssueLifecycleSummaryPointers {
+  projectContext?: ProjectContextResolution | undefined;
   workspaceKey: string | null;
   workspacePath: string | null;
   branchName: string | null;
@@ -498,6 +499,7 @@ export class FileIssueLifecycleStore {
         ...defaultSummaryPointers(),
         ...existing?.summaryPointers,
         ...patch.summaryPointers,
+        projectContext,
       },
       summaryReferences: patch.summaryReferences ?? existing?.summaryReferences ?? [],
       issueBreakdownPlans: patch.issueBreakdownPlans ?? existing?.issueBreakdownPlans ?? [],
@@ -880,6 +882,7 @@ function clip(value: string, maxChars = 500): string {
 
 function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
   return {
+    projectContext: undefined,
     workspaceKey: null,
     workspacePath: null,
     branchName: null,
@@ -966,7 +969,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     lastCompletionReportId: nullableString(value.lastCompletionReportId, filePath, "lastCompletionReportId"),
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
-    summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath),
+    summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath, projectContext),
     summaryReferences: normalizeSummaryReferences(value.summaryReferences, filePath),
     issueBreakdownPlans: normalizeIssueBreakdownPlans(value.issueBreakdownPlans, filePath, projectContext),
     completionReports: normalizeCompletionReports(value.completionReports, filePath, projectContext),
@@ -990,9 +993,19 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
   };
 }
 
-function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecycleSummaryPointers {
-  if (!isRecord(value)) return defaultSummaryPointers();
+function normalizeSummaryPointers(
+  value: unknown,
+  filePath: string,
+  fallbackProjectContext: ProjectContextResolution,
+): IssueLifecycleSummaryPointers {
+  if (!isRecord(value)) {
+    return {
+      ...defaultSummaryPointers(),
+      projectContext: fallbackProjectContext,
+    };
+  }
   return {
+    projectContext: normalizeStoredProjectContext(value.projectContext, fallbackProjectContext),
     workspaceKey: nullableString(value.workspaceKey, filePath, "summaryPointers.workspaceKey"),
     workspacePath: nullableString(value.workspacePath, filePath, "summaryPointers.workspacePath"),
     branchName: nullableString(value.branchName, filePath, "summaryPointers.branchName"),
@@ -1311,7 +1324,7 @@ function normalizeLaneMemo(
         : nonNegativeInteger(value.sizeChars, filePath, "handoff.memo.sizeChars"),
     entries: requiredStringArray(value.entries, filePath, "handoff.memo.entries"),
     openFindings: requiredStringArray(value.openFindings, filePath, "handoff.memo.openFindings"),
-    pointers: normalizeSummaryPointers(value.pointers, filePath),
+    pointers: normalizeSummaryPointers(value.pointers, filePath, fallbackProjectContext),
     lastWorkerRunId: nullableString(value.lastWorkerRunId, filePath, "handoff.memo.lastWorkerRunId"),
     lastReviewerRunId: nullableString(value.lastReviewerRunId, filePath, "handoff.memo.lastReviewerRunId"),
   };
