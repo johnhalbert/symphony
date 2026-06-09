@@ -1219,10 +1219,18 @@ function reduceCompletedEvent(
   payload: UnknownRecord | null,
   options: RunActivityReductionOptions,
 ): RunRecord {
-  if (record.runPhase === "issue_breakdown") {
+  if (requiresIssueBreakdownPlan(record)) {
     return reducePlanningRunFailedEvent(record, event, payload, options, PLANNING_NO_PLAN_ERROR, true);
   }
   return reduceTerminalEvent(record, event, "succeeded", null, options);
+}
+
+function requiresIssueBreakdownPlan(record: RunRecord): boolean {
+  return record.runPhase === "issue_breakdown" && !isOperatorConversationRun(record);
+}
+
+function isOperatorConversationRun(record: RunRecord): boolean {
+  return record.issueIdentifier === "OPERATOR" && record.issueId.startsWith("operator:");
 }
 
 function reducePlanningRunFailedEvent(
