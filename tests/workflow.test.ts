@@ -1405,6 +1405,173 @@ Work on {{ issue.identifier }}.
   });
 });
 
+describe("project context workflow contracts", () => {
+  it("normalizes project context ids into safe workflow identifiers", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "Docs Site",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+          }),
+          projectContextFixture({
+            id: "ops_portal",
+            label: "Ops Portal",
+            projectSlug: "OPS",
+            repository: "../ops-portal",
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.projectContexts.contexts.map((context) => context.id)).toEqual(["docs-site", "ops-portal"]);
+    expect(config.projectContexts.defaultContextId).toBe("docs-site");
+    expect(config.projectContexts.byId.get("docs-site")).toMatchObject({
+      id: "docs-site",
+      label: "Documentation Site",
+      tracker: { projectSlug: "DOCS" },
+      workspace: { source: { repository: path.resolve("/repo", "../docs-site") } },
+    });
+    expect(config.projectContexts.byId.get("ops-portal")).toMatchObject({
+      id: "ops-portal",
+      label: "Ops Portal",
+      tracker: { projectSlug: "OPS" },
+      workspace: { source: { repository: path.resolve("/repo", "../ops-portal") } },
+    });
+  });
+
+  it("rejects duplicate project context ids after normalization", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [
+            projectContextFixture({
+              id: "Docs Site",
+              projectSlug: "DOCS",
+              repository: "../docs-site",
+            }),
+            projectContextFixture({
+              id: "docs_site",
+              projectSlug: "DOCS2",
+              repository: "../docs-site-v2",
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrowError("Duplicate project context id: docs-site");
+  });
+
+  it("allows disabled project contexts to omit tracker and workspace source", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Disabled Docs",
+            enabled: false,
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      { SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret" },
+    );
+
+    expect(config.projectContexts.defaultContextId).toBe("symphony");
+    expect(config.projectContexts.byId.get("disabled-docs")).toMatchObject({
+      id: "disabled-docs",
+      enabled: false,
+      tracker: { projectSlug: "" },
+      workspace: { source: { kind: "none" } },
+    });
+  });
+
+  it.each([
+    {
+      label: "missing tracker",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        workspace: {
+          source: {
+            kind: "git_worktree",
+            repository: ".",
+            base_ref: "origin/main",
+          },
+        },
+        project_contexts: [
+          {
+            id: "Docs Site",
+          },
+        ],
+      },
+      env: {},
+      expectedMessage: 'project_contexts["Docs Site"].tracker.api_key is required',
+    },
+    {
+      label: "missing tracker project slug",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        workspace: {
+          source: {
+            kind: "git_worktree",
+            repository: ".",
+            base_ref: "origin/main",
+          },
+        },
+        project_contexts: [
+          {
+            id: "Docs Site",
+            tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+          },
+        ],
+      },
+      env: { DOCS_LINEAR_API_KEY: "docs-linear-secret" },
+      expectedMessage: 'project_contexts["Docs Site"].tracker.project_slug is required',
+    },
+    {
+      label: "missing workspace source",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              root: "./docs-workspaces",
+            },
+          },
+        ],
+      },
+      env: { DOCS_LINEAR_API_KEY: "docs-linear-secret" },
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source is required for enabled project contexts',
+    },
+  ])("rejects enabled project contexts with $label", ({ rawConfig, env, expectedMessage }) => {
+    expect(() => parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env)).toThrowError(expectedMessage);
+  });
+});
+
 describe("project context redaction", () => {
   it("summarizes configured project contexts without leaking secret values", () => {
     const config = parseServiceConfig(
