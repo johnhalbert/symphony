@@ -16,6 +16,10 @@ import {
   type PostgresRunActivityAppendClient,
   type RunActivityAppendInput,
 } from "../src/core/persistence/RunActivityAppendStore.js";
+import {
+  PostgresRunActivityChatMessageReducer,
+  type PostgresRunActivityChatMessageReducerClient,
+} from "../src/core/persistence/RunActivityChatMessageReducer.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -284,7 +288,7 @@ describe("Postgres Symphony-owned state migration", () => {
     expect(normalized).toContain("on symphony.projection_revision (build_mode, projection_name, updated_at desc, generated_at desc)");
   });
 
-  it("reserves owned-state project context attribution columns, chat scoping, and replaced read indexes before the migration is implemented", async () => {
+  it("reserves owned-state project context attribution columns, run-activity/chat scoping, and replaced read indexes before the migration is implemented", async () => {
     const normalized = normalizedSql(await projectContextAttributionMigrationSql());
 
     for (const fragment of [
@@ -295,6 +299,7 @@ describe("Postgres Symphony-owned state migration", () => {
       "alter table symphony.run_session add column if not exists linear_project_identity jsonb",
       "alter table symphony.run_session add column if not exists codebase_identity jsonb",
       "alter table symphony.run_session add column if not exists routing_source text",
+      "alter table symphony.run_activity_event add column if not exists project_context_id text",
       "alter table symphony.chat_message add column if not exists project_context_id text",
       "alter table symphony.writeback_operation add column if not exists project_context_id text",
       "alter table symphony.approval_request add column if not exists project_context_id text",
@@ -311,6 +316,12 @@ describe("Postgres Symphony-owned state migration", () => {
       "create unique index if not exists issue_identifier_unique_idx on symphony.issue (project_context_id, tracker_source, issue_identifier)",
       "alter table symphony.run_session drop constraint if exists run_session_pkey",
       "alter table symphony.run_session add primary key (project_context_id, run_id)",
+      "alter table symphony.run_activity_event drop constraint if exists run_activity_event_run_session_id_sequence_key",
+      "alter table symphony.run_activity_event add constraint run_activity_event_run_session_id_sequence_key unique (project_context_id, run_session_id, sequence)",
+      "drop index if exists symphony.run_activity_event_external_event_unique_idx",
+      "create unique index if not exists run_activity_event_external_event_unique_idx on symphony.run_activity_event (project_context_id, run_session_id, external_event_id)",
+      "alter table symphony.chat_message drop constraint if exists chat_message_message_id_key",
+      "alter table symphony.chat_message add constraint chat_message_message_id_key unique (project_context_id, message_id)",
       "alter table symphony.chat_message drop constraint if exists chat_message_thread_key_message_index_key",
       "alter table symphony.chat_message add constraint chat_message_thread_key_message_index_key unique (project_context_id, thread_key, message_index)",
       "alter table symphony.writeback_operation drop constraint if exists writeback_operation_pkey",
@@ -330,6 +341,9 @@ describe("Postgres Symphony-owned state migration", () => {
       "drop index if exists symphony.run_session_issue_status_idx",
       "drop index if exists symphony.run_session_identifier_started_idx",
       "drop index if exists symphony.run_session_workspace_idx",
+      "drop index if exists symphony.run_activity_event_ordering_idx",
+      "drop index if exists symphony.run_activity_event_run_ordering_idx",
+      "drop index if exists symphony.run_activity_event_time_ordering_idx",
       "drop index if exists symphony.chat_message_ordering_idx",
       "drop index if exists symphony.chat_message_issue_ordering_idx",
       "drop index if exists symphony.chat_message_run_ordering_idx",
@@ -352,6 +366,9 @@ describe("Postgres Symphony-owned state migration", () => {
       "on symphony.run_session (project_context_id, issue_key, status, started_at desc)",
       "on symphony.run_session (project_context_id, issue_identifier, started_at desc)",
       "on symphony.run_session (project_context_id, workspace_key, started_at desc)",
+      "on symphony.run_activity_event (project_context_id, run_session_id, sequence)",
+      "on symphony.run_activity_event (project_context_id, run_id, run_session_id, sequence)",
+      "on symphony.run_activity_event (project_context_id, run_session_id, event_at, sequence)",
       "on symphony.chat_message (project_context_id, thread_key, message_index)",
       "on symphony.chat_message (project_context_id, issue_key, created_at, message_index)",
       "on symphony.chat_message (project_context_id, run_id, message_index)",
@@ -365,6 +382,7 @@ describe("Postgres Symphony-owned state migration", () => {
     ]) {
       expect(normalized, `missing owned-state project context lookup fragment: ${fragment}`).toContain(fragment);
     }
+    expect(normalized).toContain("where external_event_id is not null");
   });
 
   it("reserves projection project context attribution columns, dropped/recreated read indexes, and context-scoped unique revisions before the migration is implemented", async () => {
@@ -681,6 +699,7 @@ describe("Postgres Symphony-owned state migration", () => {
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
         if (hasProjectContextAttributionMigration) {
           await expectProjectContextScopedCoexistence(containerName);
+          await expectProjectContextScopedRunActivityReplayAndReducedChatIsolation(connectionString);
         }
         await expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName);
         await expectDuplicateWorkspaceAndExternalIssueConstraints(containerName);
@@ -2425,6 +2444,49 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           ('symphony', 'run:context-shared', 'session:context-shared', 'worker', 'issue:context-shared', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/symphony/ENG-CTX-101', 1, 'running', now(), now()),
           ('docs', 'run:context-shared', 'session:context-shared', 'worker', 'issue:context-shared', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/docs/ENG-CTX-101', 1, 'running', now(), now())
         returning project_context_id, run_id
+      ), inserted_run_activity_event as (
+        insert into symphony.run_activity_event (
+          project_context_id,
+          event_id,
+          run_id,
+          session_id,
+          run_session_id,
+          sequence,
+          sequence_source,
+          event_at,
+          protocol,
+          harness_id,
+          external_event_id,
+          actor,
+          channel,
+          kind,
+          text,
+          payload,
+          metadata
+        )
+        select
+          runs.project_context_id,
+          case runs.project_context_id
+            when 'symphony' then 'activity:context-shared:symphony:1'
+            else 'activity:context-shared:docs:1'
+          end,
+          runs.run_id,
+          'session:context-shared',
+          'run-session:context-shared',
+          1,
+          'harness',
+          now(),
+          'json_rpc',
+          'hermes',
+          'external:context-shared:1',
+          'user',
+          'chat',
+          'user_message_submitted',
+          'Context-scoped run activity event',
+          '{"messageId":"shared-context-message"}'::jsonb,
+          '{"scenario":"project-context-coexistence"}'::jsonb
+        from inserted_run runs
+        returning project_context_id, run_activity_event_id
       ), inserted_chat_message as (
         insert into symphony.chat_message (
           project_context_id,
@@ -2447,10 +2509,7 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
         )
         select
           runs.project_context_id,
-          case runs.project_context_id
-            when 'symphony' then 'message:context-symphony:0'
-            else 'message:context-docs:0'
-          end,
+          'message:context-shared:0',
           'thread:context-shared',
           issues.issue_key,
           'ENG-CTX-101',
@@ -2685,6 +2744,7 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
         'workspace', (select count(*) from inserted_workspace),
         'issue', (select count(*) from inserted_issue),
         'run_session', (select count(*) from inserted_run),
+        'run_activity_event', (select count(*) from inserted_run_activity_event),
         'chat_message', (select count(*) from inserted_chat_message),
         'writeback_operation', (select count(*) from inserted_writeback_operation),
         'approval_request', (select count(*) from inserted_approval_request),
@@ -2713,6 +2773,7 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
     workspace: 2,
     issue: 2,
     run_session: 2,
+    run_activity_event: 2,
     chat_message: 2,
     writeback_operation: 2,
     approval_request: 2,
@@ -2765,6 +2826,10 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           'issue_identifier_unique_idx',
           'run_session_pkey',
           'run_session_lookup_idx',
+          'run_activity_event_ordering_idx',
+          'run_activity_event_run_ordering_idx',
+          'run_activity_event_time_ordering_idx',
+          'run_activity_event_external_event_unique_idx',
           'writeback_operation_pkey',
           'approval_request_pkey',
           'approval_request_dedupe_key_key',
@@ -2787,6 +2852,19 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
   );
   expect(indexes.run_session_pkey?.toLowerCase()).toContain("(project_context_id, run_id)");
   expect(indexes.run_session_lookup_idx?.toLowerCase()).toContain("(project_context_id, session_id, run_id)");
+  expect(indexes.run_activity_event_ordering_idx?.toLowerCase()).toContain(
+    "(project_context_id, run_session_id, sequence)",
+  );
+  expect(indexes.run_activity_event_run_ordering_idx?.toLowerCase()).toContain(
+    "(project_context_id, run_id, run_session_id, sequence)",
+  );
+  expect(indexes.run_activity_event_time_ordering_idx?.toLowerCase()).toContain(
+    "(project_context_id, run_session_id, event_at, sequence)",
+  );
+  expect(indexes.run_activity_event_external_event_unique_idx?.toLowerCase()).toContain(
+    "(project_context_id, run_session_id, external_event_id)",
+  );
+  expect(indexes.run_activity_event_external_event_unique_idx?.toLowerCase()).toContain("where (external_event_id is not null)");
   expect(indexes.writeback_operation_pkey?.toLowerCase()).toContain(
     "(project_context_id, idempotency_key)",
   );
@@ -2815,6 +2893,30 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
   expect(indexes.orchestrator_chat_projection_scope_revision_idx?.toLowerCase()).toContain(
     "(project_context_id, scope_key, conversation_key, revision)",
   );
+
+  const runActivitySequenceConstraint = await psql(
+    containerName,
+    String.raw`
+      select pg_get_constraintdef(oid)
+      from pg_constraint
+      where conrelid = 'symphony.run_activity_event'::regclass
+        and conname = 'run_activity_event_run_session_id_sequence_key';
+    `,
+  );
+  expect(normalizedSql(runActivitySequenceConstraint)).toContain(
+    "unique (project_context_id, run_session_id, sequence)",
+  );
+
+  const chatMessageIdConstraint = await psql(
+    containerName,
+    String.raw`
+      select pg_get_constraintdef(oid)
+      from pg_constraint
+      where conrelid = 'symphony.chat_message'::regclass
+        and conname = 'chat_message_message_id_key';
+    `,
+  );
+  expect(normalizedSql(chatMessageIdConstraint)).toContain("unique (project_context_id, message_id)");
 
   const chatMessageConstraint = await psql(
     containerName,
@@ -2937,6 +3039,96 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
     psql(
       containerName,
       String.raw`
+        insert into symphony.run_activity_event (
+          project_context_id,
+          event_id,
+          run_id,
+          session_id,
+          run_session_id,
+          sequence,
+          sequence_source,
+          event_at,
+          protocol,
+          harness_id,
+          external_event_id,
+          actor,
+          channel,
+          kind,
+          text,
+          payload,
+          metadata
+        ) values (
+          'symphony',
+          'activity:context-shared:symphony:duplicate-sequence',
+          'run:context-shared',
+          'session:context-shared',
+          'run-session:context-shared',
+          1,
+          'harness',
+          now(),
+          'json_rpc',
+          'hermes',
+          'external:context-shared:duplicate-sequence',
+          'user',
+          'chat',
+          'user_message_submitted',
+          'Duplicate context-scoped run activity event',
+          '{"messageId":"shared-context-message-duplicate-sequence"}'::jsonb,
+          '{"scenario":"duplicate-project-context-run-activity-sequence"}'::jsonb
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.run_activity_event (
+          project_context_id,
+          event_id,
+          run_id,
+          session_id,
+          run_session_id,
+          sequence,
+          sequence_source,
+          event_at,
+          protocol,
+          harness_id,
+          external_event_id,
+          actor,
+          channel,
+          kind,
+          text,
+          payload,
+          metadata
+        ) values (
+          'symphony',
+          'activity:context-shared:symphony:duplicate-external',
+          'run:context-shared',
+          'session:context-shared',
+          'run-session:context-shared',
+          2,
+          'harness',
+          now(),
+          'json_rpc',
+          'hermes',
+          'external:context-shared:1',
+          'user',
+          'chat',
+          'user_message_submitted',
+          'Duplicate context-scoped run activity external id',
+          '{"messageId":"shared-context-message-duplicate-external"}'::jsonb,
+          '{"scenario":"duplicate-project-context-run-activity-external-id"}'::jsonb
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
         insert into symphony.chat_message (
           project_context_id,
           message_id,
@@ -2971,6 +3163,51 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           37,
           '{"messages":[]}'::jsonb,
           '{"scenario":"duplicate-project-context-chat"}'::jsonb,
+          now(),
+          now()
+        );
+      `,
+    ),
+  ).rejects.toThrow(/duplicate key value violates unique constraint/i);
+
+  await expect(
+    psql(
+      containerName,
+      String.raw`
+        insert into symphony.chat_message (
+          project_context_id,
+          message_id,
+          thread_key,
+          issue_key,
+          issue_identifier,
+          run_id,
+          message_index,
+          role,
+          message_kind,
+          status,
+          body,
+          body_preview,
+          body_char_count,
+          payload,
+          metadata,
+          created_at,
+          updated_at
+        ) values (
+          'symphony',
+          'message:context-shared:0',
+          'thread:context-shared:duplicate-message-id',
+          'issue:context-shared',
+          'ENG-CTX-101',
+          'run:context-shared',
+          1,
+          'assistant',
+          'message',
+          'completed',
+          'Duplicate context-scoped chat message id',
+          'Duplicate context-scoped chat message id',
+          40,
+          '{"messages":[]}'::jsonb,
+          '{"scenario":"duplicate-project-context-chat-message-id"}'::jsonb,
           now(),
           now()
         );
@@ -3281,6 +3518,305 @@ async function expectProjectContextScopedProjectionChildDuplicatesRejected(conta
     `,
   ]) {
     await expect(psql(containerName, duplicateInsert)).rejects.toThrow(/duplicate key value violates unique constraint/i);
+  }
+}
+
+async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolation(
+  connectionString: string,
+): Promise<void> {
+  const pool = new Pool({ connectionString });
+  const runId = "run:context-replay-shared";
+  const sessionId = "session:context-replay-shared";
+  const threadKey = "thread:context-replay-shared";
+  const issueKey = "issue:context-replay-shared";
+  const issueIdentifier = "ENG-CTX-201";
+  const workspaceKey = "workspace:context-replay-shared";
+  const symphonyRunSessionId = "symphony:run:context-replay-shared:session:context-replay-shared";
+  const docsRunSessionId = "docs:run:context-replay-shared:session:context-replay-shared";
+  const store = new PostgresRunActivityAppendStore(
+    {
+      connect: async () => (await pool.connect()) as PostgresRunActivityAppendClient,
+    },
+    { reduceChatMessages: false },
+  );
+  const reducer = new PostgresRunActivityChatMessageReducer({
+    connect: async () => (await pool.connect()) as PostgresRunActivityChatMessageReducerClient,
+  });
+
+  try {
+    await pool.query(
+      `
+        INSERT INTO symphony.run_session (
+          project_context_id,
+          run_id,
+          session_id,
+          role,
+          issue_key,
+          issue_identifier,
+          workspace_key,
+          workspace_path,
+          turn_number,
+          status,
+          started_at,
+          updated_at
+        ) VALUES
+          ('symphony', $1, $2, 'worker', $3, $4, $5, '/tmp/symphony/ENG-CTX-201', 1, 'running', now(), now()),
+          ('docs', $1, $2, 'worker', $3, $4, $5, '/tmp/docs/ENG-CTX-201', 1, 'running', now(), now())
+      `,
+      [runId, sessionId, issueKey, issueIdentifier, workspaceKey],
+    );
+
+    const firstBatch = await store.appendEvents([
+      runActivityAppendInput({
+        id: "activity:context-replay:symphony:1",
+        runId,
+        sessionId,
+        runSessionId: symphonyRunSessionId,
+        externalEventId: "external:context-replay:1",
+        actor: "user",
+        channel: "chat",
+        kind: "user_message_submitted",
+        text: "Symphony scoped prompt",
+        payload: { messageId: "shared-user" },
+      }),
+      runActivityAppendInput({
+        id: "activity:context-replay:docs:1",
+        runId,
+        sessionId,
+        runSessionId: docsRunSessionId,
+        externalEventId: "external:context-replay:1",
+        actor: "user",
+        channel: "chat",
+        kind: "user_message_submitted",
+        text: "Docs scoped prompt",
+        payload: { messageId: "shared-user" },
+      }),
+    ]);
+
+    expect(
+      firstBatch.accepted
+        .map(({ event }) => ({
+          runSessionId: event.runSessionId,
+          sequence: event.sequence,
+          externalEventId: event.externalEventId,
+        }))
+        .sort((left, right) => left.runSessionId.localeCompare(right.runSessionId)),
+    ).toEqual([
+      { runSessionId: docsRunSessionId, sequence: 1, externalEventId: "external:context-replay:1" },
+      { runSessionId: symphonyRunSessionId, sequence: 1, externalEventId: "external:context-replay:1" },
+    ]);
+
+    const duplicate = await store.appendEvent(
+      runActivityAppendInput({
+        id: "activity:context-replay:symphony:duplicate-external",
+        runId,
+        sessionId,
+        runSessionId: symphonyRunSessionId,
+        externalEventId: "external:context-replay:1",
+        actor: "user",
+        channel: "chat",
+        kind: "user_message_submitted",
+        text: "Duplicate Symphony scoped prompt",
+        payload: { messageId: "shared-user-duplicate" },
+      }),
+    );
+    expect(duplicate).toMatchObject({
+      status: "duplicate",
+      reason: "external_event_id",
+      metadata: { sequence: 1 },
+    });
+
+    const replay = await store.readRunEvents(runId);
+    expect(
+      replay.events
+        .map(({ event }) => ({
+          runSessionId: event.runSessionId,
+          sequence: event.sequence,
+          externalEventId: event.externalEventId,
+          text: event.text,
+        }))
+        .sort((left, right) => left.runSessionId.localeCompare(right.runSessionId)),
+    ).toEqual([
+      {
+        runSessionId: docsRunSessionId,
+        sequence: 1,
+        externalEventId: "external:context-replay:1",
+        text: "Docs scoped prompt",
+      },
+      {
+        runSessionId: symphonyRunSessionId,
+        sequence: 1,
+        externalEventId: "external:context-replay:1",
+        text: "Symphony scoped prompt",
+      },
+    ]);
+
+    const symphonyReduction = await reducer.reduceRunSession(symphonyRunSessionId, {
+      threadKey,
+      issueKey,
+      issueIdentifier,
+    });
+    expect(symphonyReduction).toMatchObject({
+      runSessionId: symphonyRunSessionId,
+      threadKey,
+      upsertedCount: 1,
+      deletedCount: 0,
+    });
+    expect(symphonyReduction.messages).toHaveLength(1);
+    expect(symphonyReduction.messages[0]).toMatchObject({
+      messageId: `run_activity:${symphonyRunSessionId}:message:shared-user`,
+      runId,
+      threadKey,
+      body: "Symphony scoped prompt",
+      messageIndex: 0,
+    });
+
+    const docsReduction = await reducer.reduceRunSession(docsRunSessionId, {
+      threadKey,
+      issueKey,
+      issueIdentifier,
+    });
+    expect(docsReduction).toMatchObject({
+      runSessionId: docsRunSessionId,
+      threadKey,
+      upsertedCount: 1,
+      deletedCount: 0,
+    });
+    expect(docsReduction.messages).toHaveLength(1);
+    expect(docsReduction.messages[0]).toMatchObject({
+      messageId: `run_activity:${docsRunSessionId}:message:shared-user`,
+      runId,
+      threadKey,
+      body: "Docs scoped prompt",
+      messageIndex: 0,
+    });
+
+    const reducedRows = await pool.query<{
+      project_context_id: string | null;
+      message_id: string;
+      run_id: string | null;
+      thread_key: string;
+      message_index: number;
+      body: string;
+    }>(
+      `
+        SELECT
+          project_context_id,
+          message_id,
+          run_id,
+          thread_key,
+          message_index,
+          body
+        FROM symphony.chat_message
+        WHERE run_id = $1
+          AND thread_key = $2
+          AND metadata->>'reducedFromRunActivity' = 'true'
+        ORDER BY project_context_id NULLS LAST, message_index, message_id
+      `,
+      [runId, threadKey],
+    );
+    expect(reducedRows.rows).toEqual([
+      {
+        project_context_id: "docs",
+        message_id: `run_activity:${docsRunSessionId}:message:shared-user`,
+        run_id: runId,
+        thread_key: threadKey,
+        message_index: 0,
+        body: "Docs scoped prompt",
+      },
+      {
+        project_context_id: "symphony",
+        message_id: `run_activity:${symphonyRunSessionId}:message:shared-user`,
+        run_id: runId,
+        thread_key: threadKey,
+        message_index: 0,
+        body: "Symphony scoped prompt",
+      },
+    ]);
+
+    const followup = await store.appendEvent(
+      runActivityAppendInput({
+        id: "activity:context-replay:symphony:2",
+        runId,
+        sessionId,
+        runSessionId: symphonyRunSessionId,
+        externalEventId: "external:context-replay:2",
+        actor: "user",
+        channel: "chat",
+        kind: "user_message_submitted",
+        text: "Symphony follow-up",
+        payload: { messageId: "shared-followup" },
+      }),
+    );
+    expect(followup).toMatchObject({
+      status: "accepted",
+      event: { runSessionId: symphonyRunSessionId, sequence: 2, sequenceSource: "symphony" },
+    });
+
+    const symphonyReplayReduction = await reducer.reduceRunSession(symphonyRunSessionId, {
+      threadKey,
+      issueKey,
+      issueIdentifier,
+    });
+    expect(symphonyReplayReduction).toMatchObject({
+      runSessionId: symphonyRunSessionId,
+      threadKey,
+      upsertedCount: 2,
+      deletedCount: 0,
+    });
+
+    const maintainedRows = await pool.query<{
+      project_context_id: string | null;
+      message_id: string;
+      run_id: string | null;
+      thread_key: string;
+      message_index: number;
+      body: string;
+    }>(
+      `
+        SELECT
+          project_context_id,
+          message_id,
+          run_id,
+          thread_key,
+          message_index,
+          body
+        FROM symphony.chat_message
+        WHERE run_id = $1
+          AND thread_key = $2
+          AND metadata->>'reducedFromRunActivity' = 'true'
+        ORDER BY project_context_id NULLS LAST, message_index, message_id
+      `,
+      [runId, threadKey],
+    );
+    expect(maintainedRows.rows).toEqual([
+      {
+        project_context_id: "docs",
+        message_id: `run_activity:${docsRunSessionId}:message:shared-user`,
+        run_id: runId,
+        thread_key: threadKey,
+        message_index: 0,
+        body: "Docs scoped prompt",
+      },
+      {
+        project_context_id: "symphony",
+        message_id: `run_activity:${symphonyRunSessionId}:message:shared-user`,
+        run_id: runId,
+        thread_key: threadKey,
+        message_index: 0,
+        body: "Symphony scoped prompt",
+      },
+      {
+        project_context_id: "symphony",
+        message_id: `run_activity:${symphonyRunSessionId}:message:shared-followup`,
+        run_id: runId,
+        thread_key: threadKey,
+        message_index: 1,
+        body: "Symphony follow-up",
+      },
+    ]);
+  } finally {
+    await pool.end();
   }
 }
 
