@@ -37,6 +37,32 @@ describe("project context normalization", () => {
     });
   });
 
+  it.each(["!!!", " --- ", "___", "   "])(
+    "rejects direct context ids without letters or numbers after normalization for %j",
+    (rawId) => {
+      expect(() => normalizeProjectContextId(rawId)).toThrowError(
+        "Project context id must contain at least one letter or number after normalization",
+      );
+    },
+  );
+
+  it.each(["!!!", " --- ", "___"])(
+    "rejects routed project context ids that normalize to an empty identifier for %j",
+    (rawId) => {
+      expect(() =>
+        normalizeProjectContextResolution({
+          projectContextId: rawId,
+        }),
+      ).toThrowError("Project context id must contain at least one letter or number after normalization");
+      expect(() =>
+        projectContextResolutionFromIssue({
+          projectContextId: rawId,
+          routingSource: "candidate_poll",
+        }),
+      ).toThrowError("Project context id must contain at least one letter or number after normalization");
+    },
+  );
+
   it("derives normalized project context metadata from routed issue payloads", () => {
     expect(
       projectContextResolutionFromIssue({
