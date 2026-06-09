@@ -85,6 +85,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     });
     const context: CompletionReportActiveContext = {
       issue: loadedContext.issue,
+      projectContext: loadedContext.projectContext,
       activeRunId: loadedContext.activeRunId,
       role: loadedContext.role,
       token: loadedContext.token ?? null,
