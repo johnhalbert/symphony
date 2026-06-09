@@ -1507,6 +1507,26 @@ describe("project context workflow contracts", () => {
 
   it.each([
     {
+      label: "missing tracker",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        workspace: {
+          source: {
+            kind: "git_worktree",
+            repository: ".",
+            base_ref: "origin/main",
+          },
+        },
+        project_contexts: [
+          {
+            id: "Docs Site",
+          },
+        ],
+      },
+      env: {},
+      expectedMessage: 'project_contexts["Docs Site"].tracker.api_key is required',
+    },
+    {
       label: "missing tracker project slug",
       rawConfig: {
         tracker: { kind: "linear" },
