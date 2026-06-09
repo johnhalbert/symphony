@@ -1205,4 +1205,62 @@ describe("FileRunTranscriptStore", () => {
     });
   });
 
+  it("updates run project context attribution while preserving existing context on unrelated updates", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const platformProjectContext = {
+      projectContextId: "platform",
+      projectContextLabel: "Platform Services",
+      linearProjectSlug: "PLAT",
+      routingSource: "workflow_default",
+    } as const;
+
+    await startBasicRun(store, "run-explicit-update", { projectContext: docsProjectContext });
+    await expect(
+      store.updateRun("run-explicit-update", {
+        status: "succeeded",
+        completedAt: "2026-01-01T00:00:02.000Z",
+      }),
+    ).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+      status: "succeeded",
+    });
+
+    await startBasicRun(store, "run-legacy-update", {
+      issueId: "issue-legacy-update",
+      issueIdentifier: "LEGACY-UPDATE-1",
+      workspaceKey: "legacy-update-workspace",
+      workspacePath: "/tmp/legacy-update-workspace",
+    });
+
+    const legacyRunPath = path.join(root, "runs", "run-legacy-update", "meta.json");
+    const legacyRun = JSON.parse(await readFile(legacyRunPath, "utf8")) as Record<string, unknown>;
+    delete legacyRun.projectContext;
+    await writeFile(legacyRunPath, `${JSON.stringify(legacyRun, null, 2)}
+`, "utf8");
+
+    await expect(
+      store.updateRun("run-legacy-update", {
+        projectContext: platformProjectContext,
+        status: "failed",
+        completedAt: "2026-01-01T00:00:03.000Z",
+      }),
+    ).resolves.toMatchObject({
+      projectContext: platformProjectContext,
+      status: "failed",
+    });
+
+    const persistedUpdatedRun = JSON.parse(await readFile(legacyRunPath, "utf8")) as Record<string, unknown>;
+    expect(persistedUpdatedRun.projectContext).toEqual(platformProjectContext);
+    await expect(store.getRun("run-legacy-update")).resolves.toMatchObject({
+      projectContext: platformProjectContext,
+      status: "failed",
+    });
+  });
+
 });
