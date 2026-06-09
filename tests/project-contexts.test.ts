@@ -109,6 +109,7 @@ describe("project context normalization", () => {
     expect(config.projectContexts.defaultContext).toMatchObject({
       id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
       label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      source: "legacy_default",
       tracker: { projectSlug: "TEST" },
       publicMetadata: {
         linearProjectSlug: "TEST",
@@ -157,6 +158,7 @@ describe("project context normalization", () => {
     const docsContext = config.projectContexts.byId.get("docs");
     expect(docsContext).toMatchObject({
       label: "Documentation Site",
+      source: "explicit",
       tracker: { projectSlug: "DOCS" },
       publicMetadata: {
         linearProjectSlug: "DOCS",
