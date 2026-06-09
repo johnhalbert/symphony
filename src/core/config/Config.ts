@@ -1167,19 +1167,48 @@ function normalizeWorkspaceConfigForProjectContext(
     }
   }
 
+  const sourceCleanup = rawWorkspace?.source?.cleanup;
+  const source: WorkspaceSourceConfig = {
+    kind: sourceKind,
+    ...(sourceCleanup === undefined ? {} : { cleanup: sourceCleanup }),
+  };
+
+  switch (sourceKind) {
+    case "copy":
+      if (sourcePath !== undefined) {
+        source.path = sourcePath;
+      }
+      break;
+    case "git":
+      if (sourceRepository !== undefined) {
+        source.repository = sourceRepository;
+      }
+      if (sourceRef !== undefined) {
+        source.ref = sourceRef;
+      }
+      break;
+    case "git_worktree":
+      if (sourceRepository !== undefined) {
+        source.repository = sourceRepository;
+      }
+      if (sourceBaseRef !== undefined) {
+        source.baseRef = sourceBaseRef;
+      }
+      if (sourceBranchTemplate !== undefined) {
+        source.branchTemplate = sourceBranchTemplate;
+      }
+      if (sourceCachePath !== undefined) {
+        source.cachePath = sourceCachePath;
+      }
+      break;
+    case "none":
+      break;
+  }
+
   return {
     root,
     stateDir,
-    source: {
-      kind: sourceKind,
-      ...(sourcePath === undefined ? {} : { path: sourcePath }),
-      ...(sourceRepository === undefined ? {} : { repository: sourceRepository }),
-      ...(sourceRef === undefined ? {} : { ref: sourceRef }),
-      ...(sourceBaseRef === undefined ? {} : { baseRef: sourceBaseRef }),
-      ...(sourceBranchTemplate === undefined ? {} : { branchTemplate: sourceBranchTemplate }),
-      ...(sourceCachePath === undefined ? {} : { cachePath: sourceCachePath }),
-      ...(rawWorkspace?.source?.cleanup === undefined ? {} : { cleanup: rawWorkspace.source.cleanup }),
-    },
+    source,
   };
 }
 

@@ -997,7 +997,7 @@ describe("MCP subprocess environment", () => {
       LINEAR_ASSIGNEE: "john",
       WORKSPACE_ROOT: config.workspace.root,
       WORKSPACE_STATE_DIR: config.workspace.stateDir,
-      WORKSPACE_SOURCE_PATH: config.workspace.source.path,
+      WORKSPACE_SOURCE_PATH: config.workspace.source.path ?? "",
       WORKSPACE_REPOSITORY: config.workspace.source.repository,
       WORKSPACE_CACHE_PATH: config.workspace.source.cachePath,
     });
@@ -1090,7 +1090,7 @@ describe("MCP subprocess environment", () => {
       DOCS_LINEAR_ASSIGNEE: "writer",
       DOCS_WORKSPACE_ROOT: config.projectContexts.byId.get("docs")?.workspace.root,
       DOCS_WORKSPACE_STATE_DIR: config.projectContexts.byId.get("docs")?.workspace.stateDir,
-      DOCS_WORKSPACE_SOURCE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.path,
+      DOCS_WORKSPACE_SOURCE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.path ?? "",
       DOCS_WORKSPACE_REPOSITORY: config.projectContexts.byId.get("docs")?.workspace.source.repository,
       DOCS_WORKSPACE_CACHE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.cachePath,
       DOCS_GITHUB_OWNER: "acme-docs",

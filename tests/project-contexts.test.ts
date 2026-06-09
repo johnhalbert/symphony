@@ -331,6 +331,95 @@ describe("project context normalization", () => {
     );
   });
 
+  it("drops inherited git_worktree workspace.source fields when explicit contexts switch source kinds", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            source: {
+              kind: "git_worktree",
+              repository: ".",
+              base_ref: "origin/release",
+              branch_template: "global/{{ issue.identifier }}",
+              cache_path: "./cache/shared",
+              cleanup: "force",
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs-copy",
+            label: "Docs Copy",
+            projectSlug: "DOCS_COPY",
+            repository: null,
+            baseRef: null,
+            branchTemplate: null,
+            workspace: {
+              source: {
+                kind: "copy",
+                path: "./docs-src",
+              },
+            },
+          }),
+          projectContextFixture({
+            id: "docs-git",
+            label: "Docs Git",
+            projectSlug: "DOCS_GIT",
+            repository: null,
+            baseRef: null,
+            branchTemplate: null,
+            workspace: {
+              source: {
+                kind: "git",
+                repository: "../docs-repo",
+                ref: "feature/docs",
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+
+    const copyContext = config.projectContexts.byId.get("docs-copy");
+    const gitContext = config.projectContexts.byId.get("docs-git");
+
+    expect(copyContext?.workspace.source).toEqual({
+      kind: "copy",
+      path: path.resolve("/repo", "./docs-src"),
+      cleanup: "refuse_dirty",
+    });
+    expect(copyContext?.publicMetadata).toEqual({
+      id: "docs-copy",
+      label: "Docs Copy",
+      enabled: true,
+      linearProjectSlug: "DOCS_COPY",
+      workspaceRoot: path.resolve("/repo", "./symphony_workspaces"),
+      workspaceSourceKind: "copy",
+      repository: null,
+      path: path.resolve("/repo", "./docs-src"),
+    });
+
+    expect(gitContext?.workspace.source).toEqual({
+      kind: "git",
+      repository: path.resolve("/repo", "../docs-repo"),
+      ref: "feature/docs",
+      cleanup: "refuse_dirty",
+    });
+    expect(gitContext?.publicMetadata).toEqual({
+      id: "docs-git",
+      label: "Docs Git",
+      enabled: true,
+      linearProjectSlug: "DOCS_GIT",
+      workspaceRoot: path.resolve("/repo", "./symphony_workspaces"),
+      workspaceSourceKind: "git",
+      repository: path.resolve("/repo", "../docs-repo"),
+      path: null,
+    });
+  });
+
   it("projects default-context credential profiles into the legacy service credential registry", () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
