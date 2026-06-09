@@ -19,6 +19,13 @@ import {
   testConfig,
 } from "./helpers.js";
 
+const docsProjectContext = {
+  projectContextId: "docs-site",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
+
 describe("IssueBreakdownPlanService", () => {
   let root: string;
 
@@ -81,6 +88,45 @@ describe("IssueBreakdownPlanService", () => {
       planId: first.plan.id,
       summary: expect.stringContaining("Build planning schema"),
       issueContentFingerprint: first.plan.issueContentFingerprint,
+    });
+  });
+
+  it("propagates project context onto persisted issue breakdown plans and lifecycle state", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ updatedAt: "2026-01-02T00:00:00Z" });
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    const result = await service.submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-context",
+        issueId: candidate.id,
+        summary: "Split the work into child issues.",
+        proposedIssues: [
+          {
+            title: "Build planning schema",
+            description: agentEligibleIssueContract(),
+            acceptanceCriteria: ["Plans persist proposed issues."],
+            dependencies: [],
+            labels: ["planning"],
+          },
+        ],
+        idempotencyKey: "plan-context",
+      },
+      {
+        issue: candidate,
+        projectContext: docsProjectContext,
+        activeRunId: "run-plan-context",
+        role: "worker",
+        phase: "issue_breakdown",
+      },
+    );
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(result.plan).toMatchObject({ projectContext: docsProjectContext });
+    expect(lifecycle).toMatchObject({
+      projectContext: docsProjectContext,
+      issueBreakdownPlans: [expect.objectContaining({ projectContext: docsProjectContext })],
     });
   });
 

@@ -29,6 +29,13 @@ import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 
+const docsProjectContext = {
+  projectContextId: "docs-site",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
+
 describe("IssueBreakdownPlanApplyService", () => {
   let root: string;
 
@@ -447,6 +454,60 @@ describe("IssueBreakdownPlanApplyService", () => {
       applicationOperationKeys: [operation.idempotencyKey],
       createdIssueRefs: [],
     });
+  });
+
+  it("preserves project context on issue breakdown application and finalization writebacks", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const plan = await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-context",
+        issueId: candidate.id,
+        summary: "Split into child issues.",
+        proposedIssues: [
+          {
+            title: "Build child",
+            description: agentEligibleIssueContract(),
+            acceptanceCriteria: ["Done"],
+            dependencies: [],
+            labels: ["planning"],
+          },
+          {
+            title: "Build dependent child",
+            description: agentEligibleIssueContract(),
+            acceptanceCriteria: ["Done"],
+            dependencies: ["Build child"],
+            labels: ["planning"],
+          },
+        ],
+        idempotencyKey: "plan-context",
+      },
+      {
+        issue: candidate,
+        projectContext: docsProjectContext,
+        activeRunId: "run-plan-context",
+        role: "worker",
+        phase: "issue_breakdown",
+      },
+    );
+    const childOperations = planIssueBreakdownApplicationWritebacks(candidate, plan.plan) as IssueCreateWriteback[];
+    const planWithRefs = {
+      ...plan.plan,
+      createdIssueRefs: childOperations.map((operation) => createdIssueRef(operation)),
+    };
+    const finalOperations = planIssueBreakdownFinalizationWritebacks(candidate, planWithRefs);
+
+    expect(childOperations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectContext: docsProjectContext }),
+      ]),
+    );
+    expect(finalOperations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectContext: docsProjectContext }),
+      ]),
+    );
   });
 
   it("recovers stale-skipped child writebacks on a fresh live apply without duplicating succeeded children", async () => {

@@ -7,6 +7,7 @@ import {
 import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
+import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { Issue } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -16,6 +17,7 @@ export const REVIEW_VERDICT_TOOL_NAME = "submit_review_verdict";
 
 export interface ReviewVerdictMcpContextFile {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string | null;
   role: "reviewer";
   token?: string | null;

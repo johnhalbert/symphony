@@ -2,6 +2,10 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
+import {
+  normalizeProjectContextResolution,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { SymphonyError } from "../errors.js";
 import type { RunTranscriptStore, TranscriptEvent } from "../persistence/RunTranscriptStore.js";
 
@@ -26,6 +30,7 @@ export interface OperatorApprovalRecord {
   status: OperatorApprovalStatus;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   runId: string;
   evidenceCursor: string;
   dedupeKey: string;
@@ -46,6 +51,7 @@ export interface OperatorApprovalResolution {
 export interface OperatorApprovalRequestInput {
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   runId: string;
   evidenceCursor: string;
   action: OperatorApprovalAction;
@@ -58,16 +64,22 @@ export class FileOperatorApprovalStore {
 
   async requestOrGetPending(input: OperatorApprovalRequestInput, timeoutMs: number | null): Promise<{ record: OperatorApprovalRecord; created: boolean }> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
-    const existing = await this.getByDedupe(input.runId, input.evidenceCursor);
-    if (existing) return { record: existing, created: false };
+    const requestId = requestIdFor(dedupeKey(input.runId, input.evidenceCursor));
+    const existing = await this.get(requestId);
+    if (existing) {
+      return {
+        record: await this.backfillProjectContextOnReplay(existing, input.projectContext),
+        created: false,
+      };
+    }
 
     const requestedAt = new Date().toISOString();
-    const requestId = requestIdFor(dedupeKey(input.runId, input.evidenceCursor));
-    const record: OperatorApprovalRecord = {
+    const record: OperatorApprovalRecord = normalizeOperatorApprovalRecord({
       requestId,
       status: "pending",
       issueId: input.issueId,
       issueIdentifier: input.issueIdentifier,
+      projectContext: normalizeProjectContextResolution(input.projectContext),
       runId: input.runId,
       evidenceCursor: input.evidenceCursor,
       dedupeKey: dedupeKey(input.runId, input.evidenceCursor),
@@ -78,13 +90,14 @@ export class FileOperatorApprovalStore {
       resolvedBy: null,
       decision: null,
       staleReason: null,
-    };
+    });
     await this.write(record);
     return { record, created: true };
   }
 
   async get(requestId: string): Promise<OperatorApprovalRecord | null> {
-    return readJsonIfExists<OperatorApprovalRecord>(this.recordPath(requestId));
+    const record = await readJsonIfExists<OperatorApprovalRecord>(this.recordPath(requestId));
+    return record === null ? null : normalizeOperatorApprovalRecord(record);
   }
 
   async getByDedupe(runId: string, evidenceCursor: string): Promise<OperatorApprovalRecord | null> {
@@ -113,26 +126,31 @@ export class FileOperatorApprovalStore {
       const records = await Promise.all(
         entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<OperatorApprovalRecord>(path.join(this.recordsDir(), entry))),
       );
-      return records.filter((record): record is OperatorApprovalRecord => record !== null);
+      return records.filter((record): record is OperatorApprovalRecord => record !== null).map(normalizeOperatorApprovalRecord);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
     }
   }
 
+  private async readStoredRecord(requestId: string): Promise<Record<string, unknown> | null> {
+    return readJsonIfExists<Record<string, unknown>>(this.recordPath(requestId));
+  }
+
   async resolve(requestId: string, decision: OperatorApprovalDecision): Promise<OperatorApprovalResolution> {
     const existing = await this.get(requestId);
     if (!existing) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
-    if (existing.status === "approved" || existing.status === "rejected") {
-      if ((existing.status === "approved" && decision === "approve") || (existing.status === "rejected" && decision === "reject")) {
-        return { request: existing, replayed: true };
+    const repaired = await this.repairProjectContextIfMissing(existing);
+    if (repaired.status === "approved" || repaired.status === "rejected") {
+      if ((repaired.status === "approved" && decision === "approve") || (repaired.status === "rejected" && decision === "reject")) {
+        return { request: repaired, replayed: true };
       }
-      throw new SymphonyError("conflict", `Approval request is already ${existing.status}`);
+      throw new SymphonyError("conflict", `Approval request is already ${repaired.status}`);
     }
-    if (existing.status !== "pending") {
-      throw new SymphonyError("conflict", `Approval request is ${existing.status}`);
+    if (repaired.status !== "pending") {
+      throw new SymphonyError("conflict", `Approval request is ${repaired.status}`);
     }
-    const resolved = await this.markTerminal(existing, decision === "approve" ? "approved" : "rejected", {
+    const resolved = await this.markTerminal(repaired, decision === "approve" ? "approved" : "rejected", {
       decision,
       resolvedBy: "operator",
     });
@@ -141,20 +159,23 @@ export class FileOperatorApprovalStore {
 
   async markStale(requestId: string, reason: string): Promise<OperatorApprovalRecord> {
     const existing = await this.require(requestId);
-    if (existing.status !== "pending") return existing;
-    return this.markTerminal(existing, "stale", { staleReason: reason, resolvedBy: "system" });
+    const repaired = await this.repairProjectContextIfMissing(existing);
+    if (repaired.status !== "pending") return repaired;
+    return this.markTerminal(repaired, "stale", { staleReason: reason, resolvedBy: "system" });
   }
 
   async markExpired(requestId: string): Promise<OperatorApprovalRecord> {
     const existing = await this.require(requestId);
-    if (existing.status !== "pending") return existing;
-    return this.markTerminal(existing, "expired", { staleReason: "approval request expired", resolvedBy: "system" });
+    const repaired = await this.repairProjectContextIfMissing(existing);
+    if (repaired.status !== "pending") return repaired;
+    return this.markTerminal(repaired, "expired", { staleReason: "approval request expired", resolvedBy: "system" });
   }
 
   async markCancelled(requestId: string, reason: string): Promise<OperatorApprovalRecord> {
     const existing = await this.require(requestId);
-    if (existing.status !== "pending") return existing;
-    return this.markTerminal(existing, "cancelled", { staleReason: reason, resolvedBy: "system" });
+    const repaired = await this.repairProjectContextIfMissing(existing);
+    if (repaired.status !== "pending") return repaired;
+    return this.markTerminal(repaired, "cancelled", { staleReason: reason, resolvedBy: "system" });
   }
 
   private async require(requestId: string): Promise<OperatorApprovalRecord> {
@@ -168,16 +189,45 @@ export class FileOperatorApprovalStore {
     status: OperatorApprovalStatus,
     patch: Partial<Pick<OperatorApprovalRecord, "decision" | "resolvedBy" | "staleReason">>,
   ): Promise<OperatorApprovalRecord> {
-    const resolved: OperatorApprovalRecord = {
+    const resolved: OperatorApprovalRecord = normalizeOperatorApprovalRecord({
       ...record,
       status,
       decision: patch.decision ?? record.decision,
       resolvedBy: patch.resolvedBy ?? record.resolvedBy,
       staleReason: patch.staleReason ?? record.staleReason,
       resolvedAt: new Date().toISOString(),
-    };
+    });
     await this.write(resolved);
     return resolved;
+  }
+
+  private async backfillProjectContextOnReplay(
+    existing: OperatorApprovalRecord,
+    projectContext: ProjectContextResolution | undefined,
+  ): Promise<OperatorApprovalRecord> {
+    return this.repairProjectContextIfMissing(existing, projectContext);
+  }
+
+  private async repairProjectContextIfMissing(
+    existing: OperatorApprovalRecord,
+    projectContext: ProjectContextResolution | undefined = undefined,
+  ): Promise<OperatorApprovalRecord> {
+    const raw = await this.readStoredRecord(existing.requestId);
+    if (!needsProjectContextBackfill(raw)) return existing;
+    const runProjectContext = projectContext ?? (await this.readRunProjectContext(existing.runId));
+    const repaired = normalizeOperatorApprovalRecord({
+      ...existing,
+      projectContext: normalizeProjectContextResolution(runProjectContext),
+    });
+    await this.write(repaired);
+    return repaired;
+  }
+
+  private async readRunProjectContext(runId: string): Promise<ProjectContextResolution | undefined> {
+    const run = await readJsonIfExists<{ projectContext?: ProjectContextResolution | undefined }>(
+      path.join(this.stateDir, "runs", safeFileName(runId), "meta.json"),
+    );
+    return run?.projectContext;
   }
 
   private async write(record: OperatorApprovalRecord): Promise<void> {
@@ -208,12 +258,14 @@ export class OperatorApprovalService {
   }
 
   async requestPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
+    const projectContext = await this.resolveProjectContext(input);
     if (!this.isRequired()) {
-      return {
+      return normalizeOperatorApprovalRecord({
         requestId: "",
         status: "approved",
         issueId: input.issueId,
         issueIdentifier: input.issueIdentifier,
+        projectContext,
         runId: input.runId,
         evidenceCursor: input.evidenceCursor,
         dedupeKey: dedupeKey(input.runId, input.evidenceCursor),
@@ -224,12 +276,13 @@ export class OperatorApprovalService {
         resolvedBy: "system",
         decision: "approve",
         staleReason: null,
-      };
+      });
     }
 
     await this.staleOtherPendingRequests(input.runId, input.evidenceCursor);
+    const requestInput = { ...input, projectContext };
     const { record, created } = await this.options.store.requestOrGetPending(
-      input,
+      requestInput,
       operatorApprovalConfig(this.options.config).timeoutMs,
     );
     if (record.status === "pending") {
@@ -389,6 +442,16 @@ export class OperatorApprovalService {
     });
   }
 
+  private async resolveProjectContext(
+    input: OperatorApprovalRequestInput,
+  ): Promise<ProjectContextResolution> {
+    if (input.projectContext) {
+      return normalizeProjectContextResolution(input.projectContext);
+    }
+    const run = await this.getRun(input.runId);
+    return normalizeProjectContextResolution(run?.projectContext);
+  }
+
   private async getRun(runId: string) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
@@ -445,6 +508,7 @@ export function approvalRequestPayload(record: OperatorApprovalRecord): Record<s
       { id: "reject", label: "Reject", decision: "reject" },
     ],
     action: record.action,
+    projectContext: record.projectContext,
     dedupeKey: { runId: record.runId, evidenceCursor: record.evidenceCursor },
     requestedAt: record.requestedAt,
     expiresAt: record.expiresAt,
@@ -468,8 +532,20 @@ function approvalResolvedPayload(record: OperatorApprovalRecord, rejectPolicy: O
     resolvedAt: record.resolvedAt,
     resolvedBy: record.resolvedBy,
     staleReason: record.staleReason,
+    projectContext: record.projectContext,
     rejectPolicy: record.status === "rejected" ? rejectPolicy : undefined,
   };
+}
+
+function normalizeOperatorApprovalRecord(record: OperatorApprovalRecord): OperatorApprovalRecord {
+  return {
+    ...record,
+    projectContext: normalizeProjectContextResolution(record.projectContext),
+  };
+}
+
+function needsProjectContextBackfill(record: Record<string, unknown> | null): boolean {
+  return record !== null && (!Object.prototype.hasOwnProperty.call(record, "projectContext") || record.projectContext === null);
 }
 
 function dedupeKey(runId: string, evidenceCursor: string): string {

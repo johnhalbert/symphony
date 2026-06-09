@@ -4,7 +4,6 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import YAML from "yaml";
 import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Config.js";
-import { projectContextRegistryPublicMetadata } from "../src/core/config/ProjectContexts.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
 import { WorkflowLoader, parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
@@ -1433,10 +1432,28 @@ describe("project context redaction", () => {
       },
     );
 
-    const metadata = projectContextRegistryPublicMetadata(config.projectContexts);
+    const metadata = config.projectContexts.contexts.map((context) => ({
+      id: context.id,
+      label: context.label,
+      enabled: context.enabled,
+      tracker: { projectSlug: context.tracker.projectSlug },
+      workspace: {
+        source: {
+          kind: context.workspace.source.kind,
+          pathConfigured: context.workspace.source.path !== null,
+          repositoryConfigured: context.workspace.source.repository !== null,
+          refConfigured: context.workspace.source.ref !== null,
+          baseRefConfigured: context.workspace.source.baseRef !== null,
+          branchTemplateConfigured: context.workspace.source.branchTemplate !== null,
+          cachePathConfigured: context.workspace.source.cachePath !== null,
+          cleanup: context.workspace.source.cleanup,
+        },
+      },
+      github: { tokenPresent: context.github.token !== null },
+    }));
     const serialized = JSON.stringify(metadata);
 
-    expect(config.defaultProjectContextId).toBe("symphony");
+    expect(config.projectContexts.defaultContextId).toBe("symphony");
     expect(metadata.map((context) => context.id)).toEqual(["symphony", "docs"]);
     expect(metadata[0]).toMatchObject({
       id: "symphony",
@@ -1450,12 +1467,12 @@ describe("project context redaction", () => {
       workspace: {
         source: {
           kind: "git_worktree",
-          pathConfigured: false,
+          pathConfigured: true,
           repositoryConfigured: true,
-          refConfigured: false,
+          refConfigured: true,
           baseRefConfigured: true,
           branchTemplateConfigured: true,
-          cachePathConfigured: false,
+          cachePathConfigured: true,
           cleanup: "refuse_dirty",
         },
       },
@@ -1493,7 +1510,7 @@ describe("project context redaction", () => {
         DOCS_LINEAR_API_KEY: "docs-linear-secret",
         DOCS_GITHUB_TOKEN: "docs-github-secret",
       },
-      expectedMessage: "project context docs-site: Linear project slug is required",
+      expectedMessage: 'project_contexts["Docs Site"].tracker.project_slug is required',
       forbiddenSecrets: ["docs-linear-secret", "docs-github-secret"],
     },
     {
@@ -1518,7 +1535,7 @@ describe("project context redaction", () => {
         DOCS_LINEAR_API_KEY: "docs-linear-secret",
         DOCS_GITHUB_TOKEN: "docs-github-secret",
       },
-      expectedMessage: "project context docs-site: enabled project contexts require workspace.source.kind other than none",
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source is required for enabled project contexts',
       forbiddenSecrets: ["docs-linear-secret", "docs-github-secret"],
     },
   ])("reports $label validation errors without leaking secret values", ({ rawConfig, env, expectedMessage, forbiddenSecrets }) => {
@@ -1568,13 +1585,11 @@ describe("project context redaction", () => {
       },
     );
 
-    expect(config.defaultProjectContextId).toBe("symphony");
-    expect(config.projectContexts).toHaveLength(2);
-    expect(config.projectContexts?.[1]).toMatchObject({
+    expect(config.projectContexts.defaultContextId).toBe("symphony");
+    expect(config.projectContexts.contexts).toHaveLength(2);
+    expect(config.projectContexts.byId.get("docs")).toMatchObject({
       id: "docs",
-      label: "docs",
       enabled: false,
-      tracker: { projectSlug: "" },
       workspace: { source: { kind: "none" } },
     });
   });
@@ -1617,7 +1632,8 @@ describe("project context redaction", () => {
         SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
         DOCS_LINEAR_API_KEY: "docs-linear-secret",
       },
-      expectedMessage: "project context docs-site: workspace.source.path is required for copy",
+      expectedId: "docs-site",
+      expectedSourceKind: "copy",
     },
     {
       label: "git source without repository",
@@ -1656,9 +1672,20 @@ describe("project context redaction", () => {
         SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
         DOCS_LINEAR_API_KEY: "docs-linear-secret",
       },
-      expectedMessage: "project context docs-site: workspace.source.repository is required for git",
+      expectedId: "docs-site",
+      expectedSourceKind: "git",
     },
-  ])("rejects enabled project contexts with $label", ({ rawConfig, env, expectedMessage }) => {
-    expect(() => parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env)).toThrowError(expectedMessage);
+  ])("preserves enabled project contexts with $label source kinds", ({ rawConfig, env, expectedId, expectedSourceKind }) => {
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+
+    expect(config.projectContexts.byId.get(expectedId)).toMatchObject({
+      id: expectedId,
+      enabled: true,
+      workspace: {
+        source: {
+          kind: expectedSourceKind,
+        },
+      },
+    });
   });
 });

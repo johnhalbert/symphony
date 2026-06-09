@@ -1,123 +1,216 @@
-import type {
-  AgentConfig,
-  GitHubConfig,
-  IssueBreakdownConfig,
-  RawWorkflowConfig,
-  ReviewLoopConfig,
-  TrackerConfig,
-  WorkspaceConfig,
-  WorkspaceSourceConfig,
-} from "./Config.js";
+export type ProjectContextId = string;
 
-export const DEFAULT_PROJECT_CONTEXT_ID = "default";
-export const DEFAULT_PROJECT_CONTEXT_LABEL = "Default";
+export const LEGACY_DEFAULT_PROJECT_CONTEXT_ID = "default";
+export const LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL = "Default";
+export const LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE = "legacy_default";
 
-export interface ProjectContextConfig {
-  id: string;
-  label: string;
-  enabled: boolean;
-  tracker: TrackerConfig;
-  workspace: WorkspaceConfig;
-  github: GitHubConfig;
-  reviewLoop: ReviewLoopConfig;
-  issueBreakdown: IssueBreakdownConfig;
-  agent: AgentConfig;
-  raw: RawWorkflowConfig;
+export interface ProjectContextResolution {
+  projectContextId: ProjectContextId;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
+  routingSource: string;
+}
+
+export interface ProjectContextIssueLike {
+  projectContext?: Partial<ProjectContextResolution> | null;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  linearProjectSlug?: string | null;
+  routingSource?: string | null;
+  linearProjectIdentity?: {
+    slug?: string | null;
+  } | null;
 }
 
 export interface ProjectContextPublicMetadata {
-  id: string;
+  id: ProjectContextId;
   label: string;
   enabled: boolean;
-  tracker: {
-    kind: "linear";
-    endpoint: string;
-    projectSlug: string;
-    assignee: string | null;
-    activeStates: string[];
-    handoffStates: string[];
-    terminalStates: string[];
-  };
-  workspace: {
-    root: string;
-    stateDir: string;
-    source: {
-      kind: WorkspaceSourceConfig["kind"];
-      pathConfigured: boolean;
-      repositoryConfigured: boolean;
-      refConfigured: boolean;
-      baseRefConfigured: boolean;
-      branchTemplateConfigured: boolean;
-      cachePathConfigured: boolean;
-      cleanup: WorkspaceSourceConfig["cleanup"] | null;
-    };
-  };
-  github: {
-    owner: string | null;
-    repo: string | null;
-    headOwner: string | null;
-    apiBaseUrl: string;
-    publishPullRequests: boolean;
-    tokenPresent: boolean;
-    appConfigured: boolean;
-  };
+  linearProjectSlug: string | null;
+  workspaceRoot: string | null;
+  workspaceSourceKind: string | null;
+  repository: string | null;
+  path: string | null;
 }
 
-export function normalizeProjectContextId(value: string): string {
-  const normalized = value
+export interface ProjectContextConfig<
+  TTracker = unknown,
+  TWorkspace = unknown,
+  TGitHub = unknown,
+  TReviewLoop = unknown,
+  TIssueBreakdown = unknown,
+  TAgent = unknown,
+  TCredentialProfiles = unknown,
+> {
+  id: string;
+  label?: string;
+  enabled?: boolean;
+  tracker?: TTracker;
+  workspace?: TWorkspace;
+  github?: TGitHub;
+  review_loop?: TReviewLoop;
+  issue_breakdown?: TIssueBreakdown;
+  agent?: TAgent;
+  credential_profiles?: TCredentialProfiles;
+}
+
+export interface NormalizedProjectContext<
+  TTracker = unknown,
+  TWorkspace = unknown,
+  TGitHub = unknown,
+  TReviewLoop = unknown,
+  TIssueBreakdown = unknown,
+  TAgent = unknown,
+  TCredentialProfiles = unknown,
+> {
+  id: ProjectContextId;
+  label: string;
+  enabled: boolean;
+  tracker: TTracker;
+  workspace: TWorkspace;
+  github: TGitHub;
+  reviewLoop: TReviewLoop;
+  issueBreakdown: TIssueBreakdown;
+  agent: TAgent;
+  credentialProfiles?: TCredentialProfiles;
+  publicMetadata: ProjectContextPublicMetadata;
+}
+
+export interface ProjectContextRegistry<TContext extends { id: ProjectContextId; enabled: boolean }> {
+  contexts: TContext[];
+  enabledContexts: TContext[];
+  defaultContextId: ProjectContextId;
+  defaultContext: TContext;
+  byId: ReadonlyMap<ProjectContextId, TContext>;
+}
+
+export function normalizeProjectContextId(raw: string): ProjectContextId {
+  const normalized = raw
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^[-._]+|[-._]+$/g, "");
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
   if (normalized.length === 0) {
-    throw new Error("Project context id must not be empty after normalization");
+    throw new Error("Project context id must contain at least one letter or number after normalization");
   }
   return normalized;
 }
 
-export function projectContextPublicMetadata(context: ProjectContextConfig): ProjectContextPublicMetadata {
+export function defaultProjectContextLabel(id: string): string {
+  if (id === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL;
+  return id
+    .split(/[-_]+/)
+    .filter((part) => part.length > 0)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+export function normalizeProjectContextResolution(
+  value: Partial<ProjectContextResolution> | null | undefined,
+): ProjectContextResolution {
+  const rawProjectContextId = normalizeOptionalNonEmptyString(value?.projectContextId);
+  const projectContextId =
+    rawProjectContextId === null ? LEGACY_DEFAULT_PROJECT_CONTEXT_ID : normalizeProjectContextId(rawProjectContextId);
   return {
-    id: context.id,
-    label: context.label,
-    enabled: context.enabled,
-    tracker: {
-      kind: context.tracker.kind,
-      endpoint: context.tracker.endpoint,
-      projectSlug: context.tracker.projectSlug,
-      assignee: context.tracker.assignee,
-      activeStates: [...context.tracker.activeStates],
-      handoffStates: [...context.tracker.handoffStates],
-      terminalStates: [...context.tracker.terminalStates],
-    },
-    workspace: {
-      root: context.workspace.root,
-      stateDir: context.workspace.stateDir,
-      source: {
-        kind: context.workspace.source.kind,
-        pathConfigured: context.workspace.source.path !== undefined,
-        repositoryConfigured: context.workspace.source.repository !== undefined,
-        refConfigured: context.workspace.source.ref !== undefined,
-        baseRefConfigured: context.workspace.source.baseRef !== undefined,
-        branchTemplateConfigured: context.workspace.source.branchTemplate !== undefined,
-        cachePathConfigured: context.workspace.source.cachePath !== undefined,
-        cleanup: context.workspace.source.cleanup ?? null,
-      },
-    },
-    github: {
-      owner: context.github.owner,
-      repo: context.github.repo,
-      headOwner: context.github.headOwner,
-      apiBaseUrl: context.github.apiBaseUrl,
-      publishPullRequests: context.github.publishPullRequests,
-      tokenPresent: context.github.token !== null,
-      appConfigured: context.github.app !== null,
-    },
+    projectContextId,
+    projectContextLabel:
+      normalizeOptionalNonEmptyString(value?.projectContextLabel) ??
+      (projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+        ? LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL
+        : defaultProjectContextLabel(projectContextId)),
+    linearProjectSlug: normalizeOptionalNonEmptyString(value?.linearProjectSlug),
+    routingSource:
+      normalizeOptionalNonEmptyString(value?.routingSource) ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
   };
 }
 
-export function projectContextRegistryPublicMetadata(
-  contexts: readonly ProjectContextConfig[] | undefined,
-): ProjectContextPublicMetadata[] {
-  return (contexts ?? []).map(projectContextPublicMetadata);
+export function projectContextResolutionFromIssue(issue: unknown): ProjectContextResolution | null {
+  if (typeof issue !== "object" || issue === null) return null;
+  const value = issue as ProjectContextIssueLike;
+  if (value.projectContext) {
+    return normalizeProjectContextResolution(value.projectContext);
+  }
+
+  const projectContextId = normalizeOptionalNonEmptyString(value.projectContextId);
+  const projectContextLabel = normalizeOptionalNonEmptyString(value.projectContextLabel);
+  const linearProjectSlug =
+    normalizeOptionalNonEmptyString(value.linearProjectSlug) ??
+    normalizeOptionalNonEmptyString(value.linearProjectIdentity?.slug);
+  const routingSource = normalizeOptionalNonEmptyString(value.routingSource);
+
+  if (projectContextId === null && projectContextLabel === null && linearProjectSlug === null && routingSource === null) {
+    return null;
+  }
+
+  return normalizeProjectContextResolution({
+    ...(projectContextId === null ? {} : { projectContextId }),
+    ...(projectContextLabel === null ? {} : { projectContextLabel }),
+    ...(linearProjectSlug === null ? {} : { linearProjectSlug }),
+    ...(routingSource === null ? {} : { routingSource }),
+  });
+}
+
+export function projectContextMetadataForPublicRead(input: {
+  id: ProjectContextId;
+  label: string;
+  enabled: boolean;
+  tracker?: { projectSlug?: string | null } | null;
+  workspace?: {
+    root?: string | null;
+    source?: {
+      kind?: string | null;
+      repository?: string | null;
+      path?: string | null;
+    } | null;
+  } | null;
+}): ProjectContextPublicMetadata {
+  return {
+    id: input.id,
+    label: input.label,
+    enabled: input.enabled,
+    linearProjectSlug: normalizeOptionalNonEmptyString(input.tracker?.projectSlug),
+    workspaceRoot: normalizeOptionalNonEmptyString(input.workspace?.root),
+    workspaceSourceKind: normalizeOptionalNonEmptyString(input.workspace?.source?.kind),
+    repository: normalizeOptionalNonEmptyString(input.workspace?.source?.repository),
+    path: normalizeOptionalNonEmptyString(input.workspace?.source?.path),
+  };
+}
+
+export function buildProjectContextRegistry<TContext extends { id: ProjectContextId; enabled: boolean }>(
+  contexts: readonly TContext[],
+): ProjectContextRegistry<TContext> {
+  if (contexts.length === 0) {
+    throw new Error("At least one project context is required");
+  }
+
+  const byId = new Map<ProjectContextId, TContext>();
+  for (const context of contexts) {
+    if (byId.has(context.id)) {
+      throw new Error(`Duplicate project context id: ${context.id}`);
+    }
+    byId.set(context.id, context);
+  }
+
+  const enabledContexts = contexts.filter((context) => context.enabled);
+  const defaultContext =
+    enabledContexts.find((context) => context.id === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) ??
+    enabledContexts[0] ??
+    null;
+  if (defaultContext === null) {
+    throw new Error("At least one enabled project context is required");
+  }
+
+  return {
+    contexts: [...contexts],
+    enabledContexts,
+    defaultContextId: defaultContext.id,
+    defaultContext,
+    byId,
+  };
+}
+
+function normalizeOptionalNonEmptyString(value: string | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+  const normalized = value.trim();
+  return normalized.length === 0 ? null : normalized;
 }

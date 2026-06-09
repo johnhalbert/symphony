@@ -3,6 +3,10 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
+import {
+  normalizeProjectContextResolution,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 import { isRunActivityCommandPolicyDecisionPayload } from "../runActivity/RunActivityEvent.js";
@@ -90,6 +94,7 @@ export interface WorkspaceRecord {
   workspaceKey: string;
   issueId: string | null;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   path: string;
   sourceKind: string;
   repoPath?: string;
@@ -145,6 +150,7 @@ export interface RunRecord {
   runKind?: AgentRunKind;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   attempt: number | null;
   turnNumber: number;
   prompt: string;
@@ -274,6 +280,7 @@ export interface StartRunInput {
   runKind?: AgentRunKind;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   attempt: number | null;
   turnNumber: number;
   prompt: string;
@@ -336,16 +343,21 @@ export class FileRunTranscriptStore {
   async upsertWorkspace(record: WorkspaceRecord): Promise<void> {
     await fs.mkdir(this.workspacesDir(), { recursive: true });
     const existing = await this.getWorkspace(record.workspaceKey);
-    await writeJson(this.workspacePath(record.workspaceKey), {
+    const normalized = normalizeWorkspaceRecord({
       ...record,
-      createdAt: existing?.createdAt ?? record.createdAt,
-      updatedAt: record.updatedAt,
+      projectContext: record.projectContext ?? existing?.projectContext,
+    });
+    await writeJson(this.workspacePath(record.workspaceKey), {
+      ...normalized,
+      createdAt: existing?.createdAt ?? normalized.createdAt,
+      updatedAt: normalized.updatedAt,
     });
     this.notifyProjectionChanged("workspaces");
   }
 
   async getWorkspace(workspaceKey: string): Promise<WorkspaceRecord | null> {
-    return readJsonIfExists<WorkspaceRecord>(this.workspacePath(workspaceKey));
+    const record = await readJsonIfExists<WorkspaceRecord>(this.workspacePath(workspaceKey));
+    return record === null ? null : normalizeWorkspaceRecord(record);
   }
 
   async deleteWorkspace(workspaceKey: string): Promise<void> {
@@ -361,7 +373,7 @@ export class FileRunTranscriptStore {
     const records = await Promise.all(
       entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<WorkspaceRecord>(path.join(this.workspacesDir(), entry))),
     );
-    return records.filter((record): record is WorkspaceRecord => record !== null);
+    return records.filter((record): record is WorkspaceRecord => record !== null).map(normalizeWorkspaceRecord);
   }
 
   async findWorkspace(issueIdOrIdentifierOrKey: string): Promise<WorkspaceRecord | null> {
@@ -381,6 +393,7 @@ export class FileRunTranscriptStore {
   async startRun(input: StartRunInput): Promise<RunRecord> {
     const now = new Date().toISOString();
     const existing = await this.getRun(input.runId);
+    const projectContext = normalizeProjectContextResolution(input.projectContext ?? existing?.projectContext);
     const record: RunRecord = {
       ...existing,
       runId: input.runId,
@@ -391,6 +404,7 @@ export class FileRunTranscriptStore {
       runKind: input.runKind ?? existing?.runKind ?? runKindForPhase(input.runPhase ?? existing?.runPhase ?? defaultRunPhase(input.role)),
       issueId: input.issueId,
       issueIdentifier: input.issueIdentifier,
+      projectContext,
       attempt: input.attempt,
       turnNumber: input.turnNumber,
       prompt: promptPreview(input.prompt),
@@ -686,6 +700,13 @@ function promptPreview(prompt: string): string {
   return oneLine.length <= 240 ? oneLine : `${oneLine.slice(0, 225)}...[truncated]`;
 }
 
+function normalizeWorkspaceRecord(record: WorkspaceRecord): WorkspaceRecord {
+  return {
+    ...record,
+    projectContext: normalizeProjectContextResolution(record.projectContext),
+  };
+}
+
 function normalizeRunRecord(record: RunRecord): RunRecord {
   const runPhase = record.runPhase ?? defaultRunPhase(record.role);
   const harnessId =
@@ -699,6 +720,7 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
   const shouldBackfillCursorRuntime = harnessId === "cursor";
   return {
     ...record,
+    projectContext: normalizeProjectContextResolution(record.projectContext),
     runPhase,
     runKind: record.runKind ?? runKindForPhase(runPhase),
     ...(harnessId === undefined ? {} : { harnessId }),

@@ -1129,4 +1129,80 @@ describe("FileRunTranscriptStore", () => {
       runId: "run-c-worker-retry",
     });
   });
+
+  it("normalizes explicit and legacy project context attribution for runs and workspaces", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await store.upsertWorkspace({
+      workspaceKey: "docs-workspace",
+      issueId: "issue-docs-1",
+      issueIdentifier: "DOCS-1",
+      projectContext: docsProjectContext,
+      path: "/tmp/docs-workspace",
+      sourceKind: "git_worktree",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await startBasicRun(store, "run-explicit", {
+      issueId: "issue-docs-1",
+      issueIdentifier: "DOCS-1",
+      workspaceKey: "docs-workspace",
+      workspacePath: "/tmp/docs-workspace",
+      projectContext: docsProjectContext,
+    });
+
+    await startBasicRun(store, "run-legacy", {
+      issueId: "issue-legacy-1",
+      issueIdentifier: "LEGACY-1",
+      workspaceKey: "legacy-workspace",
+      workspacePath: "/tmp/legacy-workspace",
+    });
+    await store.upsertWorkspace({
+      workspaceKey: "legacy-workspace",
+      issueId: "issue-legacy-1",
+      issueIdentifier: "LEGACY-1",
+      path: "/tmp/legacy-workspace",
+      sourceKind: "git_worktree",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const legacyRunPath = path.join(root, "runs", "run-legacy", "meta.json");
+    const legacyRun = JSON.parse(await readFile(legacyRunPath, "utf8")) as Record<string, unknown>;
+    delete legacyRun.projectContext;
+    await writeFile(legacyRunPath, `${JSON.stringify(legacyRun, null, 2)}
+`, "utf8");
+
+    const legacyWorkspacePath = path.join(root, "workspaces", "legacy-workspace.json");
+    const legacyWorkspace = JSON.parse(await readFile(legacyWorkspacePath, "utf8")) as Record<string, unknown>;
+    delete legacyWorkspace.projectContext;
+    await writeFile(legacyWorkspacePath, `${JSON.stringify(legacyWorkspace, null, 2)}
+`, "utf8");
+
+    await expect(store.getRun("run-explicit")).resolves.toMatchObject({ projectContext: docsProjectContext });
+    await expect(store.getWorkspace("docs-workspace")).resolves.toMatchObject({ projectContext: docsProjectContext });
+    await expect(store.getRun("run-legacy")).resolves.toMatchObject({
+      projectContext: {
+        projectContextId: "default",
+        projectContextLabel: "Default",
+        linearProjectSlug: null,
+        routingSource: "legacy_default",
+      },
+    });
+    await expect(store.getWorkspace("legacy-workspace")).resolves.toMatchObject({
+      projectContext: {
+        projectContextId: "default",
+        projectContextLabel: "Default",
+        linearProjectSlug: null,
+        routingSource: "legacy_default",
+      },
+    });
+  });
+
 });

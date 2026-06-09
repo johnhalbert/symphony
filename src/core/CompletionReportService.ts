@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
+import { normalizeProjectContextResolution, projectContextResolutionFromIssue, type ProjectContextResolution } from "./config/ProjectContexts.js";
 import { SymphonyError } from "./errors.js";
 import type {
   CompletionReportChecklistItem,
@@ -74,6 +75,7 @@ type ExistingRunRecord = Awaited<ReturnType<RunTranscriptStore["getRun"]>>;
 
 export interface CompletionReportActiveContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string;
   role: CompletionReportSubmitterRole;
   token?: string | null;
@@ -250,6 +252,7 @@ export class CompletionReportService {
         if (approvalRequest.status === "pending") {
           await this.linkPendingPublicationApproval(approvalRequest);
           await this.options.lifecycleStore.updateIssue(storedContext.issue, {
+            projectContext: resolveCompletionReportProjectContext(storedContext),
             phase: "blocked",
             blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
           });
@@ -279,6 +282,7 @@ export class CompletionReportService {
       const pendingReport = buildCompletionReportRecord({
         report,
         issue: context.issue,
+        projectContext: resolveCompletionReportProjectContext(context, existingLifecycle),
         pullRequest: inputPullRequest,
         acceptedAt: existing?.acceptedAt ?? null,
         writebackOperationKeys: [],
@@ -287,17 +291,19 @@ export class CompletionReportService {
         enqueuedPendingOperations.push(await this.options.writebackOutbox.enqueueOnce(operation));
       }
       lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
-          phase: "blocked",
-          blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
-          lastCompletionReportId: pendingReport.id,
-          completionReports: upsertCompletionReport(existingLifecycle?.completionReports ?? [], pendingReport),
-          summaryPointers: summaryPointersFor(context, inputPullRequest, null, existingLifecycle),
+        projectContext: resolveCompletionReportProjectContext(context, existingLifecycle),
+        phase: "blocked",
+        blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
+        lastCompletionReportId: pendingReport.id,
+        completionReports: upsertCompletionReport(existingLifecycle?.completionReports ?? [], pendingReport),
+        summaryPointers: summaryPointersFor(context, inputPullRequest, null, existingLifecycle),
       });
       await this.processAndVerifyPendingPublicationApprovalWritebacks(pendingOperations);
       const approvalRequest = await this.requestPublicationApproval(report, context, publicationInput);
       if (approvalRequest.status === "pending") {
         await this.linkPendingPublicationApproval(approvalRequest);
         await this.options.lifecycleStore.updateIssue(context.issue, {
+          projectContext: resolveCompletionReportProjectContext(context, lifecycle),
           phase: "blocked",
           blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
         });
@@ -479,6 +485,7 @@ export class CompletionReportService {
     if (approvalRequest.status === "pending") {
       await this.linkPendingPublicationApproval(approvalRequest);
       await this.options.lifecycleStore.updateIssue(context.issue, {
+        projectContext: resolveCompletionReportProjectContext(context),
         phase: "blocked",
         blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
       });
@@ -524,6 +531,7 @@ export class CompletionReportService {
       );
     }
     const lifecycle = await this.options.lifecycleStore.ensureIssue(input.context.issue, {
+      projectContext: resolveCompletionReportProjectContext(input.context, input.lifecycle),
       summaryPointers: summaryPointersFor(input.context, pullRequest, input.publication, input.lifecycle),
     });
     const writebackContext = runWritebackContext(input.context, input.report.runId);
@@ -549,6 +557,7 @@ export class CompletionReportService {
     const storedReport = buildCompletionReportRecord({
       report: input.report,
       issue: input.context.issue,
+      projectContext: resolveCompletionReportProjectContext(input.context, lifecycle),
       pullRequest,
       writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
       acceptedAt: input.existing?.acceptedAt ?? null,
@@ -560,6 +569,7 @@ export class CompletionReportService {
     await this.recordPullRequestMetadata(input.context, input.publication);
 
     let currentLifecycle = await this.options.lifecycleStore.updateIssue(input.context.issue, {
+      projectContext: resolveCompletionReportProjectContext(input.context, lifecycle),
       phase: "review",
       blockedReason: null,
       incompleteTurnCount: 0,
@@ -571,6 +581,7 @@ export class CompletionReportService {
     const reportNumber = storedReport.pullRequest?.number ?? null;
     if (reportHeadSha !== null && reportNumber !== null && shouldSilentlyRetireMergeGate(currentLifecycle.mergeGate, reportHeadSha, reportNumber)) {
       currentLifecycle = await this.options.lifecycleStore.updateIssue(input.context.issue, {
+        projectContext: resolveCompletionReportProjectContext(input.context, currentLifecycle),
         ...supersededMergeGateLifecyclePatch(currentLifecycle, currentLifecycle.mergeGate, reportHeadSha),
       });
     }
@@ -581,6 +592,7 @@ export class CompletionReportService {
       reportNumber === currentLifecycle.mergeGate.pullRequest.number
     ) {
       currentLifecycle = await this.options.lifecycleStore.updateIssue(input.context.issue, {
+        projectContext: resolveCompletionReportProjectContext(input.context, currentLifecycle),
         mergeGate: {
           ...currentLifecycle.mergeGate,
           repairRunId: storedReport.runId,
@@ -888,6 +900,7 @@ export class CompletionReportService {
       enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
     }
     await this.options.lifecycleStore.updateIssue(context.issue, {
+      projectContext: resolveCompletionReportProjectContext(context),
       phase: "blocked",
       blockedReason: `publication approval ${approval.status}`,
     });
@@ -1000,6 +1013,7 @@ function isTerminalApprovalStatus(
 function buildCompletionReportRecord(input: {
   report: CompletionReportInput;
   issue: Issue;
+  projectContext: ProjectContextResolution;
   pullRequest: CompletionReportPullRequestRef | null;
   acceptedAt: string | null;
   writebackOperationKeys: string[];
@@ -1010,6 +1024,7 @@ function buildCompletionReportRecord(input: {
     runId: input.report.runId,
     issueId: input.issue.id,
     issueIdentifier: input.issue.identifier,
+    projectContext: input.projectContext,
     summary: input.report.summary,
     validationEvidence: input.report.validationEvidence,
     acceptanceChecklist: normalizeChecklist(input.report.acceptanceChecklist),
@@ -1020,6 +1035,15 @@ function buildCompletionReportRecord(input: {
     acceptedAt: input.acceptedAt ?? new Date().toISOString(),
     writebackOperationKeys: input.writebackOperationKeys,
   };
+}
+
+function resolveCompletionReportProjectContext(
+  context: CompletionReportActiveContext,
+  existingLifecycle: ExistingIssueLifecycle = null,
+): ProjectContextResolution {
+  return normalizeProjectContextResolution(
+    context.projectContext ?? existingLifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
 }
 
 function upsertCompletionReport(
@@ -1119,6 +1143,7 @@ function recoveryContextFor(input: {
       state: input.config.writeback.dispatchState,
       branchName,
     },
+    projectContext: input.pendingReport.projectContext ?? input.lifecycle.projectContext ?? input.run?.projectContext ?? undefined,
     activeRunId: input.pendingReport.runId,
     role: "worker",
     workspacePath,
@@ -1130,6 +1155,7 @@ function recoveryContextFor(input: {
 function runWritebackContext(context: CompletionReportActiveContext, runId: string) {
   return {
     issue: context.issue,
+    projectContext: context.projectContext ?? projectContextResolutionFromIssue(context.issue) ?? undefined,
     runId,
     sessionId: context.sessionId ?? null,
     workspacePath: context.workspacePath ?? context.workspace?.path ?? null,

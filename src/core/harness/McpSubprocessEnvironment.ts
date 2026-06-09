@@ -2,7 +2,11 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
-import type { GitHubAppConfig, ServiceConfig } from "../config/Config.js";
+import {
+  resolveDefaultProjectContextCredentialProfiles,
+  type GitHubAppConfig,
+  type ServiceConfig,
+} from "../config/Config.js";
 import type { CredentialRole } from "../config/CredentialProfiles.js";
 
 export type McpSubprocessCommand =
@@ -68,7 +72,7 @@ export function buildMcpSubprocessEnvironment(input: McpSubprocessEnvironmentInp
   const parentEnv = input.parentEnv ?? process.env;
   const env: Record<string, string> = {};
   addRuntimeBaseline(env, parentEnv);
-  addRequiredParseDependencies(env, input.config);
+  addRequiredParseDependencies(env, input.config, parentEnv);
   addCommandCapabilitySlice(env, input.config, input.command, parentEnv);
   return env;
 }
@@ -120,35 +124,160 @@ function addRuntimeBaseline(env: Record<string, string>, parentEnv: NodeJS.Proce
   }
 }
 
-function addRequiredParseDependencies(env: Record<string, string>, config: ServiceConfig): void {
+function addRequiredParseDependencies(
+  env: Record<string, string>,
+  config: ServiceConfig,
+  parentEnv: NodeJS.ProcessEnv,
+): void {
   const raw = config.raw;
-  const trackerApiKeyRef = envReference(raw.tracker?.api_key);
-  if (trackerApiKeyRef) {
-    env[trackerApiKeyRef] = config.tracker.apiKey;
-  } else if (raw.tracker?.api_key === undefined) {
-    env.LINEAR_API_KEY = config.tracker.apiKey;
+  addTrackerParseDependencies(env, raw.tracker, config.tracker, { includeDefaultApiKeyFallback: true });
+  addWorkspaceParseDependencies(env, raw.workspace, config.workspace);
+
+  if (projectContextsNeedDefaultGitHubParseDependencies(raw)) {
+    addGitHubParseDependenciesFromParentEnv(env, raw.github, parentEnv);
   }
 
-  const trackerProjectSlugRef = envReference(raw.tracker?.project_slug);
-  if (trackerProjectSlugRef) env[trackerProjectSlugRef] = config.tracker.projectSlug;
+  const rawProjectContexts = raw.project_contexts ?? [];
+  for (const [index, rawContext] of rawProjectContexts.entries()) {
+    const context = config.projectContexts.contexts[index];
+    if (!context) continue;
+    addTrackerParseDependencies(env, rawContext.tracker, context.tracker);
+    addWorkspaceParseDependencies(env, rawContext.workspace, context.workspace);
+    addGitHubParseDependencies(env, rawContext.github, context.github);
+  }
+}
 
-  const trackerAssigneeRef = envReference(raw.tracker?.assignee);
-  if (trackerAssigneeRef) env[trackerAssigneeRef] = config.tracker.assignee ?? "";
+function addTrackerParseDependencies(
+  env: Record<string, string>,
+  rawTracker:
+    | {
+        api_key?: string | undefined;
+        project_slug?: string | undefined;
+        assignee?: string | undefined;
+      }
+    | undefined,
+  tracker: {
+    apiKey: string;
+    projectSlug: string;
+    assignee?: string | null;
+  },
+  options: { includeDefaultApiKeyFallback?: boolean } = {},
+): void {
+  const trackerApiKeyRef = envReference(rawTracker?.api_key);
+  if (trackerApiKeyRef) {
+    env[trackerApiKeyRef] = tracker.apiKey;
+  } else if (options.includeDefaultApiKeyFallback && rawTracker?.api_key === undefined) {
+    env.LINEAR_API_KEY = tracker.apiKey;
+  }
 
-  const workspaceRootRef = envReference(raw.workspace?.root);
-  if (workspaceRootRef) env[workspaceRootRef] = config.workspace.root;
+  const trackerProjectSlugRef = envReference(rawTracker?.project_slug);
+  if (trackerProjectSlugRef) env[trackerProjectSlugRef] = tracker.projectSlug;
 
-  const workspaceStateDirRef = envReference(raw.workspace?.state_dir);
-  if (workspaceStateDirRef) env[workspaceStateDirRef] = config.workspace.stateDir;
+  const trackerAssigneeRef = envReference(rawTracker?.assignee);
+  if (trackerAssigneeRef) env[trackerAssigneeRef] = tracker.assignee ?? "";
+}
 
-  const sourcePathRef = envReference(raw.workspace?.source?.path);
-  if (sourcePathRef) env[sourcePathRef] = config.workspace.source.path ?? "";
+function addWorkspaceParseDependencies(
+  env: Record<string, string>,
+  rawWorkspace:
+    | {
+        root?: string | undefined;
+        state_dir?: string | undefined;
+        source?: {
+          path?: string | undefined;
+          repository?: string | undefined;
+          cache_path?: string | undefined;
+        } | undefined;
+      }
+    | undefined,
+  workspace: {
+    root: string;
+    stateDir: string;
+    source: {
+      path?: string;
+      repository?: string;
+      cachePath?: string;
+    };
+  },
+): void {
+  const workspaceRootRef = envReference(rawWorkspace?.root);
+  if (workspaceRootRef) env[workspaceRootRef] = workspace.root;
 
-  const sourceRepositoryRef = envReference(raw.workspace?.source?.repository);
-  if (sourceRepositoryRef) env[sourceRepositoryRef] = config.workspace.source.repository ?? "";
+  const workspaceStateDirRef = envReference(rawWorkspace?.state_dir);
+  if (workspaceStateDirRef) env[workspaceStateDirRef] = workspace.stateDir;
 
-  const sourceCachePathRef = envReference(raw.workspace?.source?.cache_path);
-  if (sourceCachePathRef) env[sourceCachePathRef] = config.workspace.source.cachePath ?? "";
+  const sourcePathRef = envReference(rawWorkspace?.source?.path);
+  if (sourcePathRef) env[sourcePathRef] = workspace.source.path ?? "";
+
+  const sourceRepositoryRef = envReference(rawWorkspace?.source?.repository);
+  if (sourceRepositoryRef) env[sourceRepositoryRef] = workspace.source.repository ?? "";
+
+  const sourceCachePathRef = envReference(rawWorkspace?.source?.cache_path);
+  if (sourceCachePathRef) env[sourceCachePathRef] = workspace.source.cachePath ?? "";
+}
+
+function addGitHubParseDependencies(
+  env: Record<string, string>,
+  rawGithub:
+    | {
+        owner?: string | undefined;
+        repo?: string | undefined;
+        head_owner?: string | undefined;
+        api_base_url?: string | undefined;
+      }
+    | undefined,
+  github: {
+    owner: string | null;
+    repo: string | null;
+    headOwner: string | null;
+    apiBaseUrl: string;
+  },
+): void {
+  const ownerRef = envReference(rawGithub?.owner);
+  if (ownerRef) env[ownerRef] = github.owner ?? "";
+
+  const repoRef = envReference(rawGithub?.repo);
+  if (repoRef) env[repoRef] = github.repo ?? "";
+
+  const headOwnerRef = envReference(rawGithub?.head_owner);
+  if (headOwnerRef) env[headOwnerRef] = github.headOwner ?? "";
+
+  const apiBaseUrlRef = envReference(rawGithub?.api_base_url);
+  if (apiBaseUrlRef) env[apiBaseUrlRef] = github.apiBaseUrl;
+}
+
+function addGitHubParseDependenciesFromParentEnv(
+  env: Record<string, string>,
+  rawGithub:
+    | {
+        owner?: string | undefined;
+        repo?: string | undefined;
+        head_owner?: string | undefined;
+        api_base_url?: string | undefined;
+      }
+    | undefined,
+  parentEnv: NodeJS.ProcessEnv,
+): void {
+  addEnvReferenceFromParentEnv(env, parentEnv, rawGithub?.owner);
+  addEnvReferenceFromParentEnv(env, parentEnv, rawGithub?.repo);
+  addEnvReferenceFromParentEnv(env, parentEnv, rawGithub?.head_owner);
+  addEnvReferenceFromParentEnv(env, parentEnv, rawGithub?.api_base_url);
+}
+
+function projectContextsNeedDefaultGitHubParseDependencies(raw: ServiceConfig["raw"]): boolean {
+  const defaultGithub = raw.github;
+  const rawProjectContexts = raw.project_contexts ?? [];
+  return rawProjectContexts.some(
+    (rawContext) =>
+      needsInheritedGitHubParseDependency(defaultGithub?.owner, rawContext.github?.owner) ||
+      needsInheritedGitHubParseDependency(defaultGithub?.repo, rawContext.github?.repo) ||
+      needsInheritedGitHubParseDependency(defaultGithub?.head_owner, rawContext.github?.head_owner) ||
+      needsInheritedGitHubParseDependency(defaultGithub?.api_base_url, rawContext.github?.api_base_url),
+  );
+}
+
+function needsInheritedGitHubParseDependency(defaultValue: string | undefined, contextValue: string | undefined): boolean {
+  return envReference(defaultValue) !== null && contextValue === undefined;
 }
 
 function addCommandCapabilitySlice(
@@ -199,7 +328,10 @@ function addGitHubCapabilityEnvironment(
       throw new Error(`${role} ${capability} profile assignment could not be resolved`);
     }
     if (profile.kind === "github_app") {
-      const rawProfile = config.raw.credential_profiles?.profiles?.[profile.name];
+      const rawProfile = resolveDefaultProjectContextCredentialProfiles(
+        config.raw,
+        config.projectContexts.defaultContextId,
+      )?.profiles?.[profile.name];
       if (rawProfile?.kind !== "github_app") {
         throw new Error(`${role} ${capability} GitHub App profile assignment could not be resolved`);
       }
@@ -321,4 +453,13 @@ function envReference(value: string | undefined): string | null {
 
 function addIfString(env: Record<string, string>, key: string, value: string | undefined): void {
   if (typeof value === "string") env[key] = value;
+}
+
+function addEnvReferenceFromParentEnv(
+  env: Record<string, string>,
+  parentEnv: NodeJS.ProcessEnv,
+  rawValue: string | undefined,
+): void {
+  const ref = envReference(rawValue);
+  if (ref) env[ref] = parentEnv[ref] ?? "";
 }

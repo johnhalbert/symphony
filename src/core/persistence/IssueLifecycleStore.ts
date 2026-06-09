@@ -1,6 +1,11 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
+import {
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue } from "../types.js";
 import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
@@ -81,6 +86,7 @@ export interface IssueBreakdownPlanRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   summary: string;
   proposedIssues: ProposedIssueRecord[];
   transcriptPointers: string[];
@@ -151,6 +157,7 @@ export interface IssueCompletionReportRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   summary: string;
   validationEvidence: string[];
   acceptanceChecklist: CompletionReportChecklistItem[];
@@ -176,6 +183,7 @@ export interface IssueReviewVerdictRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   verdict: IssueReviewVerdict;
   acceptanceResults: ReviewVerdictAcceptanceResult[];
   findings: string[];
@@ -195,6 +203,7 @@ export interface IssueReviewFeedbackRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   kind: PullRequestReviewFeedbackKind;
   event: PullRequestReviewFeedbackEvent | null;
   body: string;
@@ -284,6 +293,7 @@ export interface IssueMergeConflictResolutionReportRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   resolutionStatus: "resolved" | "still_conflicted" | "blocked";
   summary: string;
   validationEvidence: string[];
@@ -351,6 +361,7 @@ export interface IssueLaneMemo {
   version: 1;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   updatedAt: string;
   reviewRound: number;
   incompleteTurnCount: number;
@@ -373,6 +384,7 @@ export interface WorkerHandoffPacket {
   version: 1;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   generatedAt: string;
   memo: IssueLaneMemo;
   lastWorkerOutput: IssueWorkerOutputContract | null;
@@ -383,6 +395,7 @@ export interface WorkerHandoffPacket {
 export interface IssueLifecycleRecord {
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   phase: IssueLifecyclePhase;
   reviewRound: number;
   incompleteTurnCount: number;
@@ -411,6 +424,7 @@ export interface IssueLifecycleRecord {
 }
 
 export interface IssueLifecyclePatch {
+  projectContext?: ProjectContextResolution | undefined;
   phase?: IssueLifecyclePhase;
   reviewRound?: number;
   incompleteTurnCount?: number;
@@ -454,9 +468,13 @@ export class FileIssueLifecycleStore {
   async ensureIssue(issue: Pick<Issue, "id" | "identifier">, patch: IssueLifecyclePatch = {}): Promise<IssueLifecycleRecord> {
     const existing = await this.find(issue.id, issue.identifier);
     const now = new Date().toISOString();
+    const projectContext = normalizeProjectContextResolution(
+      patch.projectContext ?? existing?.projectContext ?? projectContextResolutionFromIssue(issue),
+    );
     const baseRecord = {
       issueId: issue.id,
       issueIdentifier: issue.identifier,
+      projectContext,
       phase: patch.phase ?? existing?.phase ?? "implementation",
       reviewRound: patch.reviewRound ?? existing?.reviewRound ?? 0,
       incompleteTurnCount: patch.incompleteTurnCount ?? existing?.incompleteTurnCount ?? 0,
@@ -585,6 +603,7 @@ export function buildWorkerHandoffPacket(
     version: 1,
     issueId: record.issueId,
     issueIdentifier: record.issueIdentifier,
+    projectContext: normalizeProjectContextResolution(record.projectContext),
     generatedAt,
     memo: record.handoff.memo,
     lastWorkerOutput: record.handoff.lastWorkerOutput,
@@ -644,6 +663,7 @@ function buildLaneMemo(
     version: 1 as const,
     issueId: record.issueId,
     issueIdentifier: record.issueIdentifier,
+    projectContext: normalizeProjectContextResolution(record.projectContext),
     updatedAt: record.updatedAt,
     reviewRound: record.reviewRound,
     incompleteTurnCount: record.incompleteTurnCount,
@@ -914,9 +934,11 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     throw corruptLifecycle(filePath, "phase is invalid");
   }
 
+  const projectContext = normalizeStoredProjectContext(value.projectContext);
   const normalized = {
     issueId: value.issueId,
     issueIdentifier: value.issueIdentifier,
+    projectContext,
     phase: value.phase,
     reviewRound: nonNegativeInteger(value.reviewRound, filePath, "reviewRound"),
     incompleteTurnCount: nonNegativeInteger(value.incompleteTurnCount, filePath, "incompleteTurnCount"),
@@ -946,10 +968,10 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
     summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath),
     summaryReferences: normalizeSummaryReferences(value.summaryReferences, filePath),
-    issueBreakdownPlans: normalizeIssueBreakdownPlans(value.issueBreakdownPlans, filePath),
-    completionReports: normalizeCompletionReports(value.completionReports, filePath),
-    reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
-    reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
+    issueBreakdownPlans: normalizeIssueBreakdownPlans(value.issueBreakdownPlans, filePath, projectContext),
+    completionReports: normalizeCompletionReports(value.completionReports, filePath, projectContext),
+    reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath, projectContext),
+    reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath, projectContext),
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
     mergeGate: normalizeMergeGateState(value.mergeGate, filePath),
     merge: normalizeMergeMetadata(value.merge, filePath),
@@ -957,6 +979,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     mergeConflictResolutionReports: normalizeMergeConflictResolutionReports(
       value.mergeConflictResolutionReports,
       filePath,
+      projectContext,
     ),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
@@ -1042,16 +1065,26 @@ function normalizeSummaryReference(value: unknown, filePath: string, index: numb
   return normalized;
 }
 
-function normalizeIssueBreakdownPlans(value: unknown, filePath: string): IssueBreakdownPlanRecord[] {
+function normalizeIssueBreakdownPlans(
+  value: unknown,
+  filePath: string,
+  fallbackProjectContext: ProjectContextResolution,
+): IssueBreakdownPlanRecord[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "issueBreakdownPlans is invalid");
-  return value.map((item, index) => normalizeIssueBreakdownPlan(item, filePath, index));
+  return value.map((item, index) => normalizeIssueBreakdownPlan(item, filePath, index, fallbackProjectContext));
 }
 
-function normalizeIssueBreakdownPlan(value: unknown, filePath: string, index: number): IssueBreakdownPlanRecord {
+function normalizeIssueBreakdownPlan(
+  value: unknown,
+  filePath: string,
+  index: number,
+  fallbackProjectContext: ProjectContextResolution,
+): IssueBreakdownPlanRecord {
   if (!isRecord(value)) throw corruptLifecycle(filePath, `issueBreakdownPlans[${index}] is invalid`);
   return {
     id: requiredString(value.id, filePath, `issueBreakdownPlans[${index}].id`),
+    projectContext: normalizeStoredProjectContext(value.projectContext, fallbackProjectContext),
     idempotencyKey: requiredString(value.idempotencyKey, filePath, `issueBreakdownPlans[${index}].idempotencyKey`),
     requestHash:
       value.requestHash === undefined
@@ -1173,31 +1206,46 @@ function normalizeCreatedIssueRefs(value: unknown, filePath: string, planIndex: 
   });
 }
 
-function normalizeCompletionReports(value: unknown, filePath: string): IssueCompletionReportRecord[] {
+function normalizeCompletionReports(
+  value: unknown,
+  filePath: string,
+  fallbackProjectContext: ProjectContextResolution,
+): IssueCompletionReportRecord[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "completionReports is invalid");
-  return value.map((item, index) => normalizeCompletionReport(item, filePath, index));
+  return value.map((item, index) => normalizeCompletionReport(item, filePath, index, fallbackProjectContext));
 }
 
-function normalizeReviewVerdicts(value: unknown, filePath: string): IssueReviewVerdictRecord[] {
+function normalizeReviewVerdicts(
+  value: unknown,
+  filePath: string,
+  fallbackProjectContext: ProjectContextResolution,
+): IssueReviewVerdictRecord[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewVerdicts is invalid");
-  return value.map((item, index) => normalizeReviewVerdict(item, filePath, index));
+  return value.map((item, index) => normalizeReviewVerdict(item, filePath, index, fallbackProjectContext));
 }
 
-function normalizeReviewFeedback(value: unknown, filePath: string): IssueReviewFeedbackRecord[] {
+function normalizeReviewFeedback(
+  value: unknown,
+  filePath: string,
+  fallbackProjectContext: ProjectContextResolution,
+): IssueReviewFeedbackRecord[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewFeedback is invalid");
-  return value.map((item, index) => normalizeReviewFeedbackRecord(item, filePath, index));
+  return value.map((item, index) => normalizeReviewFeedbackRecord(item, filePath, index, fallbackProjectContext));
 }
 
 function normalizeMergeConflictResolutionReports(
   value: unknown,
   filePath: string,
+  fallbackProjectContext: ProjectContextResolution,
 ): IssueMergeConflictResolutionReportRecord[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "mergeConflictResolutionReports is invalid");
-  return value.map((item, index) => normalizeMergeConflictResolutionReport(item, filePath, index));
+  return value.map((item, index) =>
+    normalizeMergeConflictResolutionReport(item, filePath, index, fallbackProjectContext),
+  );
 }
 
 function defaultReviewEvidence(): PullRequestReviewEvidenceState {
@@ -1236,19 +1284,24 @@ function normalizeHandoffState(
   if (value.version !== 1) throw corruptLifecycle(filePath, "handoff.version is invalid");
   return {
     version: 1,
-    memo: normalizeLaneMemo(value.memo, filePath),
+    memo: normalizeLaneMemo(value.memo, filePath, normalizeProjectContextResolution(record.projectContext)),
     lastWorkerOutput: normalizeWorkerOutputContract(value.lastWorkerOutput, filePath),
     lastReviewerOutput: normalizeReviewerOutputContract(value.lastReviewerOutput, filePath),
   };
 }
 
-function normalizeLaneMemo(value: unknown, filePath: string): IssueLaneMemo {
+function normalizeLaneMemo(
+  value: unknown,
+  filePath: string,
+  fallbackProjectContext: ProjectContextResolution,
+): IssueLaneMemo {
   if (!isRecord(value)) throw corruptLifecycle(filePath, "handoff.memo is invalid");
   if (value.version !== 1) throw corruptLifecycle(filePath, "handoff.memo.version is invalid");
   return {
     version: 1,
     issueId: requiredString(value.issueId, filePath, "handoff.memo.issueId"),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, "handoff.memo.issueIdentifier"),
+    projectContext: normalizeStoredProjectContext(value.projectContext, fallbackProjectContext),
     updatedAt: requiredString(value.updatedAt, filePath, "handoff.memo.updatedAt"),
     reviewRound: nonNegativeInteger(value.reviewRound, filePath, "handoff.memo.reviewRound"),
     incompleteTurnCount: nonNegativeInteger(value.incompleteTurnCount, filePath, "handoff.memo.incompleteTurnCount"),
@@ -1349,10 +1402,16 @@ function normalizeReviewEvidenceItem(value: unknown, filePath: string, index: nu
   };
 }
 
-function normalizeCompletionReport(value: unknown, filePath: string, index: number): IssueCompletionReportRecord {
+function normalizeCompletionReport(
+  value: unknown,
+  filePath: string,
+  index: number,
+  fallbackProjectContext: ProjectContextResolution,
+): IssueCompletionReportRecord {
   if (!isRecord(value)) throw corruptLifecycle(filePath, `completionReports[${index}] is invalid`);
   return {
     id: requiredString(value.id, filePath, `completionReports[${index}].id`),
+    projectContext: normalizeStoredProjectContext(value.projectContext, fallbackProjectContext),
     idempotencyKey: requiredString(value.idempotencyKey, filePath, `completionReports[${index}].idempotencyKey`),
     runId: requiredString(value.runId, filePath, `completionReports[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `completionReports[${index}].issueId`),
@@ -1369,7 +1428,12 @@ function normalizeCompletionReport(value: unknown, filePath: string, index: numb
   };
 }
 
-function normalizeReviewVerdict(value: unknown, filePath: string, index: number): IssueReviewVerdictRecord {
+function normalizeReviewVerdict(
+  value: unknown,
+  filePath: string,
+  index: number,
+  fallbackProjectContext: ProjectContextResolution,
+): IssueReviewVerdictRecord {
   if (!isRecord(value)) throw corruptLifecycle(filePath, `reviewVerdicts[${index}] is invalid`);
   if (value.verdict !== "pass" && value.verdict !== "fail") {
     throw corruptLifecycle(filePath, `reviewVerdicts[${index}].verdict is invalid`);
@@ -1380,6 +1444,7 @@ function normalizeReviewVerdict(value: unknown, filePath: string, index: number)
     runId: requiredString(value.runId, filePath, `reviewVerdicts[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `reviewVerdicts[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `reviewVerdicts[${index}].issueIdentifier`),
+    projectContext: normalizeStoredProjectContext(value.projectContext, fallbackProjectContext),
     verdict: value.verdict,
     acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, index),
     findings: requiredStringArray(value.findings, filePath, `reviewVerdicts[${index}].findings`),
@@ -1390,7 +1455,12 @@ function normalizeReviewVerdict(value: unknown, filePath: string, index: number)
   };
 }
 
-function normalizeReviewFeedbackRecord(value: unknown, filePath: string, index: number): IssueReviewFeedbackRecord {
+function normalizeReviewFeedbackRecord(
+  value: unknown,
+  filePath: string,
+  index: number,
+  fallbackProjectContext: ProjectContextResolution,
+): IssueReviewFeedbackRecord {
   if (!isRecord(value)) throw corruptLifecycle(filePath, `reviewFeedback[${index}] is invalid`);
   const kind = value.kind;
   if (kind !== "review" && kind !== "review_comment" && kind !== "issue_comment") {
@@ -1407,6 +1477,7 @@ function normalizeReviewFeedbackRecord(value: unknown, filePath: string, index: 
     runId: requiredString(value.runId, filePath, `reviewFeedback[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `reviewFeedback[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `reviewFeedback[${index}].issueIdentifier`),
+    projectContext: normalizeStoredProjectContext(value.projectContext, fallbackProjectContext),
     kind,
     event,
     body: requiredString(value.body, filePath, `reviewFeedback[${index}].body`),
@@ -1581,6 +1652,7 @@ function normalizeMergeConflictResolutionReport(
   value: unknown,
   filePath: string,
   index: number,
+  fallbackProjectContext: ProjectContextResolution,
 ): IssueMergeConflictResolutionReportRecord {
   if (!isRecord(value)) throw corruptLifecycle(filePath, `mergeConflictResolutionReports[${index}] is invalid`);
   const resolutionStatus = value.resolutionStatus;
@@ -1593,6 +1665,7 @@ function normalizeMergeConflictResolutionReport(
     runId: requiredString(value.runId, filePath, `mergeConflictResolutionReports[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `mergeConflictResolutionReports[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `mergeConflictResolutionReports[${index}].issueIdentifier`),
+    projectContext: normalizeStoredProjectContext(value.projectContext, fallbackProjectContext),
     resolutionStatus,
     summary: requiredString(value.summary, filePath, `mergeConflictResolutionReports[${index}].summary`),
     validationEvidence: requiredStringArray(value.validationEvidence, filePath, `mergeConflictResolutionReports[${index}].validationEvidence`),
@@ -1756,6 +1829,15 @@ function requiredStringArray(value: unknown, filePath: string, field: string): s
 function requiredString(value: unknown, filePath: string, field: string): string {
   if (typeof value === "string" && value.length > 0) return value;
   throw corruptLifecycle(filePath, `${field} is missing`);
+}
+
+function normalizeStoredProjectContext(
+  value: unknown,
+  fallbackProjectContext?: ProjectContextResolution,
+): ProjectContextResolution {
+  return normalizeProjectContextResolution(
+    value === undefined ? fallbackProjectContext : (value as Partial<ProjectContextResolution> | null | undefined),
+  );
 }
 
 function corruptLifecycle(filePath: string, reason: string): SymphonyError {
