@@ -20,6 +20,7 @@ import {
   type IssueBreakdownPlanRecord,
   type IssueLifecycleRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
@@ -44,6 +45,12 @@ type CommentWriteback = Extract<NewWritebackOperation, { kind: "comment" }>;
 
 describe("FileWritebackOutboxStore", () => {
   let root: string;
+  const docsProjectContext = {
+    projectContextId: "docs",
+    projectContextLabel: "Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "candidate_poll",
+  } as const;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-writeback-"));
@@ -67,6 +74,24 @@ describe("FileWritebackOutboxStore", () => {
       stripped = true;
     }
     if (!stripped) throw new Error(`writeback record not found: ${idempotencyKey}`);
+  }
+
+  async function recordRunProjectContext(runId: string, issueId = "issue-docs-1", issueIdentifier = "DOCS-1"): Promise<void> {
+    const runStore = new FileRunTranscriptStore(root);
+    await runStore.startRun({
+      runId,
+      sessionId: `session-${runId}`,
+      agentId: `agent-${runId}`,
+      role: "worker",
+      issueId,
+      issueIdentifier,
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: issueIdentifier,
+      workspacePath: "/tmp/workspace",
+    });
   }
 
 
@@ -149,6 +174,45 @@ describe("FileWritebackOutboxStore", () => {
     await expect(store.enqueueOnce(operation)).resolves.toMatchObject({ projectContext: docsProjectContext });
     await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ projectContext: docsProjectContext });
   });
+
+  it.each(["pending", "retrying"] as const)(
+    "backfills missing project context during plain processDue for %s legacy writebacks",
+    async (initialStatus) => {
+      const store = new FileWritebackOutboxStore(root);
+      const writer = new FakeWriter();
+      const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+      const runId = `run-docs-${initialStatus}`;
+      await recordRunProjectContext(runId, "issue-docs-process", "DOCS-PROCESS");
+      const operation = {
+        idempotencyKey: `comment:issue-docs-process:${initialStatus}`,
+        kind: "comment" as const,
+        issueId: "issue-docs-process",
+        projectContext: docsProjectContext,
+        runId,
+        payload: { body: `Docs ${initialStatus}`, dedupeKey: `docs-process-${initialStatus}` },
+      };
+
+      let record = await store.enqueueOnce(operation);
+      if (initialStatus === "retrying") {
+        record = await store.markRetry(record, "temporary outage", "1970-01-01T00:00:00.000Z");
+      }
+      await stripPersistedProjectContext(operation.idempotencyKey);
+
+      await processor.processDue({ idempotencyKeys: [operation.idempotencyKey] });
+
+      expect(writer.comments).toEqual([
+        expect.objectContaining({
+          issueId: "issue-docs-process",
+          body: `Docs ${initialStatus}`,
+          dedupeKey: `docs-process-${initialStatus}`,
+        }),
+      ]);
+      await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+        status: "succeeded",
+        projectContext: docsProjectContext,
+      });
+    },
+  );
 
 
   it("enqueues idempotently and processes due operations", async () => {

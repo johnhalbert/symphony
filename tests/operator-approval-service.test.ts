@@ -17,6 +17,12 @@ describe("OperatorApprovalService", () => {
   let runStore: FileRunTranscriptStore;
   let store: FileOperatorApprovalStore;
   let service: OperatorApprovalService;
+  const docsProjectContext = {
+    projectContextId: "docs",
+    projectContextLabel: "Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "candidate_poll",
+  } as const;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-operator-approval-"));
@@ -51,6 +57,13 @@ describe("OperatorApprovalService", () => {
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
   });
+
+  async function stripPersistedProjectContext(requestId: string): Promise<void> {
+    const approvalPath = path.join(config.workspace.stateDir, "approval-requests", `${requestId}.json`);
+    const record = JSON.parse(await readFile(approvalPath, "utf8")) as Record<string, unknown>;
+    delete record.projectContext;
+    await writeFile(approvalPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  }
 
   it("emits a structured approval request and proceeds after approval", async () => {
     const wait = service.waitForPublicationApproval(request());
@@ -233,6 +246,107 @@ describe("OperatorApprovalService", () => {
     });
     const transcript = await runStore.readTranscript("run-1");
     expect(transcript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
+  });
+
+  it.each([
+    ["approve", "approved"],
+    ["reject", "rejected"],
+  ] as const)("backfills project context before resolving a legacy pending approval as %s", async (decision, expectedStatus) => {
+    const pending = await service.requestPublicationApproval({ ...request(), evidenceCursor: `idem-terminal-${decision}` });
+    await stripPersistedProjectContext(pending.requestId);
+
+    await expect(service.resolve(pending.requestId, decision)).resolves.toMatchObject({
+      replayed: false,
+      request: {
+        status: expectedStatus,
+        projectContext: docsProjectContext,
+      },
+    });
+    await expect(store.get(pending.requestId)).resolves.toMatchObject({
+      status: expectedStatus,
+      projectContext: docsProjectContext,
+    });
+    const transcript = await runStore.readTranscript("run-1");
+    expect(transcript.events.at(-1)).toMatchObject({
+      eventType: "approval_resolved",
+      payload: {
+        status: expectedStatus,
+        projectContext: docsProjectContext,
+      },
+    });
+  });
+
+  it("backfills project context before marking a legacy pending approval stale during resolve", async () => {
+    const pending = await service.requestPublicationApproval({ ...request(), evidenceCursor: "idem-terminal-stale" });
+    await stripPersistedProjectContext(pending.requestId);
+    await runStore.updateRun("run-1", {
+      metadata: {
+        cancellationRequestedAt: "2026-01-01T00:00:01.000Z",
+        cancellationSource: "operator",
+        cancellationReason: "operator cancelled publication",
+      },
+    });
+
+    await expect(service.resolve(pending.requestId, "approve")).rejects.toMatchObject({
+      code: "conflict",
+      details: {
+        status: "stale",
+        projectContext: docsProjectContext,
+      },
+    });
+    await expect(store.get(pending.requestId)).resolves.toMatchObject({
+      status: "stale",
+      projectContext: docsProjectContext,
+    });
+    const transcript = await runStore.readTranscript("run-1");
+    expect(transcript.events.at(-1)).toMatchObject({
+      eventType: "approval_resolved",
+      payload: {
+        status: "stale",
+        projectContext: docsProjectContext,
+      },
+    });
+  });
+
+  it("backfills project context before expiring a legacy pending approval during resolve", async () => {
+    config.github.operatorApproval!.timeoutMs = 0;
+    const pending = await service.requestPublicationApproval({ ...request(), evidenceCursor: "idem-terminal-expired" });
+    await stripPersistedProjectContext(pending.requestId);
+
+    await expect(service.resolve(pending.requestId, "approve")).rejects.toMatchObject({
+      code: "conflict",
+      details: {
+        status: "expired",
+        projectContext: docsProjectContext,
+      },
+    });
+    await expect(store.get(pending.requestId)).resolves.toMatchObject({
+      status: "expired",
+      projectContext: docsProjectContext,
+    });
+    const transcript = await runStore.readTranscript("run-1");
+    expect(transcript.events.at(-1)).toMatchObject({
+      eventType: "approval_resolved",
+      payload: {
+        status: "expired",
+        projectContext: docsProjectContext,
+      },
+    });
+  });
+
+  it("backfills project context before cancelling a legacy pending approval", async () => {
+    const pending = await service.requestPublicationApproval({ ...request(), evidenceCursor: "idem-terminal-cancelled" });
+    await stripPersistedProjectContext(pending.requestId);
+
+    await expect(store.markCancelled(pending.requestId, "operator cancelled publication")).resolves.toMatchObject({
+      status: "cancelled",
+      projectContext: docsProjectContext,
+      staleReason: "operator cancelled publication",
+    });
+    await expect(store.get(pending.requestId)).resolves.toMatchObject({
+      status: "cancelled",
+      projectContext: docsProjectContext,
+    });
   });
 
 

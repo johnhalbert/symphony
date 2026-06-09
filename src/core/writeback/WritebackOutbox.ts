@@ -202,11 +202,12 @@ export class FileWritebackOutboxStore {
       if (this.claimLocks.has(record.idempotencyKey)) continue;
       this.claimLocks.add(record.idempotencyKey);
       try {
-        const current = await this.get(record.idempotencyKey);
+        let current = await this.get(record.idempotencyKey);
         if (!current) continue;
         if (!["pending", "retrying"].includes(current.status)) continue;
         if (Date.parse(current.nextAttemptAt) > now.getTime()) continue;
         if (allowed !== null && !allowed.has(current.idempotencyKey)) continue;
+        current = await this.repairProjectContextIfMissing(current);
         current.status = "in_flight";
         current.updatedAt = new Date().toISOString();
         await this.write(current);
@@ -293,15 +294,36 @@ export class FileWritebackOutboxStore {
     existing: WritebackOperation,
     operation: NewWritebackOperation,
   ): Promise<WritebackOperation> {
-    const raw = await this.readStoredRecord(operation.idempotencyKey);
-    if (!needsProjectContextBackfill(raw)) return existing;
-    return this.update(existing, {
-      projectContext: normalizeProjectContextResolution(operation.projectContext),
-    });
+    return this.repairProjectContextIfMissing(existing, operation.projectContext);
+  }
+
+  private async repairProjectContextIfMissing(
+    record: WritebackOperation,
+    projectContext: ProjectContextResolution | undefined = undefined,
+  ): Promise<WritebackOperation> {
+    const raw = await this.readStoredRecord(record.idempotencyKey);
+    if (!needsProjectContextBackfill(raw)) return record;
+    const repaired = normalizeWritebackOperation({
+      ...record,
+      projectContext: normalizeProjectContextResolution(projectContext ?? (await this.readRunProjectContext(record.runId))),
+      updatedAt: new Date().toISOString(),
+    } as WritebackOperation);
+    await this.write(repaired);
+    this.notifyProjectionChanged();
+    return repaired;
+  }
+
+  private async readRunProjectContext(runId: string | undefined): Promise<ProjectContextResolution | undefined> {
+    if (!runId) return undefined;
+    const run = await readJsonIfExists<{ projectContext?: ProjectContextResolution | undefined }>(
+      path.join(this.stateDir, "runs", safeFileName(runId), "meta.json"),
+    );
+    return run?.projectContext;
   }
 
   private async update(record: WritebackOperation, patch: Partial<WritebackOperation>): Promise<WritebackOperation> {
-    const updated = normalizeWritebackOperation({ ...record, ...patch, updatedAt: new Date().toISOString() } as WritebackOperation);
+    const current = await this.repairProjectContextIfMissing(record, patch.projectContext);
+    const updated = normalizeWritebackOperation({ ...current, ...patch, updatedAt: new Date().toISOString() } as WritebackOperation);
     await this.write(updated);
     this.notifyProjectionChanged();
     return updated;
