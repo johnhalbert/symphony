@@ -55,6 +55,7 @@ export async function submitReviewVerdictFromMcp(input: unknown, options: {
     });
     const context: ReviewVerdictActiveContext = {
       issue: loadedContext.issue,
+      projectContext: loadedContext.projectContext,
       activeRunId: loadedContext.activeRunId,
       role: loadedContext.role,
       token: loadedContext.token ?? null,

@@ -14,6 +14,13 @@ import {
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import { issue } from "./helpers.js";
 
+const docsProjectContext = {
+  projectContextId: "docs",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
+
 describe("review verdict MCP handoff", () => {
   let root: string;
 
@@ -38,6 +45,7 @@ describe("review verdict MCP handoff", () => {
     });
     await writeReviewVerdictMcpContext(contextFile, {
       issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      projectContext: docsProjectContext,
       activeRunId: "review-run-1",
       role: "reviewer",
       token: null,
@@ -71,6 +79,7 @@ describe("review verdict MCP handoff", () => {
     });
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
       phase: "implementation",
+      projectContext: docsProjectContext,
       reviewRound: 1,
       lastReviewVerdictId: "review-verdict:issue-1:review-verdict-1",
       reviewVerdicts: [
@@ -78,6 +87,7 @@ describe("review verdict MCP handoff", () => {
           runId: "review-run-1",
           verdict: "fail",
           reviewer: "reviewer-agent:review-run-1",
+          projectContext: docsProjectContext,
         },
       ],
     });
@@ -85,10 +95,12 @@ describe("review verdict MCP handoff", () => {
     expect(outbox.find((operation) => operation.kind === "comment")).toMatchObject({
       kind: "comment",
       runId: "review-run-1",
+      projectContext: docsProjectContext,
     });
     expect(outbox.find((operation) => operation.kind === "transition")).toMatchObject({
       kind: "transition",
       runId: "review-run-1",
+      projectContext: docsProjectContext,
       payload: { toState: "In Progress" },
     });
   });
