@@ -4,6 +4,7 @@ import {
   ReviewVerdictService,
   type ReviewVerdictActiveContext,
 } from "../ReviewVerdictService.js";
+import { serviceConfigForProjectContext } from "../config/Config.js";
 import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
@@ -45,11 +46,12 @@ export async function submitReviewVerdictFromMcp(input: unknown, options: {
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
+    const issueConfig = serviceConfigForProjectContext(config, loadedContext.issue.projectContextId);
     const service = new ReviewVerdictService({
       config,
-      lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
-      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
-      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+      lifecycleStore: new FileIssueLifecycleStore(issueConfig.workspace.stateDir),
+      writebackOutbox: new FileWritebackOutboxStore(issueConfig.workspace.stateDir),
+      runStore: new FileRunTranscriptStore(issueConfig.workspace.stateDir),
     });
     const context: ReviewVerdictActiveContext = {
       issue: loadedContext.issue,
@@ -157,4 +159,3 @@ function reviewVerdictInputFromMcp(input: unknown, context: ReviewVerdictActiveC
     issueId: context.issue.id,
   };
 }
-

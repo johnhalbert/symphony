@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
-import type { ServiceConfig } from "../config/Config.js";
+import { serviceConfigForProjectContext, type ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
@@ -54,6 +54,7 @@ import {
 } from "../workflow/ReviewLoopPromptGuidance.js";
 import {
   compareRunChronology,
+  FileRunTranscriptStore,
   type RunActivitySnapshot,
   type RunMetadata,
   type RunRecord,
@@ -75,6 +76,7 @@ import { sanitizeAgentEventForPublicOutput } from "../transcript/TranscriptProje
 import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
   buildWorkerHandoffPacket,
+  FileIssueLifecycleStore,
   phaseForIssueState,
   type IssueCompletionReportRecord,
   type IssueLifecyclePatch,
@@ -112,9 +114,10 @@ import {
 } from "../writeback/TransitionPolicy.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
 import {
+  FileOperatorApprovalStore,
   OPERATOR_REJECTED_PUBLICATION_ERROR,
+  OperatorApprovalService,
   type OperatorApprovalRecord,
-  type OperatorApprovalService,
 } from "../approval/OperatorApprovalService.js";
 import type {
   OrchestratorChatCommand,
@@ -170,6 +173,8 @@ export interface RunningEntry {
   sessionId: string | null;
   runId: string | null;
   activeRunId: string | null;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  runStore: RunTranscriptStore | undefined;
   lifecycle: IssueLifecycleRecord | null;
   worker: Promise<void>;
   abortController: AbortController;
@@ -983,39 +988,74 @@ export class Orchestrator {
   }
 
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
-    if (request.status !== "approved" || !this.options.lifecycleStore) return false;
+    if (request.status !== "approved") return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
-    const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
-    const result = await new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
-      ...(this.options.completionReportPublisher === undefined
-        ? {}
-        : { pullRequestPublisher: this.options.completionReportPublisher }),
-    }).resumeApprovedPublication({ approval: request, issue });
+    const issue = withResolvedIssueProjectContext(
+      latestIssues[0] ?? issueFromApprovalRequest(request),
+      request.projectContextId,
+      request.projectContextLabel,
+    );
+    const result = await this.completionReportRuntimeForIssue(issue).service.resumeApprovedPublication({ approval: request, issue });
     if (!result) return false;
     return true;
   }
 
   async recordPublicationApprovalTerminal(request: OperatorApprovalRecord): Promise<boolean> {
-    if (!this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
-    const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
-    const result = await new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
-    }).recordPublicationApprovalTerminal({ approval: request, issue });
+    const issue = withResolvedIssueProjectContext(
+      latestIssues[0] ?? issueFromApprovalRequest(request),
+      request.projectContextId,
+      request.projectContextLabel,
+    );
+    const runtime = this.completionReportRuntimeForIssue(issue);
+    const result = await runtime.service.recordPublicationApprovalTerminal({ approval: request, issue });
     if (result.length > 0) return true;
     const lifecycle =
-      (await this.options.lifecycleStore.get(request.issueId)) ??
-      (request.issueIdentifier ? await this.options.lifecycleStore.get(request.issueIdentifier) : null);
+      (await runtime.lifecycleStore.get(request.issueId)) ??
+      (request.issueIdentifier ? await runtime.lifecycleStore.get(request.issueIdentifier) : null);
     return lifecycle?.phase === "blocked" && lifecycle.blockedReason === `publication approval ${request.status}`;
+  }
+
+  private completionReportRuntimeForIssue(issue: Issue): {
+    lifecycleStore: FileIssueLifecycleStore;
+    service: CompletionReportService;
+  } {
+    const issueConfig = serviceConfigForProjectContext(this.config, issue.projectContextId);
+    const lifecycleStore = new FileIssueLifecycleStore(issueConfig.workspace.stateDir);
+    const runStore = this.options.runStore === undefined ? undefined : new FileRunTranscriptStore(issueConfig.workspace.stateDir);
+    const writebackOutbox = new FileWritebackOutboxStore(issueConfig.workspace.stateDir);
+    const writebackProcessor =
+      this.options.writeback === undefined ? undefined : this.options.writeback.withStores(writebackOutbox, lifecycleStore);
+    const operatorApproval =
+      this.options.operatorApproval === undefined || runStore === undefined
+        ? undefined
+        : new OperatorApprovalService({
+            config: this.config,
+            store: new FileOperatorApprovalStore(issueConfig.workspace.stateDir),
+            runStore,
+          });
+    return {
+      lifecycleStore,
+      service: new CompletionReportService({
+        config: this.config,
+        lifecycleStore,
+        writebackOutbox,
+        ...(runStore === undefined ? {} : { runStore }),
+        ...(writebackProcessor === undefined ? {} : { writebackProcessor }),
+        ...(this.options.completionReportPublisher === undefined
+          ? {}
+          : { pullRequestPublisher: this.options.completionReportPublisher }),
+        ...(operatorApproval === undefined ? {} : { operatorApproval }),
+      }),
+    };
+  }
+
+  private publicationRecoveryStateDirs(): string[] {
+    const stateDirs = new Set<string>([this.config.workspace.stateDir]);
+    for (const context of this.config.projectContexts.byId.values()) {
+      stateDirs.add(context.workspace.stateDir);
+    }
+    return [...stateDirs];
   }
 
   async createContinuationSummary(
@@ -1200,43 +1240,41 @@ export class Orchestrator {
   }
 
   private async recoverPendingPublicationApprovalHandoffs(): Promise<void> {
-    if (!this.options.lifecycleStore || !this.options.writeback || !this.options.operatorApproval) {
+    if (!this.options.writeback || !this.options.operatorApproval) {
       return;
     }
 
-    let lifecycles: IssueLifecycleRecord[];
-    try {
-      lifecycles = await this.options.lifecycleStore.list();
-    } catch (error) {
-      this.options.logger.warn("pending publication approval recovery lifecycle scan failed", { error: errorMessage(error) });
-      return;
+    const candidates: IssueLifecycleRecord[] = [];
+    for (const stateDir of this.publicationRecoveryStateDirs()) {
+      try {
+        const lifecycles = await new FileIssueLifecycleStore(stateDir).list();
+        candidates.push(...lifecycles.filter(hasRecoverablePendingPublicationApproval));
+      } catch (error) {
+        this.options.logger.warn("pending publication approval recovery lifecycle scan failed", {
+          state_dir: stateDir,
+          error: errorMessage(error),
+        });
+      }
     }
-    const candidates = lifecycles.filter(hasRecoverablePendingPublicationApproval);
     if (candidates.length === 0) return;
 
     let latestIssues: Issue[] = [];
     try {
-      latestIssues = await this.options.tracker.fetchIssueStatesByIds(candidates.map((lifecycle) => lifecycle.issueId));
+      latestIssues = await this.options.tracker.fetchIssueStatesByIds([...new Set(candidates.map((lifecycle) => lifecycle.issueId))]);
     } catch (error) {
       this.options.logger.warn("pending publication approval recovery issue refresh failed", { error: errorMessage(error) });
     }
     const issuesById = new Map(latestIssues.map((issue) => [issue.id, issue]));
-    const service = new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-      writebackProcessor: this.options.writeback,
-      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      ...(this.options.completionReportPublisher === undefined
-        ? {}
-        : { pullRequestPublisher: this.options.completionReportPublisher }),
-      operatorApproval: this.options.operatorApproval,
-    });
 
     for (const lifecycle of candidates) {
-      const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
+      const fallbackIssue = issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
+      const issue = withResolvedIssueProjectContext(
+        issuesById.get(lifecycle.issueId) ?? fallbackIssue,
+        fallbackIssue.projectContextId,
+        fallbackIssue.projectContextLabel,
+      );
       try {
-        const result = await service.recoverPendingPublicationApproval({ issue, lifecycle });
+        const result = await this.completionReportRuntimeForIssue(issue).service.recoverPendingPublicationApproval({ issue });
         if (result.recovered) {
           this.options.logger.info("pending publication approval recovered", {
             issue_id: lifecycle.issueId,
@@ -1293,14 +1331,15 @@ export class Orchestrator {
   }
 
   private async isAwaitingOperatorApproval(entry: RunningEntry): Promise<boolean> {
+    const runStore = entry.runStore ?? this.options.runStore;
     const runId = entry.activeRunId ?? entry.runId;
-    if (!runId || !this.options.runStore) return false;
-    const run = await this.options.runStore.getRun(runId);
+    if (!runId || !runStore) return false;
+    const run = await runStore.getRun(runId);
     return Boolean(run?.pendingApprovalRequestId);
   }
 
   private async hasPendingPublicationApprovalHandoff(entry: RunningEntry): Promise<boolean> {
-    const store = this.options.lifecycleStore;
+    const store = entry.lifecycleStore ?? this.options.lifecycleStore;
     const runId = entry.activeRunId ?? entry.runId;
     if (!store || !runId) return false;
     const lifecycle = await store.get(entry.issue.id);
@@ -1601,6 +1640,22 @@ export class Orchestrator {
     reviewEvidence: ReviewerDispatchEvidence | null,
     runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
   ): void {
+    const issueStateDir =
+      issue.projectContextId === undefined
+        ? this.config.workspace.stateDir
+        : (this.config.projectContexts.byId.get(issue.projectContextId)?.workspace.stateDir ?? this.config.workspace.stateDir);
+    const lifecycleStore =
+      this.options.lifecycleStore === undefined
+        ? undefined
+        : issueStateDir === this.config.workspace.stateDir
+          ? this.options.lifecycleStore
+          : new FileIssueLifecycleStore(issueStateDir);
+    const runStore =
+      this.options.runStore === undefined
+        ? undefined
+        : issueStateDir === this.config.workspace.stateDir
+          ? this.options.runStore
+          : new FileRunTranscriptStore(issueStateDir);
     const abortController = new AbortController();
     const retryAttempt = attempt ?? 0;
     const entry: RunningEntry = {
@@ -1612,6 +1667,8 @@ export class Orchestrator {
       sessionId: null,
       runId: null,
       activeRunId: null,
+      lifecycleStore,
+      runStore,
       lifecycle: null,
       worker: Promise.resolve(),
       abortController,
@@ -1865,7 +1922,7 @@ export class Orchestrator {
         entry.sdkRunStatus = event.sdkStatus;
         entry.sdkRunStatusUpdatedAt = eventAt;
         entry.sdkRunStatusSource = event.source;
-        await this.options.runStore?.updateRun(event.runId, {
+        await entry.runStore?.updateRun(event.runId, {
           metadata: {
             sdkRunStatus: event.sdkStatus,
             sdkRunStatusObservedAt: eventAt.toISOString(),
@@ -1887,7 +1944,7 @@ export class Orchestrator {
         entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
         const runtimeMetadata = runtimeMetadataForEntry(this.options.harness.id, entry, this.config, event);
         await this.updateLifecycle(entry, { summaryPointers: { lastRunId: entry.runId } });
-        await this.options.runStore?.startRun({
+        await entry.runStore?.startRun({
           runId: entry.runId,
           sessionId: event.sessionId,
           agentId: event.threadId ?? null,
@@ -1954,7 +2011,7 @@ export class Orchestrator {
             error: signal.message,
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "failed"),
-          });
+          }, entry.runStore);
         }
         await this.persistHarnessEvent(entry, { ...event, signal });
         throw new SymphonyError("agent_error", signal.message);
@@ -1979,7 +2036,7 @@ export class Orchestrator {
             error: PLANNING_NO_PLAN_ERROR,
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "failed"),
-          });
+          }, entry.runStore);
           await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           continue;
@@ -1989,7 +2046,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
-        });
+        }, entry.runStore);
         await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         await this.discoverPullRequestForEntry(entry, context.workspace);
@@ -2033,7 +2090,7 @@ export class Orchestrator {
           error: event.error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "failed"),
-        });
+        }, entry.runStore);
         await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         throw new SymphonyError("agent_error", event.error);
@@ -2059,7 +2116,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "cancelled"),
-        });
+        }, entry.runStore);
         await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         throw new SymphonyError("agent_error", "Run was cancelled");
@@ -2067,8 +2124,11 @@ export class Orchestrator {
     }
   }
 
-  private async updateRunTerminalStateIfRunning(runId: string, patch: TerminalRunPatch): Promise<TerminalUpdateResult> {
-    const runStore = this.options.runStore;
+  private async updateRunTerminalStateIfRunning(
+    runId: string,
+    patch: TerminalRunPatch,
+    runStore: RunTranscriptStore | undefined = this.options.runStore,
+  ): Promise<TerminalUpdateResult> {
     if (!runStore) return { updated: true, record: null };
     const existing = await runStore.getRun(runId);
     if (existing && existing.status !== "running") return { updated: false, record: existing };
@@ -2171,9 +2231,9 @@ export class Orchestrator {
       completedAt,
       tokens: entry.activeRunTokens,
       metadata,
-    });
+    }, entry.runStore);
     if (terminal.updated) {
-      await this.options.runStore?.appendEvent({
+      await entry.runStore?.appendEvent({
         runId,
         at: completedAt,
         source: "orchestrator",
@@ -2205,7 +2265,7 @@ export class Orchestrator {
       const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
       if (accepted) {
         await this.terminalizeAcceptedIssueBreakdownPlan(entry);
-        await this.options.lifecycleStore?.updateIssue(entry.issue, {
+        await entry.lifecycleStore?.updateIssue(entry.issue, {
           planningFailureCount: 0,
           planningDispatchRetryCount: 0,
           lastPlanningFailureRunId: null,
@@ -2259,7 +2319,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
-        });
+        }, entry.runStore);
         if (!terminal.updated && entry.runPhase !== "merge_conflict_resolution") {
           this.claimed.delete(issueId);
           return;
@@ -2315,7 +2375,7 @@ export class Orchestrator {
           error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
-        });
+        }, entry.runStore);
         if (!terminal.updated) {
           this.claimed.delete(issueId);
           return;
@@ -2330,7 +2390,7 @@ export class Orchestrator {
           error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "cancelled"),
-        });
+        }, entry.runStore);
         if (!terminal.updated) {
           this.claimed.delete(issueId);
           if (terminal.record?.status === "failed" && terminal.record.error === OPERATOR_REJECTED_PUBLICATION_ERROR) return;
@@ -2366,7 +2426,7 @@ export class Orchestrator {
           error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "failed"),
-        });
+        }, entry.runStore);
         if (error === OPERATOR_REJECTED_PUBLICATION_ERROR) {
           this.claimed.delete(issueId);
           return;
@@ -2416,7 +2476,7 @@ export class Orchestrator {
 
   private async recordPlanningFailure(entry: RunningEntry, error: string | null): Promise<void> {
     const issueId = entry.issue.id;
-    const store = this.options.lifecycleStore;
+    const store = entry.lifecycleStore ?? this.options.lifecycleStore;
     if (!store) {
       this.claimed.delete(issueId);
       return;
@@ -2432,7 +2492,7 @@ export class Orchestrator {
       error: failureMessage,
       tokens: entry.activeRunTokens,
       metadata: terminalRunMetadata(entry, "failed"),
-    });
+    }, entry.runStore);
     const current = (await store.get(issueId)) ?? entry.lifecycle;
     const nextCount = (current?.planningFailureCount ?? 0) + 1;
     const lifecycle = await store.updateIssue(entry.issue, {
@@ -2442,7 +2502,7 @@ export class Orchestrator {
       lastPlanningFailureAt: now,
     });
     entry.lifecycle = lifecycle;
-    await this.options.runStore?.appendEvent({
+    await entry.runStore?.appendEvent({
       runId,
       at: now,
       source: "orchestrator",
@@ -2710,16 +2770,17 @@ export class Orchestrator {
   }
 
   private async persistHarnessEvent(entry: RunningEntry, event: AgentEvent): Promise<void> {
+    const runStore = entry.runStore ?? this.options.runStore;
     const runId = event.type === "run_status" ? event.runId : (entry.activeRunId ?? entry.runId);
     if (!runId) return;
-    await this.options.runStore?.appendEvent({
+    await runStore?.appendEvent({
       runId,
       at: new Date(event.at ?? Date.now()).toISOString(),
       source: "harness",
       ...mapAgentEventToRunActivityEvent(event),
     });
     if (event.type === "tokens") {
-      await this.options.runStore?.updateRun(runId, { tokens: entry.activeRunTokens });
+      await runStore?.updateRun(runId, { tokens: entry.activeRunTokens });
     }
   }
 
@@ -3076,10 +3137,10 @@ export class Orchestrator {
   }
 
   private async updateLifecycle(entry: RunningEntry, patch: IssueLifecyclePatch): Promise<void> {
-    const store = this.options.lifecycleStore;
+    const store = entry.lifecycleStore ?? this.options.lifecycleStore;
     if (!store) return;
     entry.lifecycle = await store.updateIssue(entry.issue, patch);
-    await appendLaneMemoTelemetry(this.options.runStore, entry.activeRunId, entry.lifecycle, "orchestrator_update");
+    await appendLaneMemoTelemetry(entry.runStore ?? this.options.runStore, entry.activeRunId, entry.lifecycle, "orchestrator_update");
   }
 
   private shouldDiscoverPullRequestBeforeFirstWorkerPrompt(lifecycle: IssueLifecycleRecord | null | undefined): boolean {
@@ -3146,9 +3207,10 @@ export class Orchestrator {
       });
     }
 
+    const runStore = entry.runStore ?? this.options.runStore;
     const runId = entry.activeRunId ?? entry.runId;
-    if (!runId || !this.options.runStore) return;
-    const existing = await this.options.runStore.getRun(runId);
+    if (!runId || !runStore) return;
+    const existing = await runStore.getRun(runId);
     if (
       existing?.prUrl === metadata.prUrl &&
       existing.prNumber === metadata.prNumber &&
@@ -3158,7 +3220,7 @@ export class Orchestrator {
     ) {
       return;
     }
-    await this.options.runStore.recordPullRequestEvent({
+    await runStore.recordPullRequestEvent({
       runId,
       action: existing?.prUrl ? "updated" : "opened",
       prUrl: metadata.prUrl,
@@ -3173,19 +3235,33 @@ export class Orchestrator {
   }
 
   private async loadReviewerDispatchEvidence(issue: Issue): Promise<ReviewerDispatchEvidence | null> {
-    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
-    const completionReport = lifecycle ? latestCompletionReport(lifecycle) : null;
-    if (!lifecycle || !completionReport) return null;
-    const workerRun = (await this.options.runStore?.getRun(completionReport.runId)) ?? null;
-    const transcript = this.options.runStore
-      ? await this.options.runStore.readTranscript(completionReport.runId, { limit: 50 })
-      : null;
-    return {
-      lifecycle,
-      completionReport,
-      workerRun,
-      runDigest: digestTranscript(workerRun, transcript?.events ?? []),
-    };
+    const contextualStateDir =
+      issue.projectContextId === undefined
+        ? this.config.workspace.stateDir
+        : (this.config.projectContexts.byId.get(issue.projectContextId)?.workspace.stateDir ?? this.config.workspace.stateDir);
+    const candidates: Array<{ lifecycleStore: IssueLifecycleStore; runStore: RunTranscriptStore | undefined }> = [
+      {
+        lifecycleStore: new FileIssueLifecycleStore(contextualStateDir),
+        runStore: this.options.runStore === undefined ? undefined : new FileRunTranscriptStore(contextualStateDir),
+      },
+    ];
+    if (this.options.lifecycleStore !== undefined) {
+      candidates.push({ lifecycleStore: this.options.lifecycleStore, runStore: this.options.runStore });
+    }
+    for (const candidate of candidates) {
+      const lifecycle = await candidate.lifecycleStore.get(issue.id);
+      const completionReport = lifecycle ? latestCompletionReport(lifecycle) : null;
+      if (!lifecycle || !completionReport) continue;
+      const workerRun = (await candidate.runStore?.getRun(completionReport.runId)) ?? null;
+      const transcript = candidate.runStore ? await candidate.runStore.readTranscript(completionReport.runId, { limit: 50 }) : null;
+      return {
+        lifecycle,
+        completionReport,
+        workerRun,
+        runDigest: digestTranscript(workerRun, transcript?.events ?? []),
+      };
+    }
+    return null;
   }
 
   private reviewerPromptTemplate(): string {
@@ -4292,6 +4368,17 @@ function issueFromPendingPublicationLifecycle(lifecycle: IssueLifecycleRecord, s
     ),
     createdAt: null,
     updatedAt: null,
+  };
+}
+
+function withResolvedIssueProjectContext(
+  issue: Issue,
+  projectContextId: string | undefined,
+  projectContextLabel: string | null | undefined,
+): Issue {
+  return {
+    ...issue,
+    ...issueProjectContextFields(issue.projectContextId ?? projectContextId, issue.projectContextLabel ?? projectContextLabel),
   };
 }
 

@@ -573,10 +573,7 @@ export class FileIssueLifecycleStore {
     const target = this.recordPath(record.issueId);
     const temp = `${target}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-    if (process.platform === "win32") {
-      await fs.rm(target, { force: true });
-    }
-    await fs.rename(temp, target);
+    await replaceFileAtomically(target, temp);
   }
 
   private notifyProjectionChanged(): void {
@@ -1875,6 +1872,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function safeFileName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "record";
+}
+
+async function replaceFileAtomically(target: string, temp: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      if (process.platform === "win32") {
+        await fs.rm(target, { force: true });
+      }
+      await fs.rename(temp, target);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (process.platform !== "win32" || (code !== "EPERM" && code !== "EBUSY") || attempt >= 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)));
+    }
+  }
 }
 
 function isStateIn(state: string, states: string[]): boolean {

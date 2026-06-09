@@ -319,10 +319,7 @@ export class FileWritebackOutboxStore {
     const target = this.recordPath(record.idempotencyKey);
     const temp = path.join(this.recordsDir(), `${path.basename(target)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
     await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-    if (process.platform === "win32") {
-      await fs.rm(target, { force: true });
-    }
-    await fs.rename(temp, target);
+    await replaceFileAtomically(target, temp);
     const legacy = this.legacyRecordPath(record.idempotencyKey);
     if (legacy !== target) await rmIfExists(legacy);
   }
@@ -350,6 +347,21 @@ export class WritebackProcessor {
     private readonly dryRun = false,
     private readonly issueBreakdownFreshnessGuard?: IssueBreakdownFreshnessGuard,
   ) {}
+
+  withStores(
+    store: FileWritebackOutboxStore,
+    lifecycleStore?: Pick<IssueLifecycleStore, "get">,
+  ): WritebackProcessor {
+    return new WritebackProcessor(
+      store,
+      this.writer,
+      this.logger,
+      this.maxBackoffMs,
+      lifecycleStore,
+      this.dryRun,
+      this.issueBreakdownFreshnessGuard,
+    );
+  }
 
   async enqueueAndProcess(operation: NewWritebackOperation, options: EnqueueWritebackOptions = {}): Promise<WritebackOperation> {
     let record = await this.store.enqueueOnce(operation);
@@ -649,6 +661,22 @@ function canRetrySkipped(
   }
   if (options.retrySkippedMessages === undefined) return true;
   return options.retrySkippedMessages.some((message) => record.lastError === message || record.resultMessage === message);
+}
+
+async function replaceFileAtomically(target: string, temp: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      if (process.platform === "win32") {
+        await fs.rm(target, { force: true });
+      }
+      await fs.rename(temp, target);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (process.platform !== "win32" || (code !== "EPERM" && code !== "EBUSY") || attempt >= 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)));
+    }
+  }
 }
 
 async function readJsonIfExists<T>(filePath: string): Promise<T | null> {

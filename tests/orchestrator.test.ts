@@ -2937,7 +2937,14 @@ describe("Orchestrator", () => {
     config.github.token = "github-token";
     config.github.operatorApproval!.requiredForPublication = true;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const docsStateDir = configureDocsProjectContext(config, root);
+    const candidate = issue({
+      state: "Blocked",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
     let currentState = "Blocked";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -2961,10 +2968,14 @@ describe("Orchestrator", () => {
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const approvalStore = new FileOperatorApprovalStore(stateDir);
     const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
-    await startApprovalRun(runStore, candidate, "run-1", root);
-    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
-    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
-    const { record } = await approvalStore.requestOrGetPending(
+    const docsOutboxStore = new FileWritebackOutboxStore(docsStateDir);
+    const docsRunStore = new FileRunTranscriptStore(docsStateDir);
+    const docsLifecycleStore = new FileIssueLifecycleStore(docsStateDir);
+    const docsApprovalStore = new FileOperatorApprovalStore(docsStateDir);
+    await startApprovalRun(docsRunStore, candidate, "run-1", root);
+    await docsRunStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await docsLifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+    const { record } = await docsApprovalStore.requestOrGetPending(
       {
         issueId: candidate.id,
         issueIdentifier: candidate.identifier,
@@ -2974,7 +2985,7 @@ describe("Orchestrator", () => {
       },
       null,
     );
-    await approvalStore.resolve(record.requestId, "approve");
+    await docsApprovalStore.resolve(record.requestId, "approve");
     const publisher = new FakeCompletionReportPublisher({
       action: "created",
       url: "https://github.com/acme/symphony/pull/42",
@@ -3007,8 +3018,9 @@ describe("Orchestrator", () => {
         "reviewer dispatch after approved recovery",
       );
 
-      expect(await approvalStore.list()).toHaveLength(1);
-      await expect(approvalStore.findPendingForRun("run-1")).resolves.toBeNull();
+      expect(await approvalStore.list()).toHaveLength(0);
+      expect(await docsApprovalStore.list()).toHaveLength(1);
+      await expect(docsApprovalStore.findPendingForRun("run-1")).resolves.toBeNull();
       expect(publisher.inputs[0]).toMatchObject({
         workspacePath: path.join(root, "workspace"),
         branchName: "symphony/TEST-1",
@@ -3019,9 +3031,32 @@ describe("Orchestrator", () => {
       expect(writer.comments.filter((comment) => comment.body.includes("## Symphony Publication Approval Setup Incomplete"))).toHaveLength(1);
       expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Blocked", "In Review"]);
       expect(currentState).toBe("In Review");
-      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      const recoveryOperations = (await docsOutboxStore.list()).filter(
+        (record) => record.runId === "run-1" && record.idempotencyKey.includes("completion-report:idem-1"),
+      );
+      const pendingRecoveryOperations = recoveryOperations.filter((record) =>
+        record.idempotencyKey.includes("publication-approval-pending"),
+      );
+      const acceptedRecoveryOperations = recoveryOperations.filter(
+        (record) => !record.idempotencyKey.includes("publication-approval-pending"),
+      );
+      expect(pendingRecoveryOperations).toHaveLength(2);
+      expect(acceptedRecoveryOperations).toHaveLength(2);
+      expect(
+        recoveryOperations.every(
+          (record) =>
+            record.status === "succeeded" &&
+            record.projectContextId === "docs" &&
+            record.projectContextLabel === "Documentation Site" &&
+            record.idempotencyKey.startsWith("project-context:docs:"),
+        ),
+      ).toBe(true);
+      expect(await outboxStore.list()).toHaveLength(0);
+      await expect(docsLifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "review",
         blockedReason: null,
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
         completionReports: [
           expect.objectContaining({
             runId: "run-1",
@@ -3035,13 +3070,15 @@ describe("Orchestrator", () => {
           }),
         ],
       });
-      await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+      await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+      await expect(docsRunStore.getRun("run-1")).resolves.toMatchObject({
         prUrl: "https://github.com/acme/symphony/pull/42",
         prNumber: 42,
         prHeadSha: "abc123",
         prBranch: "symphony/TEST-1",
       });
-      expect((await runStore.getRun("run-1"))?.pendingApprovalRequestId ?? null).toBeNull();
+      expect((await docsRunStore.getRun("run-1"))?.pendingApprovalRequestId ?? null).toBeNull();
+      await expect(runStore.getRun("run-1")).resolves.toBeNull();
       expect(harness.runs.filter((run) => run.ctx.role === "worker")).toHaveLength(0);
       expect(orchestrator.snapshot().counts.retrying).toBe(0);
     } finally {
@@ -3951,13 +3988,7 @@ describe("Orchestrator", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
-    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
-    if (!defaultContext) throw new Error("missing default project context");
-    config.projectContexts.byId.set("docs", {
-      ...defaultContext,
-      id: "docs",
-      label: "Documentation Site",
-    });
+    const docsStateDir = configureDocsProjectContext(config, root);
     const candidate = issue({
       state: "Blocked",
       labels: ["dogfood-ready"],
@@ -3983,9 +4014,12 @@ describe("Orchestrator", () => {
     const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
-    await startApprovalRun(runStore, candidate, "run-1", root);
-    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
-    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+    const docsOutboxStore = new FileWritebackOutboxStore(docsStateDir);
+    const docsRunStore = new FileRunTranscriptStore(docsStateDir);
+    const docsLifecycleStore = new FileIssueLifecycleStore(docsStateDir);
+    await startApprovalRun(docsRunStore, candidate, "run-1", root);
+    await docsRunStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await docsLifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
     const publisher = new FakeCompletionReportPublisher({
       action: "created",
       url: "https://github.com/acme/symphony/pull/42",
@@ -4025,7 +4059,7 @@ describe("Orchestrator", () => {
     expect(writer.comments[0]?.body).not.toContain("Publication Approval Not Completed");
     expect(writer.transitions).toHaveLength(1);
     expect(writer.transitions[0]).toMatchObject({ toState: "In Review" });
-    const recoveryOperations = (await outboxStore.list()).filter(
+    const recoveryOperations = (await docsOutboxStore.list()).filter(
       (record) => record.runId === "run-1" && record.idempotencyKey.includes("completion-report:idem-1"),
     );
     expect(recoveryOperations).toHaveLength(2);
@@ -4038,7 +4072,8 @@ describe("Orchestrator", () => {
           record.idempotencyKey.startsWith("project-context:docs:"),
       ),
     ).toBe(true);
-    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+    expect(await outboxStore.list()).toHaveLength(0);
+    await expect(docsLifecycleStore.get(candidate.id)).resolves.toMatchObject({
       phase: "review",
       blockedReason: null,
       projectContextId: "docs",
@@ -4056,11 +4091,13 @@ describe("Orchestrator", () => {
         }),
       ],
     });
-    await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+    await expect(docsRunStore.getRun("run-1")).resolves.toMatchObject({
       prUrl: "https://github.com/acme/symphony/pull/42",
       prNumber: 42,
       prHeadSha: "abc123",
     });
+    await expect(runStore.getRun("run-1")).resolves.toBeNull();
   });
 
   it.each([
@@ -4080,13 +4117,7 @@ describe("Orchestrator", () => {
       config.github.repo = "symphony";
       config.github.token = "github-token";
       config.workspace.source.baseRef = "main";
-      const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
-      if (!defaultContext) throw new Error("missing default project context");
-      config.projectContexts.byId.set("docs", {
-        ...defaultContext,
-        id: "docs",
-        label: "Documentation Site",
-      });
+      const docsStateDir = configureDocsProjectContext(config, root);
       const candidate = issue({
         state: "Blocked",
         labels: ["dogfood-ready"],
@@ -4112,9 +4143,12 @@ describe("Orchestrator", () => {
       const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
       const runStore = new FileRunTranscriptStore(stateDir);
       const lifecycleStore = new FileIssueLifecycleStore(stateDir);
-      await startApprovalRun(runStore, candidate, "run-1", root);
-      await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
-      await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+      const docsOutboxStore = new FileWritebackOutboxStore(docsStateDir);
+      const docsRunStore = new FileRunTranscriptStore(docsStateDir);
+      const docsLifecycleStore = new FileIssueLifecycleStore(docsStateDir);
+      await startApprovalRun(docsRunStore, candidate, "run-1", root);
+      await docsRunStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+      await docsLifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
       const orchestrator = new Orchestrator({
         config,
         tracker,
@@ -4137,7 +4171,7 @@ describe("Orchestrator", () => {
       expect(writer.comments[0]?.body).toContain(`Reason: ${staleReason}`);
       expect(writer.comments[0]?.body).toContain("The worker completion report remains stored");
       expect(writer.transitions).toEqual([]);
-      const recoveryOperations = (await outboxStore.list()).filter(
+      const recoveryOperations = (await docsOutboxStore.list()).filter(
         (record) => record.runId === "run-1" && record.idempotencyKey.includes(`publication-approval-${status}`),
       );
       expect(recoveryOperations).toHaveLength(1);
@@ -4147,12 +4181,14 @@ describe("Orchestrator", () => {
         projectContextLabel: "Documentation Site",
       });
       expect(recoveryOperations[0]?.idempotencyKey.startsWith("project-context:docs:")).toBe(true);
-      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      expect(await outboxStore.list()).toHaveLength(0);
+      await expect(docsLifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "blocked",
         blockedReason: `publication approval ${status}`,
         projectContextId: "docs",
         projectContextLabel: "Documentation Site",
       });
+      await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
     },
   );
 
@@ -6570,6 +6606,22 @@ function linearLinkbackComment(): string {
     "</details>",
     "<!-- linear-review-link -->",
   ].join("\n");
+}
+
+function configureDocsProjectContext(config: ReturnType<typeof testConfig>, root: string): string {
+  const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+  if (!defaultContext) throw new Error("missing default project context");
+  const docsStateDir = path.join(root, "docs-state");
+  config.projectContexts.byId.set("docs", {
+    ...defaultContext,
+    id: "docs",
+    label: "Documentation Site",
+    workspace: {
+      ...defaultContext.workspace,
+      stateDir: docsStateDir,
+    },
+  });
+  return docsStateDir;
 }
 
 async function startApprovalRun(

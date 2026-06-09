@@ -93,6 +93,81 @@ describe("review verdict MCP handoff", () => {
     });
   });
 
+  it("uses the issue context state bucket for reviewer verdict submissions", async () => {
+    const stateDir = path.join(root, "state");
+    const docsStateDir = path.join(root, "docs-state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-context.json");
+    const docsIssue = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    const docsLifecycleStore = new FileIssueLifecycleStore(docsStateDir);
+    await writeFile(workflowPath, workflowWithDocsContext(stateDir, docsStateDir), "utf8");
+    await docsLifecycleStore.ensureIssue(docsIssue, {
+      phase: "review",
+      reviewRound: 0,
+      summaryPointers: { lastRunId: "review-run-docs-1" },
+    });
+    await writeReviewVerdictMcpContext(contextFile, {
+      issue: docsIssue,
+      activeRunId: "review-run-docs-1",
+      role: "reviewer",
+      token: null,
+      expectedToken: null,
+      reviewer: "reviewer-agent:review-run-docs-1",
+      phase: "review",
+    });
+
+    const result = await submitReviewVerdictFromMcp(
+      {
+        verdict: "fail",
+        acceptanceResults: [
+          {
+            text: "Reviewer verdict submissions use the issue context state bucket.",
+            satisfied: false,
+            evidence: "Default state bucket remained empty before the fix.",
+          },
+        ],
+        findings: ["Route reviewer verdict MCP storage through the issue context state bucket."],
+        evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-3"],
+        idempotencyKey: "review-verdict-docs-1",
+      },
+      { workflowPath, contextFile },
+    );
+
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      verdictId: "review-verdict:issue-1:review-verdict-docs-1",
+      verdict: "fail",
+    });
+    await expect(docsLifecycleStore.get(docsIssue.id)).resolves.toMatchObject({
+      phase: "implementation",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      reviewVerdicts: [
+        {
+          runId: "review-run-docs-1",
+          verdict: "fail",
+          reviewer: "reviewer-agent:review-run-docs-1",
+        },
+      ],
+    });
+    const docsOutbox = await new FileWritebackOutboxStore(docsStateDir).list();
+    expect(docsOutbox.find((operation) => operation.kind === "transition")).toMatchObject({
+      kind: "transition",
+      runId: "review-run-docs-1",
+      payload: { toState: "In Progress" },
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    await expect(new FileIssueLifecycleStore(stateDir).get(docsIssue.id)).resolves.toBeNull();
+    expect(await new FileWritebackOutboxStore(stateDir).list()).toHaveLength(0);
+  });
+
   it("submits a reviewer pass verdict through ReviewVerdictService", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
@@ -178,6 +253,44 @@ review_loop:
 workspace:
   root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
   state_dir: "${slash(stateDir)}"
+---
+Work on {{ issue.identifier }}.
+`;
+}
+
+function workflowWithDocsContext(stateDir: string, docsStateDir: string): string {
+  return `---
+tracker:
+  kind: linear
+  api_key: linear-test-key
+  project_slug: TEST
+  active_states:
+    - Todo
+    - In Progress
+  handoff_states:
+    - In Review
+writeback:
+  enabled: true
+  mode: dry_run
+  dispatch_state: In Progress
+review_loop:
+  review_states:
+    - In Review
+  review_pass_state: Ready to Merge
+workspace:
+  root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  state_dir: "${slash(stateDir)}"
+project_contexts:
+  - id: docs
+    label: Documentation Site
+    tracker:
+      api_key: linear-test-key
+      project_slug: DOCS
+    workspace:
+      state_dir: "${slash(docsStateDir)}"
+      source:
+        kind: copy
+        path: ../docs-site
 ---
 Work on {{ issue.identifier }}.
 `;
