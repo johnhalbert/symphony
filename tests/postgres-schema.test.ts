@@ -45,6 +45,15 @@ const projectContextAttributionMigrationUrl = new URL(
 const readmeUrl = new URL("../migrations/postgres/README.md", import.meta.url);
 const stateOwnershipUrl = new URL("../docs/state-ownership-and-migration.md", import.meta.url);
 const publishedOwnedStateChecksumSha256 = "8e10c03c6cfa34e9672e350c59ff4998459989529a82c98cbd9f714469799298";
+const configuredBaselineMigrationIds = [
+  "0001_migration_foundation",
+  "0002_symphony_owned_state",
+  "0003_projection_freshness_indexes",
+  "0004_run_activity_canonical_channels",
+  "0005_projection_source_freshness",
+  "0006_projection_build_modes",
+] as const;
+const projectContextAttributionMigrationId = "0007_project_context_attribution";
 
 const operationalTables = [
   "workspace",
@@ -149,6 +158,12 @@ async function configuredMigrationIds(): Promise<string[]> {
   return migrations.map((migration) => migration.id);
 }
 
+function expectedConfiguredMigrationIds(hasProjectContextAttributionMigration: boolean): string[] {
+  return hasProjectContextAttributionMigration
+    ? [...configuredBaselineMigrationIds, projectContextAttributionMigrationId]
+    : [...configuredBaselineMigrationIds];
+}
+
 function sha256(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
@@ -168,15 +183,11 @@ function normalizedSql(sql: string): string {
 describe("Postgres Symphony-owned state migration", () => {
   it("keeps the owned-state schema on the configured migration path after the runner baseline", async () => {
     const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
+    const migrationIds = migrations.map((migration) => migration.id);
 
-    expect(migrations.map((migration) => migration.id)).toEqual([
-      "0001_migration_foundation",
-      "0002_symphony_owned_state",
-      "0003_projection_freshness_indexes",
-      "0004_run_activity_canonical_channels",
-      "0005_projection_source_freshness",
-      "0006_projection_build_modes",
-    ]);
+    expect(migrationIds).toEqual(
+      expectedConfiguredMigrationIds(migrationIds.includes(projectContextAttributionMigrationId)),
+    );
     const ownedState = migrations.find((migration) => migration.id === "0002_symphony_owned_state");
     const projectionFreshness = migrations.find((migration) => migration.id === "0003_projection_freshness_indexes");
     const canonicalChannels = migrations.find((migration) => migration.id === "0004_run_activity_canonical_channels");
@@ -208,17 +219,11 @@ describe("Postgres Symphony-owned state migration", () => {
   it("reserves 0007 project-context attribution on the configured migration path before the migration is implemented", async () => {
     const migrations = await discoverPostgresMigrations(configuredMigrationsDir);
 
-    expect(migrations.map((migration) => migration.id)).toEqual([
-      "0001_migration_foundation",
-      "0002_symphony_owned_state",
-      "0003_projection_freshness_indexes",
-      "0004_run_activity_canonical_channels",
-      "0005_projection_source_freshness",
-      "0006_projection_build_modes",
-      "0007_project_context_attribution",
-    ]);
+    expect(migrations.map((migration) => migration.id)).toEqual(expectedConfiguredMigrationIds(true));
 
-    const projectContextAttribution = migrations.find((migration) => migration.id === "0007_project_context_attribution");
+    const projectContextAttribution = migrations.find(
+      (migration) => migration.id === projectContextAttributionMigrationId,
+    );
     expect(projectContextAttribution?.filePath).toBe(fileURLToPath(projectContextAttributionMigrationUrl));
     expect(projectContextAttribution?.sql).not.toMatch(/^\s*(BEGIN|COMMIT);/im);
   });
@@ -1675,6 +1680,81 @@ async function expectLegacyProjectContextAttributionMigrated(containerName: stri
   const contextIds = Object.values(contexts);
   expect(contextIds.every((value) => typeof value === "string" && value.length > 0)).toBe(true);
   expect(new Set(contextIds).size).toBe(1);
+
+  const migratedProjectionRevisions = JSON.parse(
+    (
+      await psql(
+        containerName,
+        String.raw`
+          with targeted_projection_revisions(projection_name, scope_key) as (
+            values
+              ('dashboard_projection', 'legacy-context-dashboard'),
+              ('issue_board_projection', 'legacy-context-board'),
+              ('sidebar_projection', 'legacy-context-sidebar'),
+              ('history_projection', 'legacy-context-history'),
+              ('transcript_projection', 'run:legacy-context-upgrade'),
+              ('orchestrator_chat_projection', 'legacy-context-conversation')
+          )
+          select coalesce(
+            jsonb_agg(
+              jsonb_build_object(
+                'projection_name', target.projection_name,
+                'scope_key', target.scope_key,
+                'project_context_id', revision.project_context_id,
+                'child_project_context_id', coalesce(
+                  dashboard.project_context_id,
+                  issue_board.project_context_id,
+                  sidebar.project_context_id,
+                  history.project_context_id,
+                  transcript.project_context_id,
+                  orchestrator_chat.project_context_id
+                )
+              )
+              order by target.projection_name, target.scope_key
+            ),
+            '[]'::jsonb
+          )::text
+          from targeted_projection_revisions target
+          left join symphony.projection_revision revision
+            on revision.projection_name = target.projection_name
+           and revision.scope_key = target.scope_key
+          left join symphony.dashboard_projection dashboard
+            on revision.projection_revision_id = dashboard.projection_revision_id
+          left join symphony.issue_board_projection issue_board
+            on revision.projection_revision_id = issue_board.projection_revision_id
+          left join symphony.sidebar_projection sidebar
+            on revision.projection_revision_id = sidebar.projection_revision_id
+          left join symphony.history_projection history
+            on revision.projection_revision_id = history.projection_revision_id
+          left join symphony.transcript_projection transcript
+            on revision.projection_revision_id = transcript.projection_revision_id
+          left join symphony.orchestrator_chat_projection orchestrator_chat
+            on revision.projection_revision_id = orchestrator_chat.projection_revision_id;
+        `,
+      )
+    ).trim(),
+  ) as Array<{
+    projection_name: string;
+    scope_key: string;
+    project_context_id: string | null;
+    child_project_context_id: string | null;
+  }>;
+  expect(migratedProjectionRevisions).toHaveLength(6);
+  for (const row of migratedProjectionRevisions) {
+    expect(
+      typeof row.project_context_id,
+      `missing backfilled projection_revision context for ${row.projection_name}:${row.scope_key}`,
+    ).toBe("string");
+    expect(
+      row.project_context_id?.length ?? 0,
+      `empty backfilled projection_revision context for ${row.projection_name}:${row.scope_key}`,
+    ).toBeGreaterThan(0);
+    expect(
+      row.child_project_context_id,
+      `projection_revision context drift for ${row.projection_name}:${row.scope_key}`,
+    ).toBe(row.project_context_id);
+  }
+  expect(new Set(migratedProjectionRevisions.map((row) => row.project_context_id)).size).toBe(1);
 
   const runSessionAttribution = JSON.parse(
     (
