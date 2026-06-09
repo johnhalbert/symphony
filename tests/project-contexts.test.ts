@@ -63,6 +63,27 @@ describe("project context normalization", () => {
     },
   );
 
+  it("rejects whitespace-only explicit routed project context ids even when other routed metadata is present", () => {
+    const routedResolution = {
+      projectContextId: "   ",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    };
+
+    expect(() => normalizeProjectContextResolution(routedResolution)).toThrowError(
+      "Project context id must contain at least one letter or number after normalization",
+    );
+    expect(() => projectContextResolutionFromIssue(routedResolution)).toThrowError(
+      "Project context id must contain at least one letter or number after normalization",
+    );
+    expect(() =>
+      projectContextResolutionFromIssue({
+        projectContext: routedResolution,
+      }),
+    ).toThrowError("Project context id must contain at least one letter or number after normalization");
+  });
+
   it("derives normalized project context metadata from routed issue payloads", () => {
     expect(
       projectContextResolutionFromIssue({
