@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -41,6 +41,18 @@ describe("approval status API", () => {
   let lifecycleStore: FileIssueLifecycleStore;
   let store: FileOperatorApprovalStore;
   let service: OperatorApprovalService;
+  const docsProjectContext = {
+    projectContextId: "docs",
+    projectContextLabel: "Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "candidate_poll",
+  } as const;
+  const symphonyProjectContext = {
+    projectContextId: "symphony",
+    projectContextLabel: "Symphony",
+    linearProjectSlug: "ENG",
+    routingSource: "candidate_poll",
+  } as const;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-approval-api-"));
@@ -59,6 +71,7 @@ describe("approval status API", () => {
       role: "worker",
       issueId: "issue-1",
       issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
       attempt: null,
       turnNumber: 1,
       prompt: "work",
@@ -70,6 +83,14 @@ describe("approval status API", () => {
   afterEach(async () => {
     await rmWithRetry(root);
   });
+
+  async function stripPersistedProjectContext(requestId: string): Promise<void> {
+    const approvalPath = path.join(config.workspace.stateDir, "approval-requests", `${requestId}.json`);
+    const record = JSON.parse(await readFile(approvalPath, "utf8")) as Record<string, unknown>;
+    delete record.projectContext;
+    await writeFile(approvalPath, `${JSON.stringify(record, null, 2)}
+`, "utf8");
+  }
 
   it("requires the mutation token and approves pending requests", async () => {
     const pending = await createPending("idem-1");
@@ -102,6 +123,130 @@ describe("approval status API", () => {
       expect(approvedBody.request.status).toBe("approved");
       expect(issueBody.capabilities.pendingApproval.active).toBe(false);
       expect(resumed).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("includes project context on pending approval issue details and capability summaries", async () => {
+    const pending = await createPending("idem-project-context-capability");
+    const server = statusServer({});
+    const address = await server.start();
+
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-1`);
+      const body = (await response.json()) as {
+        capabilities: {
+          pendingApproval: {
+            active: boolean;
+            requestId: string | null;
+            projectContext: typeof docsProjectContext | null;
+          };
+        };
+        pendingApproval: {
+          requestId: string;
+          projectContext: typeof docsProjectContext;
+        } | null;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.capabilities.pendingApproval).toMatchObject({
+        active: true,
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+      expect(body.pendingApproval).toMatchObject({
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("repairs legacy pending approvals in issue and run status views", async () => {
+    const pending = await createPending("idem-project-context-legacy-status");
+    await stripPersistedProjectContext(pending.requestId);
+    const server = statusServer({});
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-1`);
+      const issueBody = (await issueResponse.json()) as {
+        capabilities: {
+          pendingApproval: {
+            active: boolean;
+            requestId: string | null;
+            projectContext: typeof docsProjectContext | null;
+          };
+        };
+        pendingApproval: {
+          requestId: string;
+          projectContext: typeof docsProjectContext;
+        } | null;
+      };
+      const runBody = (await runResponse.json()) as {
+        pendingApproval: {
+          requestId: string;
+          projectContext: typeof docsProjectContext;
+        } | null;
+      };
+
+      expect(issueResponse.status).toBe(200);
+      expect(issueBody.capabilities.pendingApproval).toMatchObject({
+        active: true,
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+      expect(issueBody.pendingApproval).toMatchObject({
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+      expect(runResponse.status).toBe(200);
+      expect(runBody.pendingApproval).toMatchObject({
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("prefers the resolved issue context over unrelated latest runs when identifiers collide", async () => {
+    const pending = await createPending("idem-project-context-collision-status");
+    await runStore.startRun({
+      runId: "run-2",
+      sessionId: "session-2",
+      agentId: "agent-2",
+      role: "worker",
+      issueId: "issue-2",
+      issueIdentifier: "TEST-1",
+      projectContext: symphonyProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "other work",
+      workspaceKey: "TEST-1",
+      workspacePath: path.join(root, "workspace-2"),
+    });
+    const server = statusServer({});
+    const address = await server.start();
+
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-1`);
+      const body = (await response.json()) as {
+        pendingApproval: {
+          requestId: string;
+          projectContext: typeof docsProjectContext;
+        } | null;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.pendingApproval).toMatchObject({
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
     } finally {
       await server.stop();
     }
@@ -1546,6 +1691,7 @@ describe("approval status API", () => {
     await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
       phase: "blocked",
       blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      projectContext: docsProjectContext,
       lastCompletionReportId: `completion-report:issue-1:${evidenceCursor}`,
       completionReports: [
         {
@@ -1589,6 +1735,7 @@ describe("approval status API", () => {
         await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
           phase: "blocked",
           blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          projectContext: docsProjectContext,
           lastCompletionReportId: `completion-report:issue-1:${pending.evidenceCursor}`,
           completionReports: [
             {
