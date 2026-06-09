@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import { SymphonyError, errorMessage } from "../errors.js";
+import { SymphonyError } from "../errors.js";
 import type { IssueBoardColumnId, IssueBoardColumnMapping } from "../types.js";
 import {
   createCredentialProfileRegistry,
@@ -10,9 +10,11 @@ import {
 } from "./CredentialProfiles.js";
 import {
   DEFAULT_PROJECT_CONTEXT_ID,
-  DEFAULT_PROJECT_CONTEXT_LABEL,
   normalizeProjectContextId,
-  type ProjectContextConfig,
+  normalizeProjectContextRegistry,
+  rawProjectContextsSchema,
+  type NormalizedProjectContext,
+  type ProjectContextRegistry,
 } from "./ProjectContexts.js";
 
 const stringArray = z.array(z.string());
@@ -310,30 +312,12 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
-    project_contexts: z
-      .array(
-        z
-          .object({
-            id: z.string(),
-            label: z.string().optional(),
-            enabled: z.boolean().optional(),
-            tracker: z.record(z.string(), z.unknown()).optional(),
-            workspace: z.record(z.string(), z.unknown()).optional(),
-            github: z.record(z.string(), z.unknown()).optional(),
-            review_loop: z.record(z.string(), z.unknown()).optional(),
-            issue_breakdown: z.record(z.string(), z.unknown()).optional(),
-            agent: z.record(z.string(), z.unknown()).optional(),
-          })
-          .passthrough(),
-      )
-      .nonempty()
-      .optional(),
     credential_profiles: rawCredentialProfilesSchema.optional(),
+    project_contexts: rawProjectContextsSchema.optional(),
   })
   .passthrough();
 
 export type RawWorkflowConfig = z.infer<typeof rawConfigSchema>;
-export type RawProjectContextConfig = NonNullable<RawWorkflowConfig["project_contexts"]>[number];
 
 export interface TrackerConfig {
   kind: "linear";
@@ -594,23 +578,86 @@ export interface ServiceConfig {
   writeback: WritebackConfig;
   github: GitHubConfig;
   credentialProfiles: CredentialProfileRegistry;
+  projectContexts: ProjectContextRegistry;
   reviewLoop: ReviewLoopConfig;
   mergePolicy: MergePolicyConfig;
   issueBoard: IssueBoardConfig;
   continuationContext: ContinuationContextConfig;
   database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
-  projectContexts?: ProjectContextConfig[];
-  defaultProjectContextId?: string;
   raw: RawWorkflowConfig;
 }
 
-interface ParseServiceConfigOptions {
-  allowIncompleteProjectContext?: boolean;
+function defaultProjectContextForConfig(config: ServiceConfig): NormalizedProjectContext {
+  const context = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+  if (!context) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `Normalized default project context "${config.projectContexts.defaultContextId}" was not found`,
+    );
+  }
+  return context;
+}
+
+export function resolveProjectContextIdForConfig(config: ServiceConfig, projectContextId?: string | null): string {
+  if (
+    projectContextId === undefined ||
+    projectContextId === null ||
+    projectContextId === DEFAULT_PROJECT_CONTEXT_ID
+  ) {
+    return config.projectContexts.defaultContextId;
+  }
+
+  const normalizedProjectContextId = normalizeProjectContextId(projectContextId);
+  if (config.projectContexts.byId.has(normalizedProjectContextId)) {
+    return normalizedProjectContextId;
+  }
+
+  throw new SymphonyError(
+    "config_validation_error",
+    `Project context "${projectContextId}" was not found in the loaded workflow config. Persisted non-default project context ids must resolve exactly; only the legacy "${DEFAULT_PROJECT_CONTEXT_ID}" compatibility context may fall back.`,
+  );
+}
+
+export function resolveProjectContextForConfig(
+  config: ServiceConfig,
+  projectContextId?: string | null,
+): NormalizedProjectContext {
+  const resolvedProjectContextId = resolveProjectContextIdForConfig(config, projectContextId);
+  if (resolvedProjectContextId === config.projectContexts.defaultContextId) {
+    return defaultProjectContextForConfig(config);
+  }
+
+  const context = config.projectContexts.byId.get(resolvedProjectContextId);
+  if (context) {
+    return context;
+  }
+
+  throw new SymphonyError(
+    "config_validation_error",
+    `Project context "${resolvedProjectContextId}" was not found in the loaded workflow config.`,
+  );
+}
+
+export function serviceConfigForProjectContext(
+  config: ServiceConfig,
+  projectContextId?: string | null,
+): ServiceConfig {
+  const context = resolveProjectContextForConfig(config, projectContextId);
+  return {
+    ...config,
+    tracker: context.tracker,
+    workspace: context.workspace,
+    agent: context.agent,
+    github: context.github,
+    reviewLoop: context.reviewLoop,
+    issueBreakdown: context.issueBreakdown,
+  };
 }
 
 const DEFAULT_ACTIVE_STATES = ["Todo", "In Progress"];
 const DEFAULT_TERMINAL_STATES = ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"];
+
 const VALID_CURSOR_SETTING_SOURCES = new Set<CursorSettingSource>([
   "project",
   "user",
@@ -653,136 +700,52 @@ export function parseDatabaseConfig(rawInput: unknown, workflowPath: string, env
   return normalizeDatabaseConfig(parsed.data, workflowDir, env);
 }
 
-export function parseServiceConfig(
-  rawInput: unknown,
-  workflowPath: string,
-  env = process.env,
-  options: ParseServiceConfigOptions = {},
-): ServiceConfig {
+export function parseServiceConfig(rawInput: unknown, workflowPath: string, env = process.env): ServiceConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
   if (!parsed.success) {
     throw new SymphonyError("config_validation_error", "Workflow config is invalid", parsed.error.flatten());
   }
 
   const raw = parsed.data;
-  const allowIncompleteProjectContext = options.allowIncompleteProjectContext ?? false;
-  if (raw.project_contexts?.length) {
-    const projectContexts = normalizeExplicitProjectContexts(raw, workflowPath, env);
-    const defaultProjectContextId =
-      projectContexts.find((context) => context.id === DEFAULT_PROJECT_CONTEXT_ID && context.enabled)?.id ??
-      projectContexts.find((context) => context.enabled)?.id ??
-      DEFAULT_PROJECT_CONTEXT_ID;
-    const defaultRawProjectContext =
-      raw.project_contexts.find((context) => normalizeProjectContextId(context.id) === defaultProjectContextId) ??
-      raw.project_contexts[0]!;
-    const defaultContextConfig = parseServiceConfig(mergedRawForProjectContext(raw, defaultRawProjectContext), workflowPath, env);
-    return {
-      ...defaultContextConfig,
-      projectContexts,
-      defaultProjectContextId,
-    };
-  }
   const workflowDir = path.dirname(path.resolve(workflowPath));
-  const trackerKind = raw.tracker?.kind ?? "linear";
-  if (trackerKind !== "linear") {
-    throw new SymphonyError("unsupported_tracker_kind", `Unsupported tracker kind: ${trackerKind}`);
+  const projectContextNormalization = normalizeProjectContextRegistry({
+    rawProjectContexts: raw.project_contexts,
+    rawDefaults: {
+      ...(raw.tracker === undefined ? {} : { tracker: raw.tracker }),
+      ...(raw.workspace === undefined ? {} : { workspace: raw.workspace }),
+      ...(raw.github === undefined ? {} : { github: raw.github }),
+      ...(raw.review_loop === undefined ? {} : { review_loop: raw.review_loop }),
+      ...(raw.issue_breakdown === undefined ? {} : { issue_breakdown: raw.issue_breakdown }),
+      ...(raw.agent === undefined ? {} : { agent: raw.agent }),
+      ...(raw.credential_profiles?.roles === undefined
+        ? {}
+        : {
+            credential_profiles: {
+              roles: raw.credential_profiles.roles,
+            },
+          }),
+    },
+    workflowDir,
+    env,
+    defaultIssueBreakdownPrompt: DEFAULT_ISSUE_BREAKDOWN_PROMPT,
+  });
+  const projectContexts = projectContextNormalization.registry;
+  const defaultProjectContext = projectContexts.byId.get(projectContexts.defaultContextId);
+  if (!defaultProjectContext) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `Normalized default project context "${projectContexts.defaultContextId}" was not found`,
+    );
   }
 
-  const trackerApiKey =
-    resolveConfigString(raw.tracker?.api_key, env) ?? resolveConfigString("$LINEAR_API_KEY", env) ?? "";
-  if (trackerApiKey.length === 0 && !allowIncompleteProjectContext) {
-    throw new SymphonyError("missing_tracker_api_key", "Linear API key is required");
-  }
-
-  const projectSlug = resolveConfigString(raw.tracker?.project_slug, env) ?? "";
-  if (projectSlug.length === 0 && !allowIncompleteProjectContext) {
-    throw new SymphonyError("missing_tracker_project_slug", "Linear project slug is required");
-  }
-  const trackerAssignee =
-    resolveConfigString(raw.tracker?.assignee, env) ?? resolveConfigString("$LINEAR_ASSIGNEE", env) ?? "";
-
-  const workspaceRoot = resolvePathValue(raw.workspace?.root ?? "symphony_workspaces", workflowDir, env);
-  const workspaceStateDir = resolvePathValue(raw.workspace?.state_dir ?? ".symphony", workspaceRoot, env);
-  const sourceKind = raw.workspace?.source?.kind ?? "none";
-  const sourcePath =
-    raw.workspace?.source?.path === undefined
-      ? undefined
-      : resolvePathValue(raw.workspace.source.path, workflowDir, env);
-  const sourceCachePath =
-    raw.workspace?.source?.cache_path === undefined
-      ? undefined
-      : resolvePathValue(raw.workspace.source.cache_path, workflowDir, env);
-  const sourceRepository =
-    raw.workspace?.source?.repository === undefined
-      ? undefined
-      : resolveRepositoryValue(raw.workspace.source.repository, workflowDir, env);
-
-  if (sourceKind === "copy") {
-    if (!hasResolvedConfigString(raw.workspace?.source?.path, env) && !allowIncompleteProjectContext) {
-      throw new SymphonyError("config_validation_error", "workspace.source.path is required for copy");
-    }
-  }
-  if (sourceKind === "git") {
-    if (!hasResolvedConfigString(raw.workspace?.source?.repository, env) && !allowIncompleteProjectContext) {
-      throw new SymphonyError("config_validation_error", "workspace.source.repository is required for git");
-    }
-  }
-  if (sourceKind === "git_worktree") {
-    if (!hasResolvedConfigString(raw.workspace?.source?.repository, env) && !allowIncompleteProjectContext) {
-      throw new SymphonyError("config_validation_error", "workspace.source.repository is required for git_worktree");
-    }
-    if (!hasResolvedConfigString(raw.workspace?.source?.base_ref, env) && !allowIncompleteProjectContext) {
-      throw new SymphonyError("config_validation_error", "workspace.source.base_ref is required for git_worktree");
-    }
-  }
-  const issueBreakdownWorkspaceMode = raw.issue_breakdown?.workspace_mode ?? "none";
-  if (issueBreakdownWorkspaceMode === "readonly_checkout" && !allowIncompleteProjectContext) {
-    if (sourceKind !== "git_worktree") {
-      throw new SymphonyError(
-        "config_validation_error",
-        "issue_breakdown.workspace_mode readonly_checkout requires workspace.source.kind git_worktree",
-      );
-    }
-    if (process.platform === "win32") {
-      throw new SymphonyError(
-        "config_validation_error",
-        "issue_breakdown.workspace_mode readonly_checkout is not supported on Windows; use workspace_mode none",
-      );
-    }
-  }
-
-  const workspaceSource: WorkspaceSourceConfig = {
-    kind: sourceKind,
-    ...(sourcePath === undefined ? {} : { path: sourcePath }),
-    ...(sourceRepository === undefined ? {} : { repository: sourceRepository }),
-    ...(raw.workspace?.source?.ref === undefined ? {} : { ref: raw.workspace.source.ref }),
-    ...(raw.workspace?.source?.base_ref === undefined ? {} : { baseRef: raw.workspace.source.base_ref }),
-    ...(raw.workspace?.source?.branch_template === undefined
-      ? {}
-      : { branchTemplate: raw.workspace.source.branch_template }),
-    ...(sourceCachePath === undefined ? {} : { cachePath: sourceCachePath }),
-    ...(raw.workspace?.source?.cleanup === undefined ? {} : { cleanup: raw.workspace.source.cleanup }),
-  };
-
-  const agentHarness = normalizeAgentHarness(raw.agent?.harness);
-  const agentMaxTurns = raw.agent?.max_turns ?? 20;
-  const activeStates = raw.tracker?.active_states ?? DEFAULT_ACTIVE_STATES;
-  const handoffStates = raw.tracker?.handoff_states ?? [];
-  const terminalStates = raw.tracker?.terminal_states ?? DEFAULT_TERMINAL_STATES;
-  const githubOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.owner, env));
-  const githubRepo = normalizeOptionalConfigString(resolveConfigString(raw.github?.repo, env));
-  const githubToken = normalizeOptionalConfigString(
-    resolveConfigString(raw.github?.token, env) ?? resolveConfigString("$GITHUB_TOKEN", env),
-  );
-  const githubApp = normalizeGitHubAppConfig(raw.github?.app, workflowDir, env);
-  const githubHeadOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.head_owner, env)) ?? githubOwner;
-  const publishPullRequests = raw.github?.publish_pull_requests ?? false;
-  const githubOperatorApproval = {
-    requiredForPublication: raw.github?.operator_approval?.required_for_publication ?? false,
-    rejectPolicy: raw.github?.operator_approval?.reject_policy ?? "cancel",
-    pollIntervalMs: raw.github?.operator_approval?.poll_interval_ms ?? 2_000,
-    timeoutMs: raw.github?.operator_approval?.timeout_ms ?? null,
-  };
+  const activeStates = defaultProjectContext.tracker.activeStates;
+  const handoffStates = defaultProjectContext.tracker.handoffStates;
+  const terminalStates = defaultProjectContext.tracker.terminalStates;
+  const reviewStates = defaultProjectContext.reviewLoop.reviewStates;
+  const blockedStates = defaultProjectContext.reviewLoop.blockedStates;
+  const reviewPassState = defaultProjectContext.reviewLoop.reviewPassState;
+  const publishPullRequests = defaultProjectContext.github.publishPullRequests;
+  const pullRequestHandoff = defaultProjectContext.github.prHandoff;
   const cursorModel = raw.cursor?.model ?? DEFAULT_CURSOR_MODEL;
   const cursorModelParams = normalizeCursorModelParams(raw.cursor?.model_params);
   const cursorAllowLargeContext = raw.cursor?.allow_large_context ?? false;
@@ -797,7 +760,7 @@ export function parseServiceConfig(
       : resolvePathValue(raw.hermes.templates_dir, workflowDir, env);
   const hermesStateDir =
     raw.hermes?.state_dir === undefined
-      ? path.join(workspaceStateDir, "hermes")
+      ? path.join(defaultProjectContext.workspace.stateDir, "hermes")
       : resolvePathValue(raw.hermes.state_dir, workflowDir, env);
   const legacyHermesAcpBinaryPath = normalizeOptionalConfigString(
     resolveConfigString(raw.hermes?.acp_binary_path ?? raw.hermes?.binary_path, env),
@@ -857,19 +820,23 @@ export function parseServiceConfig(
     env,
     workflowDir,
     fallbacks: {
-      githubToken,
-      linearApiKey: trackerApiKey,
+      githubToken: defaultProjectContext.github.token,
+      linearApiKey: defaultProjectContext.tracker.apiKey,
       cursorRuntimeApiKey,
       openWorkspaceToken: serverOpenWorkspaceToken,
     },
-  });
-  const reviewStates = raw.review_loop?.review_states ?? handoffStates;
-  const blockedStates = raw.review_loop?.blocked_states ?? [];
-  const reviewPassState = raw.review_loop?.review_pass_state ?? null;
-  const pullRequestHandoff = normalizePullRequestHandoff(raw, {
-    publishPullRequests,
-    handoffStates,
-    reviewStates,
+    contextRoles: projectContextNormalization.contextRoleAssignments,
+    contextFallbacks: new Map(
+      projectContexts.contexts.map((context) => [
+        context.id,
+        {
+          githubToken: context.github.token,
+          linearApiKey: context.tracker.apiKey,
+          cursorRuntimeApiKey,
+          openWorkspaceToken: serverOpenWorkspaceToken,
+        },
+      ]),
+    ),
   });
   const mergePolicy = normalizeMergePolicy(raw, reviewPassState);
   validateStateBuckets({
@@ -898,27 +865,14 @@ export function parseServiceConfig(
     mergePolicy,
   });
 
-  const config: ServiceConfig = {
+  return {
     workflowPath: path.resolve(workflowPath),
     workflowDir,
-    tracker: {
-      kind: "linear",
-      endpoint: raw.tracker?.endpoint ?? "https://api.linear.app/graphql",
-      apiKey: trackerApiKey,
-      projectSlug,
-      assignee: trackerAssignee.length === 0 ? null : trackerAssignee,
-      activeStates,
-      handoffStates,
-      terminalStates,
-    },
+    tracker: defaultProjectContext.tracker,
     polling: {
       intervalMs: raw.polling?.interval_ms ?? 30_000,
     },
-    workspace: {
-      root: workspaceRoot,
-      stateDir: workspaceStateDir,
-      source: workspaceSource,
-    },
+    workspace: defaultProjectContext.workspace,
     hooks: {
       afterCreate: raw.hooks?.after_create ?? null,
       beforeRun: raw.hooks?.before_run ?? null,
@@ -926,18 +880,7 @@ export function parseServiceConfig(
       beforeRemove: raw.hooks?.before_remove ?? null,
       timeoutMs: raw.hooks?.timeout_ms ?? 60_000,
     },
-    agent: {
-      harness: agentHarness,
-      maxConcurrentAgents: raw.agent?.max_concurrent_agents ?? 10,
-      maxTurns: agentMaxTurns,
-      maxRetryBackoffMs: raw.agent?.max_retry_backoff_ms ?? 300_000,
-      maxSdkErrorRetries: raw.agent?.max_sdk_error_retries ?? 2,
-      maxInfraFailures: raw.agent?.max_infra_failures ?? 3,
-      maxConcurrentAgentsByState: normalizeStateLimitMap(raw.agent?.max_concurrent_agents_by_state),
-      requireLabels: normalizeLabels(raw.agent?.require_labels),
-      excludeLabels: normalizeLabels(raw.agent?.exclude_labels),
-      protectedPaths: raw.agent?.protected_paths ?? [],
-    },
+    agent: defaultProjectContext.agent,
     cursor: {
       model: cursorModel,
       mode: raw.cursor?.mode ?? null,
@@ -998,31 +941,10 @@ export function parseServiceConfig(
       dispatchState: raw.writeback?.dispatch_state ?? "In Progress",
       maxBackoffMs: raw.writeback?.max_backoff_ms ?? 300_000,
     },
-    github: {
-      owner: githubOwner,
-      repo: githubRepo,
-      token: githubToken,
-      app: githubApp,
-      headOwner: githubHeadOwner,
-      apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(raw.github?.api_base_url, env)) ?? "https://api.github.com",
-      publishPullRequests,
-      operatorApproval: githubOperatorApproval,
-      prHandoff: pullRequestHandoff,
-    },
+    github: defaultProjectContext.github,
     credentialProfiles,
-    reviewLoop: {
-      reviewStates,
-      blockedStates,
-      reviewPassState,
-      reviewerPromptTemplate: raw.review_loop?.reviewer_prompt ?? null,
-      reviewerPromptExtensions: normalizePromptExtensions(raw.review_loop?.reviewer_prompt_extensions),
-      workerPromptExtensions: normalizePromptExtensions(raw.review_loop?.worker_prompt_extensions),
-      maxReviewRounds: raw.review_loop?.max_review_rounds ?? 3,
-      maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
-      continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
-      transcriptHistoryLimit: raw.review_loop?.transcript_history_limit ?? raw.review_loop?.continuation_history_threshold ?? 5,
-      prReviewEvidenceLimit: raw.review_loop?.pr_review_evidence_limit ?? 5,
-    },
+    projectContexts,
+    reviewLoop: defaultProjectContext.reviewLoop,
     mergePolicy,
     issueBoard: {
       columns: issueBoard,
@@ -1032,115 +954,9 @@ export function parseServiceConfig(
       summarizationEnabled: raw.continuation_context?.summarization_enabled ?? false,
     },
     database,
-    issueBreakdown: {
-      enabled: raw.issue_breakdown?.enabled ?? false,
-      cursorMode: raw.issue_breakdown?.cursor_mode ?? "plan",
-      promptTemplate: raw.issue_breakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
-      planningLabels: normalizeLabels(raw.issue_breakdown?.planning_labels),
-      applyToLinear: {
-        enabled: raw.issue_breakdown?.apply_to_linear?.enabled ?? false,
-        mode: raw.issue_breakdown?.apply_to_linear?.mode ?? "child_issues",
-      },
-      workspaceMode: issueBreakdownWorkspaceMode,
-      maxPlanningFailures: raw.issue_breakdown?.max_planning_failures ?? 3,
-      maxPlanningDispatchRetries:
-        raw.issue_breakdown?.max_planning_dispatch_retries ?? raw.issue_breakdown?.max_planning_failures ?? 3,
-      planningRetryBaseMs: raw.issue_breakdown?.planning_retry_base_ms ?? 5_000,
-      planningRetryMaxMs: raw.issue_breakdown?.planning_retry_max_ms ?? 60_000,
-    },
-    projectContexts: [],
-    defaultProjectContextId: DEFAULT_PROJECT_CONTEXT_ID,
+    issueBreakdown: defaultProjectContext.issueBreakdown,
     raw,
   };
-
-  const defaultProjectContext: ProjectContextConfig = {
-    id: DEFAULT_PROJECT_CONTEXT_ID,
-    label: DEFAULT_PROJECT_CONTEXT_LABEL,
-    enabled: true,
-    tracker: config.tracker,
-    workspace: config.workspace,
-    github: config.github,
-    reviewLoop: config.reviewLoop,
-    issueBreakdown: config.issueBreakdown,
-    agent: config.agent,
-    raw: config.raw,
-  };
-
-  config.projectContexts = [defaultProjectContext];
-  return config;
-}
-
-function normalizeExplicitProjectContexts(
-  raw: RawWorkflowConfig,
-  workflowPath: string,
-  env: NodeJS.ProcessEnv,
-): ProjectContextConfig[] {
-  const projectContexts: ProjectContextConfig[] = [];
-  const seenIds = new Set<string>();
-
-  for (const rawProjectContext of raw.project_contexts ?? []) {
-    const normalizedId = normalizeProjectContextId(rawProjectContext.id);
-    if (seenIds.has(normalizedId)) {
-      throw new SymphonyError("config_validation_error", `Duplicate project_contexts id: ${rawProjectContext.id}`);
-    }
-    seenIds.add(normalizedId);
-
-    const enabled = rawProjectContext.enabled ?? true;
-    try {
-      const contextConfig = parseServiceConfig(mergedRawForProjectContext(raw, rawProjectContext), workflowPath, env, {
-        allowIncompleteProjectContext: !enabled,
-      });
-      if (enabled && contextConfig.workspace.source.kind === "none") {
-        throw new SymphonyError(
-          "config_validation_error",
-          "enabled project contexts require workspace.source.kind other than none",
-        );
-      }
-      projectContexts.push({
-        id: normalizedId,
-        label: rawProjectContext.label?.trim() || rawProjectContext.id.trim(),
-        enabled,
-        tracker: contextConfig.tracker,
-        workspace: contextConfig.workspace,
-        github: contextConfig.github,
-        reviewLoop: contextConfig.reviewLoop,
-        issueBreakdown: contextConfig.issueBreakdown,
-        agent: contextConfig.agent,
-        raw: contextConfig.raw,
-      });
-    } catch (error) {
-      throw new SymphonyError("config_validation_error", `project context ${normalizedId}: ${errorMessage(error)}`, error);
-    }
-  }
-
-  if (!projectContexts.some((context) => context.enabled)) {
-    throw new SymphonyError("config_validation_error", "At least one enabled project context is required");
-  }
-
-  return projectContexts;
-}
-
-function mergedRawForProjectContext(raw: RawWorkflowConfig, projectContext: RawProjectContextConfig): RawWorkflowConfig {
-  const { project_contexts: _projectContexts, ...rootWithoutProjectContexts } = raw;
-  const { id: _id, label: _label, enabled: _enabled, ...projectContextBody } = projectContext;
-  return deepMergeConfigValue(rootWithoutProjectContexts, projectContextBody) as RawWorkflowConfig;
-}
-
-function deepMergeConfigValue(base: unknown, override: unknown): unknown {
-  if (override === undefined) return base;
-  if (Array.isArray(base) || Array.isArray(override)) return override;
-  if (isPlainConfigObject(base) && isPlainConfigObject(override)) {
-    const merged: Record<string, unknown> = { ...base };
-    for (const [key, value] of Object.entries(override)) {
-      merged[key] = key in merged ? deepMergeConfigValue(merged[key], value) : value;
-    }
-    return merged;
-  }
-  return override;
-}
-
-function isPlainConfigObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export function resolveConfigString(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
@@ -1148,11 +964,6 @@ export function resolveConfigString(value: string | undefined, env: NodeJS.Proce
   const varMatch = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
   if (varMatch) return env[varMatch[1] ?? ""] ?? "";
   return value;
-}
-
-function hasResolvedConfigString(value: string | undefined, env: NodeJS.ProcessEnv): boolean {
-  const resolved = resolveConfigString(value, env);
-  return resolved !== undefined && resolved.trim().length > 0;
 }
 
 export function resolvePathValue(value: string, baseDir: string, env: NodeJS.ProcessEnv): string {

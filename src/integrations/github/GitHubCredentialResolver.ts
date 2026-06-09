@@ -1,4 +1,9 @@
-import type { ServiceConfig, GitHubConfig } from "../../core/config/Config.js";
+import {
+  resolveProjectContextIdForConfig,
+  serviceConfigForProjectContext,
+  type GitHubConfig,
+  type ServiceConfig,
+} from "../../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../../core/config/CredentialProfiles.js";
 import { SymphonyError } from "../../core/errors.js";
 import { GitHubAppInstallationTokenProvider } from "./GitHubAppInstallationTokenProvider.js";
@@ -26,14 +31,17 @@ export interface ResolvedGitHubClientConfig {
 export function resolveGitHubClientConfig(
   config: ServiceConfig,
   capability: GitHubCredentialCapability,
+  projectContextId?: string | null,
 ): ResolvedGitHubClientConfig {
   const role = GITHUB_CREDENTIAL_CAPABILITY_OWNERS[capability];
   if (!role) {
     throw new SymphonyError("config_validation_error", `Unsupported GitHub credential capability: ${capability}`);
   }
 
-  const assignedRoles = config.credentialProfiles.assignmentRolesFor(capability);
-  if (!config.credentialProfiles.hasAssignment(role, capability) && assignedRoles.length > 0) {
+  const resolvedProjectContextId = resolveProjectContextIdForConfig(config, projectContextId);
+  const contextualConfig = serviceConfigForProjectContext(config, resolvedProjectContextId);
+  const assignedRoles = contextualConfig.credentialProfiles.assignmentRolesFor(capability, resolvedProjectContextId);
+  if (!contextualConfig.credentialProfiles.hasAssignment(role, capability, resolvedProjectContextId) && assignedRoles.length > 0) {
     throw new SymphonyError(
       "config_validation_error",
       `GitHub credential capability ${capability} is owned by ${role}, but is assigned only to ${assignedRoles.join(
@@ -42,13 +50,13 @@ export function resolveGitHubClientConfig(
     );
   }
 
-  const credential = config.credentialProfiles.resolveForRole(role, capability);
+  const credential = contextualConfig.credentialProfiles.resolveForRole(role, capability, resolvedProjectContextId);
   if (credential?.source === "profile" && credential.kind === "github_app") {
     return {
       capability,
       role,
       github: {
-        ...config.github,
+        ...contextualConfig.github,
         token: null,
         app: credential.app,
       },
@@ -56,14 +64,14 @@ export function resolveGitHubClientConfig(
     };
   }
 
-  const selectedStaticCredential = shouldUseGitHubAppByDefault(config.github, capability, credential)
+  const selectedStaticCredential = shouldUseGitHubAppByDefault(contextualConfig.github, capability, credential)
     ? null
     : credential;
   return {
     capability,
     role,
     github: {
-      ...config.github,
+      ...contextualConfig.github,
       token: selectedStaticCredential?.value ?? null,
     },
     credential: selectedStaticCredential,
@@ -74,8 +82,9 @@ export function createGitHubPullRequestClientForCapability(
   config: ServiceConfig,
   capability: GitHubCredentialCapability,
   fetchImpl?: FetchLike,
+  projectContextId?: string | null,
 ): GitHubPullRequestClient {
-  const resolved = resolveGitHubClientConfig(config, capability).github;
+  const resolved = resolveGitHubClientConfig(config, capability, projectContextId).github;
   return new GitHubPullRequestClient(resolved, fetchImpl, createGitHubAuthTokenProvider(resolved, fetchImpl));
 }
 

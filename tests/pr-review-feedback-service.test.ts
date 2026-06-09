@@ -183,16 +183,130 @@ describe("PullRequestReviewFeedbackService", () => {
     expect(client.calls).toHaveLength(0);
   });
 
+  it("accepts docs-context review feedback in docs review states", async () => {
+    const { config, lifecycleStore, client } = fixture();
+    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+    if (!defaultContext) throw new Error("missing default project context");
+    config.reviewLoop.reviewStates = ["Default Review"];
+    config.projectContexts.byId.set("docs", {
+      ...defaultContext,
+      id: "docs",
+      label: "Documentation Site",
+      reviewLoop: {
+        ...defaultContext.reviewLoop,
+        reviewStates: ["Docs Review"],
+      },
+    });
+    const service = new PullRequestReviewFeedbackService({ config, lifecycleStore, client });
+    const docsIssue = issue({
+      state: "Docs Review",
+      branchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    const report = completionReportRecord("docs-head-sha");
+    await lifecycleStore.ensureIssue(docsIssue, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [
+        {
+          ...report,
+          branchName: "symphony/DOCS-1",
+          pullRequest: {
+            url: "https://github.com/acme-docs/docs-site/pull/42",
+            number: 42,
+            headSha: "docs-head-sha",
+            branch: "symphony/DOCS-1",
+          },
+        },
+      ],
+      summaryPointers: {
+        lastRunId: "review-run-1",
+        prUrl: "https://github.com/acme-docs/docs-site/pull/42",
+        prNumber: 42,
+        prHeadSha: "docs-head-sha",
+        prBranch: "symphony/DOCS-1",
+      },
+    });
+
+    const result = await service.submitPullRequestReviewFeedback(
+      issueComment(),
+      context({ issue: docsIssue, phase: "review" }),
+    );
+
+    expect(client.calls.at(-1)).toMatchObject({
+      kind: "issue_comment",
+      input: { pullRequestNumber: 42, body: "High-level note." },
+    });
+  });
+
+  it("fails closed when a persisted non-default review-feedback context no longer exists", async () => {
+    const { config, lifecycleStore, client } = fixture();
+    const defaultContext = config.projectContexts.byId.get(config.projectContexts.defaultContextId);
+    if (!defaultContext) throw new Error("missing default project context");
+    config.projectContexts.byId.set("docs", {
+      ...defaultContext,
+      id: "docs",
+      label: "Documentation Site",
+      reviewLoop: {
+        ...defaultContext.reviewLoop,
+        reviewStates: ["Docs Review"],
+      },
+    });
+    config.projectContexts.byId.delete("docs");
+
+    const docsIssue = issue({
+      state: "Docs Review",
+      branchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    const report = completionReportRecord("docs-head-sha");
+    await lifecycleStore.ensureIssue(docsIssue, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [
+        {
+          ...report,
+          branchName: "symphony/DOCS-1",
+          pullRequest: {
+            url: "https://github.com/acme-docs/docs-site/pull/42",
+            number: 42,
+            headSha: "docs-head-sha",
+            branch: "symphony/DOCS-1",
+          },
+        },
+      ],
+      summaryPointers: {
+        lastRunId: "review-run-1",
+        prUrl: "https://github.com/acme-docs/docs-site/pull/42",
+        prNumber: 42,
+        prHeadSha: "docs-head-sha",
+        prBranch: "symphony/DOCS-1",
+      },
+    });
+
+    const service = new PullRequestReviewFeedbackService({ config, lifecycleStore, client });
+    await expect(
+      service.submitPullRequestReviewFeedback(issueComment(), context({ issue: docsIssue, phase: "review" })),
+    ).rejects.toMatchObject({
+      code: "config_validation_error",
+      message: expect.stringContaining('Project context "docs" was not found'),
+    });
+    expect(client.calls).toHaveLength(0);
+  });
+
   function fixture() {
     const config = configured();
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const client = new RecordingFeedbackClient();
     const service = new PullRequestReviewFeedbackService({ config, lifecycleStore, client });
-    return { service, lifecycleStore, client };
+    return { config, service, lifecycleStore, client };
   }
 });
 
 class RecordingFeedbackClient implements PullRequestReviewFeedbackClient {
+
   readonly calls: Array<
     | { kind: "review"; input: PullRequestReviewFeedbackInput }
     | { kind: "review_comment"; input: PullRequestReviewCommentFeedbackInput }

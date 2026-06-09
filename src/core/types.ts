@@ -22,6 +22,8 @@ export interface Issue {
   assignedToWorker: boolean;
   labels: string[];
   blockedBy: IssueBlockerRef[];
+  projectContextId?: string;
+  projectContextLabel?: string | null;
   createdAt: string | null;
   updatedAt: string | null;
 }

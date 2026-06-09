@@ -154,6 +154,90 @@ describe("FileRunTranscriptStore", () => {
     });
   });
 
+  it("backfills default project context attribution for legacy run and workspace records", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await startBasicRun(store, "run-legacy");
+    await store.upsertWorkspace({
+      workspaceKey: "TEST-1",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      path: "/tmp/workspace",
+      sourceKind: "git_worktree",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+      gitBranchName: "symphony/TEST-1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const metaPath = path.join(root, "runs", "run-legacy", "meta.json");
+    const workspacePath = path.join(root, "workspaces", "TEST-1.json");
+    const runJson = JSON.parse(await readFile(metaPath, "utf8")) as Record<string, unknown>;
+    delete runJson.projectContextId;
+    delete runJson.projectContextLabel;
+    await writeFile(metaPath, `${JSON.stringify(runJson, null, 2)}
+`, "utf8");
+    const workspaceJson = JSON.parse(await readFile(workspacePath, "utf8")) as Record<string, unknown>;
+    delete workspaceJson.projectContextId;
+    delete workspaceJson.projectContextLabel;
+    await writeFile(workspacePath, `${JSON.stringify(workspaceJson, null, 2)}
+`, "utf8");
+
+    const reloaded = new FileRunTranscriptStore(root);
+    await expect(reloaded.getRun("run-legacy")).resolves.toMatchObject({
+      projectContextId: "default",
+      projectContextLabel: "Default",
+    });
+    await expect(reloaded.getWorkspace("TEST-1")).resolves.toMatchObject({
+      projectContextId: "default",
+      projectContextLabel: "Default",
+    });
+  });
+
+
+  it("preserves explicit non-default project context attribution on fresh run and workspace records", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await store.startRun({
+      runId: "run-docs",
+      sessionId: "session-docs",
+      agentId: "agent-docs",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "DOCS-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "DOCS-1",
+      workspacePath: "/tmp/docs-workspace",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    await store.upsertWorkspace({
+      workspaceKey: "DOCS-1",
+      issueId: "issue-1",
+      issueIdentifier: "DOCS-1",
+      path: "/tmp/docs-workspace",
+      sourceKind: "git_worktree",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+      gitBranchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const reloaded = new FileRunTranscriptStore(root);
+    await expect(reloaded.getRun("run-docs")).resolves.toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+    await expect(reloaded.getWorkspace("DOCS-1")).resolves.toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+  });
+
   it("does not backfill Cursor runtime fields onto explicit non-Cursor harness records", async () => {
     const store = new FileRunTranscriptStore(root);
     await store.startRun({

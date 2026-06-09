@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { ServiceConfig } from "../config/Config.js";
+import { DEFAULT_PROJECT_CONTEXT_ID, DEFAULT_PROJECT_CONTEXT_LABEL } from "../config/ProjectContexts.js";
 import { latestFreshIssueBreakdownPlan } from "../IssueBreakdownPlanService.js";
 import { mapWithFileReadConcurrency } from "../persistence/FileReadConcurrency.js";
 import type { IssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
@@ -19,6 +20,8 @@ export type WritebackOperation =
       kind: "transition";
       issueId: string;
       runId?: string;
+      projectContextId?: string;
+      projectContextLabel?: string | null;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -35,6 +38,8 @@ export type WritebackOperation =
       kind: "comment";
       issueId: string;
       runId?: string;
+      projectContextId?: string;
+      projectContextLabel?: string | null;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -51,6 +56,8 @@ export type WritebackOperation =
       kind: "issue_create";
       issueId: string;
       runId?: string;
+      projectContextId?: string;
+      projectContextLabel?: string | null;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -78,6 +85,8 @@ export type WritebackOperation =
       kind: "issue_relation";
       issueId: string;
       runId?: string;
+      projectContextId?: string;
+      projectContextLabel?: string | null;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -164,8 +173,13 @@ export class FileWritebackOutboxStore {
     const existing = await this.get(operation.idempotencyKey);
     if (existing) return existing;
     const now = new Date().toISOString();
+    const projectContextId = operation.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
     const record = {
       ...operation,
+      projectContextId,
+      ...(operation.projectContextLabel === undefined
+        ? { projectContextLabel: defaultProjectContextLabel(projectContextId) }
+        : { projectContextLabel: operation.projectContextLabel }),
       status: "pending",
       attempt: 0,
       createdAt: now,
@@ -255,10 +269,11 @@ export class FileWritebackOutboxStore {
 
   async get(idempotencyKey: string): Promise<WritebackOperation | null> {
     const current = await readJsonIfExists<WritebackOperation>(this.recordPath(idempotencyKey));
-    if (current) return current;
+    if (current) return normalizeWritebackOperation(current);
     const legacy = this.legacyRecordPath(idempotencyKey);
     if (legacy === this.recordPath(idempotencyKey)) return null;
-    return readJsonIfExists<WritebackOperation>(legacy);
+    const record = await readJsonIfExists<WritebackOperation>(legacy);
+    return record ? normalizeWritebackOperation(record) : null;
   }
 
   async list(): Promise<WritebackOperation[]> {
@@ -268,7 +283,7 @@ export class FileWritebackOutboxStore {
       entries.filter((entry) => entry.endsWith(".json")).map((entry) => path.join(this.recordsDir(), entry)),
       (filePath) => readJsonIfExists<WritebackOperation>(filePath),
     );
-    return dedupeWritebackRecords(records.filter((record): record is WritebackOperation => record !== null));
+    return dedupeWritebackRecords(records.filter((record): record is WritebackOperation => record !== null).map((record) => normalizeWritebackOperation(record)));
   }
 
   private async update(record: WritebackOperation, patch: Partial<WritebackOperation>): Promise<WritebackOperation> {
@@ -579,6 +594,9 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
     return false;
   }
   if (record.runId !== operation.runId) return false;
+  if ((record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID) !== (operation.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID)) return false;
+  if ((record.projectContextLabel ?? defaultProjectContextLabel(record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID)) !==
+      (operation.projectContextLabel ?? defaultProjectContextLabel(operation.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID))) return false;
   if (record.kind === "transition" && operation.kind === "transition") {
     return (
       record.payload.toState === operation.payload.toState &&
@@ -605,6 +623,20 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
 function stringArraysEqual(left: string[] | undefined, right: string[] | undefined): boolean {
   if (left === undefined || right === undefined) return left === right;
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function normalizeWritebackOperation(record: WritebackOperation): WritebackOperation {
+  const projectContextId = record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+  const projectContextLabel = record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  return {
+    ...record,
+    projectContextId,
+    ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+  };
+}
+
+function defaultProjectContextLabel(projectContextId: string): string | null {
+  return projectContextId === DEFAULT_PROJECT_CONTEXT_ID ? DEFAULT_PROJECT_CONTEXT_LABEL : null;
 }
 
 function canRetrySkipped(

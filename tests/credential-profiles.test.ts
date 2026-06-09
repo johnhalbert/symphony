@@ -328,6 +328,63 @@ describe("credential profile config", () => {
     );
   });
 
+
+  it("skips disabled project-context credential role validation while retaining the staged assignment metadata", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear" },
+        credential_profiles: {
+          profiles: {
+            good: {
+              value: "$GOOD_GITHUB_TOKEN",
+              capabilities: ["github.discovery"],
+            },
+          },
+        },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            enabled: false,
+            credential_profiles: {
+              roles: {
+                worker: {
+                  "github.discovery": "missing-profile",
+                },
+              },
+            },
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GOOD_GITHUB_TOKEN: "good-secret",
+      },
+    );
+
+    expect(config.projectContexts.byId.get("docs-site")).toMatchObject({
+      enabled: false,
+      credentialProfiles: {
+        worker: {},
+      },
+    });
+    expect(config.credentialProfiles.hasAssignment("worker", "github.discovery", "docs-site")).toBe(false);
+  });
+
   it("requires profile values to be environment references and redacts secret material from errors", () => {
     const literalSecret = "literal-secret-value";
     expect(() =>

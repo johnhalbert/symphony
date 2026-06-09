@@ -97,6 +97,64 @@ describe("review feedback MCP handoff", () => {
     });
   });
 
+  it("uses the issue project context when constructing the review-feedback GitHub client", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-feedback-context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await writeFile(workflowPath, workflowWithDocsContext(stateDir), "utf8");
+    await seedLifecycleDocs(lifecycleStore);
+    await writeReviewFeedbackMcpContext(contextFile, {
+      issue: issue({
+        state: "Docs Review",
+        branchName: "symphony/DOCS-1",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      }),
+      activeRunId: "review-run-1",
+      role: "reviewer",
+      token: null,
+      expectedToken: null,
+      reviewer: "reviewer-agent:review-run-1",
+      phase: "review",
+    });
+    const authorizations: string[] = [];
+    const paths: string[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
+      const url = new URL(String(input));
+      paths.push(url.pathname);
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      return new Response(
+        JSON.stringify({
+          id: 9001,
+          html_url: "https://github.com/acme-docs/docs-site/pull/42#pullrequestreview-9001",
+          comments: [{ html_url: "https://github.com/acme-docs/docs-site/pull/42#discussion_r9002" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+
+    const result = await submitReviewFeedbackFromMcp(
+      {
+        kind: "review",
+        event: "REQUEST_CHANGES",
+        body: "Docs review feedback from MCP.",
+        comments: [{ path: "docs/index.md", body: "Inline note.", line: 5, side: "RIGHT" }],
+        idempotencyKey: "feedback-docs-1",
+      },
+      { workflowPath, contextFile },
+    );
+
+    expect(authorizations).toEqual(["Bearer docs-feedback-secret"]);
+    expect(paths).toEqual(["/repos/acme-docs/docs-site/pulls/42/reviews"]);
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      pullRequest: { number: 42, url: "https://github.com/acme-docs/docs-site/pull/42", headSha: "docs-head-sha" },
+      reviewUrl: "https://github.com/acme-docs/docs-site/pull/42#pullrequestreview-9001",
+    });
+  });
+
   it("sanitizes GitHub token material from write errors", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
@@ -228,6 +286,79 @@ workspace:
 ---
 Work on {{ issue.identifier }}.
 `;
+}
+
+function workflowWithDocsContext(stateDir: string): string {
+  return `---
+tracker:
+  kind: linear
+  api_key: linear-test-key
+  project_slug: TEST
+github:
+  owner: acme
+  repo: symphony
+  token: default-feedback-secret
+  api_base_url: https://api.github.test
+review_loop:
+  review_states:
+    - In Review
+  review_pass_state: Ready to Merge
+workspace:
+  root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  state_dir: "${slash(stateDir)}"
+project_contexts:
+  - id: docs
+    label: Documentation Site
+    tracker:
+      api_key: linear-test-key
+      project_slug: DOCS
+    github:
+      owner: acme-docs
+      repo: docs-site
+      token: docs-feedback-secret
+      api_base_url: https://api.github.test
+    review_loop:
+      review_states:
+        - Docs Review
+      review_pass_state: Docs Ready to Merge
+    workspace:
+      source:
+        kind: copy
+        path: ../docs-site
+---
+Work on {{ issue.identifier }}.
+`;
+}
+
+async function seedLifecycleDocs(lifecycleStore: FileIssueLifecycleStore): Promise<void> {
+  const report = completionReportRecordDocs();
+  await lifecycleStore.ensureIssue(
+    issue({
+      state: "Docs Review",
+      branchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    }),
+    {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      summaryPointers: { lastRunId: "review-run-1" },
+    },
+  );
+}
+
+function completionReportRecordDocs(): IssueCompletionReportRecord {
+  return {
+    ...completionReportRecord(),
+    branchName: "symphony/DOCS-1",
+    pullRequest: {
+      url: "https://github.com/acme-docs/docs-site/pull/42",
+      number: 42,
+      headSha: "docs-head-sha",
+      branch: "symphony/DOCS-1",
+    },
+  };
 }
 
 function jsonRpcMessage(message: unknown): string {

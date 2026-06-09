@@ -12,6 +12,7 @@ import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
 import { StructuredLogger } from "../logging/StructuredLogger.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
+import { serviceConfigForProjectContext } from "../config/Config.js";
 import { SymphonyError } from "../errors.js";
 import { FileOperatorApprovalStore, OperatorApprovalService } from "../approval/OperatorApprovalService.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
@@ -53,24 +54,36 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
+    const issueConfig = serviceConfigForProjectContext(config, loadedContext.issue.projectContextId);
     const logger = new StructuredLogger(() => undefined);
-    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(issueConfig.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(issueConfig.workspace.stateDir);
+    const writebackOutbox = new FileWritebackOutboxStore(issueConfig.workspace.stateDir);
+    const approvalRequiredForPublication = issueConfig.github.operatorApproval?.requiredForPublication ?? false;
     const writebackProcessor =
-      config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
-        ? createRuntimeWritebackProcessor(() => config, logger, undefined, { outboxStore: writebackOutbox, lifecycleStore })
+      issueConfig.writeback.enabled && approvalRequiredForPublication
+        ? createRuntimeWritebackProcessor(
+            () => issueConfig,
+            logger,
+            undefined,
+            { outboxStore: writebackOutbox, lifecycleStore },
+            loadedContext.issue.projectContextId,
+          )
         : undefined;
     const operatorApproval = new OperatorApprovalService({
       config,
-      store: new FileOperatorApprovalStore(config.workspace.stateDir),
+      store: new FileOperatorApprovalStore(issueConfig.workspace.stateDir),
       runStore,
     });
-    const approvalRequiredForPublication = config.github.operatorApproval?.requiredForPublication ?? false;
     const pullRequestPublisher =
       options.pullRequestPublisher ??
-      (config.github.publishPullRequests && !approvalRequiredForPublication
-        ? createGitHubPullRequestClientForCapability(config, "github.publication")
+      (issueConfig.github.publishPullRequests && !approvalRequiredForPublication
+        ? createGitHubPullRequestClientForCapability(
+            config,
+            "github.publication",
+            undefined,
+            loadedContext.issue.projectContextId,
+          )
         : undefined);
     const service = new CompletionReportService({
       config,
@@ -81,6 +94,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       ...(pullRequestPublisher === undefined ? {} : { pullRequestPublisher }),
       operatorApproval,
     });
+
     const context: CompletionReportActiveContext = {
       issue: loadedContext.issue,
       activeRunId: loadedContext.activeRunId,
@@ -93,6 +107,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       phase: loadedContext.phase,
     };
     const result = await service.submit_completion_report(completionReportInputFromMcp(input, context), context);
+
     return {
       accepted: result.accepted,
       replayed: result.replayed,

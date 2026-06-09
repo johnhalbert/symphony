@@ -44,6 +44,14 @@ const rawGitHubAppCredentialProfileSchema = rawCredentialProfileBaseSchema.exten
   token_refresh_buffer_seconds: z.number().int().nonnegative().optional(),
 });
 
+export const rawCredentialRoleAssignmentsSchema = z
+  .object({
+    worker: z.record(z.string(), z.string()).optional(),
+    reviewer: z.record(z.string(), z.string()).optional(),
+    service: z.record(z.string(), z.string()).optional(),
+  })
+  .strict();
+
 export const rawCredentialProfilesSchema = z
   .object({
     profiles: z
@@ -52,18 +60,12 @@ export const rawCredentialProfilesSchema = z
         z.union([rawGitHubAppCredentialProfileSchema, rawStaticCredentialProfileSchema]),
       )
       .optional(),
-    roles: z
-      .object({
-        worker: z.record(z.string(), z.string()).optional(),
-        reviewer: z.record(z.string(), z.string()).optional(),
-        service: z.record(z.string(), z.string()).optional(),
-      })
-      .strict()
-      .optional(),
+    roles: rawCredentialRoleAssignmentsSchema.optional(),
   })
   .passthrough();
 
 export type RawCredentialProfilesConfig = z.infer<typeof rawCredentialProfilesSchema>;
+export type RawCredentialRoleAssignmentsConfig = z.infer<typeof rawCredentialRoleAssignmentsSchema>;
 
 export interface CredentialLegacyFallbacks {
   githubToken: string | null;
@@ -136,23 +138,29 @@ const DEFAULT_GITHUB_APP_TOKEN_REFRESH_BUFFER_SECONDS = 300;
 export class CredentialProfileRegistry {
   readonly #profiles: Map<string, CredentialProfileDefinition>;
   readonly #roleAssignments: Map<CredentialRole, Map<CredentialCapability, string>>;
+  readonly #contextRoleAssignments: Map<string, Map<CredentialRole, Map<CredentialCapability, string>>>;
   readonly #env: NodeJS.ProcessEnv;
   readonly #fallbacks: CredentialLegacyFallbacks;
+  readonly #contextFallbacks: Map<string, CredentialLegacyFallbacks>;
 
   constructor(input: {
     profiles: Map<string, CredentialProfileDefinition>;
     roleAssignments: Map<CredentialRole, Map<CredentialCapability, string>>;
+    contextRoleAssignments: Map<string, Map<CredentialRole, Map<CredentialCapability, string>>>;
     env: NodeJS.ProcessEnv;
     fallbacks: CredentialLegacyFallbacks;
+    contextFallbacks: Map<string, CredentialLegacyFallbacks>;
   }) {
     this.#profiles = input.profiles;
     this.#roleAssignments = input.roleAssignments;
+    this.#contextRoleAssignments = input.contextRoleAssignments;
     this.#env = input.env;
     this.#fallbacks = input.fallbacks;
+    this.#contextFallbacks = input.contextFallbacks;
   }
 
-  resolveForRole(role: CredentialRole, capability: CredentialCapability): ResolvedCredential | null {
-    const assignment = this.#assignmentFor(role, capability);
+  resolveForRole(role: CredentialRole, capability: CredentialCapability, projectContextId?: string | null): ResolvedCredential | null {
+    const assignment = this.#assignmentFor(role, capability, projectContextId);
     if (assignment !== null) {
       const { profileName } = assignment;
       const profile = this.#profiles.get(profileName);
@@ -180,31 +188,37 @@ export class CredentialProfileRegistry {
       return { kind: "static_token", role, capability, value, app: null, source: "profile", profileName: profile.name };
     }
 
-    const fallbackValue = this.#legacyFallback(capability);
+    const fallbackValue = this.#legacyFallback(capability, projectContextId);
     if (fallbackValue === null || fallbackValue.length === 0) return null;
     return { kind: "static_token", role, capability, value: fallbackValue, app: null, source: "legacy", profileName: null };
   }
 
-  hasAssignment(role: CredentialRole, capability: CredentialCapability): boolean {
-    return this.#assignmentFor(role, capability) !== null;
+  hasAssignment(role: CredentialRole, capability: CredentialCapability, projectContextId?: string | null): boolean {
+    return this.#assignmentFor(role, capability, projectContextId) !== null;
   }
 
-  profileForRole(role: CredentialRole, capability: CredentialCapability): CredentialProfileDefinition | null {
-    const assignment = this.#assignmentFor(role, capability);
+  profileForRole(
+    role: CredentialRole,
+    capability: CredentialCapability,
+    projectContextId?: string | null,
+  ): CredentialProfileDefinition | null {
+    const assignment = this.#assignmentFor(role, capability, projectContextId);
     if (assignment === null) return null;
     return this.#profiles.get(assignment.profileName) ?? null;
   }
 
-  assignmentRolesFor(capability: CredentialCapability): CredentialRole[] {
-    return ROLE_NAMES.filter((role) => this.hasAssignment(role, capability));
+  assignmentRolesFor(capability: CredentialCapability, projectContextId?: string | null): CredentialRole[] {
+    return ROLE_NAMES.filter((role) => this.hasAssignment(role, capability, projectContextId));
   }
 
-  capabilitiesForRole(role: CredentialRole): CredentialCapability[] {
+  capabilitiesForRole(role: CredentialRole, projectContextId?: string | null): CredentialCapability[] {
     const defaults = DEFAULT_ROLE_CREDENTIAL_CAPABILITIES[role] ?? [];
+    const contextualAssignments = projectContextId ? this.#contextRoleAssignments.get(projectContextId)?.get(role)?.keys() : undefined;
     return [
       ...new Set<CredentialCapability>([
         ...defaults,
         ...Array.from(this.#roleAssignments.get(role)?.keys() ?? []).map(canonicalCredentialCapability),
+        ...Array.from(contextualAssignments ?? []).map(canonicalCredentialCapability),
       ]),
     ];
   }
@@ -228,27 +242,46 @@ export class CredentialProfileRegistry {
     };
   }
 
-  #legacyFallback(capability: CredentialCapability): string | null {
-    if (capability.startsWith("github.")) return this.#fallbacks.githubToken;
-    if (capability.startsWith("linear.")) return this.#fallbacks.linearApiKey;
-    if (capability === "runtime.cursor" || capability === "cursor.runtime") return this.#fallbacks.cursorRuntimeApiKey;
-    if (capability === "server.open_workspace") return this.#fallbacks.openWorkspaceToken;
+  #legacyFallback(capability: CredentialCapability, projectContextId?: string | null): string | null {
+    const contextual =
+      projectContextId === undefined || projectContextId === null ? null : (this.#contextFallbacks.get(projectContextId) ?? null);
+    if (capability.startsWith("github.")) return contextual?.githubToken ?? this.#fallbacks.githubToken;
+    if (capability.startsWith("linear.")) return contextual?.linearApiKey ?? this.#fallbacks.linearApiKey;
+    if (capability === "runtime.cursor" || capability === "cursor.runtime") {
+      return contextual?.cursorRuntimeApiKey ?? this.#fallbacks.cursorRuntimeApiKey;
+    }
+    if (capability === "server.open_workspace") return contextual?.openWorkspaceToken ?? this.#fallbacks.openWorkspaceToken;
     return null;
   }
 
   #assignmentFor(
     role: CredentialRole,
     capability: CredentialCapability,
+    projectContextId?: string | null,
   ): { capability: CredentialCapability; profileName: string } | null {
+    const contextualAssignments =
+      projectContextId === undefined || projectContextId === null
+        ? undefined
+        : this.#contextRoleAssignments.get(projectContextId)?.get(role);
+    const contextual = assignmentForRoleMap(contextualAssignments, capability);
+    if (contextual !== null) return contextual;
     const roleAssignments = this.#roleAssignments.get(role);
     if (!roleAssignments) return null;
-    const profileName = roleAssignments.get(capability);
-    if (profileName !== undefined) return { capability, profileName };
-    const alias = credentialCapabilityAlias(capability);
-    if (alias === null) return null;
-    const aliasProfileName = roleAssignments.get(alias);
-    return aliasProfileName === undefined ? null : { capability: alias, profileName: aliasProfileName };
+    return assignmentForRoleMap(roleAssignments, capability);
   }
+}
+
+function assignmentForRoleMap(
+  roleAssignments: Map<CredentialCapability, string> | undefined,
+  capability: CredentialCapability,
+): { capability: CredentialCapability; profileName: string } | null {
+  if (!roleAssignments) return null;
+  const profileName = roleAssignments.get(capability);
+  if (profileName !== undefined) return { capability, profileName };
+  const alias = credentialCapabilityAlias(capability);
+  if (alias === null) return null;
+  const aliasProfileName = roleAssignments.get(alias);
+  return aliasProfileName === undefined ? null : { capability: alias, profileName: aliasProfileName };
 }
 
 export function createCredentialProfileRegistry(input: {
@@ -256,14 +289,19 @@ export function createCredentialProfileRegistry(input: {
   env: NodeJS.ProcessEnv;
   workflowDir: string;
   fallbacks: CredentialLegacyFallbacks;
+  contextRoles?: Map<string, RawCredentialRoleAssignmentsConfig | undefined>;
+  contextFallbacks?: Map<string, CredentialLegacyFallbacks>;
 }): CredentialProfileRegistry {
   const profiles = parseProfiles(input.raw?.profiles, input.workflowDir, input.env);
   const roleAssignments = parseRoleAssignments(input.raw?.roles, profiles);
+  const contextRoleAssignments = parseContextRoleAssignments(input.contextRoles, profiles);
   return new CredentialProfileRegistry({
     profiles,
     roleAssignments,
+    contextRoleAssignments,
     env: input.env,
     fallbacks: input.fallbacks,
+    contextFallbacks: input.contextFallbacks ?? new Map(),
   });
 }
 
@@ -308,30 +346,45 @@ function parseProfiles(
 }
 
 function parseRoleAssignments(
-  rawRoles: RawCredentialProfilesConfig["roles"] | undefined,
+  rawRoles: RawCredentialRoleAssignmentsConfig | undefined,
   profiles: Map<string, CredentialProfileDefinition>,
+  pathPrefix = "credential_profiles.roles",
 ): Map<CredentialRole, Map<CredentialCapability, string>> {
   const result = new Map<CredentialRole, Map<CredentialCapability, string>>();
   for (const role of ROLE_NAMES) {
     const assignments = new Map<CredentialCapability, string>();
     for (const [capabilityName, profileName] of Object.entries(rawRoles?.[role] ?? {})) {
-      const capability = parseCapabilityName(capabilityName, `credential_profiles.roles.${role}`);
+      const capability = parseCapabilityName(capabilityName, `${pathPrefix}.${role}`);
       const profile = profiles.get(profileName);
       if (profile === undefined) {
         throw new SymphonyError(
           "config_validation_error",
-          `credential_profiles.roles.${role}.${capability} references unknown profile "${profileName}"`,
+          `${pathPrefix}.${role}.${capability} references unknown profile "${profileName}"`,
         );
       }
       if (!profileSupportsCapability(profile, capability)) {
         throw new SymphonyError(
           "config_validation_error",
-          `credential_profiles.roles.${role}.${capability} references profile "${profileName}" without that capability`,
+          `${pathPrefix}.${role}.${capability} references profile "${profileName}" without that capability`,
         );
       }
       assignments.set(capability, profileName);
     }
     result.set(role, assignments);
+  }
+  return result;
+}
+
+function parseContextRoleAssignments(
+  rawContexts: Map<string, RawCredentialRoleAssignmentsConfig | undefined> | undefined,
+  profiles: Map<string, CredentialProfileDefinition>,
+): Map<string, Map<CredentialRole, Map<CredentialCapability, string>>> {
+  const result = new Map<string, Map<CredentialRole, Map<CredentialCapability, string>>>();
+  for (const [projectContextId, rawRoles] of rawContexts ?? []) {
+    result.set(
+      projectContextId,
+      parseRoleAssignments(rawRoles, profiles, `project_contexts.${projectContextId}.credential_profiles.roles`),
+    );
   }
   return result;
 }

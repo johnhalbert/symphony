@@ -6,9 +6,18 @@ import type {
   PullRequestReviewEvidenceItem,
 } from "../persistence/IssueLifecycleStore.js";
 import type { Issue, Workspace } from "../types.js";
+import {
+  mergeWritebackProjectContexts,
+  stampWritebackProjectContext,
+  stampWritebackProjectContexts,
+  type WritebackProjectContext,
+  writebackProjectContextFromIssue,
+} from "./ProjectContextAttribution.js";
 import type { NewWritebackOperation } from "./WritebackOutbox.js";
 
-export interface RunWritebackContext {
+interface ProjectScopedWritebackContext extends WritebackProjectContext {}
+
+export interface RunWritebackContext extends ProjectScopedWritebackContext {
   issue: Issue;
   runId: string;
   sessionId: string | null;
@@ -16,7 +25,7 @@ export interface RunWritebackContext {
   workspace?: Workspace | null;
 }
 
-export interface ReviewVerdictWritebackContext {
+export interface ReviewVerdictWritebackContext extends ProjectScopedWritebackContext {
   issue: Issue;
   runId: string;
   reviewer: string | null;
@@ -29,7 +38,7 @@ export interface ReviewVerdictWritebackDetails {
   evidence: string[];
 }
 
-export interface BlockedEscalationWritebackContext {
+export interface BlockedEscalationWritebackContext extends ProjectScopedWritebackContext {
   issue: Issue;
   runId: string;
   reason: string;
@@ -42,7 +51,7 @@ export interface BlockedEscalationWritebackContext {
   requiredAction?: string;
 }
 
-export interface MergeCompletedWritebackContext {
+export interface MergeCompletedWritebackContext extends ProjectScopedWritebackContext {
   issue: Issue;
   mergeId: string;
   fromState: string;
@@ -56,7 +65,7 @@ export interface MergeGateCheckEvidence {
   url: string | null;
 }
 
-export interface MergeGateWritebackContext {
+export interface MergeGateWritebackContext extends ProjectScopedWritebackContext {
   issue: Issue;
   gateId: string;
   blockerFingerprint: string | null;
@@ -78,7 +87,7 @@ export interface MergeGateWritebackContext {
   maxReviewRounds: number;
 }
 
-export interface MergeConflictsWritebackContext {
+export interface MergeConflictsWritebackContext extends ProjectScopedWritebackContext {
   issue: Issue;
   mergeId: string;
   fromState: string;
@@ -93,7 +102,7 @@ export interface MergeConflictsWritebackContext {
   reason: string;
 }
 
-export interface MergeGateHeadSupersessionWritebackContext {
+export interface MergeGateHeadSupersessionWritebackContext extends ProjectScopedWritebackContext {
   issue: Issue;
   gateId: string;
   fromState: string;
@@ -145,58 +154,67 @@ export interface PublicationApprovalActionDetails {
 export function planDispatchWriteback(issue: Issue, config: ServiceConfig): NewWritebackOperation | null {
   if (!config.writeback.enabled || !sameName(issue.state, "Todo")) return null;
   const dispatchStateVersion = safeKeySegment(issue.updatedAt ?? issue.createdAt ?? issue.state);
-  return {
-    idempotencyKey: `transition:${issue.id}:dispatch:${dispatchStateVersion}:${config.writeback.dispatchState}`,
-    kind: "transition",
-    issueId: issue.id,
-    payload: {
-      fromStates: ["Todo"],
-      toState: config.writeback.dispatchState,
-      reason: "Symphony dispatch",
+  return stampWritebackProjectContext(
+    {
+      idempotencyKey: `transition:${issue.id}:dispatch:${dispatchStateVersion}:${config.writeback.dispatchState}`,
+      kind: "transition",
+      issueId: issue.id,
+      payload: {
+        fromStates: ["Todo"],
+        toState: config.writeback.dispatchState,
+        reason: "Symphony dispatch",
+      },
     },
-  };
+    writebackProjectContextFromIssue(issue),
+  );
 }
 
 export function planRunStartedComment(context: RunWritebackContext, config: ServiceConfig): NewWritebackOperation | null {
   if (!config.writeback.enabled) return null;
-  return {
-    idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-started`,
-    kind: "comment",
-    issueId: context.issue.id,
-    runId: context.runId,
-    payload: {
-      dedupeKey: `${context.runId}:run-started`,
-      body: [
-        "Symphony started a worker run.",
-        "",
-        `Run: ${context.runId}`,
-        `Session: ${context.sessionId ?? "n/a"}`,
-        `Workspace: ${context.workspacePath ?? context.workspace?.path ?? "n/a"}`,
-        `Branch: ${context.workspace?.gitBranchName ?? context.issue.branchName ?? "n/a"}`,
-      ].join("\n"),
-    },
-  };
-}
-
-export function planRunSucceededWritebacks(context: RunWritebackContext, config: ServiceConfig): NewWritebackOperation[] {
-  if (!config.writeback.enabled) return [];
-  return [
+  return stampWritebackProjectContext(
     {
-      idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-succeeded`,
+      idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-started`,
       kind: "comment",
       issueId: context.issue.id,
       runId: context.runId,
       payload: {
-        dedupeKey: `${context.runId}:run-succeeded`,
+        dedupeKey: `${context.runId}:run-started`,
         body: [
-          `Symphony worker turn completed without an accepted completion report.`,
-          `The issue has not been marked ready for review.`,
+          "Symphony started a worker run.",
           "",
           `Run: ${context.runId}`,
+          `Session: ${context.sessionId ?? "n/a"}`,
+          `Workspace: ${context.workspacePath ?? context.workspace?.path ?? "n/a"}`,
+          `Branch: ${context.workspace?.gitBranchName ?? context.issue.branchName ?? "n/a"}`,
         ].join("\n"),
       },
     },
-  ];
+    projectContextForContext(context),
+  );
+}
+
+export function planRunSucceededWritebacks(context: RunWritebackContext, config: ServiceConfig): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  return stampWritebackProjectContexts(
+    [
+      {
+        idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-succeeded`,
+        kind: "comment",
+        issueId: context.issue.id,
+        runId: context.runId,
+        payload: {
+          dedupeKey: `${context.runId}:run-succeeded`,
+          body: [
+            `Symphony worker turn completed without an accepted completion report.`,
+            `The issue has not been marked ready for review.`,
+            "",
+            `Run: ${context.runId}`,
+          ].join("\n"),
+        },
+      },
+    ],
+    projectContextForContext(context),
+  );
 }
 
 export function planCompletionReportAcceptedWritebacks(
@@ -219,41 +237,44 @@ export function planCompletionReportAcceptedWritebacks(
     typeof report === "object" && report !== null
       ? `${context.runId}:completion-report:${safeKeySegment(report.idempotencyKey)}`
       : `${context.runId}:completion-report-accepted`;
-  return [
-    {
-      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
-      kind: "comment",
-      issueId: context.issue.id,
-      runId: context.runId,
-      payload: {
-        dedupeKey: eventKey,
-        body: [
-          "## Symphony Completion Report",
-          "",
-          "Status: accepted",
-          "Symphony accepted the worker completion report.",
-          `Next state: ${reviewState} (agent review queue)`,
-          "",
-          `Run: ${context.runId}`,
-          `Session: ${context.sessionId ?? "n/a"}`,
-          `Workspace: ${context.workspacePath ?? context.workspace?.path ?? "n/a"}`,
-          `Branch: ${context.workspace?.gitBranchName ?? context.issue.branchName ?? "n/a"}`,
-          ...formatCompletionReportForComment(report),
-        ].join("\n"),
+  return stampWritebackProjectContexts(
+    [
+      {
+        idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+        kind: "comment",
+        issueId: context.issue.id,
+        runId: context.runId,
+        payload: {
+          dedupeKey: eventKey,
+          body: [
+            "## Symphony Completion Report",
+            "",
+            "Status: accepted",
+            "Symphony accepted the worker completion report.",
+            `Next state: ${reviewState} (agent review queue)`,
+            "",
+            `Run: ${context.runId}`,
+            `Session: ${context.sessionId ?? "n/a"}`,
+            `Workspace: ${context.workspacePath ?? context.workspace?.path ?? "n/a"}`,
+            `Branch: ${context.workspace?.gitBranchName ?? context.issue.branchName ?? "n/a"}`,
+            ...formatCompletionReportForComment(report),
+          ].join("\n"),
+        },
       },
-    },
-    {
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${reviewState}`,
-      kind: "transition",
-      issueId: context.issue.id,
-      runId: context.runId,
-      payload: {
-        fromStates: completionReportFromStates,
-        toState: reviewState,
-        reason: "Symphony completion report accepted",
+      {
+        idempotencyKey: `transition:${context.issue.id}:${eventKey}:${reviewState}`,
+        kind: "transition",
+        issueId: context.issue.id,
+        runId: context.runId,
+        payload: {
+          fromStates: completionReportFromStates,
+          toState: reviewState,
+          reason: "Symphony completion report accepted",
+        },
       },
-    },
-  ];
+    ],
+    projectContextForContext(context),
+  );
 }
 
 export function planPullRequestHandoffWritebacks(
@@ -271,47 +292,50 @@ export function planPullRequestHandoffWritebacks(
   const pullRequestKey = pullRequestIdempotencySegment(details.pullRequest);
   const headKey = safeKeySegment(details.pullRequest.headSha ?? "no-head-sha");
   const eventKey = `pull-request-handoff:${pullRequestKey}:${headKey}`;
-  return [
-    {
-      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
-      kind: "comment",
-      issueId: context.issue.id,
-      runId: context.runId,
-      payload: {
-        dedupeKey: eventKey,
-        body: [
-          "## Symphony PR Handoff",
-          "",
-          "Status: verified PR ready for human review",
-          "Symphony verified the lifecycle-bound pull request before handing off the issue.",
-          `Next state: ${targetState} (PR review handoff)`,
-          "",
-          `Run: ${context.runId}`,
-          `Session: ${context.sessionId ?? "n/a"}`,
-          `Workspace: ${context.workspacePath ?? context.workspace?.path ?? "n/a"}`,
-          `Branch: ${context.workspace?.gitBranchName ?? context.issue.branchName ?? details.pullRequest.branch ?? "n/a"}`,
-          "",
-          "Pull request:",
-          `- PR: ${formatPullRequest(details.pullRequest)}`,
-          ...(details.pullRequest.headSha ? [`- PR head SHA: ${details.pullRequest.headSha}`] : []),
-          `- Draft: ${details.pullRequest.draft === true ? "yes" : "no"}`,
-          ...formatPullRequestHandoffChecks(details.ci ?? null),
-          ...(details.report ? formatCompletionReportForComment(details.report) : []),
-        ].join("\n"),
+  return stampWritebackProjectContexts(
+    [
+      {
+        idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+        kind: "comment",
+        issueId: context.issue.id,
+        runId: context.runId,
+        payload: {
+          dedupeKey: eventKey,
+          body: [
+            "## Symphony PR Handoff",
+            "",
+            "Status: verified PR ready for human review",
+            "Symphony verified the lifecycle-bound pull request before handing off the issue.",
+            `Next state: ${targetState} (PR review handoff)`,
+            "",
+            `Run: ${context.runId}`,
+            `Session: ${context.sessionId ?? "n/a"}`,
+            `Workspace: ${context.workspacePath ?? context.workspace?.path ?? "n/a"}`,
+            `Branch: ${context.workspace?.gitBranchName ?? context.issue.branchName ?? details.pullRequest.branch ?? "n/a"}`,
+            "",
+            "Pull request:",
+            `- PR: ${formatPullRequest(details.pullRequest)}`,
+            ...(details.pullRequest.headSha ? [`- PR head SHA: ${details.pullRequest.headSha}`] : []),
+            `- Draft: ${details.pullRequest.draft === true ? "yes" : "no"}`,
+            ...formatPullRequestHandoffChecks(details.ci ?? null),
+            ...(details.report ? formatCompletionReportForComment(details.report) : []),
+          ].join("\n"),
+        },
       },
-    },
-    {
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${targetState}`,
-      kind: "transition",
-      issueId: context.issue.id,
-      runId: context.runId,
-      payload: {
-        fromStates: handoffFromStates,
-        toState: targetState,
-        reason: "Symphony verified pull request handoff",
+      {
+        idempotencyKey: `transition:${context.issue.id}:${eventKey}:${targetState}`,
+        kind: "transition",
+        issueId: context.issue.id,
+        runId: context.runId,
+        payload: {
+          fromStates: handoffFromStates,
+          toState: targetState,
+          reason: "Symphony verified pull request handoff",
+        },
       },
-    },
-  ];
+    ],
+    projectContextForContext(context),
+  );
 }
 
 export function planCompletionReportPublicationApprovalPendingWritebacks(
@@ -372,7 +396,7 @@ export function planCompletionReportPublicationApprovalPendingWritebacks(
     });
   }
 
-  return operations;
+  return stampWritebackProjectContexts(operations, projectContextForContext(context));
 }
 
 export function planCompletionReportPublicationApprovalTerminalWritebacks(
@@ -388,31 +412,34 @@ export function planCompletionReportPublicationApprovalTerminalWritebacks(
   if (!isStateIn(context.issue.state, fromStates)) return [];
 
   const eventKey = `${context.runId}:completion-report:${safeKeySegment(report.idempotencyKey)}:publication-approval-${status}`;
-  return [
-    {
-      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
-      kind: "comment",
-      issueId: context.issue.id,
-      runId: context.runId,
-      payload: {
-        dedupeKey: eventKey,
-        body: [
-          "## Symphony Publication Approval Not Completed",
-          "",
-          `Status: ${status}`,
-          `Reason: ${reason ?? "n/a"}`,
-          "",
-          "The worker completion report remains stored, but Symphony did not publish a PR.",
-          "",
-          "Recovery:",
-          "- Inspect the stored completion report and worktree before retrying.",
-          "- Move the issue back to the implementation state when Symphony should run another worker.",
-          "- Submit a new completion report or approve a fresh publication request when ready.",
-          ...formatCompletionReportForComment(report),
-        ].join("\n"),
+  return stampWritebackProjectContexts(
+    [
+      {
+        idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+        kind: "comment",
+        issueId: context.issue.id,
+        runId: context.runId,
+        payload: {
+          dedupeKey: eventKey,
+          body: [
+            "## Symphony Publication Approval Not Completed",
+            "",
+            `Status: ${status}`,
+            `Reason: ${reason ?? "n/a"}`,
+            "",
+            "The worker completion report remains stored, but Symphony did not publish a PR.",
+            "",
+            "Recovery:",
+            "- Inspect the stored completion report and worktree before retrying.",
+            "- Move the issue back to the implementation state when Symphony should run another worker.",
+            "- Submit a new completion report or approve a fresh publication request when ready.",
+            ...formatCompletionReportForComment(report),
+          ].join("\n"),
+        },
       },
-    },
-  ];
+    ],
+    projectContextForContext(context),
+  );
 }
 
 export function planReviewFailWritebacks(
@@ -426,46 +453,49 @@ export function planReviewFailWritebacks(
   const details = reviewVerdictDetailsFromInput(requestedRevisions);
   const revisions = details.findings.map((revision) => revision.trim()).filter((revision) => revision.length > 0);
   const eventKey = `${context.runId}:review-verdict-fail`;
-  return [
-    {
-      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
-      kind: "comment",
-      issueId: context.issue.id,
-      runId: context.runId,
-      payload: {
-        dedupeKey: eventKey,
-        body: [
-          "## Symphony Review Verdict: Fail",
-          "",
-          "Status: requested revisions",
-          "Symphony review failed.",
-          `Next state: ${config.writeback.dispatchState}`,
-          "",
-          "Revision request:",
-          "",
-          ...(revisions.length === 0
-            ? ["- Reviewer did not provide concrete requested revisions."]
-            : revisions.map((revision) => `- ${revision}`)),
-          "",
-          `Run: ${context.runId}`,
-          `Reviewer: ${context.reviewer ?? "n/a"}`,
-          ...formatReviewVerdictDetails(details),
-          ...formatReviewEvidenceForLinearComment(reviewEvidence),
-        ].join("\n"),
+  return stampWritebackProjectContexts(
+    [
+      {
+        idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+        kind: "comment",
+        issueId: context.issue.id,
+        runId: context.runId,
+        payload: {
+          dedupeKey: eventKey,
+          body: [
+            "## Symphony Review Verdict: Fail",
+            "",
+            "Status: requested revisions",
+            "Symphony review failed.",
+            `Next state: ${config.writeback.dispatchState}`,
+            "",
+            "Revision request:",
+            "",
+            ...(revisions.length === 0
+              ? ["- Reviewer did not provide concrete requested revisions."]
+              : revisions.map((revision) => `- ${revision}`)),
+            "",
+            `Run: ${context.runId}`,
+            `Reviewer: ${context.reviewer ?? "n/a"}`,
+            ...formatReviewVerdictDetails(details),
+            ...formatReviewEvidenceForLinearComment(reviewEvidence),
+          ].join("\n"),
+        },
       },
-    },
-    {
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
-      kind: "transition",
-      issueId: context.issue.id,
-      runId: context.runId,
-      payload: {
-        fromStates: config.reviewLoop.reviewStates,
-        toState: config.writeback.dispatchState,
-        reason: "Symphony review requested revisions",
+      {
+        idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+        kind: "transition",
+        issueId: context.issue.id,
+        runId: context.runId,
+        payload: {
+          fromStates: config.reviewLoop.reviewStates,
+          toState: config.writeback.dispatchState,
+          reason: "Symphony review requested revisions",
+        },
       },
-    },
-  ];
+    ],
+    projectContextForContext(context),
+  );
 }
 
 export function planReviewPassWritebacks(
@@ -518,7 +548,7 @@ export function planReviewPassWritebacks(
     });
   }
 
-  return operations;
+  return stampWritebackProjectContexts(operations, projectContextForContext(context));
 }
 
 export function planBlockedEscalationWritebacks(
@@ -589,7 +619,7 @@ export function planBlockedEscalationWritebacks(
     });
   }
 
-  return operations;
+  return stampWritebackProjectContexts(operations, projectContextForContext(context));
 }
 
 export function planMergeCompletedWritebacks(
@@ -597,18 +627,21 @@ export function planMergeCompletedWritebacks(
   config: ServiceConfig,
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
-  return [
-    {
-      idempotencyKey: `transition:${context.issue.id}:${context.mergeId}:${context.doneState}`,
-      kind: "transition",
-      issueId: context.issue.id,
-      payload: {
-        fromStates: [context.fromState],
-        toState: context.doneState,
-        reason: "Symphony reviewer-approved merge completed",
+  return stampWritebackProjectContexts(
+    [
+      {
+        idempotencyKey: `transition:${context.issue.id}:${context.mergeId}:${context.doneState}`,
+        kind: "transition",
+        issueId: context.issue.id,
+        payload: {
+          fromStates: [context.fromState],
+          toState: context.doneState,
+          reason: "Symphony reviewer-approved merge completed",
+        },
       },
-    },
-  ];
+    ],
+    projectContextForContext(context),
+  );
 }
 
 export function planMergeGateRepairWritebacks(
@@ -630,25 +663,28 @@ export function planMergeGateRepairWritebacks(
         "Fix the failing required checks in the assigned worktree, validate the repair, leave the final implementation changes uncommitted and unpushed, and submit a new completion report.",
         "Do not run git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned commit, push, and PR publication/reuse after accepting the completion report.",
       ].join(" ");
-  return [
-    mergeGateCommentOperation(
-      context,
-      eventKey,
-      "repair required",
-      `Next state: ${config.writeback.dispatchState} (worker repair queue)`,
-      requiredAction,
-    ),
-    {
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
-      kind: "transition",
-      issueId: context.issue.id,
-      payload: {
-        fromStates: [context.fromState],
-        toState: config.writeback.dispatchState,
-        reason: conflict ? "Symphony merge gate required PR repair" : "Symphony merge gate required CI repair",
+  return stampWritebackProjectContexts(
+    [
+      mergeGateCommentOperation(
+        context,
+        eventKey,
+        "repair required",
+        `Next state: ${config.writeback.dispatchState} (worker repair queue)`,
+        requiredAction,
+      ),
+      {
+        idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+        kind: "transition",
+        issueId: context.issue.id,
+        payload: {
+          fromStates: [context.fromState],
+          toState: config.writeback.dispatchState,
+          reason: conflict ? "Symphony merge gate required PR repair" : "Symphony merge gate required CI repair",
+        },
       },
-    },
-  ];
+    ],
+    projectContextForContext(context),
+  );
 }
 
 export function planMergeGateBlockedWritebacks(
@@ -684,7 +720,7 @@ export function planMergeGateBlockedWritebacks(
       },
     });
   }
-  return operations;
+  return stampWritebackProjectContexts(operations, projectContextForContext(context));
 }
 
 function mergeGateWritebackEventKey(context: MergeGateWritebackContext, kind: "repair" | "blocked"): string {
@@ -698,40 +734,43 @@ export function planMergeGateHeadSupersessionWritebacks(
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
   const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:head-superseded:${safeKeySegment(context.liveHeadSha)}`;
-  return [
-    {
-      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
-      kind: "comment",
-      issueId: context.issue.id,
-      payload: {
-        dedupeKey: eventKey,
-        body: [
-          "## Symphony Merge Gate",
-          "",
-          "Status: head superseded, implementation rebind required",
-          `Next state: ${config.writeback.dispatchState} (worker queue)`,
-          "",
-          `PR: ${formatPullRequest(context.pullRequest)}`,
-          `Previous PR head SHA: ${context.pullRequest.headSha ?? "n/a"}`,
-          `Live PR head SHA: ${context.liveHeadSha}`,
-          `Anchor report: ${context.reportId}`,
-          "",
-          "Required action:",
-          "Submit a fresh completion report for the live PR head. Normal review and approval are required before Symphony can merge.",
-        ].join("\n"),
+  return stampWritebackProjectContexts(
+    [
+      {
+        idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+        kind: "comment",
+        issueId: context.issue.id,
+        payload: {
+          dedupeKey: eventKey,
+          body: [
+            "## Symphony Merge Gate",
+            "",
+            "Status: head superseded, implementation rebind required",
+            `Next state: ${config.writeback.dispatchState} (worker queue)`,
+            "",
+            `PR: ${formatPullRequest(context.pullRequest)}`,
+            `Previous PR head SHA: ${context.pullRequest.headSha ?? "n/a"}`,
+            `Live PR head SHA: ${context.liveHeadSha}`,
+            `Anchor report: ${context.reportId}`,
+            "",
+            "Required action:",
+            "Submit a fresh completion report for the live PR head. Normal review and approval are required before Symphony can merge.",
+          ].join("\n"),
+        },
       },
-    },
-    {
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
-      kind: "transition",
-      issueId: context.issue.id,
-      payload: {
-        fromStates: uniqueStates([context.fromState, config.writeback.dispatchState]),
-        toState: config.writeback.dispatchState,
-        reason: "Symphony merge gate head superseded",
+      {
+        idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+        kind: "transition",
+        issueId: context.issue.id,
+        payload: {
+          fromStates: uniqueStates([context.fromState, config.writeback.dispatchState]),
+          toState: config.writeback.dispatchState,
+          reason: "Symphony merge gate head superseded",
+        },
       },
-    },
-  ];
+    ],
+    projectContextForContext(context),
+  );
 }
 
 export function planMergeConflictsWritebacks(
@@ -741,67 +780,82 @@ export function planMergeConflictsWritebacks(
   if (!config.writeback.enabled) return [];
   const headSha = context.pullRequest.headSha ?? "unknown";
   const eventKey = `${context.mergeId}:merge-conflicts:${safeKeySegment(headSha)}`;
-  return [
-    {
-      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
-      kind: "comment",
-      issueId: context.issue.id,
-      payload: {
-        dedupeKey: eventKey,
-        body: [
-          "## Symphony Gated Merge Blocked",
-          "",
-          "Status: approved pull request has merge conflicts",
-          context.reason,
-          "",
-          `Pull request: ${formatPullRequest(context.pullRequest)}`,
-          `PR head SHA: ${headSha}`,
-          `GitHub mergeable_state: ${context.mergeableState ?? "unknown"}`,
-          "",
-          `Transitioning to conflict-fix state: ${context.conflictsState}`,
-          "A scoped conflict-fix worker must resolve the conflict and call submit_merge_conflict_resolution before merge can continue.",
-        ].join("\n"),
+  return stampWritebackProjectContexts(
+    [
+      {
+        idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+        kind: "comment",
+        issueId: context.issue.id,
+        payload: {
+          dedupeKey: eventKey,
+          body: [
+            "## Symphony Gated Merge Blocked",
+            "",
+            "Status: approved pull request has merge conflicts",
+            context.reason,
+            "",
+            `Pull request: ${formatPullRequest(context.pullRequest)}`,
+            `PR head SHA: ${headSha}`,
+            `GitHub mergeable_state: ${context.mergeableState ?? "unknown"}`,
+            "",
+            `Transitioning to conflict-fix state: ${context.conflictsState}`,
+            "A scoped conflict-fix worker must resolve the conflict and call submit_merge_conflict_resolution before merge can continue.",
+          ].join("\n"),
+        },
       },
-    },
-    {
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${context.conflictsState}`,
-      kind: "transition",
-      issueId: context.issue.id,
-      payload: {
-        fromStates: [context.fromState],
-        toState: context.conflictsState,
-        reason: `Symphony gated merge blocked: ${context.reason}`,
+      {
+        idempotencyKey: `transition:${context.issue.id}:${eventKey}:${context.conflictsState}`,
+        kind: "transition",
+        issueId: context.issue.id,
+        payload: {
+          fromStates: [context.fromState],
+          toState: context.conflictsState,
+          reason: `Symphony gated merge blocked: ${context.reason}`,
+        },
       },
-    },
-  ];
+    ],
+    projectContextForContext(context),
+  );
 }
 
 export function planRunFailedComment(context: RunWritebackContext, config: ServiceConfig, error: string | null): NewWritebackOperation | null {
   if (!config.writeback.enabled) return null;
-  return {
-    idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-failed`,
-    kind: "comment",
-    issueId: context.issue.id,
-    runId: context.runId,
-    payload: {
-      dedupeKey: `${context.runId}:run-failed`,
-      body: [`Symphony worker run failed.`, "", `Run: ${context.runId}`, `Error: ${error ?? "unknown"}`].join("\n"),
+  return stampWritebackProjectContext(
+    {
+      idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-failed`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: `${context.runId}:run-failed`,
+        body: [`Symphony worker run failed.`, "", `Run: ${context.runId}`, `Error: ${error ?? "unknown"}`].join("\n"),
+      },
     },
-  };
+    projectContextForContext(context),
+  );
 }
 
 export function planRunCancelledComment(context: RunWritebackContext, config: ServiceConfig, error: string | null): NewWritebackOperation | null {
   if (!config.writeback.enabled) return null;
-  return {
-    idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-cancelled`,
-    kind: "comment",
-    issueId: context.issue.id,
-    runId: context.runId,
-    payload: {
-      dedupeKey: `${context.runId}:run-cancelled`,
-      body: [`Symphony worker run was cancelled.`, "", `Run: ${context.runId}`, `Reason: ${error ?? "operator request"}`].join("\n"),
+  return stampWritebackProjectContext(
+    {
+      idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-cancelled`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: `${context.runId}:run-cancelled`,
+        body: [`Symphony worker run was cancelled.`, "", `Run: ${context.runId}`, `Reason: ${error ?? "operator request"}`].join("\n"),
+      },
     },
-  };
+    projectContextForContext(context),
+  );
+}
+
+function projectContextForContext(
+  context: ProjectScopedWritebackContext & { issue: Issue },
+): WritebackProjectContext {
+  return mergeWritebackProjectContexts(context, writebackProjectContextFromIssue(context.issue));
 }
 
 function sameName(left: string, right: string): boolean {

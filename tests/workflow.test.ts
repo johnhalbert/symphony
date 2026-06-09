@@ -131,6 +131,378 @@ Work on {{ issue.identifier }}.`,
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
   });
 
+  it("surfaces a legacy default project context when explicit contexts are absent", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.projectContexts.defaultContextId).toBe("default");
+    expect(config.projectContexts.contexts).toHaveLength(1);
+    expect(config.projectContexts.contexts[0]).toMatchObject({
+      id: "default",
+      label: "Default",
+      source: "legacy_default",
+      linearProjectIdentity: {
+        kind: "linear",
+        slug: "TEST",
+      },
+      codebaseIdentity: {
+        sourceKind: "none",
+      },
+    });
+    expect(config.tracker).toEqual(config.projectContexts.contexts[0]?.tracker);
+    expect(config.issueBreakdown).toEqual(config.projectContexts.contexts[0]?.issueBreakdown);
+  });
+
+  it("parses explicit project contexts with scoped credential overrides and legacy fallbacks", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          credential_profiles: {
+            profiles: {
+              "shared-gh": { value: "$SHARED_GITHUB_TOKEN", capabilities: ["github.discovery"] },
+              "docs-gh": { value: "$DOCS_GITHUB_TOKEN", capabilities: ["github.discovery"] },
+            },
+            roles: {
+              worker: {
+                "github.discovery": "shared-gh",
+              },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+            credential_profiles: {
+              roles: {
+                worker: {
+                  "github.discovery": "docs-gh",
+                },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+        SHARED_GITHUB_TOKEN: "shared-gh-secret",
+        DOCS_GITHUB_TOKEN: "docs-gh-secret",
+      },
+    );
+
+    expect(config.projectContexts.defaultContextId).toBe("symphony");
+    expect(config.tracker.projectSlug).toBe("SYMPHONY");
+    expect(config.projectContexts.contexts.map((context) => context.id)).toEqual(["symphony", "docs"]);
+    expect(config.projectContexts.byId.get("docs")?.codebaseIdentity.repository).toBe(path.resolve("/repo/../docs-site"));
+    expect(config.credentialProfiles.resolveForRole("worker", "github.discovery", "symphony")).toMatchObject({
+      source: "profile",
+      profileName: "shared-gh",
+      value: "shared-gh-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("worker", "github.discovery", "docs")).toMatchObject({
+      source: "profile",
+      profileName: "docs-gh",
+      value: "docs-gh-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("worker", "linear.tracker", "symphony")).toMatchObject({
+      source: "legacy",
+      profileName: null,
+      value: "linear-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("worker", "linear.tracker", "docs")).toMatchObject({
+      source: "legacy",
+      profileName: null,
+      value: "docs-linear-secret",
+    });
+  });
+
+  it("selects an enabled non-default context when the literal default context is disabled", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "default",
+            label: "Legacy",
+            enabled: false,
+            projectSlug: "LEGACY",
+            repository: "./legacy-repo",
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            workspaceRoot: "./docs-workspaces",
+            stateDir: "./docs-state",
+            repository: "../docs-site",
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+
+    expect(config.projectContexts.defaultContextId).toBe("docs");
+    expect(config.projectContexts.enabledContexts.map((context) => context.id)).toEqual(["docs"]);
+    expect(config.tracker.projectSlug).toBe("DOCS");
+    expect(config.workspace.root).toBe(path.resolve("/repo/docs-workspaces"));
+    expect(config.workspace.stateDir).toBe(path.resolve("/repo/docs-workspaces/docs-state"));
+    expect(config.workspace.source.repository).toBe(path.resolve("/repo/../docs-site"));
+  });
+
+  it("allows disabled git_worktree contexts to keep placeholder workspace, state-bucket, and PR handoff settings", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY" },
+        project_contexts: [
+          projectContextFixture({
+            id: "staged",
+            label: "Staged",
+            enabled: false,
+            repository: null,
+            baseRef: null,
+            workspaceRoot: "./staged-workspaces",
+            stateDir: "./.staged",
+            tracker: {
+              active_states: ["Todo", "In Review"],
+            },
+            review_loop: {
+              review_states: ["In Review"],
+            },
+            github: {
+              pr_handoff: {
+                enabled: true,
+              },
+            },
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+          }),
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+
+    expect(config.projectContexts.defaultContextId).toBe("docs");
+    expect(config.projectContexts.byId.get("staged")).toMatchObject({
+      enabled: false,
+      tracker: {
+        activeStates: ["Todo", "In Review"],
+      },
+      reviewLoop: {
+        reviewStates: ["In Review"],
+      },
+      github: {
+        publishPullRequests: false,
+        prHandoff: {
+          enabled: true,
+        },
+      },
+      workspace: {
+        source: {
+          kind: "git_worktree",
+        },
+      },
+    });
+    expect(config.projectContexts.byId.get("staged")?.workspace.source.repository).toBeUndefined();
+    expect(config.projectContexts.byId.get("staged")?.workspace.source.baseRef).toBeUndefined();
+  });
+
+  it("redacts secret values from project context public metadata", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: { token: "$ROOT_GITHUB_TOKEN" },
+          credential_profiles: {
+            profiles: {
+              "shared-gh": { value: "$SHARED_GITHUB_TOKEN", capabilities: ["github.discovery"] },
+            },
+            roles: {
+              worker: {
+                "github.discovery": "shared-gh",
+              },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+        ROOT_GITHUB_TOKEN: "root-gh-secret",
+        SHARED_GITHUB_TOKEN: "shared-gh-secret",
+      },
+    );
+
+    const metadata = projectContextRegistryPublicMetadata(config.projectContexts);
+    const serialized = JSON.stringify(metadata);
+    expect(serialized).not.toContain("linear-secret");
+    expect(serialized).not.toContain("docs-linear-secret");
+    expect(serialized).not.toContain("root-gh-secret");
+    expect(serialized).not.toContain("shared-gh-secret");
+    expect(metadata[0]?.github.tokenPresent).toBe(true);
+    expect(metadata[0]?.credentialProfiles.worker["github.discovery"]).toBe("shared-gh");
+  });
+
+  it("rejects duplicate project context ids after normalization", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [
+            projectContextFixture({ id: "Docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+            projectContextFixture({
+              id: " docs ",
+              label: "Duplicate Documentation Site",
+              projectSlug: "DOCS_DUPLICATE",
+              repository: "../docs-duplicate-site",
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow('Duplicate project context id after normalization: "docs"');
+  });
+
+  it("rejects project context ids that normalize to empty strings", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [projectContextFixture({ id: "!!!", label: "Broken", projectSlug: "DOCS", repository: "../docs-site" })],
+        }),
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("Project context id must not be empty after normalization");
+  });
+
+  it("rejects enabled project contexts without a Linear API key", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          topLevel: {
+            tracker: { api_key: undefined },
+          },
+          projectContexts: [
+            projectContextFixture({
+              id: "docs",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "../docs-site",
+              tracker: { api_key: undefined },
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        {},
+      ),
+    ).toThrow("project context docs: Linear API key is required");
+  });
+
+  it("rejects enabled project contexts without a Linear project slug and redacts validation errors", () => {
+    const parse = () =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          topLevel: {
+            github: { token: "$ROOT_GITHUB_TOKEN" },
+          },
+          projectContexts: [
+            projectContextFixture({
+              id: "docs",
+              label: "Documentation Site",
+              projectSlug: null,
+              repository: "../docs-site",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        {
+          LINEAR_API_KEY: "linear-secret",
+          DOCS_LINEAR_API_KEY: "docs-linear-secret",
+          ROOT_GITHUB_TOKEN: "root-gh-secret",
+        },
+      );
+
+    expect(parse).toThrow("project context docs: Linear project slug is required");
+    try {
+      parse();
+      throw new Error("expected project context slug validation to throw");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      expect(message).not.toContain("linear-secret");
+      expect(message).not.toContain("docs-linear-secret");
+      expect(message).not.toContain("root-gh-secret");
+    }
+  });
+
+  it("rejects enabled project contexts without workspace source configuration", () => {
+    expect(() =>
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY" },
+          project_contexts: [
+            {
+              id: "docs",
+              tracker: { project_slug: "DOCS" },
+            },
+          ],
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("project context docs: enabled project contexts require workspace.source.kind other than none");
+  });
+
+  it("requires at least one enabled project context", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [
+            projectContextFixture({ id: "default", enabled: false, projectSlug: "LEGACY", repository: "./legacy-repo" }),
+            projectContextFixture({ id: "docs", enabled: false, projectSlug: "DOCS", repository: "../docs-site" }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      ),
+    ).toThrow("At least one enabled project context is required");
+  });
+
   it("parses database-only config for migration commands without requiring tracker credentials", () => {
     const database = parseDatabaseConfig(
       {
@@ -1436,7 +1808,7 @@ describe("project context redaction", () => {
     const metadata = projectContextRegistryPublicMetadata(config.projectContexts);
     const serialized = JSON.stringify(metadata);
 
-    expect(config.defaultProjectContextId).toBe("symphony");
+    expect(config.projectContexts.defaultContextId).toBe("symphony");
     expect(metadata.map((context) => context.id)).toEqual(["symphony", "docs"]);
     expect(metadata[0]).toMatchObject({
       id: "symphony",
@@ -1568,9 +1940,9 @@ describe("project context redaction", () => {
       },
     );
 
-    expect(config.defaultProjectContextId).toBe("symphony");
-    expect(config.projectContexts).toHaveLength(2);
-    expect(config.projectContexts?.[1]).toMatchObject({
+    expect(config.projectContexts.defaultContextId).toBe("symphony");
+    expect(config.projectContexts.contexts).toHaveLength(2);
+    expect(config.projectContexts.byId.get("docs")).toMatchObject({
       id: "docs",
       label: "docs",
       enabled: false,
@@ -1658,7 +2030,213 @@ describe("project context redaction", () => {
       },
       expectedMessage: "project context docs-site: workspace.source.repository is required for git",
     },
+    {
+      label: "copy source with unset env placeholder path",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "copy",
+                path: "$DOCS_SOURCE_PATH",
+              },
+            },
+          },
+        ],
+      },
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+      },
+      expectedMessage: "project context docs-site: workspace.source.path is required for copy project contexts",
+    },
+    {
+      label: "git source with empty env placeholder repository",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git",
+                repository: "$DOCS_REPOSITORY",
+              },
+            },
+          },
+        ],
+      },
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+        DOCS_REPOSITORY: "",
+      },
+      expectedMessage: "project context docs-site: workspace.source.repository is required for git project contexts",
+    },
+    {
+      label: "git_worktree source with unset env placeholder repository",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "$DOCS_REPOSITORY",
+                base_ref: "origin/main",
+              },
+            },
+          },
+        ],
+      },
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+      },
+      expectedMessage: "project context docs-site: workspace.source.repository is required for git_worktree",
+    },
+    {
+      label: "git_worktree source with unset env placeholder base ref",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "../docs-site",
+                base_ref: "$DOCS_BASE_REF",
+              },
+            },
+          },
+        ],
+      },
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+      },
+      expectedMessage: "project context docs-site: workspace.source.base_ref is required for git_worktree",
+    },
+    {
+      label: "git_worktree source with empty env placeholder base ref",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "../docs-site",
+                base_ref: "$DOCS_BASE_REF",
+              },
+            },
+          },
+        ],
+      },
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+        DOCS_BASE_REF: "",
+      },
+      expectedMessage: "project context docs-site: workspace.source.base_ref is required for git_worktree",
+    },
   ])("rejects enabled project contexts with $label", ({ rawConfig, env, expectedMessage }) => {
     expect(() => parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env)).toThrowError(expectedMessage);
   });
+
 });

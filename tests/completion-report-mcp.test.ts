@@ -222,6 +222,97 @@ describe("completion report MCP handoff", () => {
     expect(authorizations).toEqual(["Bearer publication-token", "Bearer publication-token"]);
   });
 
+  it("uses the issue project context when constructing the publication GitHub client", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    const workspace = await initPublishRepo(root, { remote: true });
+    await writeFile(path.join(workspace, "feature.txt"), "changed\n", "utf8");
+    await writeFile(workflowPath, workflowWithDocsPublicationContext(stateDir), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-docs-publication",
+      sessionId: "agent-1:run-docs-publication",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: workspace,
+      gitBranchName: "symphony/TEST-1",
+      repoPath: workspace,
+      baseRef: "main",
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({
+        state: "In Progress",
+        identifier: "TEST-1",
+        branchName: "symphony/TEST-1",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      }),
+      activeRunId: "run-docs-publication",
+      role: "worker",
+      token: "handoff-token",
+      expectedToken: "handoff-token",
+      sessionId: "agent-1:run-docs-publication",
+      workspacePath: workspace,
+      workspace: {
+        path: workspace,
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: workspace,
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+    const authorizations: string[] = [];
+    const paths: string[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
+      const url = new URL(String(input));
+      paths.push(url.pathname);
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      if (init?.method === "POST") {
+        return jsonResponse(
+          {
+            html_url: "https://github.com/acme-docs/docs-site/pull/43",
+            number: 43,
+            head: {
+              ref: "symphony/TEST-1",
+              sha: "docs-remote-created-sha",
+              repo: { pushed_at: "2026-01-01T00:00:01Z" },
+            },
+          },
+          201,
+        );
+      }
+      return jsonResponse([]);
+    });
+
+    const result = await submitCompletionReportFromMcp(report("docs-publication-idem"), {
+      workflowPath,
+      contextFile,
+    });
+
+    expect(authorizations).toEqual(["Bearer docs-publication-secret", "Bearer docs-publication-secret"]);
+    expect(paths).toEqual(["/repos/acme-docs/docs-site/pulls", "/repos/acme-docs/docs-site/pulls"]);
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      pullRequest: {
+        url: "https://github.com/acme-docs/docs-site/pull/43",
+        number: 43,
+        branch: "symphony/TEST-1",
+      },
+    });
+  });
+
   it("exposes a documented stdio MCP tool and submits without caller-supplied run identity", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
@@ -424,6 +515,64 @@ credential_profiles:
   roles:
     service:
       github.publication: publication
+---
+Work on {{ issue.identifier }}.
+`;
+}
+
+function workflowWithDocsPublicationContext(stateDir: string): string {
+  return `---
+tracker:
+  kind: linear
+  api_key: linear-test-key
+  project_slug: TEST
+  active_states:
+    - Todo
+    - In Progress
+  handoff_states:
+    - Human Review
+writeback:
+  enabled: true
+  mode: dry_run
+  dispatch_state: In Progress
+review_loop:
+  review_states:
+    - In Review
+workspace:
+  root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  state_dir: "${slash(stateDir)}"
+github:
+  owner: acme
+  repo: symphony
+  token: default-publication-secret
+  publish_pull_requests: false
+  pr_handoff:
+    enabled: false
+project_contexts:
+  - id: docs
+    label: Documentation Site
+    tracker:
+      api_key: linear-test-key
+      project_slug: DOCS
+    github:
+      owner: acme-docs
+      repo: docs-site
+      token: docs-publication-secret
+      publish_pull_requests: true
+      pr_handoff:
+        enabled: true
+        target_state: Human Review
+        no_ci:
+          allowed: true
+          evidence: No CI configured in MCP test
+    review_loop:
+      review_states:
+        - Docs Review
+      review_pass_state: Docs Ready to Merge
+    workspace:
+      source:
+        kind: copy
+        path: ../docs-site
 ---
 Work on {{ issue.identifier }}.
 `;

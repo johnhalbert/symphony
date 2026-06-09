@@ -9,6 +9,10 @@ import {
   planIssueBreakdownFinalizationWritebacks,
 } from "../src/core/IssueBreakdownPlanApplyService.js";
 import {
+  planCompletionReportAcceptedWritebacks,
+  planRunStartedComment,
+} from "../src/core/writeback/TransitionPolicy.js";
+import {
   issueBreakdownConfigFingerprint,
   issueContentFingerprint,
   IssueBreakdownPlanService,
@@ -78,6 +82,162 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.transitions).toHaveLength(1);
   });
 
+  it("scopes non-default project-context writeback idempotency keys so identical logical writes do not collide", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    const config = reviewLoopWritebackConfig(root);
+    const defaultIssue = issue({
+      id: "shared-issue",
+      identifier: "ENG-1",
+      state: "In Progress",
+      branchName: "symphony/ENG-1",
+      projectContextId: "default",
+      projectContextLabel: "Default",
+    });
+    const docsIssue = issue({
+      id: "shared-issue",
+      identifier: "ENG-1",
+      state: "In Progress",
+      branchName: "symphony/DOCS-1",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+
+    const defaultOperation = planRunStartedComment(
+      {
+        issue: defaultIssue,
+        runId: "shared-run-1",
+        sessionId: "session-default-1",
+        workspacePath: "/tmp/default-workspace",
+      },
+      config,
+    );
+    const docsOperation = planRunStartedComment(
+      {
+        issue: docsIssue,
+        runId: "shared-run-1",
+        sessionId: "session-docs-1",
+        workspacePath: "/tmp/docs-workspace",
+      },
+      config,
+    );
+
+    expect(defaultOperation).not.toBeNull();
+    expect(docsOperation).not.toBeNull();
+    expect(defaultOperation?.idempotencyKey).toBe("comment:shared-issue:shared-run-1:run-started");
+    expect(docsOperation?.idempotencyKey).toBe("project-context:docs:comment:shared-issue:shared-run-1:run-started");
+
+    await processor.enqueueAndProcess(defaultOperation!);
+    await processor.enqueueAndProcess(docsOperation!);
+
+    const records = await store.list();
+    expect(records).toHaveLength(2);
+    expect(records.map((record) => record.idempotencyKey)).toEqual(
+      expect.arrayContaining([
+        "comment:shared-issue:shared-run-1:run-started",
+        "project-context:docs:comment:shared-issue:shared-run-1:run-started",
+      ]),
+    );
+    expect(writer.comments).toHaveLength(2);
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectContextId: "default", projectContextLabel: "Default" }),
+        expect.objectContaining({ projectContextId: "docs", projectContextLabel: "Documentation Site" }),
+      ]),
+    );
+  });
+
+
+  it("backfills default project context attribution for legacy writeback operations", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const record = await store.enqueueOnce({
+      idempotencyKey: "comment:issue-1:legacy-context",
+      kind: "comment",
+      issueId: "issue-1",
+      payload: { body: "legacy", dedupeKey: "legacy-context" },
+    });
+
+    const [entry] = await readdir(path.join(root, "writeback"));
+    const recordPath = path.join(root, "writeback", entry!);
+    const raw = JSON.parse(await nodeFs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+    delete raw.projectContextId;
+    delete raw.projectContextLabel;
+    await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}
+`, "utf8");
+
+    await expect(new FileWritebackOutboxStore(root).get(record.idempotencyKey)).resolves.toMatchObject({
+      projectContextId: "default",
+      projectContextLabel: "Default",
+    });
+  });
+
+  it("persists non-default project context from planned run-started comments", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const config = reviewLoopWritebackConfig(root);
+    const docsIssue = issue({ state: "In Progress", branchName: "symphony/DOCS-1", projectContextId: "docs", projectContextLabel: "Documentation Site" });
+
+    const operation = planRunStartedComment({
+      issue: docsIssue,
+      runId: "run-docs-started-1",
+      sessionId: "session-docs-started-1",
+      workspacePath: "/tmp/docs-workspace",
+    }, config);
+
+    expect(operation).not.toBeNull();
+    await store.enqueueOnce(operation!);
+
+    await expect(store.get(operation!.idempotencyKey)).resolves.toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    });
+  });
+
+  it("persists non-default project context from planned completion-report accepted writebacks", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const config = reviewLoopWritebackConfig(root);
+    const docsIssue = issue({ state: "In Progress", branchName: "symphony/DOCS-1", projectContextId: "docs", projectContextLabel: "Documentation Site" });
+
+    const operations = planCompletionReportAcceptedWritebacks({
+      issue: docsIssue,
+      runId: "run-docs-completion-1",
+      sessionId: "session-docs-completion-1",
+      workspacePath: "/tmp/docs-workspace",
+    }, config, "Documentation update is ready for review.");
+
+    expect(operations).toHaveLength(2);
+    for (const operation of operations) await store.enqueueOnce(operation);
+
+    const records = await store.list();
+    expect(records).toHaveLength(2);
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectContextId: "docs", projectContextLabel: "Documentation Site" }),
+      ]),
+    );
+    expect(records.every((record) => record.projectContextId === "docs" && record.projectContextLabel === "Documentation Site")).toBe(true);
+  });
+
+  it("persists non-default project context from issue breakdown application and finalization writebacks", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const config = reviewLoopWritebackConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const parentIssue = issue({ state: "In Progress", identifier: "DOCS-1", branchName: "symphony/DOCS-1", projectContextId: "docs", projectContextLabel: "Documentation Site" });
+    const plan = await submitTwoChildPlan(config, lifecycleStore, parentIssue, "plan-docs-context", "run-docs-plan");
+
+    const applicationOps = planIssueBreakdownApplicationWritebacks(parentIssue, plan) as IssueCreateWriteback[];
+    const finalizationOps = planIssueBreakdownFinalizationWritebacks(parentIssue, {
+      ...plan,
+      createdIssueRefs: applicationOps.map((operation) => createdIssueRefForOperation(operation)),
+    });
+
+    for (const operation of [...applicationOps, ...finalizationOps]) await store.enqueueOnce(operation);
+
+    const records = await store.list();
+    expect(records).toHaveLength(applicationOps.length + finalizationOps.length);
+    expect(records.every((record) => record.projectContextId === "docs" && record.projectContextLabel === "Documentation Site")).toBe(true);
+  });
 
   it("tracks projection revisions for successful outbox writes only", async () => {
     const store = new FileWritebackOutboxStore(root);
@@ -1260,6 +1420,16 @@ function legacyParentCommentOperation(idempotencyKey: string) {
       dedupeKey: "issue-breakdown-children:plan-1",
     },
   };
+}
+
+function reviewLoopWritebackConfig(workspaceRoot: string): ServiceConfig {
+  const config = testConfig(workspaceRoot);
+  config.writeback.enabled = true;
+  config.writeback.dispatchState = "In Progress";
+  config.reviewLoop.reviewStates = ["In Review"];
+  config.reviewLoop.blockedStates = ["Blocked"];
+  config.reviewLoop.reviewPassState = "Ready to Merge";
+  return config;
 }
 
 function createdIssueRef(): IssueBreakdownCreatedIssueRef {
