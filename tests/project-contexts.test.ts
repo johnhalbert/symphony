@@ -211,4 +211,60 @@ describe("project context normalization", () => {
       value: "feedback-secret",
     });
   });
+
+  it("merges default and project-context credential profile registries per context", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DEFAULT_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              tracker: { value: "$DEFAULT_TRACKER_TOKEN", capabilities: ["linear.tracker"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+              worker: { "linear.tracker": "tracker" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$DOCS_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "legacy-linear-secret",
+        DEFAULT_PUBLICATION_TOKEN: "default-publication-secret",
+        DEFAULT_TRACKER_TOKEN: "default-tracker-secret",
+        DOCS_PUBLICATION_TOKEN: "docs-publication-secret",
+      },
+    );
+
+    expect(config.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      value: "default-publication-secret",
+      profileName: "publication",
+    });
+    expect(config.credentialProfileRegistries.get("docs")?.resolveForRole("service", "github.publication")).toMatchObject({
+      value: "docs-publication-secret",
+      profileName: "publication",
+    });
+    expect(config.credentialProfileRegistries.get("docs")?.resolveForRole("worker", "linear.tracker")).toMatchObject({
+      value: "default-tracker-secret",
+      profileName: "tracker",
+    });
+  });
 });

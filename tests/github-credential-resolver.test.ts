@@ -6,6 +6,7 @@ import {
   type GitHubCredentialCapability,
   resolveGitHubClientConfig,
 } from "../src/integrations/github/GitHubCredentialResolver.js";
+import { multiProjectWorkflowConfig, projectContextFixture } from "./helpers.js";
 
 describe("GitHub credential resolver", () => {
   it("falls back to the legacy GitHub token when no capability profile is assigned", () => {
@@ -288,6 +289,59 @@ describe("GitHub credential resolver", () => {
         `credential_profiles.roles.${owner}.${capability}`,
       );
     }
+  });
+
+  it("resolves project-context-specific GitHub profiles and repository metadata", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: { owner: "acme", repo: "symphony", token: "$DEFAULT_GITHUB_TOKEN" },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DEFAULT_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: { owner: "acme", repo: "docs-site", token: "$DOCS_GITHUB_TOKEN" },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$DOCS_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        DEFAULT_GITHUB_TOKEN: "default-github-secret",
+        DEFAULT_PUBLICATION_TOKEN: "default-publication-secret",
+        DOCS_GITHUB_TOKEN: "docs-github-secret",
+        DOCS_PUBLICATION_TOKEN: "docs-publication-secret",
+      },
+    );
+
+    expect(resolveGitHubClientConfig(config, "github.publication")).toMatchObject({
+      github: { owner: "acme", repo: "symphony", token: "default-publication-secret" },
+      credential: { source: "profile", profileName: "publication", value: "default-publication-secret" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.publication", "docs")).toMatchObject({
+      github: { owner: "acme", repo: "docs-site", token: "docs-publication-secret" },
+      credential: { source: "profile", profileName: "publication", value: "docs-publication-secret" },
+    });
   });
 });
 

@@ -262,6 +262,113 @@ describe("MCP subprocess environment", () => {
     expect(githubEnvKeys(env)).toEqual(["GITHUB_PUBLICATION_TOKEN"]);
   });
 
+  it.each([
+    {
+      command: "completion-report-mcp" as const,
+      expectedKeys: [
+        "DOCS_GITHUB_OWNER",
+        "DOCS_GITHUB_PUBLICATION_TOKEN",
+        "DOCS_GITHUB_REPO",
+        "GITHUB_OWNER",
+        "GITHUB_REPO",
+      ],
+      expectedTokenKey: "DOCS_GITHUB_PUBLICATION_TOKEN",
+      expectedTokenValue: "docs-publication-secret",
+    },
+    {
+      command: "review-feedback-mcp" as const,
+      expectedKeys: [
+        "DOCS_GITHUB_FEEDBACK_TOKEN",
+        "DOCS_GITHUB_OWNER",
+        "DOCS_GITHUB_REPO",
+        "GITHUB_OWNER",
+        "GITHUB_REPO",
+      ],
+      expectedTokenKey: "DOCS_GITHUB_FEEDBACK_TOKEN",
+      expectedTokenValue: "docs-feedback-secret",
+    },
+  ])("uses project-context-specific GitHub env slices for $command", ({
+    command,
+    expectedKeys,
+    expectedTokenKey,
+    expectedTokenValue,
+  }) => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: {
+            owner: "$GITHUB_OWNER",
+            repo: "$GITHUB_REPO",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+              reviewer: { "github.review_feedback_write": "feedback" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: {
+              owner: "$DOCS_GITHUB_OWNER",
+              repo: "$DOCS_GITHUB_REPO",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+            },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+                feedback: { value: "$DOCS_GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_OWNER: "acme",
+        GITHUB_REPO: "symphony",
+        GITHUB_PUBLICATION_TOKEN: "default-publication-secret",
+        GITHUB_FEEDBACK_TOKEN: "default-feedback-secret",
+        DOCS_GITHUB_OWNER: "acme",
+        DOCS_GITHUB_REPO: "docs-site",
+        DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+        DOCS_GITHUB_FEEDBACK_TOKEN: "docs-feedback-secret",
+      },
+    );
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command,
+      projectContextId: "docs",
+      parentEnv: { PATH: "/bin", GITHUB_TOKEN: "decoy-parent-github-secret" },
+    });
+
+    expect(env.DOCS_GITHUB_OWNER).toBe("acme");
+    expect(env.DOCS_GITHUB_REPO).toBe("docs-site");
+    expect(env[expectedTokenKey]).toBe(expectedTokenValue);
+    expect(env).not.toHaveProperty("GITHUB_PUBLICATION_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_FEEDBACK_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(githubEnvKeys(env)).toEqual(expectedKeys);
+  });
+
   it("includes env-backed GitHub publication metadata refs without leaking decoy credentials", () => {
     const rawConfig = {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },

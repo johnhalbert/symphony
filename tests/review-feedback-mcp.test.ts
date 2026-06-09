@@ -12,6 +12,13 @@ import {
 import { FileIssueLifecycleStore, type IssueCompletionReportRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import { issue } from "./helpers.js";
 
+const docsProjectContext = {
+  projectContextId: "docs",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
+
 let root: string;
 
 describe("review feedback MCP handoff", () => {
@@ -94,6 +101,59 @@ describe("review feedback MCP handoff", () => {
         "https://github.com/acme/symphony/pull/42#pullrequestreview-9001",
         "https://github.com/acme/symphony/pull/42#discussion_r9002",
       ],
+    });
+  });
+
+  it("uses the active project context review-feedback profile", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-feedback-context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    vi.stubEnv("DOCS_GITHUB_FEEDBACK_TOKEN", "docs-feedback-secret");
+    await writeFile(workflowPath, workflowWithContextReviewProfile(stateDir), "utf8");
+    await seedLifecycle(lifecycleStore);
+    await writeReviewFeedbackMcpContext(contextFile, {
+      issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      projectContext: docsProjectContext,
+      activeRunId: "review-run-1",
+      role: "reviewer",
+      token: null,
+      expectedToken: null,
+      reviewer: "reviewer-agent:review-run-1",
+      phase: "review",
+    });
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", async (_input: unknown, init?: RequestInit) => {
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      return new Response(
+        JSON.stringify({
+          id: 9002,
+          html_url: "https://github.com/acme/docs-site/pull/42#pullrequestreview-9002",
+          comments: [{ html_url: "https://github.com/acme/docs-site/pull/42#discussion_r9003" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+
+    const result = await submitReviewFeedbackFromMcp(
+      {
+        kind: "review",
+        event: "APPROVE",
+        body: "Reviewer feedback from MCP.",
+        comments: [{ path: "src/index.ts", body: "Inline note.", line: 5, side: "RIGHT" }],
+        idempotencyKey: "feedback-docs-1",
+      },
+      { workflowPath, contextFile },
+    );
+
+    expect(authorizations).toEqual(["Bearer docs-feedback-secret"]);
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      feedbackId: "review-feedback:issue-1:review-run-1:feedback-docs-1",
+      pullRequest: { number: 42, url: "https://github.com/acme/symphony/pull/42", headSha: "abc123" },
+      reviewUrl: "https://github.com/acme/docs-site/pull/42#pullrequestreview-9002",
+      commentUrls: ["https://github.com/acme/docs-site/pull/42#discussion_r9003"],
     });
   });
 
@@ -225,6 +285,86 @@ review_loop:
 workspace:
   root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
   state_dir: "${slash(stateDir)}"
+---
+Work on {{ issue.identifier }}.
+`;
+}
+
+function workflowWithContextReviewProfile(stateDir: string): string {
+  return `---
+tracker:
+  kind: linear
+  api_key: linear-test-key
+  project_slug: TEST
+  active_states:
+    - Todo
+    - In Progress
+  handoff_states:
+    - In Review
+github:
+  owner: acme
+  repo: symphony
+  token: github-secret
+  api_base_url: https://api.github.test
+review_loop:
+  review_states:
+    - In Review
+  review_pass_state: Ready to Merge
+workspace:
+  root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  state_dir: "${slash(stateDir)}"
+credential_profiles:
+  profiles:
+    feedback:
+      value: $GITHUB_FEEDBACK_TOKEN
+      capabilities:
+        - github.review_feedback_write
+  roles:
+    reviewer:
+      github.review_feedback_write: feedback
+project_contexts:
+  - id: symphony
+    label: Symphony
+    tracker:
+      kind: linear
+      project_slug: TEST
+    workspace:
+      root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+      state_dir: "${slash(stateDir)}"
+      source:
+        kind: git_worktree
+        repository: .
+        base_ref: origin/main
+        branch_template: symphony/{{ issue.identifier }}
+        cleanup: refuse_dirty
+  - id: docs
+    label: Documentation Site
+    tracker:
+      kind: linear
+      project_slug: DOCS
+    workspace:
+      root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+      state_dir: "${slash(stateDir)}"
+      source:
+        kind: git_worktree
+        repository: ../docs-site
+        base_ref: origin/main
+        branch_template: symphony/{{ issue.identifier }}
+        cleanup: refuse_dirty
+    github:
+      owner: acme
+      repo: docs-site
+      token: docs-github-secret
+      api_base_url: https://api.github.test
+    credential_profiles:
+      profiles:
+        feedback:
+          value: $DOCS_GITHUB_FEEDBACK_TOKEN
+          capabilities:
+            - github.review_feedback_write
+      roles:
+        reviewer:
+          github.review_feedback_write: feedback
 ---
 Work on {{ issue.identifier }}.
 `;

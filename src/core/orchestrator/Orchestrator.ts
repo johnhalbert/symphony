@@ -987,9 +987,10 @@ export class Orchestrator {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
     const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
+    const projectContextId = request.projectContext?.projectContextId ?? projectContextResolutionFromIssue(issue)?.projectContextId;
     const publisher =
       this.options.completionReportPublisher ??
-      createGitHubPullRequestClientForCapability(this.config, "github.publication");
+      createGitHubPullRequestClientForCapability(this.config, "github.publication", undefined, projectContextId);
     const result = await new CompletionReportService({
       config: this.config,
       lifecycleStore: this.options.lifecycleStore,
@@ -1229,20 +1230,22 @@ export class Orchestrator {
       this.options.logger.warn("pending publication approval recovery issue refresh failed", { error: errorMessage(error) });
     }
     const issuesById = new Map(latestIssues.map((issue) => [issue.id, issue]));
-    const service = new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-      writebackProcessor: this.options.writeback,
-      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      pullRequestPublisher:
-        this.options.completionReportPublisher ??
-        createGitHubPullRequestClientForCapability(this.config, "github.publication"),
-      operatorApproval: this.options.operatorApproval,
-    });
 
     for (const lifecycle of candidates) {
       const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
+      const projectContextId =
+        lifecycle.projectContext?.projectContextId ?? projectContextResolutionFromIssue(issue)?.projectContextId;
+      const service = new CompletionReportService({
+        config: this.config,
+        lifecycleStore: this.options.lifecycleStore,
+        writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
+        writebackProcessor: this.options.writeback,
+        ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+        pullRequestPublisher:
+          this.options.completionReportPublisher ??
+          createGitHubPullRequestClientForCapability(this.config, "github.publication", undefined, projectContextId),
+        operatorApproval: this.options.operatorApproval,
+      });
       try {
         const result = await service.recoverPendingPublicationApproval({ issue, lifecycle });
         if (result.recovered) {
@@ -3106,9 +3109,11 @@ export class Orchestrator {
 
     let pullRequest: DiscoveredPullRequest | null;
     try {
+      const projectContextId =
+        entry.lifecycle?.projectContext?.projectContextId ?? projectContextResolutionFromIssue(entry.issue)?.projectContextId;
       const client =
         this.options.pullRequestClient ??
-        createGitHubPullRequestClientForCapability(this.config, "github.discovery");
+        createGitHubPullRequestClientForCapability(this.config, "github.discovery", undefined, projectContextId);
       pullRequest = await client.findOpenPullRequestByBranch({ branchName });
     } catch (error) {
       this.options.logger.warn("pull request discovery failed", {
@@ -3515,9 +3520,16 @@ export class Orchestrator {
   private async loadWorkerReviewEvidencePrompt(entry: RunningEntry): Promise<string | null> {
     if (!this.options.lifecycleStore) return null;
     try {
+      const projectContextId =
+        entry.lifecycle?.projectContext?.projectContextId ?? projectContextResolutionFromIssue(entry.issue)?.projectContextId;
       const client =
         this.options.pullRequestReviewClient ??
-        createGitHubPullRequestClientForCapability(this.config, "github.review_evidence_read");
+        createGitHubPullRequestClientForCapability(
+          this.config,
+          "github.review_evidence_read",
+          undefined,
+          projectContextId,
+        );
       const service = new PullRequestReviewEvidenceService({
         lifecycleStore: this.options.lifecycleStore,
         client,

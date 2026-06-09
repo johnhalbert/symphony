@@ -7,6 +7,7 @@ import type {
   PullRequestReviewFeedbackResult,
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
+import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import { SymphonyError } from "../errors.js";
 import type {
   CompletionReportPullRequestRef,
@@ -87,6 +88,7 @@ export interface PullRequestReviewFeedbackClient {
 
 export interface ReviewFeedbackActiveContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string;
   role: "reviewer" | string;
   token?: string | null;
