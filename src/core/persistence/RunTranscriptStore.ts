@@ -307,6 +307,7 @@ export interface StartRunInput {
 export interface UpdateRunInput {
   sessionId?: string | null;
   agentId?: string | null;
+  projectContext?: ProjectContextResolution | undefined;
   status?: RunStatus;
   completedAt?: string | null;
   error?: string | null;
@@ -448,6 +449,9 @@ export class FileRunTranscriptStore {
         ...existing,
         ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
         ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+        ...(input.projectContext === undefined
+          ? {}
+          : { projectContext: normalizeProjectContextResolution(input.projectContext) }),
         ...(input.status === undefined ? {} : { status: input.status }),
         ...(input.completedAt === undefined ? {} : { completedAt: input.completedAt }),
         ...(input.error === undefined ? {} : { error: input.error }),
