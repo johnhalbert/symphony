@@ -1,3 +1,4 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import {
@@ -165,6 +166,169 @@ describe("project context normalization", () => {
     expect(docsContext?.publicMetadata.repository).toMatch(/docs-site$/i);
     expect(config.tracker.projectSlug).toBe("SYMPHONY");
     expect(config.workspace.source?.repository).toMatch(/repo$/i);
+  });
+
+  it("merges top-level project defaults into explicit contexts before applying context overrides", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: "./global-workspaces",
+            state_dir: "./global-state",
+            source: {
+              kind: "git_worktree",
+              repository: "$DEFAULT_REPOSITORY",
+              base_ref: "$DEFAULT_BASE_REF",
+              branch_template: "$DEFAULT_BRANCH_TEMPLATE",
+              cache_path: "$DEFAULT_CACHE_PATH",
+              cleanup: "force",
+            },
+          },
+          github: {
+            owner: "top-owner",
+            repo: "top-repo",
+            head_owner: "top-head",
+            api_base_url: "https://example.invalid/api",
+            app: {
+              app_id: "123",
+              installation_id: "456",
+              private_key_path: "./keys/root.pem",
+            },
+            operator_approval: {
+              reject_policy: "fail",
+              poll_interval_ms: 1234,
+            },
+          },
+          review_loop: {
+            reviewer_prompt_extensions: ["top-reviewer"],
+            max_incomplete_turns: 5,
+          },
+          issue_breakdown: {
+            enabled: true,
+            planning_labels: ["global-planning"],
+            apply_to_linear: {
+              enabled: true,
+            },
+            workspace_mode: "none",
+          },
+          agent: {
+            harness: "hermes",
+            max_turns: 7,
+            max_concurrent_agents_by_state: {
+              Todo: 2,
+            },
+            protected_paths: ["global/**"],
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            workspaceRoot: "./docs-workspaces",
+            stateDir: "./docs-state",
+            repository: null,
+            baseRef: null,
+            branchTemplate: null,
+            workspace: {
+              source: {
+                repository: "../docs-site",
+                branch_template: "$DOCS_BRANCH_TEMPLATE",
+              },
+            },
+            github: {
+              repo: "docs-site",
+              operator_approval: {
+                required_for_publication: true,
+              },
+            },
+            review_loop: {
+              worker_prompt_extensions: ["docs-worker"],
+            },
+            issue_breakdown: {
+              apply_to_linear: {
+                enabled: false,
+              },
+              planning_labels: ["docs-planning"],
+            },
+            agent: {
+              max_turns: 3,
+              max_concurrent_agents_by_state: {
+                Review: 1,
+              },
+              protected_paths: ["docs/**"],
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-test-key",
+        DEFAULT_REPOSITORY: ".",
+        DEFAULT_BASE_REF: "origin/release",
+        DEFAULT_BRANCH_TEMPLATE: "global/{{ issue.identifier }}",
+        DEFAULT_CACHE_PATH: "./cache/shared",
+        DOCS_BRANCH_TEMPLATE: "docs/{{ issue.identifier }}",
+      },
+    );
+
+    const docsContext = config.projectContexts.byId.get("docs");
+    expect(docsContext).toMatchObject({
+      workspace: {
+        root: path.resolve("/repo", "./docs-workspaces"),
+        stateDir: path.resolve("/repo", "./docs-workspaces", "./docs-state"),
+        source: {
+          kind: "git_worktree",
+          repository: path.resolve("/repo", "../docs-site"),
+          baseRef: "origin/release",
+          branchTemplate: "docs/{{ issue.identifier }}",
+          cachePath: path.resolve("/repo", "./cache/shared"),
+        },
+      },
+      github: {
+        owner: "top-owner",
+        repo: "docs-site",
+        headOwner: "top-head",
+        apiBaseUrl: "https://example.invalid/api",
+        operatorApproval: {
+          requiredForPublication: true,
+          rejectPolicy: "fail",
+          pollIntervalMs: 1234,
+        },
+        app: {
+          appId: "123",
+          installationId: "456",
+          privateKeyPath: path.resolve("/repo", "./keys/root.pem"),
+        },
+      },
+      reviewLoop: {
+        reviewerPromptExtensions: ["top-reviewer"],
+        workerPromptExtensions: ["docs-worker"],
+        maxIncompleteTurns: 5,
+      },
+      issueBreakdown: {
+        enabled: true,
+        planningLabels: ["docs-planning"],
+        applyToLinear: {
+          enabled: false,
+          mode: "child_issues",
+        },
+        workspaceMode: "none",
+      },
+      agent: {
+        harness: "hermes",
+        maxTurns: 3,
+        protectedPaths: ["docs/**"],
+      },
+    });
+    expect(docsContext?.workspace.source.cleanup).toBe("refuse_dirty");
+    expect(docsContext?.agent.maxConcurrentAgentsByState).toEqual(
+      new Map([
+        ["todo", 2],
+        ["review", 1],
+      ]),
+    );
   });
 
   it("projects default-context credential profiles into the legacy service credential registry", () => {

@@ -1799,8 +1799,7 @@ describe("project context redaction", () => {
         SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
         DOCS_LINEAR_API_KEY: "docs-linear-secret",
       },
-      expectedId: "docs-site",
-      expectedSourceKind: "copy",
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source.path is required for copy',
     },
     {
       label: "git source without repository",
@@ -1839,20 +1838,51 @@ describe("project context redaction", () => {
         SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
         DOCS_LINEAR_API_KEY: "docs-linear-secret",
       },
-      expectedId: "docs-site",
-      expectedSourceKind: "git",
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source.repository is required for git',
     },
-  ])("preserves enabled project contexts with $label source kinds", ({ rawConfig, env, expectedId, expectedSourceKind }) => {
-    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
-
-    expect(config.projectContexts.byId.get(expectedId)).toMatchObject({
-      id: expectedId,
-      enabled: true,
-      workspace: {
-        source: {
-          kind: expectedSourceKind,
-        },
+    {
+      label: "git_worktree source with unresolved repository env",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "$DOCS_REPOSITORY",
+                base_ref: "$DOCS_BASE_REF",
+              },
+            },
+          },
+        ],
       },
-    });
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+        DOCS_BASE_REF: "origin/main",
+      },
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source.repository is required for git_worktree',
+    },
+  ])("rejects enabled project contexts with insufficient $label", ({ rawConfig, env, expectedMessage }) => {
+    expect(() => parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env)).toThrowError(expectedMessage);
   });
 });

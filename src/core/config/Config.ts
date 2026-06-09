@@ -1127,18 +1127,12 @@ function normalizeWorkspaceConfigForProjectContext(
   const root = resolvePathValue(rawWorkspace?.root ?? "symphony_workspaces", workflowDir, env);
   const stateDir = resolvePathValue(rawWorkspace?.state_dir ?? ".symphony", root, env);
   const sourceKind = rawWorkspace?.source?.kind ?? "none";
-  const sourcePath =
-    rawWorkspace?.source?.path === undefined
-      ? undefined
-      : resolvePathValue(rawWorkspace.source.path, workflowDir, env);
-  const sourceCachePath =
-    rawWorkspace?.source?.cache_path === undefined
-      ? undefined
-      : resolvePathValue(rawWorkspace.source.cache_path, workflowDir, env);
-  const sourceRepository =
-    rawWorkspace?.source?.repository === undefined
-      ? undefined
-      : resolveRepositoryValue(rawWorkspace.source.repository, workflowDir, env);
+  const sourcePath = resolveOptionalPathValue(rawWorkspace?.source?.path, workflowDir, env) ?? undefined;
+  const sourceCachePath = resolveOptionalPathValue(rawWorkspace?.source?.cache_path, workflowDir, env) ?? undefined;
+  const sourceRepository = resolveOptionalRepositoryValue(rawWorkspace?.source?.repository, workflowDir, env);
+  const sourceRef = resolveOptionalConfigStringValue(rawWorkspace?.source?.ref, env);
+  const sourceBaseRef = resolveOptionalConfigStringValue(rawWorkspace?.source?.base_ref, env);
+  const sourceBranchTemplate = resolveOptionalConfigStringValue(rawWorkspace?.source?.branch_template, env);
 
   if (options.enabled && options.requireExplicitWorkspaceSource && sourceKind === "none") {
     throw new SymphonyError(
@@ -1146,14 +1140,26 @@ function normalizeWorkspaceConfigForProjectContext(
       `${options.contextPath}.workspace.source is required for enabled project contexts`,
     );
   }
+  if (options.enabled && sourceKind === "copy" && sourcePath === undefined) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${options.contextPath}.workspace.source.path is required for copy`,
+    );
+  }
+  if (options.enabled && sourceKind === "git" && sourceRepository === undefined) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${options.contextPath}.workspace.source.repository is required for git`,
+    );
+  }
   if (options.enabled && sourceKind === "git_worktree") {
-    if (!rawWorkspace?.source?.repository) {
+    if (sourceRepository === undefined) {
       throw new SymphonyError(
         "config_validation_error",
         `${options.contextPath}.workspace.source.repository is required for git_worktree`,
       );
     }
-    if (!rawWorkspace?.source?.base_ref) {
+    if (sourceBaseRef === undefined) {
       throw new SymphonyError(
         "config_validation_error",
         `${options.contextPath}.workspace.source.base_ref is required for git_worktree`,
@@ -1168,11 +1174,9 @@ function normalizeWorkspaceConfigForProjectContext(
       kind: sourceKind,
       ...(sourcePath === undefined ? {} : { path: sourcePath }),
       ...(sourceRepository === undefined ? {} : { repository: sourceRepository }),
-      ...(rawWorkspace?.source?.ref === undefined ? {} : { ref: rawWorkspace.source.ref }),
-      ...(rawWorkspace?.source?.base_ref === undefined ? {} : { baseRef: rawWorkspace.source.base_ref }),
-      ...(rawWorkspace?.source?.branch_template === undefined
-        ? {}
-        : { branchTemplate: rawWorkspace.source.branch_template }),
+      ...(sourceRef === undefined ? {} : { ref: sourceRef }),
+      ...(sourceBaseRef === undefined ? {} : { baseRef: sourceBaseRef }),
+      ...(sourceBranchTemplate === undefined ? {} : { branchTemplate: sourceBranchTemplate }),
       ...(sourceCachePath === undefined ? {} : { cachePath: sourceCachePath }),
       ...(rawWorkspace?.source?.cleanup === undefined ? {} : { cleanup: rawWorkspace.source.cleanup }),
     },
@@ -1398,6 +1402,15 @@ export function resolveConfigString(value: string | undefined, env: NodeJS.Proce
   const varMatch = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
   if (varMatch) return env[varMatch[1] ?? ""] ?? "";
   return value;
+}
+
+function resolveOptionalConfigStringValue(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
+  return normalizeOptionalConfigString(resolveConfigString(value, env)) ?? undefined;
+}
+
+function resolveOptionalRepositoryValue(value: string | undefined, baseDir: string, env: NodeJS.ProcessEnv): string | undefined {
+  const resolved = resolveOptionalConfigStringValue(value, env);
+  return resolved === undefined ? undefined : resolveRepositoryValue(resolved, baseDir, env);
 }
 
 export function resolvePathValue(value: string, baseDir: string, env: NodeJS.ProcessEnv): string {
