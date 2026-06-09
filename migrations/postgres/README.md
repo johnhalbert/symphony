@@ -14,6 +14,7 @@ Current migrations:
 - `0004_run_activity_canonical_channels.sql` updates the `symphony.run_activity_event.channel` constraint from adapter-facing `message` / `status` aliases to the canonical frontend `chat` / `diagnostic` channels, and rewrites existing rows during upgrade.
 - `0005_projection_source_freshness.sql` adds durable `projection_revision.source_freshness` metadata, backfills rows that already embedded freshness in `source_cursors`, and indexes per-source freshness for status/projection readers.
 - `0006_projection_build_modes.sql` adds durable `projection_revision.build_mode` metadata so readers and rebuild reports can distinguish first-scope bootstrap revisions, on-demand incremental/read-repair revisions, and explicit rebuild/backfill revisions.
+- `0007_project_context_attribution.sql` adds durable project context attribution across owned operational and projection tables, backfills legacy/default rows, and re-scopes primary keys, unique constraints, foreign keys, and read indexes by `project_context_id`.
 
 Common development commands:
 
@@ -78,7 +79,7 @@ When raw tool output, harness payloads, or diagnostic payloads exceed the inline
 
 Static Vitest coverage in `tests/postgres-schema.test.ts` asserts that the configured migration path contains the owned-state schema and that it declares the required tables, indexes, source-boundary notes, transition policy, run activity/chat reconstruction fields, run-session scoped duplicate constraints, and oversized-payload policy.
 
-The opt-in Docker-backed validation applies the configured migrations to an empty `postgres:16-alpine` database, verifies the migration ledger, exercises basic operational/projection insert and query paths, checks projection `updated_at` columns, source freshness metadata, build-mode metadata, and read-index definitions, and runs a real `PostgresRunActivityAppendStore` append plus duplicate/no-op replay path against the migrated schema. It also validates the upgrade path from a database that already recorded the published `0002_symphony_owned_state.sql` checksum before applying the follow-up projection freshness, canonical run-activity-channel, projection source-freshness, and projection build-mode migrations:
+The opt-in Docker-backed validation applies the configured migrations to an empty `postgres:16-alpine` database, verifies the migration ledger, exercises basic operational/projection insert and query paths, checks projection `updated_at` columns, source freshness metadata, build-mode metadata, project-context backfills/defaults, and read-index definitions, and runs a real `PostgresRunActivityAppendStore` append plus duplicate/no-op replay path against the migrated schema. It also validates the upgrade path from a database that already recorded the published `0002_symphony_owned_state.sql` checksum before applying the follow-up projection freshness, canonical run-activity-channel, projection source-freshness, projection build-mode, and project-context attribution migrations:
 
 ```bash
 SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1 npx vitest run tests/postgres-schema.test.ts --no-file-parallelism

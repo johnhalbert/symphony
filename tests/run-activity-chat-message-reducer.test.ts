@@ -125,6 +125,7 @@ function stored(event: RunActivityEvent, overrides: Partial<RunActivityStoredEve
     metadata: {
       eventId: event.eventId,
       runId: runIdFromRunSessionId(event.runSessionId),
+      projectContextId: "default",
       runSessionId: event.runSessionId,
       sequence: event.sequence ?? 0,
       sequenceSource: event.sequenceSource,
@@ -417,7 +418,8 @@ describe("RunActivityChatMessageReducer", () => {
     expect(client.normalizedStatements.at(-1)).toBe("COMMIT");
     expect(client.normalizedStatements).not.toContain("ROLLBACK");
     expect(client.insertValues).toHaveLength(2);
-    expect(client.insertValues[0]?.slice(0, 13)).toEqual([
+    expect(client.insertValues[0]?.slice(0, 14)).toEqual([
+      "default",
       "run_activity:run-chat:session-chat:message:user-pg",
       "thread:pg",
       "issue:eng-198",
@@ -432,8 +434,8 @@ describe("RunActivityChatMessageReducer", () => {
       "Persist this request",
       20,
     ]);
-    expect(client.insertValues[1]?.[17]).toBe("77");
-    const metadata = JSON.parse(String(client.insertValues[1]?.[18]));
+    expect(client.insertValues[1]?.[18]).toBe("77");
+    const metadata = JSON.parse(String(client.insertValues[1]?.[19]));
     expect(metadata).toMatchObject({
       reducedFromRunActivity: true,
       sourceEventIds: ["activity:pg:assistant"],
@@ -461,7 +463,8 @@ describe("RunActivityChatMessageReducer", () => {
     expect(client.normalizedStatements.at(-1)).toBe("COMMIT");
     expect(client.activityRows).toHaveLength(1);
     expect(client.chatInsertValues).toHaveLength(1);
-    expect(client.chatInsertValues[0]?.slice(0, 11)).toEqual([
+    expect(client.chatInsertValues[0]?.slice(0, 12)).toEqual([
+      "default",
       "run_activity:run-chat:session-chat:message:append-user",
       "run-chat:session-chat",
       "issue:eng-198",
@@ -491,7 +494,8 @@ describe("RunActivityChatMessageReducer", () => {
     expect(result.accepted).toHaveLength(2);
     expect(client.activityRows).toHaveLength(2);
     expect(client.chatInsertValues).toHaveLength(1);
-    expect(client.chatInsertValues[0]?.slice(0, 16)).toEqual([
+    expect(client.chatInsertValues[0]?.slice(0, 17)).toEqual([
+      "default",
       "run_activity:run-chat:session-chat:tool_call:append-tool",
       "run-chat:session-chat",
       "issue:eng-198",
@@ -521,7 +525,7 @@ describe("RunActivityChatMessageReducer", () => {
     ]);
     expect(first.accepted).toHaveLength(2);
     expect(client.chatInsertValues).toHaveLength(1);
-    expect(client.chatInsertValues[0]?.slice(7, 16)).toEqual([
+    expect(client.chatInsertValues[0]?.slice(8, 17)).toEqual([
       "assistant",
       "assistant_response",
       "failed",
@@ -532,7 +536,7 @@ describe("RunActivityChatMessageReducer", () => {
       1,
       2,
     ]);
-    const metadata = JSON.parse(String(client.chatInsertValues[0]?.[18]));
+    const metadata = JSON.parse(String(client.chatInsertValues[0]?.[19]));
     expect(metadata).toMatchObject({ sourceEventIds: ["activity:append:assistant-delta", "activity:append:run-failed"], sourceEventSequences: [1, 2] });
 
     const duplicate = await store.appendEvent(
@@ -598,9 +602,11 @@ class FakeAppendAndChatReducerPostgresClient implements PostgresRunActivityChatM
       return { rows: [] as T[] };
     }
 
-    if (normalized.startsWith("SELECT run_id FROM symphony.run_session")) {
+    if (normalized.startsWith("SELECT run_id, session_id, project_context_id FROM symphony.run_session")) {
       const runIds = values?.[0] as readonly string[];
-      return { rows: runIds.map((run_id) => ({ run_id }) as unknown as T) };
+      return {
+        rows: runIds.map((run_id) => ({ run_id, session_id: "session-chat", project_context_id: "default" }) as unknown as T),
+      };
     }
 
     if (normalized.startsWith("SELECT run_activity_event_id::text AS append_revision")) {
@@ -611,26 +617,27 @@ class FakeAppendAndChatReducerPostgresClient implements PostgresRunActivityChatM
       const insertValues = [...(values ?? [])];
       const row = postgresActivityRow({
         append_revision: String(this.activityRows.length + 1),
-        event_id: insertValues[0],
-        run_id: insertValues[1],
-        session_id: insertValues[2],
-        run_session_id: insertValues[3],
-        sequence: insertValues[4],
-        sequence_source: insertValues[5],
-        event_at: insertValues[6],
-        protocol: insertValues[7],
-        harness_id: insertValues[8],
-        external_event_id: insertValues[9],
-        actor: insertValues[10],
-        channel: insertValues[11],
-        kind: insertValues[12],
-        text: insertValues[13],
-        payload: JSON.parse(String(insertValues[15])),
-        payload_schema: insertValues[16],
-        payload_truncated: insertValues[17],
-        payload_byte_length: insertValues[18],
-        raw_payload_ref_id: insertValues[19],
-        metadata: JSON.parse(String(insertValues[20])),
+        project_context_id: insertValues[0],
+        event_id: insertValues[1],
+        run_id: insertValues[2],
+        session_id: insertValues[3],
+        run_session_id: insertValues[4],
+        sequence: insertValues[5],
+        sequence_source: insertValues[6],
+        event_at: insertValues[7],
+        protocol: insertValues[8],
+        harness_id: insertValues[9],
+        external_event_id: insertValues[10],
+        actor: insertValues[11],
+        channel: insertValues[12],
+        kind: insertValues[13],
+        text: insertValues[14],
+        payload: JSON.parse(String(insertValues[16])),
+        payload_schema: insertValues[17],
+        payload_truncated: insertValues[18],
+        payload_byte_length: insertValues[19],
+        raw_payload_ref_id: insertValues[20],
+        metadata: JSON.parse(String(insertValues[21])),
         created_at: "2026-05-31T00:00:01.000Z",
       });
       this.activityRows.push(row);
@@ -720,6 +727,7 @@ function postgresActivityRow(overrides: Record<string, unknown> = {}): QueryResu
   const sequence = Number(overrides.sequence ?? 1);
   return {
     append_revision: String(sequence),
+    project_context_id: "default",
     event_id: `activity:pg:${sequence}`,
     run_id: "run-chat",
     session_id: "session-chat",

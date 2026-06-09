@@ -31,6 +31,7 @@ export type RunActivityAppendInput = RunActivityEventInput & {
 export interface RunActivityAppendMetadata {
   readonly eventId: string;
   readonly runId: string;
+  readonly projectContextId: string;
   readonly sessionId?: string | null;
   readonly runSessionId: string;
   readonly sequence: number;
@@ -131,6 +132,13 @@ interface RequiredRunActivityAppendStorageMetadata {
 interface RunActivityAppendPersistenceContext {
   readonly runId: string;
   readonly sessionId: string | null;
+  readonly projectContextId: string;
+}
+
+interface RunSessionContextRow extends QueryResultRow {
+  run_id: string;
+  session_id: string | null;
+  project_context_id: string;
 }
 
 type PersistAcceptedRunActivityEvent = (
@@ -141,6 +149,7 @@ type PersistAcceptedRunActivityEvent = (
 
 interface RunActivityEventRow extends QueryResultRow {
   append_revision: string | number | bigint;
+  project_context_id: string;
   event_id: string;
   run_id: string;
   session_id: string | null;
@@ -191,6 +200,7 @@ export class InMemoryRunActivityAppendStore implements RunActivityAppendStore {
         appendRevision: String(this.revision + 1),
         createdAt: event.occurredAt,
         runId: context.runId,
+        projectContextId: context.projectContextId,
         sessionId: context.sessionId,
       });
       this.revision += 1;
@@ -299,7 +309,8 @@ export async function appendRunActivityEventsWithPostgresClient(
   if (inputs.length === 0) return emptyAppendBatchResult();
 
   const runIds = sortedUnique(inputs.map(runIdForAppendInput));
-  await lockRunActivityAppendRuns(client, runIds);
+  const runSessions = await lockRunActivityAppendRuns(client, runIds);
+  const runSessionsByRunId = indexRunSessionsByRunId(runSessions);
 
   const runSessionIds = sortedUnique(inputs.map((input) => deriveRunActivityRunSessionId(input)));
   const eventIds = sortedUnique(inputs.map(eventIdForAppendInput));
@@ -307,6 +318,7 @@ export async function appendRunActivityEventsWithPostgresClient(
     `
       SELECT
         run_activity_event_id::text AS append_revision,
+        project_context_id,
         event_id,
         run_id,
         session_id,
@@ -337,10 +349,15 @@ export async function appendRunActivityEventsWithPostgresClient(
   );
   const state = new RunActivityAppendAccumulator(existingRows.rows.map(storedEventFromPostgresRow));
 
-  return appendRunActivityEventsWithState(inputs, state, async (event, storage, context) => {
-    const row = await insertRunActivityEventRow(client, event, storage, context);
-    return storedEventFromPostgresRow(row);
-  });
+  return appendRunActivityEventsWithState(
+    inputs,
+    state,
+    async (event, storage, context) => {
+      const row = await insertRunActivityEventRow(client, event, storage, context);
+      return storedEventFromPostgresRow(row);
+    },
+    (eventInput) => persistenceContextForPostgresAppendInput(eventInput, runSessionsByRunId),
+  );
 }
 
 async function reduceAcceptedRunActivityMessageEventsWithPostgresClient(
@@ -365,6 +382,7 @@ async function appendRunActivityEventsWithState(
   inputs: readonly RunActivityAppendInput[],
   state: RunActivityAppendAccumulator,
   persistAcceptedEvent: PersistAcceptedRunActivityEvent,
+  resolvePersistenceContext: (input: RunActivityEventInput) => RunActivityAppendPersistenceContext = persistenceContextForAppendInput,
 ): Promise<RunActivityAppendBatchResult> {
   const results: RunActivityAppendResult[] = [];
   const accepted: RunActivityAcceptedAppendResult[] = [];
@@ -374,8 +392,9 @@ async function appendRunActivityEventsWithState(
   for (const input of inputs) {
     const eventInput = eventInputForAppend(input);
     const runSessionId = deriveRunActivityRunSessionId(eventInput);
-    const persistenceContext = persistenceContextForAppendInput(eventInput);
+    const persistenceContext = resolvePersistenceContext(eventInput);
     const currentState = state.orderingStateFor(runSessionId);
+
     const existingByEventId = state.findByEventId(eventIdForAppendInput(eventInput));
     if (existingByEventId !== null) {
       const duplicateResult: RunActivityDuplicateAppendResult = {
@@ -445,6 +464,18 @@ function persistenceContextForAppendInput(input: RunActivityEventInput): RunActi
   return {
     runId: runIdForAppendInput(input),
     sessionId: sessionIdForAppendInput(input),
+    projectContextId: "default",
+  };
+}
+
+function persistenceContextForPostgresAppendInput(
+  input: RunActivityEventInput,
+  runSessionsByRunId: ReadonlyMap<string, readonly RunSessionContextRow[]>,
+): RunActivityAppendPersistenceContext {
+  return {
+    runId: runIdForAppendInput(input),
+    sessionId: sessionIdForAppendInput(input),
+    projectContextId: resolveProjectContextIdForAppendInput(input, runSessionsByRunId),
   };
 }
 
@@ -558,13 +589,16 @@ function orderingStateFromStoredEvents(
   };
 }
 
-async function lockRunActivityAppendRuns(client: PostgresQueryClient, runIds: readonly string[]): Promise<void> {
-  const rows = await client.query<{ run_id: string }>(
+async function lockRunActivityAppendRuns(
+  client: PostgresQueryClient,
+  runIds: readonly string[],
+): Promise<readonly RunSessionContextRow[]> {
+  const rows = await client.query<RunSessionContextRow>(
     `
-      SELECT run_id
+      SELECT run_id, session_id, project_context_id
       FROM symphony.run_session
       WHERE run_id = ANY($1::text[])
-      ORDER BY run_id
+      ORDER BY run_id, project_context_id
       FOR UPDATE
     `,
     [runIds],
@@ -574,6 +608,52 @@ async function lockRunActivityAppendRuns(client: PostgresQueryClient, runIds: re
   if (missing.length > 0) {
     throw new SymphonyError("not_found", `Cannot append run activity events for unknown run(s): ${missing.join(", ")}`);
   }
+  return rows.rows;
+}
+
+function indexRunSessionsByRunId(
+  rows: readonly RunSessionContextRow[],
+): ReadonlyMap<string, readonly RunSessionContextRow[]> {
+  const byRunId = new Map<string, RunSessionContextRow[]>();
+  for (const row of rows) {
+    const entries = byRunId.get(row.run_id) ?? [];
+    entries.push(row);
+    byRunId.set(row.run_id, entries);
+  }
+  return byRunId;
+}
+
+function resolveProjectContextIdForAppendInput(
+  input: RunActivityEventInput,
+  runSessionsByRunId: ReadonlyMap<string, readonly RunSessionContextRow[]>,
+): string {
+  const runId = runIdForAppendInput(input);
+  const runSessionId = deriveRunActivityRunSessionId(input);
+  const sessionId = sessionIdForAppendInput(input);
+  const candidates = runSessionsByRunId.get(runId) ?? [];
+  if (candidates.length === 0) {
+    throw new SymphonyError("not_found", `Cannot append run activity events for unknown run ${runId}`);
+  }
+  if (candidates.length === 1) {
+    return candidates[0]?.project_context_id ?? "default";
+  }
+
+  const prefixed = candidates.filter((candidate) => runSessionId.startsWith(`${candidate.project_context_id}:`));
+  if (prefixed.length === 1) {
+    return prefixed[0]?.project_context_id ?? "default";
+  }
+
+  if (sessionId !== null) {
+    const matchingSessionId = candidates.filter((candidate) => normalizeOptionalString(candidate.session_id) === sessionId);
+    if (matchingSessionId.length === 1) {
+      return matchingSessionId[0]?.project_context_id ?? "default";
+    }
+  }
+
+  throw new SymphonyError(
+    "conflict",
+    `Run activity append is ambiguous across project contexts for run ${runId} and run_session_id ${runSessionId}`,
+  );
 }
 
 async function insertRunActivityEventRow(
@@ -587,6 +667,7 @@ async function insertRunActivityEventRow(
   const row = await client.query<RunActivityEventRow>(
     `
       INSERT INTO symphony.run_activity_event (
+        project_context_id,
         event_id,
         run_id,
         session_id,
@@ -624,15 +705,17 @@ async function insertRunActivityEventRow(
         $13,
         $14,
         $15,
-        $16::jsonb,
-        $17,
+        $16,
+        $17::jsonb,
         $18,
         $19,
         $20,
-        $21::jsonb
+        $21,
+        $22::jsonb
       )
       RETURNING
         run_activity_event_id::text AS append_revision,
+        project_context_id,
         event_id,
         run_id,
         session_id,
@@ -656,6 +739,7 @@ async function insertRunActivityEventRow(
         created_at
     `,
     [
+      context.projectContextId,
       event.eventId,
       context.runId,
       context.sessionId,
@@ -680,6 +764,7 @@ async function insertRunActivityEventRow(
     ],
   );
   const inserted = row.rows[0];
+
   if (inserted === undefined) {
     throw new SymphonyError("conflict", `Run activity event insert returned no row for event ${event.eventId}`);
   }
@@ -689,13 +774,16 @@ async function insertRunActivityEventRow(
 function storedEventFromAcceptedEvent(
   event: RunActivityEvent,
   storage: RequiredRunActivityAppendStorageMetadata,
-  metadata: Pick<RunActivityAppendMetadata, "appendRevision" | "createdAt" | "runId"> & { readonly sessionId: string | null },
+  metadata: Pick<RunActivityAppendMetadata, "appendRevision" | "createdAt" | "projectContextId" | "runId"> & {
+    readonly sessionId: string | null;
+  },
 ): RunActivityStoredEvent {
   return {
     event,
     metadata: {
       eventId: event.eventId,
       runId: metadata.runId,
+      projectContextId: metadata.projectContextId,
       sessionId: metadata.sessionId,
       runSessionId: event.runSessionId,
       sequence: runActivityEventSequence(event),
@@ -729,6 +817,7 @@ function storedEventFromPostgresRow(row: RunActivityEventRow): RunActivityStored
     metadata: {
       eventId: event.eventId,
       runId: row.run_id,
+      projectContextId: row.project_context_id,
       sessionId: normalizeOptionalString(row.session_id),
       runSessionId: event.runSessionId,
       sequence: runActivityEventSequence(event),
@@ -842,6 +931,7 @@ async function rollbackRunActivityAppendQuietly(client: PostgresQueryClient): Pr
 function runActivityEventSelectColumns(): string {
   return [
     "run_activity_event_id::text AS append_revision",
+    "project_context_id",
     "event_id",
     "run_id",
     "session_id",

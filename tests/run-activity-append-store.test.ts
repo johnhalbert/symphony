@@ -224,7 +224,7 @@ describe("RunActivityAppendStore", () => {
         sequenceSource: "symphony",
         protocol: "acp",
       },
-      metadata: { appendRevision: "1" },
+      metadata: { appendRevision: "1", projectContextId: "default" },
     });
     expect(client.released).toBe(true);
     expect(client.normalizedStatements[0]).toBe("BEGIN");
@@ -248,7 +248,8 @@ describe("RunActivityAppendStore", () => {
         }),
       },
     ]);
-    expect(client.insertValues[0]?.slice(0, 10)).toEqual([
+    expect(client.insertValues[0]?.slice(0, 11)).toEqual([
+      "default",
       "activity-postgres",
       "run-postgres",
       "session-postgres",
@@ -260,6 +261,58 @@ describe("RunActivityAppendStore", () => {
       "runtime-adapter",
       null,
     ]);
+  });
+
+  it("derives Postgres project context ids from matching run-session rows when a run spans multiple contexts", async () => {
+    const client = new FakeRunActivityPostgresClient({
+      runSessionRows: [
+        { run_id: "run-postgres", session_id: "session-blue", project_context_id: "blue" },
+        { run_id: "run-postgres", session_id: "session-red", project_context_id: "red" },
+      ],
+    });
+    const store = new PostgresRunActivityAppendStore({ connect: async () => client });
+
+    const result = await store.appendEvent(
+      statusActivityInput({
+        id: "activity-postgres-red",
+        runId: "run-postgres",
+        sessionId: "session-red",
+        sequence: null,
+      }),
+    );
+
+    expect(result).toMatchObject({
+      status: "accepted",
+      metadata: { projectContextId: "red" },
+    });
+    expect(client.insertValues[0]?.[0]).toBe("red");
+  });
+
+  it("rolls back ambiguous Postgres appends when a run id maps to multiple project contexts without a unique match", async () => {
+    const client = new FakeRunActivityPostgresClient({
+      runSessionRows: [
+        { run_id: "run-postgres", session_id: null, project_context_id: "blue" },
+        { run_id: "run-postgres", session_id: null, project_context_id: "red" },
+      ],
+    });
+    const store = new PostgresRunActivityAppendStore({ connect: async () => client });
+
+    await expect(
+      store.appendEvent(
+        statusActivityInput({
+          id: "activity-postgres-ambiguous",
+          runId: "run-postgres",
+          sessionId: null,
+          runSessionId: "run-postgres:custom-scope",
+          sequence: null,
+        }),
+      ),
+    ).rejects.toThrow("ambiguous across project contexts");
+
+    expect(client.released).toBe(true);
+    expect(client.normalizedStatements).toContain("BEGIN");
+    expect(client.normalizedStatements).toContain("ROLLBACK");
+    expect(client.normalizedStatements).not.toContain("COMMIT");
   });
 
   it("reads paginated Postgres source-table events by run id for projection rebuilds", async () => {
@@ -303,9 +356,11 @@ class FakeRunActivityPostgresClient implements PostgresRunActivityAppendClient {
   released = false;
   private readonly rows: QueryResultRow[] = [];
   private readonly failInserts: boolean;
+  private readonly runSessionRows: readonly QueryResultRow[] | null;
 
-  constructor(options: { failInserts?: boolean } = {}) {
+  constructor(options: { failInserts?: boolean; runSessionRows?: readonly QueryResultRow[] } = {}) {
     this.failInserts = options.failInserts ?? false;
+    this.runSessionRows = options.runSessionRows ?? null;
   }
 
   async query<T extends QueryResultRow = QueryResultRow>(text: string, values?: readonly unknown[]): Promise<{ rows: T[] }> {
@@ -316,9 +371,16 @@ class FakeRunActivityPostgresClient implements PostgresRunActivityAppendClient {
       return { rows: [] as T[] };
     }
 
-    if (normalized.startsWith("SELECT run_id FROM symphony.run_session")) {
+    if (normalized.startsWith("SELECT run_id, session_id, project_context_id FROM symphony.run_session")) {
       const runIds = values?.[0] as readonly string[];
-      return { rows: runIds.map((run_id) => ({ run_id }) as unknown as T) };
+      if (this.runSessionRows !== null) {
+        return {
+          rows: this.runSessionRows.filter((row) => runIds.includes(String(row.run_id))) as T[],
+        };
+      }
+      return {
+        rows: runIds.map((run_id) => ({ run_id, session_id: null, project_context_id: "default" }) as unknown as T),
+      };
     }
 
     if (normalized.startsWith("SELECT count(*)::bigint AS total FROM symphony.run_activity_event")) {
@@ -348,26 +410,27 @@ class FakeRunActivityPostgresClient implements PostgresRunActivityAppendClient {
       (this.insertValues as unknown[][]).push(insertValues);
       const row = {
         append_revision: String(this.rows.length + 1),
-        event_id: insertValues[0],
-        run_id: insertValues[1],
-        session_id: insertValues[2],
-        run_session_id: insertValues[3],
-        sequence: insertValues[4],
-        sequence_source: insertValues[5],
-        event_at: insertValues[6],
-        protocol: insertValues[7],
-        harness_id: insertValues[8],
-        external_event_id: insertValues[9],
-        actor: insertValues[10],
-        channel: insertValues[11],
-        kind: insertValues[12],
-        text: insertValues[13],
-        payload: JSON.parse(String(insertValues[15])),
-        payload_schema: insertValues[16],
-        payload_truncated: insertValues[17],
-        payload_byte_length: insertValues[18],
-        raw_payload_ref_id: insertValues[19],
-        metadata: JSON.parse(String(insertValues[20])),
+        project_context_id: insertValues[0],
+        event_id: insertValues[1],
+        run_id: insertValues[2],
+        session_id: insertValues[3],
+        run_session_id: insertValues[4],
+        sequence: insertValues[5],
+        sequence_source: insertValues[6],
+        event_at: insertValues[7],
+        protocol: insertValues[8],
+        harness_id: insertValues[9],
+        external_event_id: insertValues[10],
+        actor: insertValues[11],
+        channel: insertValues[12],
+        kind: insertValues[13],
+        text: insertValues[14],
+        payload: JSON.parse(String(insertValues[16])),
+        payload_schema: insertValues[17],
+        payload_truncated: insertValues[18],
+        payload_byte_length: insertValues[19],
+        raw_payload_ref_id: insertValues[20],
+        metadata: JSON.parse(String(insertValues[21])),
         created_at: "2026-05-31T00:00:01.000Z",
       } satisfies QueryResultRow;
       this.rows.push(row);

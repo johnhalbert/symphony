@@ -571,6 +571,9 @@ describe("Postgres Symphony-owned state migration", () => {
       "migrations/postgres/0004_run_activity_canonical_channels.sql",
       "migrations/postgres/0005_projection_source_freshness.sql",
       "migrations/postgres/0006_projection_build_modes.sql",
+      ...(hasProjectContextAttributionMigration
+        ? ["migrations/postgres/0007_project_context_attribution.sql", "project context attribution"]
+        : []),
       "checksum-stable",
       "projection `updated_at` freshness columns",
       "canonical run activity channel names",
@@ -582,6 +585,10 @@ describe("Postgres Symphony-owned state migration", () => {
 
     expect(readme).toContain("state ownership and migration compatibility");
     expect(readme).toContain("docs/state-ownership-and-migration.md");
+    if (hasProjectContextAttributionMigration) {
+      expect(readme).toContain("0007_project_context_attribution.sql");
+      expect(readme).toContain("project context attribution");
+    }
   });
 
   it("classifies current Postgres tables by canonical, snapshot, and projection ownership", async () => {
