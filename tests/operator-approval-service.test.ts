@@ -159,6 +159,23 @@ describe("OperatorApprovalService", () => {
     });
   });
 
+  it("matches pending approvals by project context id even when attribution metadata changes", async () => {
+    const { record } = await store.requestOrGetPending({ ...request(), evidenceCursor: "idem-context-id-match" }, null);
+
+    await expect(
+      store.findPendingForIssue(["TEST-1"], {
+        projectContextId: "docs",
+        projectContextLabel: "Docs (renamed)",
+        linearProjectSlug: "DOCS-ALT",
+        routingSource: "state_refresh",
+      }),
+    ).resolves.toMatchObject({
+      requestId: record.requestId,
+      issueId: "issue-1",
+      projectContext: docsProjectContext,
+    });
+  });
+
   it("repairs run metadata when reusing an existing pending approval", async () => {
     const pending = await service.requestPublicationApproval(request());
     await runStore.updateRun("run-1", {
@@ -261,13 +278,25 @@ describe("OperatorApprovalService", () => {
     );
 
     await expect(store.get("approval_legacy")).resolves.toMatchObject({
-      projectContext: {
-        projectContextId: "default",
-        projectContextLabel: "Default",
-        linearProjectSlug: null,
-        routingSource: "legacy_default",
-      },
+      projectContext: docsProjectContext,
     });
+  });
+
+  it("repairs legacy pending approvals on run and issue read paths before filtering", async () => {
+    const { record } = await store.requestOrGetPending({ ...request(), evidenceCursor: "idem-read-path-repair" }, null);
+    await stripPersistedProjectContext(record.requestId);
+
+    await expect(store.findPendingForRun("run-1")).resolves.toMatchObject({
+      requestId: record.requestId,
+      projectContext: docsProjectContext,
+    });
+    await expect(store.findPendingForIssue(["TEST-1"], docsProjectContext)).resolves.toMatchObject({
+      requestId: record.requestId,
+      projectContext: docsProjectContext,
+    });
+
+    const approvalPath = path.join(config.workspace.stateDir, "approval-requests", `${record.requestId}.json`);
+    await expect(readFile(approvalPath, "utf8")).resolves.toContain('"projectContextId": "docs"');
   });
 
   it("backfills project context when reusing a legacy pending approval request", async () => {

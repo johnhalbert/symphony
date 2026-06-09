@@ -98,7 +98,12 @@ export class FileOperatorApprovalStore {
 
   async get(requestId: string): Promise<OperatorApprovalRecord | null> {
     const record = await readJsonIfExists<OperatorApprovalRecord>(this.recordPath(requestId));
-    return record === null ? null : normalizeOperatorApprovalRecord(record);
+    if (record === null) return null;
+    return this.repairProjectContextIfMissing(
+      normalizeOperatorApprovalRecord(record),
+      undefined,
+      record as unknown as Record<string, unknown>,
+    );
   }
 
   async getByDedupe(runId: string, evidenceCursor: string): Promise<OperatorApprovalRecord | null> {
@@ -132,7 +137,17 @@ export class FileOperatorApprovalStore {
       const records = await Promise.all(
         entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<OperatorApprovalRecord>(path.join(this.recordsDir(), entry))),
       );
-      return records.filter((record): record is OperatorApprovalRecord => record !== null).map(normalizeOperatorApprovalRecord);
+      return Promise.all(
+        records
+          .filter((record): record is OperatorApprovalRecord => record !== null)
+          .map((record) =>
+            this.repairProjectContextIfMissing(
+              normalizeOperatorApprovalRecord(record),
+              undefined,
+              record as unknown as Record<string, unknown>,
+            ),
+          ),
+      );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
@@ -217,8 +232,9 @@ export class FileOperatorApprovalStore {
   private async repairProjectContextIfMissing(
     existing: OperatorApprovalRecord,
     projectContext: ProjectContextResolution | undefined = undefined,
+    rawRecord: Record<string, unknown> | null | undefined = undefined,
   ): Promise<OperatorApprovalRecord> {
-    const raw = await this.readStoredRecord(existing.requestId);
+    const raw = rawRecord ?? (await this.readStoredRecord(existing.requestId));
     if (!needsProjectContextBackfill(raw)) return existing;
     const runProjectContext = projectContext ?? (await this.readRunProjectContext(existing.runId));
     const repaired = normalizeOperatorApprovalRecord({
@@ -572,14 +588,7 @@ function matchesProjectContext(
   expectedProjectContext: ProjectContextResolution | undefined,
 ): boolean {
   if (!expectedProjectContext) return true;
-  const normalizedRecord = normalizeProjectContextResolution(recordProjectContext);
-  const normalizedExpected = normalizeProjectContextResolution(expectedProjectContext);
-  return (
-    normalizedRecord.projectContextId === normalizedExpected.projectContextId &&
-    normalizedRecord.projectContextLabel === normalizedExpected.projectContextLabel &&
-    normalizedRecord.linearProjectSlug === normalizedExpected.linearProjectSlug &&
-    normalizedRecord.routingSource === normalizedExpected.routingSource
-  );
+  return normalizeProjectContextResolution(recordProjectContext).projectContextId === normalizeProjectContextResolution(expectedProjectContext).projectContextId;
 }
 
 function dedupeKey(runId: string, evidenceCursor: string): string {
