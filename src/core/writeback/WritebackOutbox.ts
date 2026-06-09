@@ -170,7 +170,7 @@ export class FileWritebackOutboxStore {
 
   async enqueueOnce(operation: NewWritebackOperation): Promise<WritebackOperation> {
     const existing = await this.get(operation.idempotencyKey);
-    if (existing) return existing;
+    if (existing) return this.backfillProjectContextOnReplay(existing, operation);
     const now = new Date().toISOString();
     const record = normalizeWritebackOperation({
       ...operation,
@@ -278,6 +278,26 @@ export class FileWritebackOutboxStore {
       (filePath) => readJsonIfExists<WritebackOperation>(filePath),
     );
     return dedupeWritebackRecords(records.filter((record): record is WritebackOperation => record !== null).map(normalizeWritebackOperation));
+  }
+
+  private async readStoredRecord(idempotencyKey: string): Promise<Record<string, unknown> | null> {
+    const currentPath = this.recordPath(idempotencyKey);
+    const current = await readJsonIfExists<Record<string, unknown>>(currentPath);
+    if (current) return current;
+    const legacy = this.legacyRecordPath(idempotencyKey);
+    if (legacy === currentPath) return null;
+    return readJsonIfExists<Record<string, unknown>>(legacy);
+  }
+
+  private async backfillProjectContextOnReplay(
+    existing: WritebackOperation,
+    operation: NewWritebackOperation,
+  ): Promise<WritebackOperation> {
+    const raw = await this.readStoredRecord(operation.idempotencyKey);
+    if (!needsProjectContextBackfill(raw)) return existing;
+    return this.update(existing, {
+      projectContext: normalizeProjectContextResolution(operation.projectContext),
+    });
   }
 
   private async update(record: WritebackOperation, patch: Partial<WritebackOperation>): Promise<WritebackOperation> {
@@ -577,6 +597,10 @@ function normalizeWritebackOperation(record: WritebackOperation): WritebackOpera
     ...record,
     projectContext: normalizeProjectContextResolution(record.projectContext),
   };
+}
+
+function needsProjectContextBackfill(record: Record<string, unknown> | null): boolean {
+  return record !== null && (!Object.prototype.hasOwnProperty.call(record, "projectContext") || record.projectContext === null);
 }
 
 function projectContextEquals(

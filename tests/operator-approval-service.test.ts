@@ -204,6 +204,37 @@ describe("OperatorApprovalService", () => {
     });
   });
 
+  it("backfills project context when reusing a legacy pending approval request", async () => {
+    const pending = await service.requestPublicationApproval({ ...request(), evidenceCursor: "idem-project-context-replay" });
+    const approvalPath = path.join(config.workspace.stateDir, "approval-requests", `${pending.requestId}.json`);
+    const legacyRecord = JSON.parse(await readFile(approvalPath, "utf8")) as Record<string, unknown>;
+    delete legacyRecord.projectContext;
+    await writeFile(approvalPath, `${JSON.stringify(legacyRecord, null, 2)}
+`, "utf8");
+
+    const replayed = await service.requestPublicationApproval({ ...request(), evidenceCursor: "idem-project-context-replay" });
+
+    expect(replayed).toMatchObject({
+      requestId: pending.requestId,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+    });
+    await expect(store.get(pending.requestId)).resolves.toMatchObject({
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+    });
+    const transcript = await runStore.readTranscript("run-1");
+    expect(transcript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
+  });
+
 
   async function waitForPending() {
     for (let attempt = 0; attempt < 100; attempt += 1) {

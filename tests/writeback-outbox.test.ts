@@ -54,6 +54,21 @@ describe("FileWritebackOutboxStore", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  async function stripPersistedProjectContext(idempotencyKey: string): Promise<void> {
+    const recordsDir = path.join(root, "writeback");
+    let stripped = false;
+    for (const entry of await readdir(recordsDir)) {
+      const filePath = path.join(recordsDir, entry);
+      const parsed = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+      if (parsed.idempotencyKey !== idempotencyKey) continue;
+      delete parsed.projectContext;
+      await writeFile(filePath, `${JSON.stringify(parsed, null, 2)}
+`, "utf8");
+      stripped = true;
+    }
+    if (!stripped) throw new Error(`writeback record not found: ${idempotencyKey}`);
+  }
+
 
   it("normalizes durable project context attribution for new and legacy writebacks", async () => {
     const store = new FileWritebackOutboxStore(root);
@@ -109,6 +124,30 @@ describe("FileWritebackOutboxStore", () => {
         }),
       ]),
     );
+  });
+
+  it("backfills missing project context when replaying an existing writeback", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const operation = {
+      idempotencyKey: "comment:issue-docs-replay:note",
+      kind: "comment" as const,
+      issueId: "issue-docs-replay",
+      projectContext: docsProjectContext,
+      runId: "run-docs-replay",
+      payload: { body: "Docs replay", dedupeKey: "docs-replay" },
+    };
+
+    await store.enqueueOnce(operation);
+    await stripPersistedProjectContext(operation.idempotencyKey);
+
+    await expect(store.enqueueOnce(operation)).resolves.toMatchObject({ projectContext: docsProjectContext });
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ projectContext: docsProjectContext });
   });
 
 
@@ -542,6 +581,44 @@ describe("FileWritebackOutboxStore", () => {
       status: "succeeded",
     });
     expect(writer.transitions).toHaveLength(1);
+  });
+
+  it("requeues skipped operations after replay backfills missing project context", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const operation = {
+      idempotencyKey: "transition:issue-1:merge:issue-1:docs-head-sha-1:Done",
+      kind: "transition" as const,
+      issueId: "issue-1",
+      projectContext: docsProjectContext,
+      payload: { fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+    };
+    const skippedProcessor = new WritebackProcessor(
+      store,
+      new FakeWriter({ transitionStatus: "skipped" }),
+      new StructuredLogger(() => undefined),
+      300_000,
+    );
+
+    await expect(skippedProcessor.enqueueAndProcess(operation)).resolves.toMatchObject({ status: "skipped" });
+    await stripPersistedProjectContext(operation.idempotencyKey);
+
+    const writer = new FakeWriter();
+    const recoveryProcessor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    await expect(recoveryProcessor.enqueueAndProcess(operation, { retrySkipped: true })).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    expect(writer.transitions).toHaveLength(1);
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
   });
 
   it("does not requeue a skipped operation when the recovery payload does not match", async () => {

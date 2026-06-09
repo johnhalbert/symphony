@@ -64,11 +64,16 @@ export class FileOperatorApprovalStore {
 
   async requestOrGetPending(input: OperatorApprovalRequestInput, timeoutMs: number | null): Promise<{ record: OperatorApprovalRecord; created: boolean }> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
-    const existing = await this.getByDedupe(input.runId, input.evidenceCursor);
-    if (existing) return { record: existing, created: false };
+    const requestId = requestIdFor(dedupeKey(input.runId, input.evidenceCursor));
+    const existing = await this.get(requestId);
+    if (existing) {
+      return {
+        record: await this.backfillProjectContextOnReplay(existing, input.projectContext),
+        created: false,
+      };
+    }
 
     const requestedAt = new Date().toISOString();
-    const requestId = requestIdFor(dedupeKey(input.runId, input.evidenceCursor));
     const record: OperatorApprovalRecord = normalizeOperatorApprovalRecord({
       requestId,
       status: "pending",
@@ -186,6 +191,20 @@ export class FileOperatorApprovalStore {
     });
     await this.write(resolved);
     return resolved;
+  }
+
+  private async backfillProjectContextOnReplay(
+    existing: OperatorApprovalRecord,
+    projectContext: ProjectContextResolution | undefined,
+  ): Promise<OperatorApprovalRecord> {
+    const raw = await readJsonIfExists<Record<string, unknown>>(this.recordPath(existing.requestId));
+    if (!needsProjectContextBackfill(raw)) return existing;
+    const repaired = normalizeOperatorApprovalRecord({
+      ...existing,
+      projectContext: normalizeProjectContextResolution(projectContext),
+    });
+    await this.write(repaired);
+    return repaired;
   }
 
   private async write(record: OperatorApprovalRecord): Promise<void> {
@@ -500,6 +519,10 @@ function normalizeOperatorApprovalRecord(record: OperatorApprovalRecord): Operat
     ...record,
     projectContext: normalizeProjectContextResolution(record.projectContext),
   };
+}
+
+function needsProjectContextBackfill(record: Record<string, unknown> | null): boolean {
+  return record !== null && (!Object.prototype.hasOwnProperty.call(record, "projectContext") || record.projectContext === null);
 }
 
 function dedupeKey(runId: string, evidenceCursor: string): string {
