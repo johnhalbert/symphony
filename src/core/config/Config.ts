@@ -348,7 +348,7 @@ const rawConfigSchema = z
   .passthrough();
 
 export type RawWorkflowConfig = z.infer<typeof rawConfigSchema>;
-type RawProjectContextConfig = z.infer<typeof rawProjectContextSchema>;
+export type RawProjectContextConfig = z.infer<typeof rawProjectContextSchema>;
 
 export type WorkflowProjectContextConfig = ProjectContextConfig<
   RawWorkflowConfig["tracker"],
