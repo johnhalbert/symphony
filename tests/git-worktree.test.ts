@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { issue, trackerIssue } from "./helpers.js";
 
@@ -150,6 +151,93 @@ describe("git worktree workspace source", () => {
     await expect(manager.getWorkspaceRecord(legacyWorkspace.workspaceKey)).resolves.toMatchObject({
       issueId: "issue-legacy-plan-collision",
       issueIdentifier: "ctx__docs__ENG-PLAN",
+    });
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+  });
+
+  it("migrates pre-upgrade legacy implementation artifacts before contextual creation claims the reserved namespace", async () => {
+    const manager = newManager(root, repo);
+    const seededLegacy = await seedPreUpgradeLegacyImplementationArtifact(root, repo, {
+      issueId: "issue-legacy-upgrade",
+      identifier: "ctx__docs__ENG-UPGRADE",
+      branchName: "symphony/ctx__docs__ENG-UPGRADE",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-upgrade",
+      identifier: "ENG-UPGRADE",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const migratedLegacyRecord = await manager.getWorkspaceRecord(seededLegacy.migratedKey);
+    const docsRecord = await manager.getWorkspaceRecord(docsWorkspace.workspaceKey);
+    const legacyBranch = await git(["branch", "--show-current"], seededLegacy.migratedPath);
+    const docsBranch = await git(["branch", "--show-current"], docsWorkspace.path);
+
+    expect(docsWorkspace.createdNow).toBe(true);
+    expect(docsWorkspace.workspaceKey).toBe("ctx__docs__ENG-UPGRADE");
+    expect(docsWorkspace.path).toBe(seededLegacy.originalPath);
+    expect(migratedLegacyRecord?.issueId).toBe("issue-legacy-upgrade");
+    expect(migratedLegacyRecord?.path).toBe(seededLegacy.migratedPath);
+    expect(docsRecord?.issueId).toBe("issue-docs-upgrade");
+    expect(docsRecord?.projectContext?.projectContextId).toBe("docs");
+    expect(legacyBranch.trim()).toBe("symphony/ctx__docs__ENG-UPGRADE");
+    expect(docsBranch.trim()).toBe("symphony/docs/ENG-UPGRADE");
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(seededLegacy.migratedPath, "README.md"), "utf8")).resolves.toContain("hello");
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    await expect(manager.getWorkspaceRecord(seededLegacy.migratedKey)).resolves.toMatchObject({
+      issueId: "issue-legacy-upgrade",
+      issueIdentifier: "ctx__docs__ENG-UPGRADE",
+    });
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+  });
+
+  it("migrates pre-upgrade legacy planning artifacts before contextual planning claims the reserved namespace", async () => {
+    const manager = newManager(root, repo, "force");
+    const seededLegacy = await seedPreUpgradeLegacyPlanningArtifact(root, {
+      issueId: "issue-legacy-plan-upgrade",
+      identifier: "ctx__docs__ENG-UPGRADE-PLAN",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-plan-upgrade",
+      identifier: "ENG-UPGRADE-PLAN",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+
+    const docsWorkspace = await manager.createForPlanning(docsIssue);
+    const migratedLegacyRecord = await manager.getWorkspaceRecord(seededLegacy.migratedKey);
+    const docsRecord = await manager.getWorkspaceRecord(docsWorkspace.workspaceKey);
+
+    expect(docsWorkspace.createdNow).toBe(true);
+    expect(docsWorkspace.workspaceKey).toBe("ctx__docs__ENG-UPGRADE-PLAN-planning");
+    expect(docsWorkspace.path).toBe(seededLegacy.originalPath);
+    expect(migratedLegacyRecord?.issueId).toBe("issue-legacy-plan-upgrade");
+    expect(migratedLegacyRecord?.path).toBe(seededLegacy.migratedPath);
+    expect(docsRecord?.issueId).toBe("issue-docs-plan-upgrade");
+    expect(docsRecord?.projectContext?.projectContextId).toBe("docs");
+    await expect(readFile(path.join(seededLegacy.migratedPath, ".symphony-planning.json"), "utf8")).resolves.toContain(
+      '"issueIdentifier": "ctx__docs__ENG-UPGRADE-PLAN"',
+    );
+    await expect(readFile(path.join(docsWorkspace.path, ".symphony-planning.json"), "utf8")).resolves.toContain(
+      '"issueIdentifier": "ENG-UPGRADE-PLAN"',
+    );
+
+    await manager.removeForPlanning(docsIssue);
+
+    await expect(readFile(path.join(seededLegacy.migratedPath, ".symphony-planning.json"), "utf8")).resolves.toContain(
+      '"issueIdentifier": "ctx__docs__ENG-UPGRADE-PLAN"',
+    );
+    await expect(readFile(path.join(docsWorkspace.path, ".symphony-planning.json"), "utf8")).rejects.toThrow();
+    await expect(manager.getWorkspaceRecord(seededLegacy.migratedKey)).resolves.toMatchObject({
+      issueId: "issue-legacy-plan-upgrade",
+      issueIdentifier: "ctx__docs__ENG-UPGRADE-PLAN",
     });
     expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
   });
@@ -383,6 +471,65 @@ async function initRepo(repository: string): Promise<void> {
   await writeFile(path.join(repository, "README.md"), "hello\n", "utf8");
   await git(["add", "README.md"], repository);
   await git(["-c", "user.name=Symphony Test", "-c", "user.email=symphony@example.com", "commit", "-m", "initial"], repository);
+}
+
+function workspaceStore(root: string): FileRunTranscriptStore {
+  return new FileRunTranscriptStore(path.join(root, "workspaces", ".symphony"));
+}
+
+async function seedPreUpgradeLegacyImplementationArtifact(
+  root: string,
+  repository: string,
+  options: { issueId: string; identifier: string; branchName: string },
+): Promise<{ originalKey: string; migratedKey: string; originalPath: string; migratedPath: string }> {
+  const originalKey = options.identifier;
+  const migratedKey = `~${options.identifier}`;
+  const originalPath = path.join(root, "workspaces", originalKey);
+  const migratedPath = path.join(root, "workspaces", migratedKey);
+  await mkdir(path.join(root, "workspaces"), { recursive: true });
+  await git(["worktree", "add", "-b", options.branchName, originalPath, "main"], repository);
+  const now = new Date().toISOString();
+  await workspaceStore(root).upsertWorkspace({
+    workspaceKey: originalKey,
+    issueId: options.issueId,
+    issueIdentifier: options.identifier,
+    path: originalPath,
+    sourceKind: "git_worktree",
+    repoPath: repository,
+    baseRef: "main",
+    gitBranchName: options.branchName,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return { originalKey, migratedKey, originalPath, migratedPath };
+}
+
+async function seedPreUpgradeLegacyPlanningArtifact(
+  root: string,
+  options: { issueId: string; identifier: string },
+): Promise<{ originalKey: string; migratedKey: string; originalPath: string; migratedPath: string }> {
+  const originalKey = `${options.identifier}-planning`;
+  const migratedKey = `~${options.identifier}-planning`;
+  const originalPath = path.join(root, "workspaces", originalKey);
+  const migratedPath = path.join(root, "workspaces", migratedKey);
+  await mkdir(originalPath, { recursive: true });
+  const now = new Date().toISOString();
+  await writeFile(
+    path.join(originalPath, ".symphony-planning.json"),
+    `${JSON.stringify({ issueId: options.issueId, issueIdentifier: options.identifier, mode: "none", createdAt: now }, null, 2)}
+`,
+    "utf8",
+  );
+  await workspaceStore(root).upsertWorkspace({
+    workspaceKey: originalKey,
+    issueId: options.issueId,
+    issueIdentifier: options.identifier,
+    path: originalPath,
+    sourceKind: "planning_none",
+    createdAt: now,
+    updatedAt: now,
+  });
+  return { originalKey, migratedKey, originalPath, migratedPath };
 }
 
 function git(args: string[], cwd: string): Promise<string> {

@@ -23,6 +23,13 @@ export interface RemoveWorktreeOptions {
   logger: Logger;
 }
 
+export interface MoveWorktreeOptions {
+  repoPath: string;
+  workspacePath: string;
+  nextWorkspacePath: string;
+  timeoutMs: number;
+}
+
 export interface WorktreeResult {
   repoPath: string;
   branchName: string;
@@ -104,6 +111,10 @@ export async function removeGitWorktree(options: RemoveWorktreeOptions): Promise
     await fs.rm(options.workspacePath, { recursive: true, force: true });
   }
   await runGit(["worktree", "prune"], options.repoPath, options.timeoutMs, { allowFailure: true });
+}
+
+export async function moveGitWorktree(options: MoveWorktreeOptions): Promise<void> {
+  await runGit(["worktree", "move", options.workspacePath, options.nextWorkspacePath], options.repoPath, options.timeoutMs);
 }
 
 async function ensureSharedRepo(

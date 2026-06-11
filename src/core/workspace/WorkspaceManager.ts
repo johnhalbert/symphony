@@ -12,7 +12,7 @@ import type { HookConfig, WorkspaceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue, Workspace } from "../types.js";
 import type { Logger } from "../logging/StructuredLogger.js";
-import { createGitPlanningCheckout, createGitWorktree, removeGitWorktree } from "./GitWorktreeManager.js";
+import { createGitPlanningCheckout, createGitWorktree, moveGitWorktree, removeGitWorktree } from "./GitWorktreeManager.js";
 import { FileRunTranscriptStore, type WorkspaceRecord } from "../persistence/RunTranscriptStore.js";
 
 export interface WorkspaceManagerOptions {
@@ -58,6 +58,7 @@ export class WorkspaceManager {
     await fs.mkdir(this.options.workspace.root, { recursive: true });
     await fs.mkdir(this.options.workspace.stateDir, { recursive: true });
     await assertWorkspaceParentInsideRoot(workspacePath, this.options.workspace.root);
+    await this.prepareWorkspaceTarget(issue, "implementation");
     const createdNow = !(await pathExists(workspacePath));
     if (createdNow && this.options.workspace.source.kind === "git_worktree") {
       const branchName = await this.resolveBranchName(issue);
@@ -137,6 +138,7 @@ export class WorkspaceManager {
     await fs.mkdir(this.options.workspace.root, { recursive: true });
     await fs.mkdir(this.options.workspace.stateDir, { recursive: true });
     await assertWorkspaceParentInsideRoot(workspacePath, this.options.workspace.root);
+    await this.prepareWorkspaceTarget(issue, "planning");
     const source = this.options.workspace.source;
     const createdNow = !(await pathExists(workspacePath));
     const existing = await this.store.getWorkspace(workspaceKey);
@@ -232,6 +234,7 @@ export class WorkspaceManager {
     const workspaceKey = workspaceKeyForPlanning(issue);
     const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
+    await this.prepareWorkspaceTarget(issue, "planning");
     const metadata = await this.store.getWorkspace(workspaceKey);
     await this.removePlanningWorkspace(workspaceKey, workspacePath, metadata);
   }
@@ -254,6 +257,7 @@ export class WorkspaceManager {
     const workspaceKey = workspaceKeyForIssue(issue);
     const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
+    await this.prepareWorkspaceTarget(issue, "implementation");
 
     if (!(await pathExists(workspacePath))) {
       await this.store.deleteWorkspace(workspaceKey);
@@ -392,6 +396,87 @@ export class WorkspaceManager {
     await this.store.upsertWorkspace(metadata);
   }
 
+  private async prepareWorkspaceTarget(issue: WorkspaceIssue, purpose: WorkspacePurpose): Promise<void> {
+    const migrationPlan = legacyWorkspaceMigrationPlanForIssue(issue, purpose, this.options.workspace.root);
+    if (!migrationPlan) return;
+
+    const metadata = await this.store.getWorkspace(migrationPlan.fromWorkspaceKey);
+    const sourceExists = await pathExists(migrationPlan.fromWorkspacePath);
+    if (!metadata) {
+      if (migrationPlan.reason === "contextual_conflict" && sourceExists) {
+        throw new SymphonyError(
+          "workspace_error",
+          `Existing reserved-prefix workspace lacks metadata and cannot be safely claimed: ${migrationPlan.fromWorkspacePath}`,
+        );
+      }
+      return;
+    }
+    if (!isLegacyWorkspaceMigrationCandidate(metadata, migrationPlan)) return;
+    if (!sourceExists) {
+      await this.store.deleteWorkspace(migrationPlan.fromWorkspaceKey);
+      this.options.logger.warn("deleted stale pre-upgrade workspace metadata while preparing workspace target", {
+        workspace_key: migrationPlan.fromWorkspaceKey,
+        workspace_path: migrationPlan.fromWorkspacePath,
+        migration_target_key: migrationPlan.toWorkspaceKey,
+        migration_reason: migrationPlan.reason,
+        workspace_purpose: migrationPlan.purpose,
+      });
+      return;
+    }
+    if ((await pathExists(migrationPlan.toWorkspacePath)) || (await this.store.getWorkspace(migrationPlan.toWorkspaceKey))) {
+      throw new SymphonyError(
+        "workspace_error",
+        `Cannot migrate pre-upgrade workspace artifact because the destination already exists: ${migrationPlan.toWorkspacePath}`,
+      );
+    }
+
+    await assertRealPathInsideRoot(migrationPlan.fromWorkspacePath, this.options.workspace.root);
+    await assertWorkspaceParentInsideRoot(migrationPlan.toWorkspacePath, this.options.workspace.root);
+    await this.moveWorkspaceArtifact(metadata, migrationPlan.fromWorkspacePath, migrationPlan.toWorkspacePath);
+    await this.writeMetadata({
+      workspaceKey: migrationPlan.toWorkspaceKey,
+      issueId: metadata.issueId,
+      issueIdentifier: metadata.issueIdentifier,
+      ...(metadata.projectContext === undefined ? {} : { projectContext: metadata.projectContext }),
+      path: migrationPlan.toWorkspacePath,
+      sourceKind: metadata.sourceKind,
+      ...(metadata.repoPath === undefined ? {} : { repoPath: metadata.repoPath }),
+      ...(metadata.baseRef === undefined ? {} : { baseRef: metadata.baseRef }),
+      ...(metadata.gitBranchName === undefined ? {} : { gitBranchName: metadata.gitBranchName }),
+      createdAt: metadata.createdAt,
+      updatedAt: new Date().toISOString(),
+    });
+    await this.store.deleteWorkspace(migrationPlan.fromWorkspaceKey);
+
+    this.options.logger.info("migrated pre-upgrade workspace artifact away from reserved contextual namespace", {
+      workspace_key: migrationPlan.fromWorkspaceKey,
+      workspace_path: migrationPlan.fromWorkspacePath,
+      migrated_workspace_key: migrationPlan.toWorkspaceKey,
+      migrated_workspace_path: migrationPlan.toWorkspacePath,
+      migration_reason: migrationPlan.reason,
+      workspace_purpose: migrationPlan.purpose,
+    });
+  }
+
+  private async moveWorkspaceArtifact(metadata: WorkspaceRecord, fromWorkspacePath: string, toWorkspacePath: string): Promise<void> {
+    if ((metadata.sourceKind === "git_worktree" || metadata.sourceKind === "planning_readonly") && metadata.repoPath) {
+      await moveGitWorktree({
+        repoPath: metadata.repoPath,
+        workspacePath: fromWorkspacePath,
+        nextWorkspacePath: toWorkspacePath,
+        timeoutMs: this.options.hooks.timeoutMs,
+      });
+      return;
+    }
+    if (metadata.sourceKind === "git_worktree" || metadata.sourceKind === "planning_readonly") {
+      throw new SymphonyError(
+        "workspace_error",
+        `Cannot migrate git-backed workspace without repository metadata: ${fromWorkspacePath}`,
+      );
+    }
+    await fs.rename(fromWorkspacePath, toWorkspacePath);
+  }
+
   private async resolveBranchName(issue: WorkspaceIssue): Promise<string> {
     const source = this.options.workspace.source;
     const template = source.branchTemplate ?? defaultBranchTemplateForIssue(issue);
@@ -432,6 +517,20 @@ export interface WorkspaceIssue {
 
 export type WorkspaceIssueInput = string | (Pick<Issue, "id" | "identifier" | "branchName"> & ProjectContextIssueLike);
 
+type WorkspacePurpose = "implementation" | "planning";
+
+type LegacyWorkspaceMigrationReason = "legacy_self" | "contextual_conflict";
+
+interface LegacyWorkspaceMigrationPlan {
+  reason: LegacyWorkspaceMigrationReason;
+  purpose: WorkspacePurpose;
+  fromWorkspaceKey: string;
+  fromWorkspacePath: string;
+  toWorkspaceKey: string;
+  toWorkspacePath: string;
+  expectedIssueIdentifierKey: string;
+}
+
 function normalizeIssueInput(input: WorkspaceIssueInput): WorkspaceIssue {
   if (typeof input === "string") return { id: null, identifier: input, branchName: null };
   const projectContext = projectContextResolutionFromIssue(input) ?? undefined;
@@ -449,11 +548,71 @@ function workspaceKeyForIssue(issue: WorkspaceIssue): string {
   if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
     return escapeReservedLegacyWorkspaceKey(identifierKey);
   }
-  return `${CONTEXTUAL_WORKSPACE_KEY_NAMESPACE}${sanitizeWorkspaceKey(projectContextId)}__${identifierKey}`;
+  return workspaceKeyForContextualIssue(projectContextId, identifierKey);
 }
 
 function workspaceKeyForPlanning(issue: WorkspaceIssue): string {
   return `${workspaceKeyForIssue(issue)}-planning`;
+}
+
+function workspaceKeyForContextualIssue(projectContextId: string, identifierKey: string): string {
+  return `${CONTEXTUAL_WORKSPACE_KEY_NAMESPACE}${sanitizeWorkspaceKey(projectContextId)}__${identifierKey}`;
+}
+
+function workspaceKeyForPreUpgradeLegacyIssue(identifierKey: string, purpose: WorkspacePurpose): string {
+  return purpose === "planning" ? `${identifierKey}-planning` : identifierKey;
+}
+
+function workspaceKeyForPurpose(issue: WorkspaceIssue, purpose: WorkspacePurpose): string {
+  return purpose === "planning" ? workspaceKeyForPlanning(issue) : workspaceKeyForIssue(issue);
+}
+
+function legacyWorkspaceMigrationPlanForIssue(
+  issue: WorkspaceIssue,
+  purpose: WorkspacePurpose,
+  workspaceRoot: string,
+): LegacyWorkspaceMigrationPlan | null {
+  const identifierKey = sanitizeWorkspaceKey(issue.identifier);
+  const projectContextId = issue.projectContext?.projectContextId;
+  if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+    const currentWorkspaceKey = workspaceKeyForPurpose(issue, purpose);
+    const preUpgradeWorkspaceKey = workspaceKeyForPreUpgradeLegacyIssue(identifierKey, purpose);
+    if (currentWorkspaceKey === preUpgradeWorkspaceKey) return null;
+    return {
+      reason: "legacy_self",
+      purpose,
+      fromWorkspaceKey: preUpgradeWorkspaceKey,
+      fromWorkspacePath: path.resolve(workspaceRoot, preUpgradeWorkspaceKey),
+      toWorkspaceKey: currentWorkspaceKey,
+      toWorkspacePath: path.resolve(workspaceRoot, currentWorkspaceKey),
+      expectedIssueIdentifierKey: identifierKey,
+    };
+  }
+
+  const contextualIdentifierKey = workspaceKeyForContextualIssue(projectContextId, identifierKey);
+  const contextualWorkspaceKey = workspaceKeyForPreUpgradeLegacyIssue(contextualIdentifierKey, purpose);
+  const escapedLegacyWorkspaceKey = workspaceKeyForPreUpgradeLegacyIssue(
+    escapeReservedLegacyWorkspaceKey(contextualIdentifierKey),
+    purpose,
+  );
+  return {
+    reason: "contextual_conflict",
+    purpose,
+    fromWorkspaceKey: contextualWorkspaceKey,
+    fromWorkspacePath: path.resolve(workspaceRoot, contextualWorkspaceKey),
+    toWorkspaceKey: escapedLegacyWorkspaceKey,
+    toWorkspacePath: path.resolve(workspaceRoot, escapedLegacyWorkspaceKey),
+    expectedIssueIdentifierKey: contextualIdentifierKey,
+  };
+}
+
+function isLegacyWorkspaceMigrationCandidate(record: WorkspaceRecord, plan: LegacyWorkspaceMigrationPlan): boolean {
+  return (
+    record.workspaceKey === plan.fromWorkspaceKey &&
+    path.resolve(record.path) === plan.fromWorkspacePath &&
+    sanitizeWorkspaceKey(record.issueIdentifier) === plan.expectedIssueIdentifierKey &&
+    (record.projectContext?.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID) === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+  );
 }
 
 export function sanitizeWorkspaceKey(identifier: string): string {
