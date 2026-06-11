@@ -534,13 +534,12 @@ export class FileIssueLifecycleStore {
 
   async get(issueIdOrIdentifier: string): Promise<IssueLifecycleRecord | null> {
     const direct = await readLifecycleJsonIfExists(this.recordPath(issueIdOrIdentifier));
-    if (direct) return direct;
-    const records = await this.list();
-    return (
-      records.find(
-        (record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier,
-      ) ?? null
-    );
+    if (direct?.issueId === issueIdOrIdentifier) return direct;
+    const records = direct ? dedupeIssueLifecycleRecords([direct, ...(await this.list())]) : await this.list();
+    const exactIssueIdMatch = records.find((record) => record.issueId === issueIdOrIdentifier);
+    if (exactIssueIdMatch) return exactIssueIdMatch;
+    const identifierMatches = records.filter((record) => record.issueIdentifier === issueIdOrIdentifier);
+    return identifierMatches.length === 1 ? identifierMatches[0] ?? null : null;
   }
 
   async list(): Promise<IssueLifecycleRecord[]> {
@@ -558,7 +557,8 @@ export class FileIssueLifecycleStore {
   private async find(issueId: string, issueIdentifier: string): Promise<IssueLifecycleRecord | null> {
     const direct = await this.get(issueId);
     if (direct) return direct;
-    return this.get(issueIdentifier);
+    const byIdentifier = await this.get(issueIdentifier);
+    return byIdentifier?.issueId === issueId ? byIdentifier : null;
   }
 
   private async write(record: IssueLifecycleRecord): Promise<void> {
@@ -1951,6 +1951,17 @@ function isMergeGateRawCheckStatus(value: unknown): value is IssueMergeGateRawCh
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function dedupeIssueLifecycleRecords(records: readonly IssueLifecycleRecord[]): IssueLifecycleRecord[] {
+  const seen = new Set<string>();
+  const deduped: IssueLifecycleRecord[] = [];
+  for (const record of records) {
+    if (seen.has(record.issueId)) continue;
+    seen.add(record.issueId);
+    deduped.push(record);
+  }
+  return deduped;
 }
 
 function safeFileName(value: string): string {

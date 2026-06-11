@@ -1118,11 +1118,10 @@ export class Orchestrator {
 
   getIssueDetails(issueIdOrIdentifier: string): RuntimeSnapshot["running"][number] | null {
     const snapshot = this.snapshot();
-    return (
-      snapshot.running.find(
-        (row) => row.issueId === issueIdOrIdentifier || row.issueIdentifier === issueIdOrIdentifier,
-      ) ?? null
-    );
+    const exactIssueIdMatch = snapshot.running.find((row) => row.issueId === issueIdOrIdentifier);
+    if (exactIssueIdMatch) return exactIssueIdMatch;
+    const identifierMatches = snapshot.running.filter((row) => row.issueIdentifier === issueIdOrIdentifier);
+    return identifierMatches.length === 1 ? identifierMatches[0] ?? null : null;
   }
 
   private scheduleTick(delayMs: number): void {

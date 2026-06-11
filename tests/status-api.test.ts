@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -590,6 +590,8 @@ describe("StatusServer durable API", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:10:00.000Z",
     });
+    await mkdir(path.join(config.workspace.root, "docs__ENG-123"), { recursive: true });
+    await mkdir(path.join(config.workspace.root, "symphony__ENG-123"), { recursive: true });
     await runStore.startRun({
       runId: "docs-run-1",
       sessionId: "docs-session-1",
@@ -649,11 +651,33 @@ describe("StatusServer durable API", () => {
       const baseUrl = `http://${address.host}:${address.port}`;
       const issueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}`);
       const runsResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}/runs`);
+      const workspaceByIdResponse = await fetch(`${baseUrl}/api/v1/workspaces/${encodeURIComponent(docsIssue.id)}`);
+      const openByIdResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousIssueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}`);
+      const ambiguousRunsResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/runs`);
+      const ambiguousWorkspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/${encodeURIComponent(docsIssue.identifier)}`);
+      const ambiguousOpenResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
       const issueBody = (await issueResponse.json()) as {
         workspace: { workspaceKey: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
         latestRun: { runId: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
       };
       const runsBody = (await runsResponse.json()) as { runs: Array<{ runId: string; issueId: string; projectContext?: { projectContextId?: string } }> };
+      const workspaceByIdBody = (await workspaceByIdResponse.json()) as {
+        workspaceKey: string;
+        issueId: string;
+        projectContext?: { projectContextId?: string };
+      };
+      const openByIdBody = (await openByIdResponse.json()) as { opened: boolean; workspace_path: string };
+      const ambiguousIssueBody = (await ambiguousIssueResponse.json()) as { error: { code: string; message: string } };
+      const ambiguousRunsBody = (await ambiguousRunsResponse.json()) as { error: { code: string; message: string } };
+      const ambiguousWorkspaceBody = (await ambiguousWorkspaceResponse.json()) as { error: { code: string; message: string } };
+      const ambiguousOpenBody = (await ambiguousOpenResponse.json()) as { error: { code: string; message: string } };
 
       expect(issueResponse.status).toBe(200);
       expect(issueBody.workspace).toMatchObject({
@@ -673,10 +697,42 @@ describe("StatusServer durable API", () => {
           projectContext: { projectContextId: "docs" },
         },
       ]);
+      expect(workspaceByIdResponse.status).toBe(200);
+      expect(workspaceByIdBody).toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(openByIdResponse.status).toBe(202);
+      expect(openByIdBody).toEqual({
+        opened: true,
+        workspace_path: path.join(config.workspace.root, "docs__ENG-123"),
+      });
+      expect(ambiguousIssueResponse.status).toBe(409);
+      expect(ambiguousRunsResponse.status).toBe(409);
+      expect(ambiguousWorkspaceResponse.status).toBe(409);
+      expect(ambiguousOpenResponse.status).toBe(409);
+      expect(ambiguousIssueBody.error).toMatchObject({
+        code: "conflict",
+        message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
+      });
+      expect(ambiguousRunsBody.error).toMatchObject({
+        code: "conflict",
+        message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
+      });
+      expect(ambiguousWorkspaceBody.error).toMatchObject({
+        code: "conflict",
+        message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
+      });
+      expect(ambiguousOpenBody.error).toMatchObject({
+        code: "conflict",
+        message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
+      });
     } finally {
       await server.stop();
     }
   });
+
 
   it("surfaces legacy/default project context attribution across durable status records", async () => {
     const config = testConfig(path.join(root, "workspaces"));

@@ -69,10 +69,11 @@ describe("WorkspaceManager", () => {
 
     expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123");
     expect(platformWorkspace.workspaceKey).toBe("platform__ENG-123");
+    expect(docsWorkspace.path).toBe(path.join(config.workspace.root, "docs__ENG-123"));
+    expect(platformWorkspace.path).toBe(path.join(config.workspace.root, "platform__ENG-123"));
     expect(docsWorkspace.path).not.toBe(platformWorkspace.path);
     expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);
     expect(manager.getPathForIssue(platformIssue)).toBe(platformWorkspace.path);
-    expect(manager.getPathForIssue("ENG-123")).toBe(path.join(config.workspace.root, "ENG-123"));
     expect(docsMetadata.projectContext?.projectContextId).toBe("docs");
     expect(platformMetadata.projectContext?.projectContextId).toBe("platform");
   });

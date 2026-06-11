@@ -316,9 +316,8 @@ export class WorkspaceManager {
     await this.store.deleteWorkspace(workspaceKey);
   }
 
-  getPathForIssue(issueInput: string | WorkspaceIssueInput): string {
-    const workspaceKey =
-      typeof issueInput === "string" ? sanitizeWorkspaceKey(issueInput) : workspaceKeyForIssue(normalizeIssueInput(issueInput));
+  getPathForIssue(issueInput: WorkspaceIssueInput): string {
+    const workspaceKey = workspaceKeyForIssue(normalizeIssueInput(issueInput));
     const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
     return workspacePath;
@@ -432,10 +431,9 @@ export interface WorkspaceIssue {
   projectContext: ProjectContextResolution | null;
 }
 
-export type WorkspaceIssueInput = string | (Pick<Issue, "id" | "identifier" | "branchName"> & Record<string, unknown>);
+export type WorkspaceIssueInput = Pick<Issue, "id" | "identifier" | "branchName"> & Record<string, unknown>;
 
 function normalizeIssueInput(input: WorkspaceIssueInput): WorkspaceIssue {
-  if (typeof input === "string") return { id: null, identifier: input, branchName: null, projectContext: null };
   return {
     id: input.id,
     identifier: input.identifier,

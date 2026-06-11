@@ -214,7 +214,7 @@ describe("approval status API", () => {
     }
   });
 
-  it("prefers the resolved issue context over unrelated latest runs when identifiers collide", async () => {
+  it("rejects ambiguous identifier issue lookups when project-context siblings collide", async () => {
     const pending = await createPending("idem-project-context-collision-status");
     await runStore.startRun({
       runId: "run-2",
@@ -235,17 +235,13 @@ describe("approval status API", () => {
 
     try {
       const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-1`);
-      const body = (await response.json()) as {
-        pendingApproval: {
-          requestId: string;
-          projectContext: typeof docsProjectContext;
-        } | null;
-      };
+      const body = (await response.json()) as { error: { code: string; message: string } };
 
-      expect(response.status).toBe(200);
-      expect(body.pendingApproval).toMatchObject({
-        requestId: pending.requestId,
-        projectContext: docsProjectContext,
+      expect(pending.projectContext).toMatchObject(docsProjectContext);
+      expect(response.status).toBe(409);
+      expect(body.error).toMatchObject({
+        code: "conflict",
+        message: expect.stringContaining("Ambiguous issue identifier: TEST-1"),
       });
     } finally {
       await server.stop();
