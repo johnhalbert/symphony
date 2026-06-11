@@ -409,7 +409,7 @@ github:
       id: string;
       label: string;
       enabled: boolean;
-      tracker: { projectSlug: string | null };
+      tracker: { projectSlug: string | null; apiKeyPresent: boolean };
       workspace: {
         source: {
           kind: string | null;
@@ -431,7 +431,7 @@ github:
       id: "symphony",
       label: "Symphony",
       enabled: true,
-      tracker: { projectSlug: "SYMPHONY" },
+      tracker: { projectSlug: "SYMPHONY", apiKeyPresent: true },
       workspace: {
         source: {
           kind: "git_worktree",
@@ -450,7 +450,7 @@ github:
       id: "docs-site",
       label: "Documentation Site",
       enabled: true,
-      tracker: { projectSlug: "DOCS" },
+      tracker: { projectSlug: "DOCS", apiKeyPresent: true },
       workspace: {
         source: {
           kind: "git_worktree",
@@ -469,7 +469,7 @@ github:
       id: "ops-portal",
       label: "Ops Portal",
       enabled: true,
-      tracker: { projectSlug: "OPS" },
+      tracker: { projectSlug: "OPS", apiKeyPresent: true },
       workspace: {
         source: {
           kind: "git_worktree",
@@ -526,6 +526,7 @@ github:
     const prefix = `Configured project contexts (default: ${config.projectContexts.defaultContextId}): `;
     const summary = JSON.parse(check.message.slice(prefix.length)) as Array<{
       id: string;
+      tracker: { projectSlug: string | null; apiKeyPresent: boolean };
       workspace: {
         source: {
           kind: string | null;
@@ -543,6 +544,7 @@ github:
     expect(summary).toHaveLength(2);
     expect(summary[1]).toMatchObject({
       id: "archive",
+      tracker: { projectSlug: "", apiKeyPresent: false },
       workspace: {
         source: {
           kind: "none",

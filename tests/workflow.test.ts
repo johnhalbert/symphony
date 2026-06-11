@@ -1840,7 +1840,10 @@ describe("project context redaction", () => {
       id: context.id,
       label: context.label,
       enabled: context.enabled,
-      tracker: { projectSlug: context.tracker.projectSlug },
+      tracker: {
+        projectSlug: context.tracker.projectSlug,
+        apiKeyPresent: context.tracker.apiKey !== "",
+      },
       workspace: {
         source: {
           kind: context.workspace.source.kind,
@@ -1862,7 +1865,7 @@ describe("project context redaction", () => {
     expect(metadata[0]).toMatchObject({
       id: "symphony",
       label: "Symphony",
-      tracker: { projectSlug: "SYMPHONY" },
+      tracker: { projectSlug: "SYMPHONY", apiKeyPresent: true },
       github: { tokenPresent: true },
     });
     expect(metadata[1]).toMatchObject({
