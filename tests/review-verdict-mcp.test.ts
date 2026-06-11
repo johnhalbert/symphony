@@ -21,6 +21,13 @@ const docsProjectContext = {
   routingSource: "candidate_poll",
 } as const;
 
+const symphonyProjectContext = {
+  projectContextId: "symphony",
+  projectContextLabel: "Symphony",
+  linearProjectSlug: "ENG",
+  routingSource: "candidate_poll",
+} as const;
+
 describe("review verdict MCP handoff", () => {
   let root: string;
 
@@ -165,6 +172,68 @@ describe("review verdict MCP handoff", () => {
       kind: "transition",
       payload: { toState: "Ready to Merge" },
     });
+  });
+
+  it("rejects reviewer verdict submissions when the handoff project context mismatches the service-owned issue context", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const serviceOwnedIssue = {
+      ...issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      projectContextId: symphonyProjectContext.projectContextId,
+      projectContextLabel: symphonyProjectContext.projectContextLabel,
+      linearProjectIdentity: { kind: "linear", slug: symphonyProjectContext.linearProjectSlug, id: null },
+      routingSource: symphonyProjectContext.routingSource,
+    };
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    await lifecycleStore.ensureIssue(serviceOwnedIssue, {
+      phase: "review",
+      reviewRound: 0,
+      projectContext: symphonyProjectContext,
+      summaryPointers: { lastRunId: "review-run-3" },
+    });
+    await writeReviewVerdictMcpContext(contextFile, {
+      issue: serviceOwnedIssue,
+      projectContext: docsProjectContext,
+      activeRunId: "review-run-3",
+      role: "reviewer",
+      token: null,
+      expectedToken: null,
+      reviewer: "reviewer-agent:review-run-3",
+      phase: "review",
+    });
+
+    await expect(
+      submitReviewVerdictFromMcp(
+        {
+          verdict: "fail",
+          acceptanceResults: [
+            {
+              text: "Reviewer verdict submissions are wired through MCP.",
+              satisfied: false,
+              evidence: "Tampered project context should be rejected.",
+            },
+          ],
+          findings: ["Reject mismatched project context claims before accepting verdicts."],
+          evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-3"],
+          idempotencyKey: "review-verdict-context-mismatch-1",
+        },
+        { workflowPath, contextFile },
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Review verdict MCP context does not match the service-owned issue project context",
+    });
+
+    const lifecycle = await lifecycleStore.get("TEST-1");
+    expect(lifecycle).toMatchObject({
+      phase: "review",
+      reviewRound: 0,
+      projectContext: symphonyProjectContext,
+    });
+    expect(lifecycle?.reviewVerdicts ?? []).toHaveLength(0);
+    expect(await new FileWritebackOutboxStore(stateDir).list()).toHaveLength(0);
   });
 });
 

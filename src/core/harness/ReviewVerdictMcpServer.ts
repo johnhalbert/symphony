@@ -7,7 +7,11 @@ import {
 import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
-import type { ProjectContextResolution } from "../config/ProjectContexts.js";
+import {
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import type { Issue } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -100,6 +104,21 @@ async function readReviewVerdictContext(filePath: string): Promise<ReviewVerdict
   const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as ReviewVerdictMcpContextFile;
   if (!parsed.issue || parsed.role !== "reviewer") {
     throw new SymphonyError("invalid_request", "Review verdict MCP context is invalid");
+  }
+  const issueProjectContext = projectContextResolutionFromIssue(parsed.issue);
+  if (parsed.projectContext && issueProjectContext) {
+    const handoffProjectContext = normalizeProjectContextResolution(parsed.projectContext);
+    if (
+      handoffProjectContext.projectContextId !== issueProjectContext.projectContextId ||
+      (handoffProjectContext.linearProjectSlug !== null &&
+        issueProjectContext.linearProjectSlug !== null &&
+        handoffProjectContext.linearProjectSlug !== issueProjectContext.linearProjectSlug)
+    ) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Review verdict MCP context does not match the service-owned issue project context",
+      );
+    }
   }
   return parsed;
 }
