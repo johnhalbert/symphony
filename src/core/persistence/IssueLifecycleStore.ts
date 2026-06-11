@@ -25,6 +25,7 @@ export interface IssueLifecycleSummaryPointers {
   workspaceKey: string | null;
   workspacePath: string | null;
   branchName: string | null;
+  issueTitle?: string | null;
   gitBranchName: string | null;
   repoPath: string | null;
   baseRef: string | null;
@@ -886,6 +887,7 @@ function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
     workspaceKey: null,
     workspacePath: null,
     branchName: null,
+    issueTitle: null,
     gitBranchName: null,
     repoPath: null,
     baseRef: null,
@@ -1009,6 +1011,7 @@ function normalizeSummaryPointers(
     workspaceKey: nullableString(value.workspaceKey, filePath, "summaryPointers.workspaceKey"),
     workspacePath: nullableString(value.workspacePath, filePath, "summaryPointers.workspacePath"),
     branchName: nullableString(value.branchName, filePath, "summaryPointers.branchName"),
+    issueTitle: optionalNullableString(value.issueTitle, filePath, "summaryPointers.issueTitle"),
     gitBranchName: optionalNullableString(value.gitBranchName, filePath, "summaryPointers.gitBranchName"),
     repoPath: optionalNullableString(value.repoPath, filePath, "summaryPointers.repoPath"),
     baseRef: optionalNullableString(value.baseRef, filePath, "summaryPointers.baseRef"),

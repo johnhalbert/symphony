@@ -965,6 +965,132 @@ describe("completion report MCP handoff", () => {
     });
   });
 
+  it("fails closed for pending completion report MCP replays when the tracker cannot load authoritative issue state", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir, false), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-pending-replay",
+      sessionId: "agent-1:run-pending-replay",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1", title: "Authoritative title" }), {
+      projectContext: docsProjectContext,
+      phase: "blocked",
+      blockedReason: "publication approval setup incomplete",
+      lastCompletionReportId: "completion-report:issue-1:pending-replay",
+      summaryPointers: {
+        lastRunId: "run-pending-replay",
+        workspacePath: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+        branchName: "symphony/TEST-1",
+        issueTitle: "Authoritative title",
+        gitBranchName: "symphony/TEST-1",
+      },
+      completionReports: [
+        {
+          id: "completion-report:issue-1:pending-replay",
+          idempotencyKey: "pending-replay",
+          runId: "run-pending-replay",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          projectContext: docsProjectContext,
+          summary: "Implemented the service contract.",
+          validationEvidence: ["npm test"],
+          acceptanceChecklist: [
+            {
+              text: "Completion reports are persisted.",
+              satisfied: true,
+              evidence: "Lifecycle store records completionReports.",
+            },
+          ],
+          changedFiles: ["src/core/CompletionReportService.ts"],
+          branchName: "forged-report-branch",
+          pullRequest: null,
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1", title: "FORGED TITLE FROM CALLER" }),
+      projectContext: docsProjectContext,
+      activeRunId: "run-pending-replay",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-pending-replay",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+
+    await expect(
+      submitCompletionReportFromMcp(
+        report("pending-replay"),
+        mcpOptions(workflowPath, contextFile, {
+          tracker: {
+            async fetchIssueStatesByIds(_issueIds: string[]): Promise<ReturnType<typeof issue>[]> {
+              throw new Error("tracker unavailable");
+            },
+          },
+        }),
+      ),
+    ).rejects.toThrow("Completion report MCP could not load the authoritative issue state");
+    await expect(
+      submitCompletionReportFromMcp(
+        report("pending-replay"),
+        mcpOptions(workflowPath, contextFile, {
+          tracker: {
+            async fetchIssueStatesByIds(_issueIds: string[]): Promise<ReturnType<typeof issue>[]> {
+              return [];
+            },
+          },
+        }),
+      ),
+    ).rejects.toThrow("Completion report MCP could not load the authoritative issue state");
+    await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "publication approval setup incomplete",
+      lastCompletionReportId: "completion-report:issue-1:pending-replay",
+      summaryPointers: {
+        lastRunId: "run-pending-replay",
+        issueTitle: "Authoritative title",
+      },
+      completionReports: [
+        expect.objectContaining({ idempotencyKey: "pending-replay", writebackOperationKeys: [] }),
+      ],
+    });
+  });
+
   it("uses service GitHub publication profile for default PR publication", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");

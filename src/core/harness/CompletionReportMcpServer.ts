@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
   CompletionReportService,
+  isFinalizedCompletionReport,
   type CompletionReportActiveContext,
   type CompletionReportPullRequestPublisher,
 } from "../CompletionReportService.js";
@@ -293,7 +294,7 @@ function allowsTerminalCompletionReportReplay(
   const idempotencyKey = completionReportIdempotencyKeyFromInput(input);
   if (!lifecycle || !idempotencyKey) return false;
   return lifecycle.completionReports.some(
-    (report) => report.idempotencyKey === idempotencyKey && report.runId === runId && report.acceptedAt !== null,
+    (report) => report.idempotencyKey === idempotencyKey && report.runId === runId && isFinalizedCompletionReport(report),
   );
 }
 

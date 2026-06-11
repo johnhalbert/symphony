@@ -351,11 +351,12 @@ describe("CompletionReportService", () => {
       repoPath: "/repo",
       baseRef: "main",
     });
-    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: null }), {
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: null, title: "Do work" }), {
       phase: "implementation",
       summaryPointers: {
         lastRunId: "run-1",
         branchName: "service-owned-branch",
+        issueTitle: "Do work",
         gitBranchName: "service-owned-branch",
       },
     });
@@ -405,7 +406,7 @@ describe("CompletionReportService", () => {
     });
   });
 
-  it("re-requests publication approval with the service-owned branch when recovering a pending handoff", async () => {
+  it("re-requests publication approval with the service-owned branch and title when recovering a pending handoff", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
@@ -433,7 +434,7 @@ describe("CompletionReportService", () => {
       repoPath: "/repo",
       baseRef: "main",
     });
-    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: null }), {
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: null, title: "Do work" }), {
       phase: "blocked",
       blockedReason: "publication approval setup incomplete",
       lastCompletionReportId: "completion-report:issue-1:branch-recovery-idem",
@@ -444,6 +445,7 @@ describe("CompletionReportService", () => {
         repoPath: "/repo",
         baseRef: "main",
         branchName: "service-owned-branch",
+        issueTitle: "Do work",
         gitBranchName: "service-owned-branch",
       },
       completionReports: [
@@ -473,6 +475,7 @@ describe("CompletionReportService", () => {
     });
     const processedKeyBatches: string[][] = [];
     let approvalBranch: string | null = null;
+    let approvalTitle: string | null = null;
     const writebackProcessor = {
       async processDue(options: { idempotencyKeys?: readonly string[] } = {}) {
         const keys = [...(options.idempotencyKeys ?? [])];
@@ -492,6 +495,7 @@ describe("CompletionReportService", () => {
       operatorApproval: {
         async requestPublicationApproval(input) {
           approvalBranch = input.action.branchName;
+          approvalTitle = input.action.title;
           return approvalRecord(input.issueId, input.issueIdentifier, input.runId, input.evidenceCursor, input.action);
         },
         async waitForPublicationApprovalRequest(record) {
@@ -501,7 +505,7 @@ describe("CompletionReportService", () => {
     });
 
     const recovered = await service.recoverPendingPublicationApproval({
-      issue: issue({ state: "In Progress", branchName: null, title: "Do work" }),
+      issue: issue({ state: "In Progress", branchName: null, title: "FORGED TITLE FROM CALLER" }),
     });
 
     expect(recovered).toMatchObject({
@@ -511,12 +515,15 @@ describe("CompletionReportService", () => {
     });
     expect(approvalBranch).toBe("service-owned-branch");
     expect(approvalBranch).not.toBe("forged-report-branch");
+    expect(approvalTitle).toBe("TEST-1: Do work");
+    expect(approvalTitle).not.toContain("FORGED TITLE FROM CALLER");
     expect(processedKeyBatches).toHaveLength(1);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
       phase: "blocked",
       blockedReason: "awaiting operator approval for PR publication",
       summaryPointers: {
         branchName: "service-owned-branch",
+        issueTitle: "Do work",
         gitBranchName: "service-owned-branch",
       },
     });
@@ -786,6 +793,9 @@ describe("CompletionReportService", () => {
 
     await service.submitCompletionReport(report(), contextWithWorkspace());
 
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      summaryPointers: { issueTitle: contextWithWorkspace().issue.title },
+    });
     expect(processedKeyBatches).toHaveLength(1);
     expect(processedKeyBatches[0]).not.toContain(siblingKey);
     expect(processedKeyBatches[0]?.every((key) => key.includes("completion-report:idem-1"))).toBe(true);

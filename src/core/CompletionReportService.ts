@@ -357,7 +357,10 @@ export class CompletionReportService {
 
     const report = completionReportInputFromRecord(existing);
     const context: CompletionReportActiveContext = {
-      issue: input.issue,
+      issue: {
+        ...input.issue,
+        title: lifecycle.summaryPointers.issueTitle ?? input.issue.title,
+      },
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -787,11 +790,12 @@ export class CompletionReportService {
     if (!baseBranch) {
       throw new SymphonyError("invalid_request", "PR publication requires a base branch");
     }
+    const issueTitle = existingLifecycle?.summaryPointers.issueTitle ?? context.issue.title;
     return {
       workspacePath,
       branchName,
       baseBranch,
-      title: `${context.issue.identifier}: ${context.issue.title}`,
+      title: `${context.issue.identifier}: ${issueTitle}`,
       body: formatPullRequestBody(report, context),
       evidenceCursor: report.idempotencyKey,
     };
@@ -1068,6 +1072,7 @@ function summaryPointersFor(
   return {
     workspacePath: context.workspacePath ?? context.workspace?.path ?? existingLifecycle?.summaryPointers.workspacePath ?? null,
     branchName,
+    issueTitle: context.issue.title,
     gitBranchName: branchName,
     repoPath: context.workspace?.repoPath ?? existingLifecycle?.summaryPointers.repoPath ?? null,
     baseRef: context.workspace?.baseRef ?? existingLifecycle?.summaryPointers.baseRef ?? null,
@@ -1162,6 +1167,7 @@ function recoveryContextFor(input: {
       ...input.issue,
       id: input.pendingReport.issueId,
       identifier: input.pendingReport.issueIdentifier,
+      title: input.lifecycle.summaryPointers.issueTitle ?? input.issue.title,
       state: input.config.writeback.dispatchState,
       branchName,
     },
