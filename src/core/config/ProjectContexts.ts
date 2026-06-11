@@ -9,11 +9,12 @@ const REPOSITORY_URL_PATTERN = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 const REPOSITORY_SCP_STYLE_PATTERN = /^([^/\\]+)@([^:]+):(.+)$/;
 const URL_HOST_QUERY_OR_FRAGMENT_BEFORE_AT_PATTERN =
   /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/(?:localhost|(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+|(?:\d{1,3}\.){3}\d{1,3}|\[[^\]]+\])(?::\d+)?[?#][^/\s]*@/i;
-const URL_SINGLE_LABEL_HOST_QUERY_OR_FRAGMENT_BEFORE_AT_PATTERN =
-  /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[A-Za-z0-9-]+(?::\d+)?[?#][^/\s]*@[A-Za-z0-9-]+(?::\d+)?$/i;
+const PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_BEFORE_AT_PATTERN =
+  /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([A-Za-z0-9-]+)([?#])([^/\s@]+)@([A-Za-z0-9-]+)(:\d+)?$/i;
 const URL_USERINFO_WITH_RAW_QUERY_OR_FRAGMENT_PATTERN =
   /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s]*[?#][^/\s]*)@([^/\s]+(?:\/.*)?)$/i;
 const URL_USERINFO_PATTERN = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s?#]*)@/i;
+const MAX_PRESERVED_PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_SEGMENT_LENGTH = 3;
 
 export interface ProjectContextResolution {
   projectContextId: ProjectContextId;
@@ -285,6 +286,25 @@ function normalizeOptionalNonEmptyString(value: string | null | undefined): stri
   return normalized.length === 0 ? null : normalized;
 }
 
+function sanitizePathlessSingleLabelQueryOrFragmentBeforeAtUrl(repository: string): string | null {
+  const match = repository.match(PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_BEFORE_AT_PATTERN);
+  if (!match) return null;
+  const scheme = match[1];
+  const hostCandidate = match[2];
+  const suffixPayload = match[4];
+  const trailingHost = match[5];
+  const trailingPort = match[6] ?? "";
+  if (!scheme || !hostCandidate || !suffixPayload || !trailingHost) return null;
+  if (
+    trailingPort ||
+    suffixPayload.length > MAX_PRESERVED_PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_SEGMENT_LENGTH ||
+    trailingHost.length > MAX_PRESERVED_PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_SEGMENT_LENGTH
+  ) {
+    return `${scheme}${REDACTED}@${trailingHost}${trailingPort}`;
+  }
+  return `${scheme}${hostCandidate}`;
+}
+
 function sanitizePublicRepositoryValue(value: string | null | undefined): string | null {
   const normalized = normalizeOptionalNonEmptyString(value);
   if (normalized === null) return null;
@@ -294,12 +314,12 @@ function sanitizePublicRepositoryValue(value: string | null | undefined): string
     return `${REDACTED}@${host}:${repositoryPath}`.replace(/[?#].*$/, "");
   }
   if (!REPOSITORY_URL_PATTERN.test(normalized)) return normalized;
-  if (
-    URL_HOST_QUERY_OR_FRAGMENT_BEFORE_AT_PATTERN.test(normalized) ||
-    URL_SINGLE_LABEL_HOST_QUERY_OR_FRAGMENT_BEFORE_AT_PATTERN.test(normalized)
-  ) {
+  if (URL_HOST_QUERY_OR_FRAGMENT_BEFORE_AT_PATTERN.test(normalized)) {
     return normalized.replace(/[?#].*$/, "");
   }
+  const pathlessSingleLabelQueryOrFragmentBeforeAtUrl =
+    sanitizePathlessSingleLabelQueryOrFragmentBeforeAtUrl(normalized);
+  if (pathlessSingleLabelQueryOrFragmentBeforeAtUrl) return pathlessSingleLabelQueryOrFragmentBeforeAtUrl;
   return normalized
     .replace(URL_USERINFO_WITH_RAW_QUERY_OR_FRAGMENT_PATTERN, `$1${REDACTED}@$3`)
     .replace(URL_USERINFO_PATTERN, `$1${REDACTED}@`)

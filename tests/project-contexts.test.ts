@@ -227,6 +227,36 @@ describe("project context normalization", () => {
         leakedSubstring: "foo@bar",
       },
       {
+        name: "raw question mark in pathless single-label username-only HTTPS URL userinfo",
+        repository: "https://user?name@host",
+        expected: "https://[redacted]@host",
+        leakedSubstring: "https://user",
+      },
+      {
+        name: "raw hash in pathless single-label username-only HTTPS URL userinfo",
+        repository: "https://user#name@host",
+        expected: "https://[redacted]@host",
+        leakedSubstring: "https://user",
+      },
+      {
+        name: "raw question mark in pathless single-label username-only generic FTP URL userinfo",
+        repository: "ftp://user?name@host",
+        expected: "ftp://[redacted]@host",
+        leakedSubstring: "ftp://user",
+      },
+      {
+        name: "raw hash in pathless single-label username-only generic custom-scheme URL userinfo",
+        repository: "custom://user#name@host",
+        expected: "custom://[redacted]@host",
+        leakedSubstring: "custom://user",
+      },
+      {
+        name: "raw question mark in pathless single-label username-only HTTPS URL userinfo with host port",
+        repository: "https://user?name@host:8443",
+        expected: "https://[redacted]@host:8443",
+        leakedSubstring: "https://user",
+      },
+      {
         name: "query token URL",
         repository: "https://example.com/acme/docs-site.git?access_token=secret",
         expected: "https://example.com/acme/docs-site.git",
@@ -442,6 +472,36 @@ describe("project context normalization", () => {
         repository: "ftp://gitlab?foo@bar",
         expected: "ftp://gitlab",
         leakedSubstring: "foo@bar",
+      },
+      {
+        name: "raw question mark in pathless single-label username-only HTTPS URL userinfo",
+        repository: "https://user?name@host",
+        expected: "https://[redacted]@host",
+        leakedSubstring: "https://user",
+      },
+      {
+        name: "raw hash in pathless single-label username-only HTTPS URL userinfo",
+        repository: "https://user#name@host",
+        expected: "https://[redacted]@host",
+        leakedSubstring: "https://user",
+      },
+      {
+        name: "raw question mark in pathless single-label username-only generic FTP URL userinfo",
+        repository: "ftp://user?name@host",
+        expected: "ftp://[redacted]@host",
+        leakedSubstring: "ftp://user",
+      },
+      {
+        name: "raw hash in pathless single-label username-only generic custom-scheme URL userinfo",
+        repository: "custom://user#name@host",
+        expected: "custom://[redacted]@host",
+        leakedSubstring: "custom://user",
+      },
+      {
+        name: "raw question mark in pathless single-label username-only HTTPS URL userinfo with host port",
+        repository: "https://user?name@host:8443",
+        expected: "https://[redacted]@host:8443",
+        leakedSubstring: "https://user",
       },
       {
         name: "query token URL",
