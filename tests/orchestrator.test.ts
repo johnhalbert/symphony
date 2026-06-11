@@ -2530,7 +2530,16 @@ describe("Orchestrator", () => {
         },
       });
 
-      await orchestrator.refreshNow();
+      await waitForAsync(async () => {
+        await orchestrator.refreshNow();
+        const running = orchestrator.snapshot().running[0];
+        const idleAlert = running?.liveness.idleAlert;
+        return (
+          running?.lifecycle?.blockedReason === PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON &&
+          idleAlert?.active === false &&
+          idleAlert?.reason === "suppressed"
+        );
+      }, "lifecycle-only pending publication approval handoff suppression");
 
       expect(orchestrator.snapshot().counts.running).toBe(1);
       expect(orchestrator.snapshot().running[0]?.liveness.idleAlert).toMatchObject({
