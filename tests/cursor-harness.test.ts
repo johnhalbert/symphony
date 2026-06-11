@@ -20,7 +20,7 @@ import {
   transcriptRecallContextFilePath,
   transcriptRecallMcpServerConfig,
 } from "../cursor/src/CursorHarness.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, testConfig, trackerIssue } from "./helpers.js";
 
 const cursorSdk = vi.hoisted(() => ({
   create: vi.fn(),
@@ -726,11 +726,26 @@ describe("Cursor event mapping", () => {
       latestRunForIssue: vi.fn(async () => ({ agentId: "agent-previous" })),
     };
     const harness = new CursorHarness({ runStore: runStore as never });
+    const ctx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      issue: trackerIssue({
+        id: "issue-docs-1",
+        identifier: "ENG-123",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        state: "In Progress",
+      }),
+    };
 
-    await harness.prepare(agentContext(config, "worker"));
-    await harness.reload(agentContext(config, "worker"));
+    await harness.prepare(ctx);
+    await harness.reload(ctx);
 
     expect(runStore.latestRunForIssue).toHaveBeenCalledTimes(1);
+    expect(runStore.latestRunForIssue).toHaveBeenCalledWith("issue-docs-1", {
+      role: "worker",
+      runPhase: "implementation",
+      projectContext: expect.objectContaining({ projectContextId: "docs" }),
+    });
     expect(cursorSdk.resume).toHaveBeenCalledTimes(1);
     expect(cursorSdk.resume).toHaveBeenCalledWith("agent-previous", expect.any(Object));
     expect(agent.reload).toHaveBeenCalledTimes(1);

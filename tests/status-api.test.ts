@@ -25,7 +25,7 @@ import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import type { Issue, IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } from "../src/core/types.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, testConfig, trackerIssue } from "./helpers.js";
 
 describe("StatusServer durable API", () => {
   let root: string;
@@ -534,6 +534,149 @@ describe("StatusServer durable API", () => {
     }
   });
 
+
+  it("resolves exact-id status lookups by lifecycle project context when visible identifiers collide", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-123",
+    });
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "docs__ENG-123",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      path: path.join(config.workspace.root, "docs__ENG-123"),
+      sourceKind: "git_worktree",
+      gitBranchName: docsIssue.branchName ?? undefined,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.upsertWorkspace({
+      workspaceKey: "symphony__ENG-123",
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: symphonyProjectContext,
+      path: path.join(config.workspace.root, "symphony__ENG-123"),
+      sourceKind: "git_worktree",
+      gitBranchName: symphonyIssue.branchName ?? undefined,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:10:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "docs-run-1",
+      sessionId: "docs-session-1",
+      agentId: "docs-agent-1",
+      role: "worker",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      workspaceKey: "docs__ENG-123",
+      workspacePath: path.join(config.workspace.root, "docs__ENG-123"),
+      gitBranchName: docsIssue.branchName ?? undefined,
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+    });
+    await runStore.startRun({
+      runId: "symphony-run-1",
+      sessionId: "symphony-session-1",
+      agentId: "symphony-agent-1",
+      role: "worker",
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: symphonyProjectContext,
+      attempt: null,
+      turnNumber: 2,
+      prompt: "symphony work",
+      workspaceKey: "symphony__ENG-123",
+      workspacePath: path.join(config.workspace.root, "symphony__ENG-123"),
+      gitBranchName: symphonyIssue.branchName ?? undefined,
+      repoPath: "/repo/symphony",
+      baseRef: "origin/main",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, { phase: "implementation" });
+    await lifecycleStore.ensureIssue(symphonyIssue, { phase: "implementation" });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}`);
+      const runsResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}/runs`);
+      const issueBody = (await issueResponse.json()) as {
+        workspace: { workspaceKey: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+        latestRun: { runId: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+      };
+      const runsBody = (await runsResponse.json()) as { runs: Array<{ runId: string; issueId: string; projectContext?: { projectContextId?: string } }> };
+
+      expect(issueResponse.status).toBe(200);
+      expect(issueBody.workspace).toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(issueBody.latestRun).toMatchObject({
+        runId: "docs-run-1",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(runsBody.runs).toMatchObject([
+        {
+          runId: "docs-run-1",
+          issueId: docsIssue.id,
+          projectContext: { projectContextId: "docs" },
+        },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
 
   it("surfaces legacy/default project context attribution across durable status records", async () => {
     const config = testConfig(path.join(root, "workspaces"));

@@ -1060,15 +1060,17 @@ export class StatusServer {
         const issueId = decodeURIComponent(issueRunsMatch[1] ?? "");
         const snapshot = this.options.orchestrator.snapshot();
         const live = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
-        const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const rawLifecycle = await this.options.lifecycleStore?.get(issueId);
+        const lifecycleLookupOptions = rawLifecycle?.projectContext ? { projectContext: rawLifecycle.projectContext } : {};
+        const workspace = await this.options.runStore?.findWorkspace(issueId, lifecycleLookupOptions);
+        const latestRun = await this.options.runStore?.latestRunForIssue(issueId, lifecycleLookupOptions);
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
-        const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
+        const runs = (await this.options.runStore?.listRunsForIssue(issueId, lifecycleLookupOptions)) ?? [];
         const lifecycle = sanitizeStatusLifecycle({
           live,
           workspace,
           latestRun,
-          lifecycle: await this.options.lifecycleStore?.get(issueId),
+          lifecycle: rawLifecycle,
         });
         const enrichedRuns = await Promise.all(
           runs.map(async (run) => ({
@@ -1152,14 +1154,16 @@ export class StatusServer {
         const issueId = decodeURIComponent(issueMatch[1] ?? "");
         const snapshot = this.options.orchestrator.snapshot();
         const live = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
-        const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const rawLifecycle = await this.options.lifecycleStore?.get(issueId);
+        const lifecycleLookupOptions = rawLifecycle?.projectContext ? { projectContext: rawLifecycle.projectContext } : {};
+        const workspace = await this.options.runStore?.findWorkspace(issueId, lifecycleLookupOptions);
+        const latestRun = await this.options.runStore?.latestRunForIssue(issueId, lifecycleLookupOptions);
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const lifecycle = sanitizeStatusLifecycle({
           live,
           workspace,
           latestRun,
-          lifecycle: await this.options.lifecycleStore?.get(issueId),
+          lifecycle: rawLifecycle,
         });
         if (!live && !workspace && !latestRun && !lifecycle) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
@@ -1256,11 +1260,12 @@ export class StatusServer {
         const runId = decodeURIComponent(runMatch[1] ?? "");
         const run = await this.options.runStore?.getRun(runId);
         if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
-        const issueRunsByIdentifier = (await this.options.runStore?.listRunsForIssue(run.issueIdentifier)) ?? [];
+        const issueLookupOptions = run.projectContext ? { projectContext: run.projectContext } : {};
+        const issueRunsByIdentifier = (await this.options.runStore?.listRunsForIssue(run.issueIdentifier, issueLookupOptions)) ?? [];
         const issueRuns =
           issueRunsByIdentifier.length > 0 || run.issueIdentifier === run.issueId
             ? issueRunsByIdentifier
-            : ((await this.options.runStore?.listRunsForIssue(run.issueId)) ?? []);
+            : ((await this.options.runStore?.listRunsForIssue(run.issueId, issueLookupOptions)) ?? []);
         const lifecycle =
           (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
@@ -1287,9 +1292,23 @@ export class StatusServer {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(openMatch[1] ?? "");
         const details = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
+        const lifecycle = await this.options.lifecycleStore?.get(issueId);
+        const lifecycleLookupOptions = lifecycle?.projectContext ? { projectContext: lifecycle.projectContext } : {};
+        const workspace = await this.options.runStore?.findWorkspace(issueId, lifecycleLookupOptions);
         const workspacePath =
-          details?.workspacePath ?? workspace?.path ?? this.options.workspaceManager.getPathForIssue(issueId);
+          details?.workspacePath ??
+          workspace?.path ??
+          lifecycle?.summaryPointers.workspacePath ??
+          this.options.workspaceManager.getPathForIssue(
+            lifecycle
+              ? {
+                  id: lifecycle.issueId,
+                  identifier: lifecycle.issueIdentifier,
+                  branchName: lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName ?? null,
+                  ...(lifecycle.projectContext === undefined ? {} : { projectContext: lifecycle.projectContext }),
+                }
+              : issueId,
+          );
         if (!(await pathExists(workspacePath))) {
           throw new SymphonyError("not_found", `Workspace not found: ${workspacePath}`);
         }
@@ -5860,9 +5879,13 @@ async function operatorSnapshotView(
       const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
       const paused = isIssuePaused(snapshot, keys);
       const agentId = await resolveRunningAgentId(row, runStore);
-      const workspace = (await runStore?.findWorkspace(row.issueId)) ?? (await runStore?.findWorkspace(row.issueIdentifier));
+      const lookupOptions = row.lifecycle?.projectContext ? { projectContext: row.lifecycle.projectContext } : {};
+      const workspace =
+        (await runStore?.findWorkspace(row.issueId, lookupOptions)) ??
+        (await runStore?.findWorkspace(row.issueIdentifier, lookupOptions));
       const latestRun =
-        (await runStore?.latestRunForIssue(row.issueId)) ?? (await runStore?.latestRunForIssue(row.issueIdentifier));
+        (await runStore?.latestRunForIssue(row.issueId, lookupOptions)) ??
+        (await runStore?.latestRunForIssue(row.issueIdentifier, lookupOptions));
       const summaryRun = await resolveIssueDetailsSummaryRun(row, latestRun, runStore);
       const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
       const mergeConflict = mergeConflictOperatorSummary(row.lifecycle?.mergeConflict ?? null);
@@ -6023,8 +6046,9 @@ async function resolveRunningAgentId(
     const run = await runStore.getRun(runId);
     if (runMatchesLiveRow(row, run)) return run.agentId;
   }
+  const lookupOptions = row.lifecycle?.projectContext ? { projectContext: row.lifecycle.projectContext } : {};
   for (const issueKey of [row.issueId, row.issueIdentifier]) {
-    const run = await runStore.latestRunForIssue(issueKey);
+    const run = await runStore.latestRunForIssue(issueKey, lookupOptions);
     if (runMatchesLiveRow(row, run)) return run.agentId;
   }
   return null;
@@ -6047,8 +6071,9 @@ async function pausedOperatorViews(
   return Promise.all(
     pausedKeys.map(async (pausedKey) => {
       const lifecycle = (await lifecycleStore?.get(pausedKey)) ?? null;
-      const workspace = await runStore?.findWorkspace(pausedKey);
-      const latestRun = await runStore?.latestRunForIssue(pausedKey);
+      const lookupOptions = lifecycle?.projectContext ? { projectContext: lifecycle.projectContext } : {};
+      const workspace = await runStore?.findWorkspace(pausedKey, lookupOptions);
+      const latestRun = await runStore?.latestRunForIssue(pausedKey, lookupOptions);
       const live = running.find((row) => row.issueId === pausedKey || row.issueIdentifier === pausedKey) ?? null;
       const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, runStore);
       const issueIdentifier = lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? pausedKey;

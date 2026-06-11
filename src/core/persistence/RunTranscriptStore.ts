@@ -104,6 +104,10 @@ export interface WorkspaceRecord {
   updatedAt: string;
 }
 
+export interface ProjectContextScopedLookup {
+  projectContext?: ProjectContextResolution | undefined;
+}
+
 export interface RunMetadata {
   prUrl?: string | null;
   prNumber?: number | null;
@@ -377,18 +381,23 @@ export class FileRunTranscriptStore {
     return records.filter((record): record is WorkspaceRecord => record !== null).map(normalizeWorkspaceRecord);
   }
 
-  async findWorkspace(issueIdOrIdentifierOrKey: string): Promise<WorkspaceRecord | null> {
+  async findWorkspace(
+    issueIdOrIdentifierOrKey: string,
+    options: ProjectContextScopedLookup = {},
+  ): Promise<WorkspaceRecord | null> {
     const direct = await this.getWorkspace(issueIdOrIdentifierOrKey);
-    if (direct) return direct;
+    if (direct && matchesProjectContext(direct.projectContext, options.projectContext)) return direct;
     const records = await this.listWorkspaces();
-    return (
-      records.find(
+    const matches = records
+      .filter(
         (record) =>
-          record.issueId === issueIdOrIdentifierOrKey ||
-          record.issueIdentifier === issueIdOrIdentifierOrKey ||
-          record.workspaceKey === issueIdOrIdentifierOrKey,
-      ) ?? null
-    );
+          (record.issueId === issueIdOrIdentifierOrKey ||
+            record.issueIdentifier === issueIdOrIdentifierOrKey ||
+            record.workspaceKey === issueIdOrIdentifierOrKey) &&
+          matchesProjectContext(record.projectContext, options.projectContext),
+      )
+      .sort(compareWorkspaceRecencyDesc);
+    return selectPreferredWorkspaceRecord(issueIdOrIdentifierOrKey, matches);
   }
 
   async startRun(input: StartRunInput): Promise<RunRecord> {
@@ -546,18 +555,22 @@ export class FileRunTranscriptStore {
     return record === null ? null : normalizeRunRecord(record);
   }
 
-  async listRunsForIssue(issueIdOrIdentifier: string): Promise<RunRecord[]> {
+  async listRunsForIssue(issueIdOrIdentifier: string, options: ProjectContextScopedLookup = {}): Promise<RunRecord[]> {
     const records = await this.listRuns();
     return records
-      .filter((record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier)
+      .filter(
+        (record) =>
+          (record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier) &&
+          matchesProjectContext(record.projectContext, options.projectContext),
+      )
       .sort(compareRunChronology);
   }
 
   async latestRunForIssue(
     issueIdOrIdentifier: string,
-    options: { role?: PersistedRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind } = {},
+    options: ProjectContextScopedLookup & { role?: PersistedRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind } = {},
   ): Promise<RunRecord | null> {
-    const records = await this.listRunsForIssue(issueIdOrIdentifier);
+    const records = await this.listRunsForIssue(issueIdOrIdentifier, options);
     const filtered = records.filter(
       (record) =>
         (options.role === undefined || record.role === options.role) &&
@@ -672,6 +685,39 @@ export function compareRunChronology(left: RunRecord, right: RunRecord): number 
     compareNullableNumber(left.attempt, right.attempt) ||
     compareNumber(left.turnNumber, right.turnNumber) ||
     compareString(left.runId, right.runId)
+  );
+}
+
+function compareWorkspaceRecencyDesc(left: WorkspaceRecord, right: WorkspaceRecord): number {
+  return (
+    compareNumber(Date.parse(right.updatedAt), Date.parse(left.updatedAt)) ||
+    compareString(right.updatedAt, left.updatedAt) ||
+    compareNumber(Date.parse(right.createdAt), Date.parse(left.createdAt)) ||
+    compareString(right.createdAt, left.createdAt) ||
+    compareString(left.workspaceKey, right.workspaceKey)
+  );
+}
+
+function selectPreferredWorkspaceRecord(
+  query: string,
+  records: readonly WorkspaceRecord[],
+): WorkspaceRecord | null {
+  return (
+    records.find((record) => record.issueId === query) ??
+    records.find((record) => record.workspaceKey === query) ??
+    records.find((record) => record.issueIdentifier === query) ??
+    null
+  );
+}
+
+function matchesProjectContext(
+  recordProjectContext: ProjectContextResolution | undefined,
+  expectedProjectContext: ProjectContextResolution | undefined,
+): boolean {
+  if (!expectedProjectContext) return true;
+  return (
+    normalizeProjectContextResolution(recordProjectContext).projectContextId ===
+    normalizeProjectContextResolution(expectedProjectContext).projectContextId
   );
 }
 

@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
-import { issue } from "./helpers.js";
+import { issue, trackerIssue } from "./helpers.js";
 
 describe("git worktree workspace source", () => {
   let root: string;
@@ -44,6 +44,54 @@ describe("git worktree workspace source", () => {
 
     expect(currentBranch.trim()).toBe("symphony/TEST-2");
     expect(workspace.workspaceKey).toBe("TEST-2");
+  });
+
+  it("creates duplicate-identifier context worktrees without collision and cleans up only the targeted sibling", async () => {
+    const manager = newManager(root, repo);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-1",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-123",
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(symphonyWorkspace.workspaceKey).toBe("symphony__ENG-123");
+    expect(docsWorkspace.path).not.toBe(symphonyWorkspace.path);
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
+    expect((await git(["branch", "--show-current"], symphonyWorkspace.path)).trim()).toBe("symphony/symphony/ENG-123");
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toMatchObject({
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: { projectContextId: "docs" },
+    });
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: { projectContextId: "symphony" },
+    });
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    await expect(readFile(path.join(symphonyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: { projectContextId: "symphony" },
+    });
   });
 
   it("refuses to remove dirty worktrees by default", async () => {

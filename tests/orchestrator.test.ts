@@ -6527,8 +6527,8 @@ describe("Orchestrator", () => {
     expect(createdSummary.summaryReference.transcriptEventCount).toBe(2);
     expect(createdSummary.summaryReference.transcriptPointers).toEqual(["/api/v1/runs/prior-run-1/transcript"]);
     expect(createdSummary.summaryReference.statusApiPointers).toEqual([
-      "/api/v1/issues/TEST-1",
-      "/api/v1/issues/TEST-1/runs",
+      "/api/v1/issues/issue-1",
+      "/api/v1/issues/issue-1/runs",
       "/api/v1/runs/prior-run-1",
     ]);
     expect(storedLifecycle?.summaryReferences).toEqual([createdSummary.summaryReference]);
@@ -6537,9 +6537,121 @@ describe("Orchestrator", () => {
     expect(harness.runs[1]?.prompt).toContain(`Reference: ${createdSummary.summaryReference.id}`);
     expect(harness.runs[1]?.prompt).toContain("Continuation history summarization is not automated yet.");
     expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1/transcript");
-    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/TEST-1");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/issue-1");
     expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1");
     expect(harness.runs[1]?.prompt).not.toContain("Full relevant history:");
+  });
+
+  it("scopes continuation summaries to the lifecycle project context when duplicate identifiers collide", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-orchestrator-summary-scope-"));
+    const config = testConfig(path.join(root, "workspaces"));
+    const candidate = trackerIssue({
+      id: "issue-docs-1",
+      identifier: "ENG-123",
+      state: "Todo",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await runStore.startRun({
+      runId: "docs-run-1",
+      sessionId: "docs-session-1",
+      agentId: "docs-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Docs worker prompt",
+      workspaceKey: "docs__ENG-123",
+      workspacePath: path.join(root, "docs-eng-123"),
+      gitBranchName: "symphony/docs/ENG-123",
+      repoPath: root,
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: "docs-run-1",
+      at: "2026-01-01T00:00:01Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Docs context gathered.",
+    });
+    await runStore.startRun({
+      runId: "symphony-run-1",
+      sessionId: "symphony-session-1",
+      agentId: "symphony-agent-1",
+      role: "worker",
+      issueId: "issue-symphony-1",
+      issueIdentifier: candidate.identifier,
+      projectContext: {
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        linearProjectSlug: "ENG",
+        routingSource: "candidate_poll",
+      },
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Symphony worker prompt",
+      workspaceKey: "symphony__ENG-123",
+      workspacePath: path.join(root, "symphony-eng-123"),
+      gitBranchName: "symphony/symphony/ENG-123",
+      repoPath: root,
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: "symphony-run-1",
+      at: "2026-01-01T00:00:02Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Sibling context should not bleed into docs summary.",
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+
+    try {
+      const createdSummary = await orchestrator.createContinuationSummary(candidate);
+
+      expect(createdSummary.summaryReference.runIds).toEqual(["docs-run-1"]);
+      expect(createdSummary.summaryReference.transcriptPointers).toEqual(["/api/v1/runs/docs-run-1/transcript"]);
+      expect(createdSummary.summaryReference.statusApiPointers).toEqual([
+        "/api/v1/issues/issue-docs-1",
+        "/api/v1/issues/issue-docs-1/runs",
+        "/api/v1/runs/docs-run-1",
+      ]);
+      expect(createdSummary.summaryReference.summary).not.toContain("Sibling context should not bleed into docs summary.");
+    } finally {
+      await orchestrator.stop();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

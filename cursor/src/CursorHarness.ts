@@ -18,6 +18,7 @@ import {
   writeInitialOperatorChatMcpContext,
 } from "../../src/core/harness/HandoffMcp.js";
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
+import { projectContextResolutionFromIssue } from "../../src/core/config/ProjectContexts.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import { resolveCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
@@ -689,9 +690,14 @@ export class CursorHarness implements AgentHarness {
     const resumeOptions = cursorAgentBaseOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
       mcpServers,
     });
+    const projectContext = projectContextResolutionFromIssue(ctx.issue) ?? undefined;
     const latestRun =
       options.allowResume && ctx.role === "worker" && cursorRunPhase(ctx) === "implementation"
-        ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker", runPhase: "implementation" })
+        ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, {
+            role: "worker",
+            runPhase: "implementation",
+            ...(projectContext === undefined ? {} : { projectContext }),
+          })
         : null;
     let agent: SDKAgent;
     if (latestRun?.agentId) {

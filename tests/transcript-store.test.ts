@@ -11,8 +11,6 @@ async function startBasicRun(
   overrides: Partial<Parameters<FileRunTranscriptStore["startRun"]>[0]> = {},
 ): Promise<void> {
   await store.startRun({
-    ...overrides,
-    runId,
     role: "worker",
     issueId: "issue-1",
     issueIdentifier: "TEST-1",
@@ -27,6 +25,8 @@ async function startBasicRun(
     gitBranchName: "symphony/TEST-1",
     repoPath: "/repo",
     baseRef: "main",
+    ...overrides,
+    runId,
   });
 }
 
@@ -1058,6 +1058,91 @@ describe("FileRunTranscriptStore", () => {
 
     await expect(store.latestRunForIssue("TEST-1")).resolves.toMatchObject({ runId: "reviewer-run" });
     await expect(store.latestRunForIssue("TEST-1", { role: "worker" })).resolves.toMatchObject({ runId: "worker-run" });
+  });
+
+  it("scopes workspace and run readback by project context when identifiers collide", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await store.upsertWorkspace({
+      workspaceKey: "docs__ENG-123",
+      issueId: "issue-docs-1",
+      issueIdentifier: "ENG-123",
+      projectContext: docsProjectContext,
+      path: "/tmp/docs-eng-123",
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/docs/ENG-123",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await store.upsertWorkspace({
+      workspaceKey: "symphony__ENG-123",
+      issueId: "issue-symphony-1",
+      issueIdentifier: "ENG-123",
+      projectContext: symphonyProjectContext,
+      path: "/tmp/symphony-eng-123",
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/symphony/ENG-123",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:10:00.000Z",
+    });
+    await startBasicRun(store, "docs-run-1", {
+      issueId: "issue-docs-1",
+      issueIdentifier: "ENG-123",
+      projectContext: docsProjectContext,
+      workspaceKey: "docs__ENG-123",
+      workspacePath: "/tmp/docs-eng-123",
+      gitBranchName: "symphony/docs/ENG-123",
+    });
+    await startBasicRun(store, "symphony-run-1", {
+      issueId: "issue-symphony-1",
+      issueIdentifier: "ENG-123",
+      projectContext: symphonyProjectContext,
+      workspaceKey: "symphony__ENG-123",
+      workspacePath: "/tmp/symphony-eng-123",
+      gitBranchName: "symphony/symphony/ENG-123",
+    });
+
+    await expect(store.findWorkspace("ENG-123", { projectContext: docsProjectContext })).resolves.toMatchObject({
+      workspaceKey: "docs__ENG-123",
+      issueId: "issue-docs-1",
+      projectContext: { projectContextId: "docs" },
+    });
+    await expect(store.findWorkspace("ENG-123", { projectContext: symphonyProjectContext })).resolves.toMatchObject({
+      workspaceKey: "symphony__ENG-123",
+      issueId: "issue-symphony-1",
+      projectContext: { projectContextId: "symphony" },
+    });
+    await expect(store.findWorkspace("issue-docs-1", { projectContext: docsProjectContext })).resolves.toMatchObject({
+      workspaceKey: "docs__ENG-123",
+    });
+    await expect(store.listRunsForIssue("ENG-123", { projectContext: docsProjectContext })).resolves.toMatchObject([
+      { runId: "docs-run-1", issueId: "issue-docs-1", projectContext: { projectContextId: "docs" } },
+    ]);
+    await expect(store.listRunsForIssue("ENG-123", { projectContext: symphonyProjectContext })).resolves.toMatchObject([
+      { runId: "symphony-run-1", issueId: "issue-symphony-1", projectContext: { projectContextId: "symphony" } },
+    ]);
+    await expect(store.latestRunForIssue("ENG-123", { projectContext: docsProjectContext })).resolves.toMatchObject({
+      runId: "docs-run-1",
+      issueId: "issue-docs-1",
+      projectContext: { projectContextId: "docs" },
+    });
+    await expect(store.latestRunForIssue("ENG-123", { projectContext: symphonyProjectContext })).resolves.toMatchObject({
+      runId: "symphony-run-1",
+      issueId: "issue-symphony-1",
+      projectContext: { projectContextId: "symphony" },
+    });
   });
 
   it("orders equal-timestamp issue runs deterministically", async () => {
