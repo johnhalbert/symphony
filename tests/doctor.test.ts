@@ -435,12 +435,12 @@ github:
       workspace: {
         source: {
           kind: "git_worktree",
-          pathConfigured: true,
+          pathConfigured: false,
           repositoryConfigured: true,
-          refConfigured: true,
+          refConfigured: false,
           baseRefConfigured: true,
           branchTemplateConfigured: true,
-          cachePathConfigured: true,
+          cachePathConfigured: false,
           cleanup: "refuse_dirty",
         },
       },
@@ -454,12 +454,12 @@ github:
       workspace: {
         source: {
           kind: "git_worktree",
-          pathConfigured: true,
+          pathConfigured: false,
           repositoryConfigured: true,
-          refConfigured: true,
+          refConfigured: false,
           baseRefConfigured: true,
           branchTemplateConfigured: true,
-          cachePathConfigured: true,
+          cachePathConfigured: false,
           cleanup: "refuse_dirty",
         },
       },
@@ -473,12 +473,12 @@ github:
       workspace: {
         source: {
           kind: "git_worktree",
-          pathConfigured: true,
+          pathConfigured: false,
           repositoryConfigured: true,
-          refConfigured: true,
+          refConfigured: false,
           baseRefConfigured: true,
           branchTemplateConfigured: true,
-          cachePathConfigured: true,
+          cachePathConfigured: false,
           cleanup: "refuse_dirty",
         },
       },
@@ -491,6 +491,71 @@ github:
     expect(check.message).not.toContain("repo-secret");
     expect(check.message).not.toContain("x-access-token");
     expect(check.message).not.toContain("https://x-access-token:repo-secret@example.com/org/docs.git");
+  });
+
+  it("treats omitted workspace source fields as unconfigured in doctor summaries", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Archive",
+            enabled: false,
+          },
+        ],
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { SYMPHONY_LINEAR_API_KEY: "linear-secret" },
+    );
+
+    const check = projectContextSummaryDoctorCheck(config);
+    const prefix = `Configured project contexts (default: ${config.projectContexts.defaultContextId}): `;
+    const summary = JSON.parse(check.message.slice(prefix.length)) as Array<{
+      id: string;
+      workspace: {
+        source: {
+          kind: string | null;
+          pathConfigured: boolean;
+          repositoryConfigured: boolean;
+          refConfigured: boolean;
+          baseRefConfigured: boolean;
+          branchTemplateConfigured: boolean;
+          cachePathConfigured: boolean;
+        };
+      };
+      github: { tokenPresent: boolean };
+    }>;
+
+    expect(summary).toHaveLength(2);
+    expect(summary[1]).toMatchObject({
+      id: "archive",
+      workspace: {
+        source: {
+          kind: "none",
+          pathConfigured: false,
+          repositoryConfigured: false,
+          refConfigured: false,
+          baseRefConfigured: false,
+          branchTemplateConfigured: false,
+          cachePathConfigured: false,
+        },
+      },
+      github: { tokenPresent: false },
+    });
   });
 
   it("surfaces context-specific enabled project context validation errors through doctor parse checks", async () => {

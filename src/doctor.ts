@@ -168,12 +168,12 @@ export function projectContextSummaryDoctorCheck(config: ServiceConfig): DoctorC
     workspace: {
       source: {
         kind: context.workspace.source.kind,
-        pathConfigured: context.workspace.source.path !== null,
-        repositoryConfigured: context.workspace.source.repository !== null,
-        refConfigured: context.workspace.source.ref !== null,
-        baseRefConfigured: context.workspace.source.baseRef !== null,
-        branchTemplateConfigured: context.workspace.source.branchTemplate !== null,
-        cachePathConfigured: context.workspace.source.cachePath !== null,
+        pathConfigured: context.workspace.source.path != null,
+        repositoryConfigured: context.workspace.source.repository != null,
+        refConfigured: context.workspace.source.ref != null,
+        baseRefConfigured: context.workspace.source.baseRef != null,
+        branchTemplateConfigured: context.workspace.source.branchTemplate != null,
+        cachePathConfigured: context.workspace.source.cachePath != null,
         cleanup: context.workspace.source.cleanup,
       },
     },

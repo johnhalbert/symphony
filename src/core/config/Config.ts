@@ -614,6 +614,11 @@ export type WorkflowProjectContext = NormalizedProjectContext<
 
 export type WorkflowProjectContextRegistry = ProjectContextRegistry<WorkflowProjectContext>;
 
+export interface TopLevelParseDependencyDefaults {
+  tracker: TrackerConfig;
+  workspace: WorkspaceConfig;
+}
+
 export interface ServiceConfig {
   workflowPath: string;
   workflowDir: string;
@@ -638,6 +643,7 @@ export interface ServiceConfig {
   database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
   projectContexts: WorkflowProjectContextRegistry;
+  topLevelDefaults?: TopLevelParseDependencyDefaults;
   raw: RawWorkflowConfig;
 }
 
@@ -706,6 +712,17 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
 
   const raw = parsed.data;
   const workflowDir = path.dirname(path.resolve(workflowPath));
+  const topLevelDefaults: TopLevelParseDependencyDefaults = {
+    tracker: normalizeTrackerConfigForProjectContext(raw.tracker, env, {
+      enabled: false,
+      contextPath: "workflow",
+    }),
+    workspace: normalizeWorkspaceConfigForProjectContext(raw.workspace, workflowDir, env, {
+      enabled: false,
+      contextPath: "workflow",
+      requireExplicitWorkspaceSource: false,
+    }),
+  };
   const projectContexts = normalizeWorkflowProjectContexts(raw, workflowDir, env);
   const defaultContext = projectContexts.defaultContext;
   const tracker = defaultContext.tracker;
@@ -914,6 +931,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     database,
     issueBreakdown,
     projectContexts,
+    topLevelDefaults,
     raw,
   };
 }
@@ -1102,18 +1120,12 @@ function normalizeWorkspaceConfigForProjectContext(
   const root = resolvePathValue(rawWorkspace?.root ?? "symphony_workspaces", workflowDir, env);
   const stateDir = resolvePathValue(rawWorkspace?.state_dir ?? ".symphony", root, env);
   const sourceKind = rawWorkspace?.source?.kind ?? "none";
-  const sourcePath =
-    rawWorkspace?.source?.path === undefined
-      ? undefined
-      : resolvePathValue(rawWorkspace.source.path, workflowDir, env);
-  const sourceCachePath =
-    rawWorkspace?.source?.cache_path === undefined
-      ? undefined
-      : resolvePathValue(rawWorkspace.source.cache_path, workflowDir, env);
-  const sourceRepository =
-    rawWorkspace?.source?.repository === undefined
-      ? undefined
-      : resolveRepositoryValue(rawWorkspace.source.repository, workflowDir, env);
+  const sourcePath = resolveOptionalPathValue(rawWorkspace?.source?.path, workflowDir, env) ?? undefined;
+  const sourceCachePath = resolveOptionalPathValue(rawWorkspace?.source?.cache_path, workflowDir, env) ?? undefined;
+  const sourceRepository = resolveOptionalRepositoryValue(rawWorkspace?.source?.repository, workflowDir, env);
+  const sourceRef = resolveOptionalConfigStringValue(rawWorkspace?.source?.ref, env);
+  const sourceBaseRef = resolveOptionalConfigStringValue(rawWorkspace?.source?.base_ref, env);
+  const sourceBranchTemplate = resolveOptionalConfigStringValue(rawWorkspace?.source?.branch_template, env);
 
   if (options.enabled && options.requireExplicitWorkspaceSource && sourceKind === "none") {
     throw new SymphonyError(
@@ -1121,14 +1133,26 @@ function normalizeWorkspaceConfigForProjectContext(
       `${options.contextPath}.workspace.source is required for enabled project contexts`,
     );
   }
+  if (options.enabled && sourceKind === "copy" && sourcePath === undefined) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${options.contextPath}.workspace.source.path is required for copy`,
+    );
+  }
+  if (options.enabled && sourceKind === "git" && sourceRepository === undefined) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${options.contextPath}.workspace.source.repository is required for git`,
+    );
+  }
   if (options.enabled && sourceKind === "git_worktree") {
-    if (!rawWorkspace?.source?.repository) {
+    if (sourceRepository === undefined) {
       throw new SymphonyError(
         "config_validation_error",
         `${options.contextPath}.workspace.source.repository is required for git_worktree`,
       );
     }
-    if (!rawWorkspace?.source?.base_ref) {
+    if (sourceBaseRef === undefined) {
       throw new SymphonyError(
         "config_validation_error",
         `${options.contextPath}.workspace.source.base_ref is required for git_worktree`,
@@ -1136,21 +1160,51 @@ function normalizeWorkspaceConfigForProjectContext(
     }
   }
 
+  const sourceCleanup = rawWorkspace?.source?.cleanup;
+  const source: WorkspaceSourceConfig = {
+    kind: sourceKind,
+    ...(sourceCleanup === undefined ? {} : { cleanup: sourceCleanup }),
+  };
+
+  switch (sourceKind) {
+    case "copy":
+      if (sourcePath !== undefined) {
+        source.path = sourcePath;
+      }
+      break;
+    case "git":
+      if (sourceRepository !== undefined) {
+        source.repository = sourceRepository;
+      }
+      if (sourceRef !== undefined) {
+        source.ref = sourceRef;
+      }
+      break;
+    case "git_worktree":
+      if (sourcePath !== undefined) {
+        source.path = sourcePath;
+      }
+      if (sourceRepository !== undefined) {
+        source.repository = sourceRepository;
+      }
+      if (sourceBaseRef !== undefined) {
+        source.baseRef = sourceBaseRef;
+      }
+      if (sourceBranchTemplate !== undefined) {
+        source.branchTemplate = sourceBranchTemplate;
+      }
+      if (sourceCachePath !== undefined) {
+        source.cachePath = sourceCachePath;
+      }
+      break;
+    case "none":
+      break;
+  }
+
   return {
     root,
     stateDir,
-    source: {
-      kind: sourceKind,
-      ...(sourcePath === undefined ? {} : { path: sourcePath }),
-      ...(sourceRepository === undefined ? {} : { repository: sourceRepository }),
-      ...(rawWorkspace?.source?.ref === undefined ? {} : { ref: rawWorkspace.source.ref }),
-      ...(rawWorkspace?.source?.base_ref === undefined ? {} : { baseRef: rawWorkspace.source.base_ref }),
-      ...(rawWorkspace?.source?.branch_template === undefined
-        ? {}
-        : { branchTemplate: rawWorkspace.source.branch_template }),
-      ...(sourceCachePath === undefined ? {} : { cachePath: sourceCachePath }),
-      ...(rawWorkspace?.source?.cleanup === undefined ? {} : { cleanup: rawWorkspace.source.cleanup }),
-    },
+    source,
   };
 }
 
@@ -1373,6 +1427,15 @@ export function resolveConfigString(value: string | undefined, env: NodeJS.Proce
   const varMatch = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
   if (varMatch) return env[varMatch[1] ?? ""] ?? "";
   return value;
+}
+
+function resolveOptionalConfigStringValue(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
+  return normalizeOptionalConfigString(resolveConfigString(value, env)) ?? undefined;
+}
+
+function resolveOptionalRepositoryValue(value: string | undefined, baseDir: string, env: NodeJS.ProcessEnv): string | undefined {
+  const resolved = resolveOptionalConfigStringValue(value, env);
+  return resolved === undefined ? undefined : resolveRepositoryValue(resolved, baseDir, env);
 }
 
 export function resolvePathValue(value: string, baseDir: string, env: NodeJS.ProcessEnv): string {

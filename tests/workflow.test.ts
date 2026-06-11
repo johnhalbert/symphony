@@ -8,7 +8,7 @@ import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Conf
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
 import { WorkflowLoader, parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
-import { issue, multiProjectWorkflowConfig, projectContextFixture } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, multiProjectWorkflowDocument, projectContextFixture } from "./helpers.js";
 
 describe("workflow loading and prompt rendering", () => {
   it("parses YAML front matter and markdown body", () => {
@@ -25,6 +25,47 @@ Work on {{ issue.identifier }}.`,
 
     expect(workflow.config.tracker?.project_slug).toBe("TEST");
     expect(workflow.promptTemplate).toBe("Work on {{ issue.identifier }}.");
+  });
+
+  it("parses two named project contexts with distinct codebases and Linear projects from workflow front matter", () => {
+    const workflow = parseWorkflowFile(
+      multiProjectWorkflowDocument({
+        projectContexts: [
+          projectContextFixture({ id: "api", label: "API", projectSlug: "API", repository: "../api-repo" }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+          }),
+        ],
+        promptTemplate: "Route {{ issue.identifier }}.",
+      }),
+      "/repo/WORKFLOW.md",
+    );
+    const rawConfig = workflow.config as ReturnType<typeof multiProjectWorkflowConfig>;
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", { LINEAR_API_KEY: "secret" });
+
+    expect(workflow.promptTemplate).toBe("Route {{ issue.identifier }}.");
+    expect(rawConfig.tracker?.api_key).toBe("$LINEAR_API_KEY");
+    expect(rawConfig.project_contexts.map((context) => context.id)).toEqual(["api", "docs"]);
+    expect(rawConfig.project_contexts.map((context) => context.tracker?.project_slug)).toEqual(["API", "DOCS"]);
+    expect(rawConfig.project_contexts.map((context) => context.workspace?.source?.repository)).toEqual([
+      "../api-repo",
+      "../docs-site",
+    ]);
+    expect(config.projectContexts.defaultContextId).toBe("api");
+    expect(config.projectContexts.contexts.map((context) => context.id)).toEqual(["api", "docs"]);
+    expect(config.projectContexts.byId.get("api")).toMatchObject({
+      id: "api",
+      tracker: { projectSlug: "API" },
+      workspace: { source: { repository: path.resolve("/repo", "../api-repo") } },
+    });
+    expect(config.projectContexts.byId.get("docs")).toMatchObject({
+      id: "docs",
+      tracker: { projectSlug: "DOCS" },
+      workspace: { source: { repository: path.resolve("/repo", "../docs-site") } },
+    });
   });
 
   it("resolves typed config defaults and env indirection", () => {
@@ -1445,6 +1486,67 @@ describe("project context workflow contracts", () => {
     });
   });
 
+  it("allows three named project contexts when two share a codebase but target different Linear projects", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "Docs Authoring",
+            label: "Docs Authoring",
+            projectSlug: "DOCS_AUTHORING",
+            repository: "../docs-site",
+          }),
+          projectContextFixture({
+            id: "Docs Release",
+            label: "Docs Release",
+            projectSlug: "DOCS_RELEASE",
+            repository: "../docs-site",
+          }),
+          projectContextFixture({
+            id: "Ops Portal",
+            label: "Ops Portal",
+            projectSlug: "OPS",
+            repository: "../ops-portal",
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.projectContexts.contexts.map((context) => context.id)).toEqual([
+      "docs-authoring",
+      "docs-release",
+      "ops-portal",
+    ]);
+    expect(config.projectContexts.defaultContextId).toBe("docs-authoring");
+
+    const docsAuthoring = config.projectContexts.byId.get("docs-authoring");
+    const docsRelease = config.projectContexts.byId.get("docs-release");
+    const opsPortal = config.projectContexts.byId.get("ops-portal");
+
+    expect(docsAuthoring).toMatchObject({
+      id: "docs-authoring",
+      label: "Docs Authoring",
+      tracker: { projectSlug: "DOCS_AUTHORING" },
+      workspace: { source: { repository: path.resolve("/repo", "../docs-site") } },
+    });
+    expect(docsRelease).toMatchObject({
+      id: "docs-release",
+      label: "Docs Release",
+      tracker: { projectSlug: "DOCS_RELEASE" },
+      workspace: { source: { repository: path.resolve("/repo", "../docs-site") } },
+    });
+    expect(opsPortal).toMatchObject({
+      id: "ops-portal",
+      label: "Ops Portal",
+      tracker: { projectSlug: "OPS" },
+      workspace: { source: { repository: path.resolve("/repo", "../ops-portal") } },
+    });
+    expect(docsAuthoring?.workspace.source.repository).toBe(docsRelease?.workspace.source.repository);
+    expect(docsAuthoring?.tracker.projectSlug).not.toBe(docsRelease?.tracker.projectSlug);
+  });
+
   it("normalizes three configured project contexts within the performance budget without network calls", () => {
     const fetchSpy = vi.fn();
     vi.stubGlobal("fetch", fetchSpy);
@@ -1654,6 +1756,54 @@ describe("project context workflow contracts", () => {
       env: { DOCS_LINEAR_API_KEY: "docs-linear-secret" },
       expectedMessage: 'project_contexts["Docs Site"].workspace.source is required for enabled project contexts',
     },
+    {
+      label: "missing git_worktree repository",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              root: "./docs-workspaces",
+              source: {
+                kind: "git_worktree",
+                base_ref: "origin/main",
+              },
+            },
+          },
+        ],
+      },
+      env: { DOCS_LINEAR_API_KEY: "docs-linear-secret" },
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source.repository is required for git_worktree',
+    },
+    {
+      label: "missing git_worktree base ref",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              root: "./docs-workspaces",
+              source: {
+                kind: "git_worktree",
+                repository: "../docs-site",
+              },
+            },
+          },
+        ],
+      },
+      env: { DOCS_LINEAR_API_KEY: "docs-linear-secret" },
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source.base_ref is required for git_worktree',
+    },
   ])("rejects enabled project contexts with $label", ({ rawConfig, env, expectedMessage }) => {
     expect(() => parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env)).toThrowError(expectedMessage);
   });
@@ -1694,12 +1844,12 @@ describe("project context redaction", () => {
       workspace: {
         source: {
           kind: context.workspace.source.kind,
-          pathConfigured: context.workspace.source.path !== null,
-          repositoryConfigured: context.workspace.source.repository !== null,
-          refConfigured: context.workspace.source.ref !== null,
-          baseRefConfigured: context.workspace.source.baseRef !== null,
-          branchTemplateConfigured: context.workspace.source.branchTemplate !== null,
-          cachePathConfigured: context.workspace.source.cachePath !== null,
+          pathConfigured: context.workspace.source.path != null,
+          repositoryConfigured: context.workspace.source.repository != null,
+          refConfigured: context.workspace.source.ref != null,
+          baseRefConfigured: context.workspace.source.baseRef != null,
+          branchTemplateConfigured: context.workspace.source.branchTemplate != null,
+          cachePathConfigured: context.workspace.source.cachePath != null,
           cleanup: context.workspace.source.cleanup,
         },
       },
@@ -1721,12 +1871,12 @@ describe("project context redaction", () => {
       workspace: {
         source: {
           kind: "git_worktree",
-          pathConfigured: true,
+          pathConfigured: false,
           repositoryConfigured: true,
-          refConfigured: true,
+          refConfigured: false,
           baseRefConfigured: true,
           branchTemplateConfigured: true,
-          cachePathConfigured: true,
+          cachePathConfigured: false,
           cleanup: "refuse_dirty",
         },
       },
@@ -1886,8 +2036,7 @@ describe("project context redaction", () => {
         SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
         DOCS_LINEAR_API_KEY: "docs-linear-secret",
       },
-      expectedId: "docs-site",
-      expectedSourceKind: "copy",
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source.path is required for copy',
     },
     {
       label: "git source without repository",
@@ -1926,20 +2075,51 @@ describe("project context redaction", () => {
         SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
         DOCS_LINEAR_API_KEY: "docs-linear-secret",
       },
-      expectedId: "docs-site",
-      expectedSourceKind: "git",
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source.repository is required for git',
     },
-  ])("preserves enabled project contexts with $label source kinds", ({ rawConfig, env, expectedId, expectedSourceKind }) => {
-    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
-
-    expect(config.projectContexts.byId.get(expectedId)).toMatchObject({
-      id: expectedId,
-      enabled: true,
-      workspace: {
-        source: {
-          kind: expectedSourceKind,
-        },
+    {
+      label: "git_worktree source with unresolved repository env",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: "$DOCS_REPOSITORY",
+                base_ref: "$DOCS_BASE_REF",
+              },
+            },
+          },
+        ],
       },
-    });
+      env: {
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-secret",
+        DOCS_LINEAR_API_KEY: "docs-linear-secret",
+        DOCS_BASE_REF: "origin/main",
+      },
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source.repository is required for git_worktree',
+    },
+  ])("rejects enabled project contexts with insufficient $label", ({ rawConfig, env, expectedMessage }) => {
+    expect(() => parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env)).toThrowError(expectedMessage);
   });
 });

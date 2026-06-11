@@ -1,3 +1,4 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseServiceConfig, type RawProjectContextConfig } from "../src/core/config/Config.js";
 import {
@@ -433,6 +434,307 @@ describe("project context normalization", () => {
       label: "Ops Portal",
       tracker: { projectSlug: "OPS" },
       workspace: { source: { repository: expect.stringMatching(/ops-portal$/i) } },
+    });
+  });
+
+  it("keeps raw project_contexts alongside the normalized project context registry", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: " Docs Site ",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+          }),
+          projectContextFixture({
+            id: "ops_portal",
+            label: "Ops Portal",
+            projectSlug: "OPS",
+            repository: "../ops-portal",
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+
+    const rawContexts = config.raw.project_contexts;
+    expect(rawContexts).toHaveLength(2);
+
+    const rawDefaultContext: RawProjectContextConfig = rawContexts![0]!;
+    expect(rawDefaultContext.id).toBe(" Docs Site ");
+    expect(rawDefaultContext.workspace?.source?.repository).toBe("../docs-site");
+
+    expect(config.projectContexts.defaultContextId).toBe("docs-site");
+    expect(config.projectContexts.defaultContext.id).toBe("docs-site");
+    expect(config.projectContexts.byId.get("docs-site")).toMatchObject({
+      label: "Documentation Site",
+      tracker: { projectSlug: "DOCS" },
+      workspace: { source: { repository: expect.stringMatching(/docs-site$/i) } },
+    });
+    expect(config.projectContexts.byId.get("ops-portal")).toMatchObject({
+      label: "Ops Portal",
+      tracker: { projectSlug: "OPS" },
+      workspace: { source: { repository: expect.stringMatching(/ops-portal$/i) } },
+    });
+  });
+
+  it("merges top-level project defaults into explicit contexts before applying context overrides", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: "./global-workspaces",
+            state_dir: "./global-state",
+            source: {
+              kind: "git_worktree",
+              path: "$DEFAULT_SOURCE_PATH",
+              repository: "$DEFAULT_REPOSITORY",
+              base_ref: "$DEFAULT_BASE_REF",
+              branch_template: "$DEFAULT_BRANCH_TEMPLATE",
+              cache_path: "$DEFAULT_CACHE_PATH",
+              cleanup: "force",
+            },
+          },
+          github: {
+            owner: "top-owner",
+            repo: "top-repo",
+            head_owner: "top-head",
+            api_base_url: "https://example.invalid/api",
+            app: {
+              app_id: "123",
+              installation_id: "456",
+              private_key_path: "./keys/root.pem",
+            },
+            operator_approval: {
+              reject_policy: "fail",
+              poll_interval_ms: 1234,
+            },
+          },
+          review_loop: {
+            reviewer_prompt_extensions: ["top-reviewer"],
+            max_incomplete_turns: 5,
+          },
+          issue_breakdown: {
+            enabled: true,
+            planning_labels: ["global-planning"],
+            apply_to_linear: {
+              enabled: true,
+            },
+            workspace_mode: "none",
+          },
+          agent: {
+            harness: "hermes",
+            max_turns: 7,
+            max_concurrent_agents_by_state: {
+              Todo: 2,
+            },
+            protected_paths: ["global/**"],
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            workspaceRoot: "./docs-workspaces",
+            stateDir: "./docs-state",
+            repository: null,
+            baseRef: null,
+            branchTemplate: null,
+            workspace: {
+              source: {
+                path: "$DOCS_SOURCE_PATH",
+                repository: "../docs-site",
+                branch_template: "$DOCS_BRANCH_TEMPLATE",
+              },
+            },
+            github: {
+              repo: "docs-site",
+              operator_approval: {
+                required_for_publication: true,
+              },
+            },
+            review_loop: {
+              worker_prompt_extensions: ["docs-worker"],
+            },
+            issue_breakdown: {
+              apply_to_linear: {
+                enabled: false,
+              },
+              planning_labels: ["docs-planning"],
+            },
+            agent: {
+              max_turns: 3,
+              max_concurrent_agents_by_state: {
+                Review: 1,
+              },
+              protected_paths: ["docs/**"],
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-test-key",
+        DEFAULT_SOURCE_PATH: "./default-source",
+        DEFAULT_REPOSITORY: ".",
+        DEFAULT_BASE_REF: "origin/release",
+        DEFAULT_BRANCH_TEMPLATE: "global/{{ issue.identifier }}",
+        DEFAULT_CACHE_PATH: "./cache/shared",
+        DOCS_SOURCE_PATH: "./docs-source",
+        DOCS_BRANCH_TEMPLATE: "docs/{{ issue.identifier }}",
+      },
+    );
+
+    const docsContext = config.projectContexts.byId.get("docs");
+    expect(docsContext).toMatchObject({
+      workspace: {
+        root: path.resolve("/repo", "./docs-workspaces"),
+        stateDir: path.resolve("/repo", "./docs-workspaces", "./docs-state"),
+        source: {
+          kind: "git_worktree",
+          path: path.resolve("/repo", "./docs-source"),
+          repository: path.resolve("/repo", "../docs-site"),
+          baseRef: "origin/release",
+          branchTemplate: "docs/{{ issue.identifier }}",
+          cachePath: path.resolve("/repo", "./cache/shared"),
+        },
+      },
+      github: {
+        owner: "top-owner",
+        repo: "docs-site",
+        headOwner: "top-head",
+        apiBaseUrl: "https://example.invalid/api",
+        operatorApproval: {
+          requiredForPublication: true,
+          rejectPolicy: "fail",
+          pollIntervalMs: 1234,
+        },
+        app: {
+          appId: "123",
+          installationId: "456",
+          privateKeyPath: path.resolve("/repo", "./keys/root.pem"),
+        },
+      },
+      reviewLoop: {
+        reviewerPromptExtensions: ["top-reviewer"],
+        workerPromptExtensions: ["docs-worker"],
+        maxIncompleteTurns: 5,
+      },
+      issueBreakdown: {
+        enabled: true,
+        planningLabels: ["docs-planning"],
+        applyToLinear: {
+          enabled: false,
+          mode: "child_issues",
+        },
+        workspaceMode: "none",
+      },
+      agent: {
+        harness: "hermes",
+        maxTurns: 3,
+        protectedPaths: ["docs/**"],
+      },
+    });
+    expect(docsContext?.workspace.source.cleanup).toBe("refuse_dirty");
+    expect(docsContext?.publicMetadata.path).toBe(path.resolve("/repo", "./docs-source"));
+    expect(docsContext?.agent.maxConcurrentAgentsByState).toEqual(
+      new Map([
+        ["todo", 2],
+        ["review", 1],
+      ]),
+    );
+  });
+
+  it("drops inherited git_worktree workspace.source fields when explicit contexts switch source kinds", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            source: {
+              kind: "git_worktree",
+              repository: ".",
+              base_ref: "origin/release",
+              branch_template: "global/{{ issue.identifier }}",
+              cache_path: "./cache/shared",
+              cleanup: "force",
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs-copy",
+            label: "Docs Copy",
+            projectSlug: "DOCS_COPY",
+            repository: null,
+            baseRef: null,
+            branchTemplate: null,
+            workspace: {
+              source: {
+                kind: "copy",
+                path: "./docs-src",
+              },
+            },
+          }),
+          projectContextFixture({
+            id: "docs-git",
+            label: "Docs Git",
+            projectSlug: "DOCS_GIT",
+            repository: null,
+            baseRef: null,
+            branchTemplate: null,
+            workspace: {
+              source: {
+                kind: "git",
+                repository: "../docs-repo",
+                ref: "feature/docs",
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+
+    const copyContext = config.projectContexts.byId.get("docs-copy");
+    const gitContext = config.projectContexts.byId.get("docs-git");
+
+    expect(copyContext?.workspace.source).toEqual({
+      kind: "copy",
+      path: path.resolve("/repo", "./docs-src"),
+      cleanup: "refuse_dirty",
+    });
+    expect(copyContext?.publicMetadata).toEqual({
+      id: "docs-copy",
+      label: "Docs Copy",
+      enabled: true,
+      linearProjectSlug: "DOCS_COPY",
+      workspaceRoot: path.resolve("/repo", "./symphony_workspaces"),
+      workspaceSourceKind: "copy",
+      repository: null,
+      path: path.resolve("/repo", "./docs-src"),
+    });
+
+    expect(gitContext?.workspace.source).toEqual({
+      kind: "git",
+      repository: path.resolve("/repo", "../docs-repo"),
+      ref: "feature/docs",
+      cleanup: "refuse_dirty",
+    });
+    expect(gitContext?.publicMetadata).toEqual({
+      id: "docs-git",
+      label: "Docs Git",
+      enabled: true,
+      linearProjectSlug: "DOCS_GIT",
+      workspaceRoot: path.resolve("/repo", "./symphony_workspaces"),
+      workspaceSourceKind: "git",
+      repository: path.resolve("/repo", "../docs-repo"),
+      path: null,
     });
   });
 
