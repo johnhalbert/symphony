@@ -5,6 +5,8 @@ export const LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL = "Default";
 export const LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE = "legacy_default";
 
 const REDACTED = "[redacted]";
+const REPOSITORY_URL_PATTERN = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+const REPOSITORY_SCP_STYLE_PATTERN = /^([^/\\\s@]+)@([^:]+):(.+)$/;
 const URL_USERINFO_PATTERN = /\b((?:https?|ssh|git):\/\/)([^\s/@"']+(?::[^\s/@"']*)?)@/gi;
 
 export interface ProjectContextResolution {
@@ -280,5 +282,11 @@ function normalizeOptionalNonEmptyString(value: string | null | undefined): stri
 function sanitizePublicRepositoryValue(value: string | null | undefined): string | null {
   const normalized = normalizeOptionalNonEmptyString(value);
   if (normalized === null) return null;
-  return normalized.replace(URL_USERINFO_PATTERN, `$1${REDACTED}@`);
+  const scpStyleMatch = REPOSITORY_SCP_STYLE_PATTERN.exec(normalized);
+  if (scpStyleMatch) {
+    const [, _username, host, repositoryPath] = scpStyleMatch;
+    return `${REDACTED}@${host}:${repositoryPath}`;
+  }
+  if (!REPOSITORY_URL_PATTERN.test(normalized)) return normalized;
+  return normalized.replace(URL_USERINFO_PATTERN, `$1${REDACTED}@`).replace(/[?#].*$/, "");
 }

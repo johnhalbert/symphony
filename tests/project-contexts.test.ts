@@ -116,119 +116,190 @@ describe("project context normalization", () => {
     });
   });
 
-  it("omits sibling secrets and redacts credential-bearing repository URLs from public metadata helpers", () => {
-    const secretBearingContext = {
-      id: "docs",
-      label: "Documentation Site",
-      enabled: true,
-      tracker: {
-        projectSlug: "DOCS",
-        api_key: "linear-secret",
+  it("omits sibling secrets and sanitizes credential-bearing repository values from public metadata helpers", () => {
+    const repositoryCases = [
+      {
+        name: "embedded userinfo URL",
+        repository: "https://token:secret@example.com/acme/docs-site.git",
+        expected: "https://[redacted]@example.com/acme/docs-site.git",
+        leakedSubstring: "token:secret@example.com",
       },
-      workspace: {
-        root: "./docs-workspaces",
-        credential_profiles: { publication: "github-secret" },
-        source: {
-          kind: "git_worktree",
-          repository: "https://token:secret@example.com/acme/docs-site.git",
-          path: "packages/site",
-          private_key: "ssh-private-key",
+      {
+        name: "query token URL",
+        repository: "https://example.com/acme/docs-site.git?access_token=secret",
+        expected: "https://example.com/acme/docs-site.git",
+        leakedSubstring: "access_token=secret",
+      },
+      {
+        name: "fragment token URL",
+        repository: "https://example.com/acme/docs-site.git#token=secret",
+        expected: "https://example.com/acme/docs-site.git",
+        leakedSubstring: "token=secret",
+      },
+      {
+        name: "SCP-style remote",
+        repository: "secret-user@example.com:acme/docs-site.git",
+        expected: "[redacted]@example.com:acme/docs-site.git",
+        leakedSubstring: "secret-user@example.com",
+      },
+    ] as const;
+
+    for (const repositoryCase of repositoryCases) {
+      const secretBearingContext = {
+        id: "docs",
+        label: "Documentation Site",
+        enabled: true,
+        tracker: {
+          projectSlug: "DOCS",
+          api_key: "linear-secret",
         },
-      },
-      github: {
-        token: "github-secret",
-      },
-    };
+        workspace: {
+          root: "./docs-workspaces",
+          credential_profiles: { publication: "github-secret" },
+          source: {
+            kind: "git_worktree",
+            repository: repositoryCase.repository,
+            path: "packages/site",
+            private_key: "ssh-private-key",
+          },
+        },
+        github: {
+          token: "github-secret",
+        },
+      };
+      const metadata = projectContextMetadataForPublicRead(secretBearingContext);
 
-    const metadata = projectContextMetadataForPublicRead(secretBearingContext);
+      expect(metadata, repositoryCase.name).toEqual({
+        id: "docs",
+        label: "Documentation Site",
+        enabled: true,
+        linearProjectSlug: "DOCS",
+        workspaceRoot: "./docs-workspaces",
+        workspaceSourceKind: "git_worktree",
+        repository: repositoryCase.expected,
+        path: "packages/site",
+      });
+      expect(Object.keys(metadata).sort()).toEqual([
+        "enabled",
+        "id",
+        "label",
+        "linearProjectSlug",
+        "path",
+        "repository",
+        "workspaceRoot",
+        "workspaceSourceKind",
+      ]);
+      expect(metadata).not.toHaveProperty("api_key");
+      expect(metadata).not.toHaveProperty("credential_profiles");
+      expect(metadata).not.toHaveProperty("token");
 
-    expect(metadata).toEqual({
-      id: "docs",
-      label: "Documentation Site",
-      enabled: true,
-      linearProjectSlug: "DOCS",
-      workspaceRoot: "./docs-workspaces",
-      workspaceSourceKind: "git_worktree",
-      repository: "https://[redacted]@example.com/acme/docs-site.git",
-      path: "packages/site",
-    });
-    expect(Object.keys(metadata).sort()).toEqual([
-      "enabled",
-      "id",
-      "label",
-      "linearProjectSlug",
-      "path",
-      "repository",
-      "workspaceRoot",
-      "workspaceSourceKind",
-    ]);
-    expect(metadata).not.toHaveProperty("api_key");
-    expect(metadata).not.toHaveProperty("credential_profiles");
-    expect(metadata).not.toHaveProperty("token");
-    expect(JSON.stringify(metadata)).not.toContain("linear-secret");
-    expect(JSON.stringify(metadata)).not.toContain("github-secret");
-    expect(JSON.stringify(metadata)).not.toContain("ssh-private-key");
-    expect(JSON.stringify(metadata)).not.toContain("token:secret");
+      const serializedMetadata = JSON.stringify(metadata);
+      expect(serializedMetadata).not.toContain("linear-secret");
+      expect(serializedMetadata).not.toContain("github-secret");
+      expect(serializedMetadata).not.toContain("ssh-private-key");
+      expect(serializedMetadata).not.toContain(repositoryCase.leakedSubstring);
+    }
   });
 
   it("keeps resolved credential values out of normalized public metadata", () => {
-    const config = parseServiceConfig(
-      multiProjectWorkflowConfig({
-        projectContexts: [
-          projectContextFixture({
-            id: "symphony",
-            label: "Symphony",
-            projectSlug: "SYMPHONY",
-            repository: "$REPO_URL",
-            credential_profiles: {
-              profiles: {
-                publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
-                feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
-              },
-              roles: {
-                service: { "github.publication": "publication" },
-                reviewer: { "github.review_feedback_write": "feedback" },
-              },
-            },
-          }),
-        ],
-      }),
-      "/repo/WORKFLOW.md",
+    const repositoryCases = [
       {
-        LINEAR_API_KEY: "linear-test-key",
-        REPO_URL: "https://token:secret@example.com/acme/symphony.git",
-        GITHUB_PUBLICATION_TOKEN: "publication-secret",
-        GITHUB_FEEDBACK_TOKEN: "feedback-secret",
+        name: "plain HTTPS repository",
+        repository: "https://example.com/acme/symphony.git",
+        expected: "https://example.com/acme/symphony.git",
+        leakedSubstring: null,
       },
-    );
+      {
+        name: "embedded userinfo URL",
+        repository: "https://token:secret@example.com/acme/symphony.git",
+        expected: "https://[redacted]@example.com/acme/symphony.git",
+        leakedSubstring: "token:secret@example.com",
+      },
+      {
+        name: "query token URL",
+        repository: "https://example.com/acme/symphony.git?access_token=secret",
+        expected: "https://example.com/acme/symphony.git",
+        leakedSubstring: "access_token=secret",
+      },
+      {
+        name: "fragment token URL",
+        repository: "https://example.com/acme/symphony.git#token=secret",
+        expected: "https://example.com/acme/symphony.git",
+        leakedSubstring: "token=secret",
+      },
+      {
+        name: "SCP-style remote",
+        repository: "secret-user@example.com:acme/symphony.git",
+        expected: "[redacted]@example.com:acme/symphony.git",
+        leakedSubstring: "secret-user@example.com",
+      },
+    ] as const;
 
-    const publicMetadata = config.projectContexts.defaultContext.publicMetadata;
-    expect(publicMetadata).toMatchObject({
-      id: "symphony",
-      label: "Symphony",
-      enabled: true,
-      linearProjectSlug: "SYMPHONY",
-      workspaceSourceKind: "git_worktree",
-      repository: "https://[redacted]@example.com/acme/symphony.git",
-      path: null,
-    });
-    expect(publicMetadata.workspaceRoot).toMatch(/symphony_workspaces$/i);
-    expect(Object.keys(publicMetadata).sort()).toEqual([
-      "enabled",
-      "id",
-      "label",
-      "linearProjectSlug",
-      "path",
-      "repository",
-      "workspaceRoot",
-      "workspaceSourceKind",
-    ]);
-    expect(publicMetadata).not.toHaveProperty("credentialProfiles");
-    expect(publicMetadata).not.toHaveProperty("token");
-    expect(JSON.stringify(publicMetadata)).not.toContain("linear-test-key");
-    expect(JSON.stringify(publicMetadata)).not.toContain("publication-secret");
-    expect(JSON.stringify(publicMetadata)).not.toContain("feedback-secret");
-    expect(JSON.stringify(publicMetadata)).not.toContain("token:secret");
+    for (const repositoryCase of repositoryCases) {
+      const config = parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: "$REPO_URL",
+              credential_profiles: {
+                profiles: {
+                  publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+                  feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+                },
+                roles: {
+                  service: { "github.publication": "publication" },
+                  reviewer: { "github.review_feedback_write": "feedback" },
+                },
+              },
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        {
+          LINEAR_API_KEY: "linear-test-key",
+          REPO_URL: repositoryCase.repository,
+          GITHUB_PUBLICATION_TOKEN: "publication-secret",
+          GITHUB_FEEDBACK_TOKEN: "feedback-secret",
+        },
+      );
+
+      const context = config.projectContexts.defaultContext;
+      const publicMetadata = context.publicMetadata;
+      expect(publicMetadata, repositoryCase.name).toMatchObject({
+        id: "symphony",
+        label: "Symphony",
+        enabled: true,
+        linearProjectSlug: "SYMPHONY",
+        workspaceSourceKind: "git_worktree",
+        repository: repositoryCase.expected,
+        path: null,
+      });
+      expect(context.workspace.source.repository, repositoryCase.name).toBe(repositoryCase.repository);
+      expect(publicMetadata.workspaceRoot).toMatch(/symphony_workspaces$/i);
+      expect(Object.keys(publicMetadata).sort()).toEqual([
+        "enabled",
+        "id",
+        "label",
+        "linearProjectSlug",
+        "path",
+        "repository",
+        "workspaceRoot",
+        "workspaceSourceKind",
+      ]);
+      expect(publicMetadata).not.toHaveProperty("credentialProfiles");
+      expect(publicMetadata).not.toHaveProperty("token");
+
+      const serializedMetadata = JSON.stringify(publicMetadata);
+      expect(serializedMetadata).not.toContain("linear-test-key");
+      expect(serializedMetadata).not.toContain("publication-secret");
+      expect(serializedMetadata).not.toContain("feedback-secret");
+      if (repositoryCase.leakedSubstring !== null) {
+        expect(serializedMetadata).not.toContain(repositoryCase.leakedSubstring);
+      }
+    }
   });
 
   it("normalizes legacy top-level config into an explicit default project context", () => {
