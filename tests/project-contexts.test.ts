@@ -160,6 +160,18 @@ describe("project context normalization", () => {
         expected: "[redacted]@example.com:acme/docs-site.git",
         leakedSubstring: "secret-user@example.com",
       },
+      {
+        name: "SCP-style remote with whitespace in username",
+        repository: "secret user@example.com:acme/docs-site.git",
+        expected: "[redacted]@example.com:acme/docs-site.git",
+        leakedSubstring: "secret user@example.com",
+      },
+      {
+        name: "SCP-style remote with multiple at-signs in username",
+        repository: "secret@user@example.com:acme/docs-site.git",
+        expected: "[redacted]@example.com:acme/docs-site.git",
+        leakedSubstring: "user@example.com",
+      },
     ] as const;
 
     for (const repositoryCase of repositoryCases) {
@@ -268,6 +280,18 @@ describe("project context normalization", () => {
         repository: "secret-user@example.com:acme/symphony.git",
         expected: "[redacted]@example.com:acme/symphony.git",
         leakedSubstring: "secret-user@example.com",
+      },
+      {
+        name: "SCP-style remote with whitespace in username",
+        repository: "secret user@example.com:acme/symphony.git",
+        expected: "[redacted]@example.com:acme/symphony.git",
+        leakedSubstring: "secret user@example.com",
+      },
+      {
+        name: "SCP-style remote with multiple at-signs in username",
+        repository: "secret@user@example.com:acme/symphony.git",
+        expected: "[redacted]@example.com:acme/symphony.git",
+        leakedSubstring: "user@example.com",
       },
     ] as const;
 

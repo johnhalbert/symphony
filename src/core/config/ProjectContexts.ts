@@ -6,7 +6,7 @@ export const LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE = "legacy_default";
 
 const REDACTED = "[redacted]";
 const REPOSITORY_URL_PATTERN = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
-const REPOSITORY_SCP_STYLE_PATTERN = /^([^/\\\s@]+)@([^:]+):(.+)$/;
+const REPOSITORY_SCP_STYLE_PATTERN = /^([^/\\]+)@([^:]+):(.+)$/;
 const URL_USERINFO_PATTERN = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s?#]*)@/gi;
 
 export interface ProjectContextResolution {

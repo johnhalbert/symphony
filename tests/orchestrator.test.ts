@@ -2534,12 +2534,21 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
 
       expect(orchestrator.snapshot().counts.running).toBe(1);
+      expect(orchestrator.snapshot().running[0]?.liveness.idleAlert).toMatchObject({
+        active: false,
+        reason: "suppressed",
+      });
       const runningRun = await runStore.getRun(runId);
       expect(runningRun).toMatchObject({
         status: "running",
       });
       expect(runningRun?.pendingApprovalRequestId ?? null).toBeNull();
       expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
+        incompleteTurnCount: 0,
+      });
       await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(1);
 
     } finally {
