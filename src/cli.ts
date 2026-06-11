@@ -288,6 +288,7 @@ program
             orchestrator,
             workspaceManager,
             workspaceOpener: opener,
+            defaultProjectContextId: config.projectContexts.defaultContextId,
             runStore,
             orchestratorConversationStore,
             lifecycleStore,

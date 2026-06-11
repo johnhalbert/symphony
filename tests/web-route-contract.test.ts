@@ -1164,6 +1164,124 @@ describe("/api/v1/web route contracts", () => {
     ]);
   });
 
+  it("resolves legacy web transcript aliases through the compatibility default context", async () => {
+    const runStore = new RecordingRunStore(
+      [
+        runRecordFixture({
+          runId: "run-default-alias-1",
+          sessionId: "session-default-alias-1",
+          issueId: "issue-default-alias-1",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+        }),
+      ],
+      {
+        "run-default-alias-1": [
+          {
+            runId: "run-default-alias-1",
+            sequence: 1,
+            at: "2026-05-31T00:00:30.000Z",
+            source: "runtime",
+            eventType: "assistant_complete",
+            message: "served from compatibility default alias",
+          },
+        ],
+      },
+    );
+    const { server, calls } = createStatusServer(root, {
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const transcript = await getJson(`${baseUrl}/api/v1/web/sessions/ENG-179/transcript`);
+      const payload = transcript.body as { messages: Array<{ text?: string }>; window: { kind: string; limit: number } };
+
+      expect(transcript.response.status).toBe(200);
+      expect(payload.window).toMatchObject({ kind: "tail", limit: 500 });
+      expect(payload.messages).toEqual(
+        expect.arrayContaining([expect.objectContaining({ text: "served from compatibility default alias" })]),
+      );
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(1);
+  });
+
+  it("fails closed for ambiguous legacy web transcript aliases while qualified aliases still resolve", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const runStore = new RecordingRunStore(
+      [
+        runRecordFixture({
+          runId: "run-default-ambiguous-1",
+          sessionId: "session-default-ambiguous-1",
+          issueId: "issue-default-ambiguous-1",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+        }),
+        runRecordFixture({
+          runId: "run-docs-ambiguous-1",
+          sessionId: "session-docs-ambiguous-1",
+          issueId: "issue-docs-ambiguous-1",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+          projectContext: docsProjectContext,
+        }),
+      ],
+      {
+        "run-default-ambiguous-1": [
+          {
+            runId: "run-default-ambiguous-1",
+            sequence: 1,
+            at: "2026-05-31T00:00:30.000Z",
+            source: "runtime",
+            eventType: "assistant_complete",
+            message: "default transcript alias",
+          },
+        ],
+        "run-docs-ambiguous-1": [
+          {
+            runId: "run-docs-ambiguous-1",
+            sequence: 1,
+            at: "2026-05-31T00:00:31.000Z",
+            source: "runtime",
+            eventType: "assistant_complete",
+            message: "docs transcript alias",
+          },
+        ],
+      },
+    );
+    const { server, calls } = createStatusServer(root, {
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const ambiguous = await getJson(`${baseUrl}/api/v1/web/sessions/ENG-179/transcript`);
+      expectTranscriptWindowPayload(ambiguous.body, [], { kind: "tail", limit: 500 });
+
+      const qualified = await getJson(`${baseUrl}/api/v1/web/sessions/docs%3AENG-179/transcript`);
+      const qualifiedBody = qualified.body as { messages: Array<{ text?: string }>; window: { kind: string; limit: number } };
+      expect(qualified.response.status).toBe(200);
+      expect(qualifiedBody.window).toMatchObject({ kind: "tail", limit: 500 });
+      expect(qualifiedBody.messages).toEqual(expect.arrayContaining([expect.objectContaining({ text: "docs transcript alias" })]));
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(1);
+  });
+
   it("returns explicit stale responses without rebuilding canonical web projection sources", async () => {
     const staleDashboard = {
       projectName: "Stale durable dashboard",
@@ -2037,6 +2155,7 @@ interface CreateStatusServerOptions {
   projectionWriter?: StatusServerProjectionWriter;
   projectionReader?: StatusServerProjectionReader;
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
+  defaultProjectContextId?: string | null;
   runStore?: RunTranscriptStore;
   tracker?: TrackerClient;
   webProjectionContextClock?: () => Date;
@@ -2480,6 +2599,7 @@ function createStatusServer(
         logger: new StructuredLogger(() => undefined),
       }),
       workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: options.defaultProjectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: null,

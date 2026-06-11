@@ -25,7 +25,7 @@ import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import type { Issue, IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } from "../src/core/types.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, testConfig } from "./helpers.js";
 
 describe("StatusServer durable API", () => {
   let root: string;
@@ -37,6 +37,12 @@ describe("StatusServer durable API", () => {
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
   });
+
+  async function stripPersistedProjectContext(filePath: string): Promise<void> {
+    const record = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+    delete record.projectContext;
+    await writeFile(filePath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  }
 
   it("serves durable issue, run, transcript, and workspace records", async () => {
     const config = testConfig(path.join(root, "workspaces"));
@@ -634,6 +640,262 @@ describe("StatusServer durable API", () => {
       expect(runsBody.runs[0]?.projectContext).toMatchObject(legacyDefaultProjectContext);
       expect(runBody.projectContext).toMatchObject(legacyDefaultProjectContext);
       expect(workspaceBody.projectContext).toMatchObject(legacyDefaultProjectContext);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("resolves legacy unqualified status and transcript aliases through the configured default project context", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "workspaces"),
+            state_dir: path.join(root, ".symphony"),
+          },
+        },
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "DEFAULT-ALIAS-1",
+      issueId: "issue-default-alias-1",
+      issueIdentifier: "DEFAULT-ALIAS-1",
+      path: path.join(config.workspace.root, "DEFAULT-ALIAS-1"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/DEFAULT-ALIAS-1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-default-alias-1",
+      sessionId: "session-default-alias-1",
+      agentId: "agent-default-alias-1",
+      role: "worker",
+      issueId: "issue-default-alias-1",
+      issueIdentifier: "DEFAULT-ALIAS-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "DEFAULT-ALIAS-1",
+      workspacePath: path.join(config.workspace.root, "DEFAULT-ALIAS-1"),
+      gitBranchName: "symphony/DEFAULT-ALIAS-1",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+    });
+    await runStore.appendEvent({
+      runId: "run-default-alias-1",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "resolved through compatibility default",
+    });
+    await lifecycleStore.ensureIssue(issue({ id: "issue-default-alias-1", identifier: "DEFAULT-ALIAS-1" }), { phase: "implementation" });
+
+    await stripPersistedProjectContext(path.join(config.workspace.stateDir, "runs", "run-default-alias-1", "meta.json"));
+    await stripPersistedProjectContext(path.join(config.workspace.stateDir, "workspaces", "DEFAULT-ALIAS-1.json"));
+    await stripPersistedProjectContext(path.join(config.workspace.stateDir, "issue-lifecycle", "issue-default-alias-1.json"));
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/DEFAULT-ALIAS-1`);
+      const runsResponse = await fetch(`${baseUrl}/api/v1/issues/DEFAULT-ALIAS-1/runs`);
+      const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/DEFAULT-ALIAS-1`);
+      const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/DEFAULT-ALIAS-1/transcript?limit=10`);
+
+      const issueBody = (await issueResponse.json()) as {
+        latestRun: { runId: string; projectContext: { projectContextId: string } } | null;
+        workspace: { workspaceKey: string; projectContext: { projectContextId: string } } | null;
+        lifecycle: { issueIdentifier: string; projectContext: { projectContextId: string } } | null;
+      };
+      const runsBody = (await runsResponse.json()) as { runs: Array<{ runId: string; projectContext: { projectContextId: string } }> };
+      const workspaceBody = (await workspaceResponse.json()) as { workspaceKey: string; projectContext: { projectContextId: string } };
+      const transcriptBody = (await transcriptResponse.json()) as { runId: string; events: Array<{ message?: string }> };
+
+      expect(issueResponse.status).toBe(200);
+      expect(runsResponse.status).toBe(200);
+      expect(workspaceResponse.status).toBe(200);
+      expect(transcriptResponse.status).toBe(200);
+      expect(issueBody.latestRun).toMatchObject({ runId: "run-default-alias-1", projectContext: { projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID } });
+      expect(issueBody.workspace).toMatchObject({ workspaceKey: "DEFAULT-ALIAS-1", projectContext: { projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID } });
+      expect(issueBody.lifecycle).toMatchObject({ issueIdentifier: "DEFAULT-ALIAS-1", projectContext: { projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID } });
+      expect(runsBody.runs).toEqual([
+        expect.objectContaining({
+          runId: "run-default-alias-1",
+          projectContext: expect.objectContaining({ projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID }),
+        }),
+      ]);
+      expect(workspaceBody).toMatchObject({ workspaceKey: "DEFAULT-ALIAS-1", projectContext: { projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID } });
+      expect(transcriptBody.runId).toBe("run-default-alias-1");
+      expect(transcriptBody.events).toEqual([
+        expect.objectContaining({ message: "resolved through compatibility default" }),
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("fails closed for ambiguous legacy unqualified status and transcript aliases across project contexts", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "workspaces"),
+            state_dir: path.join(root, ".symphony"),
+          },
+        },
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "AMBIGUOUS-ALIAS-1",
+      issueId: "issue-default-ambiguous-1",
+      issueIdentifier: "AMBIGUOUS-ALIAS-1",
+      path: path.join(config.workspace.root, "AMBIGUOUS-ALIAS-1"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/AMBIGUOUS-ALIAS-1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-default-ambiguous-1",
+      sessionId: "session-default-ambiguous-1",
+      agentId: "agent-default-ambiguous-1",
+      role: "worker",
+      issueId: "issue-default-ambiguous-1",
+      issueIdentifier: "AMBIGUOUS-ALIAS-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "AMBIGUOUS-ALIAS-1",
+      workspacePath: path.join(config.workspace.root, "AMBIGUOUS-ALIAS-1"),
+      gitBranchName: "symphony/AMBIGUOUS-ALIAS-1",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+    });
+    await runStore.appendEvent({
+      runId: "run-default-ambiguous-1",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "default transcript",
+    });
+    await lifecycleStore.ensureIssue(issue({ id: "issue-default-ambiguous-1", identifier: "AMBIGUOUS-ALIAS-1" }), { phase: "implementation" });
+
+    await stripPersistedProjectContext(path.join(config.workspace.stateDir, "runs", "run-default-ambiguous-1", "meta.json"));
+    await stripPersistedProjectContext(path.join(config.workspace.stateDir, "workspaces", "AMBIGUOUS-ALIAS-1.json"));
+    await stripPersistedProjectContext(path.join(config.workspace.stateDir, "issue-lifecycle", "issue-default-ambiguous-1.json"));
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "AMBIGUOUS-ALIAS-1",
+      issueId: "issue-docs-ambiguous-1",
+      issueIdentifier: "AMBIGUOUS-ALIAS-1",
+      path: path.join(config.workspace.root, "docs", "AMBIGUOUS-ALIAS-1"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/docs/AMBIGUOUS-ALIAS-1",
+      projectContext: docsProjectContext,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-docs-ambiguous-1",
+      sessionId: "session-docs-ambiguous-1",
+      agentId: "agent-docs-ambiguous-1",
+      role: "worker",
+      issueId: "issue-docs-ambiguous-1",
+      issueIdentifier: "AMBIGUOUS-ALIAS-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      workspaceKey: "AMBIGUOUS-ALIAS-1",
+      workspacePath: path.join(config.workspace.root, "docs", "AMBIGUOUS-ALIAS-1"),
+      gitBranchName: "symphony/docs/AMBIGUOUS-ALIAS-1",
+      repoPath: "/repo-docs",
+      baseRef: "origin/main",
+      projectContext: docsProjectContext,
+    });
+    await runStore.appendEvent({
+      runId: "run-docs-ambiguous-1",
+      at: "2026-01-01T00:00:02.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "docs transcript",
+    });
+    await lifecycleStore.ensureIssue(
+      issue({ id: "issue-docs-ambiguous-1", identifier: "AMBIGUOUS-ALIAS-1" }),
+      { phase: "implementation", projectContext: docsProjectContext },
+    );
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/AMBIGUOUS-ALIAS-1`);
+      const runsResponse = await fetch(`${baseUrl}/api/v1/issues/AMBIGUOUS-ALIAS-1/runs`);
+      const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/AMBIGUOUS-ALIAS-1`);
+      const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/AMBIGUOUS-ALIAS-1/transcript?limit=10`);
+
+      const issueBody = (await issueResponse.json()) as { error: { message: string } };
+      const runsBody = (await runsResponse.json()) as { error: { message: string } };
+      const workspaceBody = (await workspaceResponse.json()) as { error: { message: string } };
+      const transcriptBody = (await transcriptResponse.json()) as { error: { message: string } };
+
+      expect(issueResponse.status).toBe(404);
+      expect(runsResponse.status).toBe(404);
+      expect(workspaceResponse.status).toBe(404);
+      expect(transcriptResponse.status).toBe(404);
+      expect(issueBody.error.message).toContain("context-qualified alias");
+      expect(runsBody.error.message).toContain("context-qualified alias");
+      expect(workspaceBody.error.message).toContain("context-qualified alias");
+      expect(transcriptBody.error.message).toContain("context-qualified alias");
     } finally {
       await server.stop();
     }
