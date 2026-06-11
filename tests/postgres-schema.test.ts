@@ -4269,6 +4269,7 @@ async function expectPostgresRunActivityAppendStoreAppendAndDuplicatePath(connec
         INSERT INTO symphony.run_session (
           run_id,
           session_id,
+          project_context_id,
           agent_id,
           role,
           issue_key,
@@ -4283,6 +4284,7 @@ async function expectPostgresRunActivityAppendStoreAppendAndDuplicatePath(connec
         ) VALUES (
           $1,
           $2,
+          'docs',
           'agent:configured-append',
           'worker',
           'issue:configured-append',
@@ -4332,15 +4334,16 @@ async function expectPostgresRunActivityAppendStoreAppendAndDuplicatePath(connec
       metadata: { appendRevision: first.metadata.appendRevision, sequence: 1 },
     });
 
-    const persisted = await pool.query<{ count: string; max_sequence: number }>(
+    const persisted = await pool.query<{ project_context_id: string; count: string; max_sequence: number }>(
       `
-        SELECT count(*)::text AS count, max(sequence)::int AS max_sequence
+        SELECT project_context_id, count(*)::text AS count, max(sequence)::int AS max_sequence
         FROM symphony.run_activity_event
         WHERE run_session_id = $1
+        GROUP BY project_context_id
       `,
       [runSessionId],
     );
-    expect(persisted.rows[0]).toMatchObject({ count: "1", max_sequence: 1 });
+    expect(persisted.rows).toEqual([{ project_context_id: "docs", count: "1", max_sequence: 1 }]);
   } finally {
     await pool.end();
   }

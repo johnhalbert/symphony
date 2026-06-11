@@ -603,9 +603,9 @@ class FakeAppendAndChatReducerPostgresClient implements PostgresRunActivityChatM
       return { rows: [] as T[] };
     }
 
-    if (normalized.startsWith("SELECT run_id FROM symphony.run_session")) {
+    if (normalized.startsWith("SELECT run_id, project_context_id FROM symphony.run_session")) {
       const runIds = values?.[0] as readonly string[];
-      return { rows: runIds.map((run_id) => ({ run_id }) as unknown as T) };
+      return { rows: runIds.map((run_id) => ({ run_id, project_context_id: "symphony" }) as unknown as T) };
     }
 
     if (normalized.startsWith("SELECT run_activity_event_id::text AS append_revision")) {
@@ -618,24 +618,25 @@ class FakeAppendAndChatReducerPostgresClient implements PostgresRunActivityChatM
         append_revision: String(this.activityRows.length + 1),
         event_id: insertValues[0],
         run_id: insertValues[1],
-        session_id: insertValues[2],
-        run_session_id: insertValues[3],
-        sequence: insertValues[4],
-        sequence_source: insertValues[5],
-        event_at: insertValues[6],
-        protocol: insertValues[7],
-        harness_id: insertValues[8],
-        external_event_id: insertValues[9],
-        actor: insertValues[10],
-        channel: insertValues[11],
-        kind: insertValues[12],
-        text: insertValues[13],
-        payload: JSON.parse(String(insertValues[15])),
-        payload_schema: insertValues[16],
-        payload_truncated: insertValues[17],
-        payload_byte_length: insertValues[18],
-        raw_payload_ref_id: insertValues[19],
-        metadata: JSON.parse(String(insertValues[20])),
+        project_context_id: insertValues[2],
+        session_id: insertValues[3],
+        run_session_id: insertValues[4],
+        sequence: insertValues[5],
+        sequence_source: insertValues[6],
+        event_at: insertValues[7],
+        protocol: insertValues[8],
+        harness_id: insertValues[9],
+        external_event_id: insertValues[10],
+        actor: insertValues[11],
+        channel: insertValues[12],
+        kind: insertValues[13],
+        text: insertValues[14],
+        payload: JSON.parse(String(insertValues[16])),
+        payload_schema: insertValues[17],
+        payload_truncated: insertValues[18],
+        payload_byte_length: insertValues[19],
+        raw_payload_ref_id: insertValues[20],
+        metadata: JSON.parse(String(insertValues[21])),
         created_at: "2026-05-31T00:00:01.000Z",
       });
       this.activityRows.push(row);

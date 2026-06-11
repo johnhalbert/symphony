@@ -195,7 +195,7 @@ describe("RunActivityAppendStore", () => {
   });
 
   it("wraps Postgres appends in one transaction and persists normalized ordering metadata", async () => {
-    const client = new FakeRunActivityPostgresClient();
+    const client = new FakeRunActivityPostgresClient({ runProjectContextIds: { "run-postgres": "docs" } });
     const store = new PostgresRunActivityAppendStore({ connect: async () => client });
     const notifications: { event: unknown; lastStatement: string | undefined }[] = [];
     store.onProjectionChanged((event) => notifications.push({ event, lastStatement: client.normalizedStatements.at(-1) }));
@@ -248,9 +248,10 @@ describe("RunActivityAppendStore", () => {
         }),
       },
     ]);
-    expect(client.insertValues[0]?.slice(0, 10)).toEqual([
+    expect(client.insertValues[0]?.slice(0, 11)).toEqual([
       "activity-postgres",
       "run-postgres",
+      "docs",
       "session-postgres",
       "run-postgres:custom-scope",
       1,
@@ -303,9 +304,11 @@ class FakeRunActivityPostgresClient implements PostgresRunActivityAppendClient {
   released = false;
   private readonly rows: QueryResultRow[] = [];
   private readonly failInserts: boolean;
+  private readonly runProjectContextIds: Record<string, string>;
 
-  constructor(options: { failInserts?: boolean } = {}) {
+  constructor(options: { failInserts?: boolean; runProjectContextIds?: Record<string, string> } = {}) {
     this.failInserts = options.failInserts ?? false;
+    this.runProjectContextIds = options.runProjectContextIds ?? {};
   }
 
   async query<T extends QueryResultRow = QueryResultRow>(text: string, values?: readonly unknown[]): Promise<{ rows: T[] }> {
@@ -316,9 +319,17 @@ class FakeRunActivityPostgresClient implements PostgresRunActivityAppendClient {
       return { rows: [] as T[] };
     }
 
-    if (normalized.startsWith("SELECT run_id FROM symphony.run_session")) {
+    if (normalized.startsWith("SELECT run_id, project_context_id FROM symphony.run_session")) {
       const runIds = values?.[0] as readonly string[];
-      return { rows: runIds.map((run_id) => ({ run_id }) as unknown as T) };
+      return {
+        rows: runIds.map(
+          (run_id) =>
+            ({
+              run_id,
+              project_context_id: this.runProjectContextIds[run_id] ?? "default",
+            }) as unknown as T,
+        ),
+      };
     }
 
     if (normalized.startsWith("SELECT count(*)::bigint AS total FROM symphony.run_activity_event")) {
@@ -346,28 +357,53 @@ class FakeRunActivityPostgresClient implements PostgresRunActivityAppendClient {
       if (this.failInserts) throw new Error("insert failed");
       const insertValues = [...(values ?? [])];
       (this.insertValues as unknown[][]).push(insertValues);
+      const [
+        event_id,
+        run_id,
+        project_context_id,
+        session_id,
+        run_session_id,
+        sequence,
+        sequence_source,
+        event_at,
+        protocol,
+        harness_id,
+        external_event_id,
+        actor,
+        channel,
+        kind,
+        text,
+        _text_char_count,
+        payload,
+        payload_schema,
+        payload_truncated,
+        payload_byte_length,
+        raw_payload_ref_id,
+        metadata,
+      ] = insertValues;
       const row = {
         append_revision: String(this.rows.length + 1),
-        event_id: insertValues[0],
-        run_id: insertValues[1],
-        session_id: insertValues[2],
-        run_session_id: insertValues[3],
-        sequence: insertValues[4],
-        sequence_source: insertValues[5],
-        event_at: insertValues[6],
-        protocol: insertValues[7],
-        harness_id: insertValues[8],
-        external_event_id: insertValues[9],
-        actor: insertValues[10],
-        channel: insertValues[11],
-        kind: insertValues[12],
-        text: insertValues[13],
-        payload: JSON.parse(String(insertValues[15])),
-        payload_schema: insertValues[16],
-        payload_truncated: insertValues[17],
-        payload_byte_length: insertValues[18],
-        raw_payload_ref_id: insertValues[19],
-        metadata: JSON.parse(String(insertValues[20])),
+        event_id,
+        run_id,
+        project_context_id,
+        session_id,
+        run_session_id,
+        sequence,
+        sequence_source,
+        event_at,
+        protocol,
+        harness_id,
+        external_event_id,
+        actor,
+        channel,
+        kind,
+        text,
+        payload: JSON.parse(String(payload)),
+        payload_schema,
+        payload_truncated,
+        payload_byte_length,
+        raw_payload_ref_id,
+        metadata: JSON.parse(String(metadata)),
         created_at: "2026-05-31T00:00:01.000Z",
       } satisfies QueryResultRow;
       this.rows.push(row);

@@ -130,6 +130,7 @@ interface RequiredRunActivityAppendStorageMetadata {
 
 interface RunActivityAppendPersistenceContext {
   readonly runId: string;
+  readonly projectContextId: string;
   readonly sessionId: string | null;
 }
 
@@ -143,6 +144,7 @@ interface RunActivityEventRow extends QueryResultRow {
   append_revision: string | number | bigint;
   event_id: string;
   run_id: string;
+  project_context_id: string;
   session_id: string | null;
   run_session_id: string;
   sequence: number;
@@ -299,7 +301,10 @@ export async function appendRunActivityEventsWithPostgresClient(
   if (inputs.length === 0) return emptyAppendBatchResult();
 
   const runIds = sortedUnique(inputs.map(runIdForAppendInput));
-  await lockRunActivityAppendRuns(client, runIds);
+  const lockedRuns = await lockRunActivityAppendRuns(client, runIds);
+  const projectContextIdsByRunId = new Map(
+    lockedRuns.map((row) => [row.run_id, normalizeRequiredString(row.project_context_id, `project_context_id for run ${row.run_id}`)]),
+  );
 
   const runSessionIds = sortedUnique(inputs.map((input) => deriveRunActivityRunSessionId(input)));
   const eventIds = sortedUnique(inputs.map(eventIdForAppendInput));
@@ -309,6 +314,7 @@ export async function appendRunActivityEventsWithPostgresClient(
         run_activity_event_id::text AS append_revision,
         event_id,
         run_id,
+        project_context_id,
         session_id,
         run_session_id,
         sequence,
@@ -337,10 +343,15 @@ export async function appendRunActivityEventsWithPostgresClient(
   );
   const state = new RunActivityAppendAccumulator(existingRows.rows.map(storedEventFromPostgresRow));
 
-  return appendRunActivityEventsWithState(inputs, state, async (event, storage, context) => {
-    const row = await insertRunActivityEventRow(client, event, storage, context);
-    return storedEventFromPostgresRow(row);
-  });
+  return appendRunActivityEventsWithState(
+    inputs,
+    state,
+    async (event, storage, context) => {
+      const row = await insertRunActivityEventRow(client, event, storage, context);
+      return storedEventFromPostgresRow(row);
+    },
+    (input) => persistenceContextForAppendInput(input, projectContextIdsByRunId),
+  );
 }
 
 async function reduceAcceptedRunActivityMessageEventsWithPostgresClient(
@@ -365,6 +376,8 @@ async function appendRunActivityEventsWithState(
   inputs: readonly RunActivityAppendInput[],
   state: RunActivityAppendAccumulator,
   persistAcceptedEvent: PersistAcceptedRunActivityEvent,
+  derivePersistenceContext: (input: RunActivityEventInput) => RunActivityAppendPersistenceContext = (input) =>
+    persistenceContextForAppendInput(input),
 ): Promise<RunActivityAppendBatchResult> {
   const results: RunActivityAppendResult[] = [];
   const accepted: RunActivityAcceptedAppendResult[] = [];
@@ -374,7 +387,7 @@ async function appendRunActivityEventsWithState(
   for (const input of inputs) {
     const eventInput = eventInputForAppend(input);
     const runSessionId = deriveRunActivityRunSessionId(eventInput);
-    const persistenceContext = persistenceContextForAppendInput(eventInput);
+    const persistenceContext = derivePersistenceContext(eventInput);
     const currentState = state.orderingStateFor(runSessionId);
     const existingByEventId = state.findByEventId(eventIdForAppendInput(eventInput));
     if (existingByEventId !== null) {
@@ -441,9 +454,18 @@ function eventInputForAppend(input: RunActivityAppendInput): RunActivityEventInp
   return eventInput;
 }
 
-function persistenceContextForAppendInput(input: RunActivityEventInput): RunActivityAppendPersistenceContext {
+function persistenceContextForAppendInput(
+  input: RunActivityEventInput,
+  projectContextIdsByRunId?: ReadonlyMap<string, string>,
+): RunActivityAppendPersistenceContext {
+  const runId = runIdForAppendInput(input);
+  const projectContextId = projectContextIdsByRunId?.get(runId);
+  if (projectContextIdsByRunId !== undefined && projectContextId === undefined) {
+    throw new SymphonyError("not_found", `Cannot append run activity events for unknown run ${runId}`);
+  }
   return {
-    runId: runIdForAppendInput(input),
+    runId,
+    projectContextId: projectContextId ?? "default",
     sessionId: sessionIdForAppendInput(input),
   };
 }
@@ -558,10 +580,13 @@ function orderingStateFromStoredEvents(
   };
 }
 
-async function lockRunActivityAppendRuns(client: PostgresQueryClient, runIds: readonly string[]): Promise<void> {
-  const rows = await client.query<{ run_id: string }>(
+async function lockRunActivityAppendRuns(
+  client: PostgresQueryClient,
+  runIds: readonly string[],
+): Promise<readonly { run_id: string; project_context_id: string }[]> {
+  const rows = await client.query<{ run_id: string; project_context_id: string }>(
     `
-      SELECT run_id
+      SELECT run_id, project_context_id
       FROM symphony.run_session
       WHERE run_id = ANY($1::text[])
       ORDER BY run_id
@@ -574,6 +599,7 @@ async function lockRunActivityAppendRuns(client: PostgresQueryClient, runIds: re
   if (missing.length > 0) {
     throw new SymphonyError("not_found", `Cannot append run activity events for unknown run(s): ${missing.join(", ")}`);
   }
+  return rows.rows;
 }
 
 async function insertRunActivityEventRow(
@@ -589,6 +615,7 @@ async function insertRunActivityEventRow(
       INSERT INTO symphony.run_activity_event (
         event_id,
         run_id,
+        project_context_id,
         session_id,
         run_session_id,
         sequence,
@@ -624,17 +651,19 @@ async function insertRunActivityEventRow(
         $13,
         $14,
         $15,
-        $16::jsonb,
-        $17,
+        $16,
+        $17::jsonb,
         $18,
         $19,
         $20,
-        $21::jsonb
+        $21,
+        $22::jsonb
       )
       RETURNING
         run_activity_event_id::text AS append_revision,
         event_id,
         run_id,
+        project_context_id,
         session_id,
         run_session_id,
         sequence,
@@ -658,6 +687,7 @@ async function insertRunActivityEventRow(
     [
       event.eventId,
       context.runId,
+      context.projectContextId,
       context.sessionId,
       event.runSessionId,
       runActivityEventSequence(event),
@@ -844,6 +874,7 @@ function runActivityEventSelectColumns(): string {
     "run_activity_event_id::text AS append_revision",
     "event_id",
     "run_id",
+    "project_context_id",
     "session_id",
     "run_session_id",
     "sequence",
