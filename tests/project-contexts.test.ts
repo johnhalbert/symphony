@@ -94,7 +94,29 @@ describe("project context normalization", () => {
     });
   });
 
-  it("omits credential-bearing values from public metadata helpers", () => {
+  it("preserves repository URLs without embedded credentials in public metadata", () => {
+    expect(
+      projectContextMetadataForPublicRead({
+        id: "docs",
+        label: "Documentation Site",
+        enabled: true,
+        tracker: { projectSlug: "DOCS" },
+        workspace: {
+          root: "./docs-workspaces",
+          source: {
+            kind: "git_worktree",
+            repository: "https://example.com/acme/docs-site.git",
+            path: "packages/site",
+          },
+        },
+      }),
+    ).toMatchObject({
+      repository: "https://example.com/acme/docs-site.git",
+      workspaceSourceKind: "git_worktree",
+    });
+  });
+
+  it("omits sibling secrets and redacts credential-bearing repository URLs from public metadata helpers", () => {
     const secretBearingContext = {
       id: "docs",
       label: "Documentation Site",
@@ -108,7 +130,7 @@ describe("project context normalization", () => {
         credential_profiles: { publication: "github-secret" },
         source: {
           kind: "git_worktree",
-          repository: "../docs-site",
+          repository: "https://token:secret@example.com/acme/docs-site.git",
           path: "packages/site",
           private_key: "ssh-private-key",
         },
@@ -127,7 +149,7 @@ describe("project context normalization", () => {
       linearProjectSlug: "DOCS",
       workspaceRoot: "./docs-workspaces",
       workspaceSourceKind: "git_worktree",
-      repository: "../docs-site",
+      repository: "https://[redacted]@example.com/acme/docs-site.git",
       path: "packages/site",
     });
     expect(Object.keys(metadata).sort()).toEqual([
@@ -146,6 +168,7 @@ describe("project context normalization", () => {
     expect(JSON.stringify(metadata)).not.toContain("linear-secret");
     expect(JSON.stringify(metadata)).not.toContain("github-secret");
     expect(JSON.stringify(metadata)).not.toContain("ssh-private-key");
+    expect(JSON.stringify(metadata)).not.toContain("token:secret");
   });
 
   it("keeps resolved credential values out of normalized public metadata", () => {
@@ -156,7 +179,7 @@ describe("project context normalization", () => {
             id: "symphony",
             label: "Symphony",
             projectSlug: "SYMPHONY",
-            repository: ".",
+            repository: "$REPO_URL",
             credential_profiles: {
               profiles: {
                 publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
@@ -173,6 +196,7 @@ describe("project context normalization", () => {
       "/repo/WORKFLOW.md",
       {
         LINEAR_API_KEY: "linear-test-key",
+        REPO_URL: "https://token:secret@example.com/acme/symphony.git",
         GITHUB_PUBLICATION_TOKEN: "publication-secret",
         GITHUB_FEEDBACK_TOKEN: "feedback-secret",
       },
@@ -185,9 +209,9 @@ describe("project context normalization", () => {
       enabled: true,
       linearProjectSlug: "SYMPHONY",
       workspaceSourceKind: "git_worktree",
+      repository: "https://[redacted]@example.com/acme/symphony.git",
       path: null,
     });
-    expect(publicMetadata.repository).toMatch(/repo$/i);
     expect(publicMetadata.workspaceRoot).toMatch(/symphony_workspaces$/i);
     expect(Object.keys(publicMetadata).sort()).toEqual([
       "enabled",
@@ -204,6 +228,7 @@ describe("project context normalization", () => {
     expect(JSON.stringify(publicMetadata)).not.toContain("linear-test-key");
     expect(JSON.stringify(publicMetadata)).not.toContain("publication-secret");
     expect(JSON.stringify(publicMetadata)).not.toContain("feedback-secret");
+    expect(JSON.stringify(publicMetadata)).not.toContain("token:secret");
   });
 
   it("normalizes legacy top-level config into an explicit default project context", () => {

@@ -4,6 +4,9 @@ export const LEGACY_DEFAULT_PROJECT_CONTEXT_ID = "default";
 export const LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL = "Default";
 export const LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE = "legacy_default";
 
+const REDACTED = "[redacted]";
+const URL_USERINFO_PATTERN = /\b((?:https?|ssh|git):\/\/)([^\s/@"']+(?::[^\s/@"']*)?)@/gi;
+
 export interface ProjectContextResolution {
   projectContextId: ProjectContextId;
   projectContextLabel: string;
@@ -230,7 +233,7 @@ export function projectContextMetadataForPublicRead(input: {
     linearProjectSlug: normalizeOptionalNonEmptyString(input.tracker?.projectSlug),
     workspaceRoot: normalizeOptionalNonEmptyString(input.workspace?.root),
     workspaceSourceKind: normalizeOptionalNonEmptyString(input.workspace?.source?.kind),
-    repository: normalizeOptionalNonEmptyString(input.workspace?.source?.repository),
+    repository: sanitizePublicRepositoryValue(input.workspace?.source?.repository),
     path: normalizeOptionalNonEmptyString(input.workspace?.source?.path),
   };
 }
@@ -272,4 +275,10 @@ function normalizeOptionalNonEmptyString(value: string | null | undefined): stri
   if (value === null || value === undefined) return null;
   const normalized = value.trim();
   return normalized.length === 0 ? null : normalized;
+}
+
+function sanitizePublicRepositoryValue(value: string | null | undefined): string | null {
+  const normalized = normalizeOptionalNonEmptyString(value);
+  if (normalized === null) return null;
+  return normalized.replace(URL_USERINFO_PATTERN, `$1${REDACTED}@`);
 }
