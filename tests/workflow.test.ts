@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import chokidar, { type FSWatcher } from "chokidar";
 import { describe, expect, it, vi } from "vitest";
 import YAML from "yaml";
 import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Config.js";
@@ -12,8 +13,109 @@ import {
 } from "../src/core/config/ProjectContexts.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
-import { WorkflowLoader, parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
+import { WorkflowLoader, parseWorkflowFile, type WorkflowReloadEvent } from "../src/core/workflow/WorkflowLoader.js";
 import { issue, multiProjectWorkflowConfig, multiProjectWorkflowDocument, projectContextFixture } from "./helpers.js";
+
+const WORKFLOW_RELOAD_SECRET_VALUES = [
+  "root-gh-secret",
+  "docs-gh-secret",
+  "docs-linear-secret",
+  "repo-secret",
+  "x-access-token",
+  "https://x-access-token:repo-secret@example.com/org/docs.git",
+] as const;
+
+function workflowReloadTopLevelConfig() {
+  return {
+    github: { token: "$ROOT_GITHUB_TOKEN" },
+    workspace: {
+      source: { kind: "none" as const },
+    },
+  };
+}
+
+function workflowReloadDocument(options: {
+  promptTemplate: string;
+  docsContextWorkspaceSource?: boolean;
+}): string {
+  const docsContextWorkspaceSource = options.docsContextWorkspaceSource ?? true;
+  return multiProjectWorkflowDocument({
+    promptTemplate: options.promptTemplate,
+    topLevel: workflowReloadTopLevelConfig(),
+    projectContexts: [
+      projectContextFixture({
+        id: "symphony",
+        label: "Symphony",
+        projectSlug: "SYMPHONY",
+        repository: ".",
+      }),
+      projectContextFixture({
+        id: "Docs Site",
+        label: "Documentation Site",
+        projectSlug: "DOCS",
+        repository: "$DOCS_REPOSITORY",
+        tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+        github: { token: "$DOCS_GITHUB_TOKEN" },
+        ...(docsContextWorkspaceSource
+          ? {}
+          : {
+              workspace: {
+                root: "./docs-workspaces",
+                source: null,
+              },
+            }),
+      }),
+    ],
+  });
+}
+
+function workflowReloadEnvFile(): string {
+  return [
+    "LINEAR_API_KEY=linear-secret",
+    "ROOT_GITHUB_TOKEN=root-gh-secret",
+    "DOCS_LINEAR_API_KEY=docs-linear-secret",
+    "DOCS_GITHUB_TOKEN=docs-gh-secret",
+    "DOCS_REPOSITORY=https://x-access-token:repo-secret@example.com/org/docs.git",
+    "",
+  ].join("\n");
+}
+
+function expectWorkflowReloadErrorToRedactSecrets(serializedError: string): void {
+  for (const secret of WORKFLOW_RELOAD_SECRET_VALUES) {
+    expect(serializedError).not.toContain(secret);
+  }
+}
+
+function mockWorkflowWatcher(): { triggerChange: () => void; restore: () => void } {
+  let changeHandler: (() => void) | null = null;
+  const fakeWatcher = {
+    on(event: string, handler: () => void) {
+      if (event === "change") changeHandler = handler;
+      return fakeWatcher;
+    },
+    close: vi.fn(async () => undefined),
+  } as unknown as FSWatcher;
+  const watchSpy = vi.spyOn(chokidar, "watch").mockReturnValue(fakeWatcher);
+  return {
+    triggerChange: () => {
+      if (!changeHandler) throw new Error("Expected workflow change handler");
+      changeHandler();
+    },
+    restore: () => {
+      watchSpy.mockRestore();
+    },
+  };
+}
+
+async function waitForWorkflowReloadEvent(events: WorkflowReloadEvent[]): Promise<WorkflowReloadEvent> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const event = events[0];
+    if (event) return event;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for workflow reload event");
+}
 
 describe("workflow loading and prompt rendering", () => {
   it("parses YAML front matter and markdown body", () => {
@@ -308,6 +410,754 @@ Work on {{ issue.identifier }}.
       expect(loaded.serviceConfig.server.openWorkspaceToken).toBe("workspace-secret");
       expect(loaded.serviceConfig.server.webAssetsRoot?.replace(/\\/g, "/")).toMatch(/\/dist-web$/);
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("emits successful reload events and refreshes the last good workflow state", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-success-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      const initiallyLoaded = await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Updated prompt." }), "utf8");
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+
+      expect(initiallyLoaded.definition.promptTemplate).toBe("Initial prompt.");
+      expect(event.error).toBeNull();
+      expect(event.loaded?.definition.promptTemplate).toBe("Updated prompt.");
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Updated prompt.");
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports project-context reload validation failures for missing workspace sources with redacted metadata only", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-error-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        workflowReloadDocument({
+          promptTemplate: "Broken prompt.",
+          docsContextWorkspaceSource: false,
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe('Workflow reload validation failed for project_contexts["Docs Site"]: invalid workspace.source');
+      expect(event.error?.details).toEqual({
+        reason: "invalid_project_context_configuration",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["Docs Site"]',
+            rawId: "Docs Site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+        ],
+        projectContextFieldPaths: ["workspace.source"],
+      });
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports malformed project-context field types during reload with context-specific redacted metadata", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-schema-error-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            {
+              ...projectContextFixture({
+                id: "Docs Site",
+                label: "Documentation Site",
+                projectSlug: "DOCS",
+                repository: "$DOCS_REPOSITORY",
+                tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+                github: { token: "$DOCS_GITHUB_TOKEN" },
+              }),
+              enabled: 123 as unknown as boolean,
+            },
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe('Workflow reload validation failed for project_contexts["Docs Site"]: invalid enabled');
+      expect(event.error?.details).toEqual({
+        reason: "invalid_project_context_configuration",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["Docs Site"]',
+            rawId: "Docs Site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Documentation Site",
+            enabled: null,
+          },
+        ],
+        projectContextFieldPaths: ["enabled"],
+      });
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not surface dynamic agent state keys from Zod-derived reload field paths", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-agent-state-key-redaction-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            projectContextFixture({
+              id: "Docs Site",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+              agent: {
+                max_concurrent_agents_by_state: {
+                  "prod.secret": "nope" as unknown as number,
+                },
+              },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        'Workflow reload validation failed for project_contexts["Docs Site"]: invalid agent.max_concurrent_agents_by_state',
+      );
+      expect(event.error?.details).toEqual({
+        reason: "invalid_project_context_configuration",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["Docs Site"]',
+            rawId: "Docs Site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+        ],
+        projectContextFieldPaths: ["agent.max_concurrent_agents_by_state"],
+      });
+      expect(serializedError).not.toContain("prod.secret");
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not surface dynamic credential-profile role keys from Zod-derived reload field paths", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-credential-role-key-redaction-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            projectContextFixture({
+              id: "Docs Site",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+              credential_profiles: {
+                roles: {
+                  worker: {
+                    "top.secret.profile": 123 as unknown as string,
+                  },
+                },
+              },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        'Workflow reload validation failed for project_contexts["Docs Site"]: invalid credential_profiles.roles.worker',
+      );
+      expect(event.error?.details).toEqual({
+        reason: "invalid_project_context_configuration",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["Docs Site"]',
+            rawId: "Docs Site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+        ],
+        projectContextFieldPaths: ["credential_profiles.roles.worker"],
+      });
+      expect(serializedError).not.toContain("top.secret.profile");
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports default-project-context credential profile registry reload failures with scoped redacted metadata", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-default-context-credential-profiles-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+              credential_profiles: {
+                roles: {
+                  worker: {
+                    "github.discovery": "top.secret.profile",
+                  },
+                },
+              },
+            }),
+            projectContextFixture({
+              id: "Docs Site",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        'Workflow reload validation failed for project_contexts["symphony"]: invalid credential_profiles.roles.worker',
+      );
+      expect(event.error?.details).toEqual({
+        reason: "invalid_project_context_configuration",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["symphony"]',
+            rawId: "symphony",
+            projectContextId: "symphony",
+            projectContextLabel: "Symphony",
+            enabled: true,
+          },
+        ],
+        projectContextFieldPaths: ["credential_profiles.roles.worker"],
+      });
+      expect(serializedError).not.toContain("top.secret.profile");
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports sibling project-context validator failures during reload with context-specific redacted metadata", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-state-bucket-error-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            projectContextFixture({
+              id: "Docs Site",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: {
+                api_key: "$DOCS_LINEAR_API_KEY",
+                handoff_states: ["In Progress"],
+              },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        'Workflow reload validation failed for project_contexts["Docs Site"]: invalid tracker.handoff_states, tracker.active_states',
+      );
+      expect(event.error?.details).toEqual({
+        reason: "invalid_project_context_configuration",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["Docs Site"]',
+            rawId: "Docs Site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+        ],
+        projectContextFieldPaths: ["tracker.handoff_states", "tracker.active_states"],
+      });
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat overlapping state values as project-context field paths during reload sanitization", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-state-value-redaction-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            projectContextFixture({
+              id: "Docs Site",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: {
+                api_key: "$DOCS_LINEAR_API_KEY",
+                active_states: ["prod.secret"],
+                handoff_states: ["prod.secret"],
+              },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        'Workflow reload validation failed for project_contexts["Docs Site"]: invalid tracker.handoff_states, tracker.active_states',
+      );
+      expect(event.error?.details).toEqual({
+        reason: "invalid_project_context_configuration",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["Docs Site"]',
+            rawId: "Docs Site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+        ],
+        projectContextFieldPaths: ["tracker.handoff_states", "tracker.active_states"],
+      });
+      expect(serializedError).not.toContain("prod.secret");
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports duplicate normalized project-context ids during reload with redacted metadata only", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-duplicate-context-error-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            projectContextFixture({
+              id: "Docs Site",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+            }),
+            projectContextFixture({
+              id: "docs_site",
+              label: "Docs Site Mirror",
+              projectSlug: "DOCS_MIRROR",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        'Workflow reload validation failed for project_contexts["Docs Site"], project_contexts["docs_site"]: duplicate normalized project context id',
+      );
+      expect(event.error?.details).toEqual({
+        reason: "duplicate_project_context_id",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["Docs Site"]',
+            rawId: "Docs Site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+          {
+            contextPath: 'project_contexts["docs_site"]',
+            rawId: "docs_site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Docs Site Mirror",
+            enabled: true,
+          },
+        ],
+        duplicateProjectContextId: "docs-site",
+      });
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps duplicate raw project context ids distinguishable in reload validation metadata", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-duplicate-raw-id-error-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            projectContextFixture({
+              id: "docs",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+            }),
+            projectContextFixture({
+              id: "docs",
+              label: "Docs Site Mirror",
+              projectSlug: "DOCS_MIRROR",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        "Workflow reload validation failed for project_contexts[1], project_contexts[2]: duplicate normalized project context id",
+      );
+      expect(event.error?.details).toEqual({
+        reason: "duplicate_project_context_id",
+        projectContexts: [
+          {
+            contextPath: "project_contexts[1]",
+            rawId: "docs",
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+          {
+            contextPath: "project_contexts[2]",
+            rawId: "docs",
+            projectContextId: "docs",
+            projectContextLabel: "Docs Site Mirror",
+            enabled: true,
+          },
+        ],
+        duplicateProjectContextId: "docs",
+      });
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1628,6 +2478,38 @@ describe("project context workflow contracts", () => {
         { LINEAR_API_KEY: "secret" },
       ),
     ).toThrowError("Duplicate project context id: docs-site");
+  });
+
+  it("keeps duplicate raw project context ids distinguishable in parse-time validation metadata", () => {
+    expect.assertions(3);
+
+    try {
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [
+            projectContextFixture({
+              id: "docs",
+              projectSlug: "DOCS",
+              repository: "../docs-site",
+            }),
+            projectContextFixture({
+              id: "docs",
+              projectSlug: "DOCS2",
+              repository: "../docs-site-v2",
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(SymphonyError);
+      expect((error as SymphonyError).message).toBe("Duplicate project context id: docs");
+      expect((error as SymphonyError).details).toEqual({
+        projectContextPaths: ["project_contexts[0]", "project_contexts[1]"],
+        duplicateProjectContextId: "docs",
+      });
+    }
   });
 
   it.each(["!!!", "   ", "___"])(

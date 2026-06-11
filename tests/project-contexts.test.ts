@@ -1101,4 +1101,57 @@ describe("project context normalization", () => {
       value: "feedback-secret",
     });
   });
+
+  it("lets a default project context replace a top-level GitHub App profile with a static-token shorthand", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          credential_profiles: {
+            profiles: {
+              publication: {
+                kind: "github_app",
+                app_id: "$GITHUB_PUBLICATION_APP_ID",
+                installation_id: "$GITHUB_PUBLICATION_APP_INSTALLATION_ID",
+                private_key_path: "$GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH",
+                capabilities: ["github.publication"],
+              },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              },
+            },
+          }),
+          projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-test-key",
+        GITHUB_PUBLICATION_APP_ID: "111",
+        GITHUB_PUBLICATION_APP_INSTALLATION_ID: "222",
+        GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH: "/secrets/publication-app.pem",
+        GITHUB_PUBLICATION_TOKEN: "publication-secret",
+      },
+    );
+
+    expect(config.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "publication-secret",
+      app: null,
+    });
+  });
 });
