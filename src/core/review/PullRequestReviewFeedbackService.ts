@@ -175,7 +175,7 @@ export class PullRequestReviewFeedbackService {
   private async requireLifecycle(context: ReviewFeedbackActiveContext): Promise<IssueLifecycleRecord> {
     const lifecycle = await this.options.lifecycleStore.get(context.issue.id);
     if (!lifecycle) throw new SymphonyError("invalid_request", "Review feedback requires an existing issue lifecycle");
-    if (lifecycle.issueId !== context.issue.id && lifecycle.issueIdentifier !== context.issue.identifier) {
+    if (lifecycle.issueId !== context.issue.id || lifecycle.issueIdentifier !== context.issue.identifier) {
       throw new SymphonyError("invalid_request", "Review feedback issue does not match the lifecycle record");
     }
     return lifecycle;

@@ -97,6 +97,39 @@ describe("review feedback MCP handoff", () => {
     });
   });
 
+  it("rejects review feedback when the MCP context issue identifier does not match the lifecycle record", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-feedback-context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    await seedLifecycle(lifecycleStore);
+    await writeReviewFeedbackMcpContext(contextFile, {
+      issue: issue({ identifier: "TEST-2", state: "In Review", branchName: "symphony/TEST-1" }),
+      activeRunId: "review-run-1",
+      role: "reviewer",
+      phase: "review",
+    });
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ message: "expected test failure if called" }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await expect(
+      submitReviewFeedbackFromMcp(
+        { kind: "review", event: "APPROVE", body: "Looks good.", idempotencyKey: "approve-mismatch-1" },
+        { workflowPath, contextFile },
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Review feedback issue does not match the lifecycle record",
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("sanitizes GitHub token material from write errors", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
