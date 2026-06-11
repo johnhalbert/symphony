@@ -186,6 +186,9 @@ function addWorkspaceParseDependencies(
         source?: {
           path?: string | undefined;
           repository?: string | undefined;
+          ref?: string | undefined;
+          base_ref?: string | undefined;
+          branch_template?: string | undefined;
           cache_path?: string | undefined;
         } | undefined;
       }
@@ -196,6 +199,9 @@ function addWorkspaceParseDependencies(
     source: {
       path?: string;
       repository?: string;
+      ref?: string;
+      baseRef?: string;
+      branchTemplate?: string;
       cachePath?: string;
     };
   },
@@ -211,6 +217,15 @@ function addWorkspaceParseDependencies(
 
   const sourceRepositoryRef = envReference(rawWorkspace?.source?.repository);
   if (sourceRepositoryRef) env[sourceRepositoryRef] = workspace.source.repository ?? "";
+
+  const sourceRefRef = envReference(rawWorkspace?.source?.ref);
+  if (sourceRefRef) env[sourceRefRef] = workspace.source.ref ?? "";
+
+  const sourceBaseRefRef = envReference(rawWorkspace?.source?.base_ref);
+  if (sourceBaseRefRef) env[sourceBaseRefRef] = workspace.source.baseRef ?? "";
+
+  const sourceBranchTemplateRef = envReference(rawWorkspace?.source?.branch_template);
+  if (sourceBranchTemplateRef) env[sourceBranchTemplateRef] = workspace.source.branchTemplate ?? "";
 
   const sourceCachePathRef = envReference(rawWorkspace?.source?.cache_path);
   if (sourceCachePathRef) env[sourceCachePathRef] = workspace.source.cachePath ?? "";

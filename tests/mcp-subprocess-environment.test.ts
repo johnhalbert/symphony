@@ -962,7 +962,8 @@ describe("MCP subprocess environment", () => {
           kind: "git_worktree",
           path: "$WORKSPACE_SOURCE_PATH",
           repository: "$WORKSPACE_REPOSITORY",
-          base_ref: "main",
+          base_ref: "$WORKSPACE_BASE_REF",
+          branch_template: "$WORKSPACE_BRANCH_TEMPLATE",
           cache_path: "$WORKSPACE_CACHE_PATH",
         },
       },
@@ -980,6 +981,8 @@ describe("MCP subprocess environment", () => {
       WORKSPACE_STATE_DIR: "/tmp/symphony-state",
       WORKSPACE_SOURCE_PATH: "/tmp/source",
       WORKSPACE_REPOSITORY: "/tmp/repo",
+      WORKSPACE_BASE_REF: "origin/release",
+      WORKSPACE_BRANCH_TEMPLATE: "symphony/{{ issue.identifier }}",
       WORKSPACE_CACHE_PATH: "/tmp/cache",
       GITHUB_TOKEN: "decoy-github-secret",
       CURSOR_API_KEY: "cursor-secret",
@@ -997,8 +1000,10 @@ describe("MCP subprocess environment", () => {
       LINEAR_ASSIGNEE: "john",
       WORKSPACE_ROOT: config.workspace.root,
       WORKSPACE_STATE_DIR: config.workspace.stateDir,
-      WORKSPACE_SOURCE_PATH: config.workspace.source.path ?? "",
+      WORKSPACE_SOURCE_PATH: config.workspace.source.path,
       WORKSPACE_REPOSITORY: config.workspace.source.repository,
+      WORKSPACE_BASE_REF: config.workspace.source.baseRef,
+      WORKSPACE_BRANCH_TEMPLATE: config.workspace.source.branchTemplate,
       WORKSPACE_CACHE_PATH: config.workspace.source.cachePath,
     });
     expect(env).not.toHaveProperty("GITHUB_TOKEN");
@@ -1006,6 +1011,50 @@ describe("MCP subprocess environment", () => {
 
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     expect(childConfig.tracker).toMatchObject(config.tracker);
+    expect(childConfig.workspace).toEqual(config.workspace);
+  });
+
+  it("exports resolved git refs needed for child config parsing", () => {
+    const rawConfig = {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_PROFILED_KEY",
+        project_slug: "$LINEAR_PROJECT_SLUG",
+      },
+      workspace: {
+        root: "$WORKSPACE_ROOT",
+        source: {
+          kind: "git",
+          repository: "$WORKSPACE_REPOSITORY",
+          ref: "$WORKSPACE_SOURCE_REF",
+        },
+      },
+      github: {
+        owner: "acme",
+        repo: "symphony",
+        publish_pull_requests: false,
+      },
+    } as const;
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", {
+      LINEAR_PROFILED_KEY: "linear-secret",
+      LINEAR_PROJECT_SLUG: "TEST",
+      WORKSPACE_ROOT: "/tmp/symphony-workspaces",
+      WORKSPACE_REPOSITORY: "/tmp/repo",
+      WORKSPACE_SOURCE_REF: "feature/docs",
+    });
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "review-verdict-mcp",
+      parentEnv: { PATH: "/bin" },
+    });
+
+    expect(env).toMatchObject({
+      WORKSPACE_REPOSITORY: config.workspace.source.repository,
+      WORKSPACE_SOURCE_REF: config.workspace.source.ref,
+    });
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     expect(childConfig.workspace).toEqual(config.workspace);
   });
 
@@ -1040,7 +1089,8 @@ describe("MCP subprocess environment", () => {
               kind: "git_worktree",
               path: "$DOCS_WORKSPACE_SOURCE_PATH",
               repository: "$DOCS_WORKSPACE_REPOSITORY",
-              base_ref: "main",
+              base_ref: "$DOCS_WORKSPACE_BASE_REF",
+              branch_template: "$DOCS_WORKSPACE_BRANCH_TEMPLATE",
               cache_path: "$DOCS_WORKSPACE_CACHE_PATH",
             },
           },
@@ -1070,6 +1120,8 @@ describe("MCP subprocess environment", () => {
       DOCS_WORKSPACE_STATE_DIR: "/tmp/docs-state",
       DOCS_WORKSPACE_SOURCE_PATH: "/tmp/docs/source",
       DOCS_WORKSPACE_REPOSITORY: "/tmp/docs/repo",
+      DOCS_WORKSPACE_BASE_REF: "origin/docs-main",
+      DOCS_WORKSPACE_BRANCH_TEMPLATE: "docs/{{ issue.identifier }}",
       DOCS_WORKSPACE_CACHE_PATH: "/tmp/docs/cache",
       DOCS_GITHUB_OWNER: "acme-docs",
       DOCS_GITHUB_REPO: "docs-site",
@@ -1090,8 +1142,10 @@ describe("MCP subprocess environment", () => {
       DOCS_LINEAR_ASSIGNEE: "writer",
       DOCS_WORKSPACE_ROOT: config.projectContexts.byId.get("docs")?.workspace.root,
       DOCS_WORKSPACE_STATE_DIR: config.projectContexts.byId.get("docs")?.workspace.stateDir,
-      DOCS_WORKSPACE_SOURCE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.path ?? "",
+      DOCS_WORKSPACE_SOURCE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.path,
       DOCS_WORKSPACE_REPOSITORY: config.projectContexts.byId.get("docs")?.workspace.source.repository,
+      DOCS_WORKSPACE_BASE_REF: config.projectContexts.byId.get("docs")?.workspace.source.baseRef,
+      DOCS_WORKSPACE_BRANCH_TEMPLATE: config.projectContexts.byId.get("docs")?.workspace.source.branchTemplate,
       DOCS_WORKSPACE_CACHE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.cachePath,
       DOCS_GITHUB_OWNER: "acme-docs",
       DOCS_GITHUB_REPO: "docs-site",

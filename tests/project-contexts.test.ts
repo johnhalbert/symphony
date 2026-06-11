@@ -1,12 +1,13 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseServiceConfig } from "../src/core/config/Config.js";
+import { parseServiceConfig, type RawProjectContextConfig } from "../src/core/config/Config.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
   LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
   LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
   buildProjectContextRegistry,
   defaultProjectContextLabel,
+  normalizeLegacyDefaultProjectContext,
   normalizeProjectContextId,
   normalizeProjectContextResolution,
   projectContextMetadataForPublicRead,
@@ -94,16 +95,37 @@ describe("project context normalization", () => {
     });
   });
 
+  it("normalizes legacy top-level config into an explicit default project context", () => {
+    expect(
+      normalizeLegacyDefaultProjectContext({
+        tracker: { kind: "linear", project_slug: "TEST" },
+        workspace: { root: "./workspaces" },
+        github: { owner: "acme", repo: "symphony" },
+        review_loop: { review_states: ["In Review"] },
+      }),
+    ).toEqual({
+      id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      enabled: true,
+      tracker: { kind: "linear", project_slug: "TEST" },
+      workspace: { root: "./workspaces" },
+      github: { owner: "acme", repo: "symphony" },
+      review_loop: { review_states: ["In Review"] },
+    });
+  });
+
   it("synthesizes a legacy default context when project_contexts is omitted", () => {
     const config = parseServiceConfig(
       {
         tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
         workspace: { root: "./workspaces" },
+        github: { owner: "acme", repo: "symphony", token: "$GITHUB_TOKEN" },
+        review_loop: { review_states: ["In Review"], max_review_rounds: 5 },
         polling: { interval_ms: 60_000 },
         agent: { max_concurrent_agents: 2, max_turns: 1 },
       },
       "/repo/WORKFLOW.md",
-      { LINEAR_API_KEY: "linear-test-key" },
+      { LINEAR_API_KEY: "linear-test-key", GITHUB_TOKEN: "github-test-token" },
     );
 
     expect(config.projectContexts.defaultContextId).toBe(LEGACY_DEFAULT_PROJECT_CONTEXT_ID);
@@ -111,10 +133,14 @@ describe("project context normalization", () => {
       id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
       label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
       tracker: { projectSlug: "TEST" },
+      github: { owner: "acme", repo: "symphony", token: "github-test-token" },
+      reviewLoop: { reviewStates: ["In Review"], maxReviewRounds: 5 },
       publicMetadata: {
         linearProjectSlug: "TEST",
       },
     });
+    expect(config.github).toMatchObject({ owner: "acme", repo: "symphony", token: "github-test-token" });
+    expect(config.reviewLoop).toMatchObject({ reviewStates: ["In Review"], maxReviewRounds: 5 });
   });
 
   it("skips readonly checkout issue-breakdown validation for disabled project contexts", () => {
@@ -168,6 +194,49 @@ describe("project context normalization", () => {
     expect(config.workspace.source?.repository).toMatch(/repo$/i);
   });
 
+  it("keeps raw project_contexts alongside the normalized project context registry", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: " Docs Site ",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+          }),
+          projectContextFixture({
+            id: "ops_portal",
+            label: "Ops Portal",
+            projectSlug: "OPS",
+            repository: "../ops-portal",
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+
+    const rawContexts = config.raw.project_contexts;
+    expect(rawContexts).toHaveLength(2);
+
+    const rawDefaultContext: RawProjectContextConfig = rawContexts![0]!;
+    expect(rawDefaultContext.id).toBe(" Docs Site ");
+    expect(rawDefaultContext.workspace?.source?.repository).toBe("../docs-site");
+
+    expect(config.projectContexts.defaultContextId).toBe("docs-site");
+    expect(config.projectContexts.defaultContext.id).toBe("docs-site");
+    expect(config.projectContexts.byId.get("docs-site")).toMatchObject({
+      label: "Documentation Site",
+      tracker: { projectSlug: "DOCS" },
+      workspace: { source: { repository: expect.stringMatching(/docs-site$/i) } },
+    });
+    expect(config.projectContexts.byId.get("ops-portal")).toMatchObject({
+      label: "Ops Portal",
+      tracker: { projectSlug: "OPS" },
+      workspace: { source: { repository: expect.stringMatching(/ops-portal$/i) } },
+    });
+  });
+
   it("merges top-level project defaults into explicit contexts before applying context overrides", () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
@@ -177,6 +246,7 @@ describe("project context normalization", () => {
             state_dir: "./global-state",
             source: {
               kind: "git_worktree",
+              path: "$DEFAULT_SOURCE_PATH",
               repository: "$DEFAULT_REPOSITORY",
               base_ref: "$DEFAULT_BASE_REF",
               branch_template: "$DEFAULT_BRANCH_TEMPLATE",
@@ -233,6 +303,7 @@ describe("project context normalization", () => {
             branchTemplate: null,
             workspace: {
               source: {
+                path: "$DOCS_SOURCE_PATH",
                 repository: "../docs-site",
                 branch_template: "$DOCS_BRANCH_TEMPLATE",
               },
@@ -265,10 +336,12 @@ describe("project context normalization", () => {
       "/repo/WORKFLOW.md",
       {
         LINEAR_API_KEY: "linear-test-key",
+        DEFAULT_SOURCE_PATH: "./default-source",
         DEFAULT_REPOSITORY: ".",
         DEFAULT_BASE_REF: "origin/release",
         DEFAULT_BRANCH_TEMPLATE: "global/{{ issue.identifier }}",
         DEFAULT_CACHE_PATH: "./cache/shared",
+        DOCS_SOURCE_PATH: "./docs-source",
         DOCS_BRANCH_TEMPLATE: "docs/{{ issue.identifier }}",
       },
     );
@@ -280,6 +353,7 @@ describe("project context normalization", () => {
         stateDir: path.resolve("/repo", "./docs-workspaces", "./docs-state"),
         source: {
           kind: "git_worktree",
+          path: path.resolve("/repo", "./docs-source"),
           repository: path.resolve("/repo", "../docs-site"),
           baseRef: "origin/release",
           branchTemplate: "docs/{{ issue.identifier }}",
@@ -323,6 +397,7 @@ describe("project context normalization", () => {
       },
     });
     expect(docsContext?.workspace.source.cleanup).toBe("refuse_dirty");
+    expect(docsContext?.publicMetadata.path).toBe(path.resolve("/repo", "./docs-source"));
     expect(docsContext?.agent.maxConcurrentAgentsByState).toEqual(
       new Map([
         ["todo", 2],
