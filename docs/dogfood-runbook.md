@@ -22,6 +22,11 @@ unique IDs and non-empty requirement text. Use the same section names for
 docs-only drafting and implementation drafting so workers, reviewers, and
 doctor lint evaluate one contract.
 
+Spec Kit artifacts under `specs/` are planning records only for this workflow.
+Operators, workers, and reviewers should treat the promoted Linear issue's
+fenced JSON `Issue Contract` as the canonical work assignment unless a human
+explicitly invokes a Spec Kit workflow for that feature.
+
 Roadmap placeholder issues for continuation search or richer summarization stay `Backlog` with `dogfood-blocked`. Do not add `dogfood-ready` to those placeholders until the issue includes a concrete implementation path beyond interfaces, configuration flags, or docs.
 
 Do not run Symphony against the Engineering project before the gate work lands.
@@ -120,6 +125,74 @@ npm run smoke:hermes-acp -- WORKFLOW.md --source-profile <host-profile>
 ```
 
 Set `LINEAR_API_KEY`, `SYMPHONY_WORKSPACE_TOKEN`, and the GitHub credential variables in the workflow root `.env` file or process environment as needed. The reference workflow uses app-backed credential profiles: existing `GITHUB_APP_*` variables identify the publication/merge app, and `GITHUB_REVIEW_APP_*` variables identify a separate reviewer app for PR approvals and change requests. Static-token profiles such as `GITHUB_PUBLICATION_TOKEN` and `GITHUB_FEEDBACK_TOKEN` remain supported for non-app deployments.
+
+### Multi-project workflow configuration
+
+Existing single-project workflows stay valid. When `project_contexts` is absent, Symphony synthesizes one default project context from the top-level `tracker`, `workspace`, `github`, `review_loop`, `issue_breakdown`, `agent`, and `credential_profiles` blocks. Keep the current top-level-only `WORKFLOW.md` shape when every issue routes to one Linear project and one codebase.
+
+When one workflow needs to carry configuration for more than one project context, keep truly service-wide settings at the top level and move per-project overrides into `project_contexts`. In the current dogfood runtime, the first enabled explicit context becomes the compatibility default context for legacy code paths and remains the active dispatch context for polling and workspace creation, so list the primary project first. Additional contexts are still useful for workflow authoring, `doctor` validation, and future routing work, but one live dogfood workflow process does not yet poll or create worktrees for every listed context.
+
+```yaml
+tracker:
+  kind: linear
+  api_key: $LINEAR_API_KEY
+workspace:
+  root: ./symphony_workspaces
+  state_dir: ./.symphony
+  source:
+    kind: git_worktree
+    base_ref: origin/main
+    branch_template: "symphony/{{ issue.identifier }}"
+    cleanup: refuse_dirty
+github:
+  owner: johnhalbert
+  repo: symphony
+
+project_contexts:
+  - id: symphony
+    label: Symphony
+    tracker:
+      project_slug: $SYMPHONY_LINEAR_PROJECT
+    workspace:
+      source:
+        repository: .
+
+  - id: docs
+    label: Documentation Site
+    tracker:
+      project_slug: $DOCS_LINEAR_PROJECT
+    workspace:
+      source:
+        repository: ../docs-site
+    github:
+      owner: johnhalbert
+      repo: docs-site
+```
+
+Use that pattern as the operator-facing baseline:
+
+- Each enabled context needs its own `tracker.project_slug` and enough `workspace.source` fields for the selected source kind.
+- Top-level `workspace`, `github`, `review_loop`, `issue_breakdown`, `agent`, and `credential_profiles` blocks act as defaults; a context should override only the fields it actually needs to change.
+- `workspace.source.branch_template` currently renders only `issue.*` fields. Use supported values such as `{{ issue.identifier }}` and do not document `project.*` template variables until the renderer exposes them.
+- Do not inline API keys, tokens, private keys, or repository URLs with embedded credentials in `project_contexts`. Use environment references or named `credential_profiles` instead. If a context truly needs different credentials, keep them env-backed or app-backed just like the examples in [`trust-and-safety.md`](./trust-and-safety.md#credential-profiles).
+
+### Project-context redaction rules
+
+`npm run doctor -- --strict` should summarize configured project contexts without printing resolved secret values. The `workflow.project_contexts` check is expected to show context ids and labels, the Linear project slug, the workspace source kind, boolean configured/not-configured flags such as `repositoryConfigured`, `baseRefConfigured`, and `branchTemplateConfigured`, the workspace `cleanup` mode, and whether a GitHub token is present.
+
+It must not print raw API keys, GitHub tokens, private keys, credential profile secret material, provider account contents, or repository URLs that embed credentials. A sanitized summary looks like this:
+
+```text
+[OK] workflow.project_contexts: Configured project contexts (default: symphony): [{"id":"symphony","label":"Symphony","enabled":true,"tracker":{"projectSlug":"SYMPHONY"},"workspace":{"source":{"kind":"git_worktree","pathConfigured":false,"repositoryConfigured":true,"refConfigured":false,"baseRefConfigured":true,"branchTemplateConfigured":true,"cachePathConfigured":false,"cleanup":"refuse_dirty"}},"github":{"tokenPresent":true}},{"id":"docs","label":"Documentation Site","enabled":true,"tracker":{"projectSlug":"DOCS"},"workspace":{"source":{"kind":"git_worktree","pathConfigured":false,"repositoryConfigured":true,"refConfigured":false,"baseRefConfigured":true,"branchTemplateConfigured":true,"cachePathConfigured":false,"cleanup":"refuse_dirty"}},"github":{"tokenPresent":true}}]
+```
+
+Validation failures should point at the offending config path without echoing secret material. For example:
+
+```text
+[ERROR] workflow.parse: project_contexts["Docs Site"].workspace.source is required for enabled project contexts
+```
+
+If operator-facing workflow or doctor output includes a raw environment value, token, or credential-bearing repository URL, treat that as a redaction regression and stop promotion until it is fixed.
 
 Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable workspace paths, git availability, runtime harness/provider checks, Hermes paths, Python importability, managed auth readiness when `openai-codex` is selected, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, subprocess MCP tool availability, candidate isolation, and current Linear candidates.
 
