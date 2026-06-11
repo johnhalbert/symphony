@@ -7,6 +7,7 @@ import {
   createCredentialProfileRegistry,
   rawCredentialProfilesSchema,
   type CredentialProfileRegistry,
+  type RawCredentialProfilesConfig,
 } from "./CredentialProfiles.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
@@ -653,7 +654,7 @@ export function resolveDefaultProjectContextCredentialProfiles(
 ): RawWorkflowConfig["credential_profiles"] | undefined {
   for (const context of raw.project_contexts ?? []) {
     if (normalizeProjectContextId(context.id) === defaultContextId) {
-      return context.credential_profiles ?? raw.credential_profiles;
+      return mergeCredentialProfileDefaults(raw.credential_profiles, context.credential_profiles);
     }
   }
   return raw.credential_profiles;
@@ -801,7 +802,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
   const serverWebAssetsRoot = resolveOptionalPathValue(raw.server?.web_assets_root, workflowDir, env);
   const database = normalizeDatabaseConfig(raw, workflowDir, env);
-  const credentialProfilesRaw = resolveDefaultProjectContextCredentialProfiles(raw, defaultContext.id);
+  const credentialProfilesRaw = defaultContext.credentialProfiles;
   const credentialProfiles = createCredentialProfileRegistry({
     raw: credentialProfilesRaw,
     env,
@@ -1056,7 +1057,7 @@ function mergeWorkflowProjectContextDefaults(
   const reviewLoop = mergeConfigObjects(defaults.review_loop, context.review_loop);
   const issueBreakdown = mergeIssueBreakdownDefaults(defaults.issue_breakdown, context.issue_breakdown);
   const agent = mergeAgentDefaults(defaults.agent, context.agent);
-  const credentialProfiles = context.credential_profiles ?? defaults.credential_profiles;
+  const credentialProfiles = mergeCredentialProfileDefaults(defaults.credential_profiles, context.credential_profiles);
 
   return {
     id: context.id,
@@ -1411,6 +1412,57 @@ function mergeAgentDefaults(
             ...base?.max_concurrent_agents_by_state,
             ...override?.max_concurrent_agents_by_state,
           },
+  };
+}
+
+function mergeCredentialProfileDefaults(
+  base: RawWorkflowConfig["credential_profiles"] | undefined,
+  override: RawProjectContextConfig["credential_profiles"] | undefined,
+): RawWorkflowConfig["credential_profiles"] | undefined {
+  if (!base && !override) return undefined;
+
+  const mergedProfiles = mergeCredentialProfileDefinitionMap(base?.profiles, override?.profiles);
+  const mergedRoles =
+    base?.roles === undefined && override?.roles === undefined
+      ? undefined
+      : {
+          worker: mergeCredentialProfileRoleAssignments(base?.roles?.worker, override?.roles?.worker),
+          reviewer: mergeCredentialProfileRoleAssignments(base?.roles?.reviewer, override?.roles?.reviewer),
+          service: mergeCredentialProfileRoleAssignments(base?.roles?.service, override?.roles?.service),
+        };
+
+  return {
+    ...(base ?? {}),
+    ...(override ?? {}),
+    ...(mergedProfiles === undefined ? {} : { profiles: mergedProfiles }),
+    ...(mergedRoles === undefined ? {} : { roles: mergedRoles }),
+  };
+}
+
+function mergeCredentialProfileDefinitionMap(
+  base: RawCredentialProfilesConfig["profiles"] | undefined,
+  override: RawCredentialProfilesConfig["profiles"] | undefined,
+): RawCredentialProfilesConfig["profiles"] | undefined {
+  if (base === undefined && override === undefined) return undefined;
+
+  const merged: NonNullable<RawCredentialProfilesConfig["profiles"]> = { ...(base ?? {}) };
+  for (const [name, profile] of Object.entries(override ?? {})) {
+    merged[name] = {
+      ...(base?.[name] ?? {}),
+      ...profile,
+    } as NonNullable<RawCredentialProfilesConfig["profiles"]>[string];
+  }
+  return merged;
+}
+
+function mergeCredentialProfileRoleAssignments(
+  base: Record<string, string> | undefined,
+  override: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (base === undefined && override === undefined) return undefined;
+  return {
+    ...(base ?? {}),
+    ...(override ?? {}),
   };
 }
 
