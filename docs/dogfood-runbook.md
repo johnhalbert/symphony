@@ -121,6 +121,73 @@ npm run smoke:hermes-acp -- WORKFLOW.md --source-profile <host-profile>
 
 Set `LINEAR_API_KEY`, `SYMPHONY_WORKSPACE_TOKEN`, and the GitHub credential variables in the workflow root `.env` file or process environment as needed. The reference workflow uses app-backed credential profiles: existing `GITHUB_APP_*` variables identify the publication/merge app, and `GITHUB_REVIEW_APP_*` variables identify a separate reviewer app for PR approvals and change requests. Static-token profiles such as `GITHUB_PUBLICATION_TOKEN` and `GITHUB_FEEDBACK_TOKEN` remain supported for non-app deployments.
 
+### Multi-project workflow configuration
+
+Existing single-project workflows stay valid. When `project_contexts` is absent, Symphony synthesizes one default project context from the top-level `tracker`, `workspace`, `github`, `review_loop`, `issue_breakdown`, `agent`, and `credential_profiles` blocks. Keep the current top-level-only `WORKFLOW.md` shape when every issue routes to one Linear project and one codebase.
+
+When one workflow must dispatch into multiple repositories or multiple Linear projects, keep truly service-wide settings at the top level and move per-project routing into `project_contexts`. The first enabled explicit context becomes the compatibility default context for legacy code paths, so list the primary project first.
+
+```yaml
+tracker:
+  kind: linear
+  api_key: $LINEAR_API_KEY
+workspace:
+  root: ./symphony_workspaces
+  state_dir: ./.symphony
+  source:
+    kind: git_worktree
+    base_ref: origin/main
+    branch_template: "symphony/{{ project.id }}/{{ issue.identifier }}"
+    cleanup: refuse_dirty
+github:
+  owner: johnhalbert
+  repo: symphony
+
+project_contexts:
+  - id: symphony
+    label: Symphony
+    tracker:
+      project_slug: $SYMPHONY_LINEAR_PROJECT
+    workspace:
+      source:
+        repository: .
+
+  - id: docs
+    label: Documentation Site
+    tracker:
+      project_slug: $DOCS_LINEAR_PROJECT
+    workspace:
+      source:
+        repository: ../docs-site
+    github:
+      owner: johnhalbert
+      repo: docs-site
+```
+
+Use that pattern as the operator-facing baseline:
+
+- Each enabled context needs its own `tracker.project_slug` and enough `workspace.source` fields for the selected source kind.
+- Top-level `workspace`, `github`, `review_loop`, `issue_breakdown`, `agent`, and `credential_profiles` blocks act as defaults; a context should override only the fields it actually needs to change.
+- Do not inline API keys, tokens, private keys, or repository URLs with embedded credentials in `project_contexts`. Use environment references or named `credential_profiles` instead. If a context truly needs different credentials, keep them env-backed or app-backed just like the examples in [`trust-and-safety.md`](./trust-and-safety.md#credential-profiles).
+
+### Project-context redaction rules
+
+`npm run doctor -- --strict` should summarize configured project contexts without printing resolved secret values. The `workflow.project_contexts` check is expected to show context ids and labels, the Linear project slug, the workspace source kind, boolean configured/not-configured flags such as `repositoryConfigured`, `baseRefConfigured`, and `branchTemplateConfigured`, the workspace `cleanup` mode, and whether a GitHub token is present.
+
+It must not print raw API keys, GitHub tokens, private keys, credential profile secret material, provider account contents, or repository URLs that embed credentials. A sanitized summary looks like this:
+
+```text
+[OK] workflow.project_contexts: Configured project contexts (default: symphony): [{"id":"symphony","label":"Symphony","enabled":true,"tracker":{"projectSlug":"SYMPHONY"},"workspace":{"source":{"kind":"git_worktree","pathConfigured":false,"repositoryConfigured":true,"refConfigured":false,"baseRefConfigured":true,"branchTemplateConfigured":true,"cachePathConfigured":false,"cleanup":"refuse_dirty"}},"github":{"tokenPresent":true}},{"id":"docs","label":"Documentation Site","enabled":true,"tracker":{"projectSlug":"DOCS"},"workspace":{"source":{"kind":"git_worktree","pathConfigured":false,"repositoryConfigured":true,"refConfigured":false,"baseRefConfigured":true,"branchTemplateConfigured":true,"cachePathConfigured":false,"cleanup":"refuse_dirty"}},"github":{"tokenPresent":true}}]
+```
+
+Validation failures should point at the offending config path without echoing secret material. For example:
+
+```text
+[ERROR] workflow.parse: project_contexts["Docs Site"].workspace.source is required for enabled project contexts
+```
+
+If operator-facing workflow or doctor output includes a raw environment value, token, or credential-bearing repository URL, treat that as a redaction regression and stop promotion until it is fixed.
+
 Normal doctor is non-LLM and non-costly. It verifies workflow parsing, writable workspace paths, git availability, runtime harness/provider checks, Hermes paths, Python importability, managed auth readiness when `openai-codex` is selected, review-loop state configuration, actual Linear availability of `In Review`, `Blocked`, and `Ready to Merge` when Linear access is available, subprocess MCP tool availability, candidate isolation, and current Linear candidates.
 
 `doctor --live-runtime` is the opt-in live Hermes gateway readiness check. It materializes worker and reviewer profiles, writes Symphony MCP config, starts the stdio gateway, creates a session, calls `tools.list`, verifies the required Symphony MCP tools, closes the session, and redacts gateway logs. `npm run smoke:hermes-local` then uses a temp workspace/state area, starts the real `HermesHarness`, verifies MCP exposure, sends a short prompt, and persists a sanitized MCP exposure report under the configured workflow state directory. `npm run smoke:hermes-acp` is a separate opt-in live host ACP check; it is not part of default unit tests and should only be run when host Hermes ACP credentials are available. When you run it in this preflight block against `WORKFLOW.md`, treat it only as a prerequisite smoke for host Hermes setup. Final dogfood-unblock evidence must rerun the smoke against `WORKFLOW.hermes-acp.md` in the ACP checklist below so `configuredHarness: "hermes_acp"` is recorded.
