@@ -2,8 +2,10 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import {
+  completionReportMcpServerConfig,
   mergeConflictResolutionContextFilePath,
   renderCompletionMcpHandoffPrompt,
   renderIssueBreakdownMcpHandoffPrompt,
@@ -12,7 +14,7 @@ import {
   writeActiveHandoffMcpContexts,
 } from "../src/core/harness/HandoffMcp.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, projectContextFixture, testConfig } from "./helpers.js";
 
 describe("MCP handoff prompt rendering", () => {
   it("requires issue-breakdown proposals to include the agent-eligible issue contract", () => {
@@ -142,6 +144,115 @@ describe("MCP handoff context files", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("forwards resolved project context into completion-report MCP server env selection", async () => {
+    const sourceEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      SYMPHONY_GITHUB_OWNER: "acme",
+      SYMPHONY_GITHUB_REPO: "symphony",
+      SYMPHONY_GITHUB_HEAD_OWNER: "sym-owner",
+      SYMPHONY_GITHUB_API_BASE_URL: "https://api.github.sym.test",
+      SYMPHONY_GITHUB_PUBLICATION_TOKEN: "symphony-publication-secret",
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "docs-owner",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+      DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+    };
+    const rawConfig = multiProjectWorkflowConfig({
+      projectContexts: [
+        projectContextFixture({
+          id: "symphony",
+          label: "Symphony",
+          projectSlug: "SYMPHONY",
+          repository: ".",
+          github: {
+            owner: "$SYMPHONY_GITHUB_OWNER",
+            repo: "$SYMPHONY_GITHUB_REPO",
+            head_owner: "$SYMPHONY_GITHUB_HEAD_OWNER",
+            api_base_url: "$SYMPHONY_GITHUB_API_BASE_URL",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$SYMPHONY_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+            },
+          },
+        }),
+        projectContextFixture({
+          id: "docs",
+          label: "Documentation Site",
+          projectSlug: "DOCS",
+          repository: "../docs-site",
+          github: {
+            owner: "$DOCS_GITHUB_OWNER",
+            repo: "$DOCS_GITHUB_REPO",
+            head_owner: "$DOCS_GITHUB_HEAD_OWNER",
+            api_base_url: "$DOCS_GITHUB_API_BASE_URL",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+            },
+          },
+        }),
+      ],
+    });
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+    const ctx = handoffContext(config, {
+      role: "worker",
+      issueState: "In Progress",
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+    });
+
+    const prior = {
+      LINEAR_API_KEY: process.env.LINEAR_API_KEY,
+      SYMPHONY_GITHUB_OWNER: process.env.SYMPHONY_GITHUB_OWNER,
+      SYMPHONY_GITHUB_REPO: process.env.SYMPHONY_GITHUB_REPO,
+      SYMPHONY_GITHUB_HEAD_OWNER: process.env.SYMPHONY_GITHUB_HEAD_OWNER,
+      SYMPHONY_GITHUB_API_BASE_URL: process.env.SYMPHONY_GITHUB_API_BASE_URL,
+      SYMPHONY_GITHUB_PUBLICATION_TOKEN: process.env.SYMPHONY_GITHUB_PUBLICATION_TOKEN,
+      DOCS_GITHUB_OWNER: process.env.DOCS_GITHUB_OWNER,
+      DOCS_GITHUB_REPO: process.env.DOCS_GITHUB_REPO,
+      DOCS_GITHUB_HEAD_OWNER: process.env.DOCS_GITHUB_HEAD_OWNER,
+      DOCS_GITHUB_API_BASE_URL: process.env.DOCS_GITHUB_API_BASE_URL,
+      DOCS_GITHUB_PUBLICATION_TOKEN: process.env.DOCS_GITHUB_PUBLICATION_TOKEN,
+    };
+    Object.assign(process.env, sourceEnv);
+    try {
+      const server = completionReportMcpServerConfig(ctx, "/tmp/completion-context.json", { cliPath: "/repo/dist/cli.js" });
+      expect(server.env).toMatchObject({
+        DOCS_GITHUB_OWNER: "acme-docs",
+        DOCS_GITHUB_REPO: "docs-site",
+        DOCS_GITHUB_HEAD_OWNER: "docs-owner",
+        DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+        DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+      });
+      expect(server.env).not.toHaveProperty("SYMPHONY_GITHUB_PUBLICATION_TOKEN");
+    } finally {
+      for (const [key, value] of Object.entries(prior)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+  });
 });
 
 const docsProjectContext = {
@@ -152,12 +263,12 @@ const docsProjectContext = {
 } as const;
 
 function handoffContext(
-  config: ReturnType<typeof testConfig>,
+  config: AgentRunContext["config"],
   input: {
     role: "worker" | "reviewer";
     issueState: string;
     runPhase?: AgentRunContext["runPhase"];
-    projectContext?: typeof docsProjectContext;
+    projectContext?: AgentRunContext["projectContext"];
   },
 ): AgentRunContext {
   return {

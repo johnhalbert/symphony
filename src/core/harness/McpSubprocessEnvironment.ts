@@ -3,11 +3,19 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
 import {
-  resolveDefaultProjectContextCredentialProfiles,
   type GitHubAppConfig,
+  type GitHubConfig,
+  type RawProjectContextConfig,
+  type RawWorkflowConfig,
   type ServiceConfig,
 } from "../config/Config.js";
+import {
+  createCredentialProfileRegistry,
+  type CredentialProfileRegistry,
+  type RawCredentialProfilesConfig,
+} from "../config/CredentialProfiles.js";
 import type { CredentialRole } from "../config/CredentialProfiles.js";
+import { normalizeProjectContextId, type ProjectContextResolution } from "../config/ProjectContexts.js";
 
 export type McpSubprocessCommand =
   | "completion-report-mcp"
@@ -45,6 +53,7 @@ export interface McpSubprocessEnvironmentInput {
   config: ServiceConfig;
   command: McpSubprocessCommand;
   parentEnv?: NodeJS.ProcessEnv;
+  projectContext?: ProjectContextResolution | undefined;
 }
 
 const RUNTIME_BASELINE_ENV_KEYS = [
@@ -73,7 +82,8 @@ export function buildMcpSubprocessEnvironment(input: McpSubprocessEnvironmentInp
   const env: Record<string, string> = {};
   addRuntimeBaseline(env, parentEnv);
   addRequiredParseDependencies(env, input.config, parentEnv);
-  addCommandCapabilitySlice(env, input.config, input.command, parentEnv);
+  applyResolvedProjectContextCompatibilityView(env, input.config, input.projectContext);
+  addCommandCapabilitySlice(env, input.config, input.command, parentEnv, input.projectContext);
   return env;
 }
 
@@ -122,6 +132,26 @@ function addRuntimeBaseline(env: Record<string, string>, parentEnv: NodeJS.Proce
   for (const key of RUNTIME_BASELINE_ENV_KEYS) {
     addIfString(env, key, parentEnv[key]);
   }
+}
+
+function applyResolvedProjectContextCompatibilityView(
+  env: Record<string, string>,
+  config: ServiceConfig,
+  projectContext: ProjectContextResolution | undefined,
+): void {
+  const override = resolveSelectedProjectContextOverride(config, projectContext);
+  if (!override) return;
+
+  addTrackerParseDependencies(env, config.raw.tracker, override.context.tracker, { includeDefaultApiKeyFallback: true });
+  addWorkspaceParseDependencies(env, config.raw.workspace, override.context.workspace);
+  addGitHubParseDependencies(env, config.raw.github, override.context.github);
+
+  const defaultRawContext = findRawProjectContext(config.raw.project_contexts, config.projectContexts.defaultContextId);
+  if (!defaultRawContext) return;
+
+  addTrackerParseDependencies(env, defaultRawContext.tracker, override.context.tracker);
+  addWorkspaceParseDependencies(env, defaultRawContext.workspace, override.context.workspace);
+  addGitHubParseDependencies(env, defaultRawContext.github, override.context.github);
 }
 
 function addRequiredParseDependencies(
@@ -303,53 +333,57 @@ function addCommandCapabilitySlice(
   config: ServiceConfig,
   command: McpSubprocessCommand,
   parentEnv: NodeJS.ProcessEnv,
+  projectContext: ProjectContextResolution | undefined,
 ): void {
-  if (command === "completion-report-mcp" && config.github.publishPullRequests) {
-    addGitHubParseRefs(env, config);
-    if (!(config.github.operatorApproval?.requiredForPublication ?? false)) {
-      addGitHubCapabilityEnvironment(env, config, parentEnv, "service", "github.publication");
+  const view = resolveProjectContextCapabilityView(config, projectContext, parentEnv);
+
+  if (command === "completion-report-mcp" && view.github.publishPullRequests) {
+    addGitHubParseRefs(env, view.rawGithub, view.github);
+    if (!(view.github.operatorApproval?.requiredForPublication ?? false)) {
+      addGitHubCapabilityEnvironment(env, view, parentEnv, "service", "github.publication");
     }
   }
   if (command === "review-feedback-mcp") {
-    addGitHubParseRefs(env, config);
-    addGitHubCapabilityEnvironment(env, config, parentEnv, "reviewer", "github.review_feedback_write");
+    addGitHubParseRefs(env, view.rawGithub, view.github);
+    addGitHubCapabilityEnvironment(env, view, parentEnv, "reviewer", "github.review_feedback_write");
   }
 }
 
-function addGitHubParseRefs(env: Record<string, string>, config: ServiceConfig): void {
-  const rawGithub = config.raw.github;
+function addGitHubParseRefs(
+  env: Record<string, string>,
+  rawGithub: RawWorkflowConfig["github"] | undefined,
+  github: GitHubConfig,
+): void {
+  if (!rawGithub) return;
 
   const ownerRef = envReference(rawGithub?.owner);
-  if (ownerRef) env[ownerRef] = config.github.owner ?? "";
+  if (ownerRef) env[ownerRef] = github.owner ?? "";
 
   const repoRef = envReference(rawGithub?.repo);
-  if (repoRef) env[repoRef] = config.github.repo ?? "";
+  if (repoRef) env[repoRef] = github.repo ?? "";
 
   const headOwnerRef = envReference(rawGithub?.head_owner);
-  if (headOwnerRef) env[headOwnerRef] = config.github.headOwner ?? "";
+  if (headOwnerRef) env[headOwnerRef] = github.headOwner ?? "";
 
   const apiBaseUrlRef = envReference(rawGithub?.api_base_url);
-  if (apiBaseUrlRef) env[apiBaseUrlRef] = config.github.apiBaseUrl;
+  if (apiBaseUrlRef) env[apiBaseUrlRef] = github.apiBaseUrl;
 }
 
 function addGitHubCapabilityEnvironment(
   env: Record<string, string>,
-  config: ServiceConfig,
+  view: ProjectContextCapabilityView,
   parentEnv: NodeJS.ProcessEnv,
   role: CredentialRole,
   capability: "github.publication" | "github.review_feedback_write",
 ): void {
-  if (config.credentialProfiles.hasAssignment(role, capability)) {
-    const profile = config.credentialProfiles.profileForRole(role, capability);
-    const credential = config.credentialProfiles.resolveForRole(role, capability);
+  if (view.credentialProfiles.hasAssignment(role, capability)) {
+    const profile = view.credentialProfiles.profileForRole(role, capability);
+    const credential = view.credentialProfiles.resolveForRole(role, capability);
     if (profile === null || credential?.source !== "profile") {
       throw new Error(`${role} ${capability} profile assignment could not be resolved`);
     }
     if (profile.kind === "github_app") {
-      const rawProfile = resolveDefaultProjectContextCredentialProfiles(
-        config.raw,
-        config.projectContexts.defaultContextId,
-      )?.profiles?.[profile.name];
+      const rawProfile = view.rawCredentialProfiles?.profiles?.[profile.name];
       if (rawProfile?.kind !== "github_app") {
         throw new Error(`${role} ${capability} GitHub App profile assignment could not be resolved`);
       }
@@ -363,17 +397,17 @@ function addGitHubCapabilityEnvironment(
     return;
   }
 
-  if (config.github.app !== null) {
-    addGitHubAppCapabilityEnvironment(env, config, parentEnv);
+  if (view.github.app !== null) {
+    addGitHubAppCapabilityEnvironment(env, view.rawGithub?.app, view.github.app, parentEnv);
     return;
   }
 
-  const rawGithubToken = config.raw.github?.token;
+  const rawGithubToken = view.rawGithub?.token;
   const rawGithubTokenRef = envReference(rawGithubToken);
   if (rawGithubTokenRef) {
-    env[rawGithubTokenRef] = config.github.token ?? "";
-    if (config.github.token !== null) return;
-    addGitHubAppCapabilityEnvironment(env, config, parentEnv);
+    env[rawGithubTokenRef] = view.github.token ?? "";
+    if (view.github.token !== null) return;
+    addGitHubAppCapabilityEnvironment(env, view.rawGithub?.app, view.github.app, parentEnv);
     return;
   }
 
@@ -381,8 +415,8 @@ function addGitHubCapabilityEnvironment(
     return;
   }
 
-  if (config.github.token !== null) {
-    env.GITHUB_TOKEN = config.github.token;
+  if (view.github.token !== null) {
+    env.GITHUB_TOKEN = view.github.token;
   }
 }
 
@@ -409,18 +443,98 @@ function addGitHubAppProfileCapabilityEnvironment(
 
 function addGitHubAppCapabilityEnvironment(
   env: Record<string, string>,
-  config: ServiceConfig,
+  rawApp: RawGitHubAppEnvironmentSource | undefined,
+  app: GitHubAppConfig | null,
   parentEnv: NodeJS.ProcessEnv,
 ): void {
-  const app = config.github.app;
   if (app === null) return;
-
-  const rawApp = config.raw.github?.app;
   addGitHubAppStringEnvironment(env, rawApp?.app_id, "GITHUB_APP_ID", app.appId);
   addGitHubAppStringEnvironment(env, rawApp?.client_id, "GITHUB_APP_CLIENT_ID", app.clientId);
   addGitHubAppStringEnvironment(env, rawApp?.installation_id, "GITHUB_APP_INSTALLATION_ID", app.installationId);
   addGitHubAppPrivateKeyEnvironment(env, rawApp?.private_key, app.privateKeyEnvVar, parentEnv);
   addGitHubAppStringEnvironment(env, rawApp?.private_key_path, "GITHUB_APP_PRIVATE_KEY_PATH", app.privateKeyPath);
+}
+
+interface ProjectContextCapabilityView {
+  github: GitHubConfig;
+  rawGithub: RawWorkflowConfig["github"] | undefined;
+  credentialProfiles: CredentialProfileRegistry;
+  rawCredentialProfiles: RawCredentialProfilesConfig | undefined;
+}
+
+function resolveProjectContextCapabilityView(
+  config: ServiceConfig,
+  projectContext: ProjectContextResolution | undefined,
+  parentEnv: NodeJS.ProcessEnv,
+): ProjectContextCapabilityView {
+  const override = resolveSelectedProjectContextOverride(config, projectContext);
+  if (!override) {
+    return {
+      github: config.github,
+      rawGithub: mergeRawGitHubConfig(config.raw.github, findRawProjectContext(config.raw.project_contexts, config.projectContexts.defaultContextId)?.github),
+      credentialProfiles: config.credentialProfiles,
+      rawCredentialProfiles: config.projectContexts.defaultContext.credentialProfiles,
+    };
+  }
+
+  return {
+    github: override.context.github,
+    rawGithub: mergeRawGitHubConfig(config.raw.github, override.rawContext?.github),
+    credentialProfiles: createCredentialProfileRegistry({
+      raw: override.context.credentialProfiles,
+      env: parentEnv,
+      workflowDir: config.workflowDir,
+      fallbacks: {
+        githubToken: override.context.github.token,
+        linearApiKey: override.context.tracker.apiKey,
+        cursorRuntimeApiKey: parentEnv.CURSOR_API_KEY ?? null,
+        openWorkspaceToken: config.server.openWorkspaceToken,
+      },
+    }),
+    rawCredentialProfiles: override.context.credentialProfiles,
+  };
+}
+
+function resolveSelectedProjectContextOverride(
+  config: ServiceConfig,
+  projectContext: ProjectContextResolution | undefined,
+): {
+  context: ServiceConfig["projectContexts"]["defaultContext"];
+  rawContext: RawProjectContextConfig | undefined;
+} | null {
+  if (!projectContext) return null;
+
+  const projectContextId = normalizeProjectContextId(projectContext.projectContextId);
+  if (projectContextId === config.projectContexts.defaultContextId) return null;
+
+  const context = config.projectContexts.byId.get(projectContextId);
+  if (!context) {
+    throw new Error(`Resolved project context "${projectContextId}" is not configured`);
+  }
+
+  return {
+    context,
+    rawContext: findRawProjectContext(config.raw.project_contexts, projectContextId),
+  };
+}
+
+function findRawProjectContext(
+  projectContexts: RawWorkflowConfig["project_contexts"] | undefined,
+  projectContextId: string,
+): RawProjectContextConfig | undefined {
+  return projectContexts?.find((context) => normalizeProjectContextId(context.id) === projectContextId);
+}
+
+function mergeRawGitHubConfig(
+  defaults: RawWorkflowConfig["github"] | undefined,
+  overrides: RawProjectContextConfig["github"] | undefined,
+): RawWorkflowConfig["github"] | undefined {
+  if (!defaults && !overrides) return undefined;
+  return {
+    ...(defaults ?? {}),
+    ...(overrides ?? {}),
+    ...((defaults?.app || overrides?.app) ? { app: { ...(defaults?.app ?? {}), ...(overrides?.app ?? {}) } } : {}),
+  };
 }
 
 function addGitHubAppStringEnvironment(
