@@ -15,6 +15,12 @@ const URL_USERINFO_WITH_RAW_QUERY_OR_FRAGMENT_PATTERN =
   /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s]*[?#][^/\s]*)@([^/\s]+(?:\/.*)?)$/i;
 const URL_USERINFO_PATTERN = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s?#]*)@/i;
 const MAX_PRESERVED_PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_SEGMENT_LENGTH = 3;
+const MIN_PRESERVED_PATHLESS_SINGLE_LABEL_HOST_LENGTH =
+  MAX_PRESERVED_PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_SEGMENT_LENGTH * 2;
+const CREDENTIAL_LIKE_PATHLESS_SINGLE_LABEL_HOST_PATTERN =
+  /^(?:user(?:name)?|token|secret|pass(?:word)?|pwd|auth|login|admin|root|cred(?:ential)?s?|oauth|api(?:key)?)(?:[-_0-9].*)?$/i;
+const CREDENTIAL_LIKE_PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_PATTERN =
+  /^(?:pw|pwd|pass|auth|token|secret|key|name)$/i;
 
 export interface ProjectContextResolution {
   projectContextId: ProjectContextId;
@@ -298,7 +304,9 @@ function sanitizePathlessSingleLabelQueryOrFragmentBeforeAtUrl(repository: strin
   if (
     trailingPort ||
     suffixPayload.length > MAX_PRESERVED_PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_SEGMENT_LENGTH ||
-    trailingHost.length > MAX_PRESERVED_PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_SEGMENT_LENGTH
+    hostCandidate.length < MIN_PRESERVED_PATHLESS_SINGLE_LABEL_HOST_LENGTH ||
+    CREDENTIAL_LIKE_PATHLESS_SINGLE_LABEL_HOST_PATTERN.test(hostCandidate) ||
+    CREDENTIAL_LIKE_PATHLESS_SINGLE_LABEL_QUERY_OR_FRAGMENT_PATTERN.test(suffixPayload)
   ) {
     return `${scheme}${REDACTED}@${trailingHost}${trailingPort}`;
   }
