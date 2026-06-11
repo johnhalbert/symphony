@@ -4,6 +4,8 @@ export const LEGACY_DEFAULT_PROJECT_CONTEXT_ID = "default";
 export const LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL = "Default";
 export const LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE = "legacy_default";
 
+export type ProjectContextSource = "explicit" | "legacy_default";
+
 export interface ProjectContextResolution {
   projectContextId: ProjectContextId;
   projectContextLabel: string;
@@ -66,6 +68,7 @@ export interface NormalizedProjectContext<
   id: ProjectContextId;
   label: string;
   enabled: boolean;
+  source: ProjectContextSource;
   tracker: TTracker;
   workspace: TWorkspace;
   github: TGitHub;

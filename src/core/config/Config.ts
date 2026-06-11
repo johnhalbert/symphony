@@ -1016,6 +1016,7 @@ function normalizeWorkflowProjectContext(
     id,
     label,
     enabled,
+    source: options.requireExplicitWorkspaceSource ? "explicit" : "legacy_default",
     tracker,
     workspace,
     github,

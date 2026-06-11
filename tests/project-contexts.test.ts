@@ -178,6 +178,7 @@ describe("project context normalization", () => {
     expect(config.projectContexts.defaultContext).toMatchObject({
       id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
       label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      source: "legacy_default",
       tracker: { projectSlug: "TEST" },
       github: { owner: "acme", repo: "symphony", token: "github-test-token" },
       reviewLoop: { reviewStates: ["In Review"], maxReviewRounds: 5 },
@@ -311,6 +312,7 @@ describe("project context normalization", () => {
 
     expect(docsContext).toMatchObject({
       label: "Documentation Site",
+      source: "explicit",
       tracker: { projectSlug: "DOCS" },
       github: {
         owner: "docs-owner",
@@ -346,6 +348,49 @@ describe("project context normalization", () => {
     expect(config.reviewLoop.reviewPassState).toBe("Context Ready");
     expect(config.issueBreakdown.planningLabels).toEqual(["context-plan"]);
     expect(config.issueBreakdown.workspaceMode).toBe("none");
+  });
+
+  it("keeps raw project_contexts alongside the normalized project context registry", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: " Docs Site ",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+          }),
+          projectContextFixture({
+            id: "ops_portal",
+            label: "Ops Portal",
+            projectSlug: "OPS",
+            repository: "../ops-portal",
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+
+    const rawContexts = config.raw.project_contexts;
+    expect(rawContexts).toHaveLength(2);
+
+    const rawDefaultContext: RawProjectContextConfig = rawContexts![0]!;
+    expect(rawDefaultContext.id).toBe(" Docs Site ");
+    expect(rawDefaultContext.workspace?.source?.repository).toBe("../docs-site");
+
+    expect(config.projectContexts.defaultContextId).toBe("docs-site");
+    expect(config.projectContexts.defaultContext.id).toBe("docs-site");
+    expect(config.projectContexts.byId.get("docs-site")).toMatchObject({
+      label: "Documentation Site",
+      tracker: { projectSlug: "DOCS" },
+      workspace: { source: { repository: expect.stringMatching(/docs-site$/i) } },
+    });
+    expect(config.projectContexts.byId.get("ops-portal")).toMatchObject({
+      label: "Ops Portal",
+      tracker: { projectSlug: "OPS" },
+      workspace: { source: { repository: expect.stringMatching(/ops-portal$/i) } },
+    });
   });
 
   it("keeps raw project_contexts alongside the normalized project context registry", () => {
