@@ -1957,6 +1957,275 @@ describe("MCP subprocess environment", () => {
     },
   );
 
+  it("merges inherited default-context GitHub app profile refs before exporting publication capability env", () => {
+    const rawConfig = multiProjectWorkflowConfig({
+      topLevel: {
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          publish_pull_requests: true,
+          pr_handoff: { enabled: false },
+        },
+        credential_profiles: {
+          profiles: {
+            publication: {
+              kind: "github_app",
+              app_id: "$GLOBAL_GITHUB_APP_ID",
+              client_id: "$GLOBAL_GITHUB_APP_CLIENT_ID",
+              private_key_path: "$GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.publication"],
+            },
+          },
+          roles: {
+            service: {
+              "github.publication": "publication",
+            },
+          },
+        },
+      },
+      projectContexts: [
+        projectContextFixture({
+          id: "symphony",
+          label: "Symphony",
+          projectSlug: "SYMPHONY",
+          repository: ".",
+          github: {
+            owner: "acme",
+            repo: "symphony",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: {
+                kind: "github_app",
+                installation_id: "$CONTEXT_GITHUB_APP_INSTALLATION_ID",
+                private_key: "$CONTEXT_GITHUB_APP_PRIVATE_KEY",
+                capabilities: ["github.publication"],
+              },
+            },
+          },
+        }),
+        projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+      ],
+    });
+    const sourceEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      GLOBAL_GITHUB_APP_ID: "111",
+      GLOBAL_GITHUB_APP_CLIENT_ID: "Iv1.publication",
+      GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH: "/secrets/publication.pem",
+      CONTEXT_GITHUB_APP_INSTALLATION_ID: "222",
+      CONTEXT_GITHUB_APP_PRIVATE_KEY: "publication-private-key",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+    const publicationCredential = config.credentialProfiles.resolveForRole("service", "github.publication");
+
+    expect(publicationCredential).toMatchObject({
+      kind: "github_app",
+      source: "profile",
+      profileName: "publication",
+      app: {
+        appId: "111",
+        clientId: "Iv1.publication",
+        installationId: "222",
+        privateKeyEnvVar: "CONTEXT_GITHUB_APP_PRIVATE_KEY",
+      },
+    });
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "completion-report-mcp",
+      parentEnv: { PATH: "/bin", ...sourceEnv, GITHUB_TOKEN: "decoy-github-secret" },
+    });
+
+    expect(env).toMatchObject({
+      GLOBAL_GITHUB_APP_ID: "111",
+      GLOBAL_GITHUB_APP_CLIENT_ID: "Iv1.publication",
+      CONTEXT_GITHUB_APP_INSTALLATION_ID: "222",
+      CONTEXT_GITHUB_APP_PRIVATE_KEY: "publication-private-key",
+      GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH: publicationCredential?.app?.privateKeyPath,
+    });
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    expect(childConfig.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "github_app",
+      source: "profile",
+      profileName: "publication",
+      app: {
+        appId: "111",
+        clientId: "Iv1.publication",
+        installationId: "222",
+        privateKeyEnvVar: "CONTEXT_GITHUB_APP_PRIVATE_KEY",
+        privateKeyPath: publicationCredential?.app?.privateKeyPath,
+      },
+    });
+  });
+
+  it("exports default-context static-token kind switches through MCP env and child reparse", () => {
+    const rawConfig = multiProjectWorkflowConfig({
+      topLevel: {
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          publish_pull_requests: true,
+          pr_handoff: { enabled: false },
+        },
+        credential_profiles: {
+          profiles: {
+            publication: {
+              kind: "github_app",
+              app_id: "$GLOBAL_GITHUB_APP_ID",
+              client_id: "$GLOBAL_GITHUB_APP_CLIENT_ID",
+              installation_id: "$GLOBAL_GITHUB_APP_INSTALLATION_ID",
+              private_key_path: "$GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.publication", "github.merge"],
+            },
+            feedback: {
+              kind: "github_app",
+              app_id: "$GLOBAL_GITHUB_REVIEW_APP_ID",
+              client_id: "$GLOBAL_GITHUB_REVIEW_APP_CLIENT_ID",
+              installation_id: "$GLOBAL_GITHUB_REVIEW_APP_INSTALLATION_ID",
+              private_key_path: "$GLOBAL_GITHUB_REVIEW_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.review_feedback_write"],
+            },
+          },
+          roles: {
+            service: {
+              "github.publication": "publication",
+              "github.merge": "publication",
+            },
+            reviewer: {
+              "github.review_feedback_write": "feedback",
+            },
+          },
+        },
+      },
+      projectContexts: [
+        projectContextFixture({
+          id: "symphony",
+          label: "Symphony",
+          projectSlug: "SYMPHONY",
+          repository: ".",
+          github: {
+            owner: "acme",
+            repo: "symphony",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: {
+                value: "$CONTEXT_GITHUB_PUBLICATION_TOKEN",
+                capabilities: ["github.publication", "github.merge"],
+              },
+              feedback: {
+                value: "$CONTEXT_GITHUB_FEEDBACK_TOKEN",
+                capabilities: ["github.review_feedback_write"],
+              },
+            },
+          },
+        }),
+        projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+      ],
+    });
+    const sourceEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      GLOBAL_GITHUB_APP_ID: "111",
+      GLOBAL_GITHUB_APP_CLIENT_ID: "Iv1.publication",
+      GLOBAL_GITHUB_APP_INSTALLATION_ID: "222",
+      GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH: "/secrets/publication.pem",
+      GLOBAL_GITHUB_REVIEW_APP_ID: "333",
+      GLOBAL_GITHUB_REVIEW_APP_CLIENT_ID: "Iv1.review",
+      GLOBAL_GITHUB_REVIEW_APP_INSTALLATION_ID: "444",
+      GLOBAL_GITHUB_REVIEW_APP_PRIVATE_KEY_PATH: "/secrets/reviewer.pem",
+      CONTEXT_GITHUB_PUBLICATION_TOKEN: "context-publication-secret",
+      CONTEXT_GITHUB_FEEDBACK_TOKEN: "context-feedback-secret",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    expect(config.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("service", "github.merge")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("reviewer", "github.review_feedback_write")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "feedback",
+      value: "context-feedback-secret",
+    });
+
+    const completionEnv = buildMcpSubprocessEnvironment({
+      config,
+      command: "completion-report-mcp",
+      parentEnv: { PATH: "/bin", ...sourceEnv, GITHUB_TOKEN: "decoy-github-secret" },
+    });
+
+    expect(completionEnv).toMatchObject({
+      CONTEXT_GITHUB_PUBLICATION_TOKEN: "context-publication-secret",
+    });
+    expect(completionEnv).not.toHaveProperty("GITHUB_TOKEN");
+    expect(completionEnv).not.toHaveProperty("CONTEXT_GITHUB_FEEDBACK_TOKEN");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_CLIENT_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_INSTALLATION_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_CLIENT_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_INSTALLATION_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_PRIVATE_KEY_PATH");
+
+    const childCompletionConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", completionEnv);
+    expect(childCompletionConfig.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+    expect(childCompletionConfig.credentialProfiles.resolveForRole("service", "github.merge")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+
+    const reviewEnv = buildMcpSubprocessEnvironment({
+      config,
+      command: "review-feedback-mcp",
+      parentEnv: { PATH: "/bin", ...sourceEnv, GITHUB_TOKEN: "decoy-github-secret" },
+    });
+
+    expect(reviewEnv).toMatchObject({
+      CONTEXT_GITHUB_FEEDBACK_TOKEN: "context-feedback-secret",
+    });
+    expect(reviewEnv).not.toHaveProperty("GITHUB_TOKEN");
+    expect(reviewEnv).not.toHaveProperty("CONTEXT_GITHUB_PUBLICATION_TOKEN");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_CLIENT_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_INSTALLATION_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_CLIENT_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_INSTALLATION_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_PRIVATE_KEY_PATH");
+
+    const childReviewConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", reviewEnv);
+    expect(childReviewConfig.credentialProfiles.resolveForRole("reviewer", "github.review_feedback_write")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "feedback",
+      value: "context-feedback-secret",
+    });
+  });
+
   it("reports missing assigned publication profile secrets without falling back to legacy GITHUB_TOKEN", () => {
     const config = parseServiceConfig(
       {
