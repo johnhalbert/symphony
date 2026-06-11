@@ -2,7 +2,7 @@
 
 This guide explains how the configured Postgres migration path in `migrations/postgres` maps to Symphony-owned state, external authorities, and the current file-backed transition period. Use it before adding a persistence repository, reducer, importer, or status projection so new code writes the right state to the right place.
 
-The active migration runner surface is `migrations/postgres/0001_migration_foundation.sql`, the published checksum-stable `migrations/postgres/0002_symphony_owned_state.sql`, `migrations/postgres/0003_projection_freshness_indexes.sql`, `migrations/postgres/0004_run_activity_canonical_channels.sql`, `migrations/postgres/0005_projection_source_freshness.sql`, and `migrations/postgres/0006_projection_build_modes.sql`. The older `db/migrations/postgres/0001_symphony_owned_state.sql` file is the original schema copy, not the service-configured migration runner path; do not implement repositories or reducers from that legacy copy alone.
+The active migration runner surface is `migrations/postgres/0001_migration_foundation.sql`, the published checksum-stable `migrations/postgres/0002_symphony_owned_state.sql`, `migrations/postgres/0003_projection_freshness_indexes.sql`, `migrations/postgres/0004_run_activity_canonical_channels.sql`, `migrations/postgres/0005_projection_source_freshness.sql`, `migrations/postgres/0006_projection_build_modes.sql`, and `migrations/postgres/0007_project_context_attribution.sql`. The older `db/migrations/postgres/0001_symphony_owned_state.sql` file is the original schema copy, not the service-configured migration runner path; do not implement repositories or reducers from that legacy copy alone.
 
 ## Active schema surface
 
@@ -12,6 +12,7 @@ The active migration runner surface is `migrations/postgres/0001_migration_found
 - `migrations/postgres/0004_run_activity_canonical_channels.sql` migrates legacy `message` and `status` run activity channel aliases to canonical `chat` and `diagnostic` values, then enforces those canonical run activity channel names for persisted rows.
 - `migrations/postgres/0005_projection_source_freshness.sql` adds `projection_revision.source_freshness`, backfills rows that already embedded freshness under `source_cursors.sourceFreshness` / `source_cursors.freshness`, and indexes the JSONB metadata for status/projection readers.
 - `migrations/postgres/0006_projection_build_modes.sql` adds `projection_revision.build_mode`, backfills first-scope rows to `bootstrap`, constrains the build-mode vocabulary, and indexes rebuild/bootstrap/incremental revisions for rebuild reports and projection readers.
+- `migrations/postgres/0007_project_context_attribution.sql` adds project context attribution columns plus legacy/default backfills across owned operational and projection tables, then re-scopes primary keys, unique constraints, foreign keys, and read indexes by `project_context_id`.
 - `migrations/postgres/README.md` is the schema entry point engineers should read first. It links here for state ownership and migration compatibility guidance.
 
 ## Ownership decision rules
@@ -62,7 +63,7 @@ The active migration runner surface is `migrations/postgres/0001_migration_found
 
 ## File-backed transition constraints
 
-- The configured `migrations/postgres` schema is additive. `0002_symphony_owned_state.sql`, `0003_projection_freshness_indexes.sql`, `0004_run_activity_canonical_channels.sql`, `0005_projection_source_freshness.sql`, and `0006_projection_build_modes.sql` do not, by themselves, switch lifecycle, writeback, approval, or transcript reads away from the current file-backed stores.
+- The configured `migrations/postgres` schema is additive. `0002_symphony_owned_state.sql`, `0003_projection_freshness_indexes.sql`, `0004_run_activity_canonical_channels.sql`, `0005_projection_source_freshness.sql`, `0006_projection_build_modes.sql`, and `0007_project_context_attribution.sql` do not, by themselves, switch lifecycle, writeback, approval, or transcript reads away from the current file-backed stores.
 - The legacy `db/migrations/postgres/0001_symphony_owned_state.sql` copy remains documentation/history for the original schema proposal. The service-configured runner path is `migrations/postgres`, and repository implementations should validate against that current path.
 - Existing stores under `workspace.stateDir` remain compatibility contracts: `FileRunTranscriptStore`, `FileIssueLifecycleStore`, `FileWritebackOutboxStore`, `FileOperatorApprovalStore`, and related projection revision notifications must keep their observable API behavior until a later repository layer explicitly migrates them.
 - A future persistence implementation should introduce repository interfaces or adapters first, then dual-write/import, then switch reads behind configuration after replay and recovery tests pass.

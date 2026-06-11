@@ -472,6 +472,82 @@ describe("web history/transcript durable projection writes", () => {
     expect(serializedWrites).toContain("token=[redacted]");
   });
 
+  it("passes project context ids into durable transcript rebuild reads when transcript pages come from the run-activity source store", async () => {
+    const projectionWriter = recordingProjectionWriter();
+    const run = runFixture({
+      runId: "shared-run",
+      sessionId: "shared-session-red",
+      issueId: "issue-red",
+      issueIdentifier: "TEST-RED",
+      transcriptEventCount: 2,
+      projectContext: {
+        projectContextId: "red",
+        projectContextLabel: "Red",
+        linearProjectSlug: "red",
+        routingSource: "issue_record",
+      },
+    });
+    const durableActivityStore = new InMemoryRunActivityAppendStore();
+    const appended = await durableActivityStore.appendEvents([
+      runActivityInputFixture({
+        id: "activity-shared-1",
+        runId: run.runId,
+        sessionId: run.sessionId,
+        sequence: 1,
+        text: "shared durable message 1",
+      }),
+      runActivityInputFixture({
+        id: "activity-shared-2",
+        runId: run.runId,
+        sessionId: run.sessionId,
+        sequence: 2,
+        text: "shared durable message 2",
+      }),
+    ]);
+    expect(appended.rejected).toEqual([]);
+    const durableReadCalls: Array<{ runId: string; offset: number | undefined; limit: number | undefined; projectContextId: string | null }> = [];
+    const runActivitySourceStore = {
+      async readRunEvents(runId: string, options: { offset?: number; limit?: number; projectContextId?: string | null } = {}) {
+        durableReadCalls.push({
+          runId,
+          offset: options.offset,
+          limit: options.limit,
+          projectContextId: options.projectContextId ?? null,
+        });
+        return durableActivityStore.readRunEvents(runId, {
+          ...(options.offset === undefined ? {} : { offset: options.offset }),
+          ...(options.limit === undefined ? {} : { limit: options.limit }),
+        });
+      },
+    };
+    let rawTranscriptReads = 0;
+    const server = createStatusServer({
+      runStore: runStoreFixture({
+        runs: [run],
+        beforeReadTranscript: () => {
+          rawTranscriptReads += 1;
+          throw new Error("context-scoped durable rebuild should not hydrate raw transcript pages");
+        },
+      }),
+      runActivitySourceStore,
+      projectionWriter,
+    });
+
+    const result = await server.rebuildDurableWebProjections({
+      projections: ["transcript_projection"],
+      transcriptPageLimit: 1,
+    });
+
+    expect(result).toMatchObject({ attempted: 3, written: 3, unchanged: 0, skipped: 0, failed: 0 });
+    expect(rawTranscriptReads).toBe(0);
+    expect(durableReadCalls).toEqual([
+      { runId: "shared-run", offset: 0, limit: 1, projectContextId: "red" },
+      { runId: "shared-run", offset: 0, limit: 500, projectContextId: "red" },
+      { runId: "shared-run", offset: 0, limit: 1, projectContextId: "red" },
+      { runId: "shared-run", offset: 1, limit: 1, projectContextId: "red" },
+    ]);
+  });
+
   it("serves large history views from bounded run slices without transcript hydration", async () => {
     const projectionWriter = recordingProjectionWriter();
     const runs = Array.from({ length: 250 }, (_, index) =>
