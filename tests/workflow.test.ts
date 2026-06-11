@@ -1485,6 +1485,67 @@ describe("project context workflow contracts", () => {
     });
   });
 
+  it("allows three named project contexts when two share a codebase but target different Linear projects", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "Docs Authoring",
+            label: "Docs Authoring",
+            projectSlug: "DOCS_AUTHORING",
+            repository: "../docs-site",
+          }),
+          projectContextFixture({
+            id: "Docs Release",
+            label: "Docs Release",
+            projectSlug: "DOCS_RELEASE",
+            repository: "../docs-site",
+          }),
+          projectContextFixture({
+            id: "Ops Portal",
+            label: "Ops Portal",
+            projectSlug: "OPS",
+            repository: "../ops-portal",
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.projectContexts.contexts.map((context) => context.id)).toEqual([
+      "docs-authoring",
+      "docs-release",
+      "ops-portal",
+    ]);
+    expect(config.projectContexts.defaultContextId).toBe("docs-authoring");
+
+    const docsAuthoring = config.projectContexts.byId.get("docs-authoring");
+    const docsRelease = config.projectContexts.byId.get("docs-release");
+    const opsPortal = config.projectContexts.byId.get("ops-portal");
+
+    expect(docsAuthoring).toMatchObject({
+      id: "docs-authoring",
+      label: "Docs Authoring",
+      tracker: { projectSlug: "DOCS_AUTHORING" },
+      workspace: { source: { repository: path.resolve("/repo", "../docs-site") } },
+    });
+    expect(docsRelease).toMatchObject({
+      id: "docs-release",
+      label: "Docs Release",
+      tracker: { projectSlug: "DOCS_RELEASE" },
+      workspace: { source: { repository: path.resolve("/repo", "../docs-site") } },
+    });
+    expect(opsPortal).toMatchObject({
+      id: "ops-portal",
+      label: "Ops Portal",
+      tracker: { projectSlug: "OPS" },
+      workspace: { source: { repository: path.resolve("/repo", "../ops-portal") } },
+    });
+    expect(docsAuthoring?.workspace.source.repository).toBe(docsRelease?.workspace.source.repository);
+    expect(docsAuthoring?.tracker.projectSlug).not.toBe(docsRelease?.tracker.projectSlug);
+  });
+
   it("rejects duplicate project context ids after normalization", () => {
     expect(() =>
       parseServiceConfig(
