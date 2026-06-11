@@ -152,6 +152,81 @@ describe("runtime dependency credential wiring", () => {
     expect(authorizations).toEqual(["docs-writeback-secret"]);
   });
 
+  it("treats legacy default project context as the configured runtime default for scoped writeback drains", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LEGACY_LINEAR_TOKEN", project_slug: "SYM" },
+        workspace: {
+          root,
+          state_dir: path.join(root, "state"),
+          source: { kind: "copy", path: root },
+        },
+        writeback: { enabled: true, mode: "live" },
+        credential_profiles: {
+          profiles: {
+            "linear-tracker": { value: "$LINEAR_TRACKER_TOKEN", capabilities: ["linear.tracker"] },
+            "linear-writeback": { value: "$LINEAR_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
+          },
+          roles: {
+            worker: { "linear.tracker": "linear-tracker" },
+            service: { "linear.writeback": "linear-writeback" },
+          },
+        },
+        project_contexts: [
+          {
+            id: "symphony",
+            label: "Symphony",
+            tracker: { project_slug: "SYM" },
+            workspace: { source: { kind: "copy", path: root } },
+          },
+          {
+            id: "docs",
+            label: "Documentation Site",
+            tracker: { api_key: "$DOCS_LEGACY_LINEAR_TOKEN", project_slug: "DOCS" },
+            workspace: { source: { kind: "copy", path: root } },
+            credential_profiles: {
+              profiles: {
+                "docs-tracker": { value: "$DOCS_TRACKER_TOKEN", capabilities: ["linear.tracker"] },
+                "docs-writeback": { value: "$DOCS_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
+              },
+              roles: {
+                worker: { "linear.tracker": "docs-tracker" },
+                service: { "linear.writeback": "docs-writeback" },
+              },
+            },
+          },
+        ],
+      },
+      path.join(root, "WORKFLOW.md"),
+      {
+        LEGACY_LINEAR_TOKEN: "legacy-linear-secret",
+        LINEAR_TRACKER_TOKEN: "linear-tracker-secret",
+        LINEAR_WRITEBACK_TOKEN: "linear-writeback-secret",
+        DOCS_LEGACY_LINEAR_TOKEN: "docs-legacy-linear-secret",
+        DOCS_TRACKER_TOKEN: "docs-tracker-secret",
+        DOCS_WRITEBACK_TOKEN: "docs-writeback-secret",
+      },
+    );
+    const authorizations: string[] = [];
+    const processor = createRuntimeWritebackProcessor(
+      config,
+      new StructuredLogger(() => undefined),
+      async (_input, init) => {
+        authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+        return jsonResponse({ data: { issueUpdate: { success: true } } });
+      },
+    );
+
+    await processor?.enqueueAndProcess({
+      kind: "transition",
+      idempotencyKey: "transition:issue-symphony-1:In Review",
+      issueId: "issue-symphony-1",
+      payload: { toState: "In Review", fromStates: ["In Progress"] },
+    });
+
+    expect(authorizations).toEqual(["linear-writeback-secret"]);
+  });
+
   it("rejects wrong-role-only service writeback assignments in runtime writeback construction", () => {
     const config = runtimeConfig({
       credentialProfiles: {

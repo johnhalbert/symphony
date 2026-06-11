@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { promises as nodeFs } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -40,6 +41,7 @@ import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbo
 import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
+
 type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
 type CommentWriteback = Extract<NewWritebackOperation, { kind: "comment" }>;
 
@@ -56,6 +58,12 @@ describe("FileWritebackOutboxStore", () => {
     projectContextLabel: "Symphony",
     linearProjectSlug: "ENG",
     routingSource: "candidate_poll",
+  } as const;
+  const legacyDefaultProjectContext = {
+    projectContextId: "default",
+    projectContextLabel: "Default",
+    linearProjectSlug: null,
+    routingSource: "legacy_default",
   } as const;
 
   beforeEach(async () => {
@@ -82,6 +90,30 @@ describe("FileWritebackOutboxStore", () => {
     if (!stripped) throw new Error(`writeback record not found: ${idempotencyKey}`);
   }
 
+  async function relocatePersistedWritebackToLegacyPath(
+    idempotencyKey: string,
+    targetKind: "short" | "full",
+  ): Promise<void> {
+    const recordsDir = path.join(root, "writeback");
+    const targetPath = path.join(
+      recordsDir,
+      targetKind === "short" ? legacyShortRecordFileName(idempotencyKey) : `${safeLegacyFileName(idempotencyKey)}.json`,
+    );
+    for (const entry of await readdir(recordsDir)) {
+      const filePath = path.join(recordsDir, entry);
+      const parsed = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+      if (parsed.idempotencyKey !== idempotencyKey) continue;
+      delete parsed.projectContext;
+      await writeFile(targetPath, `${JSON.stringify(parsed, null, 2)}
+`, "utf8");
+      if (filePath !== targetPath) {
+        await rm(filePath, { force: true });
+      }
+      return;
+    }
+    throw new Error(`writeback record not found: ${idempotencyKey}`);
+  }
+
   async function recordRunProjectContext(
     runId: string,
     issueId = "issue-docs-1",
@@ -103,6 +135,23 @@ describe("FileWritebackOutboxStore", () => {
       workspaceKey: issueIdentifier,
       workspacePath: "/tmp/workspace",
     });
+  }
+
+  function safeLegacyFileName(value: string): string {
+    return value.replace(/[^A-Za-z0-9._-]/g, "_") || "record";
+  }
+
+  function legacyShortRecordFileName(idempotencyKey: string): string {
+    const [rawKind, rawIssueId] = idempotencyKey.split(":");
+    const kind = truncateFileSegment(safeLegacyFileName(rawKind ?? "record"), 16);
+    const issueId = truncateFileSegment(safeLegacyFileName(rawIssueId ?? "unknown"), 48);
+    const digest = createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 20);
+    return `wb_${kind}_${issueId}_${digest}.json`;
+  }
+
+  function truncateFileSegment(value: string, maxLength: number): string {
+    const trimmed = value.slice(0, maxLength);
+    return trimmed.length > 0 ? trimmed : "record";
   }
 
 
@@ -184,6 +233,76 @@ describe("FileWritebackOutboxStore", () => {
 
     await expect(store.enqueueOnce(operation)).resolves.toMatchObject({ projectContext: docsProjectContext });
     await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ projectContext: docsProjectContext });
+  });
+
+  it("replays pre-fix short-path legacy writebacks idempotently for non-default project contexts", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    const operation = {
+      idempotencyKey: "comment:issue-docs-replay-short:note",
+      kind: "comment" as const,
+      issueId: "issue-docs-replay-short",
+      projectContext: docsProjectContext,
+      runId: "run-docs-replay-short",
+      payload: { body: "Docs replay short", dedupeKey: "docs-replay-short" },
+    };
+
+    await store.enqueueOnce(operation);
+    await relocatePersistedWritebackToLegacyPath(operation.idempotencyKey, "short");
+
+    await expect(store.enqueueOnce(operation)).resolves.toMatchObject({
+      status: "pending",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.list()).resolves.toEqual([
+      expect.objectContaining({ idempotencyKey: operation.idempotencyKey, projectContext: docsProjectContext, status: "pending" }),
+    ]);
+
+    await processor.processDue({ idempotencyKeys: [operation.idempotencyKey] });
+
+    expect(writer.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-docs-replay-short",
+        body: "Docs replay short",
+        dedupeKey: "docs-replay-short",
+      }),
+    ]);
+    await expect(store.get(operation.idempotencyKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.get(operation.idempotencyKey, legacyDefaultProjectContext)).resolves.toBeNull();
+  });
+
+  it("preserves settled replay idempotency for legacy full-path writebacks missing project context", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    const operation = {
+      idempotencyKey: "comment:issue-docs-replay-full:note",
+      kind: "comment" as const,
+      issueId: "issue-docs-replay-full",
+      projectContext: docsProjectContext,
+      runId: "run-docs-replay-full",
+      payload: { body: "Docs replay full", dedupeKey: "docs-replay-full" },
+    };
+
+    const settled = await store.enqueueOnce(operation);
+    await store.markSucceeded(settled);
+    await relocatePersistedWritebackToLegacyPath(operation.idempotencyKey, "full");
+
+    await expect(store.enqueueOnce(operation)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.list()).resolves.toEqual([
+      expect.objectContaining({ idempotencyKey: operation.idempotencyKey, projectContext: docsProjectContext, status: "succeeded" }),
+    ]);
+
+    await processor.processDue({ idempotencyKeys: [operation.idempotencyKey] });
+
+    expect(writer.comments).toEqual([]);
   });
 
   it.each(["pending", "retrying"] as const)(
@@ -362,6 +481,64 @@ describe("FileWritebackOutboxStore", () => {
     ]);
     expect(defaultWriter.comments).toEqual([]);
     await expect(store.get(sharedKey, symphonyProjectContext)).resolves.toMatchObject({ status: "succeeded" });
+  });
+
+  it("preserves default-context records when a non-default context shares the same idempotency key", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const defaultWriter = new FakeWriter();
+    const docsWriter = new FakeWriter();
+    const processor = new WritebackProcessor(
+      store,
+      defaultWriter,
+      new StructuredLogger(() => undefined),
+      300_000,
+      undefined,
+      false,
+      undefined,
+      (projectContext) => (projectContext?.projectContextId === docsProjectContext.projectContextId ? docsWriter : defaultWriter),
+    );
+    const sharedKey = "comment:issue-default-docs-scope:same-key";
+
+    await store.enqueueOnce({
+      idempotencyKey: sharedKey,
+      kind: "comment",
+      issueId: "issue-default-docs-scope",
+      runId: "run-default-shared",
+      payload: { body: "Default shared-key note", dedupeKey: "shared-key-default" },
+    });
+    await store.enqueueOnce({
+      idempotencyKey: sharedKey,
+      kind: "comment",
+      issueId: "issue-default-docs-scope",
+      projectContext: docsProjectContext,
+      runId: "run-docs-shared",
+      payload: { body: "Docs shared-key note", dedupeKey: "shared-key-docs" },
+    });
+
+    await expect(store.list()).resolves.toHaveLength(2);
+    await expect(store.get(sharedKey, legacyDefaultProjectContext)).resolves.toMatchObject({
+      status: "pending",
+      projectContext: legacyDefaultProjectContext,
+      payload: expect.objectContaining({ body: "Default shared-key note", dedupeKey: "shared-key-default" }),
+    });
+    await expect(store.get(sharedKey, docsProjectContext)).resolves.toMatchObject({
+      status: "pending",
+      projectContext: docsProjectContext,
+      payload: expect.objectContaining({ body: "Docs shared-key note", dedupeKey: "shared-key-docs" }),
+    });
+
+    await processor.processDue({ projectContext: docsProjectContext, idempotencyKeys: [sharedKey] });
+
+    expect(docsWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-default-docs-scope",
+        body: "Docs shared-key note",
+        dedupeKey: "shared-key-docs",
+      }),
+    ]);
+    expect(defaultWriter.comments).toEqual([]);
+    await expect(store.get(sharedKey, docsProjectContext)).resolves.toMatchObject({ status: "succeeded" });
+    await expect(store.get(sharedKey, legacyDefaultProjectContext)).resolves.toMatchObject({ status: "pending" });
   });
 
   it("matches processDue project context by id even when attribution metadata changes", async () => {

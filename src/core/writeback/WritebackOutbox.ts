@@ -273,11 +273,11 @@ export class FileWritebackOutboxStore {
     const current = await readJsonIfExists<WritebackOperation>(this.recordPath(idempotencyKey, projectContext));
     if (current) return normalizeWritebackOperation(current);
     const previousShort = await readJsonIfExists<WritebackOperation>(this.previousShortRecordPath(idempotencyKey));
-    if (previousShort && matchesProjectContextScope(previousShort.projectContext, projectContext)) {
+    if (previousShort && matchesReplayLookupScope(previousShort, projectContext)) {
       return normalizeWritebackOperation(previousShort);
     }
     const legacy = await readJsonIfExists<WritebackOperation>(this.legacyRecordPath(idempotencyKey));
-    if (legacy && matchesProjectContextScope(legacy.projectContext, projectContext)) {
+    if (legacy && matchesReplayLookupScope(legacy, projectContext)) {
       return normalizeWritebackOperation(legacy);
     }
     const matches = (await this.list()).filter((record) => record.idempotencyKey === idempotencyKey);
@@ -308,14 +308,14 @@ export class FileWritebackOutboxStore {
     const previousShortPath = this.previousShortRecordPath(idempotencyKey);
     if (previousShortPath !== currentPath) {
       const previousShort = await readJsonIfExists<Record<string, unknown>>(previousShortPath);
-      if (previousShort && matchesProjectContextScope(previousShort.projectContext as ProjectContextResolution | undefined, projectContext)) {
+      if (previousShort && matchesReplayLookupScope(previousShort, projectContext)) {
         return previousShort;
       }
     }
     const legacyPath = this.legacyRecordPath(idempotencyKey);
     if (legacyPath !== currentPath && legacyPath !== previousShortPath) {
       const legacy = await readJsonIfExists<Record<string, unknown>>(legacyPath);
-      if (legacy && matchesProjectContextScope(legacy.projectContext as ProjectContextResolution | undefined, projectContext)) {
+      if (legacy && matchesReplayLookupScope(legacy, projectContext)) {
         return legacy;
       }
     }
@@ -415,7 +415,7 @@ export class FileWritebackOutboxStore {
   }
 
   private previousShortRecordPath(idempotencyKey: string): string {
-    return path.join(this.recordsDir(), shortRecordFileName(idempotencyKey));
+    return path.join(this.recordsDir(), legacyShortRecordFileName(idempotencyKey));
   }
 
   private legacyRecordPath(idempotencyKey: string): string {
@@ -654,10 +654,18 @@ function safeFileName(value: string): string {
 }
 
 function shortRecordFileName(idempotencyKey: string, projectContext?: ProjectContextResolution): string {
+  return buildShortRecordFileName(idempotencyKey, writebackIdentityKey(idempotencyKey, projectContext));
+}
+
+function legacyShortRecordFileName(idempotencyKey: string): string {
+  return buildShortRecordFileName(idempotencyKey, idempotencyKey);
+}
+
+function buildShortRecordFileName(idempotencyKey: string, digestSource: string): string {
   const [rawKind, rawIssueId] = idempotencyKey.split(":");
   const kind = truncateFileSegment(safeFileName(rawKind ?? "record"), 16);
   const issueId = truncateFileSegment(safeFileName(rawIssueId ?? "unknown"), 48);
-  const digest = createHash("sha256").update(writebackIdentityKey(idempotencyKey, projectContext)).digest("hex").slice(0, 20);
+  const digest = createHash("sha256").update(digestSource).digest("hex").slice(0, 20);
   return `wb_${kind}_${issueId}_${digest}.json`;
 }
 
@@ -675,6 +683,13 @@ function normalizeWritebackOperation(record: WritebackOperation): WritebackOpera
 
 function needsProjectContextBackfill(record: Record<string, unknown> | null): boolean {
   return record !== null && (!Object.prototype.hasOwnProperty.call(record, "projectContext") || record.projectContext === null);
+}
+
+function matchesReplayLookupScope(
+  record: Record<string, unknown> | null,
+  expectedProjectContext: ProjectContextResolution | undefined,
+): boolean {
+  return needsProjectContextBackfill(record) || matchesProjectContextScope(record?.projectContext as ProjectContextResolution | undefined, expectedProjectContext);
 }
 
 function projectContextEquals(

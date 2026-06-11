@@ -7,7 +7,11 @@ import {
   type CredentialRole,
   type ResolvedCredential,
 } from "../core/config/CredentialProfiles.js";
-import { normalizeProjectContextId, type ProjectContextResolution } from "../core/config/ProjectContexts.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  normalizeProjectContextId,
+  type ProjectContextResolution,
+} from "../core/config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import { FileIssueLifecycleStore, type IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
 import type { IssueBreakdownIssueLookupResult } from "../core/writeback/WritebackOutbox.js";
@@ -76,7 +80,11 @@ export function resolveServiceConfigForProjectContext(
   projectContext?: ProjectContextResolution,
 ): ServiceConfig {
   if (!projectContext) return config;
-  const projectContextId = normalizeProjectContextId(projectContext.projectContextId);
+  const requestedProjectContextId = normalizeProjectContextId(projectContext.projectContextId);
+  const projectContextId =
+    requestedProjectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+      ? config.projectContexts.defaultContextId
+      : requestedProjectContextId;
   if (projectContextId === config.projectContexts.defaultContextId) return config;
 
   const context = config.projectContexts.byId.get(projectContextId);
