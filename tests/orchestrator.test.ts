@@ -2519,6 +2519,11 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
       await waitFor(() => typeof orchestrator.snapshot().running[0]?.runId === "string", "worker run start");
       const runId = orchestrator.snapshot().running[0]?.runId ?? "";
+      await waitForRunRecord(runStore, runId);
+      await waitForAsync(async () => {
+        const lifecycle = await lifecycleStore.get(candidate.id);
+        return lifecycle?.phase === "implementation";
+      }, "initial worker lifecycle persistence");
       await lifecycleStore.ensureIssue(
         candidate,
         pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
@@ -5707,7 +5712,9 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => authorizations.length === 2, "lazy discovery credential fetches");
+    await waitFor(() => harness.runs.length === 1, "worker dispatch for lazy discovery credentials");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "worker exit for lazy discovery credentials");
     await orchestrator.stop();
 
     expect(authorizations).toEqual(["Bearer discovery-secret", "Bearer discovery-secret"]);
@@ -5816,7 +5823,9 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => pullRequestReviewClient.calls.length === 1, "review evidence ingestion for worker prompt");
+    await waitFor(() => harness.runs.length === 1, "worker dispatch with review evidence prompt");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "worker exit after review evidence prompt");
     await orchestrator.stop();
 
     expect(pullRequestReviewClient.calls).toEqual([42]);
@@ -5933,7 +5942,9 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => pullRequestReviewClient.calls.length === 1, "linkback-only evidence ingestion");
+    await waitFor(() => harness.runs.length === 1, "worker dispatch for linkback-only review evidence");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "worker exit after linkback-only review evidence");
     await orchestrator.stop();
 
     const prompt = harness.runs[0]?.prompt ?? "";
@@ -6044,7 +6055,9 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => calls.length === 4, "lazy reviewer review-evidence credential fetches");
+    await waitFor(() => harness.runs.length === 1, "worker dispatch with lazy reviewer review-evidence credentials");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "worker exit after lazy reviewer review-evidence credentials");
     await orchestrator.stop();
 
     expect(calls.map((call) => call.authorization)).toEqual([
@@ -6103,7 +6116,8 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => harness.runs.length === 1, "worker dispatch with reviewer-fail repair context");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "worker exit after reviewer-fail repair context");
     await orchestrator.stop();
 
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
@@ -6201,7 +6215,8 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(() => harness.runs.length === 1, "worker dispatch with merge-gate repair context");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "worker exit after merge-gate repair context");
     await orchestrator.stop();
 
     expect(harness.runs[0]?.prompt).toContain("## Symphony Merge Gate Repair");
