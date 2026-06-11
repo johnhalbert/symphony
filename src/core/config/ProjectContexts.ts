@@ -315,10 +315,7 @@ export function resolveProjectContextForIssue<
   options: ResolveProjectContextForIssueOptions = {},
 ): ProjectContextRoutingResult {
   if (options.persistedContext !== null && options.persistedContext !== undefined) {
-    return {
-      kind: "resolved",
-      projectContext: normalizeProjectContextResolution(options.persistedContext),
-    };
+    return validatePersistedContextForResolution(issue, options.persistedContext);
   }
 
   const issueRouting = readIssueRoutingFields(issue);
@@ -347,6 +344,18 @@ export function resolveProjectContextForIssue<
     const normalizedProjectContextId = normalizeProjectContextId(issueRouting.projectContextId);
     const configuredContext = registry.byId.get(normalizedProjectContextId);
     if (configuredContext?.enabled) {
+      if (explicitRoutingMismatchesConfiguredSlug(configuredContext, issueRouting.linearProjectSlug)) {
+        return {
+          kind: "problem",
+          problem: createProjectContextRoutingProblem(
+            "stale_context",
+            issue,
+            [configuredContext.id],
+            `Issue ${describeIssueForRouting(issue)} declared project context ${configuredContext.id} with a mismatched Linear project slug`,
+          ),
+        };
+      }
+
       return {
         kind: "resolved",
         projectContext: projectContextResolutionFromConfiguredContext(configuredContext, issueRouting),
@@ -508,6 +517,41 @@ function readIssueRoutingFields(issue: unknown): {
     linearProjectSlug,
     routingSource,
   };
+}
+
+function validatePersistedContextForResolution(
+  issue: unknown,
+  persistedContext: Partial<ProjectContextResolution>,
+): ProjectContextRoutingResult {
+  if (readExplicitProjectContextId(persistedContext) === undefined) {
+    return {
+      kind: "problem",
+      problem: createProjectContextRoutingProblem(
+        "stale_context",
+        issue,
+        [],
+        `Issue ${describeIssueForRouting(issue)} has persisted project context metadata without an explicit project context id`,
+      ),
+    };
+  }
+
+  return {
+    kind: "resolved",
+    projectContext: normalizeProjectContextResolution(persistedContext),
+  };
+}
+
+function explicitRoutingMismatchesConfiguredSlug<
+  TContext extends {
+    id: ProjectContextId;
+    tracker?: { projectSlug?: string | null } | null;
+  },
+>(context: TContext, routedProjectSlug: string | null): boolean {
+  const configuredProjectSlug = normalizeOptionalNonEmptyString(context.tracker?.projectSlug);
+  if (configuredProjectSlug === null || routedProjectSlug === null) {
+    return false;
+  }
+  return !sameProjectSlug(configuredProjectSlug, routedProjectSlug);
 }
 
 function projectContextResolutionFromConfiguredContext<
