@@ -24,8 +24,14 @@ doctor lint evaluate one contract.
 
 Spec Kit artifacts under `specs/` are planning records only for this workflow.
 Operators, workers, and reviewers should treat the promoted Linear issue's
-fenced JSON `Issue Contract` as the canonical work assignment unless a human
-explicitly invokes a Spec Kit workflow for that feature.
+title, description, blockers, labels, and fenced JSON `Issue Contract` as the
+canonical runtime work assignment unless a human explicitly invokes a Spec Kit
+workflow for that feature.
+
+The repo-level `AGENTS.md` reminder about Spec Kit planning material can point
+back to this policy, but it does not override the promoted Linear issue. If
+operator intent changes, update the Linear issue itself instead of relying on
+`specs/`, `AGENTS.md`, or sidecar planning notes to redirect agent execution.
 
 Roadmap placeholder issues for continuation search or richer summarization stay `Backlog` with `dogfood-blocked`. Do not add `dogfood-ready` to those placeholders until the issue includes a concrete implementation path beyond interfaces, configuration flags, or docs.
 
@@ -270,6 +276,7 @@ Before promotion, verify:
 - The `Contract Checklist` covers the relevant happy path, negative/error path, sibling surfaces, stale/fallback states, replay/idempotency, credential boundary, and side-effect verification cases.
 - The issue has no open blockers.
 - The issue is assigned according to the workflow route.
+- Treat the current Linear issue title, description, blockers, labels, and fenced JSON issue contract as the live worker/reviewer prompt context. If the intended work changes, update the Linear issue itself instead of relying on `specs/`, `AGENTS.md`, branch names, or sidecar notes.
 - The issue has `dogfood-ready` only after an operator reviewed the required
   sections, fenced JSON issue contract, contract checklist, and validation plan.
 - `dogfood-blocked` has been removed only after the required issue contract is complete and, when the issue depends on `hermes_acp`, after the ACP final live validation checklist passes.
