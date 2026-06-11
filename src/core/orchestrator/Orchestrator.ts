@@ -1,7 +1,12 @@
 import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
-import { projectContextResolutionFromIssue } from "../config/ProjectContexts.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+  projectContextResolutionFromIssue,
+  resolveProjectContextForIssue,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
@@ -216,27 +221,6 @@ interface ReviewerDispatchEvidence {
   completionReport: IssueCompletionReportRecord;
   workerRun: RunRecord | null;
   runDigest: string[];
-}
-
-function projectContextForEntry(entry: RunningEntry, config: ServiceConfig) {
-  const legacyDefaultContext =
-    config.projectContexts.defaultContext.source !== "legacy_default"
-      ? undefined
-      : {
-          projectContextId: config.projectContexts.defaultContext.id,
-          projectContextLabel: config.projectContexts.defaultContext.label,
-          linearProjectSlug: config.projectContexts.defaultContext.publicMetadata.linearProjectSlug,
-          routingSource: config.projectContexts.defaultContext.source,
-        };
-  const resolved = entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? legacyDefaultContext;
-  if (resolved === undefined || legacyDefaultContext === undefined || resolved.projectContextId !== legacyDefaultContext.projectContextId) {
-    return resolved;
-  }
-  return {
-    ...legacyDefaultContext,
-    ...resolved,
-    linearProjectSlug: resolved.linearProjectSlug ?? legacyDefaultContext.linearProjectSlug,
-  };
 }
 
 type WorkerDispatchDecision =
@@ -1721,6 +1705,15 @@ export class Orchestrator {
     let workspace: Workspace | null = null;
     try {
       entry.lifecycle ??= await this.options.lifecycleStore?.get(entry.issue.id) ?? null;
+      const resolvedProjectContext =
+        entry.runPhase === "issue_breakdown" ? null : await this.resolveWorkerProjectContext(entry);
+      if (
+        entry.runPhase !== "issue_breakdown" &&
+        entry.lifecycle !== null &&
+        (entry.lifecycle.phase === "blocked" || entry.lifecycle.blockedReason !== null)
+      ) {
+        return;
+      }
       workspace =
         entry.runPhase === "issue_breakdown"
           ? await this.options.workspaceManager.createForPlanning(entry.issue)
@@ -1733,6 +1726,7 @@ export class Orchestrator {
           ? { phase: phaseForIssueState(entry.issue.state, this.config) }
           : {
               phase: phaseForIssueState(entry.issue.state, this.config),
+              ...(resolvedProjectContext === null ? {} : { projectContext: resolvedProjectContext }),
               summaryPointers: {
                 workspaceKey: workspace.workspaceKey,
                 workspacePath: workspace.path,
@@ -1926,7 +1920,7 @@ export class Orchestrator {
           runKind: runKindForPhase(entry.runPhase),
           issueId: entry.issue.id,
           issueIdentifier: entry.issue.identifier,
-          projectContext: projectContextForEntry(entry, this.config),
+          projectContext: this.resolvedProjectContext(entry),
           attempt: context.attempt,
           turnNumber: context.turnNumber,
           prompt: context.prompt,
@@ -1952,7 +1946,7 @@ export class Orchestrator {
             planRunStartedComment(
               {
                 issue: entry.issue,
-                projectContext: projectContextForEntry(entry, this.config),
+                projectContext: this.resolvedProjectContext(entry),
                 runId: entry.runId,
                 sessionId: entry.sessionId,
                 workspacePath: entry.workspacePath,
@@ -2697,6 +2691,64 @@ export class Orchestrator {
     this.retryAttempts.delete(issueId);
   }
 
+  private resolvedProjectContext(entry: RunningEntry): ProjectContextResolution | undefined {
+    const resolvedFromLifecycleOrIssue = entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue);
+    const defaultContext = this.config.projectContexts.defaultContext;
+
+    if (resolvedFromLifecycleOrIssue) {
+      if (
+        defaultContext.source === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE &&
+        resolvedFromLifecycleOrIssue.projectContextId === defaultContext.id &&
+        resolvedFromLifecycleOrIssue.routingSource === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE &&
+        resolvedFromLifecycleOrIssue.linearProjectSlug === null
+      ) {
+        return {
+          ...resolvedFromLifecycleOrIssue,
+          linearProjectSlug: defaultContext.tracker.projectSlug,
+        };
+      }
+      return resolvedFromLifecycleOrIssue;
+    }
+
+    if (defaultContext.source !== LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE) return undefined;
+
+    return {
+      projectContextId: defaultContext.id,
+      projectContextLabel: defaultContext.label,
+      linearProjectSlug: defaultContext.tracker.projectSlug,
+      routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+    };
+  }
+
+  private async resolveWorkerProjectContext(entry: RunningEntry): Promise<ProjectContextResolution | null> {
+    const persistedOrIssueResolution = this.resolvedProjectContext(entry) ?? null;
+    const usesConfiguredRouting =
+      entry.runPhase === "implementation" && this.config.projectContexts.contexts.some((context) => context.source === "explicit");
+    if (!usesConfiguredRouting) {
+      return persistedOrIssueResolution;
+    }
+
+    const routing = resolveProjectContextForIssue(
+      entry.issue,
+      this.config.projectContexts,
+      entry.lifecycle?.projectContext === undefined ? {} : { persistedContext: entry.lifecycle.projectContext },
+    );
+    if (routing.kind === "resolved") {
+      return routing.projectContext;
+    }
+    if (!this.options.lifecycleStore) {
+      entry.suppressRetryOnExit = true;
+      throw new SymphonyError("agent_error", routing.problem.safeMessage);
+    }
+
+    entry.lifecycle = await this.options.lifecycleStore.updateIssue(entry.issue, {
+      phase: phaseForIssueState(entry.issue.state, this.config),
+      ...(persistedOrIssueResolution === null ? {} : { projectContext: persistedOrIssueResolution }),
+    });
+    await this.escalateEntryBlocked(entry, routing.problem.safeMessage);
+    return null;
+  }
+
   private buildRunContext(
     entry: RunningEntry,
     workspace: Workspace,
@@ -2705,7 +2757,7 @@ export class Orchestrator {
   ) {
     return {
       issue: entry.issue,
-      projectContext: projectContextForEntry(entry, this.config),
+      projectContext: this.resolvedProjectContext(entry),
       role: entry.role,
       runPhase: entry.runPhase,
       attempt,
@@ -3111,7 +3163,7 @@ export class Orchestrator {
     if (!store) return;
     entry.lifecycle = await store.updateIssue(entry.issue, {
       ...patch,
-      projectContext: patch.projectContext ?? projectContextForEntry(entry, this.config),
+      projectContext: patch.projectContext ?? this.resolvedProjectContext(entry),
     });
     await appendLaneMemoTelemetry(this.options.runStore, entry.activeRunId, entry.lifecycle, "orchestrator_update");
   }

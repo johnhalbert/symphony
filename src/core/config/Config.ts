@@ -813,8 +813,10 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       cursorRuntimeApiKey,
       openWorkspaceToken: serverOpenWorkspaceToken,
     },
+    errorTransformer: (error) => attachDefaultProjectContextValidationSignal(error, raw, defaultContext.id),
   });
   const mergePolicy = normalizeMergePolicy(raw, reviewLoop.reviewPassState);
+
 
   validateStateBuckets({
     activeStates: tracker.activeStates,
@@ -937,246 +939,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   };
 }
 
-function buildWorkflowConfigValidationDetails(rawInput: unknown, error: z.ZodError): Record<string, unknown> {
-  const signals = projectContextValidationSignalsFromZodIssues(rawInput, error.issues);
-  if (signals.projectContextPaths.length === 0) {
-    return error.flatten();
-  }
-  return {
-    ...error.flatten(),
-    issues: error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
-    projectContextPaths: signals.projectContextPaths,
-    ...(signals.projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths: signals.projectContextFieldPaths }),
-  };
-}
 
-function projectContextValidationSignalsFromZodIssues(
-  rawInput: unknown,
-  issues: readonly z.ZodIssue[],
-): { projectContextPaths: string[]; projectContextFieldPaths: string[] } {
-  const projectContextPaths: string[] = [];
-  const projectContextFieldPaths: string[] = [];
-  for (const issue of issues) {
-    const signal = projectContextValidationSignalFromIssuePath(rawInput, issue.path);
-    if (signal === null) continue;
-    projectContextPaths.push(signal.contextPath);
-    if (signal.fieldPath !== null) projectContextFieldPaths.push(signal.fieldPath);
-  }
-  return {
-    projectContextPaths: uniqueStringValues(projectContextPaths),
-    projectContextFieldPaths: uniqueStringValues(projectContextFieldPaths),
-  };
-}
-
-function projectContextValidationSignalFromIssuePath(
-  rawInput: unknown,
-  issuePath: readonly PropertyKey[],
-): { contextPath: string; fieldPath: string | null } | null {
-  if (issuePath[0] !== "project_contexts") return null;
-  const contextIndex = issuePath[1];
-  if (typeof contextIndex !== "number" || contextIndex < 0) return null;
-  return {
-    contextPath: rawProjectContextPathFromInput(rawInput, contextIndex),
-    fieldPath: fieldPathFromSegments(issuePath.slice(2)),
-  };
-}
-
-function rawProjectContextPathFromInput(rawInput: unknown, index: number): string {
-  const rawContexts = readRawProjectContextsFromValue(rawInput);
-  return rawProjectContextPath(rawContexts, index);
-}
-
-function rawProjectContextPath(rawContexts: readonly unknown[], index: number): string {
-  const rawId = readRawProjectContextIdFromValue(rawContexts[index]);
-  if (rawId === null || rawProjectContextIdIsAmbiguous(rawContexts, rawId)) {
-    return `project_contexts[${index}]`;
-  }
-  return `project_contexts[${JSON.stringify(rawId)}]`;
-}
-
-function rawProjectContextIdIsAmbiguous(rawContexts: readonly unknown[], rawId: string): boolean {
-  let matches = 0;
-  for (const rawContext of rawContexts) {
-    if (readRawProjectContextIdFromValue(rawContext) !== rawId) continue;
-    matches += 1;
-    if (matches > 1) return true;
-  }
-  return false;
-}
-
-const KNOWN_PROJECT_CONTEXT_VALIDATION_FIELD_PATHS = new Set<string>([
-  "id",
-  "enabled",
-  "tracker.kind",
-  "tracker.api_key",
-  "tracker.project_slug",
-  "tracker.active_states",
-  "tracker.handoff_states",
-  "tracker.terminal_states",
-  "workspace.source",
-  "workspace.source.kind",
-  "workspace.source.path",
-  "workspace.source.repository",
-  "workspace.source.base_ref",
-  "workspace.source.branch_template",
-  "review_loop.blocked_states",
-  "review_loop.review_states",
-  "review_loop.review_pass_state",
-  "github.pr_handoff.target_state",
-  "issue_breakdown.workspace_mode",
-  "agent.max_concurrent_agents_by_state",
-  "credential_profiles.roles.worker",
-  "credential_profiles.roles.reviewer",
-  "credential_profiles.roles.service",
-  "credential_profiles.profiles",
-]);
-
-export function normalizeProjectContextValidationFieldPath(value: unknown): string | null {
-  if (typeof value !== "string" || value.length === 0) return null;
-  return longestKnownProjectContextFieldPath(projectContextFieldPathSegments(value));
-}
-
-function extractScopedProjectContextFieldPath(remainder: string): string | null {
-  const scopedMatch = /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(remainder);
-  return normalizeProjectContextValidationFieldPath(scopedMatch?.[1]);
-}
-
-function configValidationError(message: string, projectContextFieldPaths?: readonly string[]): SymphonyError {
-  const normalizedFieldPaths = uniqueStringValues(
-    (projectContextFieldPaths ?? []).flatMap((fieldPath) => {
-      const normalizedFieldPath = normalizeProjectContextValidationFieldPath(fieldPath);
-      return normalizedFieldPath === null ? [] : [normalizedFieldPath];
-    }),
-  );
-  return new SymphonyError(
-    "config_validation_error",
-    message,
-    normalizedFieldPaths.length === 0 ? undefined : { projectContextFieldPaths: normalizedFieldPaths },
-  );
-}
-
-function attachProjectContextValidationSignal(error: unknown, contextPath: string): SymphonyError {
-  const symphonyError =
-    error instanceof SymphonyError
-      ? error
-      : new SymphonyError("config_validation_error", error instanceof Error ? error.message : String(error));
-  const existingDetails = isObjectRecord(symphonyError.details) ? { ...symphonyError.details } : {};
-  const projectContextPaths = uniqueStringValues([
-    ...readStringArrayValues(existingDetails.projectContextPaths),
-    contextPath,
-  ]);
-  const projectContextFieldPaths = uniqueStringValues([
-    ...readStringArrayValues(existingDetails.projectContextFieldPaths),
-    ...extractProjectContextFieldPaths(symphonyError.message, contextPath),
-  ]);
-  return new SymphonyError(symphonyError.code, symphonyError.message, {
-    ...existingDetails,
-    projectContextPaths,
-    ...(projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths }),
-  });
-}
-
-function extractProjectContextFieldPaths(message: string, contextPath: string): string[] {
-  const prefix = `${contextPath}.`;
-  if (!message.startsWith(prefix)) return [];
-  const fieldPath = extractScopedProjectContextFieldPath(message.slice(prefix.length));
-  return fieldPath === null ? [] : [fieldPath];
-}
-
-function duplicateProjectContextIdFromMessage(message: string): string | null {
-  const match = /^Duplicate project context id: (.+)$/.exec(message);
-  return normalizeOptionalSignalString(match?.[1]);
-}
-
-function rawProjectContextPathsByNormalizedId(rawContexts: readonly unknown[], duplicateProjectContextId: string): string[] {
-  return uniqueStringValues(
-    rawContexts.flatMap((rawContext, index) => {
-      const rawId = readRawProjectContextIdFromValue(rawContext);
-      if (rawId === null) return [];
-      try {
-        return normalizeProjectContextId(rawId) === duplicateProjectContextId ? [rawProjectContextPath(rawContexts, index)] : [];
-      } catch {
-        return [];
-      }
-    }),
-  );
-}
-
-function rawProjectContextPaths(rawContexts: readonly unknown[]): string[] {
-  return uniqueStringValues(rawContexts.map((_, index) => rawProjectContextPath(rawContexts, index)));
-}
-
-function readRawProjectContextsFromValue(value: unknown): unknown[] {
-  return isObjectRecord(value) && Array.isArray(value.project_contexts) ? value.project_contexts : [];
-}
-
-function readRawProjectContextIdFromValue(value: unknown): string | null {
-  return isObjectRecord(value) && typeof value.id === "string" ? value.id : null;
-}
-
-function readStringArrayValues(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
-}
-
-function normalizeOptionalSignalString(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const normalized = value.trim();
-  return normalized.length === 0 ? null : normalized;
-}
-
-function fieldPathFromSegments(segments: readonly PropertyKey[]): string | null {
-  return longestKnownProjectContextFieldPath(
-    segments.flatMap((segment): Array<string | number> => {
-      if (typeof segment === "string" || typeof segment === "number") return [segment];
-      return [];
-    }),
-  );
-}
-
-function longestKnownProjectContextFieldPath(segments: readonly (string | number)[]): string | null {
-  if (segments.length === 0) return null;
-  let fieldPath = "";
-  let knownFieldPath: string | null = null;
-  for (const segment of segments) {
-    if (typeof segment === "number") {
-      fieldPath += `[${segment}]`;
-    } else {
-      fieldPath = fieldPath.length === 0 ? segment : `${fieldPath}.${segment}`;
-    }
-    if (KNOWN_PROJECT_CONTEXT_VALIDATION_FIELD_PATHS.has(fieldPath)) {
-      knownFieldPath = fieldPath;
-    }
-  }
-  return knownFieldPath;
-}
-
-function projectContextFieldPathSegments(value: string): Array<string | number> {
-  const segments: Array<string | number> = [];
-  for (const part of value.split(".")) {
-    if (part.length === 0) return [];
-    let remainder = part;
-    const baseMatch = /^([^\[]+)/.exec(remainder);
-    if (baseMatch?.[1]) {
-      segments.push(baseMatch[1]);
-      remainder = remainder.slice(baseMatch[1].length);
-    }
-    while (remainder.length > 0) {
-      const indexMatch = /^\[(\d+)\]/.exec(remainder);
-      if (!indexMatch?.[1]) return [];
-      segments.push(Number.parseInt(indexMatch[1], 10));
-      remainder = remainder.slice(indexMatch[0].length);
-    }
-  }
-  return segments;
-}
-
-function uniqueStringValues(values: readonly string[]): string[] {
-  return [...new Set(values.filter((value) => value.length > 0))];
-}
-
-function isObjectRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function normalizeWorkflowProjectContexts(
   raw: RawWorkflowConfig,
@@ -1740,23 +1503,13 @@ function inferRawCredentialProfileKind(
 }
 
 function mergeCredentialProfileRoleAssignments(
-  base:
-    | NonNullable<NonNullable<RawWorkflowConfig["credential_profiles"]>["roles"]>[keyof NonNullable<
-        NonNullable<RawWorkflowConfig["credential_profiles"]>["roles"]
-      >]
-    | undefined,
-  override:
-    | NonNullable<NonNullable<RawProjectContextConfig["credential_profiles"]>["roles"]>[keyof NonNullable<
-        NonNullable<RawProjectContextConfig["credential_profiles"]>["roles"]
-      >]
-    | undefined,
-): NonNullable<NonNullable<RawWorkflowConfig["credential_profiles"]>["roles"]>[keyof NonNullable<
-  NonNullable<RawWorkflowConfig["credential_profiles"]>["roles"]
->] | undefined {
+  base: Record<string, string> | undefined,
+  override: Record<string, string> | undefined,
+): Record<string, string> | undefined {
   if (base === undefined && override === undefined) return undefined;
   return {
-    ...base,
-    ...override,
+    ...(base ?? {}),
+    ...(override ?? {}),
   };
 }
 
@@ -1767,6 +1520,283 @@ function mergeConfigObjects<T extends Record<string, unknown> | undefined>(base:
     ...(override ?? {}),
   } as T;
 }
+
+function buildWorkflowConfigValidationDetails(rawInput: unknown, error: z.ZodError): Record<string, unknown> {
+  const signals = projectContextValidationSignalsFromZodIssues(rawInput, error.issues);
+  if (signals.projectContextPaths.length === 0) {
+    return error.flatten();
+  }
+  return {
+    ...error.flatten(),
+    issues: error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
+    projectContextPaths: signals.projectContextPaths,
+    ...(signals.projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths: signals.projectContextFieldPaths }),
+  };
+}
+
+function projectContextValidationSignalsFromZodIssues(
+  rawInput: unknown,
+  issues: readonly z.ZodIssue[],
+): { projectContextPaths: string[]; projectContextFieldPaths: string[] } {
+  const projectContextPaths: string[] = [];
+  const projectContextFieldPaths: string[] = [];
+  for (const issue of issues) {
+    const signal = projectContextValidationSignalFromIssuePath(rawInput, issue.path);
+    if (signal === null) continue;
+    projectContextPaths.push(signal.contextPath);
+    if (signal.fieldPath !== null) projectContextFieldPaths.push(signal.fieldPath);
+  }
+  return {
+    projectContextPaths: uniqueStringValues(projectContextPaths),
+    projectContextFieldPaths: uniqueStringValues(projectContextFieldPaths),
+  };
+}
+
+function projectContextValidationSignalFromIssuePath(
+  rawInput: unknown,
+  issuePath: readonly PropertyKey[],
+): { contextPath: string; fieldPath: string | null } | null {
+  if (issuePath[0] !== "project_contexts") return null;
+  const contextIndex = issuePath[1];
+  if (typeof contextIndex !== "number" || contextIndex < 0) return null;
+  return {
+    contextPath: rawProjectContextPathFromInput(rawInput, contextIndex),
+    fieldPath: fieldPathFromSegments(issuePath.slice(2)),
+  };
+}
+
+function rawProjectContextPathFromInput(rawInput: unknown, index: number): string {
+  const rawContexts = readRawProjectContextsFromValue(rawInput);
+  return rawProjectContextPath(rawContexts, index);
+}
+
+function rawProjectContextPath(rawContexts: readonly unknown[], index: number): string {
+  const rawId = readRawProjectContextIdFromValue(rawContexts[index]);
+  if (rawId === null || rawProjectContextIdIsAmbiguous(rawContexts, rawId)) {
+    return `project_contexts[${index}]`;
+  }
+  return `project_contexts[${JSON.stringify(rawId)}]`;
+}
+
+function rawProjectContextIdIsAmbiguous(rawContexts: readonly unknown[], rawId: string): boolean {
+  let matches = 0;
+  for (const rawContext of rawContexts) {
+    if (readRawProjectContextIdFromValue(rawContext) !== rawId) continue;
+    matches += 1;
+    if (matches > 1) return true;
+  }
+  return false;
+}
+
+const KNOWN_PROJECT_CONTEXT_VALIDATION_FIELD_PATHS = new Set<string>([
+  "id",
+  "enabled",
+  "tracker.kind",
+  "tracker.api_key",
+  "tracker.project_slug",
+  "tracker.active_states",
+  "tracker.handoff_states",
+  "tracker.terminal_states",
+  "workspace.source",
+  "workspace.source.kind",
+  "workspace.source.path",
+  "workspace.source.repository",
+  "workspace.source.base_ref",
+  "workspace.source.branch_template",
+  "review_loop.blocked_states",
+  "review_loop.review_states",
+  "review_loop.review_pass_state",
+  "github.pr_handoff.target_state",
+  "issue_breakdown.workspace_mode",
+  "agent.max_concurrent_agents_by_state",
+  "credential_profiles.roles.worker",
+  "credential_profiles.roles.reviewer",
+  "credential_profiles.roles.service",
+  "credential_profiles.profiles",
+]);
+
+export function normalizeProjectContextValidationFieldPath(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return longestKnownProjectContextFieldPath(projectContextFieldPathSegments(value));
+}
+
+function extractScopedProjectContextFieldPath(remainder: string): string | null {
+  const scopedMatch = /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(remainder);
+  return normalizeProjectContextValidationFieldPath(scopedMatch?.[1]);
+}
+
+function configValidationError(message: string, projectContextFieldPaths?: readonly string[]): SymphonyError {
+  const normalizedFieldPaths = uniqueStringValues(
+    (projectContextFieldPaths ?? []).flatMap((fieldPath) => {
+      const normalizedFieldPath = normalizeProjectContextValidationFieldPath(fieldPath);
+      return normalizedFieldPath === null ? [] : [normalizedFieldPath];
+    }),
+  );
+  return new SymphonyError(
+    "config_validation_error",
+    message,
+    normalizedFieldPaths.length === 0 ? undefined : { projectContextFieldPaths: normalizedFieldPaths },
+  );
+}
+
+function attachProjectContextValidationSignal(error: unknown, contextPath: string): SymphonyError {
+  const symphonyError =
+    error instanceof SymphonyError
+      ? error
+      : new SymphonyError("config_validation_error", error instanceof Error ? error.message : String(error));
+  const existingDetails = isObjectRecord(symphonyError.details) ? { ...symphonyError.details } : {};
+  const projectContextPaths = uniqueStringValues([
+    ...readStringArrayValues(existingDetails.projectContextPaths),
+    contextPath,
+  ]);
+  const projectContextFieldPaths = uniqueStringValues([
+    ...readStringArrayValues(existingDetails.projectContextFieldPaths),
+    ...extractProjectContextFieldPaths(symphonyError.message, contextPath),
+  ]);
+  return new SymphonyError(symphonyError.code, symphonyError.message, {
+    ...existingDetails,
+    projectContextPaths,
+    ...(projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths }),
+  });
+}
+
+function attachDefaultProjectContextValidationSignal(
+  error: unknown,
+  raw: RawWorkflowConfig,
+  defaultContextId: string,
+): SymphonyError {
+  const symphonyError =
+    error instanceof SymphonyError
+      ? error
+      : new SymphonyError("config_validation_error", error instanceof Error ? error.message : String(error));
+  const contextPath = rawProjectContextPathsByNormalizedId(raw.project_contexts ?? [], defaultContextId)[0] ?? null;
+  if (contextPath === null) return symphonyError;
+
+  const existingDetails = isObjectRecord(symphonyError.details) ? { ...symphonyError.details } : {};
+  const projectContextPaths = uniqueStringValues([
+    ...readStringArrayValues(existingDetails.projectContextPaths),
+    contextPath,
+  ]);
+  const projectContextFieldPaths = uniqueStringValues([
+    ...readStringArrayValues(existingDetails.projectContextFieldPaths),
+    ...readLeadingProjectContextFieldPaths(symphonyError.message),
+  ]);
+  return new SymphonyError(symphonyError.code, symphonyError.message, {
+    ...existingDetails,
+    projectContextPaths,
+    ...(projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths }),
+  });
+}
+
+function extractProjectContextFieldPaths(message: string, contextPath: string): string[] {
+  const prefix = `${contextPath}.`;
+  if (!message.startsWith(prefix)) return [];
+  const fieldPath = extractScopedProjectContextFieldPath(message.slice(prefix.length));
+  return fieldPath === null ? [] : [fieldPath];
+}
+
+function readLeadingProjectContextFieldPaths(message: string): string[] {
+  const fieldPath = normalizeProjectContextValidationFieldPath(
+    /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(message)?.[1],
+  );
+  return fieldPath === null ? [] : [fieldPath];
+}
+
+function duplicateProjectContextIdFromMessage(message: string): string | null {
+  const match = /^Duplicate project context id: (.+)$/.exec(message);
+  return normalizeOptionalSignalString(match?.[1]);
+}
+
+function rawProjectContextPathsByNormalizedId(rawContexts: readonly unknown[], duplicateProjectContextId: string): string[] {
+  return uniqueStringValues(
+    rawContexts.flatMap((rawContext, index) => {
+      const rawId = readRawProjectContextIdFromValue(rawContext);
+      if (rawId === null) return [];
+      try {
+        return normalizeProjectContextId(rawId) === duplicateProjectContextId ? [rawProjectContextPath(rawContexts, index)] : [];
+      } catch {
+        return [];
+      }
+    }),
+  );
+}
+
+function rawProjectContextPaths(rawContexts: readonly unknown[]): string[] {
+  return uniqueStringValues(rawContexts.map((_, index) => rawProjectContextPath(rawContexts, index)));
+}
+
+function readRawProjectContextsFromValue(value: unknown): unknown[] {
+  return isObjectRecord(value) && Array.isArray(value.project_contexts) ? value.project_contexts : [];
+}
+
+function readRawProjectContextIdFromValue(value: unknown): string | null {
+  return isObjectRecord(value) && typeof value.id === "string" ? value.id : null;
+}
+
+function readStringArrayValues(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function normalizeOptionalSignalString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length === 0 ? null : normalized;
+}
+
+function fieldPathFromSegments(segments: readonly PropertyKey[]): string | null {
+  return longestKnownProjectContextFieldPath(
+    segments.flatMap((segment): Array<string | number> => {
+      if (typeof segment === "string" || typeof segment === "number") return [segment];
+      return [];
+    }),
+  );
+}
+
+function longestKnownProjectContextFieldPath(segments: readonly (string | number)[]): string | null {
+  if (segments.length === 0) return null;
+  let fieldPath = "";
+  let knownFieldPath: string | null = null;
+  for (const segment of segments) {
+    if (typeof segment === "number") {
+      fieldPath += `[${segment}]`;
+    } else {
+      fieldPath = fieldPath.length === 0 ? segment : `${fieldPath}.${segment}`;
+    }
+    if (KNOWN_PROJECT_CONTEXT_VALIDATION_FIELD_PATHS.has(fieldPath)) {
+      knownFieldPath = fieldPath;
+    }
+  }
+  return knownFieldPath;
+}
+
+function projectContextFieldPathSegments(value: string): Array<string | number> {
+  const segments: Array<string | number> = [];
+  for (const part of value.split(".")) {
+    if (part.length === 0) return [];
+    let remainder = part;
+    const baseMatch = /^([^\[]+)/.exec(remainder);
+    if (baseMatch?.[1]) {
+      segments.push(baseMatch[1]);
+      remainder = remainder.slice(baseMatch[1].length);
+    }
+    while (remainder.length > 0) {
+      const indexMatch = /^\[(\d+)\]/.exec(remainder);
+      if (!indexMatch?.[1]) return [];
+      segments.push(Number.parseInt(indexMatch[1], 10));
+      remainder = remainder.slice(indexMatch[0].length);
+    }
+  }
+  return segments;
+}
+
+function uniqueStringValues(values: readonly string[]): string[] {
+  return [...new Set(values.filter((value) => value.length > 0))];
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 
 export function resolveConfigString(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
   if (value === undefined) return undefined;
