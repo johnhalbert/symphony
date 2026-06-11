@@ -76,9 +76,13 @@ describe("git worktree workspace source", () => {
     expect(docsWorkspace.workspaceKey).toBe("ctx__docs__ENG-BRANCH-CTX");
   });
 
-  it("avoids collisions between legacy identifiers and context-qualified workspace keys", async () => {
+  it("escapes reserved contextual prefixes for legacy implementation workspaces and preserves cleanup isolation", async () => {
     const manager = newManager(root, repo);
-    const legacyIssue = issue({ id: "issue-legacy-collision", identifier: "docs__ENG-LEGACY", branchName: "symphony/docs__ENG-LEGACY" });
+    const legacyIssue = issue({
+      id: "issue-legacy-collision",
+      identifier: "ctx__docs__ENG-LEGACY",
+      branchName: "symphony/ctx__docs__ENG-LEGACY",
+    });
     const docsIssue = trackerIssue({
       id: "issue-docs-collision",
       identifier: "ENG-LEGACY",
@@ -92,12 +96,62 @@ describe("git worktree workspace source", () => {
     const legacyRecord = await manager.getWorkspaceRecord(legacyWorkspace.workspaceKey);
     const docsRecord = await manager.getWorkspaceRecord(docsWorkspace.workspaceKey);
 
-    expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-LEGACY");
+    expect(legacyWorkspace.workspaceKey).toBe("~ctx__docs__ENG-LEGACY");
     expect(docsWorkspace.workspaceKey).toBe("ctx__docs__ENG-LEGACY");
     expect(legacyWorkspace.path).not.toBe(docsWorkspace.path);
     expect(legacyRecord?.issueId).toBe("issue-legacy-collision");
     expect(docsRecord?.issueId).toBe("issue-docs-collision");
     expect(docsRecord?.projectContext?.projectContextId).toBe("docs");
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(legacyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    await expect(manager.getWorkspaceRecord(legacyWorkspace.workspaceKey)).resolves.toMatchObject({
+      issueId: "issue-legacy-collision",
+      issueIdentifier: "ctx__docs__ENG-LEGACY",
+    });
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+  });
+
+  it("escapes reserved contextual prefixes for legacy planning workspaces and preserves cleanup isolation", async () => {
+    const manager = newManager(root, repo, "force");
+    const legacyIssue = issue({
+      id: "issue-legacy-plan-collision",
+      identifier: "ctx__docs__ENG-PLAN",
+      branchName: "symphony/ctx__docs__ENG-PLAN",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-plan-collision",
+      identifier: "ENG-PLAN",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+
+    const legacyWorkspace = await manager.createForPlanning(legacyIssue);
+    const docsWorkspace = await manager.createForPlanning(docsIssue);
+    const legacyRecord = await manager.getWorkspaceRecord(legacyWorkspace.workspaceKey);
+    const docsRecord = await manager.getWorkspaceRecord(docsWorkspace.workspaceKey);
+
+    expect(legacyWorkspace.workspaceKey).toBe("~ctx__docs__ENG-PLAN-planning");
+    expect(docsWorkspace.workspaceKey).toBe("ctx__docs__ENG-PLAN-planning");
+    expect(legacyWorkspace.path).not.toBe(docsWorkspace.path);
+    expect(legacyRecord?.issueId).toBe("issue-legacy-plan-collision");
+    expect(docsRecord?.issueId).toBe("issue-docs-plan-collision");
+    expect(docsRecord?.projectContext?.projectContextId).toBe("docs");
+
+    await manager.removeForPlanning(docsIssue);
+
+    await expect(readFile(path.join(legacyWorkspace.path, ".symphony-planning.json"), "utf8")).resolves.toContain(
+      '"issueIdentifier": "ctx__docs__ENG-PLAN"',
+    );
+    await expect(readFile(path.join(docsWorkspace.path, ".symphony-planning.json"), "utf8")).rejects.toThrow();
+    await expect(manager.getWorkspaceRecord(legacyWorkspace.workspaceKey)).resolves.toMatchObject({
+      issueId: "issue-legacy-plan-collision",
+      issueIdentifier: "ctx__docs__ENG-PLAN",
+    });
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
   });
 
   it("namespaces workspace keys, paths, and durable metadata for overlapping identifiers across project contexts", async () => {

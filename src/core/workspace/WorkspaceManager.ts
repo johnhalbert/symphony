@@ -37,6 +37,8 @@ export interface WorkspaceMetadata {
 }
 
 const CONTEXTUAL_WORKSPACE_KEY_PREFIX = "ctx";
+const CONTEXTUAL_WORKSPACE_KEY_NAMESPACE = `${CONTEXTUAL_WORKSPACE_KEY_PREFIX}__`;
+const LEGACY_RESERVED_WORKSPACE_KEY_ESCAPE_PREFIX = "~";
 
 export class WorkspaceManager {
   private readonly branchRenderer = new Liquid({ strictVariables: true });
@@ -324,8 +326,8 @@ export class WorkspaceManager {
     return workspacePath;
   }
 
-  async getWorkspaceRecord(workspaceKeyOrIssue: string): Promise<WorkspaceRecord | null> {
-    return this.store.findWorkspace(workspaceKeyOrIssue);
+  async getWorkspaceRecord(workspaceKey: string): Promise<WorkspaceRecord | null> {
+    return this.store.getWorkspace(workspaceKey);
   }
 
   isInsideRoot(workspacePath: string): boolean {
@@ -445,9 +447,9 @@ function workspaceKeyForIssue(issue: WorkspaceIssue): string {
   const identifierKey = sanitizeWorkspaceKey(issue.identifier);
   const projectContextId = issue.projectContext?.projectContextId;
   if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
-    return identifierKey;
+    return escapeReservedLegacyWorkspaceKey(identifierKey);
   }
-  return `${CONTEXTUAL_WORKSPACE_KEY_PREFIX}__${sanitizeWorkspaceKey(projectContextId)}__${identifierKey}`;
+  return `${CONTEXTUAL_WORKSPACE_KEY_NAMESPACE}${sanitizeWorkspaceKey(projectContextId)}__${identifierKey}`;
 }
 
 function workspaceKeyForPlanning(issue: WorkspaceIssue): string {
@@ -457,6 +459,12 @@ function workspaceKeyForPlanning(issue: WorkspaceIssue): string {
 export function sanitizeWorkspaceKey(identifier: string): string {
   const sanitized = identifier.replace(/[^A-Za-z0-9._-]/g, "_");
   return sanitized.length > 0 ? sanitized : "issue";
+}
+
+function escapeReservedLegacyWorkspaceKey(identifierKey: string): string {
+  return identifierKey.startsWith(CONTEXTUAL_WORKSPACE_KEY_NAMESPACE)
+    ? `${LEGACY_RESERVED_WORKSPACE_KEY_ESCAPE_PREFIX}${identifierKey}`
+    : identifierKey;
 }
 
 function defaultBranchTemplateForIssue(issue: WorkspaceIssue): string {
