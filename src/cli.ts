@@ -40,7 +40,7 @@ import { runTranscriptRecallMcpServer } from "./core/harness/TranscriptRecallMcp
 import { runAgentCommandPolicyHookStdio } from "./core/harness/AgentCommandPolicyHookRunner.js";
 import { FileOperatorApprovalStore, OperatorApprovalService } from "./core/approval/OperatorApprovalService.js";
 import {
-  createRuntimeTrackerClient,
+  createLiveRuntimeTrackerClient,
   createRuntimeWritebackProcessor,
   resolveStatusMutationToken,
   resolveTrackerStateLists,
@@ -232,7 +232,7 @@ program
 
     const configRef = { value: config };
 
-    const tracker = createRuntimeTrackerClient(config);
+    const tracker = createLiveRuntimeTrackerClient(() => configRef.value);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const orchestratorConversationStore = new FileOrchestratorConversationStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);

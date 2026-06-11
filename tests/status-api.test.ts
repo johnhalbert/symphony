@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
-import { resolveStatusMutationToken } from "../src/app/RuntimeDependencies.js";
+import { createLiveRuntimeTrackerClient, resolveStatusMutationToken } from "../src/app/RuntimeDependencies.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import {
   FileIssueLifecycleStore,
@@ -2509,6 +2509,203 @@ describe("StatusServer durable API", () => {
       expect(issueBody.capabilities.mutationsRequireToken).toBe(true);
       expect(defaultPauseResponse.status).toBe(401);
       expect(docsPauseResponse.status).toBe(202);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("recovers docs project context for status mutations from live tracker lookups", async () => {
+    const workspaceRoot = path.join(root, "workspaces");
+    const stateDir = path.join(root, "state");
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          tracker: {
+            kind: "linear",
+            api_key: "$DEFAULT_LINEAR_TOKEN",
+            project_slug: "TEST",
+            active_states: ["Todo", "In Progress"],
+            handoff_states: ["In Review"],
+          },
+          workspace: {
+            root: workspaceRoot,
+            state_dir: stateDir,
+            source: {
+              kind: "git_worktree",
+              repository: root,
+              base_ref: "main",
+              branch_template: "symphony/{{ issue.identifier }}",
+              cleanup: "refuse_dirty",
+            },
+          },
+          server: {
+            open_workspace_token: "$LEGACY_OPEN_WORKSPACE_TOKEN",
+          },
+          credential_profiles: {
+            profiles: {
+              tracker: { value: "$DEFAULT_TRACKER_TOKEN", capabilities: ["linear.tracker"] },
+              "open-workspace": { value: "$DEFAULT_OPEN_WORKSPACE_TOKEN", capabilities: ["server.open_workspace"] },
+            },
+            roles: {
+              worker: {
+                "linear.tracker": "tracker",
+                "server.open_workspace": "open-workspace",
+              },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "TEST",
+            workspaceRoot,
+            stateDir,
+            repository: root,
+            baseRef: "main",
+            branchTemplate: "symphony/{{ issue.identifier }}",
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            workspaceRoot,
+            stateDir,
+            repository: root,
+            baseRef: "main",
+            branchTemplate: "symphony/{{ issue.identifier }}",
+            tracker: {
+              api_key: "$DOCS_LINEAR_TOKEN",
+              project_slug: "DOCS",
+            },
+            credential_profiles: {
+              profiles: {
+                tracker: { value: "$DOCS_TRACKER_TOKEN", capabilities: ["linear.tracker"] },
+                "open-workspace": { value: "$DOCS_OPEN_WORKSPACE_TOKEN", capabilities: ["server.open_workspace"] },
+              },
+              roles: {
+                worker: {
+                  "linear.tracker": "tracker",
+                  "server.open_workspace": "open-workspace",
+                },
+              },
+            },
+          }),
+        ],
+      }),
+      path.join(root, "WORKFLOW.md"),
+      {
+        DEFAULT_LINEAR_TOKEN: "default-linear-secret",
+        DEFAULT_TRACKER_TOKEN: "default-tracker-secret",
+        DEFAULT_OPEN_WORKSPACE_TOKEN: "default-open-secret",
+        DOCS_LINEAR_TOKEN: "docs-linear-secret",
+        DOCS_TRACKER_TOKEN: "docs-tracker-secret",
+        DOCS_OPEN_WORKSPACE_TOKEN: "docs-open-secret",
+        LEGACY_OPEN_WORKSPACE_TOKEN: "legacy-open-secret",
+      },
+    );
+    const liveRunning = liveRunningFixture(config as ReturnType<typeof testConfig>, "DOCS-1", "In Progress");
+    liveRunning.workspacePath = path.join(workspaceRoot, "DOCS-1");
+    const trackerRequests: Array<{
+      authorization: string;
+      query: string;
+      variables: Record<string, unknown>;
+    }> = [];
+    const tracker = createLiveRuntimeTrackerClient(() => config, async (_input, init) => {
+      const authorization = String((init?.headers as Record<string, string> | undefined)?.authorization);
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        query?: string;
+        variables?: Record<string, unknown>;
+      };
+      const query = String(body.query ?? "");
+      const variables = body.variables ?? {};
+      trackerRequests.push({ authorization, query, variables });
+      if (query.includes("SymphonyIssueStates") && authorization === "docs-tracker-secret") {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issues: {
+                nodes: [
+                  {
+                    id: "issue-docs-1",
+                    identifier: "DOCS-1",
+                    title: "Docs issue",
+                    description: null,
+                    priority: 1,
+                    branchName: "symphony/DOCS-1",
+                    url: "https://linear.app/example/issue/docs-1",
+                    createdAt: "2026-01-01T00:00:00Z",
+                    updatedAt: "2026-01-01T00:00:00Z",
+                    state: { name: "In Progress" },
+                    assignee: null,
+                    delegate: null,
+                    labels: { nodes: [] },
+                    project: { id: "project-docs", slugId: "DOCS" },
+                    inverseRelations: { nodes: [] },
+                  },
+                ],
+              },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ data: { issues: { nodes: [] } } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([liveRunning]),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: resolveStatusMutationToken(config),
+      resolveOpenWorkspaceToken: (projectContextId) => resolveStatusMutationToken(config, projectContextId),
+      tracker,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/DOCS-1`);
+      const defaultPauseResponse = await fetch(`${baseUrl}/api/v1/issues/DOCS-1/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "default-open-secret" },
+      });
+      const docsPauseResponse = await fetch(`${baseUrl}/api/v1/issues/DOCS-1/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "docs-open-secret" },
+      });
+      const issueBody = (await issueResponse.json()) as {
+        capabilities: {
+          mutationsRequireToken: boolean;
+        };
+      };
+      const issueStateRequests = trackerRequests.filter((request) => request.query.includes("SymphonyIssueStates"));
+
+      expect(issueResponse.status).toBe(200);
+      expect(issueBody.capabilities.mutationsRequireToken).toBe(true);
+      expect(defaultPauseResponse.status).toBe(401);
+      expect(docsPauseResponse.status).toBe(202);
+      expect(issueStateRequests).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            authorization: "default-tracker-secret",
+            variables: expect.objectContaining({ ids: expect.arrayContaining(["DOCS-1"]) }),
+          }),
+          expect.objectContaining({
+            authorization: "docs-tracker-secret",
+            variables: expect.objectContaining({ ids: expect.arrayContaining(["DOCS-1"]) }),
+          }),
+        ]),
+      );
     } finally {
       await server.stop();
     }

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import {
+  createLiveRuntimeTrackerClient,
   createRuntimeTrackerClient,
   createRuntimeWritebackProcessor,
   resolveCursorRuntimeApiKey,
@@ -215,6 +216,103 @@ describe("runtime dependency credential wiring", () => {
     });
   });
 
+  it("routes live runtime tracker candidate and reviewer reads through each enabled project context", async () => {
+    const config = runtimeProjectContextConfig();
+    const requests: Array<{
+      authorization: string;
+      query: string;
+      variables: Record<string, unknown>;
+    }> = [];
+    const tracker = createLiveRuntimeTrackerClient(() => config, async (_input, init) => {
+      const authorization = String((init?.headers as Record<string, string> | undefined)?.authorization);
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        query?: string;
+        variables?: Record<string, unknown>;
+      };
+      const query = String(body.query ?? "");
+      const variables = body.variables ?? {};
+      requests.push({ authorization, query, variables });
+      if (query.includes("SymphonyCandidateIssues")) {
+        const projectSlug = String(variables.projectSlug ?? "");
+        return linearIssuesResponse(
+          projectSlug === "SYMPHONY"
+            ? [linearIssueNode({ id: "issue-symphony-1", identifier: "TEST-1", state: "Todo", projectSlug })]
+            : projectSlug === "DOCS"
+              ? [linearIssueNode({ id: "issue-docs-1", identifier: "DOCS-1", state: "Todo", projectSlug })]
+              : [],
+        );
+      }
+      if (query.includes("SymphonyIssuesByStates")) {
+        const projectSlug = String(variables.projectSlug ?? "");
+        return linearIssuesResponse(
+          projectSlug === "SYMPHONY"
+            ? [linearIssueNode({ id: "issue-symphony-review-1", identifier: "TEST-REVIEW-1", state: "In Review", projectSlug })]
+            : projectSlug === "DOCS"
+              ? [linearIssueNode({ id: "issue-docs-review-1", identifier: "DOCS-REVIEW-1", state: "In Review", projectSlug })]
+              : [],
+        );
+      }
+      return linearIssuesResponse([]);
+    });
+
+    const candidates = await tracker.fetchCandidateIssues();
+    const reviewIssues = await tracker.fetchIssuesByStates(["In Review"]);
+
+    expect(candidates).toMatchObject([
+      {
+        id: "issue-symphony-1",
+        identifier: "TEST-1",
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        linearProjectSlug: "SYMPHONY",
+      },
+      {
+        id: "issue-docs-1",
+        identifier: "DOCS-1",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+      },
+    ]);
+    expect(reviewIssues).toMatchObject([
+      {
+        id: "issue-symphony-review-1",
+        identifier: "TEST-REVIEW-1",
+        projectContextId: "symphony",
+        linearProjectSlug: "SYMPHONY",
+      },
+      {
+        id: "issue-docs-review-1",
+        identifier: "DOCS-REVIEW-1",
+        projectContextId: "docs",
+        linearProjectSlug: "DOCS",
+      },
+    ]);
+    expect(
+      requests
+        .filter((request) => request.query.includes("SymphonyCandidateIssues"))
+        .map((request) => ({
+          authorization: request.authorization,
+          projectSlug: request.variables.projectSlug,
+        })),
+    ).toEqual([
+      { authorization: "default-tracker-secret", projectSlug: "SYMPHONY" },
+      { authorization: "docs-tracker-secret", projectSlug: "DOCS" },
+    ]);
+    expect(
+      requests
+        .filter((request) => request.query.includes("SymphonyIssuesByStates"))
+        .map((request) => ({
+          authorization: request.authorization,
+          projectSlug: request.variables.projectSlug,
+          states: request.variables.states,
+        })),
+    ).toEqual([
+      { authorization: "default-tracker-secret", projectSlug: "SYMPHONY", states: ["In Review"] },
+      { authorization: "docs-tracker-secret", projectSlug: "DOCS", states: ["In Review"] },
+    ]);
+  });
+
   it("routes global runtime writeback processing through each operation's project context", async () => {
     const config = runtimeProjectContextConfig();
     const authorizations: string[] = [];
@@ -414,6 +512,43 @@ function runtimeProjectContextConfig(overrides: { env?: NodeJS.ProcessEnv } = {}
       ...overrides.env,
     },
   );
+}
+
+function linearIssueNode(input: {
+  id: string;
+  identifier: string;
+  state: string;
+  projectSlug: string;
+  title?: string;
+}): Record<string, unknown> {
+  return {
+    id: input.id,
+    identifier: input.identifier,
+    title: input.title ?? `${input.identifier} title`,
+    description: null,
+    priority: 1,
+    branchName: `symphony/${input.identifier}`,
+    url: `https://linear.app/example/issue/${input.identifier.toLowerCase()}`,
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    state: { name: input.state },
+    assignee: null,
+    delegate: null,
+    labels: { nodes: [] },
+    project: { id: `project-${input.projectSlug.toLowerCase()}`, slugId: input.projectSlug },
+    inverseRelations: { nodes: [] },
+  };
+}
+
+function linearIssuesResponse(nodes: Record<string, unknown>[]): Response {
+  return jsonResponse({
+    data: {
+      issues: {
+        nodes,
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    },
+  });
 }
 
 function jsonResponse(body: unknown): Response {

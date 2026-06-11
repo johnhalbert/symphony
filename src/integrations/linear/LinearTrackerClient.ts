@@ -65,6 +65,10 @@ interface LinearIssueNode {
   labels?: {
     nodes?: Array<{ name?: unknown }>;
   } | null;
+  project?: {
+    id?: unknown;
+    slugId?: unknown;
+  } | null;
   inverseRelations?: {
     nodes?: LinearRelationNode[];
   } | null;
@@ -153,6 +157,7 @@ const ISSUE_FIELDS = `
   assignee { id }
   delegate { id }
   labels { nodes { name } }
+  project { id slugId }
   inverseRelations { nodes { type issue { id identifier state { name } } } }
 `;
 
@@ -211,6 +216,7 @@ const ISSUE_STATES_QUERY = `
         assignee { id }
         delegate { id }
         labels { nodes { name } }
+        project { id slugId }
         inverseRelations { nodes { type issue { id identifier state { name } } } }
       }
     }
@@ -715,6 +721,8 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
   if (!id || !identifier || !title || !state) return null;
   const assigneeId = asNullableString(node.assignee?.id);
   const delegateId = asNullableString(node.delegate?.id);
+  const linearProjectId = asNullableString(node.project?.id);
+  const linearProjectSlug = asNullableString(node.project?.slugId);
 
   return {
     id,
@@ -732,7 +740,17 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
     blockedBy: normalizeBlockers(node.inverseRelations?.nodes),
     createdAt: asNullableString(node.createdAt),
     updatedAt: asNullableString(node.updatedAt),
-  };
+    ...(linearProjectSlug === null ? {} : { linearProjectSlug }),
+    ...(linearProjectId === null && linearProjectSlug === null
+      ? {}
+      : {
+          linearProjectIdentity: {
+            kind: "linear",
+            ...(linearProjectId === null ? {} : { id: linearProjectId }),
+            ...(linearProjectSlug === null ? {} : { slug: linearProjectSlug }),
+          },
+        }),
+  } as Issue;
 }
 
 function normalizeLabels(nodes: Array<{ name?: unknown }> | undefined): string[] {
