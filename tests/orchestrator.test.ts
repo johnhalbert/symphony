@@ -69,7 +69,7 @@ import {
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import type { Issue, TokenCounts, TrackerStateLists } from "../src/core/types.js";
-import { agentEligibleIssueContract, issue, testConfig, trackerIssue } from "./helpers.js";
+import { agentEligibleIssueContract, issue, multiProjectWorkflowConfig, projectContextFixture, testConfig, trackerIssue } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
@@ -2529,7 +2529,6 @@ describe("Orchestrator", () => {
           pendingApprovalRequestedAt: null,
         },
       });
-      await new Promise((resolve) => setTimeout(resolve, 5));
 
       await orchestrator.refreshNow();
 
@@ -2810,6 +2809,114 @@ describe("Orchestrator", () => {
         pendingApprovalRequestedAt: approval.requestedAt,
       });
       expect(logs.some((line) => line.includes("pending publication approval recovered"))).toBe(false);
+      expect(orchestrator.snapshot().counts.running).toBe(0);
+    } finally {
+      await orchestrator.stop();
+    }
+  });
+
+  it("recovers docs-context pending publication approval after worker exit when the default context disables publication", async () => {
+    const config = multiProjectPublicationApprovalConfig(root, {
+      topLevelGithub: {
+        publish_pull_requests: false,
+        operator_approval: {
+          required_for_publication: false,
+          reject_policy: "cancel",
+          poll_interval_ms: 5,
+        },
+      },
+      docsGithub: {
+        publish_pull_requests: true,
+        operator_approval: {
+          required_for_publication: true,
+          reject_policy: "fail",
+          poll_interval_ms: 5,
+        },
+      },
+    });
+    const candidate = trackerIssue({
+      id: "issue-docs-recovery-1",
+      identifier: "DOCS-RECOVERY-1",
+      state: "Blocked",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/docs-site/DOCS-RECOVERY-1",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logs: string[] = [];
+    const logger = new StructuredLogger((line) => logs.push(line));
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter(() => undefined);
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const approvalStore = new FileOperatorApprovalStore(stateDir);
+    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    await startApprovalRun(runStore, candidate, "run-1", root);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await lifecycleStore.ensureIssue(
+      candidate,
+      pendingApprovalLifecyclePatch(candidate, root, "run-1", PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
+    );
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/docs-site/pull/42",
+      number: 42,
+      headBranch: candidate.branchName ?? "symphony/docs-site/DOCS-RECOVERY-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      operatorApproval,
+      completionReportPublisher: publisher,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+
+      const pending = await approvalStore.findPendingForRun("run-1");
+      expect(pending).toMatchObject({
+        status: "pending",
+        issueId: candidate.id,
+        runId: "run-1",
+        projectContext: docsProjectContext,
+      });
+      expect(await approvalStore.list()).toHaveLength(1);
+      expect(publisher.inputs).toEqual([]);
+      expect(await outboxStore.list()).toEqual(expect.arrayContaining([expect.objectContaining({ projectContext: docsProjectContext })]));
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+        projectContext: docsProjectContext,
+        pendingApprovalRequestId: pending?.requestId ?? null,
+      });
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+        projectContext: docsProjectContext,
+      });
+      expect(logs.some((line) => line.includes("pending publication approval recovered"))).toBe(true);
       expect(orchestrator.snapshot().counts.running).toBe(0);
     } finally {
       await orchestrator.stop();
@@ -4182,6 +4289,192 @@ describe("Orchestrator", () => {
     },
   );
 
+  it.each([
+    ["fail", "cancel", "failed", OPERATOR_REJECTED_PUBLICATION_ERROR],
+    ["cancel", "fail", "cancelled", "Operator cancelled issue"],
+  ] as const)(
+    "uses the docs-context reject policy for rejected publication approvals after worker exit when tracker refresh misses (%s)",
+    async (docsRejectPolicy, defaultRejectPolicy, expectedStatus, expectedError) => {
+      const config = multiProjectPublicationApprovalConfig(root, {
+        topLevelGithub: {
+          publish_pull_requests: true,
+          operator_approval: {
+            required_for_publication: true,
+            reject_policy: defaultRejectPolicy,
+            poll_interval_ms: 5,
+          },
+        },
+        docsGithub: {
+          publish_pull_requests: true,
+          operator_approval: {
+            required_for_publication: true,
+            reject_policy: docsRejectPolicy,
+            poll_interval_ms: 5,
+          },
+        },
+      });
+      const candidate = trackerIssue({
+        id: `issue-docs-rejected-${docsRejectPolicy}`,
+        identifier: `DOCS-REJECT-${docsRejectPolicy.toUpperCase()}`,
+        state: "Blocked",
+        labels: ["dogfood-ready"],
+        branchName: `symphony/docs-site/DOCS-REJECT-${docsRejectPolicy.toUpperCase()}`,
+        projectContextId: docsProjectContext.projectContextId,
+        projectContextLabel: docsProjectContext.projectContextLabel,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+      });
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [];
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const stateDir = config.workspace.stateDir;
+      const outboxStore = new FileWritebackOutboxStore(stateDir);
+      const writer = new StateChangingWriter(() => undefined);
+      const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+      const runStore = new FileRunTranscriptStore(stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+      await startApprovalRun(runStore, candidate, "run-1", root);
+      await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+      await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        harness: new FakeHarness(),
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+        runStore,
+        writeback,
+      });
+      const approval = approvalRecordFor("rejected", candidate, "run-1", root);
+
+      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+
+      expect(writer.comments).toHaveLength(1);
+      expect(writer.comments[0]?.body).toContain("Status: rejected");
+      expect(writer.transitions).toEqual([]);
+      expect(await outboxStore.list()).toEqual(expect.arrayContaining([expect.objectContaining({ projectContext: docsProjectContext })]));
+      await expect(waitForTerminalRunRecord(runStore, "run-1")).resolves.toMatchObject({
+        projectContext: docsProjectContext,
+        status: expectedStatus,
+        completedAt: expect.any(String),
+        error: expectedError,
+        pendingApprovalRequestId: null,
+      });
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: "publication approval rejected",
+        projectContext: docsProjectContext,
+      });
+      await orchestrator.stop();
+    },
+  );
+
+  it.each([
+    ["stale", "run cancellation has been requested", "Publication approval stale"],
+    ["expired", "approval request expired", "Publication approval expired"],
+    ["cancelled", null, "Publication approval cancelled"],
+  ] as const)(
+    "preserves docs-context terminal approval routing for %s after worker exit when tracker refresh misses",
+    async (status, staleReason, expectedError) => {
+      const config = multiProjectPublicationApprovalConfig(root, {
+        topLevelGithub: {
+          publish_pull_requests: true,
+          operator_approval: {
+            required_for_publication: true,
+            reject_policy: "cancel",
+            poll_interval_ms: 5,
+          },
+        },
+        docsGithub: {
+          publish_pull_requests: true,
+          operator_approval: {
+            required_for_publication: true,
+            reject_policy: "fail",
+            poll_interval_ms: 5,
+          },
+        },
+      });
+      const candidate = trackerIssue({
+        id: `issue-docs-terminal-${status}`,
+        identifier: `DOCS-TERM-${status.toUpperCase()}`,
+        state: "Blocked",
+        labels: ["dogfood-ready"],
+        branchName: `symphony/docs-site/DOCS-TERM-${status.toUpperCase()}`,
+        projectContextId: docsProjectContext.projectContextId,
+        projectContextLabel: docsProjectContext.projectContextLabel,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+      });
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [];
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const stateDir = config.workspace.stateDir;
+      const outboxStore = new FileWritebackOutboxStore(stateDir);
+      const writer = new StateChangingWriter(() => undefined);
+      const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+      const runStore = new FileRunTranscriptStore(stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+      await startApprovalRun(runStore, candidate, "run-1", root);
+      await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+      await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        harness: new FakeHarness(),
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+        runStore,
+        writeback,
+      });
+      const approval = approvalRecordFor(status, candidate, "run-1", root, staleReason);
+
+      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+
+      expect(writer.comments).toHaveLength(1);
+      expect(writer.comments[0]?.body).toContain(`Status: ${status}`);
+      if (staleReason !== null) {
+        expect(writer.comments[0]?.body).toContain(`Reason: ${staleReason}`);
+      }
+      expect(writer.transitions).toEqual([]);
+      expect(await outboxStore.list()).toEqual(expect.arrayContaining([expect.objectContaining({ projectContext: docsProjectContext })]));
+      await expect(waitForTerminalRunRecord(runStore, "run-1")).resolves.toMatchObject({
+        projectContext: docsProjectContext,
+        status: "failed",
+        completedAt: expect.any(String),
+        error: expectedError,
+        pendingApprovalRequestId: null,
+      });
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: `publication approval ${status}`,
+        projectContext: docsProjectContext,
+      });
+      await orchestrator.stop();
+    },
+  );
+
   it("smokes a manufactured fail, revision worker, and pass review loop", async () => {
     const config = testConfig(root);
     config.agent.maxConcurrentAgents = 1;
@@ -4948,7 +5241,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitFor(() => pullRequestClient.branches.length === 2, "pull request discovery");
     await orchestrator.stop();
 
     const run = await runStore.latestRunForIssue(candidate.identifier);
@@ -6413,12 +6706,14 @@ describe("Orchestrator", () => {
 });
 
 function completionReportRecord(candidate = issue()): IssueCompletionReportRecord {
+  const projectContext = testProjectContextResolution(candidate);
   return {
     id: `completion-report:${candidate.id}:idem-1`,
     idempotencyKey: "idem-1",
     runId: "worker-run-1",
     issueId: candidate.id,
     issueIdentifier: candidate.identifier,
+    ...(projectContext === undefined ? {} : { projectContext }),
     summary: "Implemented the requested change.",
     validationEvidence: ["npm test -- orchestrator"],
     acceptanceChecklist: [
@@ -6511,12 +6806,39 @@ function linearLinkbackComment(): string {
   ].join("\n");
 }
 
+function testProjectContextResolution(candidate: Issue): OperatorApprovalRecord["projectContext"] {
+  const value = candidate as unknown as Record<string, unknown>;
+  if (typeof value.projectContext === "object" && value.projectContext !== null) {
+    return value.projectContext as OperatorApprovalRecord["projectContext"];
+  }
+  if (typeof value.projectContextId !== "string" || value.projectContextId.length === 0) {
+    return undefined;
+  }
+  return {
+    projectContextId: value.projectContextId,
+    projectContextLabel:
+      typeof value.projectContextLabel === "string" && value.projectContextLabel.length > 0
+        ? value.projectContextLabel
+        : value.projectContextId,
+    linearProjectSlug:
+      typeof value.linearProjectSlug === "string" && value.linearProjectSlug.length > 0
+        ? value.linearProjectSlug
+        : typeof (value.linearProjectIdentity as { slug?: unknown } | undefined)?.slug === "string" &&
+            ((value.linearProjectIdentity as { slug?: string }).slug?.length ?? 0) > 0
+          ? (value.linearProjectIdentity as { slug: string }).slug
+          : value.projectContextId.toUpperCase().replace(/[^A-Z0-9]+/g, "_"),
+    routingSource:
+      typeof value.routingSource === "string" && value.routingSource.length > 0 ? value.routingSource : "candidate_poll",
+  };
+}
+
 async function startApprovalRun(
   runStore: FileRunTranscriptStore,
   candidate: Issue,
   runId: string,
   root: string,
 ): Promise<void> {
+  const projectContext = testProjectContextResolution(candidate);
   await runStore.startRun({
     runId,
     sessionId: `${runId}-session`,
@@ -6524,6 +6846,7 @@ async function startApprovalRun(
     role: "worker",
     issueId: candidate.id,
     issueIdentifier: candidate.identifier,
+    ...(projectContext === undefined ? {} : { projectContext }),
     attempt: null,
     turnNumber: 1,
     prompt: "Worker submitted a completion report.",
@@ -6541,9 +6864,11 @@ function pendingApprovalLifecyclePatch(
   runId: string,
   blockedReason = PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
 ): IssueLifecyclePatch {
+  const projectContext = testProjectContextResolution(candidate);
   return {
     phase: "blocked",
     blockedReason,
+    ...(projectContext === undefined ? {} : { projectContext }),
     lastCompletionReportId: `completion-report:${candidate.id}:idem-1`,
     completionReports: [
       {
@@ -6572,11 +6897,13 @@ function approvalRecordFor(
   root: string,
   staleReason: string | null = null,
 ): OperatorApprovalRecord {
+  const projectContext = testProjectContextResolution(candidate);
   return {
     requestId: `approval-${status}`,
     status,
     issueId: candidate.id,
     issueIdentifier: candidate.identifier,
+    ...(projectContext === undefined ? {} : { projectContext }),
     runId,
     evidenceCursor: "idem-1",
     dedupeKey: `${runId}:idem-1:push_and_pr`,
@@ -6598,6 +6925,100 @@ function approvalRecordFor(
     decision: status === "approved" ? "approve" : status === "rejected" ? "reject" : null,
     staleReason,
   };
+}
+
+function multiProjectPublicationApprovalConfig(
+  root: string,
+  input: {
+    dispatchState?: string;
+    topLevelGithub?: Record<string, unknown>;
+    docsGithub?: Record<string, unknown>;
+  } = {},
+) {
+  return parseServiceConfig(
+    multiProjectWorkflowConfig({
+      topLevel: {
+        tracker: {
+          project_slug: "TEST",
+          active_states: ["Todo", "In Progress"],
+          handoff_states: ["In Review"],
+        },
+        workspace: {
+          root: path.join(root, "workspaces"),
+          state_dir: path.join(root, "state"),
+          source: {
+            kind: "git_worktree",
+            repository: root,
+            base_ref: "main",
+            branch_template: "symphony/{{ issue.identifier }}",
+            cleanup: "refuse_dirty",
+          },
+        },
+        writeback: {
+          enabled: true,
+          mode: "live",
+          dispatch_state: input.dispatchState ?? "Todo",
+          max_backoff_ms: 1,
+        },
+        review_loop: {
+          blocked_states: ["Blocked"],
+          review_states: ["In Review"],
+        },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          token: "github-token",
+          api_base_url: "https://api.github.test",
+          publish_pull_requests: false,
+          pr_handoff: { enabled: false },
+          operator_approval: {
+            required_for_publication: false,
+            reject_policy: "cancel",
+            poll_interval_ms: 5,
+          },
+          ...input.topLevelGithub,
+        },
+      },
+      projectContexts: [
+        projectContextFixture({
+          id: "symphony",
+          label: "Symphony",
+          projectSlug: "TEST",
+          workspaceRoot: path.join(root, "workspaces"),
+          stateDir: path.join(root, "state"),
+          repository: root,
+          baseRef: "main",
+          branchTemplate: "symphony/{{ issue.identifier }}",
+        }),
+        projectContextFixture({
+          id: docsProjectContext.projectContextId,
+          label: docsProjectContext.projectContextLabel,
+          projectSlug: docsProjectContext.linearProjectSlug,
+          workspaceRoot: path.join(root, "workspaces"),
+          stateDir: path.join(root, "state"),
+          repository: "../docs-site",
+          baseRef: "main",
+          branchTemplate: "symphony/{{ issue.identifier }}",
+          github: {
+            owner: "acme",
+            repo: "docs-site",
+            token: "docs-github-token",
+            api_base_url: "https://api.github.test",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+            operator_approval: {
+              required_for_publication: true,
+              reject_policy: "fail",
+              poll_interval_ms: 5,
+            },
+            ...input.docsGithub,
+          },
+        }),
+      ],
+    }),
+    path.join(root, "WORKFLOW.md"),
+    { LINEAR_API_KEY: "linear-test-key" },
+  );
 }
 
 function githubProfileConfig(

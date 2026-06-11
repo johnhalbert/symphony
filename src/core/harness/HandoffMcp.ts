@@ -275,6 +275,7 @@ async function writeHandoffMcpContexts(
   });
   await writeReviewFeedbackMcpContext(reviewFeedbackContextFilePath(ctx), {
     issue: ctx.issue,
+    projectContext: ctx.projectContext,
     activeRunId: input.activeRunId,
     role: "reviewer",
     token: null,
@@ -303,6 +304,7 @@ export function completionReportMcpServerConfig(
 ): McpSubprocessServerConfig {
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
+    projectContextId: ctx.projectContext?.projectContextId ?? null,
     command: "completion-report-mcp",
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
@@ -317,6 +319,7 @@ export function mergeConflictResolutionMcpServerConfig(
 ): McpSubprocessServerConfig {
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
+    projectContextId: ctx.projectContext?.projectContextId ?? null,
     command: "merge-conflict-resolution-mcp",
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
@@ -331,6 +334,7 @@ export function issueBreakdownPlanMcpServerConfig(
 ): McpSubprocessServerConfig {
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
+    projectContextId: ctx.projectContext?.projectContextId ?? null,
     command: "issue-breakdown-plan-mcp",
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
@@ -345,6 +349,7 @@ export function reviewVerdictMcpServerConfig(
 ): McpSubprocessServerConfig {
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
+    projectContextId: ctx.projectContext?.projectContextId ?? null,
     command: "review-verdict-mcp",
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
@@ -359,6 +364,7 @@ export function reviewFeedbackMcpServerConfig(
 ): McpSubprocessServerConfig {
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
+    projectContextId: ctx.projectContext?.projectContextId ?? null,
     command: "review-feedback-mcp",
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
@@ -373,6 +379,7 @@ export function transcriptRecallMcpServerConfig(
 ): McpSubprocessServerConfig {
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
+    projectContextId: ctx.projectContext?.projectContextId ?? null,
     command: "transcript-recall-mcp",
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,

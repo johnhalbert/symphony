@@ -7,6 +7,7 @@ import {
   createCredentialProfileRegistry,
   rawCredentialProfilesSchema,
   type CredentialProfileRegistry,
+  type RawCredentialProfilesConfig,
 } from "./CredentialProfiles.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
@@ -631,6 +632,7 @@ export interface ServiceConfig {
   writeback: WritebackConfig;
   github: GitHubConfig;
   credentialProfiles: CredentialProfileRegistry;
+  credentialProfileRegistries: ReadonlyMap<string, CredentialProfileRegistry>;
   reviewLoop: ReviewLoopConfig;
   mergePolicy: MergePolicyConfig;
   issueBoard: IssueBoardConfig;
@@ -641,16 +643,126 @@ export interface ServiceConfig {
   raw: RawWorkflowConfig;
 }
 
+export function resolveProjectContextConfig(
+  config: ServiceConfig,
+  projectContextId?: string | null,
+): WorkflowProjectContext {
+  if (!projectContextId) return config.projectContexts.defaultContext;
+
+  let normalizedProjectContextId: string;
+  try {
+    normalizedProjectContextId = normalizeProjectContextId(projectContextId);
+  } catch (error) {
+    throw new SymphonyError("config_validation_error", `Invalid project context id: ${projectContextId}`, {
+      cause: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const context = config.projectContexts.byId.get(normalizedProjectContextId);
+  if (!context) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `Project context ${normalizedProjectContextId} is not defined in the active workflow`,
+    );
+  }
+  return context;
+}
+
+export function resolveProjectContextCredentialRegistry(
+  config: ServiceConfig,
+  projectContextId?: string | null,
+): CredentialProfileRegistry {
+  const context = resolveProjectContextConfig(config, projectContextId);
+  return config.credentialProfileRegistries.get(context.id) ?? config.credentialProfiles;
+}
+
 export function resolveDefaultProjectContextCredentialProfiles(
   raw: RawWorkflowConfig,
   defaultContextId: string,
 ): RawWorkflowConfig["credential_profiles"] | undefined {
+  return resolveProjectContextCredentialProfiles(raw, defaultContextId);
+}
+
+export function resolveProjectContextCredentialProfiles(
+  raw: RawWorkflowConfig,
+  projectContextId: string,
+): RawWorkflowConfig["credential_profiles"] | undefined {
+  const normalizedProjectContextId = normalizeProjectContextId(projectContextId);
   for (const context of raw.project_contexts ?? []) {
-    if (normalizeProjectContextId(context.id) === defaultContextId) {
-      return context.credential_profiles ?? raw.credential_profiles;
+    if (normalizeProjectContextId(context.id) === normalizedProjectContextId) {
+      return mergeCredentialProfileConfigs(raw.credential_profiles, context.credential_profiles);
     }
   }
   return raw.credential_profiles;
+}
+
+function mergeCredentialProfileConfigs(
+  defaults: RawCredentialProfilesConfig | undefined,
+  context: RawCredentialProfilesConfig | undefined,
+): RawCredentialProfilesConfig | undefined {
+  if (!defaults) return context;
+  if (!context) return defaults;
+
+  const profiles = mergeCredentialProfileDefinitions(defaults.profiles, context.profiles);
+  const roles = mergeCredentialProfileRoleAssignments(defaults.roles, context.roles);
+
+  return {
+    ...defaults,
+    ...context,
+    ...(profiles === undefined ? {} : { profiles }),
+    ...(roles === undefined ? {} : { roles }),
+  };
+}
+
+function mergeCredentialProfileDefinitions(
+  defaults: RawCredentialProfilesConfig["profiles"] | undefined,
+  context: RawCredentialProfilesConfig["profiles"] | undefined,
+): RawCredentialProfilesConfig["profiles"] | undefined {
+  if (!defaults) return context;
+  if (!context) return defaults;
+
+  const mergedProfiles: NonNullable<RawCredentialProfilesConfig["profiles"]> = {
+    ...defaults,
+  };
+
+  for (const [name, contextProfile] of Object.entries(context)) {
+    const defaultProfile = defaults[name];
+    mergedProfiles[name] = defaultProfile ? { ...defaultProfile, ...contextProfile } : contextProfile;
+  }
+
+  return Object.keys(mergedProfiles).length === 0 ? undefined : mergedProfiles;
+}
+
+function mergeCredentialProfileRoleAssignments(
+  defaults: RawCredentialProfilesConfig["roles"] | undefined,
+  context: RawCredentialProfilesConfig["roles"] | undefined,
+): RawCredentialProfilesConfig["roles"] | undefined {
+  if (!defaults) return context;
+  if (!context) return defaults;
+
+  const worker = mergeCredentialProfileRoleAssignment(defaults.worker, context.worker);
+  const reviewer = mergeCredentialProfileRoleAssignment(defaults.reviewer, context.reviewer);
+  const service = mergeCredentialProfileRoleAssignment(defaults.service, context.service);
+
+  const mergedRoles = {
+    ...(worker === undefined ? {} : { worker }),
+    ...(reviewer === undefined ? {} : { reviewer }),
+    ...(service === undefined ? {} : { service }),
+  };
+
+  return Object.keys(mergedRoles).length === 0 ? undefined : mergedRoles;
+}
+
+function mergeCredentialProfileRoleAssignment(
+  defaults: Record<string, string> | undefined,
+  context: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!defaults) return context;
+  if (!context) return defaults;
+  return {
+    ...defaults,
+    ...context,
+  };
 }
 
 const DEFAULT_ACTIVE_STATES = ["Todo", "In Progress"];
@@ -784,18 +896,35 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
   const serverWebAssetsRoot = resolveOptionalPathValue(raw.server?.web_assets_root, workflowDir, env);
   const database = normalizeDatabaseConfig(raw, workflowDir, env);
-  const credentialProfilesRaw = resolveDefaultProjectContextCredentialProfiles(raw, defaultContext.id);
-  const credentialProfiles = createCredentialProfileRegistry({
-    raw: credentialProfilesRaw,
-    env,
-    workflowDir,
-    fallbacks: {
-      githubToken: github.token,
-      linearApiKey: tracker.apiKey,
-      cursorRuntimeApiKey,
-      openWorkspaceToken: serverOpenWorkspaceToken,
-    },
-  });
+  const credentialProfileRegistries = new Map<string, CredentialProfileRegistry>(
+    projectContexts.contexts.map((context) => [
+      context.id,
+      createCredentialProfileRegistry({
+        raw: resolveProjectContextCredentialProfiles(raw, context.id),
+        env,
+        workflowDir,
+        fallbacks: {
+          githubToken: context.github.token,
+          linearApiKey: context.tracker.apiKey,
+          cursorRuntimeApiKey,
+          openWorkspaceToken: serverOpenWorkspaceToken,
+        },
+      }),
+    ]),
+  );
+  const credentialProfiles =
+    credentialProfileRegistries.get(defaultContext.id) ??
+    createCredentialProfileRegistry({
+      raw: resolveDefaultProjectContextCredentialProfiles(raw, defaultContext.id),
+      env,
+      workflowDir,
+      fallbacks: {
+        githubToken: github.token,
+        linearApiKey: tracker.apiKey,
+        cursorRuntimeApiKey,
+        openWorkspaceToken: serverOpenWorkspaceToken,
+      },
+    });
   const mergePolicy = normalizeMergePolicy(raw, reviewLoop.reviewPassState);
 
   validateStateBuckets({
@@ -902,6 +1031,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     },
     github,
     credentialProfiles,
+    credentialProfileRegistries,
     reviewLoop,
     mergePolicy,
     issueBoard: {
@@ -1038,7 +1168,7 @@ function mergeWorkflowProjectContextDefaults(
   const reviewLoop = mergeConfigObjects(defaults.review_loop, context.review_loop);
   const issueBreakdown = mergeIssueBreakdownDefaults(defaults.issue_breakdown, context.issue_breakdown);
   const agent = mergeAgentDefaults(defaults.agent, context.agent);
-  const credentialProfiles = context.credential_profiles ?? defaults.credential_profiles;
+  const credentialProfiles = mergeCredentialProfileConfigs(defaults.credential_profiles, context.credential_profiles);
 
   return {
     id: context.id,

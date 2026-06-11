@@ -136,7 +136,7 @@ export type IssueBreakdownIssueLookupResult =
 
 export type IssueBreakdownFreshnessGuard = {
   getConfig: () => ServiceConfig;
-  resolveIssue: (issueId: string) => Promise<IssueBreakdownIssueLookupResult>;
+  resolveIssue: (issueId: string, projectContextId?: string | null) => Promise<IssueBreakdownIssueLookupResult>;
 };
 
 export type ProcessDueOptions = {
@@ -385,6 +385,7 @@ export class WritebackProcessor {
     private readonly lifecycleStore?: Pick<IssueLifecycleStore, "get">,
     private readonly dryRun = false,
     private readonly issueBreakdownFreshnessGuard?: IssueBreakdownFreshnessGuard,
+    private readonly writerResolver?: (projectContextId?: string | null) => TrackerWriter,
   ) {}
 
   async enqueueAndProcess(operation: NewWritebackOperation, options: EnqueueWritebackOptions = {}): Promise<WritebackOperation> {
@@ -457,7 +458,10 @@ export class WritebackProcessor {
         return { status: "blocked", message: "issue breakdown writeback requires freshness guard" };
       }
       const config = this.issueBreakdownFreshnessGuard.getConfig();
-      const lookup = await this.issueBreakdownFreshnessGuard.resolveIssue(record.issueId);
+      const lookup = await this.issueBreakdownFreshnessGuard.resolveIssue(
+        record.issueId,
+        record.projectContext?.projectContextId,
+      );
       if (lookup.status === "transient_error") {
         return { status: "retry", message: `issue breakdown freshness lookup failed: ${lookup.message}` };
       }
@@ -483,11 +487,12 @@ export class WritebackProcessor {
   }
 
   private async execute(record: WritebackOperation) {
+    const writer = this.writerResolver?.(record.projectContext?.projectContextId) ?? this.writer;
     if (this.dryRun) {
       return dryRunResult(record);
     }
     if (record.kind === "transition") {
-      return this.writer.transitionIssueState({
+      return writer.transitionIssueState({
         issueId: record.issueId,
         toState: record.payload.toState,
         ...(record.payload.fromStates === undefined ? {} : { fromStates: record.payload.fromStates }),
@@ -495,17 +500,17 @@ export class WritebackProcessor {
       });
     }
     if (record.kind === "comment") {
-      return this.writer.createIssueComment({
+      return writer.createIssueComment({
         issueId: record.issueId,
         body: record.payload.body,
         dedupeKey: record.payload.dedupeKey,
       });
     }
     if (record.kind === "issue_relation") {
-      if (!this.writer.createIssueRelation) {
+      if (!writer.createIssueRelation) {
         throw new Error("Tracker writer does not support issue_relation writeback operations");
       }
-      return this.writer.createIssueRelation({
+      return writer.createIssueRelation({
         sourceIssueId: record.payload.sourceIssueId,
         targetIssueId: record.payload.targetIssueId,
         type: record.payload.type,
@@ -514,10 +519,10 @@ export class WritebackProcessor {
         dependency: record.payload.dependency,
       });
     }
-    if (!this.writer.createIssueFromPlan) {
+    if (!writer.createIssueFromPlan) {
       throw new Error("Tracker writer does not support issue_create writeback operations");
     }
-    return this.writer.createIssueFromPlan({
+    return writer.createIssueFromPlan({
       parentIssueId: record.payload.parentIssueId,
       planId: record.payload.planId,
       proposedIssueIndex: record.payload.proposedIssueIndex,

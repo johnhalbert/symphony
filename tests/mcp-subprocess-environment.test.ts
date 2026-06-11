@@ -262,6 +262,191 @@ describe("MCP subprocess environment", () => {
     expect(githubEnvKeys(env)).toEqual(["GITHUB_PUBLICATION_TOKEN"]);
   });
 
+  it.each([
+    {
+      command: "completion-report-mcp" as const,
+      expectedKeys: [
+        "DOCS_GITHUB_OWNER",
+        "DOCS_GITHUB_PUBLICATION_TOKEN",
+        "DOCS_GITHUB_REPO",
+        "GITHUB_OWNER",
+        "GITHUB_REPO",
+      ],
+      expectedTokenKey: "DOCS_GITHUB_PUBLICATION_TOKEN",
+      expectedTokenValue: "docs-publication-secret",
+    },
+    {
+      command: "review-feedback-mcp" as const,
+      expectedKeys: [
+        "DOCS_GITHUB_FEEDBACK_TOKEN",
+        "DOCS_GITHUB_OWNER",
+        "DOCS_GITHUB_REPO",
+        "GITHUB_OWNER",
+        "GITHUB_REPO",
+      ],
+      expectedTokenKey: "DOCS_GITHUB_FEEDBACK_TOKEN",
+      expectedTokenValue: "docs-feedback-secret",
+    },
+  ])("uses project-context-specific GitHub env slices for $command", ({
+    command,
+    expectedKeys,
+    expectedTokenKey,
+    expectedTokenValue,
+  }) => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: {
+            owner: "$GITHUB_OWNER",
+            repo: "$GITHUB_REPO",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+              reviewer: { "github.review_feedback_write": "feedback" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: {
+              owner: "$DOCS_GITHUB_OWNER",
+              repo: "$DOCS_GITHUB_REPO",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+            },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+                feedback: { value: "$DOCS_GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_OWNER: "acme",
+        GITHUB_REPO: "symphony",
+        GITHUB_PUBLICATION_TOKEN: "default-publication-secret",
+        GITHUB_FEEDBACK_TOKEN: "default-feedback-secret",
+        DOCS_GITHUB_OWNER: "acme",
+        DOCS_GITHUB_REPO: "docs-site",
+        DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+        DOCS_GITHUB_FEEDBACK_TOKEN: "docs-feedback-secret",
+      },
+    );
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command,
+      projectContextId: "docs",
+      parentEnv: { PATH: "/bin", GITHUB_TOKEN: "decoy-parent-github-secret" },
+    });
+
+    expect(env.DOCS_GITHUB_OWNER).toBe("acme");
+    expect(env.DOCS_GITHUB_REPO).toBe("docs-site");
+    expect(env[expectedTokenKey]).toBe(expectedTokenValue);
+    expect(env).not.toHaveProperty("GITHUB_PUBLICATION_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_FEEDBACK_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(githubEnvKeys(env)).toEqual(expectedKeys);
+  });
+
+  it("uses the active project context publication gating for completion-report MCP env slices", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: {
+            owner: "$GITHUB_OWNER",
+            repo: "$GITHUB_REPO",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+            operator_approval: { required_for_publication: true },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: {
+              owner: "$DOCS_GITHUB_OWNER",
+              repo: "$DOCS_GITHUB_REPO",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+              operator_approval: { required_for_publication: false },
+            },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_OWNER: "acme",
+        GITHUB_REPO: "symphony",
+        GITHUB_PUBLICATION_TOKEN: "default-publication-secret",
+        DOCS_GITHUB_OWNER: "acme",
+        DOCS_GITHUB_REPO: "docs-site",
+        DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+      },
+    );
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "completion-report-mcp",
+      projectContextId: "docs",
+      parentEnv: { PATH: "/bin", GITHUB_TOKEN: "decoy-parent-github-secret" },
+    });
+
+    expect(env.DOCS_GITHUB_OWNER).toBe("acme");
+    expect(env.DOCS_GITHUB_REPO).toBe("docs-site");
+    expect(env.DOCS_GITHUB_PUBLICATION_TOKEN).toBe("docs-publication-secret");
+    expect(env).not.toHaveProperty("GITHUB_PUBLICATION_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(githubEnvKeys(env)).toEqual([
+      "DOCS_GITHUB_OWNER",
+      "DOCS_GITHUB_PUBLICATION_TOKEN",
+      "DOCS_GITHUB_REPO",
+      "GITHUB_OWNER",
+      "GITHUB_REPO",
+    ]);
+  });
+
   it("includes env-backed GitHub publication metadata refs without leaking decoy credentials", () => {
     const rawConfig = {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -709,6 +894,167 @@ describe("MCP subprocess environment", () => {
     expect(reviewChildConfig.credentialProfiles.resolveForRole("reviewer", "github.review_feedback_write")).toMatchObject({
       kind: "github_app",
       app: { appId: "333", clientId: "Iv1.review", installationId: "444", privateKeyPath: reviewerKeyPath },
+    });
+  });
+
+  it("inherits unspecified github_app env refs for same-named project-context profile overrides", () => {
+    const rawConfig = multiProjectWorkflowConfig({
+      topLevel: {
+        github: {
+          owner: "$GITHUB_OWNER",
+          repo: "$GITHUB_REPO",
+          head_owner: "$GITHUB_HEAD_OWNER",
+          publish_pull_requests: true,
+          pr_handoff: { enabled: false },
+        },
+        credential_profiles: {
+          profiles: {
+            publication: {
+              kind: "github_app",
+              app_id: "$GITHUB_PUBLICATION_APP_ID",
+              client_id: "$GITHUB_PUBLICATION_APP_CLIENT_ID",
+              installation_id: "$GITHUB_PUBLICATION_APP_INSTALLATION_ID",
+              private_key_path: "$GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.publication", "github.merge"],
+            },
+            feedback: {
+              kind: "github_app",
+              app_id: "$GITHUB_REVIEW_APP_ID",
+              client_id: "$GITHUB_REVIEW_APP_CLIENT_ID",
+              installation_id: "$GITHUB_REVIEW_APP_INSTALLATION_ID",
+              private_key_path: "$GITHUB_REVIEW_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.review_feedback_write"],
+            },
+          },
+          roles: {
+            service: {
+              "github.publication": "publication",
+              "github.merge": "publication",
+            },
+            reviewer: {
+              "github.review_feedback_write": "feedback",
+            },
+          },
+        },
+      },
+      projectContexts: [
+        projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+        projectContextFixture({
+          id: "docs",
+          label: "Documentation Site",
+          projectSlug: "DOCS",
+          repository: "../docs-site",
+          github: {
+            owner: "$DOCS_GITHUB_OWNER",
+            repo: "$DOCS_GITHUB_REPO",
+            head_owner: "$DOCS_GITHUB_HEAD_OWNER",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: {
+                kind: "github_app",
+                installation_id: "$DOCS_GITHUB_PUBLICATION_APP_INSTALLATION_ID",
+                capabilities: ["github.publication", "github.merge"],
+              },
+              feedback: {
+                kind: "github_app",
+                installation_id: "$DOCS_GITHUB_REVIEW_APP_INSTALLATION_ID",
+                capabilities: ["github.review_feedback_write"],
+              },
+            },
+            roles: {
+              service: {
+                "github.publication": "publication",
+                "github.merge": "publication",
+              },
+              reviewer: {
+                "github.review_feedback_write": "feedback",
+              },
+            },
+          },
+        }),
+      ],
+    });
+    const sourceEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      GITHUB_OWNER: "acme",
+      GITHUB_REPO: "symphony",
+      GITHUB_HEAD_OWNER: "john",
+      DOCS_GITHUB_OWNER: "acme",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "docs-bot",
+      GITHUB_PUBLICATION_APP_ID: "111",
+      GITHUB_PUBLICATION_APP_CLIENT_ID: "Iv1.publication",
+      GITHUB_PUBLICATION_APP_INSTALLATION_ID: "222",
+      GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH: "/secrets/publication.pem",
+      DOCS_GITHUB_PUBLICATION_APP_INSTALLATION_ID: "333",
+      GITHUB_REVIEW_APP_ID: "444",
+      GITHUB_REVIEW_APP_CLIENT_ID: "Iv1.review",
+      GITHUB_REVIEW_APP_INSTALLATION_ID: "555",
+      GITHUB_REVIEW_APP_PRIVATE_KEY_PATH: "/secrets/reviewer.pem",
+      DOCS_GITHUB_REVIEW_APP_INSTALLATION_ID: "666",
+      GITHUB_TOKEN: "decoy-github-secret",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    const completionEnv = buildMcpSubprocessEnvironment({
+      config,
+      command: "completion-report-mcp",
+      projectContextId: "docs",
+      parentEnv: { PATH: "/bin", ...sourceEnv },
+    });
+    expect(completionEnv).toMatchObject({
+      DOCS_GITHUB_OWNER: "acme",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "docs-bot",
+      GITHUB_PUBLICATION_APP_ID: "111",
+      GITHUB_PUBLICATION_APP_CLIENT_ID: "Iv1.publication",
+      DOCS_GITHUB_PUBLICATION_APP_INSTALLATION_ID: "333",
+      GITHUB_PUBLICATION_APP_PRIVATE_KEY_PATH: expect.stringContaining("publication.pem"),
+    });
+    expect(completionEnv).not.toHaveProperty("GITHUB_REVIEW_APP_ID");
+    expect(completionEnv).not.toHaveProperty("GITHUB_TOKEN");
+
+    const completionChildConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", completionEnv);
+    expect(completionChildConfig.credentialProfileRegistries.get("docs")?.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "github_app",
+      app: {
+        appId: "111",
+        clientId: "Iv1.publication",
+        installationId: "333",
+        privateKeyPath: expect.stringContaining("publication.pem"),
+      },
+    });
+
+    const reviewEnv = buildMcpSubprocessEnvironment({
+      config,
+      command: "review-feedback-mcp",
+      projectContextId: "docs",
+      parentEnv: { PATH: "/bin", ...sourceEnv },
+    });
+    expect(reviewEnv).toMatchObject({
+      DOCS_GITHUB_OWNER: "acme",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "docs-bot",
+      GITHUB_REVIEW_APP_ID: "444",
+      GITHUB_REVIEW_APP_CLIENT_ID: "Iv1.review",
+      DOCS_GITHUB_REVIEW_APP_INSTALLATION_ID: "666",
+      GITHUB_REVIEW_APP_PRIVATE_KEY_PATH: expect.stringContaining("reviewer.pem"),
+    });
+    expect(reviewEnv).not.toHaveProperty("GITHUB_PUBLICATION_APP_ID");
+    expect(reviewEnv).not.toHaveProperty("GITHUB_TOKEN");
+
+    const reviewChildConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", reviewEnv);
+    expect(reviewChildConfig.credentialProfileRegistries.get("docs")?.resolveForRole("reviewer", "github.review_feedback_write")).toMatchObject({
+      kind: "github_app",
+      app: {
+        appId: "444",
+        clientId: "Iv1.review",
+        installationId: "666",
+        privateKeyPath: expect.stringContaining("reviewer.pem"),
+      },
     });
   });
 

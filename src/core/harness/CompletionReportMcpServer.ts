@@ -8,6 +8,7 @@ import {
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { ProjectContextResolution } from "../config/ProjectContexts.js";
+import { resolveProjectContextConfig } from "../config/Config.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -59,20 +60,28 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const projectContextId = loadedContext.projectContext?.projectContextId;
+    const github = resolveProjectContextConfig(config, projectContextId).github;
+    const approvalRequiredForPublication = github.operatorApproval?.requiredForPublication ?? false;
     const writebackProcessor =
-      config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
-        ? createRuntimeWritebackProcessor(() => config, logger, undefined, { outboxStore: writebackOutbox, lifecycleStore })
+      config.writeback.enabled && approvalRequiredForPublication
+        ? createRuntimeWritebackProcessor(
+            () => config,
+            logger,
+            undefined,
+            { outboxStore: writebackOutbox, lifecycleStore },
+            projectContextId,
+          )
         : undefined;
     const operatorApproval = new OperatorApprovalService({
       config,
       store: new FileOperatorApprovalStore(config.workspace.stateDir),
       runStore,
     });
-    const approvalRequiredForPublication = config.github.operatorApproval?.requiredForPublication ?? false;
     const pullRequestPublisher =
       options.pullRequestPublisher ??
-      (config.github.publishPullRequests && !approvalRequiredForPublication
-        ? createGitHubPullRequestClientForCapability(config, "github.publication")
+      (github.publishPullRequests && !approvalRequiredForPublication
+        ? createGitHubPullRequestClientForCapability(config, "github.publication", undefined, projectContextId)
         : undefined);
     const service = new CompletionReportService({
       config,

@@ -6,6 +6,7 @@ import {
   type GitHubCredentialCapability,
   resolveGitHubClientConfig,
 } from "../src/integrations/github/GitHubCredentialResolver.js";
+import { multiProjectWorkflowConfig, projectContextFixture } from "./helpers.js";
 
 describe("GitHub credential resolver", () => {
   it("falls back to the legacy GitHub token when no capability profile is assigned", () => {
@@ -288,6 +289,164 @@ describe("GitHub credential resolver", () => {
         `credential_profiles.roles.${owner}.${capability}`,
       );
     }
+  });
+
+  it("resolves project-context-specific GitHub profiles and repository metadata", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: { owner: "acme", repo: "symphony", token: "$DEFAULT_GITHUB_TOKEN" },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DEFAULT_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: { owner: "acme", repo: "docs-site", token: "$DOCS_GITHUB_TOKEN" },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$DOCS_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        DEFAULT_GITHUB_TOKEN: "default-github-secret",
+        DEFAULT_PUBLICATION_TOKEN: "default-publication-secret",
+        DOCS_GITHUB_TOKEN: "docs-github-secret",
+        DOCS_PUBLICATION_TOKEN: "docs-publication-secret",
+      },
+    );
+
+    expect(resolveGitHubClientConfig(config, "github.publication")).toMatchObject({
+      github: { owner: "acme", repo: "symphony", token: "default-publication-secret" },
+      credential: { source: "profile", profileName: "publication", value: "default-publication-secret" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.publication", "docs")).toMatchObject({
+      github: { owner: "acme", repo: "docs-site", token: "docs-publication-secret" },
+      credential: { source: "profile", profileName: "publication", value: "docs-publication-secret" },
+    });
+  });
+
+  it("inherits unspecified github_app fields for same-named project-context profile overrides", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: { owner: "acme", repo: "symphony" },
+          credential_profiles: {
+            profiles: {
+              publication: {
+                kind: "github_app",
+                app_id: "$DEFAULT_PUBLICATION_APP_ID",
+                client_id: "$DEFAULT_PUBLICATION_APP_CLIENT_ID",
+                installation_id: "$DEFAULT_PUBLICATION_APP_INSTALLATION_ID",
+                private_key_path: "$DEFAULT_PUBLICATION_APP_PRIVATE_KEY_PATH",
+                capabilities: ["github.publication", "github.merge"],
+              },
+              feedback: {
+                kind: "github_app",
+                app_id: "$DEFAULT_FEEDBACK_APP_ID",
+                client_id: "$DEFAULT_FEEDBACK_APP_CLIENT_ID",
+                installation_id: "$DEFAULT_FEEDBACK_APP_INSTALLATION_ID",
+                private_key_path: "$DEFAULT_FEEDBACK_APP_PRIVATE_KEY_PATH",
+                capabilities: ["github.review_feedback_write"],
+              },
+            },
+            roles: {
+              service: { "github.publication": "publication", "github.merge": "publication" },
+              reviewer: { "github.review_feedback_write": "feedback" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: { owner: "acme", repo: "docs-site" },
+            credential_profiles: {
+              profiles: {
+                publication: {
+                  kind: "github_app",
+                  installation_id: "$DOCS_PUBLICATION_APP_INSTALLATION_ID",
+                  capabilities: ["github.publication", "github.merge"],
+                },
+                feedback: {
+                  kind: "github_app",
+                  installation_id: "$DOCS_FEEDBACK_APP_INSTALLATION_ID",
+                  capabilities: ["github.review_feedback_write"],
+                },
+              },
+              roles: {
+                service: { "github.publication": "publication", "github.merge": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        DEFAULT_PUBLICATION_APP_ID: "111",
+        DEFAULT_PUBLICATION_APP_CLIENT_ID: "Iv1.default-publication",
+        DEFAULT_PUBLICATION_APP_INSTALLATION_ID: "222",
+        DEFAULT_PUBLICATION_APP_PRIVATE_KEY_PATH: "/secrets/default-publication.pem",
+        DOCS_PUBLICATION_APP_INSTALLATION_ID: "333",
+        DEFAULT_FEEDBACK_APP_ID: "444",
+        DEFAULT_FEEDBACK_APP_CLIENT_ID: "Iv1.default-feedback",
+        DEFAULT_FEEDBACK_APP_INSTALLATION_ID: "555",
+        DEFAULT_FEEDBACK_APP_PRIVATE_KEY_PATH: "/secrets/default-feedback.pem",
+        DOCS_FEEDBACK_APP_INSTALLATION_ID: "666",
+      },
+    );
+
+    expect(resolveGitHubClientConfig(config, "github.publication", "docs")).toMatchObject({
+      github: {
+        owner: "acme",
+        repo: "docs-site",
+        token: null,
+        app: {
+          appId: "111",
+          clientId: "Iv1.default-publication",
+          installationId: "333",
+          privateKeyPath: expect.stringContaining("default-publication.pem"),
+        },
+      },
+      credential: { kind: "github_app", source: "profile", profileName: "publication" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.review_feedback_write", "docs")).toMatchObject({
+      github: {
+        owner: "acme",
+        repo: "docs-site",
+        token: null,
+        app: {
+          appId: "444",
+          clientId: "Iv1.default-feedback",
+          installationId: "666",
+          privateKeyPath: expect.stringContaining("default-feedback.pem"),
+        },
+      },
+      credential: { kind: "github_app", source: "profile", profileName: "feedback" },
+    });
   });
 });
 

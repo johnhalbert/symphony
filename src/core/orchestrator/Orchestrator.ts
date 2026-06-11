@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
-import type { ServiceConfig } from "../config/Config.js";
-import { projectContextResolutionFromIssue } from "../config/ProjectContexts.js";
+import { resolveProjectContextConfig, type ServiceConfig } from "../config/Config.js";
+import { projectContextResolutionFromIssue, type ProjectContextResolution } from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
@@ -987,9 +987,10 @@ export class Orchestrator {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
     const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
+    const projectContextId = request.projectContext?.projectContextId ?? projectContextResolutionFromIssue(issue)?.projectContextId;
     const publisher =
       this.options.completionReportPublisher ??
-      createGitHubPullRequestClientForCapability(this.config, "github.publication");
+      createGitHubPullRequestClientForCapability(this.config, "github.publication", undefined, projectContextId);
     const result = await new CompletionReportService({
       config: this.config,
       lifecycleStore: this.options.lifecycleStore,
@@ -1202,13 +1203,7 @@ export class Orchestrator {
   }
 
   private async recoverPendingPublicationApprovalHandoffs(): Promise<void> {
-    if (
-      !this.config.github.publishPullRequests ||
-      !(this.config.github.operatorApproval?.requiredForPublication ?? false) ||
-      !this.options.lifecycleStore ||
-      !this.options.writeback ||
-      !this.options.operatorApproval
-    ) {
+    if (!this.options.lifecycleStore || !this.options.writeback || !this.options.operatorApproval) {
       return;
     }
 
@@ -1229,20 +1224,26 @@ export class Orchestrator {
       this.options.logger.warn("pending publication approval recovery issue refresh failed", { error: errorMessage(error) });
     }
     const issuesById = new Map(latestIssues.map((issue) => [issue.id, issue]));
-    const service = new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-      writebackProcessor: this.options.writeback,
-      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      pullRequestPublisher:
-        this.options.completionReportPublisher ??
-        createGitHubPullRequestClientForCapability(this.config, "github.publication"),
-      operatorApproval: this.options.operatorApproval,
-    });
 
     for (const lifecycle of candidates) {
       const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
+      const projectContext = pendingPublicationProjectContext(lifecycle, issue);
+      const projectContextId = projectContext?.projectContextId;
+      const github = resolveProjectContextConfig(this.config, projectContextId).github;
+      if (!github.publishPullRequests || !(github.operatorApproval?.requiredForPublication ?? false)) {
+        continue;
+      }
+      const service = new CompletionReportService({
+        config: this.config,
+        lifecycleStore: this.options.lifecycleStore,
+        writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
+        writebackProcessor: this.options.writeback,
+        ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+        pullRequestPublisher:
+          this.options.completionReportPublisher ??
+          createGitHubPullRequestClientForCapability(this.config, "github.publication", undefined, projectContextId),
+        operatorApproval: this.options.operatorApproval,
+      });
       try {
         const result = await service.recoverPendingPublicationApproval({ issue, lifecycle });
         if (result.recovered) {
@@ -3106,9 +3107,11 @@ export class Orchestrator {
 
     let pullRequest: DiscoveredPullRequest | null;
     try {
+      const projectContextId =
+        entry.lifecycle?.projectContext?.projectContextId ?? projectContextResolutionFromIssue(entry.issue)?.projectContextId;
       const client =
         this.options.pullRequestClient ??
-        createGitHubPullRequestClientForCapability(this.config, "github.discovery");
+        createGitHubPullRequestClientForCapability(this.config, "github.discovery", undefined, projectContextId);
       pullRequest = await client.findOpenPullRequestByBranch({ branchName });
     } catch (error) {
       this.options.logger.warn("pull request discovery failed", {
@@ -3515,9 +3518,16 @@ export class Orchestrator {
   private async loadWorkerReviewEvidencePrompt(entry: RunningEntry): Promise<string | null> {
     if (!this.options.lifecycleStore) return null;
     try {
+      const projectContextId =
+        entry.lifecycle?.projectContext?.projectContextId ?? projectContextResolutionFromIssue(entry.issue)?.projectContextId;
       const client =
         this.options.pullRequestReviewClient ??
-        createGitHubPullRequestClientForCapability(this.config, "github.review_evidence_read");
+        createGitHubPullRequestClientForCapability(
+          this.config,
+          "github.review_evidence_read",
+          undefined,
+          projectContextId,
+        );
       const service = new PullRequestReviewEvidenceService({
         lifecycleStore: this.options.lifecycleStore,
         client,
@@ -4241,27 +4251,56 @@ function isInfraFailureDiagnosticCode(code: string | null | undefined): boolean 
   return typeof code === "string" && INFRA_FAILURE_DIAGNOSTIC_CODES.has(code);
 }
 
+function pendingPublicationProjectContext(
+  lifecycle: IssueLifecycleRecord,
+  issue?: Issue | null,
+): ProjectContextResolution | undefined {
+  return (
+    pendingPublicationHandoffForRun(lifecycle)?.pendingReport.projectContext ??
+    lifecycle.projectContext ??
+    (issue ? projectContextResolutionFromIssue(issue) ?? undefined : undefined)
+  );
+}
+
+function withProjectContextIssueMetadata(
+  issue: Issue,
+  projectContext?: ProjectContextResolution | null,
+): Issue {
+  if (!projectContext) return issue;
+  return {
+    ...issue,
+    projectContext,
+    projectContextId: projectContext.projectContextId,
+    projectContextLabel: projectContext.projectContextLabel,
+    linearProjectSlug: projectContext.linearProjectSlug,
+    routingSource: projectContext.routingSource,
+  } as Issue;
+}
+
 function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {
   const title = request.action.title.startsWith(`${request.issueIdentifier}: `)
     ? request.action.title.slice(request.issueIdentifier.length + 2)
     : request.action.title;
-  return {
-    id: request.issueId,
-    identifier: request.issueIdentifier,
-    title,
-    description: null,
-    priority: null,
-    state: "Blocked",
-    branchName: request.action.branchName,
-    url: null,
-    assigneeId: null,
-    delegateId: null,
-    assignedToWorker: false,
-    labels: [],
-    blockedBy: [],
-    createdAt: null,
-    updatedAt: null,
-  };
+  return withProjectContextIssueMetadata(
+    {
+      id: request.issueId,
+      identifier: request.issueIdentifier,
+      title,
+      description: null,
+      priority: null,
+      state: "Blocked",
+      branchName: request.action.branchName,
+      url: null,
+      assigneeId: null,
+      delegateId: null,
+      assignedToWorker: false,
+      labels: [],
+      blockedBy: [],
+      createdAt: null,
+      updatedAt: null,
+    },
+    request.projectContext,
+  );
 }
 
 function hasRecoverablePendingPublicationApproval(lifecycle: IssueLifecycleRecord): boolean {
@@ -4274,23 +4313,26 @@ function issueFromPendingPublicationLifecycle(lifecycle: IssueLifecycleRecord, s
       ? undefined
       : lifecycle.completionReports.find((item) => item.id === lifecycle.lastCompletionReportId)) ??
     lifecycle.completionReports.at(-1);
-  return {
-    id: lifecycle.issueId,
-    identifier: lifecycle.issueIdentifier,
-    title: lifecycle.issueIdentifier,
-    description: null,
-    priority: null,
-    state,
-    branchName: report?.branchName ?? lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName,
-    url: null,
-    assigneeId: null,
-    delegateId: null,
-    assignedToWorker: false,
-    labels: [],
-    blockedBy: [],
-    createdAt: null,
-    updatedAt: null,
-  };
+  return withProjectContextIssueMetadata(
+    {
+      id: lifecycle.issueId,
+      identifier: lifecycle.issueIdentifier,
+      title: lifecycle.issueIdentifier,
+      description: null,
+      priority: null,
+      state,
+      branchName: report?.branchName ?? lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName,
+      url: null,
+      assigneeId: null,
+      delegateId: null,
+      assignedToWorker: false,
+      labels: [],
+      blockedBy: [],
+      createdAt: null,
+      updatedAt: null,
+    },
+    report?.projectContext ?? lifecycle.projectContext,
+  );
 }
 
 function cancellationForEntry(entry: RunningEntry): RunCancellationState {
