@@ -541,6 +541,86 @@ describe("FileWritebackOutboxStore", () => {
     await expect(store.get(sharedKey, legacyDefaultProjectContext)).resolves.toMatchObject({ status: "pending" });
   });
 
+  it.each(["short", "full"] as const)(
+    "preserves legacy default-context records when a sibling context reuses the same idempotency key via the %s legacy path",
+    async (targetKind) => {
+      const store = new FileWritebackOutboxStore(root);
+      const defaultWriter = new FakeWriter();
+      const docsWriter = new FakeWriter();
+      const processor = new WritebackProcessor(
+        store,
+        defaultWriter,
+        new StructuredLogger(() => undefined),
+        300_000,
+        undefined,
+        false,
+        undefined,
+        (projectContext) => (projectContext?.projectContextId === docsProjectContext.projectContextId ? docsWriter : defaultWriter),
+      );
+      const sharedKey = `comment:issue-legacy-default-collision:${targetKind}`;
+
+      await store.enqueueOnce({
+        idempotencyKey: sharedKey,
+        kind: "comment",
+        issueId: "issue-legacy-default-collision",
+        runId: `run-legacy-default-${targetKind}`,
+        payload: { body: `Default ${targetKind} note`, dedupeKey: `legacy-default-${targetKind}` },
+      });
+      await relocatePersistedWritebackToLegacyPath(sharedKey, targetKind);
+
+      await expect(
+        store.enqueueOnce({
+          idempotencyKey: sharedKey,
+          kind: "comment",
+          issueId: "issue-legacy-default-collision",
+          projectContext: docsProjectContext,
+          runId: `run-legacy-docs-${targetKind}`,
+          payload: { body: `Docs ${targetKind} note`, dedupeKey: `legacy-docs-${targetKind}` },
+        }),
+      ).resolves.toMatchObject({
+        status: "pending",
+        projectContext: docsProjectContext,
+        payload: expect.objectContaining({ body: `Docs ${targetKind} note`, dedupeKey: `legacy-docs-${targetKind}` }),
+      });
+
+      await expect(store.list()).resolves.toHaveLength(2);
+      await expect(store.get(sharedKey, legacyDefaultProjectContext)).resolves.toMatchObject({
+        status: "pending",
+        projectContext: legacyDefaultProjectContext,
+        payload: expect.objectContaining({ body: `Default ${targetKind} note`, dedupeKey: `legacy-default-${targetKind}` }),
+      });
+      await expect(store.get(sharedKey, docsProjectContext)).resolves.toMatchObject({
+        status: "pending",
+        projectContext: docsProjectContext,
+        payload: expect.objectContaining({ body: `Docs ${targetKind} note`, dedupeKey: `legacy-docs-${targetKind}` }),
+      });
+
+      await processor.processDue({ projectContext: docsProjectContext, idempotencyKeys: [sharedKey] });
+
+      expect(docsWriter.comments).toEqual([
+        expect.objectContaining({
+          issueId: "issue-legacy-default-collision",
+          body: `Docs ${targetKind} note`,
+          dedupeKey: `legacy-docs-${targetKind}`,
+        }),
+      ]);
+      expect(defaultWriter.comments).toEqual([]);
+      await expect(store.get(sharedKey, docsProjectContext)).resolves.toMatchObject({ status: "succeeded" });
+      await expect(store.get(sharedKey, legacyDefaultProjectContext)).resolves.toMatchObject({ status: "pending" });
+
+      await processor.processDue({ projectContext: legacyDefaultProjectContext, idempotencyKeys: [sharedKey] });
+
+      expect(defaultWriter.comments).toEqual([
+        expect.objectContaining({
+          issueId: "issue-legacy-default-collision",
+          body: `Default ${targetKind} note`,
+          dedupeKey: `legacy-default-${targetKind}`,
+        }),
+      ]);
+      await expect(store.get(sharedKey, legacyDefaultProjectContext)).resolves.toMatchObject({ status: "succeeded" });
+    },
+  );
+
   it("matches processDue project context by id even when attribution metadata changes", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();

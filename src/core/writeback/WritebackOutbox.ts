@@ -171,7 +171,10 @@ export class FileWritebackOutboxStore {
 
   async enqueueOnce(operation: NewWritebackOperation): Promise<WritebackOperation> {
     const existing = await this.get(operation.idempotencyKey, operation.projectContext);
-    if (existing) return this.backfillProjectContextOnReplay(existing, operation);
+    if (existing) {
+      const replay = await this.backfillProjectContextOnReplay(existing, operation);
+      if (replay) return replay;
+    }
     const now = new Date().toISOString();
     const record = normalizeWritebackOperation({
       ...operation,
@@ -334,8 +337,13 @@ export class FileWritebackOutboxStore {
   private async backfillProjectContextOnReplay(
     existing: WritebackOperation,
     operation: NewWritebackOperation,
-  ): Promise<WritebackOperation> {
-    return this.repairProjectContextIfMissing(existing, operation.projectContext);
+  ): Promise<WritebackOperation | null> {
+    const raw = await this.readStoredRecord(existing.idempotencyKey, operation.projectContext ?? existing.projectContext);
+    if (needsProjectContextBackfill(raw) && matchesNewWritebackOperationIgnoringProjectContext(existing, operation)) {
+      return this.repairProjectContextIfMissing(existing, operation.projectContext);
+    }
+    const repaired = await this.repairProjectContextIfMissing(existing);
+    return matchesProjectContextScope(repaired.projectContext, operation.projectContext) ? repaired : null;
   }
 
   private async repairProjectContextIfMissing(
@@ -753,6 +761,19 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
     return JSON.stringify(record.payload) === JSON.stringify(operation.payload);
   }
   return false;
+}
+
+function matchesNewWritebackOperationIgnoringProjectContext(
+  record: WritebackOperation,
+  operation: NewWritebackOperation,
+): boolean {
+  return matchesNewWritebackOperation(
+    {
+      ...record,
+      projectContext: normalizeProjectContextResolution(operation.projectContext),
+    } as WritebackOperation,
+    operation,
+  );
 }
 
 function stringArraysEqual(left: string[] | undefined, right: string[] | undefined): boolean {
