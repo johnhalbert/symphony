@@ -16,6 +16,7 @@ import {
   hermesRuntimeDoctorChecks,
   hostHermesAcpDoctorChecks,
   issueContractDoctorCheck,
+  projectContextSummaryDoctorCheck,
   reviewLoopDoctorChecks,
   runDoctor,
   runtimeCredentialDoctorCheck,
@@ -27,7 +28,9 @@ import {
   agentEligibleIssueContract,
   fencedAuthoringSectionSpoof,
   issue,
+  multiProjectWorkflowConfig,
   nestedFencedIssueContractSpoof,
+  projectContextFixture,
   testConfig,
 } from "./helpers.js";
 import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from "../hermes/src/GatewayFacade.js";
@@ -354,6 +357,246 @@ github:
             id: "workflow.parse",
             status: "error",
             message: "github.pr_handoff.target_state must resolve to a tracker.handoff_states value",
+          },
+        ],
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("summarizes configured project contexts without leaking secret values", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: { token: "$ROOT_GITHUB_TOKEN" },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "Docs Site",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "$DOCS_REPOSITORY",
+            github: { token: "$DOCS_GITHUB_TOKEN" },
+          }),
+          projectContextFixture({
+            id: "Ops Portal",
+            label: "Ops Portal",
+            projectSlug: "OPS",
+            repository: "../shared-platform",
+            github: { token: "$OPS_GITHUB_TOKEN" },
+          }),
+        ],
+      }),
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        ROOT_GITHUB_TOKEN: "root-gh-secret",
+        DOCS_GITHUB_TOKEN: "docs-gh-secret",
+        OPS_GITHUB_TOKEN: "ops-gh-secret",
+        DOCS_REPOSITORY: "https://x-access-token:repo-secret@example.com/org/docs.git",
+      },
+    );
+
+    const check = projectContextSummaryDoctorCheck(config);
+    const prefix = `Configured project contexts (default: ${config.projectContexts.defaultContextId}): `;
+    expect(check.id).toBe("workflow.project_contexts");
+    expect(check.status).toBe("ok");
+    expect(check.message.startsWith(prefix)).toBe(true);
+
+    const summary = JSON.parse(check.message.slice(prefix.length)) as Array<{
+      id: string;
+      label: string;
+      enabled: boolean;
+      tracker: { projectSlug: string | null };
+      workspace: {
+        source: {
+          kind: string | null;
+          pathConfigured: boolean;
+          repositoryConfigured: boolean;
+          refConfigured: boolean;
+          baseRefConfigured: boolean;
+          branchTemplateConfigured: boolean;
+          cachePathConfigured: boolean;
+          cleanup: string | null;
+        };
+      };
+      github: { tokenPresent: boolean };
+    }>;
+
+    expect(summary).toHaveLength(3);
+    expect(summary.map((context) => context.id)).toEqual(["symphony", "docs-site", "ops-portal"]);
+    expect(summary[0]).toMatchObject({
+      id: "symphony",
+      label: "Symphony",
+      enabled: true,
+      tracker: { projectSlug: "SYMPHONY" },
+      workspace: {
+        source: {
+          kind: "git_worktree",
+          pathConfigured: false,
+          repositoryConfigured: true,
+          refConfigured: false,
+          baseRefConfigured: true,
+          branchTemplateConfigured: true,
+          cachePathConfigured: false,
+          cleanup: "refuse_dirty",
+        },
+      },
+      github: { tokenPresent: true },
+    });
+    expect(summary[1]).toMatchObject({
+      id: "docs-site",
+      label: "Documentation Site",
+      enabled: true,
+      tracker: { projectSlug: "DOCS" },
+      workspace: {
+        source: {
+          kind: "git_worktree",
+          pathConfigured: false,
+          repositoryConfigured: true,
+          refConfigured: false,
+          baseRefConfigured: true,
+          branchTemplateConfigured: true,
+          cachePathConfigured: false,
+          cleanup: "refuse_dirty",
+        },
+      },
+      github: { tokenPresent: true },
+    });
+    expect(summary[2]).toMatchObject({
+      id: "ops-portal",
+      label: "Ops Portal",
+      enabled: true,
+      tracker: { projectSlug: "OPS" },
+      workspace: {
+        source: {
+          kind: "git_worktree",
+          pathConfigured: false,
+          repositoryConfigured: true,
+          refConfigured: false,
+          baseRefConfigured: true,
+          branchTemplateConfigured: true,
+          cachePathConfigured: false,
+          cleanup: "refuse_dirty",
+        },
+      },
+      github: { tokenPresent: true },
+    });
+    expect(check.message).not.toContain("linear-secret");
+    expect(check.message).not.toContain("root-gh-secret");
+    expect(check.message).not.toContain("docs-gh-secret");
+    expect(check.message).not.toContain("ops-gh-secret");
+    expect(check.message).not.toContain("repo-secret");
+    expect(check.message).not.toContain("x-access-token");
+    expect(check.message).not.toContain("https://x-access-token:repo-secret@example.com/org/docs.git");
+  });
+
+  it("treats omitted workspace source fields as unconfigured in doctor summaries", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              source: {
+                kind: "git_worktree",
+                repository: ".",
+                base_ref: "origin/main",
+              },
+            },
+          },
+          {
+            id: "Archive",
+            enabled: false,
+          },
+        ],
+      },
+      "/tmp/symphony-doctor/WORKFLOW.md",
+      { SYMPHONY_LINEAR_API_KEY: "linear-secret" },
+    );
+
+    const check = projectContextSummaryDoctorCheck(config);
+    const prefix = `Configured project contexts (default: ${config.projectContexts.defaultContextId}): `;
+    const summary = JSON.parse(check.message.slice(prefix.length)) as Array<{
+      id: string;
+      workspace: {
+        source: {
+          kind: string | null;
+          pathConfigured: boolean;
+          repositoryConfigured: boolean;
+          refConfigured: boolean;
+          baseRefConfigured: boolean;
+          branchTemplateConfigured: boolean;
+          cachePathConfigured: boolean;
+        };
+      };
+      github: { tokenPresent: boolean };
+    }>;
+
+    expect(summary).toHaveLength(2);
+    expect(summary[1]).toMatchObject({
+      id: "archive",
+      workspace: {
+        source: {
+          kind: "none",
+          pathConfigured: false,
+          repositoryConfigured: false,
+          refConfigured: false,
+          baseRefConfigured: false,
+          branchTemplateConfigured: false,
+          cachePathConfigured: false,
+        },
+      },
+      github: { tokenPresent: false },
+    });
+  });
+
+  it("surfaces context-specific enabled project context validation errors through doctor parse checks", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-doctor-project-context-"));
+    try {
+      const workflowPath = path.join(root, "WORKFLOW.md");
+      await writeFile(
+        workflowPath,
+        `---
+tracker:
+  kind: linear
+  api_key: linear-test-key
+project_contexts:
+  - id: Docs Site
+    tracker:
+      api_key: linear-test-key
+      project_slug: DOCS
+    workspace:
+      root: ./docs-workspaces
+  - id: Ops Portal
+    tracker:
+      api_key: linear-test-key
+      project_slug: OPS
+    workspace:
+      source:
+        kind: git_worktree
+        repository: ../shared-platform
+        base_ref: origin/main
+---
+Work on {{ issue.identifier }}.
+`,
+        "utf8",
+      );
+
+      await expect(runDoctor({ workflowPath })).resolves.toEqual({
+        ok: false,
+        checks: [
+          {
+            id: "workflow.parse",
+            status: "error",
+            message: 'project_contexts["Docs Site"].workspace.source is required for enabled project contexts',
           },
         ],
       });

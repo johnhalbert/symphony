@@ -1,7 +1,8 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { performance } from "node:perf_hooks";
+import { describe, expect, it, vi } from "vitest";
 import YAML from "yaml";
 import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
@@ -1743,6 +1744,69 @@ describe("project context workflow contracts", () => {
   ])("rejects enabled project contexts with $label", ({ rawConfig, env, expectedMessage }) => {
     expect(() => parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env)).toThrowError(expectedMessage);
   });
+
+  it("normalizes three configured project contexts within the performance budget without network calls", () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      const rawConfig = multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "Docs Site",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../shared-platform",
+          }),
+          projectContextFixture({
+            id: "ops_portal",
+            label: "Ops Portal",
+            projectSlug: "OPS",
+            repository: "../shared-platform",
+          }),
+          projectContextFixture({
+            id: "Status Board",
+            label: "Status Board",
+            projectSlug: "STATUS",
+            repository: "../status-board",
+          }),
+        ],
+      });
+      const env = { LINEAR_API_KEY: "secret" };
+      const warmup = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+      expect(warmup.projectContexts.contexts.map((context) => context.id)).toEqual([
+        "docs-site",
+        "ops-portal",
+        "status-board",
+      ]);
+      expect(warmup.projectContexts.defaultContextId).toBe("docs-site");
+
+      const iterations = 200;
+      const startedAt = performance.now();
+      let lastConfig = warmup;
+      for (let index = 0; index < iterations; index += 1) {
+        lastConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+      }
+      const averageMs = (performance.now() - startedAt) / iterations;
+
+      expect(lastConfig.projectContexts.contexts).toHaveLength(3);
+      expect(lastConfig.projectContexts.byId.get("docs-site")).toMatchObject({
+        id: "docs-site",
+        tracker: { projectSlug: "DOCS" },
+      });
+      expect(lastConfig.projectContexts.byId.get("ops-portal")).toMatchObject({
+        id: "ops-portal",
+        tracker: { projectSlug: "OPS" },
+      });
+      expect(lastConfig.projectContexts.byId.get("status-board")).toMatchObject({
+        id: "status-board",
+        tracker: { projectSlug: "STATUS" },
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(averageMs).toBeLessThan(20);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("project context redaction", () => {
@@ -1780,12 +1844,12 @@ describe("project context redaction", () => {
       workspace: {
         source: {
           kind: context.workspace.source.kind,
-          pathConfigured: context.workspace.source.path !== null,
-          repositoryConfigured: context.workspace.source.repository !== null,
-          refConfigured: context.workspace.source.ref !== null,
-          baseRefConfigured: context.workspace.source.baseRef !== null,
-          branchTemplateConfigured: context.workspace.source.branchTemplate !== null,
-          cachePathConfigured: context.workspace.source.cachePath !== null,
+          pathConfigured: context.workspace.source.path != null,
+          repositoryConfigured: context.workspace.source.repository != null,
+          refConfigured: context.workspace.source.ref != null,
+          baseRefConfigured: context.workspace.source.baseRef != null,
+          branchTemplateConfigured: context.workspace.source.branchTemplate != null,
+          cachePathConfigured: context.workspace.source.cachePath != null,
           cleanup: context.workspace.source.cleanup,
         },
       },
@@ -1807,12 +1871,12 @@ describe("project context redaction", () => {
       workspace: {
         source: {
           kind: "git_worktree",
-          pathConfigured: true,
+          pathConfigured: false,
           repositoryConfigured: true,
-          refConfigured: true,
+          refConfigured: false,
           baseRefConfigured: true,
           branchTemplateConfigured: true,
-          cachePathConfigured: true,
+          cachePathConfigured: false,
           cleanup: "refuse_dirty",
         },
       },

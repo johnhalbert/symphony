@@ -104,6 +104,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
     checks.push({ id: "workflow.parse", status: "ok", message: `Loaded ${workflowPath}` });
+    checks.push(projectContextSummaryDoctorCheck(config));
     checks.push(...runtimeHarnessDoctorChecks(config));
     checks.push(
       ...(await runtimeHarnessDependencyDoctorChecks(config, {
@@ -156,6 +157,33 @@ export function formatDoctorResult(result: DoctorResult): string {
   return result.checks
     .map((check) => `[${check.status.toUpperCase()}] ${check.id}: ${check.message}`)
     .join("\n");
+}
+
+export function projectContextSummaryDoctorCheck(config: ServiceConfig): DoctorCheck {
+  const summary = config.projectContexts.contexts.map((context) => ({
+    id: context.id,
+    label: context.label,
+    enabled: context.enabled,
+    tracker: { projectSlug: context.tracker.projectSlug },
+    workspace: {
+      source: {
+        kind: context.workspace.source.kind,
+        pathConfigured: context.workspace.source.path != null,
+        repositoryConfigured: context.workspace.source.repository != null,
+        refConfigured: context.workspace.source.ref != null,
+        baseRefConfigured: context.workspace.source.baseRef != null,
+        branchTemplateConfigured: context.workspace.source.branchTemplate != null,
+        cachePathConfigured: context.workspace.source.cachePath != null,
+        cleanup: context.workspace.source.cleanup,
+      },
+    },
+    github: { tokenPresent: context.github.token !== null },
+  }));
+  return {
+    id: "workflow.project_contexts",
+    status: "ok",
+    message: `Configured project contexts (default: ${config.projectContexts.defaultContextId}): ${JSON.stringify(summary)}`,
+  };
 }
 
 export function issueContractDoctorCheck(config: ServiceConfig, issues: readonly Issue[]): DoctorCheck {
