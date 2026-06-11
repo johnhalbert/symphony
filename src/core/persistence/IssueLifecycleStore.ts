@@ -467,10 +467,13 @@ export class FileIssueLifecycleStore {
   }
 
   async ensureIssue(issue: Pick<Issue, "id" | "identifier">, patch: IssueLifecyclePatch = {}): Promise<IssueLifecycleRecord> {
-    const existing = await this.find(issue.id, issue.identifier);
+    const requestedProjectContext = normalizeProjectContextResolution(
+      patch.projectContext ?? projectContextResolutionFromIssue(issue),
+    );
+    const existing = await this.find(issue.id, issue.identifier, requestedProjectContext?.projectContextId);
     const now = new Date().toISOString();
     const projectContext = normalizeProjectContextResolution(
-      patch.projectContext ?? existing?.projectContext ?? projectContextResolutionFromIssue(issue),
+      patch.projectContext ?? existing?.projectContext ?? requestedProjectContext,
     );
     const baseRecord = {
       issueId: issue.id,
@@ -531,15 +534,26 @@ export class FileIssueLifecycleStore {
     return this.ensureIssue(issue, patch);
   }
 
-  async get(issueIdOrIdentifier: string): Promise<IssueLifecycleRecord | null> {
+  async get(
+    issueIdOrIdentifier: string,
+    options: { projectContextId?: string | null } = {},
+  ): Promise<IssueLifecycleRecord | null> {
     const direct = await readLifecycleJsonIfExists(this.recordPath(issueIdOrIdentifier));
-    if (direct) return direct;
-    const records = await this.list();
-    return (
-      records.find(
-        (record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier,
-      ) ?? null
+    if (direct && matchesLifecycleProjectContextId(direct.projectContext, options.projectContextId)) return direct;
+    const records = filterLifecycleRecords(
+      await this.list(),
+      options.projectContextId,
+      (record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier,
     );
+    if (records.length === 0) return null;
+    const identities = new Set(records.map((record) => record.issueId));
+    if (identities.size > 1) {
+      throw new SymphonyError(
+        "conflict",
+        `Ambiguous lifecycle lookup for ${issueIdOrIdentifier}: ${[...new Set(records.map((record) => `${record.issueId}(${record.projectContext?.projectContextId ?? "legacy_default"})`))].join(", ")}`,
+      );
+    }
+    return records[0] ?? null;
   }
 
   async list(): Promise<IssueLifecycleRecord[]> {
@@ -554,10 +568,14 @@ export class FileIssueLifecycleStore {
     return records.filter((record): record is IssueLifecycleRecord => record !== null);
   }
 
-  private async find(issueId: string, issueIdentifier: string): Promise<IssueLifecycleRecord | null> {
-    const direct = await this.get(issueId);
+  private async find(
+    issueId: string,
+    issueIdentifier: string,
+    projectContextId?: string | null,
+  ): Promise<IssueLifecycleRecord | null> {
+    const direct = await this.get(issueId, projectContextId === undefined ? {} : { projectContextId });
     if (direct) return direct;
-    return this.get(issueIdentifier);
+    return this.get(issueIdentifier, projectContextId === undefined ? {} : { projectContextId });
   }
 
   private async write(record: IssueLifecycleRecord): Promise<void> {
@@ -582,6 +600,23 @@ export class FileIssueLifecycleStore {
   private recordPath(issueIdOrIdentifier: string): string {
     return path.join(this.recordsDir(), `${safeFileName(issueIdOrIdentifier)}.json`);
   }
+}
+
+function matchesLifecycleProjectContextId(
+  projectContext: ProjectContextResolution | null | undefined,
+  projectContextId: string | null | undefined,
+): boolean {
+  return projectContextId === undefined || projectContextId === null || projectContext?.projectContextId === projectContextId;
+}
+
+function filterLifecycleRecords<T extends { projectContext?: ProjectContextResolution | undefined }>(
+  records: readonly T[],
+  projectContextId: string | null | undefined,
+  predicate: (record: T) => boolean,
+): T[] {
+  return records.filter(
+    (record) => predicate(record) && matchesLifecycleProjectContextId(record.projectContext, projectContextId),
+  );
 }
 
 export function phaseForIssueState(state: string, config: ServiceConfig): IssueLifecyclePhase {

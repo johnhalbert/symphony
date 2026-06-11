@@ -529,6 +529,202 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("rejects ambiguous duplicate-identifier issue routes while keeping exact-id readback scoped", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony Runtime",
+      linearProjectSlug: "SYMPHONY",
+      routingSource: "candidate_poll",
+    } as const;
+    const docsWorkspacePath = path.join(config.workspace.root, "docs__ENG-123");
+    const symphonyWorkspacePath = path.join(config.workspace.root, "symphony__ENG-123");
+    await (await import("node:fs/promises")).mkdir(docsWorkspacePath, { recursive: true });
+    await (await import("node:fs/promises")).mkdir(symphonyWorkspacePath, { recursive: true });
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "docs__ENG-123",
+      issueId: "issue-docs-123",
+      issueIdentifier: "ENG-123",
+      projectContext: docsProjectContext,
+      path: docsWorkspacePath,
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/docs/ENG-123",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.upsertWorkspace({
+      workspaceKey: "symphony__ENG-123",
+      issueId: "issue-symphony-123",
+      issueIdentifier: "ENG-123",
+      projectContext: symphonyProjectContext,
+      path: symphonyWorkspacePath,
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/runtime/ENG-123",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-docs",
+      sessionId: "session-docs",
+      agentId: "agent-docs",
+      role: "worker",
+      issueId: "issue-docs-123",
+      issueIdentifier: "ENG-123",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      workspaceKey: "docs__ENG-123",
+      workspacePath: docsWorkspacePath,
+      gitBranchName: "symphony/docs/ENG-123",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+    });
+    await runStore.startRun({
+      runId: "run-symphony",
+      sessionId: "session-symphony",
+      agentId: "agent-symphony",
+      role: "worker",
+      issueId: "issue-symphony-123",
+      issueIdentifier: "ENG-123",
+      projectContext: symphonyProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "runtime work",
+      workspaceKey: "symphony__ENG-123",
+      workspacePath: symphonyWorkspacePath,
+      gitBranchName: "symphony/runtime/ENG-123",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+    });
+    const docsLifecycleIssue = {
+      ...issue({
+        id: "issue-docs-123",
+        identifier: "ENG-123",
+        branchName: "symphony/docs/ENG-123",
+      }),
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    } as const;
+    const symphonyLifecycleIssue = {
+      ...issue({
+        id: "issue-symphony-123",
+        identifier: "ENG-123",
+        branchName: "symphony/runtime/ENG-123",
+      }),
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony Runtime",
+    } as const;
+    await lifecycleStore.ensureIssue(
+      docsLifecycleIssue,
+      {
+        phase: "implementation",
+        summaryPointers: {
+          workspaceKey: "docs__ENG-123",
+          workspacePath: docsWorkspacePath,
+          branchName: "symphony/docs/ENG-123",
+          gitBranchName: "symphony/docs/ENG-123",
+          repoPath: "/repo",
+          baseRef: "origin/main",
+          lastRunId: "run-docs",
+        },
+      },
+    );
+    await lifecycleStore.ensureIssue(
+      symphonyLifecycleIssue,
+      {
+        phase: "implementation",
+        summaryPointers: {
+          workspaceKey: "symphony__ENG-123",
+          workspacePath: symphonyWorkspacePath,
+          branchName: "symphony/runtime/ENG-123",
+          gitBranchName: "symphony/runtime/ENG-123",
+          repoPath: "/repo",
+          baseRef: "origin/main",
+          lastRunId: "run-symphony",
+        },
+      },
+    );
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const ambiguousIssueResponse = await fetch(`${baseUrl}/api/v1/issues/ENG-123`);
+      const ambiguousRunsResponse = await fetch(`${baseUrl}/api/v1/issues/ENG-123/runs`);
+      const ambiguousOpenResponse = await fetch(`${baseUrl}/api/v1/issues/ENG-123/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const exactIssueResponse = await fetch(`${baseUrl}/api/v1/issues/issue-docs-123`);
+      const exactRunsResponse = await fetch(`${baseUrl}/api/v1/issues/issue-docs-123/runs`);
+      const exactOpenResponse = await fetch(`${baseUrl}/api/v1/issues/issue-docs-123/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-docs`);
+      const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/docs__ENG-123`);
+
+      expect(ambiguousIssueResponse.status).toBe(409);
+      expect(ambiguousRunsResponse.status).toBe(409);
+      expect(ambiguousOpenResponse.status).toBe(409);
+      await expect(ambiguousIssueResponse.json()).resolves.toMatchObject({ error: { code: "conflict" } });
+      await expect(ambiguousRunsResponse.json()).resolves.toMatchObject({ error: { code: "conflict" } });
+      await expect(ambiguousOpenResponse.json()).resolves.toMatchObject({ error: { code: "conflict" } });
+
+      expect(exactIssueResponse.status).toBe(200);
+      await expect(exactIssueResponse.json()).resolves.toMatchObject({
+        latestRun: { runId: "run-docs" },
+      });
+      expect(exactRunsResponse.status).toBe(200);
+      await expect(exactRunsResponse.json()).resolves.toMatchObject({
+        runs: [{ runId: "run-docs", issueId: "issue-docs-123" }],
+      });
+      expect(exactOpenResponse.status).toBe(202);
+      await expect(exactOpenResponse.json()).resolves.toMatchObject({
+        opened: true,
+        workspace_path: docsWorkspacePath,
+      });
+      expect(runResponse.status).toBe(200);
+      await expect(runResponse.json()).resolves.toMatchObject({
+        runId: "run-docs",
+        issueId: "issue-docs-123",
+        issueIdentifier: "ENG-123",
+      });
+      expect(workspaceResponse.status).toBe(200);
+      await expect(workspaceResponse.json()).resolves.toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: "issue-docs-123",
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("surfaces provider-limit gates in state and dashboard and lets operators clear them", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     config.hermes.provider = "openai-codex";

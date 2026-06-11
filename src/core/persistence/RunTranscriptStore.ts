@@ -7,6 +7,7 @@ import {
   normalizeProjectContextResolution,
   type ProjectContextResolution,
 } from "../config/ProjectContexts.js";
+import { SymphonyError } from "../errors.js";
 import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 import { isRunActivityCommandPolicyDecisionPayload } from "../runActivity/RunActivityEvent.js";
@@ -377,18 +378,24 @@ export class FileRunTranscriptStore {
     return records.filter((record): record is WorkspaceRecord => record !== null).map(normalizeWorkspaceRecord);
   }
 
-  async findWorkspace(issueIdOrIdentifierOrKey: string): Promise<WorkspaceRecord | null> {
-    const direct = await this.getWorkspace(issueIdOrIdentifierOrKey);
-    if (direct) return direct;
-    const records = await this.listWorkspaces();
-    return (
-      records.find(
-        (record) =>
-          record.issueId === issueIdOrIdentifierOrKey ||
-          record.issueIdentifier === issueIdOrIdentifierOrKey ||
-          record.workspaceKey === issueIdOrIdentifierOrKey,
-      ) ?? null
+  async findWorkspace(
+    issueIdOrIdentifierOrKey: string,
+    options: { projectContextId?: string | null; includeWorkspaceKey?: boolean } = {},
+  ): Promise<WorkspaceRecord | null> {
+    const includeWorkspaceKey = options.includeWorkspaceKey ?? true;
+    if (includeWorkspaceKey) {
+      const direct = await this.getWorkspace(issueIdOrIdentifierOrKey);
+      if (direct && matchesProjectContextId(direct.projectContext, options.projectContextId)) return direct;
+    }
+    const records = filterByProjectContext(
+      await this.listWorkspaces(),
+      options.projectContextId,
+      (record) =>
+        record.issueId === issueIdOrIdentifierOrKey ||
+        record.issueIdentifier === issueIdOrIdentifierOrKey ||
+        (includeWorkspaceKey && record.workspaceKey === issueIdOrIdentifierOrKey),
     );
+    return resolveWorkspaceLookup(issueIdOrIdentifierOrKey, records);
   }
 
   async startRun(input: StartRunInput): Promise<RunRecord> {
@@ -546,23 +553,35 @@ export class FileRunTranscriptStore {
     return record === null ? null : normalizeRunRecord(record);
   }
 
-  async listRunsForIssue(issueIdOrIdentifier: string): Promise<RunRecord[]> {
-    const records = await this.listRuns();
-    return records
-      .filter((record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier)
-      .sort(compareRunChronology);
+  async listRunsForIssue(
+    issueIdOrIdentifier: string,
+    options: { projectContextId?: string | null } = {},
+  ): Promise<RunRecord[]> {
+    const records = filterByProjectContext(
+      await this.listRuns(),
+      options.projectContextId,
+      (record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier,
+    );
+    assertSingleRunIssueIdentity(issueIdOrIdentifier, records);
+    return records.sort(compareRunChronology);
   }
 
   async latestRunForIssue(
     issueIdOrIdentifier: string,
-    options: { role?: PersistedRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind } = {},
+    options: { role?: PersistedRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind; projectContextId?: string | null } = {},
   ): Promise<RunRecord | null> {
-    const records = await this.listRunsForIssue(issueIdOrIdentifier);
-    const filtered = records.filter(
+    const roleFilter = options.role;
+    const runPhaseFilter = options.runPhase;
+    const runKindFilter = options.runKind;
+    const runs = await this.listRunsForIssue(
+      issueIdOrIdentifier,
+      options.projectContextId === undefined ? {} : { projectContextId: options.projectContextId },
+    );
+    const filtered = runs.filter(
       (record) =>
-        (options.role === undefined || record.role === options.role) &&
-        (options.runPhase === undefined || record.runPhase === options.runPhase) &&
-        (options.runKind === undefined || record.runKind === options.runKind),
+        (roleFilter === undefined || record.role === roleFilter) &&
+        (runPhaseFilter === undefined || record.runPhase === runPhaseFilter) &&
+        (runKindFilter === undefined || record.runKind === runKindFilter),
     );
     return filtered[filtered.length - 1] ?? null;
   }
@@ -697,6 +716,68 @@ function compareString(left: string, right: string): number {
   if (left < right) return -1;
   if (left > right) return 1;
   return 0;
+}
+
+function ambiguousLookupError(kind: string, requestKey: string, candidates: readonly string[]): SymphonyError {
+  return new SymphonyError("conflict", `Ambiguous ${kind} lookup for ${requestKey}: ${candidates.join(", ")}`);
+}
+
+function matchesProjectContextId(
+  projectContext: ProjectContextResolution | null | undefined,
+  projectContextId: string | null | undefined,
+): boolean {
+  return projectContextId === undefined || projectContextId === null || projectContext?.projectContextId === projectContextId;
+}
+
+function filterByProjectContext<T extends { projectContext?: ProjectContextResolution | undefined }>(
+  records: readonly T[],
+  projectContextId: string | null | undefined,
+  predicate: (record: T) => boolean,
+): T[] {
+  return records.filter((record) => predicate(record) && matchesProjectContextId(record.projectContext, projectContextId));
+}
+
+function workspaceIssueIdentity(record: WorkspaceRecord): string {
+  return record.issueId ?? `${record.projectContext?.projectContextId ?? "legacy_default"}::${record.issueIdentifier}`;
+}
+
+function isPlanningWorkspace(record: WorkspaceRecord): boolean {
+  return (
+    record.workspaceKey.endsWith("-planning") ||
+    record.sourceKind === "planning_repo" ||
+    record.sourceKind === "planning_file_copy"
+  );
+}
+
+function compareWorkspaceLookupPreference(left: WorkspaceRecord, right: WorkspaceRecord): number {
+  return (
+    compareNumber(Number(isPlanningWorkspace(left)), Number(isPlanningWorkspace(right))) ||
+    -compareNumber(Date.parse(left.updatedAt), Date.parse(right.updatedAt)) ||
+    compareString(left.workspaceKey, right.workspaceKey)
+  );
+}
+
+function resolveWorkspaceLookup(requestKey: string, records: WorkspaceRecord[]): WorkspaceRecord | null {
+  if (records.length === 0) return null;
+  const identities = new Set(records.map(workspaceIssueIdentity));
+  if (identities.size > 1) {
+    throw ambiguousLookupError(
+      "workspace",
+      requestKey,
+      [...new Set(records.map((record) => `${record.workspaceKey}(${record.projectContext?.projectContextId ?? "legacy_default"})`))],
+    );
+  }
+  return [...records].sort(compareWorkspaceLookupPreference)[0] ?? null;
+}
+
+function assertSingleRunIssueIdentity(requestKey: string, records: readonly RunRecord[]): void {
+  const identities = new Set(records.map((record) => record.issueId));
+  if (identities.size <= 1) return;
+  throw ambiguousLookupError(
+    "run",
+    requestKey,
+    [...new Set(records.map((record) => `${record.issueId}/${record.runId}(${record.projectContext?.projectContextId ?? "legacy_default"})`))],
+  );
 }
 
 function promptPreview(prompt: string): string {

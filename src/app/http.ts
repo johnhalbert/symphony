@@ -1059,8 +1059,10 @@ export class StatusServer {
       if (request.method === "GET" && issueRunsMatch) {
         const issueId = decodeURIComponent(issueRunsMatch[1] ?? "");
         const snapshot = this.options.orchestrator.snapshot();
-        const live = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
+        const live = findLiveIssueByKey(snapshot.running, issueId);
+        const workspace =
+          (await this.options.runStore?.findWorkspace(issueId, { includeWorkspaceKey: false })) ??
+          (await this.options.runStore?.getWorkspace(issueId));
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
@@ -1151,8 +1153,10 @@ export class StatusServer {
       if (request.method === "GET" && issueMatch) {
         const issueId = decodeURIComponent(issueMatch[1] ?? "");
         const snapshot = this.options.orchestrator.snapshot();
-        const live = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
+        const live = findLiveIssueByKey(snapshot.running, issueId);
+        const workspace =
+          (await this.options.runStore?.findWorkspace(issueId, { includeWorkspaceKey: false })) ??
+          (await this.options.runStore?.getWorkspace(issueId));
         const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const lifecycle = sanitizeStatusLifecycle({
@@ -1256,13 +1260,22 @@ export class StatusServer {
         const runId = decodeURIComponent(runMatch[1] ?? "");
         const run = await this.options.runStore?.getRun(runId);
         if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
-        const issueRunsByIdentifier = (await this.options.runStore?.listRunsForIssue(run.issueIdentifier)) ?? [];
+        const issueRunsByIdentifier =
+          (await this.options.runStore?.listRunsForIssue(
+            run.issueIdentifier,
+            run.projectContext?.projectContextId ? { projectContextId: run.projectContext.projectContextId } : {},
+          )) ?? [];
         const issueRuns =
           issueRunsByIdentifier.length > 0 || run.issueIdentifier === run.issueId
             ? issueRunsByIdentifier
             : ((await this.options.runStore?.listRunsForIssue(run.issueId)) ?? []);
         const lifecycle =
-          (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
+          (await this.options.lifecycleStore?.get(run.issueId)) ??
+          (await this.options.lifecycleStore?.get(
+            run.issueIdentifier,
+            run.projectContext?.projectContextId ? { projectContextId: run.projectContext.projectContextId } : {},
+          )) ??
+          null;
         sendJson(response, 200, {
           ...publicRunRecord(run),
           pendingApproval: (await this.options.operatorApproval?.findPendingForRun(runId)) ?? null,
@@ -1276,7 +1289,7 @@ export class StatusServer {
       const workspaceMatch = /^\/api\/v1\/workspaces\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && workspaceMatch) {
         const workspaceKey = decodeURIComponent(workspaceMatch[1] ?? "");
-        const workspace = await this.options.runStore?.findWorkspace(workspaceKey);
+        const workspace = await this.options.runStore?.getWorkspace(workspaceKey);
         if (!workspace) throw new SymphonyError("not_found", `Workspace not found: ${workspaceKey}`);
         sendJson(response, 200, workspace);
         return;
@@ -1286,14 +1299,38 @@ export class StatusServer {
       if (request.method === "POST" && openMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(openMatch[1] ?? "");
-        const details = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
+        const snapshot = this.options.orchestrator.snapshot();
+        const details = findLiveIssueByKey(snapshot.running, issueId);
+        const workspace = await this.options.runStore?.findWorkspace(issueId, { includeWorkspaceKey: false });
+        const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const lifecycle = await this.options.lifecycleStore?.get(issueId);
+        const issueProjectContext =
+          lifecycle?.projectContext ?? workspace?.projectContext ?? details?.lifecycle?.projectContext ?? latestRun?.projectContext;
+        const resolvedIssueIdentifier =
+          details?.issueIdentifier ?? latestRun?.issueIdentifier ?? lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? issueId;
+        const resolvedIssueId = details?.issueId ?? latestRun?.issueId ?? lifecycle?.issueId ?? workspace?.issueId;
+        const resolvedBranchName =
+          latestRun?.gitBranchName ?? lifecycle?.summaryPointers.branchName ?? workspace?.gitBranchName ?? null;
         const workspacePath =
-          details?.workspacePath ?? workspace?.path ?? this.options.workspaceManager.getPathForIssue(issueId);
+          details?.workspacePath ??
+          workspace?.path ??
+          latestRun?.workspacePath ??
+          lifecycle?.summaryPointers.workspacePath ??
+          this.options.workspaceManager.getPathForIssue(
+            issueProjectContext
+              ? {
+                  id: resolvedIssueId ?? issueId,
+                  identifier: resolvedIssueIdentifier,
+                  branchName: resolvedBranchName,
+                  projectContext: issueProjectContext,
+                }
+              : issueId,
+          );
         if (!(await pathExists(workspacePath))) {
           throw new SymphonyError("not_found", `Workspace not found: ${workspacePath}`);
         }
         await this.options.workspaceOpener.open(workspacePath);
+
         sendJson(response, 202, { opened: true, workspace_path: workspacePath });
         return;
       }
@@ -5860,9 +5897,19 @@ async function operatorSnapshotView(
       const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
       const paused = isIssuePaused(snapshot, keys);
       const agentId = await resolveRunningAgentId(row, runStore);
-      const workspace = (await runStore?.findWorkspace(row.issueId)) ?? (await runStore?.findWorkspace(row.issueIdentifier));
+      const projectContextId = row.lifecycle?.projectContext?.projectContextId;
+      const workspace =
+        (await runStore?.findWorkspace(
+          row.issueId,
+          projectContextId ? { projectContextId, includeWorkspaceKey: false } : { includeWorkspaceKey: false },
+        )) ??
+        (await runStore?.findWorkspace(
+          row.issueIdentifier,
+          projectContextId ? { projectContextId, includeWorkspaceKey: false } : { includeWorkspaceKey: false },
+        ));
       const latestRun =
-        (await runStore?.latestRunForIssue(row.issueId)) ?? (await runStore?.latestRunForIssue(row.issueIdentifier));
+        (await runStore?.latestRunForIssue(row.issueId, projectContextId ? { projectContextId } : {})) ??
+        (await runStore?.latestRunForIssue(row.issueIdentifier, projectContextId ? { projectContextId } : {}));
       const summaryRun = await resolveIssueDetailsSummaryRun(row, latestRun, runStore);
       const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
       const mergeConflict = mergeConflictOperatorSummary(row.lifecycle?.mergeConflict ?? null);
@@ -6023,10 +6070,14 @@ async function resolveRunningAgentId(
     const run = await runStore.getRun(runId);
     if (runMatchesLiveRow(row, run)) return run.agentId;
   }
-  for (const issueKey of [row.issueId, row.issueIdentifier]) {
-    const run = await runStore.latestRunForIssue(issueKey);
-    if (runMatchesLiveRow(row, run)) return run.agentId;
-  }
+  const projectContextId = row.lifecycle?.projectContext?.projectContextId;
+  const runByIssueId = await runStore.latestRunForIssue(row.issueId, projectContextId ? { projectContextId } : {});
+  if (runMatchesLiveRow(row, runByIssueId)) return runByIssueId.agentId;
+  const runByIdentifier = await runStore.latestRunForIssue(
+    row.issueIdentifier,
+    projectContextId ? { projectContextId } : {},
+  );
+  if (runMatchesLiveRow(row, runByIdentifier)) return runByIdentifier.agentId;
   return null;
 }
 
@@ -6046,10 +6097,15 @@ async function pausedOperatorViews(
 ): Promise<PausedOperatorView[]> {
   return Promise.all(
     pausedKeys.map(async (pausedKey) => {
-      const lifecycle = (await lifecycleStore?.get(pausedKey)) ?? null;
-      const workspace = await runStore?.findWorkspace(pausedKey);
-      const latestRun = await runStore?.latestRunForIssue(pausedKey);
-      const live = running.find((row) => row.issueId === pausedKey || row.issueIdentifier === pausedKey) ?? null;
+      const live = findLiveIssueByKey(running, pausedKey);
+      const projectContextId = live?.lifecycle?.projectContext?.projectContextId;
+      const lifecycle =
+        (await lifecycleStore?.get(pausedKey, projectContextId ? { projectContextId } : {})) ?? null;
+      const workspace = await runStore?.findWorkspace(
+        pausedKey,
+        projectContextId ? { projectContextId, includeWorkspaceKey: false } : { includeWorkspaceKey: false },
+      );
+      const latestRun = await runStore?.latestRunForIssue(pausedKey, projectContextId ? { projectContextId } : {});
       const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, runStore);
       const issueIdentifier = lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? pausedKey;
       const controls = operatorControls({ issueKnown: true, live: null, paused: true, mutationsConfigured });
@@ -7020,6 +7076,21 @@ function issueKeys(
     input.lifecycle?.issueId,
     input.lifecycle?.issueIdentifier,
   ].filter((value, index, values): value is string => value !== null && value !== undefined && values.indexOf(value) === index);
+}
+
+function findLiveIssueByKey(running: RunningRow[], issueIdOrIdentifier: string): RunningRow | null {
+  const matches = running.filter(
+    (row) => row.issueId === issueIdOrIdentifier || row.issueIdentifier === issueIdOrIdentifier,
+  );
+  if (matches.length === 0) return null;
+  const identities = new Set(matches.map((row) => row.issueId));
+  if (identities.size > 1) {
+    throw new SymphonyError(
+      "conflict",
+      `Ambiguous issue lookup for ${issueIdOrIdentifier}: ${[...new Set(matches.map((row) => `${row.issueId}(${row.lifecycle?.projectContext?.projectContextId ?? "legacy_default"})`))].join(", ")}`,
+    );
+  }
+  return matches[0] ?? null;
 }
 
 function isIssuePaused(snapshot: RuntimeSnapshot, keys: string[]): boolean {

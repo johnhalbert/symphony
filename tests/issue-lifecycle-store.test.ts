@@ -412,6 +412,46 @@ describe("FileIssueLifecycleStore", () => {
   });
 
 
+  it("rejects ambiguous identifier lifecycle lookups across project contexts unless scoped", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const docsIssue = {
+      ...issue({
+        id: "issue-docs-123",
+        identifier: "ENG-123",
+      }),
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    } as const;
+    const symphonyIssue = {
+      ...issue({
+        id: "issue-symphony-123",
+        identifier: "ENG-123",
+      }),
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony Runtime",
+    } as const;
+    await store.ensureIssue(docsIssue, { phase: "implementation" });
+    await store.ensureIssue(symphonyIssue, { phase: "review" });
+
+    await expect(store.get("ENG-123")).rejects.toMatchObject({ code: "conflict" });
+    await expect(store.get("ENG-123", { projectContextId: "docs" })).resolves.toMatchObject({
+      issueId: "issue-docs-123",
+      issueIdentifier: "ENG-123",
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      },
+    });
+    await expect(store.get("issue-symphony-123")).resolves.toMatchObject({
+      issueId: "issue-symphony-123",
+      issueIdentifier: "ENG-123",
+      projectContext: {
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony Runtime",
+      },
+    });
+  });
+
   it("surfaces corrupt lifecycle records", async () => {
     await mkdir(path.join(root, "issue-lifecycle"), { recursive: true });
     await writeFile(path.join(root, "issue-lifecycle", "issue-1.json"), "{nope", "utf8");
