@@ -119,10 +119,28 @@ describe("project context normalization", () => {
   it("omits sibling secrets and sanitizes credential-bearing repository values from public metadata helpers", () => {
     const repositoryCases = [
       {
-        name: "embedded userinfo URL",
+        name: "HTTPS embedded userinfo URL",
         repository: "https://token:secret@example.com/acme/docs-site.git",
         expected: "https://[redacted]@example.com/acme/docs-site.git",
         leakedSubstring: "token:secret@example.com",
+      },
+      {
+        name: "generic FTP embedded userinfo URL",
+        repository: "ftp://token:secret@example.com/acme/docs-site.git",
+        expected: "ftp://[redacted]@example.com/acme/docs-site.git",
+        leakedSubstring: "token:secret@example.com",
+      },
+      {
+        name: "generic custom-scheme embedded userinfo URL",
+        repository: "custom://token:secret@example.com/acme/docs-site.git",
+        expected: "custom://[redacted]@example.com/acme/docs-site.git",
+        leakedSubstring: "token:secret@example.com",
+      },
+      {
+        name: "password containing at-sign in URL userinfo",
+        repository: "https://token:pa@ss@example.com/acme/docs-site.git",
+        expected: "https://[redacted]@example.com/acme/docs-site.git",
+        leakedSubstring: "ss@example.com",
       },
       {
         name: "query token URL",
@@ -210,10 +228,28 @@ describe("project context normalization", () => {
         leakedSubstring: null,
       },
       {
-        name: "embedded userinfo URL",
+        name: "HTTPS embedded userinfo URL",
         repository: "https://token:secret@example.com/acme/symphony.git",
         expected: "https://[redacted]@example.com/acme/symphony.git",
         leakedSubstring: "token:secret@example.com",
+      },
+      {
+        name: "generic FTP embedded userinfo URL",
+        repository: "ftp://token:secret@example.com/acme/symphony.git",
+        expected: "ftp://[redacted]@example.com/acme/symphony.git",
+        leakedSubstring: "token:secret@example.com",
+      },
+      {
+        name: "generic custom-scheme embedded userinfo URL",
+        repository: "custom://token:secret@example.com/acme/symphony.git",
+        expected: "custom://[redacted]@example.com/acme/symphony.git",
+        leakedSubstring: "token:secret@example.com",
+      },
+      {
+        name: "password containing at-sign in URL userinfo",
+        repository: "https://token:pa@ss@example.com/acme/symphony.git",
+        expected: "https://[redacted]@example.com/acme/symphony.git",
+        leakedSubstring: "ss@example.com",
       },
       {
         name: "query token URL",
