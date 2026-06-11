@@ -165,6 +165,7 @@ export interface ContinuationSummaryCreationResult {
 export interface RunningEntry {
   issue: Issue;
   resolvedConfig: ServiceConfig;
+  resolvedPromptTemplate: string;
   role: AgentRunRole;
   runPhase: AgentRunPhase;
   workspacePath: string | null;
@@ -1378,8 +1379,9 @@ export class Orchestrator {
     const runId = entry.activeRunId ?? entry.runId;
     if (!store || !runId) return false;
     const lifecycle = await store.get(entry.issue.id);
+    if (!lifecycle) return false;
     const handoff = pendingPublicationHandoffForRun(lifecycle, { runId }) ?? pendingPublicationHandoffForRun(lifecycle);
-    if (!handoff) return false;
+    if (!handoff && !isPendingPublicationApprovalReason(lifecycle.blockedReason)) return false;
     entry.lifecycle = lifecycle;
     return true;
   }
@@ -1694,6 +1696,7 @@ export class Orchestrator {
     const entry: RunningEntry = {
       issue,
       resolvedConfig: this.configForIssue(issue),
+      resolvedPromptTemplate: this.promptTemplate,
       role,
       runPhase,
       workspacePath: null,
@@ -1909,8 +1912,9 @@ export class Orchestrator {
       this.requireMcpHandoff("review");
 
       entry.turnCount = 1;
+      const entryConfig = this.configForEntry(entry);
       const prompt = this.formatRenderedReviewerPrompt(
-        await this.promptRenderer.render(this.reviewerPromptTemplate(), {
+        await this.promptRenderer.render(this.reviewerPromptTemplate(entryConfig), {
           issue: entry.issue,
           attempt: null,
           role: "reviewer",
@@ -1919,8 +1923,8 @@ export class Orchestrator {
           workspaceEvidence: workspaceEvidenceForReview(entry.issue, workspace, evidence),
           validationEvidence: evidence.completionReport.validationEvidence,
           runDigest: evidence.runDigest,
-          reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
-          workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+          reviewerPromptExtensions: entryConfig.reviewLoop.reviewerPromptExtensions,
+          workerPromptExtensions: entryConfig.reviewLoop.workerPromptExtensions,
         }),
         {
           issue: entry.issue,
@@ -1930,6 +1934,7 @@ export class Orchestrator {
           repoPath: workspace.repoPath ?? null,
           baseRef: workspace.baseRef ?? null,
         },
+        entryConfig,
       );
       await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
         workspace,
@@ -3284,8 +3289,8 @@ export class Orchestrator {
     };
   }
 
-  private reviewerPromptTemplate(): string {
-    const configured = this.config.reviewLoop.reviewerPromptTemplate;
+  private reviewerPromptTemplate(config: ServiceConfig): string {
+    const configured = config.reviewLoop.reviewerPromptTemplate;
     if (configured !== null && configured.trim().length > 0) return configured;
     return DEFAULT_REVIEWER_PROMPT_TEMPLATE;
   }
@@ -3293,14 +3298,14 @@ export class Orchestrator {
   private formatRenderedReviewerPrompt(
     prompt: string,
     mcpHandoff: Parameters<typeof renderReviewMcpHandoffPrompt>[0],
+    config: ServiceConfig,
   ): string {
-    const configured = this.config.reviewLoop.reviewerPromptTemplate;
+    const configured = config.reviewLoop.reviewerPromptTemplate;
     if (configured !== null && configured.trim().length > 0) return prompt;
     const rendered = prompt
       .replace(
         PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER,
-        formatPromptExtensions("Project-specific reviewer extensions:", this.config.reviewLoop.reviewerPromptExtensions) ??
-          "",
+        formatPromptExtensions("Project-specific reviewer extensions:", config.reviewLoop.reviewerPromptExtensions) ?? "",
       )
       .trim();
     return [rendered, renderReviewMcpHandoffPrompt(mcpHandoff)].join("\n").trim();
@@ -3308,14 +3313,15 @@ export class Orchestrator {
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
     if (entry.runPhase === "merge_conflict_resolution") return this.renderMergeConflictResolutionPrompt(entry);
-    const basePrompt = await this.promptRenderer.render(this.promptTemplate, {
+    const entryConfig = this.configForEntry(entry);
+    const basePrompt = await this.promptRenderer.render(entry.resolvedPromptTemplate, {
       issue: entry.issue,
       attempt,
-      reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
-      workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+      reviewerPromptExtensions: entryConfig.reviewLoop.reviewerPromptExtensions,
+      workerPromptExtensions: entryConfig.reviewLoop.workerPromptExtensions,
     });
     const issueBreakdownPlan = await this.loadIssueBreakdownPlanPrompt(entry);
-    const reviewHardening = this.workerReviewHardeningPrompt();
+    const reviewHardening = this.workerReviewHardeningPrompt(entry);
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
@@ -3369,7 +3375,7 @@ export class Orchestrator {
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
     const continuationBrief = await this.renderContinuationBrief(entry);
-    const reviewHardening = this.workerReviewHardeningPrompt();
+    const reviewHardening = this.workerReviewHardeningPrompt(entry);
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
@@ -3388,21 +3394,23 @@ export class Orchestrator {
       .join("\n");
   }
 
-  private workerReviewHardeningPrompt(): string {
+  private workerReviewHardeningPrompt(entry: RunningEntry): string {
+    const entryConfig = this.configForEntry(entry);
     return [
       "",
       DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE,
-      formatPromptExtensions("Project-specific worker extensions:", this.config.reviewLoop.workerPromptExtensions),
+      formatPromptExtensions("Project-specific worker extensions:", entryConfig.reviewLoop.workerPromptExtensions),
     ]
       .filter((item): item is string => item !== null)
       .join("\n");
   }
 
   private async renderContinuationBrief(entry: RunningEntry): Promise<string> {
+    const entryConfig = this.configForEntry(entry);
     const lifecycle = entry.lifecycle ?? (await this.options.lifecycleStore?.get(entry.issue.id)) ?? null;
     const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id)) ?? [];
-    const history = await this.loadContinuationHistory(runs);
-    const threshold = this.configForEntry(entry).reviewLoop.transcriptHistoryLimit;
+    const threshold = entryConfig.reviewLoop.transcriptHistoryLimit;
+    const history = await this.loadContinuationHistory(runs, threshold);
     const historyMode = "summary";
     const summaryReference = latestContinuationSummaryReference(lifecycle);
     const workspace = entry.workspace;
@@ -3452,11 +3460,10 @@ export class Orchestrator {
     ].join("\n");
   }
 
-  private async loadContinuationHistory(runs: RunRecord[]): Promise<{
+  private async loadContinuationHistory(runs: RunRecord[], threshold: number): Promise<{
     eventCount: number;
     runs: Array<{ run: RunRecord; events: TranscriptEvent[]; truncated: boolean }>;
   }> {
-    const threshold = this.config.reviewLoop.transcriptHistoryLimit;
     let eventCount = 0;
     const history: Array<{ run: RunRecord; events: TranscriptEvent[]; truncated: boolean }> = [];
     for (const run of runs) {

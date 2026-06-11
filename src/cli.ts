@@ -275,7 +275,7 @@ program
     });
 
     const opener = new CursorWorkspaceOpener({
-      workspaceRoot: config.workspace.root,
+      workspaceRoot: () => workspaceManager.workspaceRoots(),
       openerCommand: config.cursor.openerCommand,
     });
     const statusServer =

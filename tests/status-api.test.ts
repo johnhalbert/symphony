@@ -1,9 +1,10 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
 import { resolveStatusMutationToken } from "../src/app/RuntimeDependencies.js";
+import { createProjectContextRuntimeDependencies } from "../src/app/ProjectContextRuntime.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import {
   FileIssueLifecycleStore,
@@ -17,10 +18,11 @@ import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import type { Issue, IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } from "../src/core/types.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, projectContextFixture, testConfig, trackerClientFixture, trackerIssue } from "./helpers.js";
 
 describe("StatusServer durable API", () => {
   let root: string;
@@ -526,6 +528,159 @@ describe("StatusServer durable API", () => {
       });
     } finally {
       await server.stop();
+    }
+  });
+
+  it("opens routed non-default workspaces after dispatch and after config reload", async () => {
+    const symphonyWorkspaceRoot = path.join(root, "symphony-workspaces");
+    const symphonyStateDir = path.join(root, "symphony-state");
+    const docsWorkspaceRoot = path.join(root, "docs-workspaces");
+    const docsStateDir = path.join(root, "docs-state");
+    const docsReloadWorkspaceRoot = path.join(root, "docs-workspaces-reloaded");
+    const docsReloadStateDir = path.join(root, "docs-state-reloaded");
+    const symphonySourcePath = path.join(root, "symphony-source");
+    const docsSourcePath = path.join(root, "docs-source");
+    const docsReloadSourcePath = path.join(root, "docs-source-reloaded");
+    await mkdir(symphonySourcePath, { recursive: true });
+    await mkdir(docsSourcePath, { recursive: true });
+    await mkdir(docsReloadSourcePath, { recursive: true });
+
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: { agent: { max_concurrent_agents: 1, max_turns: 1 } },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "ENG",
+            workspaceRoot: symphonyWorkspaceRoot,
+            stateDir: symphonyStateDir,
+            tracker: { active_states: ["Todo", "In Progress"], handoff_states: ["Human Review"] },
+            review_loop: { review_states: ["In Review"] },
+            workspace: { source: { kind: "copy", path: symphonySourcePath } },
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            workspaceRoot: docsWorkspaceRoot,
+            stateDir: docsStateDir,
+            tracker: { active_states: ["Queued", "Doing"], handoff_states: ["Docs Handoff"] },
+            review_loop: { review_states: ["Docs Review"] },
+            workspace: { source: { kind: "copy", path: docsSourcePath } },
+          }),
+        ],
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const docsIssue = trackerIssue({
+      id: "issue-docs-open-1",
+      identifier: "DOCS-123",
+      state: "Queued",
+      labels: ["dogfood-ready"],
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+    const tracker = trackerClientFixture({ candidates: [docsIssue], issues: [docsIssue] });
+    const logger = new StructuredLogger(() => undefined);
+    const runtimeDependencies = createProjectContextRuntimeDependencies(config, logger);
+    const { workspaceManager, lifecycleStore, runStore } = runtimeDependencies;
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({
+        workspaceRoot: () => workspaceManager.workspaceRoots(),
+        openerCommand: process.execPath,
+      }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+
+    try {
+      await orchestrator.refreshNow();
+      await waitForStatusApiAsync(async () => harness.runs.length === 1, "docs dispatch");
+      await waitForStatusApiAsync(
+        async () => (await runStore.findWorkspace(docsIssue.id)) !== null,
+        "docs workspace record persisted",
+      );
+
+      const firstOpenResponse = await fetch(`${baseUrl}/api/v1/issues/${docsIssue.id}/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const firstOpenBody = (await firstOpenResponse.json()) as { opened: boolean; workspace_path: string };
+      expect(firstOpenResponse.status).toBe(202);
+      expect(firstOpenBody).toMatchObject({
+        opened: true,
+        workspace_path: path.join(docsWorkspaceRoot, docsIssue.identifier),
+      });
+
+      const reloadedConfig = parseServiceConfig(
+        multiProjectWorkflowConfig({
+          topLevel: { agent: { max_concurrent_agents: 1, max_turns: 1 } },
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "ENG",
+              workspaceRoot: symphonyWorkspaceRoot,
+              stateDir: symphonyStateDir,
+              tracker: { active_states: ["Todo", "In Progress"], handoff_states: ["Human Review"] },
+              review_loop: { review_states: ["In Review"] },
+              workspace: { source: { kind: "copy", path: symphonySourcePath } },
+            }),
+            projectContextFixture({
+              id: "docs",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              workspaceRoot: docsReloadWorkspaceRoot,
+              stateDir: docsReloadStateDir,
+              tracker: { active_states: ["Ready"], handoff_states: ["Queued"] },
+              review_loop: { review_states: ["Docs Review"] },
+              workspace: { source: { kind: "copy", path: docsReloadSourcePath } },
+            }),
+          ],
+        }),
+        path.join(root, "WORKFLOW.md"),
+        { LINEAR_API_KEY: "linear-test-key" },
+      );
+      runtimeDependencies.updateConfig(reloadedConfig);
+      orchestrator.updateConfig(reloadedConfig, "Work on {{ issue.identifier }}");
+
+      const secondOpenResponse = await fetch(`${baseUrl}/api/v1/issues/${docsIssue.id}/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const secondOpenBody = (await secondOpenResponse.json()) as { opened: boolean; workspace_path: string };
+      expect(secondOpenResponse.status).toBe(202);
+      expect(secondOpenBody).toMatchObject({
+        opened: true,
+        workspace_path: path.join(docsWorkspaceRoot, docsIssue.identifier),
+      });
+      expect(secondOpenBody.workspace_path.startsWith(docsReloadWorkspaceRoot)).toBe(false);
+    } finally {
+      await server.stop();
+      await orchestrator.stop();
     }
   });
 

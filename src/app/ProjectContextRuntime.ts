@@ -289,6 +289,10 @@ export class ProjectContextWorkspaceManager extends WorkspaceManager {
   override isInsideRoot(workspacePath: string): boolean {
     return this.allManagers().some((manager) => manager.isInsideRoot(workspacePath));
   }
+
+  override workspaceRoots(): string[] {
+    return uniqueValues(this.allManagers().map((manager) => manager.workspaceRoot()));
+  }
 }
 
 export class ProjectContextLifecycleStore extends FileIssueLifecycleStore {

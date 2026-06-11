@@ -37,6 +37,14 @@ export class WorkspaceManager {
     this.store = new FileRunTranscriptStore(options.workspace.stateDir);
   }
 
+  workspaceRoot(): string {
+    return this.options.workspace.root;
+  }
+
+  workspaceRoots(): string[] {
+    return [this.workspaceRoot()];
+  }
+
   async createForIssue(issueInput: WorkspaceIssueInput): Promise<Workspace> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;

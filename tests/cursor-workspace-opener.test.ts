@@ -32,4 +32,21 @@ describe("CursorWorkspaceOpener", () => {
       await rm(outside, { recursive: true, force: true });
     }
   });
+  it("accepts workspace paths inside any configured routed root", async () => {
+    const rootA = await mkdtemp(path.join(os.tmpdir(), "symphony-open-root-a-"));
+    const rootB = await mkdtemp(path.join(os.tmpdir(), "symphony-open-root-b-"));
+    try {
+      const workspace = path.join(rootB, "DOCS-123");
+      await mkdir(workspace, { recursive: true });
+      const opener = new CursorWorkspaceOpener({
+        workspaceRoot: () => [rootA, rootB],
+        openerCommand: process.execPath,
+      });
+
+      await expect(opener.open(workspace)).resolves.toBeUndefined();
+    } finally {
+      await rm(rootA, { recursive: true, force: true });
+      await rm(rootB, { recursive: true, force: true });
+    }
+  });
 });
