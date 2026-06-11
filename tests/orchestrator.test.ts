@@ -385,8 +385,8 @@ describe("Orchestrator", () => {
       projectContextLabel: "Documentation Site",
     });
     await expect(runStore.getWorkspace(candidate.identifier)).resolves.toMatchObject({
-      projectContextId: "docs",
-      projectContextLabel: "Documentation Site",
+      workspaceKey: candidate.identifier,
+      issueIdentifier: candidate.identifier,
     });
   });
 

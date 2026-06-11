@@ -25,14 +25,7 @@ describe("WorkspaceManager", () => {
       logger: new StructuredLogger(() => undefined),
     });
 
-    const workspace = await manager.createForIssue(
-      issue({
-        id: "abc-123",
-        identifier: "ABC/123",
-        projectContextId: "docs",
-        projectContextLabel: "Documentation Site",
-      }),
-    );
+    const workspace = await manager.createForIssue(issue({ id: "abc-123", identifier: "ABC/123" }));
     const metadata = JSON.parse(
       await readFile(path.join(config.workspace.stateDir, "workspaces", "ABC_123.json"), "utf8"),
     );
@@ -41,8 +34,6 @@ describe("WorkspaceManager", () => {
     expect(workspace.issueId).toBe("abc-123");
     expect(metadata.issueIdentifier).toBe("ABC/123");
     expect(metadata.issueId).toBe("abc-123");
-    expect(metadata.projectContextId).toBe("docs");
-    expect(metadata.projectContextLabel).toBe("Documentation Site");
   });
 
   it("rejects paths outside the workspace root", () => {

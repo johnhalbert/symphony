@@ -1,7 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
-import { serviceConfigForProjectContext } from "../config/Config.js";
 import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import {
@@ -46,18 +45,11 @@ export async function submitReviewFeedbackFromMcp(input: unknown, options: {
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
-    const issueConfig = serviceConfigForProjectContext(config, loadedContext.issue.projectContextId);
     const service = new PullRequestReviewFeedbackService({
       config,
-      lifecycleStore: new FileIssueLifecycleStore(issueConfig.workspace.stateDir),
-      client: createGitHubPullRequestClientForCapability(
-        config,
-        "github.review_feedback_write",
-        undefined,
-        loadedContext.issue.projectContextId,
-      ),
+      lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
+      client: createGitHubPullRequestClientForCapability(config, "github.review_feedback_write"),
     });
-
     const context: ReviewFeedbackActiveContext = {
       issue: loadedContext.issue,
       activeRunId: loadedContext.activeRunId,
@@ -68,7 +60,6 @@ export async function submitReviewFeedbackFromMcp(input: unknown, options: {
       phase: loadedContext.phase,
     };
     const result = await service.submit_pull_request_review_feedback(input, context);
-
     return {
       accepted: result.accepted,
       replayed: result.replayed,

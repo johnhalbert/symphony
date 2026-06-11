@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { parseServiceConfig, serviceConfigForProjectContext } from "../src/core/config/Config.js";
+import { parseServiceConfig } from "../src/core/config/Config.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import {
   createRuntimeTrackerClient,
@@ -69,66 +69,6 @@ describe("runtime dependency credential wiring", () => {
     });
 
     expect(authorizations).toEqual(["linear-writeback-secret", "linear-writeback-secret"]);
-  });
-
-  it("honors project-context runtime credential assignments after context resolution", async () => {
-    const config = runtimeProjectContextConfig();
-    const issueConfig = serviceConfigForProjectContext(config, "default");
-    const trackerAuthorizations: string[] = [];
-    const writebackAuthorizations: string[] = [];
-
-    expect(config.projectContexts.defaultContextId).toBe("docs");
-
-    await createRuntimeTrackerClient(
-      issueConfig,
-      async (_input, init) => {
-        trackerAuthorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
-        return jsonResponse({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
-      },
-      "default",
-    ).fetchCandidateIssues();
-
-    const processor = createRuntimeWritebackProcessor(
-      () => issueConfig,
-      new StructuredLogger(() => undefined),
-      async (_input, init) => {
-        writebackAuthorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
-        const body = JSON.parse(String(init?.body)) as { query?: string };
-        if (body.query?.includes("issueUpdate")) {
-          return jsonResponse({ data: { issueUpdate: { success: true } } });
-        }
-        return jsonResponse({
-          data: {
-            issue: {
-              id: "issue-1",
-              identifier: "DOCS-1",
-              state: { id: "state-ready", name: "Ready to Merge" },
-              team: { states: { nodes: [{ id: "state-done", name: "Done" }] } },
-              comments: { nodes: [] },
-            },
-          },
-        });
-      },
-      {},
-      "default",
-    );
-
-    await processor?.enqueueAndProcess({
-      kind: "transition",
-      idempotencyKey: "transition:issue-1:Done",
-      issueId: "issue-1",
-      payload: { toState: "Done", fromStates: ["Ready to Merge"] },
-    });
-
-    expect(trackerAuthorizations).toEqual(["docs-linear-tracker-secret"]);
-    expect(writebackAuthorizations).toEqual(["docs-linear-writeback-secret", "docs-linear-writeback-secret"]);
-    expect(resolveCursorRuntimeApiKey(issueConfig, "worker", "default")).toBe("docs-worker-cursor-secret");
-    expect(resolveStatusMutationToken(issueConfig, "default")).toBe("docs-open-workspace-secret");
-    expect(resolveRuntimeCredential(issueConfig, "worker", "hermes", "default")).toMatchObject({
-      capability: "runtime.hermes",
-      value: "docs-worker-hermes-secret",
-      profileName: "docs-worker-hermes",
-    });
   });
 
   it("rejects wrong-role-only service writeback assignments in runtime writeback construction", () => {
@@ -300,88 +240,6 @@ function runtimeConfig(
       LEGACY_OPEN_WORKSPACE_TOKEN: "legacy-open-secret",
       OPEN_WORKSPACE_PROFILE_TOKEN: "open-workspace-secret",
       ...overrides.env,
-    },
-  );
-}
-
-function runtimeProjectContextConfig() {
-  return parseServiceConfig(
-    {
-      tracker: { kind: "linear", api_key: "$DEFAULT_LINEAR_TOKEN", project_slug: "DEFAULT" },
-      workspace: {
-        root,
-        state_dir: path.join(root, "state"),
-        source: {
-          kind: "git_worktree",
-          repository: "../default-site",
-          base_ref: "origin/main",
-        },
-      },
-      writeback: { enabled: true, mode: "live" },
-      server: { open_workspace_token: "$LEGACY_OPEN_WORKSPACE_TOKEN" },
-      credential_profiles: {
-        profiles: {
-          "docs-linear-tracker": { value: "$DOCS_LINEAR_TRACKER_TOKEN", capabilities: ["linear.tracker"] },
-          "docs-linear-writeback": { value: "$DOCS_LINEAR_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
-          "docs-worker-cursor": { value: "$DOCS_WORKER_CURSOR_TOKEN", capabilities: ["runtime.cursor"] },
-          "docs-worker-hermes": { value: "$DOCS_WORKER_HERMES_TOKEN", capabilities: ["runtime.hermes"] },
-          "docs-open-workspace": { value: "$DOCS_OPEN_WORKSPACE_TOKEN", capabilities: ["server.open_workspace"] },
-        },
-      },
-      project_contexts: [
-        {
-          id: "default",
-          enabled: false,
-          tracker: { project_slug: "LEGACY" },
-          workspace: {
-            source: {
-              kind: "git_worktree",
-              repository: "../legacy-site",
-              base_ref: "origin/main",
-            },
-          },
-        },
-        {
-          id: "docs",
-          label: "Documentation Site",
-          tracker: {
-            api_key: "$DOCS_LINEAR_TOKEN",
-            project_slug: "DOCS",
-          },
-          workspace: {
-            source: {
-              kind: "git_worktree",
-              repository: "../docs-site",
-              base_ref: "origin/main",
-            },
-          },
-          credential_profiles: {
-            roles: {
-              worker: {
-                "linear.tracker": "docs-linear-tracker",
-                "runtime.cursor": "docs-worker-cursor",
-                "runtime.hermes": "docs-worker-hermes",
-                "server.open_workspace": "docs-open-workspace",
-              },
-              service: {
-                "linear.writeback": "docs-linear-writeback",
-              },
-            },
-          },
-        },
-      ],
-    },
-    path.join(root, "WORKFLOW.md"),
-    {
-      DEFAULT_LINEAR_TOKEN: "default-linear-secret",
-      DOCS_LINEAR_TOKEN: "docs-linear-legacy-secret",
-      DOCS_LINEAR_TRACKER_TOKEN: "docs-linear-tracker-secret",
-      DOCS_LINEAR_WRITEBACK_TOKEN: "docs-linear-writeback-secret",
-      CURSOR_API_KEY: "legacy-cursor-secret",
-      DOCS_WORKER_CURSOR_TOKEN: "docs-worker-cursor-secret",
-      DOCS_WORKER_HERMES_TOKEN: "docs-worker-hermes-secret",
-      LEGACY_OPEN_WORKSPACE_TOKEN: "legacy-open-secret",
-      DOCS_OPEN_WORKSPACE_TOKEN: "docs-open-workspace-secret",
     },
   );
 }

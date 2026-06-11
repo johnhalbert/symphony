@@ -20,8 +20,6 @@ export interface WorkspaceMetadata {
   workspaceKey: string;
   issueId: string | null;
   issueIdentifier: string;
-  projectContextId?: string;
-  projectContextLabel?: string | null;
   path: string;
   createdAt: string;
   updatedAt: string;
@@ -93,8 +91,6 @@ export class WorkspaceManager {
       workspaceKey,
       issueId: issue.id,
       issueIdentifier,
-      ...(issue.projectContextId === undefined ? {} : { projectContextId: issue.projectContextId }),
-      ...(issue.projectContextLabel === undefined ? {} : { projectContextLabel: issue.projectContextLabel }),
       path: workspacePath,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -196,8 +192,6 @@ export class WorkspaceManager {
       workspaceKey,
       issueId: issue.id,
       issueIdentifier,
-      ...(issue.projectContextId === undefined ? {} : { projectContextId: issue.projectContextId }),
-      ...(issue.projectContextLabel === undefined ? {} : { projectContextLabel: issue.projectContextLabel }),
       path: workspacePath,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -418,21 +412,13 @@ export interface WorkspaceIssue {
   id: string | null;
   identifier: string;
   branchName: string | null;
-  projectContextId?: string;
-  projectContextLabel?: string | null;
 }
 
-export type WorkspaceIssueInput = string | Pick<Issue, "id" | "identifier" | "branchName" | "projectContextId" | "projectContextLabel">;
+export type WorkspaceIssueInput = string | Pick<Issue, "id" | "identifier" | "branchName">;
 
 function normalizeIssueInput(input: WorkspaceIssueInput): WorkspaceIssue {
   if (typeof input === "string") return { id: null, identifier: input, branchName: null };
-  return {
-    id: input.id,
-    identifier: input.identifier,
-    branchName: input.branchName,
-    ...(input.projectContextId === undefined ? {} : { projectContextId: input.projectContextId }),
-    ...(input.projectContextLabel === undefined ? {} : { projectContextLabel: input.projectContextLabel }),
-  };
+  return { id: input.id, identifier: input.identifier, branchName: input.branchName };
 }
 
 export function sanitizeWorkspaceKey(identifier: string): string {

@@ -120,11 +120,11 @@ export class MergePolicyService {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service-owned writeback");
     }
 
-    const serviceLinear = resolveLinearClientConfig(config, "linear.writeback", issue.projectContextId).credential;
+    const serviceLinear = resolveLinearClientConfig(config, "linear.writeback").credential;
     if (!serviceLinear) {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service linear.writeback credentials");
     }
-    const serviceMergeConfig = resolveGitHubClientConfig(config, "github.merge", issue.projectContextId);
+    const serviceMergeConfig = resolveGitHubClientConfig(config, "github.merge");
     const serviceMerge = serviceMergeConfig.credential;
     if (!serviceMerge && serviceMergeConfig.github.app === null) {
       throw new SymphonyError(
@@ -162,9 +162,7 @@ export class MergePolicyService {
     const resolvedConflict = resolvedMergeConflictForIssue(latestIssue, lifecycle, config);
     const pullRequest = resolvedConflict ? pullRequestRefForResolvedConflict(resolvedConflict) : approvedPullRequest;
     const headSha = requireValue(pullRequest.headSha, "Completion report pull request head SHA is required for gated merge");
-    const github =
-      this.options.client ??
-      createGitHubPullRequestClientForCapability(config, "github.merge", undefined, issue.projectContextId);
+    const github = this.options.client ?? createGitHubPullRequestClientForCapability(config, "github.merge");
     const livePullRequest = await github.getPullRequest({ pullRequestNumber: requireNumber(pullRequest.number) });
     validateLivePullRequestMetadata(livePullRequest, pullRequest, headSha);
     if (livePullRequest.headSha !== headSha) {

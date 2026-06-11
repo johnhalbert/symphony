@@ -1,6 +1,6 @@
 import type { Logger } from "../core/logging/StructuredLogger.js";
 import type { AgentRunRole, TrackerStateLists } from "../core/types.js";
-import { resolveProjectContextIdForConfig, type ServiceConfig } from "../core/config/Config.js";
+import type { ServiceConfig } from "../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../core/config/CredentialProfiles.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import { FileIssueLifecycleStore, type IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
@@ -10,12 +10,8 @@ import { createLinearTrackerClientForCapability } from "../integrations/linear/L
 
 type FetchLike = typeof fetch;
 
-export function createRuntimeTrackerClient(
-  config: ServiceConfig,
-  fetchImpl?: FetchLike,
-  projectContextId?: string | null,
-) {
-  return createLinearTrackerClientForCapability(config, "linear.tracker", fetchImpl, projectContextId);
+export function createRuntimeTrackerClient(config: ServiceConfig, fetchImpl?: FetchLike) {
+  return createLinearTrackerClientForCapability(config, "linear.tracker", fetchImpl);
 }
 
 export function createRuntimeWritebackProcessor(
@@ -26,21 +22,20 @@ export function createRuntimeWritebackProcessor(
     outboxStore?: FileWritebackOutboxStore;
     lifecycleStore?: Pick<IssueLifecycleStore, "get">;
   } = {},
-  projectContextId?: string | null,
 ): WritebackProcessor | undefined {
   const getConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
   const config = getConfig();
   if (!config.writeback.enabled) return undefined;
   return new WritebackProcessor(
     stores.outboxStore ?? new FileWritebackOutboxStore(config.workspace.stateDir),
-    createLinearTrackerClientForCapability(config, "linear.writeback", fetchImpl, projectContextId),
+    createLinearTrackerClientForCapability(config, "linear.writeback", fetchImpl),
     logger,
     config.writeback.maxBackoffMs,
     stores.lifecycleStore ?? new FileIssueLifecycleStore(config.workspace.stateDir),
     config.writeback.mode === "dry_run",
     {
       getConfig,
-      resolveIssue: (issueId) => resolveIssueForBreakdownFreshness(issueId, getConfig, fetchImpl, projectContextId),
+      resolveIssue: (issueId) => resolveIssueForBreakdownFreshness(issueId, getConfig, fetchImpl),
     },
   );
 }
@@ -49,10 +44,9 @@ export async function resolveIssueForBreakdownFreshness(
   issueId: string,
   getConfig: () => ServiceConfig,
   fetchImpl?: FetchLike,
-  projectContextId?: string | null,
 ): Promise<IssueBreakdownIssueLookupResult> {
   try {
-    const tracker = createRuntimeTrackerClient(getConfig(), fetchImpl, projectContextId);
+    const tracker = createRuntimeTrackerClient(getConfig(), fetchImpl);
     const issue = (await tracker.fetchIssueStatesByIds([issueId]))[0];
     return issue ? { status: "ok", issue } : { status: "not_found" };
   } catch (error) {
@@ -60,75 +54,44 @@ export async function resolveIssueForBreakdownFreshness(
   }
 }
 
-export function resolveCursorRuntimeApiKey(
-  config: ServiceConfig,
-  role: AgentRunRole,
-  projectContextId?: string | null,
-): string | null {
-  return resolveRuntimeApiKey(config, role, "cursor", projectContextId);
+export function resolveCursorRuntimeApiKey(config: ServiceConfig, role: AgentRunRole): string | null {
+  return resolveRuntimeApiKey(config, role, "cursor");
 }
 
-export function resolveCursorRuntimeCredential(
-  config: ServiceConfig,
-  role: AgentRunRole,
-  projectContextId?: string | null,
-): ResolvedCredential | null {
-  return resolveRuntimeCredential(config, role, "cursor", projectContextId);
+export function resolveCursorRuntimeCredential(config: ServiceConfig, role: AgentRunRole): ResolvedCredential | null {
+  return resolveRuntimeCredential(config, role, "cursor");
 }
 
-export function resolveRuntimeApiKey(
-  config: ServiceConfig,
-  role: AgentRunRole,
-  harnessId: string,
-  projectContextId?: string | null,
-): string | null {
-  return resolveRuntimeCredential(config, role, harnessId, projectContextId)?.value ?? null;
+export function resolveRuntimeApiKey(config: ServiceConfig, role: AgentRunRole, harnessId: string): string | null {
+  return resolveRuntimeCredential(config, role, harnessId)?.value ?? null;
 }
 
 export function resolveRuntimeCredential(
   config: ServiceConfig,
   role: AgentRunRole,
   harnessId: string,
-  projectContextId?: string | null,
 ): ResolvedCredential | null {
-  const resolvedProjectContextId = resolveProjectContextIdForConfig(config, projectContextId);
   if (harnessId === "cursor") {
-    enforceCapabilityOwner(config, role, "runtime.cursor", "CURSOR_API_KEY", resolvedProjectContextId);
+    enforceCapabilityOwner(config, role, "runtime.cursor", "CURSOR_API_KEY");
     return (
-      config.credentialProfiles.resolveForRole(role, "runtime.cursor", resolvedProjectContextId) ??
-      config.credentialProfiles.resolveForRole(role, "cursor.runtime", resolvedProjectContextId)
+      config.credentialProfiles.resolveForRole(role, "runtime.cursor") ??
+      config.credentialProfiles.resolveForRole(role, "cursor.runtime")
     );
   }
   if (harnessId === "hermes") {
-    enforceCapabilityOwner(
-      config,
-      role,
-      "runtime.hermes",
-      "runtime.hermes credential profile",
-      resolvedProjectContextId,
-    );
-    return config.credentialProfiles.resolveForRole(role, "runtime.hermes", resolvedProjectContextId);
+    enforceCapabilityOwner(config, role, "runtime.hermes", "runtime.hermes credential profile");
+    return config.credentialProfiles.resolveForRole(role, "runtime.hermes");
   }
   return null;
 }
 
-export function resolveStatusMutationToken(config: ServiceConfig, projectContextId?: string | null): string | null {
-  return resolveStatusMutationCredential(config, projectContextId)?.value ?? null;
+export function resolveStatusMutationToken(config: ServiceConfig): string | null {
+  return resolveStatusMutationCredential(config)?.value ?? null;
 }
 
-export function resolveStatusMutationCredential(
-  config: ServiceConfig,
-  projectContextId?: string | null,
-): ResolvedCredential | null {
-  const resolvedProjectContextId = resolveProjectContextIdForConfig(config, projectContextId);
-  enforceCapabilityOwner(
-    config,
-    "worker",
-    "server.open_workspace",
-    "server.open_workspace_token",
-    resolvedProjectContextId,
-  );
-  return config.credentialProfiles.resolveForRole("worker", "server.open_workspace", resolvedProjectContextId);
+export function resolveStatusMutationCredential(config: ServiceConfig): ResolvedCredential | null {
+  enforceCapabilityOwner(config, "worker", "server.open_workspace", "server.open_workspace_token");
+  return config.credentialProfiles.resolveForRole("worker", "server.open_workspace");
 }
 
 export function resolveTrackerStateLists(config: ServiceConfig): TrackerStateLists {
@@ -146,10 +109,9 @@ function enforceCapabilityOwner(
   owner: CredentialRole,
   capability: CredentialCapability,
   legacyFallbackLabel: string,
-  projectContextId?: string | null,
 ): void {
-  const assignedRoles = config.credentialProfiles.assignmentRolesFor(capability, projectContextId);
-  if (config.credentialProfiles.hasAssignment(owner, capability, projectContextId) || assignedRoles.length === 0) return;
+  const assignedRoles = config.credentialProfiles.assignmentRolesFor(capability);
+  if (config.credentialProfiles.hasAssignment(owner, capability) || assignedRoles.length === 0) return;
   throw new SymphonyError(
     "config_validation_error",
     `Credential capability ${capability} is owned by ${owner}, but is assigned only to ${assignedRoles.join(

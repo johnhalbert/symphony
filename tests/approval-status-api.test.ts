@@ -1640,7 +1640,6 @@ describe("approval status API", () => {
       terminalRecords,
       operatorApproval: {
         rejectPolicy: "cancel",
-        rejectPolicyForProjectContext: () => "cancel",
         isRequired: () => true,
         async get() {
           throw new Error("approval store read failed");

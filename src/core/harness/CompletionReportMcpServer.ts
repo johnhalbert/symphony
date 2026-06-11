@@ -69,7 +69,6 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
             logger,
             undefined,
             { outboxStore: writebackOutbox, lifecycleStore },
-            loadedContext.issue.projectContextId,
           )
         : undefined;
     const operatorApproval = new OperatorApprovalService({

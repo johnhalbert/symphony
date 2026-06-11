@@ -1,9 +1,4 @@
-import {
-  resolveProjectContextIdForConfig,
-  serviceConfigForProjectContext,
-  type ServiceConfig,
-  type TrackerConfig,
-} from "../../core/config/Config.js";
+import type { ServiceConfig, TrackerConfig } from "../../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../../core/config/CredentialProfiles.js";
 import { SymphonyError } from "../../core/errors.js";
 import { LinearTrackerClient } from "./LinearTrackerClient.js";
@@ -27,17 +22,14 @@ export interface ResolvedLinearClientConfig {
 export function resolveLinearClientConfig(
   config: ServiceConfig,
   capability: LinearCredentialCapability,
-  projectContextId?: string | null,
 ): ResolvedLinearClientConfig {
   const role = LINEAR_CREDENTIAL_CAPABILITY_OWNERS[capability];
   if (!role) {
     throw new SymphonyError("config_validation_error", `Unsupported Linear credential capability: ${capability}`);
   }
 
-  const resolvedProjectContextId = resolveProjectContextIdForConfig(config, projectContextId);
-  const contextualConfig = serviceConfigForProjectContext(config, resolvedProjectContextId);
-  const assignedRoles = contextualConfig.credentialProfiles.assignmentRolesFor(capability, resolvedProjectContextId);
-  if (!contextualConfig.credentialProfiles.hasAssignment(role, capability, resolvedProjectContextId) && assignedRoles.length > 0) {
+  const assignedRoles = config.credentialProfiles.assignmentRolesFor(capability);
+  if (!config.credentialProfiles.hasAssignment(role, capability) && assignedRoles.length > 0) {
     throw new SymphonyError(
       "config_validation_error",
       `Linear credential capability ${capability} is owned by ${role}, but is assigned only to ${assignedRoles.join(
@@ -46,13 +38,13 @@ export function resolveLinearClientConfig(
     );
   }
 
-  const credential = contextualConfig.credentialProfiles.resolveForRole(role, capability, resolvedProjectContextId);
+  const credential = config.credentialProfiles.resolveForRole(role, capability);
   return {
     capability,
     role,
     tracker: {
-      ...contextualConfig.tracker,
-      apiKey: credential?.value ?? contextualConfig.tracker.apiKey,
+      ...config.tracker,
+      apiKey: credential?.value ?? config.tracker.apiKey,
     },
     credential,
   };
@@ -62,7 +54,6 @@ export function createLinearTrackerClientForCapability(
   config: ServiceConfig,
   capability: LinearCredentialCapability,
   fetchImpl?: FetchLike,
-  projectContextId?: string | null,
 ): LinearTrackerClient {
-  return new LinearTrackerClient(resolveLinearClientConfig(config, capability, projectContextId).tracker, fetchImpl);
+  return new LinearTrackerClient(resolveLinearClientConfig(config, capability).tracker, fetchImpl);
 }
