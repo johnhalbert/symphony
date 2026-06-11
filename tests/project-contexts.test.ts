@@ -142,7 +142,54 @@ describe("project context normalization", () => {
     });
   });
 
-  it("redacts unexpected tracker and workspace fields from public metadata", () => {
+  it.each([
+    {
+      label: "userinfo url",
+      repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+      expectedRepository: "https://example.com/org/docs.git",
+      forbiddenSubstrings: ["repo-secret", "x-access-token"],
+    },
+    {
+      label: "query url",
+      repository: "https://example.com/org/docs.git?token=query-secret",
+      expectedRepository: "https://example.com/org/docs.git",
+      forbiddenSubstrings: ["query-secret", "token=query-secret"],
+    },
+    {
+      label: "fragment url",
+      repository: "https://example.com/org/docs.git#fragment-secret",
+      expectedRepository: "https://example.com/org/docs.git",
+      forbiddenSubstrings: ["fragment-secret", "#fragment-secret"],
+    },
+    {
+      label: "pathless url",
+      repository: "https://repo-secret@example.com",
+      expectedRepository: "https://example.com/",
+      forbiddenSubstrings: ["repo-secret"],
+    },
+    {
+      label: "single-label value",
+      repository: "repo-secret",
+      expectedRepository: null,
+      forbiddenSubstrings: ["repo-secret"],
+    },
+    {
+      label: "ambiguous at-sign slash form",
+      repository: "repo-secret@example.com/org/docs.git",
+      expectedRepository: "example.com/org/docs.git",
+      forbiddenSubstrings: ["repo-secret"],
+    },
+    {
+      label: "scp-like at-sign form",
+      repository: "repo-secret@docs:org/docs.git?token=query-secret",
+      expectedRepository: "docs:org/docs.git",
+      forbiddenSubstrings: ["repo-secret", "query-secret"],
+    },
+  ])("sanitizes $label repository summaries and drops unexpected fields from public metadata", ({
+    repository,
+    expectedRepository,
+    forbiddenSubstrings,
+  }) => {
     const metadata = projectContextMetadataForPublicRead({
       id: "docs",
       label: "Documentation Site",
@@ -153,7 +200,7 @@ describe("project context normalization", () => {
         checkoutToken: "workspace-secret",
         source: {
           kind: "git_worktree",
-          repository: "../docs-site",
+          repository,
           path: "packages/site",
           branch: "secret-branch",
         },
@@ -170,7 +217,7 @@ describe("project context normalization", () => {
       linearProjectSlug: "DOCS",
       workspaceRoot: null,
       workspaceSourceKind: "git_worktree",
-      repository: "../docs-site",
+      repository: expectedRepository,
       path: "packages/site",
     });
     expect(Object.keys(metadata).sort()).toEqual([
@@ -183,6 +230,74 @@ describe("project context normalization", () => {
       "workspaceRoot",
       "workspaceSourceKind",
     ]);
+    const serialized = JSON.stringify(metadata);
+    expect(serialized).not.toContain("linear-secret");
+    expect(serialized).not.toContain("workspace-secret");
+    expect(serialized).not.toContain("secret-branch");
+    for (const fragment of forbiddenSubstrings) {
+      expect(serialized).not.toContain(fragment);
+    }
+  });
+
+  it("sanitizes credential-bearing repository/source forms in normalized workflow-config public metadata", () => {
+    const cases = [
+      {
+        id: "docs-userinfo",
+        repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+        expectedRepository: "https://example.com/org/docs.git",
+        forbiddenSubstrings: ["repo-secret", "x-access-token"],
+      },
+      {
+        id: "docs-query",
+        repository: "https://example.com/org/docs.git?token=query-secret",
+        expectedRepository: "https://example.com/org/docs.git",
+        forbiddenSubstrings: ["query-secret"],
+      },
+      {
+        id: "docs-fragment",
+        repository: "https://example.com/org/docs.git#fragment-secret",
+        expectedRepository: "https://example.com/org/docs.git",
+        forbiddenSubstrings: ["fragment-secret"],
+      },
+      {
+        id: "docs-pathless",
+        repository: "https://repo-secret@example.com",
+        expectedRepository: "https://example.com/",
+        forbiddenSubstrings: ["repo-secret"],
+      },
+      {
+        id: "docs-single-label",
+        repository: "ssh://repo-secret@docs/org/docs.git?token=query-secret",
+        expectedRepository: "ssh://docs/org/docs.git",
+        forbiddenSubstrings: ["repo-secret", "query-secret"],
+      },
+      {
+        id: "docs-ambiguous",
+        repository: "repo-secret@docs:org/docs.git#fragment-secret",
+        expectedRepository: "docs:org/docs.git",
+        forbiddenSubstrings: ["repo-secret", "fragment-secret"],
+      },
+    ] as const;
+
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          ...cases.map((testCase) => projectContextFixture({ id: testCase.id, repository: testCase.repository })),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+
+    for (const testCase of cases) {
+      const context = config.projectContexts.byId.get(testCase.id);
+      expect(context?.publicMetadata.repository).toBe(testCase.expectedRepository);
+      const serialized = JSON.stringify(context?.publicMetadata ?? null);
+      for (const fragment of testCase.forbiddenSubstrings) {
+        expect(serialized).not.toContain(fragment);
+      }
+    }
   });
 
   it("normalizes legacy top-level config into an explicit default project context", () => {

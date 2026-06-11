@@ -264,7 +264,7 @@ export function projectContextMetadataForPublicRead(input: {
     linearProjectSlug: normalizeOptionalNonEmptyString(input.tracker?.projectSlug),
     workspaceRoot: normalizeOptionalNonEmptyString(input.workspace?.root),
     workspaceSourceKind: normalizeOptionalNonEmptyString(input.workspace?.source?.kind),
-    repository: normalizeOptionalNonEmptyString(input.workspace?.source?.repository),
+    repository: publicRepositorySummary(input.workspace?.source?.repository),
     path: normalizeOptionalNonEmptyString(input.workspace?.source?.path),
   };
 }
@@ -463,6 +463,89 @@ function normalizeOptionalNonEmptyString(value: string | null | undefined): stri
   if (value === null || value === undefined) return null;
   const normalized = value.trim();
   return normalized.length === 0 ? null : normalized;
+}
+
+function publicRepositorySummary(value: string | null | undefined): string | null {
+  const normalized = normalizeOptionalNonEmptyString(value);
+  if (normalized === null) return null;
+
+  const sanitizedUrl = sanitizedUrlRepositorySummary(normalized);
+  if (sanitizedUrl !== null) return sanitizedUrl;
+
+  const sanitizedScp = sanitizedScpLikeRepositorySummary(normalized);
+  if (sanitizedScp !== null) return sanitizedScp;
+
+  const sanitizedAtSign = sanitizedAtSignRepositorySummary(normalized);
+  if (sanitizedAtSign !== null) return sanitizedAtSign;
+
+  const strippedSuffix = stripRepositoryQueryAndFragment(normalized);
+  if (strippedSuffix !== normalized) return publicRepositorySummary(strippedSuffix);
+
+  if (looksLikeLocalRepositoryPath(normalized)) return normalized;
+  if (looksLikeHostIdentifier(normalized)) return normalized;
+  return null;
+}
+
+function sanitizedUrlRepositorySummary(value: string): string | null {
+  if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(value)) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+
+  const pathname = parsed.pathname.length === 0 ? "/" : parsed.pathname;
+  if (parsed.host.length === 0) return `${parsed.protocol}//${pathname}`;
+  return `${parsed.protocol}//${parsed.host}${pathname}`;
+}
+
+function sanitizedScpLikeRepositorySummary(value: string): string | null {
+  const match = /^([^@\s/:]+)@([^:\s/]+):(.+)$/u.exec(value);
+  if (!match) return null;
+
+  const host = normalizeOptionalNonEmptyString(match[2]);
+  const repositoryPath = normalizeOptionalNonEmptyString(stripRepositoryQueryAndFragment(match[3] ?? ""));
+  if (host === null) return null;
+  if (repositoryPath === null) return host;
+  return `${host}:${repositoryPath}`;
+}
+
+function sanitizedAtSignRepositorySummary(value: string): string | null {
+  const slashMatch = /^([^@\s/]+)@([^/\s?#]+)\/(.+)$/u.exec(value);
+  if (slashMatch) {
+    const host = normalizeOptionalNonEmptyString(slashMatch[2]);
+    const repositoryPath = normalizeOptionalNonEmptyString(stripRepositoryQueryAndFragment(slashMatch[3] ?? ""));
+    if (host === null) return null;
+    if (repositoryPath === null) return host;
+    return `${host}/${repositoryPath}`;
+  }
+
+  const hostOnlyMatch = /^([^@\s]+)@([^/\s?#:]+(?:\.[^/\s?#:]+)*)$/u.exec(value);
+  if (!hostOnlyMatch) return null;
+  return normalizeOptionalNonEmptyString(hostOnlyMatch[2]);
+}
+
+function stripRepositoryQueryAndFragment(value: string): string {
+  return value.replace(/[?#].*$/u, "");
+}
+
+function looksLikeLocalRepositoryPath(value: string): boolean {
+  return (
+    value.startsWith(".") ||
+    value.startsWith("~") ||
+    value.startsWith("/") ||
+    value.startsWith("\\") ||
+    /^[A-Za-z]:[\\/]/u.test(value) ||
+    /[\\/]/u.test(value)
+  );
+}
+
+function looksLikeHostIdentifier(value: string): boolean {
+  if (/[\s@]/u.test(value)) return false;
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(value)) return false;
+  return /[.:\[]/u.test(value);
 }
 
 function readIssueRoutingFields(issue: unknown): {
