@@ -239,7 +239,7 @@ export class FileOperatorApprovalStore {
     const runProjectContext = projectContext ?? (await this.readRunProjectContext(existing.runId));
     const repaired = normalizeOperatorApprovalRecord({
       ...existing,
-      projectContext: normalizeProjectContextResolution(runProjectContext),
+      projectContext: projectContextBackfillSource(raw, runProjectContext, existing.projectContext),
     });
     await this.write(repaired);
     return repaired;
@@ -580,7 +580,44 @@ function normalizeOperatorApprovalRecord(record: OperatorApprovalRecord): Operat
 }
 
 function needsProjectContextBackfill(record: Record<string, unknown> | null): boolean {
-  return record !== null && (!Object.prototype.hasOwnProperty.call(record, "projectContext") || record.projectContext === null);
+  if (record === null) return false;
+  if (!Object.prototype.hasOwnProperty.call(record, "projectContext") || record.projectContext === null) return true;
+  if (typeof record.projectContext !== "object") return true;
+
+  const projectContext = record.projectContext as Record<string, unknown>;
+  return (
+    !hasNonEmptyString(projectContext.projectContextId) ||
+    !hasNonEmptyString(projectContext.projectContextLabel) ||
+    !hasNonEmptyString(projectContext.routingSource) ||
+    !Object.prototype.hasOwnProperty.call(projectContext, "linearProjectSlug") ||
+    !hasNullableString(projectContext.linearProjectSlug)
+  );
+}
+
+function projectContextBackfillSource(
+  record: Record<string, unknown> | null,
+  runProjectContext: ProjectContextResolution | undefined,
+  existingProjectContext: ProjectContextResolution | undefined,
+): ProjectContextResolution {
+  if (runProjectContext) return normalizeProjectContextResolution(runProjectContext);
+  const recordProjectContext = readProjectContextRecord(record);
+  if (recordProjectContext) return normalizeProjectContextResolution(recordProjectContext);
+  return normalizeProjectContextResolution(existingProjectContext);
+}
+
+function readProjectContextRecord(record: Record<string, unknown> | null): Partial<ProjectContextResolution> | undefined {
+  if (record === null || typeof record.projectContext !== "object" || record.projectContext === null) {
+    return undefined;
+  }
+  return record.projectContext as Partial<ProjectContextResolution>;
+}
+
+function hasNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function hasNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
 }
 
 function matchesProjectContext(
