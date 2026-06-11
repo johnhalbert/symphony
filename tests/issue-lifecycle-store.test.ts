@@ -284,7 +284,7 @@ describe("FileIssueLifecycleStore", () => {
     });
   });
 
-  it("backfills and propagates durable project context attribution", async () => {
+  it("backfills project context attribution and falls back historical lifecycle metadata without mutating stored records", async () => {
     const store = new FileIssueLifecycleStore(root);
     const docsProjectContext = {
       projectContextId: " Docs Site ",
@@ -298,11 +298,49 @@ describe("FileIssueLifecycleStore", () => {
       linearProjectSlug: "DOCS",
       routingSource: "candidate_poll",
     } as const;
+    const legacyDefaultProjectContext = {
+      projectContextId: "default",
+      projectContextLabel: "Default",
+      linearProjectSlug: null,
+      routingSource: "legacy_default",
+    } as const;
 
     await store.ensureIssue(issue(), {
       projectContext: docsProjectContext,
       lastCompletionReportId: "report-1",
       lastReviewVerdictId: "verdict-1",
+      issueBreakdownPlans: [
+        {
+          id: "plan-1",
+          idempotencyKey: "plan-key",
+          requestHash: "plan-hash",
+          runId: "planner-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Split documentation updates into smaller issues.",
+          proposedIssues: [
+            {
+              title: "Add docs API examples",
+              description: "Document the docs-site API examples.",
+              acceptanceCriteria: ["Examples are documented"],
+              dependencies: [],
+              labels: ["docs"],
+            },
+          ],
+          transcriptPointers: ["/api/v1/runs/planner-run-1/transcript"],
+          statusApiPointers: ["/api/v1/issues/TEST-1"],
+          issueUpdatedAt: "2026-01-01T00:00:00.000Z",
+          issueContentFingerprint: "fingerprint-1",
+          configFingerprint: "config-fingerprint-1",
+          cursorMode: "review",
+          acceptedAt: "2026-01-01T00:00:15.000Z",
+          applicationStatus: "not_requested",
+          applicationOperationKeys: [],
+          createdIssueRefs: [],
+          appliedAt: null,
+          applicationBlockedReason: null,
+        },
+      ],
       completionReports: [
         {
           id: "report-1",
@@ -337,6 +375,24 @@ describe("FileIssueLifecycleStore", () => {
           writebackOperationKeys: [],
         },
       ],
+      reviewFeedback: [
+        {
+          id: "feedback-1",
+          idempotencyKey: "feedback-key",
+          requestHash: "feedback-hash",
+          runId: "reviewer-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          kind: "review",
+          event: "APPROVE",
+          body: "Approved after context propagation review.",
+          pullRequest: { url: null, number: null, headSha: null, branch: null },
+          reviewer: "reviewer:run",
+          reviewUrl: null,
+          commentUrls: [],
+          submittedAt: "2026-01-01T00:01:30.000Z",
+        },
+      ],
       mergeConflictResolutionReports: [
         {
           id: "merge-report-1",
@@ -363,10 +419,13 @@ describe("FileIssueLifecycleStore", () => {
     const reloaded = await store.get("TEST-1");
     expect(reloaded).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(reloaded?.summaryPointers).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.issueBreakdownPlans[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(reloaded?.completionReports[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(reloaded?.reviewVerdicts[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.reviewFeedback[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(reloaded?.mergeConflictResolutionReports[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(reloaded?.handoff.memo).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.handoff.memo.pointers).toMatchObject({ projectContext: normalizedDocsProjectContext });
     expect(buildWorkerHandoffPacket(reloaded!, "2026-01-01T00:03:00.000Z")).toMatchObject({
       projectContext: normalizedDocsProjectContext,
       pointers: {
@@ -374,41 +433,58 @@ describe("FileIssueLifecycleStore", () => {
       },
     });
 
-    await store.ensureIssue(issue({ id: "issue-legacy", identifier: "LEGACY-1" }), { phase: "implementation" });
-    const legacyPath = path.join(root, "issue-lifecycle", "issue-legacy.json");
+    const legacyPath = path.join(root, "issue-lifecycle", "issue-1.json");
     const legacyRecord = JSON.parse(await nodeFs.readFile(legacyPath, "utf8")) as Record<string, unknown>;
     delete legacyRecord.projectContext;
+    const summaryPointers = legacyRecord.summaryPointers as Record<string, unknown> | undefined;
+    summaryPointers && delete summaryPointers.projectContext;
+    const issueBreakdownPlans = legacyRecord.issueBreakdownPlans as Array<Record<string, unknown>> | undefined;
+    issueBreakdownPlans?.forEach((plan) => delete plan.projectContext);
+    const completionReports = legacyRecord.completionReports as Array<Record<string, unknown>> | undefined;
+    completionReports?.forEach((report) => delete report.projectContext);
+    const reviewVerdicts = legacyRecord.reviewVerdicts as Array<Record<string, unknown>> | undefined;
+    reviewVerdicts?.forEach((verdict) => delete verdict.projectContext);
+    const reviewFeedback = legacyRecord.reviewFeedback as Array<Record<string, unknown>> | undefined;
+    reviewFeedback?.forEach((feedback) => delete feedback.projectContext);
+    const mergeConflictResolutionReports = legacyRecord.mergeConflictResolutionReports as Array<Record<string, unknown>> | undefined;
+    mergeConflictResolutionReports?.forEach((report) => delete report.projectContext);
     const handoff = legacyRecord.handoff as { memo?: Record<string, unknown> } | undefined;
-    handoff?.memo && delete handoff.memo.projectContext;
+    if (handoff?.memo) {
+      delete handoff.memo.projectContext;
+      const handoffPointers = handoff.memo.pointers as Record<string, unknown> | undefined;
+      handoffPointers && delete handoffPointers.projectContext;
+    }
     await writeFile(legacyPath, `${JSON.stringify(legacyRecord, null, 2)}
 `, "utf8");
+    const beforeRead = await nodeFs.readFile(legacyPath, "utf8");
 
-    await expect(store.get("LEGACY-1")).resolves.toMatchObject({
-      projectContext: {
-        projectContextId: "default",
-        projectContextLabel: "Default",
-        linearProjectSlug: null,
-        routingSource: "legacy_default",
-      },
+    const legacyReloaded = await store.get("TEST-1");
+    expect(legacyReloaded).toMatchObject({
+      projectContext: legacyDefaultProjectContext,
       summaryPointers: {
-        projectContext: {
-          projectContextId: "default",
-          projectContextLabel: "Default",
-          linearProjectSlug: null,
-          routingSource: "legacy_default",
-        },
+        projectContext: legacyDefaultProjectContext,
       },
+      issueBreakdownPlans: [{ projectContext: legacyDefaultProjectContext }],
+      completionReports: [{ projectContext: legacyDefaultProjectContext }],
+      reviewVerdicts: [{ projectContext: legacyDefaultProjectContext }],
+      reviewFeedback: [{ projectContext: legacyDefaultProjectContext }],
+      mergeConflictResolutionReports: [{ projectContext: legacyDefaultProjectContext }],
       handoff: {
         memo: {
-          projectContext: {
-            projectContextId: "default",
-            projectContextLabel: "Default",
-            linearProjectSlug: null,
-            routingSource: "legacy_default",
+          projectContext: legacyDefaultProjectContext,
+          pointers: {
+            projectContext: legacyDefaultProjectContext,
           },
         },
       },
     });
+    expect(buildWorkerHandoffPacket(legacyReloaded!, "2026-01-01T00:04:00.000Z")).toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+      pointers: {
+        projectContext: legacyDefaultProjectContext,
+      },
+    });
+    expect(await nodeFs.readFile(legacyPath, "utf8")).toBe(beforeRead);
   });
 
 

@@ -1150,6 +1150,44 @@ async function seedLegacyProjectContextAttributionRows(containerName: string): P
           '{"lastTranscriptEventAt":"2026-06-01T00:00:00.000Z"}'::jsonb,
           '{"scenario":"legacy-project-context-upgrade"}'::jsonb
         ) returning run_id
+      ), inserted_run_activity_event as (
+        insert into symphony.run_activity_event (
+          event_id,
+          run_id,
+          session_id,
+          run_session_id,
+          sequence,
+          sequence_source,
+          event_at,
+          protocol,
+          harness_id,
+          external_event_id,
+          actor,
+          channel,
+          kind,
+          text,
+          text_char_count,
+          payload,
+          metadata
+        ) values (
+          'activity:legacy-context-upgrade:1',
+          'run:legacy-context-upgrade',
+          'session:legacy-context-upgrade',
+          'run:legacy-context-upgrade:session:legacy-context-upgrade',
+          1,
+          'harness',
+          now(),
+          'symphony',
+          'hermes',
+          'external:legacy-context-upgrade:1',
+          'assistant',
+          'lifecycle',
+          'run_started',
+          'Legacy project context upgrade activity',
+          39,
+          '{"status":"running"}'::jsonb,
+          '{"scenario":"legacy-project-context-upgrade"}'::jsonb
+        ) returning run_activity_event_id
       ), inserted_chat_message as (
         insert into symphony.chat_message (
           message_id,
@@ -1430,6 +1468,7 @@ async function seedLegacyProjectContextAttributionRows(containerName: string): P
         'workspace', (select count(*) from inserted_workspace),
         'issue', (select count(*) from inserted_issue),
         'run_session', (select count(*) from inserted_run),
+        'run_activity_event', (select count(*) from inserted_run_activity_event),
         'chat_message', (select count(*) from inserted_chat_message),
         'writeback_operation', (select count(*) from inserted_writeback),
         'approval_request', (select count(*) from inserted_approval),
@@ -1458,6 +1497,7 @@ async function seedLegacyProjectContextAttributionRows(containerName: string): P
     workspace: 1,
     issue: 1,
     run_session: 1,
+    run_activity_event: 1,
     chat_message: 1,
     writeback_operation: 1,
     approval_request: 1,
@@ -1636,6 +1676,11 @@ async function expectLegacyProjectContextAttributionMigrated(containerName: stri
           select project_context_id
           from symphony.run_session
           where run_id = 'run:legacy-context-upgrade'
+        ),
+        'run_activity_event', (
+          select project_context_id
+          from symphony.run_activity_event
+          where event_id = 'activity:legacy-context-upgrade:1'
         ),
         'chat_message', (
           select project_context_id
