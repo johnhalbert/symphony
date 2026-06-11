@@ -1058,6 +1058,197 @@ describe("MCP subprocess environment", () => {
     expect(childConfig.workspace).toEqual(config.workspace);
   });
 
+  it("preserves inherited top-level git_worktree parse refs when the default context overrides them", () => {
+    const rawConfig = {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_PROFILED_KEY",
+        project_slug: "$ROOT_PROJECT",
+        assignee: "$ROOT_ASSIGNEE",
+      },
+      workspace: {
+        root: "$ROOT_WORKSPACE_ROOT",
+        state_dir: "$ROOT_STATE_DIR",
+        source: {
+          kind: "git_worktree",
+          path: "$ROOT_SOURCE_PATH",
+          repository: "$ROOT_REPOSITORY",
+          base_ref: "$ROOT_BASE_REF",
+          branch_template: "$ROOT_BRANCH_TEMPLATE",
+          cache_path: "$ROOT_CACHE_PATH",
+        },
+      },
+      project_contexts: [
+        {
+          id: "symphony",
+          tracker: {
+            kind: "linear",
+            project_slug: "$DEFAULT_PROJECT",
+            assignee: "$DEFAULT_ASSIGNEE",
+          },
+          workspace: {
+            root: "$DEFAULT_WORKSPACE_ROOT",
+            state_dir: "$DEFAULT_STATE_DIR",
+            source: {
+              kind: "git_worktree",
+              path: "$DEFAULT_SOURCE_PATH",
+              repository: "$DEFAULT_REPOSITORY",
+              base_ref: "$DEFAULT_BASE_REF",
+              branch_template: "$DEFAULT_BRANCH_TEMPLATE",
+              cache_path: "$DEFAULT_CACHE_PATH",
+            },
+          },
+        },
+        {
+          id: "docs",
+        },
+      ],
+      github: {
+        owner: "acme",
+        repo: "symphony",
+        publish_pull_requests: false,
+      },
+    } as const;
+    const sourceEnv = {
+      LINEAR_PROFILED_KEY: "linear-secret",
+      ROOT_PROJECT: "ROOT",
+      ROOT_ASSIGNEE: "root-user",
+      ROOT_WORKSPACE_ROOT: "/tmp/root/workspaces",
+      ROOT_STATE_DIR: "/tmp/root/state",
+      ROOT_SOURCE_PATH: "/tmp/root/source",
+      ROOT_REPOSITORY: "/tmp/root/repo",
+      ROOT_BASE_REF: "origin/main",
+      ROOT_BRANCH_TEMPLATE: "root/{{ issue.identifier }}",
+      ROOT_CACHE_PATH: "/tmp/root/cache",
+      DEFAULT_PROJECT: "SYM",
+      DEFAULT_ASSIGNEE: "sym-user",
+      DEFAULT_WORKSPACE_ROOT: "/tmp/sym/workspaces",
+      DEFAULT_STATE_DIR: "/tmp/sym/state",
+      DEFAULT_SOURCE_PATH: "/tmp/sym/source",
+      DEFAULT_REPOSITORY: "/tmp/sym/repo",
+      DEFAULT_BASE_REF: "origin/symphony-main",
+      DEFAULT_BRANCH_TEMPLATE: "sym/{{ issue.identifier }}",
+      DEFAULT_CACHE_PATH: "/tmp/sym/cache",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    expect(config.topLevelDefaults).toBeDefined();
+    expect(config.workspace.source.baseRef).toBe("origin/symphony-main");
+    expect(config.projectContexts.byId.get("docs")?.workspace.source.baseRef).toBe("origin/main");
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "issue-breakdown-plan-mcp",
+      parentEnv: { PATH: "/bin" },
+    });
+
+    expect(env).toMatchObject({
+      ROOT_PROJECT: config.topLevelDefaults?.tracker.projectSlug,
+      ROOT_ASSIGNEE: config.topLevelDefaults?.tracker.assignee,
+      ROOT_WORKSPACE_ROOT: config.topLevelDefaults?.workspace.root,
+      ROOT_STATE_DIR: config.topLevelDefaults?.workspace.stateDir,
+      ROOT_SOURCE_PATH: config.topLevelDefaults?.workspace.source.path,
+      ROOT_REPOSITORY: config.topLevelDefaults?.workspace.source.repository,
+      ROOT_BASE_REF: config.topLevelDefaults?.workspace.source.baseRef,
+      ROOT_BRANCH_TEMPLATE: config.topLevelDefaults?.workspace.source.branchTemplate,
+      ROOT_CACHE_PATH: config.topLevelDefaults?.workspace.source.cachePath,
+      DEFAULT_PROJECT: config.projectContexts.byId.get("symphony")?.tracker.projectSlug,
+      DEFAULT_ASSIGNEE: config.projectContexts.byId.get("symphony")?.tracker.assignee,
+      DEFAULT_WORKSPACE_ROOT: config.projectContexts.byId.get("symphony")?.workspace.root,
+      DEFAULT_STATE_DIR: config.projectContexts.byId.get("symphony")?.workspace.stateDir,
+      DEFAULT_SOURCE_PATH: config.projectContexts.byId.get("symphony")?.workspace.source.path,
+      DEFAULT_REPOSITORY: config.projectContexts.byId.get("symphony")?.workspace.source.repository,
+      DEFAULT_BASE_REF: config.projectContexts.byId.get("symphony")?.workspace.source.baseRef,
+      DEFAULT_BRANCH_TEMPLATE: config.projectContexts.byId.get("symphony")?.workspace.source.branchTemplate,
+      DEFAULT_CACHE_PATH: config.projectContexts.byId.get("symphony")?.workspace.source.cachePath,
+    });
+    expect(env.ROOT_BASE_REF).toBe("origin/main");
+    expect(env.ROOT_BASE_REF).not.toBe(config.workspace.source.baseRef);
+    expect(env.ROOT_BRANCH_TEMPLATE).toBe("root/{{ issue.identifier }}");
+    expect(env.ROOT_BRANCH_TEMPLATE).not.toBe(config.workspace.source.branchTemplate);
+    expect(env.ROOT_SOURCE_PATH).toBe(config.topLevelDefaults?.workspace.source.path);
+    expect(env.ROOT_SOURCE_PATH).not.toBe(config.workspace.source.path);
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    expect(childConfig.workspace).toEqual(config.workspace);
+    expect(childConfig.projectContexts.byId.get("symphony")).toEqual(config.projectContexts.byId.get("symphony"));
+    expect(childConfig.projectContexts.byId.get("docs")).toEqual(config.projectContexts.byId.get("docs"));
+  });
+
+  it("preserves inherited top-level git refs when the default context overrides them", () => {
+    const rawConfig = {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_PROFILED_KEY",
+        project_slug: "$ROOT_PROJECT",
+      },
+      workspace: {
+        root: "$ROOT_WORKSPACE_ROOT",
+        source: {
+          kind: "git",
+          repository: "$ROOT_REPOSITORY",
+          ref: "$ROOT_REF",
+        },
+      },
+      project_contexts: [
+        {
+          id: "symphony",
+          workspace: {
+            source: {
+              kind: "git",
+              repository: "$DEFAULT_REPOSITORY",
+              ref: "$DEFAULT_REF",
+            },
+          },
+        },
+        {
+          id: "docs",
+        },
+      ],
+      github: {
+        owner: "acme",
+        repo: "symphony",
+        publish_pull_requests: false,
+      },
+    } as const;
+    const sourceEnv = {
+      LINEAR_PROFILED_KEY: "linear-secret",
+      ROOT_PROJECT: "ROOT",
+      ROOT_WORKSPACE_ROOT: "/tmp/root/workspaces",
+      ROOT_REPOSITORY: "/tmp/root/repo",
+      ROOT_REF: "refs/heads/root-main",
+      DEFAULT_REPOSITORY: "/tmp/sym/repo",
+      DEFAULT_REF: "refs/heads/symphony-main",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    expect(config.topLevelDefaults).toBeDefined();
+    expect(config.workspace.source.ref).toBe("refs/heads/symphony-main");
+    expect(config.projectContexts.byId.get("docs")?.workspace.source.ref).toBe("refs/heads/root-main");
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "review-verdict-mcp",
+      parentEnv: { PATH: "/bin" },
+    });
+
+    expect(env).toMatchObject({
+      ROOT_PROJECT: config.topLevelDefaults?.tracker.projectSlug,
+      ROOT_WORKSPACE_ROOT: config.topLevelDefaults?.workspace.root,
+      ROOT_REPOSITORY: config.topLevelDefaults?.workspace.source.repository,
+      ROOT_REF: config.topLevelDefaults?.workspace.source.ref,
+      DEFAULT_REPOSITORY: config.projectContexts.byId.get("symphony")?.workspace.source.repository,
+      DEFAULT_REF: config.projectContexts.byId.get("symphony")?.workspace.source.ref,
+    });
+    expect(env.ROOT_REF).toBe("refs/heads/root-main");
+    expect(env.ROOT_REF).not.toBe(config.workspace.source.ref);
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    expect(childConfig.workspace).toEqual(config.workspace);
+    expect(childConfig.projectContexts.byId.get("symphony")).toEqual(config.projectContexts.byId.get("symphony"));
+    expect(childConfig.projectContexts.byId.get("docs")).toEqual(config.projectContexts.byId.get("docs"));
+  });
+
   it("carries project-context parse dependencies needed for child config parsing", () => {
     const rawConfig = {
       tracker: {

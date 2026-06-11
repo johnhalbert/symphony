@@ -614,6 +614,11 @@ export type WorkflowProjectContext = NormalizedProjectContext<
 
 export type WorkflowProjectContextRegistry = ProjectContextRegistry<WorkflowProjectContext>;
 
+export interface TopLevelParseDependencyDefaults {
+  tracker: TrackerConfig;
+  workspace: WorkspaceConfig;
+}
+
 export interface ServiceConfig {
   workflowPath: string;
   workflowDir: string;
@@ -638,6 +643,7 @@ export interface ServiceConfig {
   database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
   projectContexts: WorkflowProjectContextRegistry;
+  topLevelDefaults?: TopLevelParseDependencyDefaults;
   raw: RawWorkflowConfig;
 }
 
@@ -706,6 +712,17 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
 
   const raw = parsed.data;
   const workflowDir = path.dirname(path.resolve(workflowPath));
+  const topLevelDefaults: TopLevelParseDependencyDefaults = {
+    tracker: normalizeTrackerConfigForProjectContext(raw.tracker, env, {
+      enabled: false,
+      contextPath: "workflow",
+    }),
+    workspace: normalizeWorkspaceConfigForProjectContext(raw.workspace, workflowDir, env, {
+      enabled: false,
+      contextPath: "workflow",
+      requireExplicitWorkspaceSource: false,
+    }),
+  };
   const projectContexts = normalizeWorkflowProjectContexts(raw, workflowDir, env);
   const defaultContext = projectContexts.defaultContext;
   const tracker = defaultContext.tracker;
@@ -914,6 +931,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     database,
     issueBreakdown,
     projectContexts,
+    topLevelDefaults,
     raw,
   };
 }

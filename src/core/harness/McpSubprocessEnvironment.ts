@@ -130,8 +130,11 @@ function addRequiredParseDependencies(
   parentEnv: NodeJS.ProcessEnv,
 ): void {
   const raw = config.raw;
-  addTrackerParseDependencies(env, raw.tracker, config.tracker, { includeDefaultApiKeyFallback: true });
-  addWorkspaceParseDependencies(env, raw.workspace, config.workspace);
+  const topLevelTracker = config.topLevelDefaults?.tracker ?? config.tracker;
+  const topLevelWorkspace = config.topLevelDefaults?.workspace ?? config.workspace;
+
+  addTrackerParseDependencies(env, raw.tracker, topLevelTracker, { includeDefaultApiKeyFallback: true });
+  addWorkspaceParseDependencies(env, raw.workspace, topLevelWorkspace);
 
   if (projectContextsNeedDefaultGitHubParseDependencies(raw)) {
     addGitHubParseDependenciesFromParentEnv(env, raw.github, parentEnv);
