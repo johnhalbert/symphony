@@ -167,9 +167,11 @@ export function normalizeLegacyDefaultProjectContext<
 export function normalizeProjectContextResolution(
   value: Partial<ProjectContextResolution> | null | undefined,
 ): ProjectContextResolution {
-  const rawProjectContextId = normalizeOptionalNonEmptyString(value?.projectContextId);
+  const explicitProjectContextId = readExplicitProjectContextId(value);
   const projectContextId =
-    rawProjectContextId === null ? LEGACY_DEFAULT_PROJECT_CONTEXT_ID : normalizeProjectContextId(rawProjectContextId);
+    explicitProjectContextId === undefined
+      ? LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+      : normalizeProjectContextId(explicitProjectContextId);
   return {
     projectContextId,
     projectContextLabel:
@@ -190,19 +192,24 @@ export function projectContextResolutionFromIssue(issue: unknown): ProjectContex
     return normalizeProjectContextResolution(value.projectContext);
   }
 
-  const projectContextId = normalizeOptionalNonEmptyString(value.projectContextId);
+  const explicitProjectContextId = readExplicitProjectContextId(value);
   const projectContextLabel = normalizeOptionalNonEmptyString(value.projectContextLabel);
   const linearProjectSlug =
     normalizeOptionalNonEmptyString(value.linearProjectSlug) ??
     normalizeOptionalNonEmptyString(value.linearProjectIdentity?.slug);
   const routingSource = normalizeOptionalNonEmptyString(value.routingSource);
 
-  if (projectContextId === null && projectContextLabel === null && linearProjectSlug === null && routingSource === null) {
+  if (
+    explicitProjectContextId === undefined &&
+    projectContextLabel === null &&
+    linearProjectSlug === null &&
+    routingSource === null
+  ) {
     return null;
   }
 
   return normalizeProjectContextResolution({
-    ...(projectContextId === null ? {} : { projectContextId }),
+    ...(explicitProjectContextId === undefined ? {} : { projectContextId: explicitProjectContextId }),
     ...(projectContextLabel === null ? {} : { projectContextLabel }),
     ...(linearProjectSlug === null ? {} : { linearProjectSlug }),
     ...(routingSource === null ? {} : { routingSource }),
@@ -266,6 +273,15 @@ export function buildProjectContextRegistry<TContext extends { id: ProjectContex
     defaultContext,
     byId,
   };
+}
+
+function readExplicitProjectContextId(
+  value: { projectContextId?: string | null } | null | undefined,
+): string | undefined {
+  if (value === null || value === undefined || !Object.prototype.hasOwnProperty.call(value, "projectContextId")) {
+    return undefined;
+  }
+  return typeof value.projectContextId === "string" ? value.projectContextId : undefined;
 }
 
 function normalizeOptionalNonEmptyString(value: string | null | undefined): string | null {

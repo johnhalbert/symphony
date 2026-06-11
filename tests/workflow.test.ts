@@ -1467,6 +1467,29 @@ describe("project context workflow contracts", () => {
     ).toThrowError("Duplicate project context id: docs-site");
   });
 
+  it.each(["!!!", "   ", "___"])(
+    "rejects project context ids without letters or numbers after normalization for %j",
+    (rawId) => {
+      expect(() =>
+        parseServiceConfig(
+          multiProjectWorkflowConfig({
+            projectContexts: [
+              projectContextFixture({
+                id: rawId,
+                projectSlug: "DOCS",
+                repository: "../docs-site",
+              }),
+            ],
+          }),
+          "/repo/WORKFLOW.md",
+          { LINEAR_API_KEY: "secret" },
+        ),
+      ).toThrowError(
+        `project_contexts[${JSON.stringify(rawId)}].id must contain at least one letter or number after normalization`,
+      );
+    },
+  );
+
   it("allows disabled project contexts to omit tracker and workspace source", () => {
     const config = parseServiceConfig(
       {
