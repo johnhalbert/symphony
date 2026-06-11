@@ -185,6 +185,7 @@ export class CompletionReportService {
     this.validateCaller(report, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
+    validateCompletionReportProjectContext(context, existingLifecycle);
     const existing = existingLifecycle?.completionReports.find((item) => item.idempotencyKey === report.idempotencyKey);
     if (existing && isFinalizedCompletionReport(existing)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
@@ -1042,7 +1043,33 @@ function resolveCompletionReportProjectContext(
   existingLifecycle: ExistingIssueLifecycle = null,
 ): ProjectContextResolution {
   return normalizeProjectContextResolution(
-    context.projectContext ?? existingLifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+    existingLifecycle?.projectContext ?? context.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
+}
+
+function validateCompletionReportProjectContext(
+  context: CompletionReportActiveContext,
+  existingLifecycle: ExistingIssueLifecycle,
+): void {
+  if (!context.projectContext || !existingLifecycle?.projectContext) return;
+  if (projectContextEquals(context.projectContext, existingLifecycle.projectContext)) return;
+  throw new SymphonyError(
+    "invalid_request",
+    "Completion report issue project context does not match the lifecycle record",
+  );
+}
+
+function projectContextEquals(
+  left: ProjectContextResolution | undefined,
+  right: ProjectContextResolution | undefined,
+): boolean {
+  const normalizedLeft = normalizeProjectContextResolution(left);
+  const normalizedRight = normalizeProjectContextResolution(right);
+  return (
+    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
+    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
+    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
+    normalizedLeft.routingSource === normalizedRight.routingSource
   );
 }
 

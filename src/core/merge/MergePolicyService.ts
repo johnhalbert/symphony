@@ -10,6 +10,7 @@ import type {
   PullRequestMergeResult,
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
+import { projectContextResolutionFromIssue, type ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { ResolvedCredential } from "../config/CredentialProfiles.js";
 import { SymphonyError } from "../errors.js";
 import type { Logger } from "../logging/StructuredLogger.js";
@@ -124,14 +125,6 @@ export class MergePolicyService {
     if (!serviceLinear) {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service linear.writeback credentials");
     }
-    const serviceMergeConfig = resolveGitHubClientConfig(config, "github.merge");
-    const serviceMerge = serviceMergeConfig.credential;
-    if (!serviceMerge && serviceMergeConfig.github.app === null) {
-      throw new SymphonyError(
-        "invalid_request",
-        "Gated merge policy requires service github.merge credentials or GitHub App installation auth",
-      );
-    }
 
     const latestIssue = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? issue;
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
@@ -156,13 +149,28 @@ export class MergePolicyService {
 
     const report = latestCompletionReport(lifecycle);
     if (!report) throw new SymphonyError("invalid_request", "Gated merge requires a latest completion report");
+    const projectContext = this.projectContextForIssue(latestIssue, lifecycle, report);
+    const serviceMergeConfig = resolveGitHubClientConfig(
+      config,
+      "github.merge",
+      projectContext === undefined ? {} : { projectContext },
+    );
+    const serviceMerge = serviceMergeConfig.credential;
+    if (!serviceMerge && serviceMergeConfig.github.app === null) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Gated merge policy requires service github.merge credentials or GitHub App installation auth",
+      );
+    }
 
     const approvedPullRequest = requirePullRequest(report);
     const approvedHeadSha = requireValue(approvedPullRequest.headSha, "Completion report pull request head SHA is required for gated merge");
     const resolvedConflict = resolvedMergeConflictForIssue(latestIssue, lifecycle, config);
     const pullRequest = resolvedConflict ? pullRequestRefForResolvedConflict(resolvedConflict) : approvedPullRequest;
     const headSha = requireValue(pullRequest.headSha, "Completion report pull request head SHA is required for gated merge");
-    const github = this.options.client ?? createGitHubPullRequestClientForCapability(config, "github.merge");
+    const github =
+      this.options.client ??
+      createGitHubPullRequestClientForCapability(config, "github.merge", undefined, projectContext === undefined ? {} : { projectContext });
     const livePullRequest = await github.getPullRequest({ pullRequestNumber: requireNumber(pullRequest.number) });
     validateLivePullRequestMetadata(livePullRequest, pullRequest, headSha);
     if (livePullRequest.headSha !== headSha) {
@@ -513,6 +521,14 @@ export class MergePolicyService {
     if (!latest || !statesEqual(latest.state, expectedState)) {
       throw new SymphonyError("invalid_request", "Merge gate writeback could not be verified");
     }
+  }
+
+  private projectContextForIssue(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    report: IssueCompletionReportRecord,
+  ): ProjectContextResolution | undefined {
+    return lifecycle.projectContext ?? report.projectContext ?? projectContextResolutionFromIssue(issue) ?? undefined;
   }
 
   private mergeSourceState(issue: Issue, lifecycle: IssueLifecycleRecord | null = null): string | null {

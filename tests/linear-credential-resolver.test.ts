@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
+import { normalizeProjectContextResolution } from "../src/core/config/ProjectContexts.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { resolveLinearClientConfig } from "../src/integrations/linear/LinearCredentialResolver.js";
 
@@ -220,6 +221,67 @@ describe("Linear credential resolver", () => {
     expect(resolveLinearClientConfig(config, "linear.writeback", { projectContext: docsContext, env: contextEnv })).toMatchObject({
       credential: { source: "profile", profileName: "publication", value: "global-linear-writeback-secret" },
       tracker: { apiKey: "global-linear-writeback-secret" },
+    });
+  });
+
+  it("maps legacy-default project-context routing to the configured default context", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LEGACY_LINEAR_TOKEN", project_slug: "TEST" },
+        workspace: { root: "/repo/workspaces", state_dir: "/repo/state" },
+        credential_profiles: {
+          profiles: {
+            publication: { value: "$GLOBAL_LINEAR_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
+          },
+          roles: {
+            service: { "linear.writeback": "publication" },
+          },
+        },
+        project_contexts: [
+          {
+            id: "docs",
+            tracker: { project_slug: "DOCS" },
+            workspace: { source: { kind: "git", repository: "../docs-site" } },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$DOCS_LINEAR_WRITEBACK_TOKEN" },
+              },
+            },
+          },
+          {
+            id: "symphony",
+            tracker: { project_slug: "TEST" },
+            workspace: { source: { kind: "git", repository: "." } },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$SYMPHONY_LINEAR_WRITEBACK_TOKEN" },
+              },
+            },
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LEGACY_LINEAR_TOKEN: "legacy-linear-secret",
+        GLOBAL_LINEAR_WRITEBACK_TOKEN: "global-linear-writeback-secret",
+        DOCS_LINEAR_WRITEBACK_TOKEN: "docs-linear-writeback-secret",
+        SYMPHONY_LINEAR_WRITEBACK_TOKEN: "symphony-linear-writeback-secret",
+      },
+    );
+
+    expect(
+      resolveLinearClientConfig(config, "linear.writeback", {
+        projectContext: normalizeProjectContextResolution(undefined),
+        env: {
+          LEGACY_LINEAR_TOKEN: "legacy-linear-secret",
+          GLOBAL_LINEAR_WRITEBACK_TOKEN: "global-linear-writeback-secret",
+          DOCS_LINEAR_WRITEBACK_TOKEN: "docs-linear-writeback-secret",
+          SYMPHONY_LINEAR_WRITEBACK_TOKEN: "symphony-linear-writeback-secret",
+        },
+      }),
+    ).toMatchObject({
+      credential: { source: "profile", profileName: "publication", value: "docs-linear-writeback-secret" },
+      tracker: { apiKey: "docs-linear-writeback-secret" },
     });
   });
 

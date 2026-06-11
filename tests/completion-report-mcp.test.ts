@@ -27,6 +27,13 @@ const docsProjectContext = {
   routingSource: "candidate_poll",
 } as const;
 
+const symphonyProjectContext = {
+  projectContextId: "symphony",
+  projectContextLabel: "Symphony",
+  linearProjectSlug: "TEST",
+  routingSource: "candidate_poll",
+} as const;
+
 describe("completion report MCP handoff", () => {
   let root: string;
 
@@ -153,7 +160,7 @@ describe("completion report MCP handoff", () => {
     });
   });
 
-  it("uses project-context GitHub publication profiles for default PR publication", async () => {
+  it("resolves publication GitHub credentials from the project context", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "context.json");
@@ -237,6 +244,82 @@ describe("completion report MCP handoff", () => {
       },
     });
     expect(authorizations).toEqual(["Bearer docs-publication-token", "Bearer docs-publication-token"]);
+  });
+
+  it("rejects completion reports when the MCP context project context mismatches the lifecycle record", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await writeFile(workflowPath, workflowWithContextualPublicationProfile(stateDir), "utf8");
+    await runStore.startRun({
+      runId: "run-context-mismatch",
+      sessionId: "agent-1:run-context-mismatch",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-context-mismatch" },
+      completionReports: [],
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      projectContext: symphonyProjectContext,
+      activeRunId: "run-context-mismatch",
+      role: "worker",
+      token: "handoff-token",
+      expectedToken: "handoff-token",
+      sessionId: "agent-1:run-context-mismatch",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+    const fetchSpy = vi.fn(async () => jsonResponse({ message: "expected test failure if called" }, 500));
+    vi.stubGlobal("fetch", fetchSpy);
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+
+    await expect(
+      submitCompletionReportFromMcp(report("context-mismatch-idem"), {
+        workflowPath,
+        contextFile,
+        pullRequestPublisher: publisher,
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Completion report MCP context does not match the service-owned issue project context",
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(publisher.inputs).toEqual([]);
   });
 
   it("exposes a documented stdio MCP tool and submits without caller-supplied run identity", async () => {

@@ -7,7 +7,11 @@ import {
 } from "../CompletionReportService.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
-import type { ProjectContextResolution } from "../config/ProjectContexts.js";
+import {
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -46,11 +50,6 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
   contextFile: string;
   pullRequestPublisher?: CompletionReportPullRequestPublisher;
 }): Promise<unknown> {
-  const loadedContext = await readCompletionReportContext(options.contextFile);
-  if (!loadedContext.activeRunId) {
-    throw new SymphonyError("invalid_request", "Completion report context is not ready for the active run");
-  }
-
   const loader = new WorkflowLoader(options.workflowPath);
   try {
     const loaded = await loader.load();
@@ -58,6 +57,10 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const loadedContext = await readCompletionReportContext(options.contextFile, lifecycleStore);
+    if (!loadedContext.activeRunId) {
+      throw new SymphonyError("invalid_request", "Completion report context is not ready for the active run");
+    }
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writebackProcessor =
       config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
@@ -137,12 +140,54 @@ export async function runCompletionReportMcpServer(options: {
   });
 }
 
-async function readCompletionReportContext(filePath: string): Promise<CompletionReportMcpContextFile> {
+async function readCompletionReportContext(
+  filePath: string,
+  lifecycleStore?: Pick<FileIssueLifecycleStore, "get">,
+): Promise<CompletionReportMcpContextFile> {
   const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as CompletionReportMcpContextFile;
   if (!parsed.issue || !parsed.workspace || parsed.role !== "worker") {
     throw new SymphonyError("invalid_request", "Completion report MCP context is invalid");
   }
-  return parsed;
+  const authoritativeProjectContext = await readServiceOwnedCompletionReportProjectContext(parsed.issue, lifecycleStore);
+  if (
+    parsed.projectContext &&
+    authoritativeProjectContext &&
+    !projectContextEquals(parsed.projectContext, authoritativeProjectContext)
+  ) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Completion report MCP context does not match the service-owned issue project context",
+    );
+  }
+  return {
+    ...parsed,
+    ...(authoritativeProjectContext === null ? {} : { projectContext: authoritativeProjectContext }),
+  };
+}
+
+async function readServiceOwnedCompletionReportProjectContext(
+  issue: Issue,
+  lifecycleStore?: Pick<FileIssueLifecycleStore, "get">,
+): Promise<ProjectContextResolution | null> {
+  const lifecycle =
+    (await lifecycleStore?.get(issue.id)) ??
+    (issue.identifier !== issue.id ? await lifecycleStore?.get(issue.identifier) : null) ??
+    null;
+  return lifecycle?.projectContext ?? projectContextResolutionFromIssue(issue);
+}
+
+function projectContextEquals(
+  left: ProjectContextResolution | undefined,
+  right: ProjectContextResolution | undefined,
+): boolean {
+  const normalizedLeft = normalizeProjectContextResolution(left);
+  const normalizedRight = normalizeProjectContextResolution(right);
+  return (
+    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
+    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
+    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
+    normalizedLeft.routingSource === normalizedRight.routingSource
+  );
 }
 
 function completionReportInputSchema(): Record<string, unknown> {

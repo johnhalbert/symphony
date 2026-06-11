@@ -19,6 +19,13 @@ const docsProjectContext = {
   routingSource: "candidate_poll",
 } as const;
 
+const symphonyProjectContext = {
+  projectContextId: "symphony",
+  projectContextLabel: "Symphony",
+  linearProjectSlug: "TEST",
+  routingSource: "candidate_poll",
+} as const;
+
 let root: string;
 
 describe("review feedback MCP handoff", () => {
@@ -142,6 +149,40 @@ describe("review feedback MCP handoff", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it("rejects review feedback when the MCP context project context mismatches the lifecycle record", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-feedback-context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    await seedLifecycle(lifecycleStore, docsProjectContext);
+    await writeReviewFeedbackMcpContext(contextFile, {
+      issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      projectContext: symphonyProjectContext,
+      activeRunId: "review-run-1",
+      role: "reviewer",
+      phase: "review",
+    });
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ message: "expected test failure if called" }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await expect(
+      submitReviewFeedbackFromMcp(
+        { kind: "review", event: "APPROVE", body: "Looks good.", idempotencyKey: "approve-context-mismatch-1" },
+        { workflowPath, contextFile },
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Review feedback MCP context does not match the service-owned issue project context",
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("sanitizes GitHub token material from write errors", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
@@ -156,7 +197,7 @@ describe("review feedback MCP handoff", () => {
       phase: "review",
     });
     vi.stubGlobal("fetch", async () =>
-      new Response(JSON.stringify({ message: "Cannot approve with global-feedback-secret" }), {
+      new Response(JSON.stringify({ message: "Cannot approve with docs-feedback-secret" }), {
         status: 422,
         headers: { "content-type": "application/json" },
       }),
@@ -171,7 +212,7 @@ describe("review feedback MCP handoff", () => {
     } catch (error) {
       const message = String((error as Error).message);
       expect(message).toContain("[redacted]");
-      expect(message).not.toContain("global-feedback-secret");
+      expect(message).not.toContain("docs-feedback-secret");
     }
   });
 });
@@ -213,9 +254,13 @@ async function listToolsViaServer(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function seedLifecycle(lifecycleStore: FileIssueLifecycleStore): Promise<void> {
+async function seedLifecycle(
+  lifecycleStore: FileIssueLifecycleStore,
+  projectContext: typeof docsProjectContext | typeof symphonyProjectContext = docsProjectContext,
+): Promise<void> {
   const report = completionReportRecord();
   await lifecycleStore.ensureIssue(issue({ state: "In Review", branchName: "symphony/TEST-1" }), {
+    projectContext,
     phase: "review",
     lastCompletionReportId: report.id,
     completionReports: [report],
