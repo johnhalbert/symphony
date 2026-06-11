@@ -1447,6 +1447,148 @@ describe("MCP subprocess environment", () => {
     expect(childConfig.projectContexts.byId.get("docs")).toMatchObject(expectedDocsContext!);
   });
 
+  it("exports only non-secret project-context parse refs while omitting project-context GitHub secrets and profile values", () => {
+    const rawConfig = multiProjectWorkflowConfig({
+      projectContexts: [
+        projectContextFixture({
+          id: "symphony",
+          label: "Symphony",
+          projectSlug: "SYMPHONY",
+          repository: ".",
+        }),
+        projectContextFixture({
+          id: "docs",
+          label: "Documentation Site",
+          projectSlug: "DOCS",
+          repository: "../docs-site",
+          tracker: {
+            api_key: "$DOCS_LINEAR_KEY",
+            project_slug: "$DOCS_LINEAR_PROJECT",
+            assignee: "$DOCS_LINEAR_ASSIGNEE",
+          },
+          workspace: {
+            root: "$DOCS_WORKSPACE_ROOT",
+            state_dir: "$DOCS_WORKSPACE_STATE_DIR",
+            source: {
+              path: "$DOCS_WORKSPACE_SOURCE_PATH",
+              repository: "$DOCS_WORKSPACE_REPOSITORY",
+              cache_path: "$DOCS_WORKSPACE_CACHE_PATH",
+            },
+          },
+          github: {
+            owner: "$DOCS_GITHUB_OWNER",
+            repo: "$DOCS_GITHUB_REPO",
+            head_owner: "$DOCS_GITHUB_HEAD_OWNER",
+            api_base_url: "$DOCS_GITHUB_API_BASE_URL",
+            token: "$DOCS_GITHUB_TOKEN",
+            app: {
+              private_key: "$DOCS_GITHUB_APP_PRIVATE_KEY",
+            },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+            },
+            roles: {
+              service: {
+                "github.publication": "publication",
+              },
+            },
+          },
+        }),
+      ],
+    });
+    const sourceEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      DOCS_LINEAR_KEY: "docs-linear-secret",
+      DOCS_LINEAR_PROJECT: "DOCS",
+      DOCS_LINEAR_ASSIGNEE: "writer",
+      DOCS_WORKSPACE_ROOT: "/tmp/docs-workspaces",
+      DOCS_WORKSPACE_STATE_DIR: "/tmp/docs-state",
+      DOCS_WORKSPACE_SOURCE_PATH: "/tmp/docs/source",
+      DOCS_WORKSPACE_REPOSITORY: "/tmp/docs/repo",
+      DOCS_WORKSPACE_CACHE_PATH: "/tmp/docs/cache",
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "john",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+      DOCS_GITHUB_TOKEN: "docs-token-secret",
+      DOCS_GITHUB_APP_PRIVATE_KEY: "docs-app-private-key",
+      DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "issue-breakdown-plan-mcp",
+      parentEnv: {
+        PATH: "/bin",
+        ...sourceEnv,
+        GITHUB_TOKEN: "decoy-parent-github-secret",
+        CURSOR_API_KEY: "ambient-cursor-secret",
+      },
+    });
+
+    expect(env).toMatchObject({
+      DOCS_LINEAR_KEY: "docs-linear-secret",
+      DOCS_LINEAR_PROJECT: "DOCS",
+      DOCS_LINEAR_ASSIGNEE: "writer",
+      DOCS_WORKSPACE_ROOT: config.projectContexts.byId.get("docs")?.workspace.root,
+      DOCS_WORKSPACE_STATE_DIR: config.projectContexts.byId.get("docs")?.workspace.stateDir,
+      DOCS_WORKSPACE_SOURCE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.path,
+      DOCS_WORKSPACE_REPOSITORY: config.projectContexts.byId.get("docs")?.workspace.source.repository,
+      DOCS_WORKSPACE_CACHE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.cachePath,
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "john",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+    });
+    expect(githubEnvKeys(env)).toEqual([
+      "DOCS_GITHUB_API_BASE_URL",
+      "DOCS_GITHUB_HEAD_OWNER",
+      "DOCS_GITHUB_OWNER",
+      "DOCS_GITHUB_REPO",
+    ]);
+    expect(env).not.toHaveProperty("DOCS_GITHUB_TOKEN");
+    expect(env).not.toHaveProperty("DOCS_GITHUB_APP_PRIVATE_KEY");
+    expect(env).not.toHaveProperty("DOCS_GITHUB_PUBLICATION_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(env).not.toHaveProperty("CURSOR_API_KEY");
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    const expectedDocsContext = config.projectContexts.byId.get("docs");
+    const childDocsContext = childConfig.projectContexts.byId.get("docs");
+    expect(expectedDocsContext).toBeDefined();
+    expect(childDocsContext).toBeDefined();
+    expect(childDocsContext).toMatchObject({
+      tracker: {
+        apiKey: expectedDocsContext!.tracker.apiKey,
+        projectSlug: expectedDocsContext!.tracker.projectSlug,
+        assignee: expectedDocsContext!.tracker.assignee,
+      },
+      workspace: {
+        root: expectedDocsContext!.workspace.root,
+        stateDir: expectedDocsContext!.workspace.stateDir,
+        source: {
+          path: expectedDocsContext!.workspace.source.path,
+          repository: expectedDocsContext!.workspace.source.repository,
+          cachePath: expectedDocsContext!.workspace.source.cachePath,
+        },
+      },
+      github: {
+        owner: expectedDocsContext!.github.owner,
+        repo: expectedDocsContext!.github.repo,
+        headOwner: expectedDocsContext!.github.headOwner,
+        apiBaseUrl: expectedDocsContext!.github.apiBaseUrl,
+        token: null,
+      },
+    });
+    expect(childDocsContext?.github.app).toMatchObject({
+      privateKey: null,
+      privateKeyEnvVar: "DOCS_GITHUB_APP_PRIVATE_KEY",
+    });
+  });
+
   it.each([
     {
       command: "completion-report-mcp",
