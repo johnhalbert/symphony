@@ -51,6 +51,12 @@ describe("FileWritebackOutboxStore", () => {
     linearProjectSlug: "DOCS",
     routingSource: "candidate_poll",
   } as const;
+  const legacyDefaultProjectContext = {
+    projectContextId: "default",
+    projectContextLabel: "Default",
+    linearProjectSlug: null,
+    routingSource: "legacy_default",
+  } as const;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-writeback-"));
@@ -61,32 +67,37 @@ describe("FileWritebackOutboxStore", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  async function stripPersistedProjectContext(idempotencyKey: string): Promise<void> {
+  async function findPersistedWritebackPath(idempotencyKey: string): Promise<string> {
     const recordsDir = path.join(root, "writeback");
-    let stripped = false;
     for (const entry of await readdir(recordsDir)) {
       const filePath = path.join(recordsDir, entry);
       const parsed = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
-      if (parsed.idempotencyKey !== idempotencyKey) continue;
-      delete parsed.projectContext;
-      await writeFile(filePath, `${JSON.stringify(parsed, null, 2)}
-`, "utf8");
-      stripped = true;
-    }
-    if (!stripped) throw new Error(`writeback record not found: ${idempotencyKey}`);
-  }
-
-  async function readPersistedWritebackText(idempotencyKey: string): Promise<string> {
-    const recordsDir = path.join(root, "writeback");
-    for (const entry of await readdir(recordsDir)) {
-      const filePath = path.join(recordsDir, entry);
-      const contents = await readFile(filePath, "utf8");
-      const parsed = JSON.parse(contents) as Record<string, unknown>;
       if (parsed.idempotencyKey === idempotencyKey) {
-        return contents;
+        return filePath;
       }
     }
     throw new Error(`writeback record not found: ${idempotencyKey}`);
+  }
+
+  async function updatePersistedWriteback(
+    idempotencyKey: string,
+    transform: (parsed: Record<string, unknown>) => Record<string, unknown>,
+  ): Promise<void> {
+    const filePath = await findPersistedWritebackPath(idempotencyKey);
+    const parsed = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+    await writeFile(filePath, `${JSON.stringify(transform(parsed), null, 2)}
+`, "utf8");
+  }
+
+  async function stripPersistedProjectContext(idempotencyKey: string): Promise<void> {
+    await updatePersistedWriteback(idempotencyKey, (parsed) => {
+      delete parsed.projectContext;
+      return parsed;
+    });
+  }
+
+  async function readPersistedWritebackText(idempotencyKey: string): Promise<string> {
+    return readFile(await findPersistedWritebackPath(idempotencyKey), "utf8");
   }
 
   async function recordRunProjectContext(runId: string, issueId = "issue-docs-1", issueIdentifier = "DOCS-1"): Promise<void> {
@@ -186,6 +197,27 @@ describe("FileWritebackOutboxStore", () => {
 
     await expect(store.enqueueOnce(operation)).resolves.toMatchObject({ projectContext: docsProjectContext });
     await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ projectContext: docsProjectContext });
+  });
+
+  it("does not promote explicit legacy default project context when replaying an existing writeback", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const operation = {
+      idempotencyKey: "comment:issue-default-replay:note",
+      kind: "comment" as const,
+      issueId: "issue-default-replay",
+      projectContext: legacyDefaultProjectContext,
+      runId: "run-default-replay",
+      payload: { body: "Default replay", dedupeKey: "default-replay" },
+    };
+
+    await store.enqueueOnce(operation);
+
+    await expect(store.enqueueOnce({ ...operation, projectContext: docsProjectContext })).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
   });
 
   it("derives project context from the run and backfills legacy writebacks on get and list read paths", async () => {
@@ -537,6 +569,105 @@ describe("FileWritebackOutboxStore", () => {
     ]);
     await expect(store.get(idempotencyKey)).resolves.toMatchObject({
       idempotencyKey,
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+  });
+
+  it("dedupes canonical and legacy duplicate files before repairing get and replay lookups", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writebackDir = path.join(root, "writeback");
+    const getOperation = {
+      idempotencyKey: "comment:issue-legacy-duplicate-get:merge-gate:legacy-repair",
+      kind: "comment" as const,
+      issueId: "issue-legacy-duplicate-get",
+      runId: "run-legacy-duplicate-get",
+      projectContext: docsProjectContext,
+      payload: { body: "Get duplicate.", dedupeKey: "legacy-duplicate-get" },
+    };
+    const replayOperation = {
+      idempotencyKey: "comment:issue-legacy-duplicate-replay:merge-gate:legacy-repair",
+      kind: "comment" as const,
+      issueId: "issue-legacy-duplicate-replay",
+      runId: "run-legacy-duplicate-replay",
+      projectContext: docsProjectContext,
+      payload: { body: "Replay duplicate.", dedupeKey: "legacy-duplicate-replay" },
+    };
+
+    await recordRunProjectContext(getOperation.runId, getOperation.issueId, "DOCS-DUPLICATE-GET");
+    await recordRunProjectContext(replayOperation.runId, replayOperation.issueId, "DOCS-DUPLICATE-REPLAY");
+
+    await store.enqueueOnce(getOperation);
+    const getPersisted = JSON.parse(await readPersistedWritebackText(getOperation.idempotencyKey)) as Record<string, unknown>;
+    await updatePersistedWriteback(getOperation.idempotencyKey, (parsed) => ({
+      ...parsed,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      nextAttemptAt: "2026-01-01T00:00:00.000Z",
+      resultStatus: null,
+      resultMessage: null,
+      resultEvidence: null,
+    }));
+    const getLegacyFileName = `${getOperation.idempotencyKey.replace(/[^A-Za-z0-9._-]/g, "_")}.json`;
+    await writeFile(
+      path.join(writebackDir, getLegacyFileName),
+      `${JSON.stringify(
+        {
+          ...getPersisted,
+          status: "succeeded",
+          updatedAt: "2026-01-02T00:00:00.000Z",
+          nextAttemptAt: "2026-01-02T00:00:00.000Z",
+          resultStatus: null,
+          resultMessage: null,
+          resultEvidence: null,
+        },
+        (key, value) => (key === "projectContext" ? undefined : value),
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await expect(store.get(getOperation.idempotencyKey)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(readPersistedWritebackText(getOperation.idempotencyKey)).resolves.toContain('"status": "succeeded"');
+    await expect(readPersistedWritebackText(getOperation.idempotencyKey)).resolves.toContain('"projectContextId": "docs"');
+    expect(await readdir(writebackDir)).not.toContain(getLegacyFileName);
+
+    await store.enqueueOnce(replayOperation);
+    const replayPersisted = JSON.parse(await readPersistedWritebackText(replayOperation.idempotencyKey)) as Record<string, unknown>;
+    await updatePersistedWriteback(replayOperation.idempotencyKey, (parsed) => ({
+      ...parsed,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      nextAttemptAt: "2026-01-01T00:00:00.000Z",
+      resultStatus: null,
+      resultMessage: null,
+      resultEvidence: null,
+    }));
+    const replayLegacyFileName = `${replayOperation.idempotencyKey.replace(/[^A-Za-z0-9._-]/g, "_")}.json`;
+    await writeFile(
+      path.join(writebackDir, replayLegacyFileName),
+      `${JSON.stringify(
+        {
+          ...replayPersisted,
+          status: "succeeded",
+          updatedAt: "2026-01-02T00:00:00.000Z",
+          nextAttemptAt: "2026-01-02T00:00:00.000Z",
+          resultStatus: null,
+          resultMessage: null,
+          resultEvidence: null,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await expect(store.enqueueOnce(replayOperation)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.get(replayOperation.idempotencyKey)).resolves.toMatchObject({
       status: "succeeded",
       projectContext: docsProjectContext,
     });

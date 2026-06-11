@@ -271,23 +271,9 @@ export class FileWritebackOutboxStore {
   }
 
   async get(idempotencyKey: string): Promise<WritebackOperation | null> {
-    const current = await readJsonIfExists<WritebackOperation>(this.recordPath(idempotencyKey));
-    if (current) {
-      return this.repairProjectContextIfMissing(
-        normalizeWritebackOperation(current),
-        undefined,
-        current as unknown as Record<string, unknown>,
-      );
-    }
-    const legacy = this.legacyRecordPath(idempotencyKey);
-    if (legacy === this.recordPath(idempotencyKey)) return null;
-    const record = await readJsonIfExists<WritebackOperation>(legacy);
-    if (record === null) return null;
-    return this.repairProjectContextIfMissing(
-      normalizeWritebackOperation(record),
-      undefined,
-      record as unknown as Record<string, unknown>,
-    );
+    const stored = await this.readPreferredStoredRecord(idempotencyKey);
+    if (stored === null) return null;
+    return this.repairProjectContextIfMissing(stored.record, undefined, stored.rawRecord);
   }
 
   async list(): Promise<WritebackOperation[]> {
@@ -313,12 +299,23 @@ export class FileWritebackOutboxStore {
   }
 
   private async readStoredRecord(idempotencyKey: string): Promise<Record<string, unknown> | null> {
-    const currentPath = this.recordPath(idempotencyKey);
-    const current = await readJsonIfExists<Record<string, unknown>>(currentPath);
-    if (current) return current;
-    const legacy = this.legacyRecordPath(idempotencyKey);
-    if (legacy === currentPath) return null;
-    return readJsonIfExists<Record<string, unknown>>(legacy);
+    return (await this.readPreferredStoredRecord(idempotencyKey))?.rawRecord ?? null;
+  }
+
+  private async readPreferredStoredRecord(idempotencyKey: string): Promise<StoredWritebackRecord | null> {
+    const records = await mapWithFileReadConcurrency(
+      this.recordCandidatePaths(idempotencyKey),
+      async (filePath): Promise<StoredWritebackRecord | null> => {
+        const rawRecord = await readJsonIfExists<Record<string, unknown>>(filePath);
+        if (rawRecord === null) return null;
+        return {
+          filePath,
+          rawRecord,
+          record: normalizeWritebackOperation(rawRecord as WritebackOperation),
+        };
+      },
+    );
+    return dedupeStoredWritebackRecords(records.filter((record): record is StoredWritebackRecord => record !== null))[0] ?? null;
   }
 
   private async backfillProjectContextOnReplay(
@@ -326,10 +323,11 @@ export class FileWritebackOutboxStore {
     operation: NewWritebackOperation,
     rawRecord: Record<string, unknown> | null | undefined = undefined,
   ): Promise<WritebackOperation> {
-    if (shouldPromoteReplayProjectContext(existing.projectContext, operation.projectContext)) {
+    const raw = rawRecord ?? (await this.readStoredRecord(existing.idempotencyKey));
+    if (needsProjectContextBackfill(raw) && shouldPromoteReplayProjectContext(existing.projectContext, operation.projectContext)) {
       return this.update(existing, { projectContext: normalizeProjectContextResolution(operation.projectContext) });
     }
-    return this.repairProjectContextIfMissing(existing, operation.projectContext, rawRecord);
+    return this.repairProjectContextIfMissing(existing, operation.projectContext, raw);
   }
 
   private async repairProjectContextIfMissing(
@@ -339,11 +337,22 @@ export class FileWritebackOutboxStore {
   ): Promise<WritebackOperation> {
     const raw = rawRecord ?? (await this.readStoredRecord(record.idempotencyKey));
     if (!needsProjectContextBackfill(raw)) return record;
-    const repaired = normalizeWritebackOperation({
-      ...record,
-      projectContext: normalizeProjectContextResolution(projectContext ?? (await this.readRunProjectContext(record.runId))),
-    } as WritebackOperation);
-    await this.write(repaired);
+    const resolvedProjectContext = normalizeProjectContextResolution(projectContext ?? (await this.readRunProjectContext(record.runId)));
+    let repaired = record;
+    await this.withWriteLock(record.idempotencyKey, async () => {
+      const latest = await this.readPreferredStoredRecord(record.idempotencyKey);
+      const currentRecord = latest?.record ?? record;
+      const currentRaw = latest?.rawRecord ?? raw ?? null;
+      if (!needsProjectContextBackfill(currentRaw)) {
+        repaired = currentRecord;
+        return;
+      }
+      repaired = normalizeWritebackOperation({
+        ...currentRecord,
+        projectContext: resolvedProjectContext,
+      } as WritebackOperation);
+      await this.writeUnlocked(repaired);
+    });
     return repaired;
   }
 
@@ -367,21 +376,25 @@ export class FileWritebackOutboxStore {
     this.projectionNotifier.notify("writeback");
   }
 
-  private async write(record: WritebackOperation): Promise<void> {
-    const previous = this.writeLocks.get(record.idempotencyKey) ?? Promise.resolve();
+  private async withWriteLock(idempotencyKey: string, action: () => Promise<void>): Promise<void> {
+    const previous = this.writeLocks.get(idempotencyKey) ?? Promise.resolve();
     let current!: Promise<void>;
     current = (async () => {
       await previous.catch(() => undefined);
       try {
-        await this.writeUnlocked(record);
+        await action();
       } finally {
-        if (this.writeLocks.get(record.idempotencyKey) === current) {
-          this.writeLocks.delete(record.idempotencyKey);
+        if (this.writeLocks.get(idempotencyKey) === current) {
+          this.writeLocks.delete(idempotencyKey);
         }
       }
     })();
-    this.writeLocks.set(record.idempotencyKey, current);
+    this.writeLocks.set(idempotencyKey, current);
     await current;
+  }
+
+  private async write(record: WritebackOperation): Promise<void> {
+    await this.withWriteLock(record.idempotencyKey, () => this.writeUnlocked(record));
   }
 
   private async writeUnlocked(record: WritebackOperation): Promise<void> {
@@ -403,6 +416,12 @@ export class FileWritebackOutboxStore {
 
   private recordPath(idempotencyKey: string): string {
     return path.join(this.recordsDir(), shortRecordFileName(idempotencyKey));
+  }
+
+  private recordCandidatePaths(idempotencyKey: string): string[] {
+    const currentPath = this.recordPath(idempotencyKey);
+    const legacyPath = this.legacyRecordPath(idempotencyKey);
+    return legacyPath === currentPath ? [currentPath] : [currentPath, legacyPath];
   }
 
   private legacyRecordPath(idempotencyKey: string): string {
