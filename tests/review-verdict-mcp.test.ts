@@ -48,6 +48,7 @@ describe("review verdict MCP handoff", () => {
     await lifecycleStore.ensureIssue(issue({ state: "In Review", branchName: "symphony/TEST-1" }), {
       phase: "review",
       reviewRound: 0,
+      projectContext: docsProjectContext,
       summaryPointers: { lastRunId: "review-run-1" },
     });
     await writeReviewVerdictMcpContext(contextFile, {
@@ -174,18 +175,12 @@ describe("review verdict MCP handoff", () => {
     });
   });
 
-  it("rejects reviewer verdict submissions when the handoff project context mismatches the service-owned issue context", async () => {
+  it("rejects reviewer verdict submissions when the handoff project context mismatches the persisted lifecycle context", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "review-context.json");
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
-    const serviceOwnedIssue = {
-      ...issue({ state: "In Review", branchName: "symphony/TEST-1" }),
-      projectContextId: symphonyProjectContext.projectContextId,
-      projectContextLabel: symphonyProjectContext.projectContextLabel,
-      linearProjectIdentity: { kind: "linear", slug: symphonyProjectContext.linearProjectSlug, id: null },
-      routingSource: symphonyProjectContext.routingSource,
-    };
+    const serviceOwnedIssue = issue({ state: "In Review", branchName: "symphony/TEST-1" });
     await writeFile(workflowPath, workflow(stateDir), "utf8");
     await lifecycleStore.ensureIssue(serviceOwnedIssue, {
       phase: "review",
@@ -218,6 +213,73 @@ describe("review verdict MCP handoff", () => {
           findings: ["Reject mismatched project context claims before accepting verdicts."],
           evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-3"],
           idempotencyKey: "review-verdict-context-mismatch-1",
+        },
+        { workflowPath, contextFile },
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Review verdict MCP context does not match the service-owned issue project context",
+    });
+
+    const lifecycle = await lifecycleStore.get("TEST-1");
+    expect(lifecycle).toMatchObject({
+      phase: "review",
+      reviewRound: 0,
+      projectContext: symphonyProjectContext,
+    });
+    expect(lifecycle?.reviewVerdicts ?? []).toHaveLength(0);
+    expect(await new FileWritebackOutboxStore(stateDir).list()).toHaveLength(0);
+  });
+
+  it("rejects reviewer verdict submissions when any normalized project-context field is spoofed", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const spoofedIssue = {
+      ...issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      projectContextId: symphonyProjectContext.projectContextId,
+      projectContextLabel: "Spoofed Symphony",
+      linearProjectIdentity: { kind: "linear", slug: null, id: null },
+      routingSource: "replay",
+    };
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    await lifecycleStore.ensureIssue(issue({ state: "In Review", branchName: "symphony/TEST-1" }), {
+      phase: "review",
+      reviewRound: 0,
+      projectContext: symphonyProjectContext,
+      summaryPointers: { lastRunId: "review-run-4" },
+    });
+    await writeReviewVerdictMcpContext(contextFile, {
+      issue: spoofedIssue,
+      projectContext: {
+        projectContextId: symphonyProjectContext.projectContextId,
+        projectContextLabel: "Spoofed Symphony",
+        linearProjectSlug: null,
+        routingSource: "replay",
+      },
+      activeRunId: "review-run-4",
+      role: "reviewer",
+      token: null,
+      expectedToken: null,
+      reviewer: "reviewer-agent:review-run-4",
+      phase: "review",
+    });
+
+    await expect(
+      submitReviewVerdictFromMcp(
+        {
+          verdict: "fail",
+          acceptanceResults: [
+            {
+              text: "Review verdicts cannot change or spoof the resolved context.",
+              satisfied: false,
+              evidence: "Spoofed label, routing source, and null slug should be rejected.",
+            },
+          ],
+          findings: ["Reject normalized project-context metadata mismatches before accepting verdicts."],
+          evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-4"],
+          idempotencyKey: "review-verdict-context-mismatch-2",
         },
         { workflowPath, contextFile },
       ),
