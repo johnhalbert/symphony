@@ -1,0 +1,46 @@
+{
+  "runId": "worker-run-1",
+  "sessionId": "worker-session-docs-review-1",
+  "agentId": "worker-agent-docs-review-1",
+  "role": "worker",
+  "runPhase": "implementation",
+  "runKind": "implementation",
+  "issueId": "issue-docs-review-redispatch-1",
+  "issueIdentifier": "DOCS-707",
+  "projectContext": {
+    "projectContextId": "docs",
+    "projectContextLabel": "Documentation Site",
+    "linearProjectSlug": "DOCS",
+    "routingSource": "candidate_poll"
+  },
+  "attempt": null,
+  "turnNumber": 1,
+  "prompt": "Worker prompt",
+  "promptCharCount": 13,
+  "workspaceKey": "DOCS-707",
+  "workspacePath": "C:\\Users\\john\\src\\github.com\\johnhalbert\\symphony\\symphony_workspaces\\ENG-392\\tmp-debug-docs-reviewer-redispatch\\DOCS-707",
+  "gitBranchName": "docs/DOCS-707",
+  "repoPath": "C:\\Users\\john\\src\\github.com\\johnhalbert\\symphony\\symphony_workspaces\\ENG-392\\tmp-debug-docs-reviewer-redispatch-source",
+  "baseRef": "main",
+  "status": "running",
+  "startedAt": "2026-06-11T20:44:48.120Z",
+  "updatedAt": "2026-06-11T20:46:33.953Z",
+  "completedAt": null,
+  "error": null,
+  "tokens": {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "totalTokens": 0
+  },
+  "transcriptEventCount": 3,
+  "runtimeModel": null,
+  "runtimeModelParams": [],
+  "runtimeSettingSources": [],
+  "runtimeMode": null,
+  "activitySnapshot": {
+    "lastHarnessActivityAt": "2026-01-01T00:00:02Z",
+    "lastStreamActivityAt": "2026-01-01T00:00:02Z",
+    "lastDeltaOrToolActivityAt": null,
+    "lastToolActivityAt": null
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "workspaceKey": "DOCS-707",
+  "issueId": "issue-docs-review-redispatch-1",
+  "issueIdentifier": "DOCS-707",
+  "path": "C:\\Users\\john\\src\\github.com\\johnhalbert\\symphony\\symphony_workspaces\\ENG-392\\tmp-debug-docs-reviewer-redispatch\\DOCS-707",
+  "createdAt": "2026-06-11T20:44:48.146Z",
+  "updatedAt": "2026-06-11T20:46:34.174Z",
+  "sourceKind": "copy",
+  "projectContext": {
+    "projectContextId": "default",
+    "projectContextLabel": "Default",
+    "linearProjectSlug": null,
+    "routingSource": "legacy_default"
+  }
+}

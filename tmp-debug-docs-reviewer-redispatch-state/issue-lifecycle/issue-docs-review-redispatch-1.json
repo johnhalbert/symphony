@@ -1,0 +1,168 @@
+{
+  "issueId": "issue-docs-review-redispatch-1",
+  "issueIdentifier": "DOCS-707",
+  "projectContext": {
+    "projectContextId": "docs",
+    "projectContextLabel": "Documentation Site",
+    "linearProjectSlug": "DOCS",
+    "routingSource": "candidate_poll"
+  },
+  "phase": "review",
+  "reviewRound": 0,
+  "incompleteTurnCount": 0,
+  "lastIssueBreakdownPlanId": null,
+  "planningFailureCount": 0,
+  "planningDispatchRetryCount": 0,
+  "lastPlanningFailureRunId": null,
+  "lastPlanningFailureAt": null,
+  "lastCompletionReportId": "completion-report:issue-docs-review-redispatch-1:idem-1",
+  "lastReviewVerdictId": null,
+  "blockedReason": null,
+  "summaryPointers": {
+    "projectContext": {
+      "projectContextId": "docs",
+      "projectContextLabel": "Documentation Site",
+      "linearProjectSlug": "DOCS",
+      "routingSource": "candidate_poll"
+    },
+    "workspaceKey": "DOCS-707",
+    "workspacePath": "C:\\Users\\john\\src\\github.com\\johnhalbert\\symphony\\symphony_workspaces\\ENG-392\\tmp-debug-docs-reviewer-redispatch\\DOCS-707",
+    "branchName": "docs/DOCS-707",
+    "gitBranchName": "docs/DOCS-707",
+    "repoPath": null,
+    "baseRef": null,
+    "lastRunId": "reload-issue-docs-review-redispatch-1-2",
+    "prUrl": "https://github.com/acme/docs/pull/21",
+    "prNumber": 21,
+    "prHeadSha": "docs-head-21",
+    "prBranch": null,
+    "ciStatus": null,
+    "lastPushedAt": null,
+    "lastEvidenceCursor": null
+  },
+  "summaryReferences": [],
+  "issueBreakdownPlans": [],
+  "completionReports": [
+    {
+      "id": "completion-report:issue-docs-review-redispatch-1:idem-1",
+      "projectContext": {
+        "projectContextId": "docs",
+        "projectContextLabel": "Documentation Site",
+        "linearProjectSlug": "DOCS",
+        "routingSource": "candidate_poll"
+      },
+      "idempotencyKey": "idem-1",
+      "runId": "worker-run-1",
+      "issueId": "issue-docs-review-redispatch-1",
+      "issueIdentifier": "DOCS-707",
+      "summary": "Implemented the requested change.",
+      "validationEvidence": [
+        "npm test -- orchestrator"
+      ],
+      "acceptanceChecklist": [
+        {
+          "text": "Reviewer dispatch is covered.",
+          "satisfied": true,
+          "evidence": "orchestrator test"
+        }
+      ],
+      "changedFiles": [
+        "src/core/orchestrator/Orchestrator.ts"
+      ],
+      "branchName": "docs/DOCS-707",
+      "pullRequest": {
+        "url": "https://github.com/acme/symphony/pull/42",
+        "number": 42,
+        "headSha": "abc123",
+        "branch": "docs/DOCS-707"
+      },
+      "risks": [],
+      "acceptedAt": "2026-01-01T00:00:01Z",
+      "writebackOperationKeys": []
+    }
+  ],
+  "reviewVerdicts": [],
+  "reviewFeedback": [],
+  "reviewEvidence": {
+    "pullRequest": null,
+    "lastIngestedCursor": null,
+    "lastWorkerEvidenceCursor": null,
+    "items": [],
+    "updatedAt": null
+  },
+  "mergeGate": null,
+  "merge": null,
+  "mergeConflict": null,
+  "mergeConflictResolutionReports": [],
+  "createdAt": "2026-06-11T20:44:48.116Z",
+  "updatedAt": "2026-06-11T20:46:34.181Z",
+  "handoff": {
+    "version": 1,
+    "memo": {
+      "version": 1,
+      "issueId": "issue-docs-review-redispatch-1",
+      "issueIdentifier": "DOCS-707",
+      "projectContext": {
+        "projectContextId": "docs",
+        "projectContextLabel": "Documentation Site",
+        "linearProjectSlug": "DOCS",
+        "routingSource": "candidate_poll"
+      },
+      "updatedAt": "2026-06-11T20:46:34.181Z",
+      "reviewRound": 0,
+      "incompleteTurnCount": 0,
+      "entries": [
+        "Lifecycle phase: review; review round: 0; incomplete worker turns: 0.",
+        "Latest worker output completion-report:issue-docs-review-redispatch-1:idem-1 (worker-run-1): Implemented the requested change.",
+        "No reviewer output is available yet."
+      ],
+      "openFindings": [],
+      "pointers": {
+        "projectContext": {
+          "projectContextId": "docs",
+          "projectContextLabel": "Documentation Site",
+          "linearProjectSlug": "DOCS",
+          "routingSource": "candidate_poll"
+        },
+        "workspaceKey": "DOCS-707",
+        "workspacePath": "C:\\Users\\john\\src\\github.com\\johnhalbert\\symphony\\symphony_workspaces\\ENG-392\\tmp-debug-docs-reviewer-redispatch\\DOCS-707",
+        "branchName": "docs/DOCS-707",
+        "gitBranchName": "docs/DOCS-707",
+        "repoPath": null,
+        "baseRef": null,
+        "lastRunId": "reload-issue-docs-review-redispatch-1-2",
+        "prUrl": "https://github.com/acme/docs/pull/21",
+        "prNumber": 21,
+        "prHeadSha": "docs-head-21",
+        "prBranch": null,
+        "ciStatus": null,
+        "lastPushedAt": null,
+        "lastEvidenceCursor": null
+      },
+      "lastWorkerRunId": "worker-run-1",
+      "lastReviewerRunId": null,
+      "sizeChars": 1289
+    },
+    "lastWorkerOutput": {
+      "version": 1,
+      "reportId": "completion-report:issue-docs-review-redispatch-1:idem-1",
+      "runId": "worker-run-1",
+      "summary": "Implemented the requested change.",
+      "changedFiles": [
+        "src/core/orchestrator/Orchestrator.ts"
+      ],
+      "validationEvidence": [
+        "npm test -- orchestrator"
+      ],
+      "risks": [],
+      "pullRequest": {
+        "url": "https://github.com/acme/symphony/pull/42",
+        "number": 42,
+        "headSha": "abc123",
+        "branch": "docs/DOCS-707"
+      },
+      "acceptedAt": "2026-01-01T00:00:01Z"
+    },
+    "lastReviewerOutput": null
+  }
+}

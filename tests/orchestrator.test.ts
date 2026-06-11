@@ -2408,7 +2408,7 @@ describe("Orchestrator", () => {
   it("blocks after consecutive worker SDK wait errors reach the retry cap", async () => {
     const config = testConfig(root);
     config.agent.maxSdkErrorRetries = 2;
-    config.agent.maxRetryBackoffMs = 0;
+    config.agent.maxRetryBackoffMs = 1;
     config.writeback.enabled = true;
     config.writeback.mode = "live";
     config.writeback.dispatchState = "In Progress";
@@ -2800,9 +2800,10 @@ describe("Orchestrator", () => {
     });
 
     try {
+      const runId = "run-123";
       await orchestrator.refreshNow();
-      await waitFor(() => typeof orchestrator.snapshot().running[0]?.runId === "string", "worker run start");
-      const runId = orchestrator.snapshot().running[0]?.runId ?? "";
+      await waitFor(() => orchestrator.snapshot().running[0]?.runId === runId, "worker run start");
+      await waitForRunRecord(runStore, runId);
       await lifecycleStore.ensureIssue(
         candidate,
         pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
@@ -2813,7 +2814,6 @@ describe("Orchestrator", () => {
           pendingApprovalRequestedAt: null,
         },
       });
-      await new Promise((resolve) => setTimeout(resolve, 5));
 
       await waitForAsync(async () => {
         await orchestrator.refreshNow();
@@ -7026,6 +7026,149 @@ describe("Orchestrator", () => {
     expect(harness.runs[1]?.prompt).not.toContain("Configured full-history threshold: 1");
   });
 
+  it("preserves worker retry redispatch through the original docs active states after reload", async () => {
+    const symphonyWorkspaceRoot = path.join(root, "symphony-worker-retry");
+    const symphonyStateDir = path.join(root, "symphony-worker-retry-state");
+    const docsWorkspaceRoot = path.join(root, "docs-worker-retry");
+    const docsStateDir = path.join(root, "docs-worker-retry-state");
+    const docsReloadWorkspaceRoot = path.join(root, "docs-worker-retry-reloaded");
+    const docsReloadStateDir = path.join(root, "docs-worker-retry-state-reloaded");
+    const symphonySourcePath = path.join(root, "symphony-worker-retry-source");
+    const docsSourcePath = path.join(root, "docs-worker-retry-source");
+    const docsReloadSourcePath = path.join(root, "docs-worker-retry-source-reloaded");
+    await mkdir(symphonySourcePath, { recursive: true });
+    await mkdir(docsSourcePath, { recursive: true });
+    await mkdir(docsReloadSourcePath, { recursive: true });
+
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          agent: { max_concurrent_agents: 1, max_turns: 1, max_retry_backoff_ms: 1 },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "ENG",
+            workspaceRoot: symphonyWorkspaceRoot,
+            stateDir: symphonyStateDir,
+            tracker: { active_states: ["Todo", "In Progress"], handoff_states: ["Human Review"] },
+            review_loop: { review_states: ["In Review"] },
+            workspace: { source: { kind: "copy", path: symphonySourcePath } },
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            workspaceRoot: docsWorkspaceRoot,
+            stateDir: docsStateDir,
+            tracker: { active_states: ["Queued", "Doing"], handoff_states: ["Docs Handoff"] },
+            review_loop: { review_states: ["Docs Review"] },
+            workspace: { source: { kind: "copy", path: docsSourcePath } },
+          }),
+        ],
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const reloadedConfig = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          agent: { max_concurrent_agents: 1, max_turns: 1, max_retry_backoff_ms: 1 },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "ENG",
+            workspaceRoot: symphonyWorkspaceRoot,
+            stateDir: symphonyStateDir,
+            tracker: { active_states: ["Todo", "In Progress"], handoff_states: ["Human Review"] },
+            review_loop: { review_states: ["In Review"] },
+            workspace: { source: { kind: "copy", path: symphonySourcePath } },
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            workspaceRoot: docsReloadWorkspaceRoot,
+            stateDir: docsReloadStateDir,
+            tracker: { active_states: ["Ready"], handoff_states: ["Docs Handoff"] },
+            review_loop: { review_states: ["Docs Review"] },
+            workspace: { source: { kind: "copy", path: docsReloadSourcePath } },
+          }),
+        ],
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const docsIssue = trackerIssue({
+      id: "issue-docs-retry-1",
+      identifier: "DOCS-606",
+      state: "Doing",
+      branchName: "docs/DOCS-606",
+      labels: ["dogfood-ready"],
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+    let reloaded = false;
+    let workerCandidateFetches = 0;
+    let harness: ConfigReloadHarness;
+    const currentState = () => (harness?.runs.length >= 2 ? "Done" : "Doing");
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        workerCandidateFetches += 1;
+        return reloaded ? [] : [{ ...docsIssue, state: currentState() }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        return issueIds.includes(docsIssue.id) ? [{ ...docsIssue, state: currentState() }] : [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runtimeDependencies = createProjectContextRuntimeDependencies(config, logger);
+    const { workspaceManager, lifecycleStore, runStore } = runtimeDependencies;
+    let orchestrator: Orchestrator;
+    harness = new ConfigReloadHarness(
+      () => {
+        reloaded = true;
+        runtimeDependencies.updateConfig(reloadedConfig);
+        orchestrator.updateConfig(reloadedConfig, "RELOADED retry worker prompt {{ issue.identifier }}");
+      },
+      [
+        [{ type: "failed", error: "reload-triggered worker failure" }],
+        [{ type: "completed", message: "retry completed" }],
+      ],
+    );
+    orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "ORIGINAL retry worker prompt {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2, "docs worker retry redispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "docs worker retry completion");
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+    await settleOrchestratorExit();
+
+    expect(workerCandidateFetches).toBe(1);
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject({ projectContextId: "docs", linearProjectSlug: "DOCS" });
+    expect(harness.runs[1]?.ctx.projectContext).toMatchObject({ projectContextId: "docs", linearProjectSlug: "DOCS" });
+    expect(harness.runs[1]?.ctx.config.tracker.activeStates).toEqual(["Queued", "Doing"]);
+    expect(harness.runs[1]?.prompt).toContain("ORIGINAL retry worker prompt DOCS-606");
+    expect(harness.runs[1]?.prompt).not.toContain("RELOADED retry worker prompt DOCS-606");
+  });
+
   it("preserves reviewer prompt templates and extensions from the running entry config across reload", async () => {
     const symphonyWorkspaceRoot = path.join(root, "symphony-reviewer-prompts");
     const symphonyStateDir = path.join(root, "symphony-reviewer-state");
@@ -7202,6 +7345,196 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).not.toContain("RELOADED TOP reviewer template DOCS-505");
     expect(harness.runs[0]?.prompt).not.toContain("RELOADED DOCS reviewer template DOCS-505");
     expect(harness.runs[0]?.prompt).not.toContain("RELOADED DOCS reviewer extension");
+  });
+
+  it("preserves reviewer redispatch through the original docs review states after reload", async () => {
+    const symphonyWorkspaceRoot = path.join(root, "symphony-reviewer-redispatch");
+    const symphonyStateDir = path.join(root, "symphony-reviewer-redispatch-state");
+    const docsWorkspaceRoot = path.join(root, "docs-reviewer-redispatch");
+    const docsStateDir = path.join(root, "docs-reviewer-redispatch-state");
+    const docsReloadWorkspaceRoot = path.join(root, "docs-reviewer-redispatch-reloaded");
+    const docsReloadStateDir = path.join(root, "docs-reviewer-redispatch-state-reloaded");
+    const symphonySourcePath = path.join(root, "symphony-reviewer-redispatch-source");
+    const docsSourcePath = path.join(root, "docs-reviewer-redispatch-source");
+    const docsReloadSourcePath = path.join(root, "docs-reviewer-redispatch-source-reloaded");
+    await mkdir(symphonySourcePath, { recursive: true });
+    await mkdir(docsSourcePath, { recursive: true });
+    await mkdir(docsReloadSourcePath, { recursive: true });
+
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          agent: { max_concurrent_agents: 1, max_turns: 1 },
+          review_loop: {
+            reviewer_prompt: "TOP reviewer template {{ issue.identifier }}",
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "ENG",
+            workspaceRoot: symphonyWorkspaceRoot,
+            stateDir: symphonyStateDir,
+            tracker: { active_states: ["Todo", "In Progress"], handoff_states: ["Human Review"] },
+            review_loop: { review_states: ["In Review"] },
+            workspace: { source: { kind: "copy", path: symphonySourcePath } },
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            workspaceRoot: docsWorkspaceRoot,
+            stateDir: docsStateDir,
+            tracker: { active_states: ["Queued", "Doing"], handoff_states: ["Docs Handoff"] },
+            review_loop: {
+              review_states: ["Docs Review"],
+              reviewer_prompt: "DOCS reviewer redispatch template {{ issue.identifier }}",
+            },
+            workspace: { source: { kind: "copy", path: docsSourcePath } },
+          }),
+        ],
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const reloadedConfig = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          agent: { max_concurrent_agents: 1, max_turns: 1 },
+          review_loop: {
+            reviewer_prompt: "RELOADED TOP reviewer template {{ issue.identifier }}",
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "ENG",
+            workspaceRoot: symphonyWorkspaceRoot,
+            stateDir: symphonyStateDir,
+            tracker: { active_states: ["Todo", "In Progress"], handoff_states: ["Human Review"] },
+            review_loop: { review_states: ["In Review"] },
+            workspace: { source: { kind: "copy", path: symphonySourcePath } },
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            workspaceRoot: docsReloadWorkspaceRoot,
+            stateDir: docsReloadStateDir,
+            tracker: { active_states: ["Ready"], handoff_states: ["Docs Handoff"] },
+            review_loop: {
+              review_states: ["Ready For Docs Approval"],
+              reviewer_prompt: "RELOADED DOCS reviewer redispatch template {{ issue.identifier }}",
+            },
+            workspace: { source: { kind: "copy", path: docsReloadSourcePath } },
+          }),
+        ],
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const docsIssue = trackerIssue({
+      id: "issue-docs-review-redispatch-1",
+      identifier: "DOCS-707",
+      state: "Docs Review",
+      branchName: "docs/DOCS-707",
+      labels: ["dogfood-ready"],
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+    const reviewStateRequests: string[][] = [];
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        reviewStateRequests.push([...states]);
+        return states.includes(docsIssue.state) ? [docsIssue] : [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        return issueIds.includes(docsIssue.id) ? [docsIssue] : [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runtimeDependencies = createProjectContextRuntimeDependencies(config, logger);
+    const { workspaceManager, lifecycleStore, runStore } = runtimeDependencies;
+    const report = completionReportRecord(docsIssue);
+    await lifecycleStore.ensureIssue(docsIssue, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      summaryPointers: {
+        branchName: "docs/DOCS-707",
+        gitBranchName: "docs/DOCS-707",
+        prUrl: "https://github.com/acme/docs/pull/21",
+        prNumber: 21,
+        prHeadSha: "docs-head-21",
+      },
+    });
+    await runStore.startRun({
+      runId: report.runId,
+      sessionId: "worker-session-docs-review-1",
+      agentId: "worker-agent-docs-review-1",
+      role: "worker",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: projectContextResolutionFromIssue(docsIssue) ?? undefined,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: docsIssue.identifier,
+      workspacePath: path.join(docsWorkspaceRoot, docsIssue.identifier),
+      gitBranchName: "docs/DOCS-707",
+      repoPath: docsSourcePath,
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: report.runId,
+      at: "2026-01-01T00:00:02Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Docs reviewer redispatch evidence line.",
+    });
+    let orchestrator: Orchestrator;
+    const harness = new ConfigReloadHarness(
+      () => {
+        runtimeDependencies.updateConfig(reloadedConfig);
+        orchestrator.updateConfig(reloadedConfig, "RELOADED worker prompt {{ issue.identifier }}");
+      },
+      [
+        [{ type: "failed", error: "reload-triggered reviewer failure" }],
+        [{ type: "completed", message: "review retry completed" }],
+      ],
+    );
+    orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1 && orchestrator.snapshot().counts.running === 0, "first docs reviewer failure");
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2, "docs reviewer redispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "docs reviewer redispatch completion");
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+    await settleOrchestratorExit();
+
+    expect(reviewStateRequests[0]).toContain("Docs Review");
+    expect(reviewStateRequests[reviewStateRequests.length - 1]).toContain("Ready For Docs Approval");
+    expect(harness.runs[1]?.ctx.projectContext).toMatchObject({ projectContextId: "docs", linearProjectSlug: "DOCS" });
+    expect(harness.runs[1]?.ctx.config.reviewLoop.reviewStates).toEqual(["Docs Review"]);
+    expect(harness.runs[1]?.prompt).toContain("DOCS reviewer redispatch template DOCS-707");
+    expect(harness.runs[1]?.prompt).not.toContain("RELOADED DOCS reviewer redispatch template DOCS-707");
   });
 
 });
@@ -7873,7 +8206,10 @@ class ConfigReloadHarness implements AgentHarness {
   readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
   private reloaded = false;
 
-  constructor(private readonly onReload: (ctx: AgentRunContext) => Promise<void> | void = () => undefined) {}
+  constructor(
+    private readonly onReload: (ctx: AgentRunContext) => Promise<void> | void = () => undefined,
+    private readonly runEvents: AgentEvent[][] = [[{ type: "completed", message: "fake completed" }]],
+  ) {}
 
   async reload(ctx: AgentRunContext): Promise<void> {
     if (this.reloaded) return;
@@ -7882,10 +8218,12 @@ class ConfigReloadHarness implements AgentHarness {
   }
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
-    const runId = `reload-${ctx.issue.id}-${ctx.turnNumber}`;
-    this.runs.push({ ctx, prompt });
+    const runNumber = this.runs.push({ ctx, prompt });
+    const runId = `reload-${ctx.issue.id}-${runNumber}`;
     yield { type: "session_started", sessionId: runId, runId };
-    yield { type: "completed", message: "fake completed" };
+    for (const event of this.runEvents[runNumber - 1] ?? [{ type: "completed", message: "fake completed" }]) {
+      yield event;
+    }
   }
 }
 

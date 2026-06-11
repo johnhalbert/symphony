@@ -232,6 +232,15 @@ export interface RetryEntry {
   timer: NodeJS.Timeout;
   error: string | null;
   runPhase: AgentRunPhase;
+  resolvedConfig: ServiceConfig;
+  resolvedPromptTemplate: string;
+}
+
+interface PreservedReviewerDispatchEntry {
+  issueId: string;
+  identifier: string;
+  resolvedConfig: ServiceConfig;
+  resolvedPromptTemplate: string;
 }
 
 type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
@@ -457,6 +466,7 @@ export class Orchestrator {
   private readonly completed = new Set<string>();
   private readonly pausedIssues = new Set<string>();
   private readonly retryAttempts = new Map<string, RetryEntry>();
+  private readonly pendingReviewerRedispatches = new Map<string, PreservedReviewerDispatchEntry>();
   private readonly operatorChatQueues = new Map<string, Promise<void>>();
   private readonly operatorChatRuns = new Map<string, OperatorChatQueueEntry>();
   private readonly totals: TokenCounts = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
@@ -592,6 +602,58 @@ export class Orchestrator {
       ...this.config.reviewLoop.reviewStates,
       ...this.config.projectContexts.contexts.flatMap((context) => context.reviewLoop.reviewStates),
     ]);
+  }
+
+  private shouldQueueReviewerRedispatch(entry: RunningEntry): boolean {
+    if (this.stopped || entry.suppressRetryOnExit) return false;
+    const entryConfig = this.configForEntry(entry);
+    if (entry.role === "worker") {
+      return entry.completionReportAccepted && entryConfig.reviewLoop.reviewStates.length > 0;
+    }
+    if (entry.role !== "reviewer") return false;
+    if (entry.reviewVerdictAccepted) return false;
+    if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason != null) return false;
+    if (isStateIn(entry.issue.state, entryConfig.tracker.terminalStates)) return false;
+    return true;
+  }
+
+  private queueReviewerRedispatch(entry: RunningEntry): void {
+    if (!this.shouldQueueReviewerRedispatch(entry)) return;
+    this.pendingReviewerRedispatches.set(entry.issue.id, {
+      issueId: entry.issue.id,
+      identifier: entry.issue.identifier,
+      resolvedConfig: this.configForEntry(entry),
+      resolvedPromptTemplate: entry.resolvedPromptTemplate,
+    });
+  }
+
+  private async processPendingReviewerRedispatches(): Promise<void> {
+    if (this.pendingReviewerRedispatches.size == 0) return;
+    let refreshed: Issue[];
+    try {
+      refreshed = await this.options.tracker.fetchIssueStatesByIds([...this.pendingReviewerRedispatches.keys()]);
+    } catch (error) {
+      this.options.logger.warn("preserved reviewer redispatch refresh failed", { error: errorMessage(error) });
+      return;
+    }
+    const issuesById = new Map(refreshed.map((issue) => [issue.id, issue]));
+    for (const [issueId, pending] of this.pendingReviewerRedispatches) {
+      if (this.availableSlots() <= 0) break;
+      const issue = issuesById.get(issueId);
+      if (!issue) continue;
+      if (isStateIn(issue.state, pending.resolvedConfig.tracker.terminalStates)) {
+        this.pendingReviewerRedispatches.delete(issueId);
+        continue;
+      }
+      if (await this.tryDispatchReviewerIssue(issue, false, pending.resolvedConfig, pending.resolvedPromptTemplate)) {
+        this.pendingReviewerRedispatches.delete(issueId);
+        continue;
+      }
+      const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+      if (lifecycle && (lifecycle.phase === "blocked" || lifecycle.blockedReason != null || lifecycle.phase === "terminal")) {
+        this.pendingReviewerRedispatches.delete(issueId);
+      }
+    }
   }
 
   async refreshNow(): Promise<void> {
@@ -1224,6 +1286,7 @@ export class Orchestrator {
         if (this.availableSlots() <= 0) break;
         await this.tryDispatchWorkerIssue(issue, null);
       }
+      await this.processPendingReviewerRedispatches();
       const reviewerCandidates = await this.options.tracker.fetchIssuesByStates(this.reviewerDispatchStates());
       for (const issue of sortIssuesForDispatch(reviewerCandidates)) {
         if (this.availableSlots() <= 0) break;
@@ -1481,7 +1544,7 @@ export class Orchestrator {
       }
       return false;
     }
-    const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
+    const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason != null;
     if (blockedByLifecycle) {
       if (isPendingPublicationApprovalReason(lifecycle.blockedReason)) {
         return false;
@@ -1550,12 +1613,17 @@ export class Orchestrator {
     return true;
   }
 
-  private async tryDispatchWorkerIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
+  private async tryDispatchWorkerIssue(
+    issue: Issue,
+    attempt: number | null,
+    allowExistingClaim = false,
+    dispatchConfig: ServiceConfig = this.configForIssue(issue),
+    resolvedPromptTemplate: string = this.promptTemplate,
+  ): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     const initialRunPhase = this.isMergeConflictState(issue.state) ? "merge_conflict_resolution" : "implementation";
-    const initialConfig = this.configForIssue(issue);
-    if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase, initialConfig)) return false;
+    if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase, dispatchConfig)) return false;
 
     let refreshed: Issue[];
     try {
@@ -1574,10 +1642,9 @@ export class Orchestrator {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     const latestRunPhase = this.isMergeConflictState(latest.state) ? "merge_conflict_resolution" : "implementation";
-    const latestConfig = this.configForIssue(latest);
-    if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase, latestConfig)) return false;
+    if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase, dispatchConfig)) return false;
 
-    const decision = await this.resolveWorkerDispatchDecision(latest, latestConfig);
+    const decision = await this.resolveWorkerDispatchDecision(latest, dispatchConfig);
     if (decision.action === "skip") {
       this.options.logger.warn("worker dispatch skipped", {
         issue_id: latest.id,
@@ -1587,14 +1654,13 @@ export class Orchestrator {
       return false;
     }
     let runPhase = decision.runPhase;
-    if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase, latestConfig))) return false;
-    const dispatchWriteback = runPhase === "implementation" ? planDispatchWriteback(latest, latestConfig) : null;
+    if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase, dispatchConfig))) return false;
+    const dispatchWriteback = runPhase === "implementation" ? planDispatchWriteback(latest, dispatchConfig) : null;
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
     const afterWriteback = dispatchWriteback ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] : latest;
     if (!afterWriteback) return false;
-    const afterWritebackConfig = this.configForIssue(afterWriteback);
     if (dispatchWriteback) {
-      const postWritebackDecision = await this.resolveWorkerDispatchDecision(afterWriteback, afterWritebackConfig);
+      const postWritebackDecision = await this.resolveWorkerDispatchDecision(afterWriteback, dispatchConfig);
       if (postWritebackDecision.action === "skip") {
         this.options.logger.warn("worker dispatch skipped after writeback", {
           issue_id: afterWriteback.id,
@@ -1605,19 +1671,23 @@ export class Orchestrator {
       }
       runPhase = postWritebackDecision.runPhase;
     }
-    if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim, runPhase, afterWritebackConfig)) return false;
-    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase, afterWritebackConfig))) return false;
+    if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim, runPhase, dispatchConfig)) return false;
+    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase, dispatchConfig))) return false;
 
-    this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase);
+    this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase, dispatchConfig, resolvedPromptTemplate);
     return true;
   }
 
-  private async tryDispatchReviewerIssue(issue: Issue, allowExistingClaim = false): Promise<boolean> {
+  private async tryDispatchReviewerIssue(
+    issue: Issue,
+    allowExistingClaim = false,
+    dispatchConfig: ServiceConfig = this.configForIssue(issue),
+    resolvedPromptTemplate: string = this.promptTemplate,
+  ): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
-    const issueConfig = this.configForIssue(issue);
-    if (!this.shouldDispatchReviewer(issue, allowExistingClaim, issueConfig)) return false;
-    if (!(await this.lifecycleAllowsDispatch(issue, "reviewer", "review", issueConfig))) return false;
+    if (!this.shouldDispatchReviewer(issue, allowExistingClaim, dispatchConfig)) return false;
+    if (!(await this.lifecycleAllowsDispatch(issue, "reviewer", "review", dispatchConfig))) return false;
 
     let refreshed: Issue[];
     try {
@@ -1635,14 +1705,13 @@ export class Orchestrator {
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
-    const latestConfig = this.configForIssue(latest);
-    if (!this.shouldDispatchReviewer(latest, allowExistingClaim, latestConfig)) return false;
-    if (!(await this.lifecycleAllowsDispatch(latest, "reviewer", "review", latestConfig))) return false;
+    if (!this.shouldDispatchReviewer(latest, allowExistingClaim, dispatchConfig)) return false;
+    if (!(await this.lifecycleAllowsDispatch(latest, "reviewer", "review", dispatchConfig))) return false;
 
     const reviewEvidence = await this.loadReviewerDispatchEvidence(latest);
     if (!reviewEvidence) return false;
 
-    this.dispatchIssue(latest, null, "reviewer", reviewEvidence);
+    this.dispatchIssue(latest, null, "reviewer", reviewEvidence, "review", dispatchConfig, resolvedPromptTemplate);
     return true;
   }
 
@@ -1690,13 +1759,15 @@ export class Orchestrator {
     role: AgentRunRole,
     reviewEvidence: ReviewerDispatchEvidence | null,
     runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
+    resolvedConfig: ServiceConfig = this.configForIssue(issue),
+    resolvedPromptTemplate: string = this.promptTemplate,
   ): void {
     const abortController = new AbortController();
     const retryAttempt = attempt ?? 0;
     const entry: RunningEntry = {
       issue,
-      resolvedConfig: this.configForIssue(issue),
-      resolvedPromptTemplate: this.promptTemplate,
+      resolvedConfig,
+      resolvedPromptTemplate,
       role,
       runPhase,
       workspacePath: null,
@@ -1746,6 +1817,7 @@ export class Orchestrator {
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
     this.clearRetry(issue.id);
+    if (role == "reviewer") this.pendingReviewerRedispatches.delete(issue.id);
     const run = role === "reviewer" ? this.runReviewer(entry) : this.runWorker(entry, attempt);
     const worker = this.monitorRunExit(entry, run);
     entry.worker = worker;
@@ -1851,7 +1923,7 @@ export class Orchestrator {
           turnNumber,
         });
         if (entry.completionReportAccepted || entry.mergeConflictResolutionAccepted) break;
-        if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) break;
+        if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason != null) break;
 
         const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
         const latest = refreshed[0];
@@ -2338,11 +2410,13 @@ export class Orchestrator {
         );
         if (!terminal.updated) {
           if (entry.runPhase !== "merge_conflict_resolution") {
+            if (entry.completionReportAccepted) this.queueReviewerRedispatch(entry);
             this.claimed.delete(issueId);
             return;
           }
         }
       }
+      if (entry.completionReportAccepted) this.queueReviewerRedispatch(entry);
       if (entry.runPhase !== "merge_conflict_resolution") {
         this.completed.add(issueId);
       }
@@ -2358,7 +2432,7 @@ export class Orchestrator {
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
         });
-        if (!terminal.updated && entry.runPhase !== "merge_conflict_resolution") {
+        if (!terminal.updated && entry.runPhase !== "merge_conflict_resolution" && entry.role !== "reviewer") {
           this.claimed.delete(issueId);
           return;
         }
@@ -2368,16 +2442,26 @@ export class Orchestrator {
       }
       if (entry.role === "reviewer") {
         await this.reconcileReviewVerdictHandoff(entry);
+        this.queueReviewerRedispatch(entry);
         this.claimed.delete(issueId);
         return;
       }
-      if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) {
+      if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason != null) {
         this.claimed.delete(issueId);
         return;
       }
       if (entry.runPhase === "merge_conflict_resolution") {
         if (await this.shouldScheduleContinuation(entry)) {
-          this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
+          this.scheduleRetry(
+            issueId,
+            entry.issue.identifier,
+            1,
+            1_000,
+            null,
+            entry.runPhase,
+            this.configForEntry(entry),
+            entry.resolvedPromptTemplate,
+          );
         } else {
           this.claimed.delete(issueId);
         }
@@ -2401,7 +2485,16 @@ export class Orchestrator {
         return;
       }
       if (await this.shouldScheduleContinuation(entry)) {
-        this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
+        this.scheduleRetry(
+          issueId,
+          entry.issue.identifier,
+          1,
+          1_000,
+          null,
+          entry.runPhase,
+          this.configForEntry(entry),
+          entry.resolvedPromptTemplate,
+        );
       } else {
         this.claimed.delete(issueId);
       }
@@ -2414,11 +2507,12 @@ export class Orchestrator {
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
         });
-        if (!terminal.updated) {
+        if (!terminal.updated && !terminal.record) {
           this.claimed.delete(issueId);
           return;
         }
       }
+      this.queueReviewerRedispatch(entry);
       this.claimed.delete(issueId);
     } else if (entry.suppressRetryOnExit) {
       if (entry.runId) {
@@ -2452,7 +2546,7 @@ export class Orchestrator {
     } else {
       if (entry.runPhase === "merge_conflict_resolution") {
         await this.recordMergeConflictAttempt(entry, error ?? "conflict-fix run failed before reporting resolution");
-        if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) {
+        if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason != null) {
           this.claimed.delete(issueId);
           return;
         }
@@ -2508,7 +2602,16 @@ export class Orchestrator {
       }
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), entryConfig.agent.maxRetryBackoffMs);
-      this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error, entry.runPhase);
+      this.scheduleRetry(
+        issueId,
+        entry.issue.identifier,
+        nextAttempt,
+        delayMs,
+        error,
+        entry.runPhase,
+        this.configForEntry(entry),
+        entry.resolvedPromptTemplate,
+      );
     }
   }
 
@@ -2565,7 +2668,16 @@ export class Orchestrator {
     }
 
     const delayMs = planningRetryDelayMs(nextCount, entryConfig);
-    this.scheduleRetry(issueId, entry.issue.identifier, nextCount, delayMs, error, "issue_breakdown");
+    this.scheduleRetry(
+      issueId,
+      entry.issue.identifier,
+      nextCount,
+      delayMs,
+      error,
+      "issue_breakdown",
+      this.configForEntry(entry),
+      entry.resolvedPromptTemplate,
+    );
   }
 
   private async consecutiveSdkErrorFailures(issue: Issue): Promise<number> {
@@ -2639,7 +2751,7 @@ export class Orchestrator {
     const latest = refreshed[0];
     if (!latest) return false;
     entry.issue = latest;
-    return this.shouldDispatchWorker(latest, true, entry.runPhase);
+    return this.shouldDispatchWorker(latest, true, entry.runPhase, this.configForEntry(entry));
   }
 
   private scheduleRetry(
@@ -2649,6 +2761,8 @@ export class Orchestrator {
     delayMs: number,
     error: string | null,
     runPhase: AgentRunPhase = "implementation",
+    resolvedConfig: ServiceConfig = this.config,
+    resolvedPromptTemplate: string = this.promptTemplate,
   ): void {
     this.clearRetry(issueId);
     if (this.stopped) {
@@ -2659,7 +2773,17 @@ export class Orchestrator {
     const timer = setTimeout(() => {
       void this.onRetryTimer(issueId);
     }, delayMs);
-    this.retryAttempts.set(issueId, { issueId, identifier, attempt, dueAtMs, timer, error, runPhase });
+    this.retryAttempts.set(issueId, {
+      issueId,
+      identifier,
+      attempt,
+      dueAtMs,
+      timer,
+      error,
+      runPhase,
+      resolvedConfig,
+      resolvedPromptTemplate,
+    });
   }
 
   private async onRetryTimer(issueId: string): Promise<void> {
@@ -2678,13 +2802,12 @@ export class Orchestrator {
           Math.max(delayMs, this.config.polling.intervalMs),
           retry.error ?? providerGateDispatchBlockedMessage(providerGate),
           retry.runPhase,
+          retry.resolvedConfig,
+          retry.resolvedPromptTemplate,
         );
         return;
       }
-      const candidates =
-        retry.runPhase === "merge_conflict_resolution"
-          ? await this.options.tracker.fetchIssueStatesByIds([issueId])
-          : await this.options.tracker.fetchCandidateIssues();
+      const candidates = await this.options.tracker.fetchIssueStatesByIds([issueId]);
       issue = candidates.find((candidate) => candidate.id === issueId) ?? null;
       if (!issue) {
         this.claimed.delete(issueId);
@@ -2693,7 +2816,16 @@ export class Orchestrator {
       if (retry.runPhase === "issue_breakdown") {
         const remainingMs = await this.planningBackoffRemainingForIssue(issue);
         if (remainingMs > 0) {
-          this.scheduleRetry(issueId, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+          this.scheduleRetry(
+            issueId,
+            retry.identifier,
+            retry.attempt,
+            remainingMs,
+            retry.error,
+            retry.runPhase,
+            retry.resolvedConfig,
+            retry.resolvedPromptTemplate,
+          );
           return;
         }
       }
@@ -2701,11 +2833,26 @@ export class Orchestrator {
         if (retry.runPhase === "issue_breakdown") {
           await this.recordPlanningDispatchRetry(issue, retry, "no available orchestrator slots");
         } else {
-          this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, "no available orchestrator slots", retry.runPhase);
+          this.scheduleRetry(
+            issueId,
+            retry.identifier,
+            retry.attempt + 1,
+            1_000,
+            "no available orchestrator slots",
+            retry.runPhase,
+            retry.resolvedConfig,
+            retry.resolvedPromptTemplate,
+          );
         }
         return;
       }
-      const dispatched = await this.tryDispatchWorkerIssue(issue, retry.attempt, true);
+      const dispatched = await this.tryDispatchWorkerIssue(
+        issue,
+        retry.attempt,
+        true,
+        retry.resolvedConfig,
+        retry.resolvedPromptTemplate,
+      );
       if (!dispatched) {
         if (retry.runPhase === "issue_breakdown") {
           await this.recordPlanningDispatchRetry(issue, retry, retry.error ?? "planning dispatch retry failed");
@@ -2714,12 +2861,21 @@ export class Orchestrator {
         }
       }
     } catch (error) {
-      const issueConfig = issue ? this.configForIssue(issue) : this.config;
+      const issueConfig = retry.resolvedConfig;
       if (retry.runPhase === "issue_breakdown" && retry.attempt >= issueConfig.issueBreakdown.maxPlanningDispatchRetries) {
         this.claimed.delete(issueId);
         return;
       }
-      this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, errorMessage(error), retry.runPhase);
+      this.scheduleRetry(
+        issueId,
+        retry.identifier,
+        retry.attempt + 1,
+        1_000,
+        errorMessage(error),
+        retry.runPhase,
+        retry.resolvedConfig,
+        retry.resolvedPromptTemplate,
+      );
     }
   }
 
@@ -2740,7 +2896,16 @@ export class Orchestrator {
     if (current) {
       const remainingMs = planningBackoffRemainingMs(current, issueConfig);
       if (remainingMs > 0) {
-        this.scheduleRetry(issue.id, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+        this.scheduleRetry(
+          issue.id,
+          retry.identifier,
+          retry.attempt,
+          remainingMs,
+          retry.error,
+          retry.runPhase,
+          retry.resolvedConfig,
+          retry.resolvedPromptTemplate,
+        );
         return;
       }
     }
@@ -2759,7 +2924,16 @@ export class Orchestrator {
       return;
     }
     const delayMs = planningRetryDelayMs(Math.max(lifecycle.planningFailureCount, 1), issueConfig);
-    this.scheduleRetry(issue.id, retry.identifier, retry.attempt + 1, delayMs, error, retry.runPhase);
+    this.scheduleRetry(
+      issue.id,
+      retry.identifier,
+      retry.attempt + 1,
+      delayMs,
+      error,
+      retry.runPhase,
+      retry.resolvedConfig,
+      retry.resolvedPromptTemplate,
+    );
   }
 
   private clearRetry(issueId: string): void {
@@ -3771,7 +3945,7 @@ function isTerminalSdkRunStatus(status: AgentRunSdkStatus): boolean {
 }
 
 function isLifecycleHumanBlocked(lifecycle: IssueLifecycleRecord | null): boolean {
-  return lifecycle !== null && (lifecycle.phase === "blocked" || lifecycle.blockedReason !== null);
+  return lifecycle !== null && (lifecycle.phase === "blocked" || lifecycle.blockedReason != null);
 }
 
 function hasOpenBlocker(issue: Issue, terminalStates: string[]): boolean {
