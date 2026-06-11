@@ -7,7 +7,11 @@ export const LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE = "legacy_default";
 const REDACTED = "[redacted]";
 const REPOSITORY_URL_PATTERN = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 const REPOSITORY_SCP_STYLE_PATTERN = /^([^/\\]+)@([^:]+):(.+)$/;
-const URL_USERINFO_PATTERN = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s?#]*)@/gi;
+const URL_HOST_QUERY_OR_FRAGMENT_BEFORE_AT_PATTERN =
+  /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/(?:localhost|(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+|(?:\d{1,3}\.){3}\d{1,3}|\[[^\]]+\])(?::\d+)?[?#][^/\s]*@/i;
+const URL_USERINFO_WITH_RAW_QUERY_OR_FRAGMENT_PATTERN =
+  /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s]*[?#][^/\s]*)@([^/\s]+\/.*)$/i;
+const URL_USERINFO_PATTERN = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s?#]*)@/i;
 
 export interface ProjectContextResolution {
   projectContextId: ProjectContextId;
@@ -288,5 +292,9 @@ function sanitizePublicRepositoryValue(value: string | null | undefined): string
     return `${REDACTED}@${host}:${repositoryPath}`.replace(/[?#].*$/, "");
   }
   if (!REPOSITORY_URL_PATTERN.test(normalized)) return normalized;
-  return normalized.replace(URL_USERINFO_PATTERN, `$1${REDACTED}@`).replace(/[?#].*$/, "");
+  if (URL_HOST_QUERY_OR_FRAGMENT_BEFORE_AT_PATTERN.test(normalized)) return normalized.replace(/[?#].*$/, "");
+  return normalized
+    .replace(URL_USERINFO_WITH_RAW_QUERY_OR_FRAGMENT_PATTERN, `$1${REDACTED}@$3`)
+    .replace(URL_USERINFO_PATTERN, `$1${REDACTED}@`)
+    .replace(/[?#].*$/, "");
 }

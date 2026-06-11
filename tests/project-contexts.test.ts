@@ -143,6 +143,36 @@ describe("project context normalization", () => {
         leakedSubstring: "ss@example.com",
       },
       {
+        name: "raw question mark in HTTPS URL userinfo",
+        repository: "https://token:pa?ss@example.com/acme/docs-site.git",
+        expected: "https://[redacted]@example.com/acme/docs-site.git",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw question mark in generic FTP URL userinfo",
+        repository: "ftp://token:pa?ss@example.com/acme/docs-site.git",
+        expected: "ftp://[redacted]@example.com/acme/docs-site.git",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw question mark in username-only HTTPS URL userinfo",
+        repository: "https://user?name@example.com/acme/docs-site.git",
+        expected: "https://[redacted]@example.com/acme/docs-site.git",
+        leakedSubstring: "https://user",
+      },
+      {
+        name: "raw hash in HTTPS URL userinfo",
+        repository: "https://token:pa#ss@example.com/acme/docs-site.git",
+        expected: "https://[redacted]@example.com/acme/docs-site.git",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw hash in generic custom-scheme URL userinfo",
+        repository: "custom://token:pa#ss@example.com/acme/docs-site.git",
+        expected: "custom://[redacted]@example.com/acme/docs-site.git",
+        leakedSubstring: "token:pa",
+      },
+      {
         name: "query token URL",
         repository: "https://example.com/acme/docs-site.git?access_token=secret",
         expected: "https://example.com/acme/docs-site.git",
@@ -274,6 +304,36 @@ describe("project context normalization", () => {
         repository: "https://token:pa@ss@example.com/acme/symphony.git",
         expected: "https://[redacted]@example.com/acme/symphony.git",
         leakedSubstring: "ss@example.com",
+      },
+      {
+        name: "raw question mark in HTTPS URL userinfo",
+        repository: "https://token:pa?ss@example.com/acme/symphony.git",
+        expected: "https://[redacted]@example.com/acme/symphony.git",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw question mark in generic FTP URL userinfo",
+        repository: "ftp://token:pa?ss@example.com/acme/symphony.git",
+        expected: "ftp://[redacted]@example.com/acme/symphony.git",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw question mark in username-only HTTPS URL userinfo",
+        repository: "https://user?name@example.com/acme/symphony.git",
+        expected: "https://[redacted]@example.com/acme/symphony.git",
+        leakedSubstring: "https://user",
+      },
+      {
+        name: "raw hash in HTTPS URL userinfo",
+        repository: "https://token:pa#ss@example.com/acme/symphony.git",
+        expected: "https://[redacted]@example.com/acme/symphony.git",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw hash in generic custom-scheme URL userinfo",
+        repository: "custom://token:pa#ss@example.com/acme/symphony.git",
+        expected: "custom://[redacted]@example.com/acme/symphony.git",
+        leakedSubstring: "token:pa",
       },
       {
         name: "query token URL",
