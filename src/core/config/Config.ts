@@ -1063,6 +1063,19 @@ function normalizeWorkflowProjectContext(
       });
     }
 
+    const publicMetadataRepository =
+      workspace.source.kind === "git" || workspace.source.kind === "git_worktree"
+        ? resolveOptionalConfigStringValue(merged.workspace?.source?.repository, env)
+        : undefined;
+    const publicMetadataWorkspace = {
+      root: workspace.root,
+      source: {
+        kind: workspace.source.kind,
+        repository: publicMetadataRepository ?? null,
+        path: workspace.source.path ?? null,
+      },
+    };
+
     return {
       id,
       label,
@@ -1075,7 +1088,13 @@ function normalizeWorkflowProjectContext(
       issueBreakdown,
       agent,
       credentialProfiles: merged.credential_profiles,
-      publicMetadata: projectContextMetadataForPublicRead({ id, label, enabled, tracker, workspace }),
+      publicMetadata: projectContextMetadataForPublicRead({
+        id,
+        label,
+        enabled,
+        tracker,
+        workspace: publicMetadataWorkspace,
+      }),
     };
   } catch (error) {
     throw attachProjectContextValidationSignal(error, contextPath);

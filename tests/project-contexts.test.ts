@@ -174,6 +174,24 @@ describe("project context normalization", () => {
       forbiddenSubstrings: ["repo-secret"],
     },
     {
+      label: "dot-delimited credential-like value",
+      repository: "ghp_abcd.efgh",
+      expectedRepository: null,
+      forbiddenSubstrings: ["ghp_abcd.efgh"],
+    },
+    {
+      label: "colon-delimited credential-like value",
+      repository: "token:secret",
+      expectedRepository: null,
+      forbiddenSubstrings: ["token:secret"],
+    },
+    {
+      label: "invalid url-shaped value",
+      repository: "https://user:secret#fragment@example.com/org/docs.git",
+      expectedRepository: null,
+      forbiddenSubstrings: ["user", "secret", "fragment@example.com"],
+    },
+    {
       label: "ambiguous at-sign slash form",
       repository: "repo-secret@example.com/org/docs.git",
       expectedRepository: "example.com/org/docs.git",
@@ -267,6 +285,36 @@ describe("project context normalization", () => {
       },
       {
         id: "docs-single-label",
+        repository: "repo-secret",
+        expectedRepository: null,
+        forbiddenSubstrings: ["repo-secret", path.resolve("/repo", "repo-secret")],
+      },
+      {
+        id: "docs-env-single-label",
+        repository: "$REPO_SECRET",
+        expectedRepository: null,
+        forbiddenSubstrings: ["repo-secret", path.resolve("/repo", "repo-secret")],
+      },
+      {
+        id: "docs-dot-delimited",
+        repository: "ghp_abcd.efgh",
+        expectedRepository: null,
+        forbiddenSubstrings: ["ghp_abcd.efgh", path.resolve("/repo", "ghp_abcd.efgh")],
+      },
+      {
+        id: "docs-colon-delimited",
+        repository: "token:secret",
+        expectedRepository: null,
+        forbiddenSubstrings: ["token:secret"],
+      },
+      {
+        id: "docs-invalid-url",
+        repository: "https://user:secret#fragment@example.com/org/docs.git",
+        expectedRepository: null,
+        forbiddenSubstrings: ["user", "secret", "fragment@example.com"],
+      },
+      {
+        id: "docs-ssh",
         repository: "ssh://repo-secret@docs/org/docs.git?token=query-secret",
         expectedRepository: "ssh://docs/org/docs.git",
         forbiddenSubstrings: ["repo-secret", "query-secret"],
@@ -287,7 +335,7 @@ describe("project context normalization", () => {
         ],
       }),
       "/repo/WORKFLOW.md",
-      { LINEAR_API_KEY: "linear-test-key" },
+      { LINEAR_API_KEY: "linear-test-key", REPO_SECRET: "repo-secret" },
     );
 
     for (const testCase of cases) {
@@ -889,6 +937,7 @@ describe("project context normalization", () => {
       branchTemplate: "global/{{ issue.identifier }}",
       cleanup: "force",
     };
+    const inheritedPublicRepository = ".";
 
     expect(symphonyContext).toMatchObject({
       workspace: {
@@ -899,7 +948,7 @@ describe("project context normalization", () => {
       publicMetadata: {
         workspaceRoot: path.resolve("/repo", "./symphony-workspaces"),
         workspaceSourceKind: "git_worktree",
-        repository: path.resolve("/repo", "."),
+        repository: inheritedPublicRepository,
         path: path.resolve("/repo", "./default-source"),
       },
     });
@@ -912,7 +961,7 @@ describe("project context normalization", () => {
       publicMetadata: {
         workspaceRoot: path.resolve("/repo", "./docs-workspaces"),
         workspaceSourceKind: "git_worktree",
-        repository: path.resolve("/repo", "."),
+        repository: inheritedPublicRepository,
         path: path.resolve("/repo", "./default-source"),
       },
     });
@@ -1005,7 +1054,7 @@ describe("project context normalization", () => {
       linearProjectSlug: "DOCS_GIT",
       workspaceRoot: path.resolve("/repo", "./symphony_workspaces"),
       workspaceSourceKind: "git",
-      repository: path.resolve("/repo", "../docs-repo"),
+      repository: "../docs-repo",
       path: null,
     });
   });

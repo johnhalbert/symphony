@@ -469,8 +469,9 @@ function publicRepositorySummary(value: string | null | undefined): string | nul
   const normalized = normalizeOptionalNonEmptyString(value);
   if (normalized === null) return null;
 
-  const sanitizedUrl = sanitizedUrlRepositorySummary(normalized);
-  if (sanitizedUrl !== null) return sanitizedUrl;
+  if (looksLikeUrlRepositoryValue(normalized)) {
+    return sanitizedUrlRepositorySummary(normalized);
+  }
 
   const sanitizedScp = sanitizedScpLikeRepositorySummary(normalized);
   if (sanitizedScp !== null) return sanitizedScp;
@@ -482,12 +483,15 @@ function publicRepositorySummary(value: string | null | undefined): string | nul
   if (strippedSuffix !== normalized) return publicRepositorySummary(strippedSuffix);
 
   if (looksLikeLocalRepositoryPath(normalized)) return normalized;
-  if (looksLikeHostIdentifier(normalized)) return normalized;
-  return null;
+  return sanitizedHostIdentifierRepositorySummary(normalized);
+}
+
+function looksLikeUrlRepositoryValue(value: string): boolean {
+  return /^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(value);
 }
 
 function sanitizedUrlRepositorySummary(value: string): string | null {
-  if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(value)) return null;
+  if (!looksLikeUrlRepositoryValue(value)) return null;
 
   let parsed: URL;
   try {
@@ -542,10 +546,32 @@ function looksLikeLocalRepositoryPath(value: string): boolean {
   );
 }
 
-function looksLikeHostIdentifier(value: string): boolean {
-  if (/[\s@]/u.test(value)) return false;
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(value)) return false;
-  return /[.:\[]/u.test(value);
+function sanitizedHostIdentifierRepositorySummary(value: string): string | null {
+  if (/[\s@/]/u.test(value)) return null;
+
+  const match = /^(?<host>\[[0-9A-Fa-f:.]+\]|localhost|(?:\d{1,3}\.){3}\d{1,3}|(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+)(?::(?<port>\d+))?$/u.exec(
+    value,
+  );
+  const host = normalizeOptionalNonEmptyString(match?.groups?.host);
+  const port = normalizeOptionalNonEmptyString(match?.groups?.port);
+  if (host === null || !isSafePublicRepositoryHost(host)) return null;
+  return port === null ? host : `${host}:${port}`;
+}
+
+function isSafePublicRepositoryHost(host: string): boolean {
+  if (host === "localhost") return true;
+  if (/^\[[0-9A-Fa-f:.]+\]$/u.test(host)) return true;
+  if (isValidIpv4Host(host)) return true;
+
+  const labels = host.split(".");
+  if (labels.length < 2) return false;
+  return labels.every((label) => /^[A-Za-z0-9-]+$/u.test(label) && !label.startsWith("-") && !label.endsWith("-"));
+}
+
+function isValidIpv4Host(host: string): boolean {
+  const octets = host.split(".");
+  if (octets.length !== 4) return false;
+  return octets.every((octet) => /^\d{1,3}$/u.test(octet) && Number(octet) >= 0 && Number(octet) <= 255);
 }
 
 function readIssueRoutingFields(issue: unknown): {
