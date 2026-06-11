@@ -7,7 +7,11 @@ import {
 import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
-import type { ProjectContextResolution } from "../config/ProjectContexts.js";
+import {
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import type { Issue } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -38,18 +42,18 @@ export async function submitReviewVerdictFromMcp(input: unknown, options: {
   workflowPath: string;
   contextFile: string;
 }): Promise<unknown> {
-  const loadedContext = await readReviewVerdictContext(options.contextFile);
-  if (!loadedContext.activeRunId) {
-    throw new SymphonyError("invalid_request", "Review verdict context is not ready for the active run");
-  }
-
   const loader = new WorkflowLoader(options.workflowPath);
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const loadedContext = await readReviewVerdictContext(options.contextFile, lifecycleStore);
+    if (!loadedContext.activeRunId) {
+      throw new SymphonyError("invalid_request", "Review verdict context is not ready for the active run");
+    }
     const service = new ReviewVerdictService({
       config,
-      lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
+      lifecycleStore,
       writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
       runStore: new FileRunTranscriptStore(config.workspace.stateDir),
     });
@@ -96,12 +100,47 @@ export async function runReviewVerdictMcpServer(options: {
   });
 }
 
-async function readReviewVerdictContext(filePath: string): Promise<ReviewVerdictMcpContextFile> {
+async function readReviewVerdictContext(
+  filePath: string,
+  lifecycleStore?: Pick<FileIssueLifecycleStore, "get">,
+): Promise<ReviewVerdictMcpContextFile> {
   const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as ReviewVerdictMcpContextFile;
   if (!parsed.issue || parsed.role !== "reviewer") {
     throw new SymphonyError("invalid_request", "Review verdict MCP context is invalid");
   }
+  const authoritativeProjectContext = await readServiceOwnedReviewVerdictProjectContext(parsed.issue, lifecycleStore);
+  if (parsed.projectContext && authoritativeProjectContext && !projectContextEquals(parsed.projectContext, authoritativeProjectContext)) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Review verdict MCP context does not match the service-owned issue project context",
+    );
+  }
   return parsed;
+}
+
+async function readServiceOwnedReviewVerdictProjectContext(
+  issue: Issue,
+  lifecycleStore?: Pick<FileIssueLifecycleStore, "get">,
+): Promise<ProjectContextResolution | null> {
+  const lifecycle =
+    (await lifecycleStore?.get(issue.id)) ??
+    (issue.identifier !== issue.id ? await lifecycleStore?.get(issue.identifier) : null) ??
+    null;
+  return lifecycle?.projectContext ?? projectContextResolutionFromIssue(issue);
+}
+
+function projectContextEquals(
+  left: ProjectContextResolution | undefined,
+  right: ProjectContextResolution | undefined,
+): boolean {
+  const normalizedLeft = normalizeProjectContextResolution(left);
+  const normalizedRight = normalizeProjectContextResolution(right);
+  return (
+    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
+    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
+    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
+    normalizedLeft.routingSource === normalizedRight.routingSource
+  );
 }
 
 function reviewVerdictInputSchema(): Record<string, unknown> {
