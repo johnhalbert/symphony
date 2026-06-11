@@ -141,6 +141,118 @@ describe("project context normalization", () => {
     });
   });
 
+  it("omits credential-bearing values from public metadata helpers", () => {
+    const secretBearingContext = {
+      id: "docs",
+      label: "Documentation Site",
+      enabled: true,
+      tracker: {
+        projectSlug: "DOCS",
+        api_key: "linear-secret",
+      },
+      workspace: {
+        root: "./docs-workspaces",
+        credential_profiles: { publication: "github-secret" },
+        source: {
+          kind: "git_worktree",
+          repository: "../docs-site",
+          path: "packages/site",
+          private_key: "ssh-private-key",
+        },
+      },
+      github: {
+        token: "github-secret",
+      },
+    };
+
+    const metadata = projectContextMetadataForPublicRead(secretBearingContext);
+
+    expect(metadata).toEqual({
+      id: "docs",
+      label: "Documentation Site",
+      enabled: true,
+      linearProjectSlug: "DOCS",
+      workspaceRoot: "./docs-workspaces",
+      workspaceSourceKind: "git_worktree",
+      repository: "../docs-site",
+      path: "packages/site",
+    });
+    expect(Object.keys(metadata).sort()).toEqual([
+      "enabled",
+      "id",
+      "label",
+      "linearProjectSlug",
+      "path",
+      "repository",
+      "workspaceRoot",
+      "workspaceSourceKind",
+    ]);
+    expect(metadata).not.toHaveProperty("api_key");
+    expect(metadata).not.toHaveProperty("credential_profiles");
+    expect(metadata).not.toHaveProperty("token");
+    expect(JSON.stringify(metadata)).not.toContain("linear-secret");
+    expect(JSON.stringify(metadata)).not.toContain("github-secret");
+    expect(JSON.stringify(metadata)).not.toContain("ssh-private-key");
+  });
+
+  it("keeps resolved credential values out of normalized public metadata", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+                feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-test-key",
+        GITHUB_PUBLICATION_TOKEN: "publication-secret",
+        GITHUB_FEEDBACK_TOKEN: "feedback-secret",
+      },
+    );
+
+    const publicMetadata = config.projectContexts.defaultContext.publicMetadata;
+    expect(publicMetadata).toMatchObject({
+      id: "symphony",
+      label: "Symphony",
+      enabled: true,
+      linearProjectSlug: "SYMPHONY",
+      workspaceSourceKind: "git_worktree",
+      path: null,
+    });
+    expect(publicMetadata.repository).toMatch(/repo$/i);
+    expect(publicMetadata.workspaceRoot).toMatch(/symphony_workspaces$/i);
+    expect(Object.keys(publicMetadata).sort()).toEqual([
+      "enabled",
+      "id",
+      "label",
+      "linearProjectSlug",
+      "path",
+      "repository",
+      "workspaceRoot",
+      "workspaceSourceKind",
+    ]);
+    expect(publicMetadata).not.toHaveProperty("credentialProfiles");
+    expect(publicMetadata).not.toHaveProperty("token");
+    expect(JSON.stringify(publicMetadata)).not.toContain("linear-test-key");
+    expect(JSON.stringify(publicMetadata)).not.toContain("publication-secret");
+    expect(JSON.stringify(publicMetadata)).not.toContain("feedback-secret");
+  });
+
   it("normalizes legacy top-level config into an explicit default project context", () => {
     expect(
       normalizeLegacyDefaultProjectContext({
