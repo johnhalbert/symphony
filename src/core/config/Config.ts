@@ -623,6 +623,7 @@ export interface TopLevelParseDependencyDefaults {
 export interface ServiceConfig {
   workflowPath: string;
   workflowDir: string;
+  environment: NodeJS.ProcessEnv;
   tracker: TrackerConfig;
   polling: {
     intervalMs: number;
@@ -845,6 +846,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   return {
     workflowPath: path.resolve(workflowPath),
     workflowDir,
+    environment: env,
     tracker,
     polling: {
       intervalMs: raw.polling?.interval_ms ?? 30_000,
@@ -871,6 +873,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       upstreamRoot: hermesUpstreamRoot,
       python: hermesPython,
       templatesDir: hermesTemplatesDir,
+
       stateDir: hermesStateDir,
       acpBinaryPath: legacyHermesAcpBinaryPath,
       acpSourceProfile: legacyHermesAcpSourceProfile,

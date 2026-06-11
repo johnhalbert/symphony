@@ -262,6 +262,108 @@ describe("FileWritebackOutboxStore", () => {
     await expect(store.get(symphonyKey)).resolves.toMatchObject({ status: "pending", projectContext: symphonyProjectContext });
   });
 
+  it("keeps same idempotency keys isolated per project context and routes scoped writes through the matching writer", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const defaultWriter = new FakeWriter();
+    const docsWriter = new FakeWriter();
+    const symphonyWriter = new FakeWriter();
+    const processor = new WritebackProcessor(
+      store,
+      defaultWriter,
+      new StructuredLogger(() => undefined),
+      300_000,
+      undefined,
+      false,
+      undefined,
+      (projectContext) =>
+        projectContext?.projectContextId === docsProjectContext.projectContextId
+          ? docsWriter
+          : projectContext?.projectContextId === symphonyProjectContext.projectContextId
+            ? symphonyWriter
+            : defaultWriter,
+    );
+    const sharedKey = "comment:issue-shared-scope:same-key";
+    const docsOperation = {
+      idempotencyKey: sharedKey,
+      kind: "comment" as const,
+      issueId: "issue-shared-scope",
+      projectContext: docsProjectContext,
+      runId: "run-shared-docs",
+      payload: { body: "Docs shared-key note", dedupeKey: "shared-key-docs" },
+    };
+    const symphonyOperation = {
+      idempotencyKey: sharedKey,
+      kind: "comment" as const,
+      issueId: "issue-shared-scope",
+      projectContext: symphonyProjectContext,
+      runId: "run-shared-symphony",
+      payload: { body: "Symphony shared-key note", dedupeKey: "shared-key-symphony" },
+    };
+
+    await expect(store.enqueueOnce(docsOperation)).resolves.toMatchObject({ projectContext: docsProjectContext });
+    await expect(store.enqueueOnce(symphonyOperation)).resolves.toMatchObject({ projectContext: symphonyProjectContext });
+    await expect(
+      store.enqueueOnce({
+        ...docsOperation,
+        projectContext: {
+          projectContextId: "docs",
+          projectContextLabel: "Docs (renamed)",
+          linearProjectSlug: "DOCS-ALT",
+          routingSource: "state_refresh",
+        },
+      }),
+    ).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+      payload: expect.objectContaining({ body: "Docs shared-key note", dedupeKey: "shared-key-docs" }),
+    });
+
+    await expect(store.list()).resolves.toHaveLength(2);
+    await expect(store.get(sharedKey, docsProjectContext)).resolves.toMatchObject({
+      status: "pending",
+      projectContext: docsProjectContext,
+      payload: expect.objectContaining({ body: "Docs shared-key note", dedupeKey: "shared-key-docs" }),
+    });
+    await expect(store.get(sharedKey, symphonyProjectContext)).resolves.toMatchObject({
+      status: "pending",
+      projectContext: symphonyProjectContext,
+      payload: expect.objectContaining({ body: "Symphony shared-key note", dedupeKey: "shared-key-symphony" }),
+    });
+
+    await processor.processDue({ projectContext: docsProjectContext, idempotencyKeys: [sharedKey] });
+
+    expect(docsWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-shared-scope",
+        body: "Docs shared-key note",
+        dedupeKey: "shared-key-docs",
+      }),
+    ]);
+    expect(symphonyWriter.comments).toEqual([]);
+    expect(defaultWriter.comments).toEqual([]);
+    await expect(store.get(sharedKey, docsProjectContext)).resolves.toMatchObject({ status: "succeeded" });
+    await expect(store.get(sharedKey, symphonyProjectContext)).resolves.toMatchObject({ status: "pending" });
+
+    await processor.processDue({
+      projectContext: {
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony (renamed)",
+        linearProjectSlug: "ENG-ALT",
+        routingSource: "state_refresh",
+      },
+      idempotencyKeys: [sharedKey],
+    });
+
+    expect(symphonyWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-shared-scope",
+        body: "Symphony shared-key note",
+        dedupeKey: "shared-key-symphony",
+      }),
+    ]);
+    expect(defaultWriter.comments).toEqual([]);
+    await expect(store.get(sharedKey, symphonyProjectContext)).resolves.toMatchObject({ status: "succeeded" });
+  });
+
   it("matches processDue project context by id even when attribution metadata changes", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
