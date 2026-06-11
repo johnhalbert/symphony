@@ -2209,6 +2209,17 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.ctx.config.tracker.activeStates).toEqual(["Queued", "Doing"]);
     expect(harness.runs[0]?.ctx.workspace.path.startsWith(docsWorkspaceRoot)).toBe(true);
 
+    const oldRunStore = new FileRunTranscriptStore(docsStateDir);
+    const oldLifecycleStore = new FileIssueLifecycleStore(docsStateDir);
+    await waitForAsync(
+      async () => (await oldRunStore.latestRunForIssue(docsIssue.id)) !== null,
+      "initial docs run persisted before reload",
+    );
+    await waitForAsync(
+      async () => (await oldLifecycleStore.get(docsIssue.id)) !== null,
+      "initial docs lifecycle persisted before reload",
+    );
+
     const reloadedConfig = parseServiceConfig(
       multiProjectWorkflowConfig({
         topLevel: { agent: { max_concurrent_agents: 1, max_turns: 1 } },
@@ -2254,15 +2265,21 @@ describe("Orchestrator", () => {
     await settleOrchestratorExit();
     await orchestrator.stop();
 
-    const oldRunStore = new FileRunTranscriptStore(docsStateDir);
     const reloadedRunStore = new FileRunTranscriptStore(docsReloadStateDir);
+    await waitForAsync(
+      async () => (await oldRunStore.latestRunForIssue(docsIssue.id))?.workspacePath?.startsWith(docsWorkspaceRoot) ?? false,
+      "preserved docs run in original state dir after reload",
+    );
     const oldRun = await oldRunStore.latestRunForIssue(docsIssue.id);
     expect(oldRun?.projectContext).toMatchObject({ projectContextId: "docs", linearProjectSlug: "DOCS" });
     expect(oldRun?.workspacePath.startsWith(docsWorkspaceRoot)).toBe(true);
     await expect(reloadedRunStore.latestRunForIssue(docsIssue.id)).resolves.toBeNull();
 
-    const oldLifecycleStore = new FileIssueLifecycleStore(docsStateDir);
     const reloadedLifecycleStore = new FileIssueLifecycleStore(docsReloadStateDir);
+    await waitForAsync(
+      async () => (await oldLifecycleStore.get(docsIssue.id))?.summaryPointers.workspacePath?.startsWith(docsWorkspaceRoot) ?? false,
+      "preserved docs lifecycle in original state dir after reload",
+    );
     const oldLifecycle = await oldLifecycleStore.get(docsIssue.id);
     expect(oldLifecycle?.projectContext).toMatchObject({ projectContextId: "docs", linearProjectSlug: "DOCS" });
     expect(oldLifecycle?.summaryPointers.workspacePath?.startsWith(docsWorkspaceRoot)).toBe(true);
