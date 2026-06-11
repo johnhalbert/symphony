@@ -403,6 +403,7 @@ export class CompletionReportService {
     const report = completionReportInputFromRecord(existing);
     const context: CompletionReportActiveContext = {
       issue: input.issue,
+      projectContext: pendingReport.projectContext ?? input.approval.projectContext ?? lifecycle.projectContext ?? undefined,
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -810,6 +811,9 @@ export class CompletionReportService {
     existingLifecycle: ExistingIssueLifecycle = null,
   ): ServiceConfig["github"] {
     const projectContext = resolveCompletionReportProjectContext(context, existingLifecycle);
+    if (!this.options.config.projectContexts.byId.has(projectContext.projectContextId)) {
+      return this.options.config.github;
+    }
     return resolveProjectContextConfig(this.options.config, projectContext.projectContextId).github;
   }
 
@@ -885,7 +889,7 @@ export class CompletionReportService {
     pullRequest: CompletionReportPullRequestRef | null,
   ): Promise<WritebackOperation[]> {
     if (!isTerminalApprovalStatus(approval.status)) return [];
-    await this.recordPublicationApprovalTerminalRun(approval);
+    await this.recordPublicationApprovalTerminalRun(approval, context);
     const terminalReason = `publication approval ${approval.status}`;
     const latestLifecycle =
       (await this.options.lifecycleStore.get(context.issue.id)) ??
@@ -924,12 +928,15 @@ export class CompletionReportService {
     });
   }
 
-  private async recordPublicationApprovalTerminalRun(approval: OperatorApprovalRecord): Promise<void> {
+  private async recordPublicationApprovalTerminalRun(
+    approval: OperatorApprovalRecord,
+    context: CompletionReportActiveContext,
+  ): Promise<void> {
     const runStore = this.options.runStore;
     if (!runStore) return;
     const existing = await runStore.getRun(approval.runId);
     const completedAt = existing?.completedAt ?? new Date().toISOString();
-    const rejectPolicy = this.options.config.github.operatorApproval?.rejectPolicy ?? "cancel";
+    const rejectPolicy = this.githubConfigFor(context).operatorApproval?.rejectPolicy ?? "cancel";
     const cancelledByPolicy = approval.status === "rejected" && rejectPolicy === "cancel";
     const failedByPolicy = approval.status === "rejected" && rejectPolicy === "fail";
     await runStore.updateRun(approval.runId, {

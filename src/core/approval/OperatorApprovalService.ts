@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { ServiceConfig } from "../config/Config.js";
+import { resolveProjectContextConfig, type ServiceConfig } from "../config/Config.js";
 import {
   normalizeProjectContextResolution,
   type ProjectContextResolution,
@@ -254,12 +254,12 @@ export class OperatorApprovalService {
   ) {}
 
   get rejectPolicy(): OperatorApprovalRejectPolicy {
-    return operatorApprovalConfig(this.options.config).rejectPolicy;
+    return this.operatorApprovalConfigFor().rejectPolicy;
   }
 
   async requestPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
     const projectContext = await this.resolveProjectContext(input);
-    if (!this.isRequired()) {
+    if (!this.isRequired(projectContext)) {
       return normalizeOperatorApprovalRecord({
         requestId: "",
         status: "approved",
@@ -283,7 +283,7 @@ export class OperatorApprovalService {
     const requestInput = { ...input, projectContext };
     const { record, created } = await this.options.store.requestOrGetPending(
       requestInput,
-      operatorApprovalConfig(this.options.config).timeoutMs,
+      this.operatorApprovalConfigFor(projectContext).timeoutMs,
     );
     if (record.status === "pending") {
       await this.recordPendingRun(record);
@@ -325,7 +325,7 @@ export class OperatorApprovalService {
 
     const result = await this.options.store.resolve(requestId, decision);
     if (!result.replayed) {
-      if (decision === "reject" && this.rejectPolicy === "fail") {
+      if (decision === "reject" && this.rejectPolicyFor(result.request.projectContext) === "fail") {
         await this.clearPendingRun(result.request);
         await this.markRunFailedForRejection(result.request);
       } else {
@@ -352,8 +352,9 @@ export class OperatorApprovalService {
     return this.options.store.findPendingForIssue(keys);
   }
 
-  isRequired(): boolean {
-    return this.options.config.github.publishPullRequests && operatorApprovalConfig(this.options.config).requiredForPublication;
+  isRequired(projectContext?: ProjectContextResolution | null): boolean {
+    const github = this.githubConfigFor(projectContext);
+    return github.publishPullRequests && this.operatorApprovalConfigFor(projectContext).requiredForPublication;
   }
 
   private async waitForResolution(initial: OperatorApprovalRecord): Promise<OperatorApprovalRecord> {
@@ -386,7 +387,7 @@ export class OperatorApprovalService {
         continue;
       }
 
-      await sleep(operatorApprovalConfig(this.options.config).pollIntervalMs);
+      await sleep(this.operatorApprovalConfigFor(current.projectContext).pollIntervalMs);
       current = (await this.options.store.get(current.requestId)) ?? current;
     }
   }
@@ -442,6 +443,22 @@ export class OperatorApprovalService {
     });
   }
 
+  private rejectPolicyFor(projectContext?: ProjectContextResolution | null): OperatorApprovalRejectPolicy {
+    return this.operatorApprovalConfigFor(projectContext).rejectPolicy;
+  }
+
+  private githubConfigFor(projectContext?: ProjectContextResolution | null): ServiceConfig["github"] {
+    const projectContextId = projectContext?.projectContextId;
+    if (!projectContextId || !this.options.config.projectContexts.byId.has(projectContextId)) {
+      return this.options.config.github;
+    }
+    return resolveProjectContextConfig(this.options.config, projectContextId).github;
+  }
+
+  private operatorApprovalConfigFor(projectContext?: ProjectContextResolution | null) {
+    return operatorApprovalConfig(this.githubConfigFor(projectContext));
+  }
+
   private async resolveProjectContext(
     input: OperatorApprovalRequestInput,
   ): Promise<ProjectContextResolution> {
@@ -492,7 +509,7 @@ export class OperatorApprovalService {
       source: "orchestrator",
       eventType: "approval_resolved",
       message: `Operator approval ${record.status}: ${record.action.branchName} -> ${record.action.baseBranch}`,
-      payload: approvalResolvedPayload(record, operatorApprovalConfig(this.options.config).rejectPolicy),
+      payload: approvalResolvedPayload(record, this.rejectPolicyFor(record.projectContext)),
     });
   }
 }
@@ -585,9 +602,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function operatorApprovalConfig(config: ServiceConfig) {
+function operatorApprovalConfig(github: ServiceConfig["github"]) {
   return (
-    config.github.operatorApproval ?? {
+    github.operatorApproval ?? {
       requiredForPublication: false,
       rejectPolicy: "cancel" as const,
       pollIntervalMs: 2_000,
