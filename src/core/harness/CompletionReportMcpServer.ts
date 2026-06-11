@@ -69,11 +69,13 @@ export async function submitCompletionReportFromMcp(input: unknown, options: Com
       throw new SymphonyError("invalid_request", "Completion report MCP context does not match the active worker run");
     }
     const tracker = options.tracker ?? createRuntimeTrackerClient(config);
-    const authoritativeIssue = await resolveAuthoritativeCompletionReportIssue(
+    const authoritativeIssue = await resolveCompletionReportMcpIssue({
       tracker,
-      activeRun.issueId,
-      activeRun.issueIdentifier,
-    );
+      context: loadedContext,
+      activeRun,
+      lifecycle,
+      input,
+    });
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writebackProcessor =
       config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
@@ -175,6 +177,39 @@ async function resolveAuthoritativeCompletionReportIssue(
   }
 }
 
+async function resolveCompletionReportMcpIssue(input: {
+  tracker: Pick<TrackerClient, "fetchIssueStatesByIds">;
+  context: CompletionReportMcpContextFile;
+  activeRun: RunRecord;
+  lifecycle: IssueLifecycleRecord;
+  input: unknown;
+}): Promise<Issue> {
+  try {
+    return await resolveAuthoritativeCompletionReportIssue(
+      input.tracker,
+      input.activeRun.issueId,
+      input.activeRun.issueIdentifier,
+    );
+  } catch (error) {
+    if (allowsTerminalCompletionReportReplay(input.lifecycle, input.input, input.activeRun.runId) && isTrackerLookupFailure(error)) {
+      return replayIssueFromValidatedMcpContext(input.context, input.activeRun);
+    }
+    throw error;
+  }
+}
+
+function isTrackerLookupFailure(error: unknown): error is SymphonyError {
+  return error instanceof SymphonyError && error.code === "tracker_error";
+}
+
+function replayIssueFromValidatedMcpContext(context: CompletionReportMcpContextFile, activeRun: RunRecord): Issue {
+  return {
+    ...context.issue,
+    id: activeRun.issueId,
+    identifier: activeRun.issueIdentifier,
+  };
+}
+
 function completionReportContextFromAuthoritativeState(input: {
   context: CompletionReportMcpContextFile;
   activeRun: RunRecord;
@@ -218,7 +253,9 @@ function validateCompletionReportMcpActiveContext(input: {
 
   const mismatches: string[] = [];
   const allowsTerminalReplay = allowsTerminalCompletionReportReplay(input.lifecycle, input.input, activeRun.runId);
-  if (!lifecycle || lifecycle.summaryPointers.lastRunId !== activeRun.runId) mismatches.push("summaryPointers.lastRunId");
+  if (!lifecycle || (lifecycle.summaryPointers.lastRunId !== activeRun.runId && !allowsTerminalReplay)) {
+    mismatches.push("summaryPointers.lastRunId");
+  }
   if (activeRun.runPhase !== "implementation") mismatches.push("runPhase");
   if (activeRun.status !== "running" && !allowsTerminalReplay) mismatches.push("status");
   if (activeRun.issueId !== context.issue.id) mismatches.push("issue.id");

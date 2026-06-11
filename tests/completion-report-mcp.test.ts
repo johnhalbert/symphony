@@ -905,9 +905,51 @@ describe("completion report MCP handoff", () => {
       report("replay-after-completion"),
       mcpOptions(workflowPath, contextFile),
     );
+    await lifecycleStore.ensureIssue(issue({ state: "In Review", branchName: "symphony/TEST-1" }), {
+      summaryPointers: { lastRunId: "run-review-1" },
+    });
+    const third = await submitCompletionReportFromMcp(
+      report("replay-after-completion"),
+      mcpOptions(workflowPath, contextFile),
+    );
+    const fourth = await submitCompletionReportFromMcp(
+      report("replay-after-completion"),
+      mcpOptions(workflowPath, contextFile, {
+        tracker: {
+          async fetchIssueStatesByIds(_issueIds: string[]): Promise<ReturnType<typeof issue>[]> {
+            throw new Error("tracker unavailable");
+          },
+        },
+      }),
+    );
+    const fifth = await submitCompletionReportFromMcp(
+      report("replay-after-completion"),
+      mcpOptions(workflowPath, contextFile, {
+        tracker: {
+          async fetchIssueStatesByIds(_issueIds: string[]): Promise<ReturnType<typeof issue>[]> {
+            return [];
+          },
+        },
+      }),
+    );
 
     expect(first).toMatchObject({ accepted: true, replayed: false });
     expect(second).toMatchObject({
+      accepted: true,
+      replayed: true,
+      reportId: "completion-report:issue-1:replay-after-completion",
+    });
+    expect(third).toMatchObject({
+      accepted: true,
+      replayed: true,
+      reportId: "completion-report:issue-1:replay-after-completion",
+    });
+    expect(fourth).toMatchObject({
+      accepted: true,
+      replayed: true,
+      reportId: "completion-report:issue-1:replay-after-completion",
+    });
+    expect(fifth).toMatchObject({
       accepted: true,
       replayed: true,
       reportId: "completion-report:issue-1:replay-after-completion",
@@ -916,7 +958,7 @@ describe("completion report MCP handoff", () => {
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
       phase: "review",
       lastCompletionReportId: "completion-report:issue-1:replay-after-completion",
-      summaryPointers: { lastRunId: "run-replay-after-completion" },
+      summaryPointers: { lastRunId: "run-review-1" },
       completionReports: [
         expect.objectContaining({ runId: "run-replay-after-completion", idempotencyKey: "replay-after-completion" }),
       ],
