@@ -168,6 +168,22 @@ describe("PullRequestReviewFeedbackService", () => {
     });
   });
 
+  it("rejects review feedback when the active issue identifier does not match the lifecycle record", async () => {
+    const { service, lifecycleStore, client } = fixture();
+    await seedLifecycle(lifecycleStore);
+
+    await expect(
+      service.submitPullRequestReviewFeedback(
+        issueComment(),
+        context({ issue: issue({ identifier: "TEST-2", state: "In Review", branchName: "symphony/TEST-1" }) }),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Review feedback issue does not match the lifecycle record",
+    });
+    expect(client.calls).toHaveLength(0);
+  });
+
   it("fails closed when inline feedback lacks a lifecycle-bound head SHA", async () => {
     const { service, lifecycleStore, client } = fixture();
     await seedLifecycle(lifecycleStore, { headSha: null });
