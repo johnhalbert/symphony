@@ -6,6 +6,11 @@ import { StatusServer } from "../src/app/http.js";
 import { resolveStatusMutationToken } from "../src/app/RuntimeDependencies.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
+import {
   FileIssueLifecycleStore,
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
@@ -524,6 +529,111 @@ describe("StatusServer durable API", () => {
         transcriptPointers: ["/api/v1/runs/run-1/transcript"],
         statusApiPointers: ["/api/v1/issues/TEST-1"],
       });
+    } finally {
+      await server.stop();
+    }
+  });
+
+
+  it("surfaces legacy/default project context attribution across durable status records", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const legacyDefaultProjectContext = {
+      projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      linearProjectSlug: null,
+      routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+    };
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "LEGACY-1",
+      issueId: "issue-legacy",
+      issueIdentifier: "LEGACY-1",
+      path: path.join(config.workspace.root, "LEGACY-1"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/LEGACY-1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-legacy",
+      sessionId: "session-legacy",
+      agentId: "agent-legacy",
+      role: "worker",
+      issueId: "issue-legacy",
+      issueIdentifier: "LEGACY-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "LEGACY-1",
+      workspacePath: path.join(config.workspace.root, "LEGACY-1"),
+      gitBranchName: "symphony/LEGACY-1",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+    });
+    await lifecycleStore.ensureIssue(issue({ id: "issue-legacy", identifier: "LEGACY-1" }), { phase: "implementation" });
+
+    const legacyRunPath = path.join(config.workspace.stateDir, "runs", "run-legacy", "meta.json");
+    const legacyRun = JSON.parse(await readFile(legacyRunPath, "utf8")) as Record<string, unknown>;
+    delete legacyRun.projectContext;
+    await writeFile(legacyRunPath, `${JSON.stringify(legacyRun, null, 2)}\n`, "utf8");
+
+    const legacyWorkspacePath = path.join(config.workspace.stateDir, "workspaces", "LEGACY-1.json");
+    const legacyWorkspace = JSON.parse(await readFile(legacyWorkspacePath, "utf8")) as Record<string, unknown>;
+    delete legacyWorkspace.projectContext;
+    await writeFile(legacyWorkspacePath, `${JSON.stringify(legacyWorkspace, null, 2)}\n`, "utf8");
+
+    const legacyLifecyclePath = path.join(config.workspace.stateDir, "issue-lifecycle", "issue-legacy.json");
+    const legacyLifecycle = JSON.parse(await readFile(legacyLifecyclePath, "utf8")) as Record<string, unknown>;
+    delete legacyLifecycle.projectContext;
+    await writeFile(legacyLifecyclePath, `${JSON.stringify(legacyLifecycle, null, 2)}\n`, "utf8");
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/LEGACY-1`);
+      const runsResponse = await fetch(`${baseUrl}/api/v1/issues/LEGACY-1/runs`);
+      const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-legacy`);
+      const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/LEGACY-1`);
+
+      const issueBody = (await issueResponse.json()) as {
+        workspace: { projectContext: typeof legacyDefaultProjectContext } | null;
+        latestRun: { projectContext: typeof legacyDefaultProjectContext } | null;
+        lifecycle: { projectContext: typeof legacyDefaultProjectContext } | null;
+      };
+      const runsBody = (await runsResponse.json()) as { runs: Array<{ projectContext: typeof legacyDefaultProjectContext }> };
+      const runBody = (await runResponse.json()) as { projectContext: typeof legacyDefaultProjectContext };
+      const workspaceBody = (await workspaceResponse.json()) as { projectContext: typeof legacyDefaultProjectContext };
+
+      expect(issueResponse.status).toBe(200);
+      expect(runsResponse.status).toBe(200);
+      expect(runResponse.status).toBe(200);
+      expect(workspaceResponse.status).toBe(200);
+      expect(issueBody.workspace?.projectContext).toMatchObject(legacyDefaultProjectContext);
+      expect(issueBody.latestRun?.projectContext).toMatchObject(legacyDefaultProjectContext);
+      expect(issueBody.lifecycle?.projectContext).toMatchObject(legacyDefaultProjectContext);
+      expect(runsBody.runs).toHaveLength(1);
+      expect(runsBody.runs[0]?.projectContext).toMatchObject(legacyDefaultProjectContext);
+      expect(runBody.projectContext).toMatchObject(legacyDefaultProjectContext);
+      expect(workspaceBody.projectContext).toMatchObject(legacyDefaultProjectContext);
     } finally {
       await server.stop();
     }
