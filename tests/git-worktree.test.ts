@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
-import { issue } from "./helpers.js";
+import { issue, trackerIssue } from "./helpers.js";
 
 describe("git worktree workspace source", () => {
   let root: string;
@@ -44,6 +44,110 @@ describe("git worktree workspace source", () => {
 
     expect(currentBranch.trim()).toBe("symphony/TEST-2");
     expect(workspace.workspaceKey).toBe("TEST-2");
+  });
+
+  it("namespaces workspace keys, paths, and durable metadata for overlapping identifiers across project contexts", async () => {
+    const manager = newManager(root, repo);
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "SYMPHONY",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyRecord = await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey);
+    const docsRecord = await manager.getWorkspaceRecord(docsWorkspace.workspaceKey);
+
+    expect(symphonyWorkspace.workspaceKey).toContain("symphony");
+    expect(docsWorkspace.workspaceKey).toContain("docs");
+    expect(symphonyWorkspace.workspaceKey).toContain("ENG-123");
+    expect(docsWorkspace.workspaceKey).toContain("ENG-123");
+    expect(symphonyWorkspace.workspaceKey).not.toBe(docsWorkspace.workspaceKey);
+    expect(symphonyWorkspace.path).not.toBe(docsWorkspace.path);
+    expect(symphonyRecord?.projectContext?.projectContextId).toBe("symphony");
+    expect(docsRecord?.projectContext?.projectContextId).toBe("docs");
+    expect(symphonyRecord?.path).toBe(symphonyWorkspace.path);
+    expect(docsRecord?.path).toBe(docsWorkspace.path);
+  });
+
+  it("reuses the same context-scoped workspace while keeping sibling contexts isolated on cleanup", async () => {
+    const manager = newManager(root, repo);
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony",
+      identifier: "ENG-124",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "SYMPHONY",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs",
+      identifier: "ENG-124",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+
+    const firstWorkspace = await manager.createForIssue(symphonyIssue);
+    const reusedWorkspace = await manager.createForIssue(symphonyIssue);
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+
+    expect(reusedWorkspace.createdNow).toBe(false);
+    expect(reusedWorkspace.workspaceKey).toBe(firstWorkspace.workspaceKey);
+    expect(reusedWorkspace.path).toBe(firstWorkspace.path);
+    expect(docsWorkspace.path).not.toBe(firstWorkspace.path);
+
+    await manager.removeForIssue(symphonyIssue);
+
+    await expect(readFile(path.join(firstWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    expect(await manager.getWorkspaceRecord(firstWorkspace.workspaceKey)).toBeNull();
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).not.toBeNull();
+  });
+
+  it("namespaces planning workspaces across project contexts with overlapping identifiers", async () => {
+    const manager = newManager(root, repo, "force");
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-plan",
+      identifier: "ENG-PLAN",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "SYMPHONY",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-plan",
+      identifier: "ENG-PLAN",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+
+    const symphonyWorkspace = await manager.createForPlanning(symphonyIssue);
+    const docsWorkspace = await manager.createForPlanning(docsIssue);
+    const symphonyRecord = await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey);
+    const docsRecord = await manager.getWorkspaceRecord(docsWorkspace.workspaceKey);
+
+    expect(symphonyWorkspace.workspaceKey).toContain("symphony");
+    expect(docsWorkspace.workspaceKey).toContain("docs");
+    expect(symphonyWorkspace.workspaceKey).toContain("ENG-PLAN");
+    expect(docsWorkspace.workspaceKey).toContain("ENG-PLAN");
+    expect(symphonyWorkspace.workspaceKey).toContain("planning");
+    expect(docsWorkspace.workspaceKey).toContain("planning");
+    expect(symphonyWorkspace.path).not.toBe(docsWorkspace.path);
+    expect(symphonyRecord?.projectContext?.projectContextId).toBe("symphony");
+    expect(docsRecord?.projectContext?.projectContextId).toBe("docs");
+
+    await manager.removeForPlanning(symphonyIssue);
+    await manager.removeForPlanning(docsIssue);
   });
 
   it("refuses to remove dirty worktrees by default", async () => {
