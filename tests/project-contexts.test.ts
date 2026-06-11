@@ -829,6 +829,120 @@ describe("project context normalization", () => {
     });
   });
 
+  it("replaces inherited GitHub App profiles when project contexts override them with static-token shorthand", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          credential_profiles: {
+            profiles: {
+              publication: {
+                kind: "github_app",
+                app_id: "$GLOBAL_GITHUB_APP_ID",
+                client_id: "$GLOBAL_GITHUB_APP_CLIENT_ID",
+                installation_id: "$GLOBAL_GITHUB_APP_INSTALLATION_ID",
+                private_key: "$GLOBAL_GITHUB_APP_PRIVATE_KEY",
+                capabilities: ["github.publication", "github.merge"],
+              },
+              feedback: {
+                kind: "github_app",
+                app_id: "$GLOBAL_GITHUB_APP_ID",
+                client_id: "$GLOBAL_GITHUB_APP_CLIENT_ID",
+                installation_id: "$GLOBAL_GITHUB_APP_INSTALLATION_ID",
+                private_key: "$GLOBAL_GITHUB_APP_PRIVATE_KEY",
+                capabilities: ["github.review_feedback_write"],
+              },
+            },
+            roles: {
+              service: {
+                "github.publication": "publication",
+                "github.merge": "publication",
+              },
+              reviewer: {
+                "github.review_feedback_write": "feedback",
+              },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+            credential_profiles: {
+              profiles: {
+                publication: {
+                  value: "$CONTEXT_GITHUB_PUBLICATION_TOKEN",
+                  capabilities: ["github.publication", "github.merge"],
+                },
+                feedback: {
+                  value: "$CONTEXT_GITHUB_FEEDBACK_TOKEN",
+                  capabilities: ["github.review_feedback_write"],
+                },
+              },
+            },
+          }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            credential_profiles: {
+              profiles: {
+                publication: {
+                  value: "$DOCS_GITHUB_PUBLICATION_TOKEN",
+                  capabilities: ["github.publication", "github.merge"],
+                },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-test-key",
+        GLOBAL_GITHUB_APP_ID: "111",
+        GLOBAL_GITHUB_APP_CLIENT_ID: "Iv1.global",
+        GLOBAL_GITHUB_APP_INSTALLATION_ID: "222",
+        GLOBAL_GITHUB_APP_PRIVATE_KEY: "global-private-key",
+        CONTEXT_GITHUB_PUBLICATION_TOKEN: "context-publication-secret",
+        CONTEXT_GITHUB_FEEDBACK_TOKEN: "context-feedback-secret",
+        DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+      },
+    );
+
+    expect(config.projectContexts.defaultContext.credentialProfiles?.profiles?.publication).toEqual({
+      value: "$CONTEXT_GITHUB_PUBLICATION_TOKEN",
+      capabilities: ["github.publication", "github.merge"],
+    });
+    expect(config.projectContexts.defaultContext.credentialProfiles?.profiles?.feedback).toEqual({
+      value: "$CONTEXT_GITHUB_FEEDBACK_TOKEN",
+      capabilities: ["github.review_feedback_write"],
+    });
+    expect(config.projectContexts.byId.get("docs")?.credentialProfiles?.profiles?.publication).toEqual({
+      value: "$DOCS_GITHUB_PUBLICATION_TOKEN",
+      capabilities: ["github.publication", "github.merge"],
+    });
+    expect(config.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("service", "github.merge")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("reviewer", "github.review_feedback_write")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "feedback",
+      value: "context-feedback-secret",
+    });
+  });
+
   it("projects default-context credential profiles into the legacy service credential registry", () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({

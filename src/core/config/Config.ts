@@ -1447,12 +1447,24 @@ function mergeCredentialProfileDefinitionMap(
 
   const merged: NonNullable<RawCredentialProfilesConfig["profiles"]> = { ...(base ?? {}) };
   for (const [name, profile] of Object.entries(override ?? {})) {
-    merged[name] = {
-      ...(base?.[name] ?? {}),
-      ...profile,
-    } as NonNullable<RawCredentialProfilesConfig["profiles"]>[string];
+    const baseProfile = base?.[name] as NonNullable<RawCredentialProfilesConfig["profiles"]>[string] | undefined;
+    const overrideProfile = profile as NonNullable<RawCredentialProfilesConfig["profiles"]>[string];
+
+    merged[name] =
+      baseProfile !== undefined && inferRawCredentialProfileKind(baseProfile) !== inferRawCredentialProfileKind(overrideProfile)
+        ? overrideProfile
+        : ({
+            ...(baseProfile ?? {}),
+            ...overrideProfile,
+          } as NonNullable<RawCredentialProfilesConfig["profiles"]>[string]);
   }
   return merged;
+}
+
+function inferRawCredentialProfileKind(
+  profile: NonNullable<RawCredentialProfilesConfig["profiles"]>[string],
+): "github_app" | "static_token" {
+  return profile.kind === "github_app" ? "github_app" : "static_token";
 }
 
 function mergeCredentialProfileRoleAssignments(
