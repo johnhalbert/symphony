@@ -51,6 +51,12 @@ describe("FileWritebackOutboxStore", () => {
     linearProjectSlug: "DOCS",
     routingSource: "candidate_poll",
   } as const;
+  const symphonyProjectContext = {
+    projectContextId: "symphony",
+    projectContextLabel: "Symphony",
+    linearProjectSlug: "ENG",
+    routingSource: "candidate_poll",
+  } as const;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-writeback-"));
@@ -76,7 +82,12 @@ describe("FileWritebackOutboxStore", () => {
     if (!stripped) throw new Error(`writeback record not found: ${idempotencyKey}`);
   }
 
-  async function recordRunProjectContext(runId: string, issueId = "issue-docs-1", issueIdentifier = "DOCS-1"): Promise<void> {
+  async function recordRunProjectContext(
+    runId: string,
+    issueId = "issue-docs-1",
+    issueIdentifier = "DOCS-1",
+    projectContext = docsProjectContext,
+  ): Promise<void> {
     const runStore = new FileRunTranscriptStore(root);
     await runStore.startRun({
       runId,
@@ -85,7 +96,7 @@ describe("FileWritebackOutboxStore", () => {
       role: "worker",
       issueId,
       issueIdentifier,
-      projectContext: docsProjectContext,
+      projectContext,
       attempt: null,
       turnNumber: 1,
       prompt: "work",
@@ -208,6 +219,123 @@ describe("FileWritebackOutboxStore", () => {
         }),
       ]);
       await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+        status: "succeeded",
+        projectContext: docsProjectContext,
+      });
+    },
+  );
+
+  it("scopes processDue to the requested project context without consuming sibling work", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    const docsKey = "comment:issue-docs-scope:docs";
+    const symphonyKey = "comment:issue-symphony-scope:symphony";
+
+    await store.enqueueOnce({
+      idempotencyKey: docsKey,
+      kind: "comment",
+      issueId: "issue-docs-scope",
+      projectContext: docsProjectContext,
+      runId: "run-docs-scope",
+      payload: { body: "Docs scoped note", dedupeKey: "docs-scope" },
+    });
+    await store.enqueueOnce({
+      idempotencyKey: symphonyKey,
+      kind: "comment",
+      issueId: "issue-symphony-scope",
+      projectContext: symphonyProjectContext,
+      runId: "run-symphony-scope",
+      payload: { body: "Symphony sibling note", dedupeKey: "symphony-scope" },
+    });
+
+    await processor.processDue({ projectContext: docsProjectContext });
+
+    expect(writer.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-docs-scope",
+        body: "Docs scoped note",
+        dedupeKey: "docs-scope",
+      }),
+    ]);
+    await expect(store.get(docsKey)).resolves.toMatchObject({ status: "succeeded", projectContext: docsProjectContext });
+    await expect(store.get(symphonyKey)).resolves.toMatchObject({ status: "pending", projectContext: symphonyProjectContext });
+  });
+
+  it("matches processDue project context by id even when attribution metadata changes", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    const operationKey = "comment:issue-docs-context-id:docs";
+
+    await store.enqueueOnce({
+      idempotencyKey: operationKey,
+      kind: "comment",
+      issueId: "issue-docs-context-id",
+      projectContext: docsProjectContext,
+      runId: "run-docs-context-id",
+      payload: { body: "Docs context id match", dedupeKey: "docs-context-id-match" },
+    });
+
+    await processor.processDue({
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Docs (renamed)",
+        linearProjectSlug: "DOCS-ALT",
+        routingSource: "state_refresh",
+      },
+    });
+
+    expect(writer.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-docs-context-id",
+        body: "Docs context id match",
+        dedupeKey: "docs-context-id-match",
+      }),
+    ]);
+    await expect(store.get(operationKey)).resolves.toMatchObject({ status: "succeeded", projectContext: docsProjectContext });
+  });
+
+  it.each(["pending", "retrying"] as const)(
+    "backfills missing project context before applying project-context processDue scoping for %s legacy writebacks",
+    async (initialStatus) => {
+      const store = new FileWritebackOutboxStore(root);
+      const writer = new FakeWriter();
+      const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+      const runId = `run-docs-scope-${initialStatus}`;
+      const operationKey = `comment:issue-docs-scope:${initialStatus}`;
+      await recordRunProjectContext(runId, "issue-docs-scope", "DOCS-SCOPE", docsProjectContext);
+
+      let record = await store.enqueueOnce({
+        idempotencyKey: operationKey,
+        kind: "comment",
+        issueId: "issue-docs-scope",
+        projectContext: docsProjectContext,
+        runId,
+        payload: { body: `Docs scoped ${initialStatus}`, dedupeKey: `docs-scope-${initialStatus}` },
+      });
+      if (initialStatus === "retrying") {
+        record = await store.markRetry(record, "temporary outage", "1970-01-01T00:00:00.000Z");
+      }
+      await stripPersistedProjectContext(operationKey);
+
+      await processor.processDue({
+        projectContext: {
+          projectContextId: "docs",
+          projectContextLabel: "Docs (renamed)",
+          linearProjectSlug: "DOCS-ALT",
+          routingSource: "state_refresh",
+        },
+      });
+
+      expect(writer.comments).toEqual([
+        expect.objectContaining({
+          issueId: "issue-docs-scope",
+          body: `Docs scoped ${initialStatus}`,
+          dedupeKey: `docs-scope-${initialStatus}`,
+        }),
+      ]);
+      await expect(store.get(operationKey)).resolves.toMatchObject({
         status: "succeeded",
         projectContext: docsProjectContext,
       });

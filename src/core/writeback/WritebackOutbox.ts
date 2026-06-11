@@ -141,6 +141,7 @@ export type IssueBreakdownFreshnessGuard = {
 
 export type ProcessDueOptions = {
   idempotencyKeys?: readonly string[];
+  projectContext?: ProjectContextResolution | undefined;
 };
 
 export type EnqueueWritebackOptions = {
@@ -189,9 +190,13 @@ export class FileWritebackOutboxStore {
     return record;
   }
 
-  async claimDue(now = new Date(), options: { idempotencyKeys?: readonly string[] } = {}): Promise<WritebackOperation[]> {
+  async claimDue(
+    now = new Date(),
+    options: { idempotencyKeys?: readonly string[]; projectContext?: ProjectContextResolution | undefined } = {},
+  ): Promise<WritebackOperation[]> {
     const records = await this.list();
     const allowed = options.idempotencyKeys === undefined ? null : new Set(options.idempotencyKeys);
+    const expectedProjectContext = options.projectContext;
     const due = records
       .filter((record) => ["pending", "retrying"].includes(record.status))
       .filter((record) => Date.parse(record.nextAttemptAt) <= now.getTime())
@@ -208,6 +213,7 @@ export class FileWritebackOutboxStore {
         if (Date.parse(current.nextAttemptAt) > now.getTime()) continue;
         if (allowed !== null && !allowed.has(current.idempotencyKey)) continue;
         current = await this.repairProjectContextIfMissing(current);
+        if (!matchesProjectContextScope(current.projectContext, expectedProjectContext)) continue;
         current.status = "in_flight";
         current.updatedAt = new Date().toISOString();
         await this.write(current);
@@ -398,7 +404,10 @@ export class WritebackProcessor {
   }
 
   async processDue(options: ProcessDueOptions = {}): Promise<void> {
-    const claimOptions = options.idempotencyKeys === undefined ? {} : { idempotencyKeys: options.idempotencyKeys };
+    const claimOptions = {
+      ...(options.idempotencyKeys === undefined ? {} : { idempotencyKeys: options.idempotencyKeys }),
+      ...(options.projectContext === undefined ? {} : { projectContext: options.projectContext }),
+    };
     for (const record of await this.store.claimDue(new Date(), claimOptions)) {
       try {
         const guard = await this.verifyLifecycleBoundOperation(record);
@@ -636,6 +645,17 @@ function projectContextEquals(
     normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
     normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
     normalizedLeft.routingSource === normalizedRight.routingSource
+  );
+}
+
+function matchesProjectContextScope(
+  recordProjectContext: ProjectContextResolution | undefined,
+  expectedProjectContext: ProjectContextResolution | undefined,
+): boolean {
+  if (!expectedProjectContext) return true;
+  return (
+    normalizeProjectContextResolution(recordProjectContext).projectContextId ===
+    normalizeProjectContextResolution(expectedProjectContext).projectContextId
   );
 }
 
