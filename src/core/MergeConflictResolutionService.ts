@@ -163,7 +163,9 @@ export class MergeConflictResolutionService {
       },
     });
 
-    await this.options.writebackProcessor?.processDue();
+    await this.options.writebackProcessor?.processDue({
+      projectContext: resolveMergeConflictProjectContext(context, lifecycle),
+    });
     return {
       accepted: true,
       replayed: false,

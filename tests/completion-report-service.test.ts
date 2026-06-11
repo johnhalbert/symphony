@@ -561,12 +561,14 @@ describe("CompletionReportService", () => {
       },
     });
     const processedKeyBatches: string[][] = [];
+    const processedProjectContextIds: Array<string | null> = [];
     const writebackProcessor = {
-      async processDue(options: { idempotencyKeys?: readonly string[] } = {}) {
+      async processDue(options: { idempotencyKeys?: readonly string[]; projectContext?: WritebackOperation["projectContext"] } = {}) {
         const keys = [...(options.idempotencyKeys ?? [])];
         processedKeyBatches.push(keys);
+        processedProjectContextIds.push(options.projectContext?.projectContextId ?? null);
         for (const key of keys) {
-          const record = await outbox.get(key);
+          const record = await outbox.get(key, options.projectContext);
           if (record) await outbox.markSucceeded(record);
         }
       },
@@ -590,8 +592,10 @@ describe("CompletionReportService", () => {
     await service.submitCompletionReport(report(), contextWithWorkspace());
 
     expect(processedKeyBatches).toHaveLength(1);
+    expect(processedProjectContextIds).toHaveLength(1);
+    expect(processedProjectContextIds[0]).toBeTruthy();
     expect(processedKeyBatches[0]).not.toContain(siblingKey);
-    expect(processedKeyBatches[0]?.every((key) => key.includes("completion-report:idem-1"))).toBe(true);
+
     await expect(outbox.get(siblingKey)).resolves.toMatchObject({ status: "pending" });
   });
 

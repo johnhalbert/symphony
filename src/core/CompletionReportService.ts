@@ -815,9 +815,13 @@ export class CompletionReportService {
         "Publication approval requires a writeback processor to apply pending Linear audit before waiting",
       );
     }
-    await processor.processDue({ idempotencyKeys: operations.map((operation) => operation.idempotencyKey) });
+    const projectContext = sharedWritebackProjectContext(operations);
+    await processor.processDue({
+      idempotencyKeys: operations.map((operation) => operation.idempotencyKey),
+      ...(projectContext === undefined ? {} : { projectContext }),
+    });
     for (const operation of operations) {
-      const record = await this.options.writebackOutbox.get(operation.idempotencyKey);
+      const record = await this.options.writebackOutbox.get(operation.idempotencyKey, operation.projectContext);
       if (!record || !SETTLED_WRITEBACK_STATUSES.has(record.status)) {
         throw new SymphonyError("tracker_error", "Pending publication approval writeback did not complete", {
           idempotencyKey: operation.idempotencyKey,
@@ -908,10 +912,14 @@ export class CompletionReportService {
     return enqueued;
   }
 
-  private async processDueForOperations(operations: ReadonlyArray<Pick<WritebackOperation, "idempotencyKey">>): Promise<void> {
+  private async processDueForOperations(
+    operations: ReadonlyArray<Pick<WritebackOperation, "idempotencyKey" | "projectContext">>,
+  ): Promise<void> {
     if (operations.length === 0) return;
+    const projectContext = sharedWritebackProjectContext(operations);
     await this.options.writebackProcessor?.processDue({
       idempotencyKeys: operations.map((operation) => operation.idempotencyKey),
+      ...(projectContext === undefined ? {} : { projectContext }),
     });
   }
 
@@ -1044,6 +1052,18 @@ function resolveCompletionReportProjectContext(
   return normalizeProjectContextResolution(
     context.projectContext ?? existingLifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
   );
+}
+
+function sharedWritebackProjectContext(
+  operations: ReadonlyArray<Pick<NewWritebackOperation, "projectContext"> | Pick<WritebackOperation, "projectContext">>,
+): ProjectContextResolution | undefined {
+  if (operations.length === 0) return undefined;
+  const first = normalizeProjectContextResolution(operations[0]?.projectContext);
+  return operations.every(
+    (operation) => normalizeProjectContextResolution(operation.projectContext).projectContextId === first.projectContextId,
+  )
+    ? first
+    : undefined;
 }
 
 function upsertCompletionReport(
