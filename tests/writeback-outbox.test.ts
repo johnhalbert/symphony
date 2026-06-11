@@ -76,6 +76,19 @@ describe("FileWritebackOutboxStore", () => {
     if (!stripped) throw new Error(`writeback record not found: ${idempotencyKey}`);
   }
 
+  async function readPersistedWritebackText(idempotencyKey: string): Promise<string> {
+    const recordsDir = path.join(root, "writeback");
+    for (const entry of await readdir(recordsDir)) {
+      const filePath = path.join(recordsDir, entry);
+      const contents = await readFile(filePath, "utf8");
+      const parsed = JSON.parse(contents) as Record<string, unknown>;
+      if (parsed.idempotencyKey === idempotencyKey) {
+        return contents;
+      }
+    }
+    throw new Error(`writeback record not found: ${idempotencyKey}`);
+  }
+
   async function recordRunProjectContext(runId: string, issueId = "issue-docs-1", issueIdentifier = "DOCS-1"): Promise<void> {
     const runStore = new FileRunTranscriptStore(root);
     await runStore.startRun({
@@ -173,6 +186,44 @@ describe("FileWritebackOutboxStore", () => {
 
     await expect(store.enqueueOnce(operation)).resolves.toMatchObject({ projectContext: docsProjectContext });
     await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ projectContext: docsProjectContext });
+  });
+
+  it("derives project context from the run and backfills legacy writebacks on get and list read paths", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    await recordRunProjectContext("run-docs-read-paths", "issue-docs-read-paths", "DOCS-READ-PATHS");
+
+    const getOperation = {
+      idempotencyKey: "comment:issue-docs-read-paths:get",
+      kind: "comment" as const,
+      issueId: "issue-docs-read-paths",
+      runId: "run-docs-read-paths",
+      projectContext: docsProjectContext,
+      payload: { body: "Docs get", dedupeKey: "docs-get" },
+    };
+    const listOperation = {
+      idempotencyKey: "comment:issue-docs-read-paths:list",
+      kind: "comment" as const,
+      issueId: "issue-docs-read-paths",
+      runId: "run-docs-read-paths",
+      projectContext: docsProjectContext,
+      payload: { body: "Docs list", dedupeKey: "docs-list" },
+    };
+
+    await store.enqueueOnce(getOperation);
+    await store.enqueueOnce(listOperation);
+    await stripPersistedProjectContext(getOperation.idempotencyKey);
+    await stripPersistedProjectContext(listOperation.idempotencyKey);
+
+    await expect(store.get(getOperation.idempotencyKey)).resolves.toMatchObject({ projectContext: docsProjectContext });
+    await expect(readPersistedWritebackText(getOperation.idempotencyKey)).resolves.toContain('"projectContextId": "docs"');
+
+    await expect(store.list()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ idempotencyKey: getOperation.idempotencyKey, projectContext: docsProjectContext }),
+        expect.objectContaining({ idempotencyKey: listOperation.idempotencyKey, projectContext: docsProjectContext }),
+      ]),
+    );
+    await expect(readPersistedWritebackText(listOperation.idempotencyKey)).resolves.toContain('"projectContextId": "docs"');
   });
 
   it.each(["pending", "retrying"] as const)(
