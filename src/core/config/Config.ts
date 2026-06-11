@@ -7,6 +7,7 @@ import {
   createCredentialProfileRegistry,
   rawCredentialProfilesSchema,
   type CredentialProfileRegistry,
+  type RawCredentialProfilesConfig,
 } from "./CredentialProfiles.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
@@ -653,7 +654,7 @@ export function resolveDefaultProjectContextCredentialProfiles(
 ): RawWorkflowConfig["credential_profiles"] | undefined {
   for (const context of raw.project_contexts ?? []) {
     if (normalizeProjectContextId(context.id) === defaultContextId) {
-      return context.credential_profiles ?? raw.credential_profiles;
+      return mergeCredentialProfileDefaults(raw.credential_profiles, context.credential_profiles);
     }
   }
   return raw.credential_profiles;
@@ -801,7 +802,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
   const serverWebAssetsRoot = resolveOptionalPathValue(raw.server?.web_assets_root, workflowDir, env);
   const database = normalizeDatabaseConfig(raw, workflowDir, env);
-  const credentialProfilesRaw = resolveDefaultProjectContextCredentialProfiles(raw, defaultContext.id);
+  const credentialProfilesRaw = defaultContext.credentialProfiles;
   const credentialProfiles = createCredentialProfileRegistry({
     raw: credentialProfilesRaw,
     env,
@@ -981,12 +982,72 @@ function projectContextValidationSignalFromIssuePath(
 }
 
 function rawProjectContextPathFromInput(rawInput: unknown, index: number): string {
-  return rawProjectContextPath(readRawProjectContextsFromValue(rawInput)[index], index);
+  const rawContexts = readRawProjectContextsFromValue(rawInput);
+  return rawProjectContextPath(rawContexts, index);
 }
 
-function rawProjectContextPath(rawContext: unknown, index: number): string {
-  const rawId = readRawProjectContextIdFromValue(rawContext);
-  return rawId === null ? `project_contexts[${index}]` : `project_contexts[${JSON.stringify(rawId)}]`;
+function rawProjectContextPath(rawContexts: readonly unknown[], index: number): string {
+  const rawId = readRawProjectContextIdFromValue(rawContexts[index]);
+  if (rawId === null || rawProjectContextIdIsAmbiguous(rawContexts, rawId)) {
+    return `project_contexts[${index}]`;
+  }
+  return `project_contexts[${JSON.stringify(rawId)}]`;
+}
+
+function rawProjectContextIdIsAmbiguous(rawContexts: readonly unknown[], rawId: string): boolean {
+  let matches = 0;
+  for (const rawContext of rawContexts) {
+    if (readRawProjectContextIdFromValue(rawContext) !== rawId) continue;
+    matches += 1;
+    if (matches > 1) return true;
+  }
+  return false;
+}
+
+const KNOWN_PROJECT_CONTEXT_MESSAGE_FIELD_PATHS = new Set<string>([
+  "id",
+  "enabled",
+  "tracker.kind",
+  "tracker.api_key",
+  "tracker.project_slug",
+  "tracker.active_states",
+  "tracker.handoff_states",
+  "tracker.terminal_states",
+  "workspace.source",
+  "workspace.source.kind",
+  "workspace.source.path",
+  "workspace.source.repository",
+  "workspace.source.base_ref",
+  "workspace.source.branch_template",
+  "review_loop.blocked_states",
+  "review_loop.review_states",
+  "review_loop.review_pass_state",
+  "github.pr_handoff.target_state",
+  "issue_breakdown.workspace_mode",
+]);
+
+function normalizeKnownProjectContextMessageFieldPath(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return KNOWN_PROJECT_CONTEXT_MESSAGE_FIELD_PATHS.has(value) ? value : null;
+}
+
+function extractScopedProjectContextFieldPath(remainder: string): string | null {
+  const scopedMatch = /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(remainder);
+  return normalizeKnownProjectContextMessageFieldPath(scopedMatch?.[1]);
+}
+
+function configValidationError(message: string, projectContextFieldPaths?: readonly string[]): SymphonyError {
+  const normalizedFieldPaths = uniqueStringValues(
+    (projectContextFieldPaths ?? []).flatMap((fieldPath) => {
+      const normalizedFieldPath = normalizeKnownProjectContextMessageFieldPath(fieldPath);
+      return normalizedFieldPath === null ? [] : [normalizedFieldPath];
+    }),
+  );
+  return new SymphonyError(
+    "config_validation_error",
+    message,
+    normalizedFieldPaths.length === 0 ? undefined : { projectContextFieldPaths: normalizedFieldPaths },
+  );
 }
 
 function attachProjectContextValidationSignal(error: unknown, contextPath: string): SymphonyError {
@@ -1012,12 +1073,9 @@ function attachProjectContextValidationSignal(error: unknown, contextPath: strin
 
 function extractProjectContextFieldPaths(message: string, contextPath: string): string[] {
   const prefix = `${contextPath}.`;
-  if (message.startsWith(prefix)) {
-    const remainder = message.slice(prefix.length);
-    const scopedMatch = /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(remainder);
-    if (scopedMatch?.[1]) return [scopedMatch[1]];
-  }
-  return uniqueStringValues(message.match(/[a-z_]+(?:\.[a-z_]+|\[\d+\])+/g) ?? []);
+  if (!message.startsWith(prefix)) return [];
+  const fieldPath = extractScopedProjectContextFieldPath(message.slice(prefix.length));
+  return fieldPath === null ? [] : [fieldPath];
 }
 
 function duplicateProjectContextIdFromMessage(message: string): string | null {
@@ -1031,7 +1089,7 @@ function rawProjectContextPathsByNormalizedId(rawContexts: readonly unknown[], d
       const rawId = readRawProjectContextIdFromValue(rawContext);
       if (rawId === null) return [];
       try {
-        return normalizeProjectContextId(rawId) === duplicateProjectContextId ? [rawProjectContextPath(rawContext, index)] : [];
+        return normalizeProjectContextId(rawId) === duplicateProjectContextId ? [rawProjectContextPath(rawContexts, index)] : [];
       } catch {
         return [];
       }
@@ -1040,7 +1098,7 @@ function rawProjectContextPathsByNormalizedId(rawContexts: readonly unknown[], d
 }
 
 function rawProjectContextPaths(rawContexts: readonly unknown[]): string[] {
-  return uniqueStringValues(rawContexts.map((rawContext, index) => rawProjectContextPath(rawContext, index)));
+  return uniqueStringValues(rawContexts.map((_, index) => rawProjectContextPath(rawContexts, index)));
 }
 
 function readRawProjectContextsFromValue(value: unknown): unknown[] {
@@ -1098,11 +1156,22 @@ function normalizeWorkflowProjectContexts(
     credential_profiles: raw.credential_profiles,
   }) as RawProjectContextConfig;
   const defaults = legacyDefaultContext as WorkflowProjectContextConfig;
+  const rawProjectContexts = raw.project_contexts ?? [];
 
   const contexts =
-    raw.project_contexts?.map((context) =>
-      normalizeWorkflowProjectContext(context, defaults, workflowDir, env, { requireExplicitWorkspaceSource: true }),
-    ) ?? [normalizeWorkflowProjectContext(legacyDefaultContext, {}, workflowDir, env, { requireExplicitWorkspaceSource: false })];
+    rawProjectContexts.length > 0
+      ? rawProjectContexts.map((context, index) =>
+          normalizeWorkflowProjectContext(context, defaults, workflowDir, env, {
+            requireExplicitWorkspaceSource: true,
+            contextPath: rawProjectContextPath(rawProjectContexts, index),
+          }),
+        )
+      : [
+          normalizeWorkflowProjectContext(legacyDefaultContext, {}, workflowDir, env, {
+            requireExplicitWorkspaceSource: false,
+            contextPath: rawProjectContextPath([legacyDefaultContext], 0),
+          }),
+        ];
 
   try {
     return buildProjectContextRegistry(contexts);
@@ -1133,9 +1202,9 @@ function normalizeWorkflowProjectContext(
   defaults: Partial<WorkflowProjectContextConfig>,
   workflowDir: string,
   env: NodeJS.ProcessEnv,
-  options: { requireExplicitWorkspaceSource: boolean },
+  options: { requireExplicitWorkspaceSource: boolean; contextPath: string },
 ): WorkflowProjectContext {
-  const contextPath = `project_contexts[${JSON.stringify(rawContext.id)}]`;
+  const { contextPath } = options;
   try {
     let id: string;
     try {
@@ -1181,6 +1250,7 @@ function normalizeWorkflowProjectContext(
         reviewStates: reviewLoop.reviewStates,
         blockedStates: reviewLoop.blockedStates,
         reviewPassState: reviewLoop.reviewPassState,
+        attachFieldPathDetails: true,
       });
       validatePullRequestHandoffPolicy({
         publishPullRequests: github.publishPullRequests,
@@ -1189,6 +1259,7 @@ function normalizeWorkflowProjectContext(
         blockedStates: reviewLoop.blockedStates,
         reviewPassState: reviewLoop.reviewPassState,
         prHandoff: github.prHandoff,
+        attachFieldPathDetails: true,
       });
     }
 
@@ -1221,7 +1292,7 @@ function mergeWorkflowProjectContextDefaults(
   const reviewLoop = mergeConfigObjects(defaults.review_loop, context.review_loop);
   const issueBreakdown = mergeIssueBreakdownDefaults(defaults.issue_breakdown, context.issue_breakdown);
   const agent = mergeAgentDefaults(defaults.agent, context.agent);
-  const credentialProfiles = context.credential_profiles ?? defaults.credential_profiles;
+  const credentialProfiles = mergeCredentialProfileDefaults(defaults.credential_profiles, context.credential_profiles);
 
   return {
     id: context.id,
@@ -1579,6 +1650,82 @@ function mergeAgentDefaults(
   };
 }
 
+function mergeCredentialProfileDefaults(
+  base: RawWorkflowConfig["credential_profiles"] | undefined,
+  override: RawProjectContextConfig["credential_profiles"] | undefined,
+): RawWorkflowConfig["credential_profiles"] | undefined {
+  if (!base && !override) return undefined;
+
+  const mergedProfiles = mergeCredentialProfileDefinitionMap(base?.profiles, override?.profiles);
+  const mergedRoles =
+    base?.roles === undefined && override?.roles === undefined
+      ? undefined
+      : {
+          worker: mergeCredentialProfileRoleAssignments(base?.roles?.worker, override?.roles?.worker),
+          reviewer: mergeCredentialProfileRoleAssignments(base?.roles?.reviewer, override?.roles?.reviewer),
+          service: mergeCredentialProfileRoleAssignments(base?.roles?.service, override?.roles?.service),
+        };
+
+  return {
+    ...(base ?? {}),
+    ...(override ?? {}),
+    ...(mergedProfiles === undefined ? {} : { profiles: mergedProfiles }),
+    ...(mergedRoles === undefined ? {} : { roles: mergedRoles }),
+  };
+}
+
+function mergeCredentialProfileDefinitionMap(
+  base: RawCredentialProfilesConfig["profiles"] | undefined,
+  override: RawCredentialProfilesConfig["profiles"] | undefined,
+): RawCredentialProfilesConfig["profiles"] | undefined {
+  if (base === undefined && override === undefined) return undefined;
+
+  const merged: NonNullable<RawCredentialProfilesConfig["profiles"]> = { ...(base ?? {}) };
+  for (const [name, profile] of Object.entries(override ?? {})) {
+    const baseProfile = base?.[name] as NonNullable<RawCredentialProfilesConfig["profiles"]>[string] | undefined;
+    const overrideProfile = profile as NonNullable<RawCredentialProfilesConfig["profiles"]>[string];
+
+    merged[name] =
+      baseProfile !== undefined && inferRawCredentialProfileKind(baseProfile) !== inferRawCredentialProfileKind(overrideProfile)
+        ? overrideProfile
+        : ({
+            ...(baseProfile ?? {}),
+            ...overrideProfile,
+          } as NonNullable<RawCredentialProfilesConfig["profiles"]>[string]);
+  }
+  return merged;
+}
+
+function inferRawCredentialProfileKind(
+  profile: NonNullable<RawCredentialProfilesConfig["profiles"]>[string],
+): keyof NonNullable<RawCredentialProfilesConfig["profiles"]>[string] {
+  if ("env" in profile) return "env";
+  if ("git_credential" in profile) return "git_credential";
+  if ("github_app" in profile) return "github_app";
+  return "env";
+}
+
+function mergeCredentialProfileRoleAssignments(
+  base:
+    | NonNullable<NonNullable<RawWorkflowConfig["credential_profiles"]>["roles"]>[keyof NonNullable<
+        NonNullable<RawWorkflowConfig["credential_profiles"]>["roles"]
+      >]
+    | undefined,
+  override:
+    | NonNullable<NonNullable<RawProjectContextConfig["credential_profiles"]>["roles"]>[keyof NonNullable<
+        NonNullable<RawProjectContextConfig["credential_profiles"]>["roles"]
+      >]
+    | undefined,
+): NonNullable<NonNullable<RawWorkflowConfig["credential_profiles"]>["roles"]>[keyof NonNullable<
+  NonNullable<RawWorkflowConfig["credential_profiles"]>["roles"]
+>] | undefined {
+  if (base === undefined && override === undefined) return undefined;
+  return {
+    ...base,
+    ...override,
+  };
+}
+
 function mergeConfigObjects<T extends Record<string, unknown> | undefined>(base: T, override: T): T {
   if (!base && !override) return undefined as T;
   return {
@@ -1817,48 +1964,50 @@ function validatePullRequestHandoffPolicy(input: {
   blockedStates: string[];
   reviewPassState: string | null;
   prHandoff: GitHubPullRequestHandoffConfig;
+  attachFieldPathDetails?: boolean;
 }): void {
   if (!input.prHandoff.enabled) return;
   if (!input.publishPullRequests) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       "github.pr_handoff.enabled requires github.publish_pull_requests until a service PR verifier is configured",
     );
   }
   if (input.prHandoff.targetState === null) {
-    throw new SymphonyError("config_validation_error", "github.pr_handoff.target_state must resolve to a tracker.handoff_states value");
+    throw configValidationError(
+      "github.pr_handoff.target_state must resolve to a tracker.handoff_states value",
+      input.attachFieldPathDetails ? ["github.pr_handoff.target_state", "tracker.handoff_states"] : undefined,
+    );
   }
   if (!input.handoffStates.some((state) => statesEqual(state, input.prHandoff.targetState ?? ""))) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `github.pr_handoff.target_state must be listed in tracker.handoff_states: ${input.prHandoff.targetState}`,
+      input.attachFieldPathDetails ? ["github.pr_handoff.target_state", "tracker.handoff_states"] : undefined,
     );
   }
 
   const reviewOverlap = overlappingStates(input.handoffStates, input.reviewStates);
   if (reviewOverlap.length > 0) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `tracker.handoff_states must not overlap review_loop.review_states when github.pr_handoff is enabled: ${reviewOverlap.join(", ")}`,
+      input.attachFieldPathDetails ? ["tracker.handoff_states", "review_loop.review_states"] : undefined,
     );
   }
   const blockedOverlap = overlappingStates(input.handoffStates, input.blockedStates);
   if (blockedOverlap.length > 0) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `tracker.handoff_states must not overlap review_loop.blocked_states when github.pr_handoff is enabled: ${blockedOverlap.join(", ")}`,
+      input.attachFieldPathDetails ? ["tracker.handoff_states", "review_loop.blocked_states"] : undefined,
     );
   }
   const passOverlap = input.reviewPassState === null ? [] : overlappingStates(input.handoffStates, [input.reviewPassState]);
   if (passOverlap.length > 0) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `tracker.handoff_states must not overlap review_loop.review_pass_state when github.pr_handoff is enabled: ${passOverlap.join(", ")}`,
+      input.attachFieldPathDetails ? ["tracker.handoff_states", "review_loop.review_pass_state"] : undefined,
     );
   }
   if (input.prHandoff.requiredChecks.length === 0 && !input.prHandoff.noCiAllowed) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       "github.pr_handoff.required_checks is required when PR publication handoff is enabled unless github.pr_handoff.no_ci.allowed is true",
     );
   }
@@ -1955,20 +2104,21 @@ function validateStateBuckets(input: {
   reviewStates: string[];
   blockedStates: string[];
   reviewPassState: string | null;
+  attachFieldPathDetails?: boolean;
 }): void {
   const { activeStates, handoffStates, terminalStates, reviewStates, blockedStates, reviewPassState } = input;
   const activeHandoffOverlap = overlappingStates(activeStates, handoffStates);
   if (activeHandoffOverlap.length > 0) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `tracker.handoff_states must not overlap tracker.active_states: ${activeHandoffOverlap.join(", ")}`,
+      input.attachFieldPathDetails ? ["tracker.handoff_states", "tracker.active_states"] : undefined,
     );
   }
   const terminalHandoffOverlap = overlappingStates(terminalStates, handoffStates);
   if (terminalHandoffOverlap.length > 0) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `tracker.handoff_states must not overlap tracker.terminal_states: ${terminalHandoffOverlap.join(", ")}`,
+      input.attachFieldPathDetails ? ["tracker.handoff_states", "tracker.terminal_states"] : undefined,
     );
   }
 
@@ -1987,9 +2137,9 @@ function validateStateBuckets(input: {
       const [rightName, rightStates] = buckets[rightIndex] ?? ["", []];
       const overlap = overlappingStates(leftStates, rightStates);
       if (overlap.length > 0) {
-        throw new SymphonyError(
-          "config_validation_error",
+        throw configValidationError(
           `${leftName} must not overlap ${rightName}: ${overlap.join(", ")}`,
+          input.attachFieldPathDetails ? [leftName, rightName] : undefined,
         );
       }
     }

@@ -6,6 +6,11 @@ import chokidar, { type FSWatcher } from "chokidar";
 import { describe, expect, it, vi } from "vitest";
 import YAML from "yaml";
 import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Config.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
 import { WorkflowLoader, parseWorkflowFile, type WorkflowReloadEvent } from "../src/core/workflow/WorkflowLoader.js";
@@ -170,7 +175,7 @@ Work on {{ issue.identifier }}.`,
     });
   });
 
-  it("preserves flattened schema details for non-attributable project_contexts boundary errors", () => {
+  it("rejects empty project_contexts arrays at the raw config schema boundary", () => {
     expect.assertions(2);
 
     try {
@@ -650,6 +655,86 @@ Work on {{ issue.identifier }}.
     }
   });
 
+  it("does not treat overlapping state values as project-context field paths during reload sanitization", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-state-value-redaction-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            projectContextFixture({
+              id: "Docs Site",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: {
+                api_key: "$DOCS_LINEAR_API_KEY",
+                active_states: ["prod.secret"],
+                handoff_states: ["prod.secret"],
+              },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        'Workflow reload validation failed for project_contexts["Docs Site"]: invalid tracker.handoff_states, tracker.active_states',
+      );
+      expect(event.error?.details).toEqual({
+        reason: "invalid_project_context_configuration",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["Docs Site"]',
+            rawId: "Docs Site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+        ],
+        projectContextFieldPaths: ["tracker.handoff_states", "tracker.active_states"],
+      });
+      expect(serializedError).not.toContain("prod.secret");
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reports duplicate normalized project-context ids during reload with redacted metadata only", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-duplicate-context-error-"));
     const workflowPath = path.join(root, "WORKFLOW.md");
@@ -730,6 +815,96 @@ Work on {{ issue.identifier }}.
           },
         ],
         duplicateProjectContextId: "docs-site",
+      });
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps duplicate raw project context ids distinguishable in reload validation metadata", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-duplicate-raw-id-error-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            projectContextFixture({
+              id: "docs",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+            }),
+            projectContextFixture({
+              id: "docs",
+              label: "Docs Site Mirror",
+              projectSlug: "DOCS_MIRROR",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        "Workflow reload validation failed for project_contexts[1], project_contexts[2]: duplicate normalized project context id",
+      );
+      expect(event.error?.details).toEqual({
+        reason: "duplicate_project_context_id",
+        projectContexts: [
+          {
+            contextPath: "project_contexts[1]",
+            rawId: "docs",
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+          {
+            contextPath: "project_contexts[2]",
+            rawId: "docs",
+            projectContextId: "docs",
+            projectContextLabel: "Docs Site Mirror",
+            enabled: true,
+          },
+        ],
+        duplicateProjectContextId: "docs",
       });
       expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
       expectWorkflowReloadErrorToRedactSecrets(serializedError);
@@ -1904,6 +2079,38 @@ Work on {{ issue.identifier }}.
 });
 
 describe("project context workflow contracts", () => {
+  it("normalizes legacy single-project workflows without project_contexts into one default context", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        workspace: { root: "./workspaces" },
+        github: { owner: "acme", repo: "symphony", token: "$GITHUB_TOKEN" },
+        review_loop: { review_states: ["In Review"], max_review_rounds: 5 },
+        polling: { interval_ms: 60_000 },
+        agent: { max_concurrent_agents: 2, max_turns: 1 },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key", GITHUB_TOKEN: "github-test-token" },
+    );
+
+    expect(config.projectContexts.contexts).toHaveLength(1);
+    expect(config.projectContexts.defaultContextId).toBe(LEGACY_DEFAULT_PROJECT_CONTEXT_ID);
+    expect(config.projectContexts.defaultContext).toMatchObject({
+      id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      source: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+      tracker: { projectSlug: "TEST" },
+      github: { owner: "acme", repo: "symphony", token: "github-test-token" },
+      reviewLoop: { reviewStates: ["In Review"], maxReviewRounds: 5 },
+      agent: { maxConcurrentAgents: 2, maxTurns: 1 },
+    });
+    expect(config.projectContexts.defaultContext.publicMetadata).toMatchObject({
+      id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      linearProjectSlug: "TEST",
+    });
+  });
+
   it("normalizes project context ids into safe workflow identifiers", () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
@@ -2024,6 +2231,38 @@ describe("project context workflow contracts", () => {
         { LINEAR_API_KEY: "secret" },
       ),
     ).toThrowError("Duplicate project context id: docs-site");
+  });
+
+  it("keeps duplicate raw project context ids distinguishable in parse-time validation metadata", () => {
+    expect.assertions(3);
+
+    try {
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [
+            projectContextFixture({
+              id: "docs",
+              projectSlug: "DOCS",
+              repository: "../docs-site",
+            }),
+            projectContextFixture({
+              id: "docs",
+              projectSlug: "DOCS2",
+              repository: "../docs-site-v2",
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(SymphonyError);
+      expect((error as SymphonyError).message).toBe("Duplicate project context id: docs");
+      expect((error as SymphonyError).details).toEqual({
+        projectContextPaths: ["project_contexts[0]", "project_contexts[1]"],
+        duplicateProjectContextId: "docs",
+      });
+    }
   });
 
   it.each(["!!!", "   ", "___"])(

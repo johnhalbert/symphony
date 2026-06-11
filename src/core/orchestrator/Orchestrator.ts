@@ -218,6 +218,27 @@ interface ReviewerDispatchEvidence {
   runDigest: string[];
 }
 
+function projectContextForEntry(entry: RunningEntry, config: ServiceConfig) {
+  const legacyDefaultContext =
+    config.projectContexts.defaultContext.source !== "legacy_default"
+      ? undefined
+      : {
+          projectContextId: config.projectContexts.defaultContext.id,
+          projectContextLabel: config.projectContexts.defaultContext.label,
+          linearProjectSlug: config.projectContexts.defaultContext.publicMetadata.linearProjectSlug,
+          routingSource: config.projectContexts.defaultContext.source,
+        };
+  const resolved = entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? legacyDefaultContext;
+  if (resolved === undefined || legacyDefaultContext === undefined || resolved.projectContextId !== legacyDefaultContext.projectContextId) {
+    return resolved;
+  }
+  return {
+    ...legacyDefaultContext,
+    ...resolved,
+    linearProjectSlug: resolved.linearProjectSlug ?? legacyDefaultContext.linearProjectSlug,
+  };
+}
+
 type WorkerDispatchDecision =
   | { action: "dispatch"; runPhase: AgentRunPhase }
   | { action: "skip"; reason: string };
@@ -1905,7 +1926,7 @@ export class Orchestrator {
           runKind: runKindForPhase(entry.runPhase),
           issueId: entry.issue.id,
           issueIdentifier: entry.issue.identifier,
-          projectContext: entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
+          projectContext: projectContextForEntry(entry, this.config),
           attempt: context.attempt,
           turnNumber: context.turnNumber,
           prompt: context.prompt,
@@ -1931,7 +1952,7 @@ export class Orchestrator {
             planRunStartedComment(
               {
                 issue: entry.issue,
-                projectContext: entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
+                projectContext: projectContextForEntry(entry, this.config),
                 runId: entry.runId,
                 sessionId: entry.sessionId,
                 workspacePath: entry.workspacePath,
@@ -2684,7 +2705,7 @@ export class Orchestrator {
   ) {
     return {
       issue: entry.issue,
-      projectContext: entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
+      projectContext: projectContextForEntry(entry, this.config),
       role: entry.role,
       runPhase: entry.runPhase,
       attempt,
@@ -3090,7 +3111,7 @@ export class Orchestrator {
     if (!store) return;
     entry.lifecycle = await store.updateIssue(entry.issue, {
       ...patch,
-      projectContext: patch.projectContext ?? entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
+      projectContext: patch.projectContext ?? projectContextForEntry(entry, this.config),
     });
     await appendLaneMemoTelemetry(this.options.runStore, entry.activeRunId, entry.lifecycle, "orchestrator_update");
   }

@@ -287,11 +287,12 @@ function readWorkflowReloadErrorSignal(details: unknown): WorkflowReloadErrorSig
 }
 
 function workflowReloadProjectContextPathsForDuplicateId(config: RawWorkflowConfig, duplicateProjectContextId: string): string[] {
+  const rawContexts = readRawProjectContexts(config);
   return uniqueStrings(
-    readRawProjectContexts(config).flatMap((rawContext, index) => {
+    rawContexts.flatMap((rawContext, index) => {
       const rawId = readRawProjectContextId(rawContext);
       if (rawId === null || normalizeWorkflowReloadProjectContextId(rawId) !== duplicateProjectContextId) return [];
-      return [workflowReloadContextPath(rawId, index)];
+      return [workflowReloadContextPath(rawContexts, index)];
     }),
   );
 }
@@ -375,18 +376,58 @@ function workflowReloadProjectContextLabel(
   return normalizedRawId && normalizedRawId.length > 0 ? normalizedRawId : rawId;
 }
 
-function workflowReloadContextPath(rawId: string | null, index: number): string {
-  return rawId === null ? `project_contexts[${index}]` : `project_contexts[${JSON.stringify(rawId)}]`;
+function workflowReloadContextPath(rawContexts: readonly unknown[], index: number): string {
+  const rawId = readRawProjectContextId(rawContexts[index]);
+  if (rawId === null || workflowReloadRawProjectContextIdIsAmbiguous(rawContexts, rawId)) {
+    return `project_contexts[${index}]`;
+  }
+  return `project_contexts[${JSON.stringify(rawId)}]`;
+}
+
+function workflowReloadRawProjectContextIdIsAmbiguous(rawContexts: readonly unknown[], rawId: string): boolean {
+  let matches = 0;
+  for (const rawContext of rawContexts) {
+    if (readRawProjectContextId(rawContext) !== rawId) continue;
+    matches += 1;
+    if (matches > 1) return true;
+  }
+  return false;
+}
+
+const KNOWN_PROJECT_CONTEXT_MESSAGE_FIELD_PATHS = new Set<string>([
+  "id",
+  "enabled",
+  "tracker.kind",
+  "tracker.api_key",
+  "tracker.project_slug",
+  "tracker.active_states",
+  "tracker.handoff_states",
+  "tracker.terminal_states",
+  "workspace.source",
+  "workspace.source.kind",
+  "workspace.source.path",
+  "workspace.source.repository",
+  "workspace.source.base_ref",
+  "workspace.source.branch_template",
+  "review_loop.blocked_states",
+  "review_loop.review_states",
+  "review_loop.review_pass_state",
+  "github.pr_handoff.target_state",
+  "issue_breakdown.workspace_mode",
+]);
+
+function normalizeKnownProjectContextMessageFieldPath(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return KNOWN_PROJECT_CONTEXT_MESSAGE_FIELD_PATHS.has(value) ? value : null;
 }
 
 function extractProjectContextFieldPaths(message: string, contextPath: string): string[] {
   const prefix = `${contextPath}.`;
-  if (message.startsWith(prefix)) {
-    const remainder = message.slice(prefix.length);
-    const scopedMatch = /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(remainder);
-    if (scopedMatch?.[1]) return [scopedMatch[1]];
-  }
-  return uniqueStrings(message.match(/[a-z_]+(?:\.[a-z_]+|\[\d+\])+/g) ?? []);
+  if (!message.startsWith(prefix)) return [];
+  const remainder = message.slice(prefix.length);
+  const scopedMatch = /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(remainder);
+  const fieldPath = normalizeKnownProjectContextMessageFieldPath(scopedMatch?.[1]);
+  return fieldPath === null ? [] : [fieldPath];
 }
 
 function readStringArray(value: unknown): string[] {
