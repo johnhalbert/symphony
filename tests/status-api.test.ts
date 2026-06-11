@@ -757,6 +757,197 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("resolves literal colon-bearing session IDs on the durable transcript route", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const sessionId = "sym_eng-447_worker_issue:00dcda50:hermes-run-1";
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "COLON-SESSION-1",
+      issueId: "issue-colon-session-1",
+      issueIdentifier: "COLON-SESSION-1",
+      path: path.join(config.workspace.root, "COLON-SESSION-1"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/COLON-SESSION-1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-colon-session-1",
+      sessionId,
+      agentId: "agent-colon-session-1",
+      role: "worker",
+      issueId: "issue-colon-session-1",
+      issueIdentifier: "COLON-SESSION-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "COLON-SESSION-1",
+      workspacePath: path.join(config.workspace.root, "COLON-SESSION-1"),
+      gitBranchName: "symphony/COLON-SESSION-1",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+    });
+    await runStore.appendEvent({
+      runId: "run-colon-session-1",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "colon session transcript",
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(
+        `http://${address.host}:${address.port}/api/v1/runs/${encodeURIComponent(sessionId)}/transcript?limit=10`,
+      );
+      const body = (await response.json()) as { runId: string; events: Array<{ message?: string }> };
+
+      expect(response.status).toBe(200);
+      expect(body.runId).toBe("run-colon-session-1");
+      expect(body.events).toEqual([expect.objectContaining({ message: "colon session transcript" })]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("refreshes the default project context used for legacy alias resolution", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "ENG-179",
+      issueId: "issue-docs-refresh-1",
+      issueIdentifier: "ENG-179",
+      path: path.join(config.workspace.root, "docs", "ENG-179"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/docs/ENG-179",
+      projectContext: docsProjectContext,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-docs-refresh-1",
+      sessionId: "session-docs-refresh-1",
+      agentId: "agent-docs-refresh-1",
+      role: "worker",
+      issueId: "issue-docs-refresh-1",
+      issueIdentifier: "ENG-179",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      workspaceKey: "ENG-179",
+      workspacePath: path.join(config.workspace.root, "docs", "ENG-179"),
+      gitBranchName: "symphony/docs/ENG-179",
+      repoPath: "/repo-docs",
+      baseRef: "origin/main",
+      projectContext: docsProjectContext,
+    });
+    await runStore.appendEvent({
+      runId: "run-docs-refresh-1",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "docs transcript",
+    });
+    await lifecycleStore.ensureIssue(
+      issue({ id: "issue-docs-refresh-1", identifier: "ENG-179" }),
+      { phase: "implementation", projectContext: docsProjectContext },
+    );
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: "docs",
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/ENG-179`);
+      const runsResponse = await fetch(`${baseUrl}/api/v1/issues/ENG-179/runs`);
+      const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/ENG-179`);
+      const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/ENG-179/transcript?limit=10`);
+
+      const issueBody = (await issueResponse.json()) as {
+        latestRun: { projectContext?: { projectContextId: string } } | null;
+        workspace: { projectContext?: { projectContextId: string } } | null;
+        lifecycle: { projectContext?: { projectContextId: string } } | null;
+      };
+      const runsBody = (await runsResponse.json()) as { runs: Array<{ projectContext?: { projectContextId: string } }> };
+      const workspaceBody = (await workspaceResponse.json()) as { projectContext?: { projectContextId: string } };
+      const transcriptBody = (await transcriptResponse.json()) as { runId: string; events: Array<{ message?: string }> };
+
+      expect(issueResponse.status).toBe(200);
+      expect(runsResponse.status).toBe(200);
+      expect(workspaceResponse.status).toBe(200);
+      expect(transcriptResponse.status).toBe(200);
+      expect(issueBody.latestRun?.projectContext).toMatchObject({ projectContextId: "docs" });
+      expect(issueBody.workspace?.projectContext).toMatchObject({ projectContextId: "docs" });
+      expect(issueBody.lifecycle?.projectContext).toMatchObject({ projectContextId: "docs" });
+      expect(runsBody.runs).toEqual([expect.objectContaining({ projectContext: expect.objectContaining({ projectContextId: "docs" }) })]);
+      expect(workspaceBody.projectContext).toMatchObject({ projectContextId: "docs" });
+      expect(transcriptBody.runId).toBe("run-docs-refresh-1");
+      expect(transcriptBody.events).toEqual([expect.objectContaining({ message: "docs transcript" })]);
+
+      server.setDefaultProjectContextId("symphony");
+
+      const updatedIssueResponse = await fetch(`${baseUrl}/api/v1/issues/ENG-179`);
+      const updatedRunsResponse = await fetch(`${baseUrl}/api/v1/issues/ENG-179/runs`);
+      const updatedWorkspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/ENG-179`);
+      const updatedTranscriptResponse = await fetch(`${baseUrl}/api/v1/runs/ENG-179/transcript?limit=10`);
+
+      const updatedIssueBody = (await updatedIssueResponse.json()) as { error: { message: string } };
+      const updatedRunsBody = (await updatedRunsResponse.json()) as { error: { message: string } };
+      const updatedWorkspaceBody = (await updatedWorkspaceResponse.json()) as { error: { message: string } };
+      const updatedTranscriptBody = (await updatedTranscriptResponse.json()) as { error: { message: string } };
+
+      expect(updatedIssueResponse.status).toBe(404);
+      expect(updatedRunsResponse.status).toBe(404);
+      expect(updatedWorkspaceResponse.status).toBe(404);
+      expect(updatedTranscriptResponse.status).toBe(404);
+      expect(updatedIssueBody.error.message).toContain("default project context");
+      expect(updatedRunsBody.error.message).toContain("default project context");
+      expect(updatedWorkspaceBody.error.message).toContain("default project context");
+      expect(updatedTranscriptBody.error.message).toContain("default project context");
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("fails closed for ambiguous legacy unqualified status and transcript aliases across project contexts", async () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
@@ -3649,6 +3840,12 @@ describe("StatusServer durable API", () => {
       runPhase: "implementation",
       runKind: "implementation",
       state: "In Progress",
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
       workspacePath: null,
       sessionId: "session-1",
       runId: "run-1",
@@ -3725,6 +3922,7 @@ describe("StatusServer durable API", () => {
         logger: new StructuredLogger(() => undefined),
       }),
       workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: "docs",
       runStore,
       host: "127.0.0.1",
       port: 0,
@@ -3740,7 +3938,12 @@ describe("StatusServer durable API", () => {
       const runsResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1/runs`);
       const dashboardResponse = await fetch(`${baseUrl}/`);
       const stateBody = (await stateResponse.json()) as {
-        running: Array<{ issueDetails: IssueStatusView; liveness: unknown; cancellation: unknown }>;
+        running: Array<{
+          issueDetails: IssueStatusView;
+          liveness: unknown;
+          cancellation: unknown;
+          projectContext?: { projectContextId: string; projectContextLabel: string };
+        }>;
         operatorView: {
           running: Array<{
             issueDetails: IssueDetailsEnvelope;
@@ -3748,6 +3951,7 @@ describe("StatusServer durable API", () => {
             controls: { cancel: boolean };
             humanRequired: { active: boolean };
             continuationSummary: { available: boolean };
+            projectContext?: { projectContextId: string; projectContextLabel: string };
           }>;
         };
         operatorLivenessContract: { cancelFailed: { tracked: boolean }; deferred: Record<string, unknown> };
@@ -3793,6 +3997,10 @@ describe("StatusServer durable API", () => {
           title: "Live issue",
           labels: ["dogfood-ready"],
         },
+        projectContext: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+        },
         liveness: { status: "cancelling", activeRunId: "run-1" },
         cancellation: {
           requested: true,
@@ -3829,6 +4037,10 @@ describe("StatusServer durable API", () => {
           completeness: "full",
           issue: stateBody.running[0]?.issueDetails,
           tracker: { generatedAt: "2026-01-01T00:10:00.000Z", classification: "active", stale: true },
+        },
+        projectContext: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
         },
         liveness: { status: "cancelling", agentId: "agent-1" },
         controls: { cancel: false },

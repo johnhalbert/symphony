@@ -1267,7 +1267,67 @@ describe("/api/v1/web route contracts", () => {
     const baseUrl = baseUrlFor(address);
     try {
       const ambiguous = await getJson(`${baseUrl}/api/v1/web/sessions/ENG-179/transcript`);
-      expectTranscriptWindowPayload(ambiguous.body, [], { kind: "tail", limit: 500 });
+      const ambiguousBody = ambiguous.body as { error: { message: string } };
+      expect(ambiguous.response.status).toBe(404);
+      expect(ambiguousBody.error.message).toContain("ambiguous across project contexts");
+      expect(ambiguousBody.error.message).toContain("context-qualified alias");
+
+      const qualified = await getJson(`${baseUrl}/api/v1/web/sessions/docs%3AENG-179/transcript`);
+      const qualifiedBody = qualified.body as { messages: Array<{ text?: string }>; window: { kind: string; limit: number } };
+      expect(qualified.response.status).toBe(200);
+      expect(qualifiedBody.window).toMatchObject({ kind: "tail", limit: 500 });
+      expect(qualifiedBody.messages).toEqual(expect.arrayContaining([expect.objectContaining({ text: "docs transcript alias" })]));
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(1);
+  });
+
+  it("fails closed for wrong-context legacy web transcript aliases with actionable guidance", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const runStore = new RecordingRunStore(
+      [
+        runRecordFixture({
+          runId: "run-docs-wrong-context-1",
+          sessionId: "session-docs-wrong-context-1",
+          issueId: "issue-docs-wrong-context-1",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+          projectContext: docsProjectContext,
+        }),
+      ],
+      {
+        "run-docs-wrong-context-1": [
+          {
+            runId: "run-docs-wrong-context-1",
+            sequence: 1,
+            at: "2026-05-31T00:00:31.000Z",
+            source: "runtime",
+            eventType: "assistant_complete",
+            message: "docs transcript alias",
+          },
+        ],
+      },
+    );
+    const { server, calls } = createStatusServer(root, {
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const wrongContext = await getJson(`${baseUrl}/api/v1/web/sessions/ENG-179/transcript`);
+      const wrongContextBody = wrongContext.body as { error: { message: string } };
+      expect(wrongContext.response.status).toBe(404);
+      expect(wrongContextBody.error.message).toContain("not available through the default project context");
+      expect(wrongContextBody.error.message).toContain("context-qualified alias");
 
       const qualified = await getJson(`${baseUrl}/api/v1/web/sessions/docs%3AENG-179/transcript`);
       const qualifiedBody = qualified.body as { messages: Array<{ text?: string }>; window: { kind: string; limit: number } };

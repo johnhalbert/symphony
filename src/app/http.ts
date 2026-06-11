@@ -335,6 +335,10 @@ export class StatusServer {
     });
   }
 
+  setDefaultProjectContextId(defaultProjectContextId: string | null | undefined): void {
+    this.options.defaultProjectContextId = defaultProjectContextId;
+  }
+
   async start(): Promise<{ host: string; port: number }> {
     if (this.server) {
       this.registerWebProjectionRevisionListeners();
@@ -781,8 +785,11 @@ export class StatusServer {
           );
           return;
         }
-        const run = await resolveWebTranscriptRun(this.options.runStore, sessionIdOrRunId, this.options.defaultProjectContextId);
-        if (!run) {
+        const resolvedRun = await resolveWebTranscriptRun(this.options.runStore, sessionIdOrRunId, this.options.defaultProjectContextId);
+        if (resolvedRun.status === "ambiguous" || resolvedRun.status === "wrong_context") {
+          throw statusAliasResolutionError("Transcript", sessionIdOrRunId, resolvedRun.status);
+        }
+        if (!resolvedRun.run) {
           sendJson(
             response,
             200,
@@ -794,6 +801,7 @@ export class StatusServer {
           );
           return;
         }
+        const run = resolvedRun.run;
         let durableTranscript: DurableProjectionReadResult<WebTranscriptProjectionPayload> | undefined;
         if (!requestedFullTranscript && !shouldBypassDurableWebTranscriptForActiveTail(run, requestedTranscriptPage)) {
           durableTranscript = await this.webProjectionRepositories.transcript.readRunPage(
@@ -5973,6 +5981,10 @@ async function resolveTranscriptRunFromAlias(input: {
   if (directRun) return { status: "resolved", run: directRun };
 
   const runs = (await input.runStore.listRuns()).sort(compareRunChronology);
+  const directSessionMatches = runs.filter((record) => record.sessionId === input.requestKey);
+  if (directSessionMatches.length === 1) return { status: "resolved", run: directSessionMatches[0] ?? null };
+  if (directSessionMatches.length > 1) return { status: "ambiguous", run: null };
+
   const resolution = resolveContextualAliasMatches({
     requestKey: input.requestKey,
     candidates: runs,
@@ -6253,6 +6265,7 @@ async function operatorSnapshotView(
         runPhase: row.runPhase,
         runKind: row.runKind,
         state: row.state,
+        ...(row.projectContext === undefined ? {} : { projectContext: row.projectContext }),
         runId: row.liveness.activeRunId ?? row.runId,
         workspacePath: row.workspacePath,
         paused,
@@ -6506,13 +6519,12 @@ async function resolveWebTranscriptRun(
   runStore: RunTranscriptStore,
   sessionIdOrRunId: string,
   defaultProjectContextId: string | null | undefined,
-): Promise<RunRecord | null> {
-  const resolvedRun = await resolveTranscriptRunFromAlias({
+): Promise<TranscriptRunResolution> {
+  return resolveTranscriptRunFromAlias({
     runStore,
     requestKey: sessionIdOrRunId,
     defaultProjectContextId,
   });
-  return resolvedRun.run;
 }
 
 async function readBoundedWebTranscript(runStore: RunTranscriptStore, runId: string, url?: URL): Promise<TranscriptEvent[]> {
