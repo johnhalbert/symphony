@@ -142,6 +142,49 @@ describe("project context normalization", () => {
     });
   });
 
+  it("redacts unexpected tracker and workspace fields from public metadata", () => {
+    const metadata = projectContextMetadataForPublicRead({
+      id: "docs",
+      label: "Documentation Site",
+      enabled: false,
+      tracker: { projectSlug: "DOCS", apiKey: "linear-secret", teamId: "team-1" } as unknown as { projectSlug: string },
+      workspace: {
+        root: "   ",
+        checkoutToken: "workspace-secret",
+        source: {
+          kind: "git_worktree",
+          repository: "../docs-site",
+          path: "packages/site",
+          branch: "secret-branch",
+        },
+      } as unknown as {
+        root: string;
+        source: { kind: string; repository: string; path: string };
+      },
+    });
+
+    expect(metadata).toEqual({
+      id: "docs",
+      label: "Documentation Site",
+      enabled: false,
+      linearProjectSlug: "DOCS",
+      workspaceRoot: null,
+      workspaceSourceKind: "git_worktree",
+      repository: "../docs-site",
+      path: "packages/site",
+    });
+    expect(Object.keys(metadata).sort()).toEqual([
+      "enabled",
+      "id",
+      "label",
+      "linearProjectSlug",
+      "path",
+      "repository",
+      "workspaceRoot",
+      "workspaceSourceKind",
+    ]);
+  });
+
   it("normalizes legacy top-level config into an explicit default project context", () => {
     expect(
       normalizeLegacyDefaultProjectContext({
