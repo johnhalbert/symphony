@@ -211,11 +211,13 @@ describe("FileWritebackOutboxStore", () => {
 
     await store.enqueueOnce(getOperation);
     await store.enqueueOnce(listOperation);
+    expect(store.projectionRevision()).toBe(2);
     await stripPersistedProjectContext(getOperation.idempotencyKey);
     await stripPersistedProjectContext(listOperation.idempotencyKey);
 
     await expect(store.get(getOperation.idempotencyKey)).resolves.toMatchObject({ projectContext: docsProjectContext });
     await expect(readPersistedWritebackText(getOperation.idempotencyKey)).resolves.toContain('"projectContextId": "docs"');
+    expect(store.projectionRevision()).toBe(2);
 
     await expect(store.list()).resolves.toEqual(
       expect.arrayContaining([
@@ -224,6 +226,7 @@ describe("FileWritebackOutboxStore", () => {
       ]),
     );
     await expect(readPersistedWritebackText(listOperation.idempotencyKey)).resolves.toContain('"projectContextId": "docs"');
+    expect(store.projectionRevision()).toBe(2);
   });
 
   it.each(["pending", "retrying"] as const)(
@@ -491,6 +494,52 @@ describe("FileWritebackOutboxStore", () => {
     expect(files[0]).toMatch(/^wb_comment_issue-legacy_[a-f0-9]{20}\.json$/);
     expect(files).not.toContain(legacyFileName);
     await expect(store.get(idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
+  });
+
+  it("dedupes canonical and legacy duplicate files before repairing missing project context on list", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const idempotencyKey = "comment:issue-legacy-duplicate:merge-gate:legacy-repair";
+    const writebackDir = path.join(root, "writeback");
+    const operation = {
+      idempotencyKey,
+      kind: "comment" as const,
+      issueId: "issue-legacy-duplicate",
+      runId: "run-legacy-duplicate",
+      projectContext: docsProjectContext,
+      payload: { body: "Canonical record.", dedupeKey: "legacy-duplicate" },
+    };
+
+    await recordRunProjectContext("run-legacy-duplicate", "issue-legacy-duplicate", "DOCS-DUPLICATE");
+    const pending = await store.enqueueOnce(operation);
+    const succeeded = await store.markSucceeded(pending);
+    const legacyFileName = `${idempotencyKey.replace(/[^A-Za-z0-9._-]/g, "_")}.json`;
+    await mkdir(writebackDir, { recursive: true });
+    await writeFile(
+      path.join(writebackDir, legacyFileName),
+      `${JSON.stringify(
+        {
+          ...succeeded,
+          status: "pending",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          nextAttemptAt: "2026-01-01T00:00:00.000Z",
+          resultStatus: null,
+          resultMessage: null,
+          resultEvidence: null,
+        },
+        (key, value) => (key === "projectContext" ? undefined : value),
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await expect(store.list()).resolves.toEqual([
+      expect.objectContaining({ idempotencyKey, status: "succeeded", projectContext: docsProjectContext }),
+    ]);
+    await expect(store.get(idempotencyKey)).resolves.toMatchObject({
+      idempotencyKey,
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
   });
 
   it("claims the same due record only once across concurrent processors", async () => {

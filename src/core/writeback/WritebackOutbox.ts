@@ -295,19 +295,19 @@ export class FileWritebackOutboxStore {
     const entries = await fs.readdir(this.recordsDir());
     const records = await mapWithFileReadConcurrency(
       entries.filter((entry) => entry.endsWith(".json")).map((entry) => path.join(this.recordsDir(), entry)),
-      (filePath) => readJsonIfExists<WritebackOperation>(filePath),
+      async (filePath): Promise<StoredWritebackRecord | null> => {
+        const rawRecord = await readJsonIfExists<Record<string, unknown>>(filePath);
+        if (rawRecord === null) return null;
+        return {
+          filePath,
+          rawRecord,
+          record: normalizeWritebackOperation(rawRecord as WritebackOperation),
+        };
+      },
     );
-    return dedupeWritebackRecords(
-      await Promise.all(
-        records
-          .filter((record): record is WritebackOperation => record !== null)
-          .map((record) =>
-            this.repairProjectContextIfMissing(
-              normalizeWritebackOperation(record),
-              undefined,
-              record as unknown as Record<string, unknown>,
-            ),
-          ),
+    return Promise.all(
+      dedupeStoredWritebackRecords(records.filter((record): record is StoredWritebackRecord => record !== null)).map(
+        ({ record, rawRecord }) => this.repairProjectContextIfMissing(record, undefined, rawRecord),
       ),
     );
   }
@@ -342,10 +342,8 @@ export class FileWritebackOutboxStore {
     const repaired = normalizeWritebackOperation({
       ...record,
       projectContext: normalizeProjectContextResolution(projectContext ?? (await this.readRunProjectContext(record.runId))),
-      updatedAt: new Date().toISOString(),
     } as WritebackOperation);
     await this.write(repaired);
-    this.notifyProjectionChanged();
     return repaired;
   }
 
@@ -689,15 +687,34 @@ function shouldPromoteReplayProjectContext(
   );
 }
 
-function dedupeWritebackRecords(records: WritebackOperation[]): WritebackOperation[] {
-  const byKey = new Map<string, WritebackOperation>();
+type StoredWritebackRecord = {
+  filePath: string;
+  rawRecord: Record<string, unknown>;
+  record: WritebackOperation;
+};
+
+function dedupeStoredWritebackRecords(records: StoredWritebackRecord[]): StoredWritebackRecord[] {
+  const byKey = new Map<string, StoredWritebackRecord>();
   for (const record of records) {
-    const existing = byKey.get(record.idempotencyKey);
-    if (!existing || Date.parse(record.updatedAt) >= Date.parse(existing.updatedAt)) {
-      byKey.set(record.idempotencyKey, record);
+    const existing = byKey.get(record.record.idempotencyKey);
+    if (!existing || compareStoredWritebackRecords(record, existing) >= 0) {
+      byKey.set(record.record.idempotencyKey, record);
     }
   }
   return Array.from(byKey.values());
+}
+
+function compareStoredWritebackRecords(left: StoredWritebackRecord, right: StoredWritebackRecord): number {
+  const updatedAtDelta = Date.parse(left.record.updatedAt) - Date.parse(right.record.updatedAt);
+  if (updatedAtDelta !== 0) return updatedAtDelta;
+  const leftCanonical = isCanonicalRecordPath(left.filePath, left.record.idempotencyKey);
+  const rightCanonical = isCanonicalRecordPath(right.filePath, right.record.idempotencyKey);
+  if (leftCanonical === rightCanonical) return 0;
+  return leftCanonical ? 1 : -1;
+}
+
+function isCanonicalRecordPath(filePath: string, idempotencyKey: string): boolean {
+  return path.basename(filePath) === shortRecordFileName(idempotencyKey);
 }
 
 function matchesNewWritebackOperation(record: WritebackOperation, operation: NewWritebackOperation): boolean {
