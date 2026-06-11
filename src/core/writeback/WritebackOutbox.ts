@@ -387,6 +387,18 @@ export class WritebackProcessor {
     private readonly issueBreakdownFreshnessGuard?: IssueBreakdownFreshnessGuard,
   ) {}
 
+  forStore(store: FileWritebackOutboxStore): WritebackProcessor {
+    return new WritebackProcessor(
+      store,
+      this.writer,
+      this.logger,
+      this.maxBackoffMs,
+      this.lifecycleStore,
+      this.dryRun,
+      this.issueBreakdownFreshnessGuard,
+    );
+  }
+
   async enqueueAndProcess(operation: NewWritebackOperation, options: EnqueueWritebackOptions = {}): Promise<WritebackOperation> {
     let record = await this.store.enqueueOnce(operation);
     if (record.status === "succeeded") return record;

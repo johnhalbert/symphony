@@ -358,6 +358,8 @@ export class CompletionReportService {
     const report = completionReportInputFromRecord(existing);
     const context: CompletionReportActiveContext = {
       issue: input.issue,
+      projectContext:
+        input.approval.projectContext ?? lifecycle.projectContext ?? projectContextResolutionFromIssue(input.issue) ?? undefined,
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -403,6 +405,8 @@ export class CompletionReportService {
     const report = completionReportInputFromRecord(existing);
     const context: CompletionReportActiveContext = {
       issue: input.issue,
+      projectContext:
+        input.approval.projectContext ?? lifecycle.projectContext ?? projectContextResolutionFromIssue(input.issue) ?? undefined,
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,

@@ -20,7 +20,7 @@ import {
   type OperatorApprovalRecord,
 } from "../src/core/approval/OperatorApprovalService.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
-import { normalizeProjectContextId, projectContextResolutionFromIssue } from "../src/core/config/ProjectContexts.js";
+import { normalizeProjectContextId, projectContextResolutionFromIssue, type ProjectContextResolution } from "../src/core/config/ProjectContexts.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type {
@@ -84,6 +84,23 @@ type ParsedServiceConfig = ReturnType<typeof parseServiceConfig>;
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
 type CommentWriteback = Extract<NewWritebackOperation, { kind: "comment" }>;
+
+interface ApprovalRoutingOptions {
+  projectContext?: ProjectContextResolution;
+  workspacePath?: string;
+  baseBranch?: string;
+}
+
+interface MultiProjectApprovalRecoveryFixture {
+  config: ParsedServiceConfig;
+  reloadedConfig: ParsedServiceConfig;
+  docsIssue: ReturnType<typeof trackerIssue>;
+  docsProjectContext: ProjectContextResolution;
+  defaultStateDir: string;
+  defaultReloadStateDir: string;
+  docsStateDir: string;
+  docsWorkspacePath: string;
+}
 
 const docsProjectContext = {
   projectContextId: "docs-site",
@@ -2039,7 +2056,7 @@ describe("Orchestrator", () => {
             projectSlug: "DOCS",
             workspaceRoot: docsWorkspaceRoot,
             stateDir: docsStateDir,
-            tracker: { active_states: ["Queued", "Doing"], handoff_states: ["Docs Review"] },
+            tracker: { active_states: ["Queued", "Doing"], handoff_states: ["Docs Handoff"] },
             review_loop: { review_states: ["Docs Review"] },
             workspace: { source: { kind: "copy", path: docsSourcePath } },
           }),
@@ -4434,6 +4451,189 @@ describe("Orchestrator", () => {
     },
   );
 
+  it("resumes approved publication through the docs project context after config reload", async () => {
+    const fixture = await createMultiProjectApprovalRecoveryFixture(root);
+    let currentState = "Blocked";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...fixture.docsIssue, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(fixture.defaultStateDir), writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(fixture.docsStateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(fixture.docsStateDir);
+    const routingOptions: ApprovalRoutingOptions = {
+      projectContext: fixture.docsProjectContext,
+      workspacePath: fixture.docsWorkspacePath,
+      baseBranch: "docs-main",
+    };
+    await startApprovalRun(runStore, fixture.docsIssue, "run-1", root, routingOptions);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await lifecycleStore.ensureIssue(
+      fixture.docsIssue,
+      pendingApprovalLifecyclePatch(
+        fixture.docsIssue,
+        root,
+        "run-1",
+        PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+        routingOptions,
+      ),
+    );
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/docs-site/pull/42",
+      number: 42,
+      headBranch: fixture.docsIssue.branchName ?? "symphony/docs/DOCS-404",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const orchestrator = new Orchestrator({
+      config: fixture.config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: fixture.config.workspace, hooks: fixture.config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      completionReportPublisher: publisher,
+    });
+    orchestrator.updateConfig(fixture.reloadedConfig, "Work on {{ issue.identifier }}");
+
+    await expect(
+      orchestrator.resumeApprovedPublication(approvalRecordFor("approved", fixture.docsIssue, "run-1", root, null, routingOptions)),
+    ).resolves.toBe(true);
+
+    const docsOutboxRecords = await new FileWritebackOutboxStore(fixture.docsStateDir).list();
+    await expect(new FileWritebackOutboxStore(fixture.defaultStateDir).list()).resolves.toEqual([]);
+    await expect(new FileWritebackOutboxStore(fixture.defaultReloadStateDir).list()).resolves.toEqual([]);
+    expect(docsOutboxRecords).toHaveLength(2);
+    expect(docsOutboxRecords.map((record) => record.kind).sort()).toEqual(["comment", "transition"]);
+    expect(docsOutboxRecords.every((record) => record.projectContext?.projectContextId === "docs")).toBe(true);
+    expect(docsOutboxRecords.every((record) => record.status === "succeeded")).toBe(true);
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      workspacePath: fixture.docsWorkspacePath,
+      branchName: fixture.docsIssue.branchName,
+      baseBranch: "docs-main",
+      evidenceCursor: "idem-1",
+    });
+    expect(writer.comments).toHaveLength(1);
+    expect(writer.comments[0]?.body).toContain("## Symphony Completion Report");
+    expect(writer.comments[0]?.body).toContain("Status: accepted");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Docs Review"]);
+    expect(currentState).toBe("Docs Review");
+    await expect(lifecycleStore.get(fixture.docsIssue.id)).resolves.toMatchObject({
+      projectContext: fixture.docsProjectContext,
+      phase: "review",
+      blockedReason: null,
+    });
+    await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+      prUrl: "https://github.com/acme/docs-site/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: fixture.docsIssue.branchName,
+    });
+    await orchestrator.stop();
+  });
+
+  it.each([
+    ["rejected", null, OPERATOR_REJECTED_PUBLICATION_ERROR],
+    ["stale", "run cancellation has been requested", "Publication approval stale"],
+    ["expired", "approval request expired", "Publication approval expired"],
+  ] as const)(
+    "records %s publication approval recovery through the docs project context after config reload",
+    async (status, staleReason, expectedError) => {
+      const fixture = await createMultiProjectApprovalRecoveryFixture(root);
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [fixture.docsIssue];
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const writer = new StateChangingWriter(() => undefined);
+      const writeback = new WritebackProcessor(new FileWritebackOutboxStore(fixture.defaultStateDir), writer, logger, 300_000);
+      const runStore = new FileRunTranscriptStore(fixture.docsStateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(fixture.docsStateDir);
+      const routingOptions: ApprovalRoutingOptions = {
+        projectContext: fixture.docsProjectContext,
+        workspacePath: fixture.docsWorkspacePath,
+        baseBranch: "docs-main",
+      };
+      await startApprovalRun(runStore, fixture.docsIssue, "run-1", root, routingOptions);
+      await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+      await lifecycleStore.ensureIssue(
+        fixture.docsIssue,
+        pendingApprovalLifecyclePatch(
+          fixture.docsIssue,
+          root,
+          "run-1",
+          PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          routingOptions,
+        ),
+      );
+      const orchestrator = new Orchestrator({
+        config: fixture.config,
+        tracker,
+        workspaceManager: new WorkspaceManager({ workspace: fixture.config.workspace, hooks: fixture.config.hooks, logger }),
+        harness: new FakeHarness(),
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+        runStore,
+        writeback,
+      });
+      orchestrator.updateConfig(fixture.reloadedConfig, "Work on {{ issue.identifier }}");
+      const approval = approvalRecordFor(status, fixture.docsIssue, "run-1", root, staleReason, routingOptions);
+
+      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+
+      const docsOutboxRecords = await new FileWritebackOutboxStore(fixture.docsStateDir).list();
+      await expect(new FileWritebackOutboxStore(fixture.defaultStateDir).list()).resolves.toEqual([]);
+      await expect(new FileWritebackOutboxStore(fixture.defaultReloadStateDir).list()).resolves.toEqual([]);
+      expect(docsOutboxRecords).toHaveLength(1);
+      expect(docsOutboxRecords[0]).toMatchObject({ kind: "comment", status: "succeeded" });
+      expect(docsOutboxRecords[0]?.projectContext).toMatchObject({ projectContextId: "docs", linearProjectSlug: "DOCS" });
+      expect(writer.comments).toHaveLength(1);
+      expect(writer.comments[0]?.body).toContain("## Symphony Publication Approval Not Completed");
+      expect(writer.comments[0]?.body).toContain(`Status: ${status}`);
+      if (staleReason !== null) {
+        expect(writer.comments[0]?.body).toContain(`Reason: ${staleReason}`);
+      }
+      expect(writer.transitions).toEqual([]);
+      await expect(lifecycleStore.get(fixture.docsIssue.id)).resolves.toMatchObject({
+        projectContext: fixture.docsProjectContext,
+        phase: "blocked",
+        blockedReason: `publication approval ${status}`,
+      });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+        status: "failed",
+        error: expectedError,
+        pendingApprovalRequestId: null,
+      });
+      await orchestrator.stop();
+    },
+  );
+
   it("smokes a manufactured fail, revision worker, and pass review loop", async () => {
     const config = testConfig(root);
     config.agent.maxConcurrentAgents = 1;
@@ -6763,11 +6963,118 @@ function linearLinkbackComment(): string {
   ].join("\n");
 }
 
+async function createMultiProjectApprovalRecoveryFixture(root: string): Promise<MultiProjectApprovalRecoveryFixture> {
+  const defaultWorkspaceRoot = path.join(root, "default-workspaces");
+  const defaultStateDir = path.join(root, "default-state");
+  const defaultReloadWorkspaceRoot = path.join(root, "default-workspaces-reloaded");
+  const defaultReloadStateDir = path.join(root, "default-state-reloaded");
+  const docsWorkspaceRoot = path.join(root, "docs-workspaces");
+  const docsStateDir = path.join(root, "docs-state");
+  const defaultSourcePath = path.join(root, "default-source");
+  const defaultReloadSourcePath = path.join(root, "default-source-reloaded");
+  const docsSourcePath = path.join(root, "docs-source");
+  await Promise.all([
+    mkdir(defaultSourcePath, { recursive: true }),
+    mkdir(defaultReloadSourcePath, { recursive: true }),
+    mkdir(docsSourcePath, { recursive: true }),
+  ]);
+
+  const topLevel: NonNullable<NonNullable<Parameters<typeof multiProjectWorkflowConfig>[0]>["topLevel"]> = {
+    tracker: { project_slug: "ENG" },
+    workspace: {
+      root: defaultWorkspaceRoot,
+      state_dir: defaultStateDir,
+      source: { kind: "copy", path: defaultSourcePath, base_ref: "main" },
+    },
+    writeback: { enabled: true, mode: "live", dispatch_state: "Todo" },
+    review_loop: {
+      blocked_states: ["Blocked"],
+      review_states: ["Human Review"],
+      reviewer_prompt_template: "Review {{ issue.identifier }}.",
+    },
+    github: {
+      publish_pull_requests: true,
+      owner: "acme",
+      repo: "symphony",
+      token: "github-token",
+      pr_handoff: { enabled: false },
+      operator_approval: { required_for_publication: true, reject_policy: "fail" },
+    },
+  };
+  const docsContext = projectContextFixture({
+    id: "docs",
+    label: "Documentation Site",
+    projectSlug: "DOCS",
+    workspaceRoot: docsWorkspaceRoot,
+    stateDir: docsStateDir,
+    tracker: { active_states: ["Queued", "Doing"], handoff_states: ["Docs Handoff"] },
+    review_loop: { review_states: ["Docs Review"] },
+    workspace: { source: { kind: "copy", path: docsSourcePath, base_ref: "docs-main" } },
+    github: {
+      publish_pull_requests: true,
+      owner: "acme",
+      repo: "docs-site",
+      token: "github-token",
+      pr_handoff: { enabled: false },
+      operator_approval: { required_for_publication: true, reject_policy: "fail" },
+    },
+  });
+  const workflowPath = path.join(root, "WORKFLOW.md");
+  const config = parseServiceConfig(
+    multiProjectWorkflowConfig({ topLevel, projectContexts: [docsContext] }),
+    workflowPath,
+    { LINEAR_API_KEY: "linear-test-key" },
+  );
+  const reloadedConfig = parseServiceConfig(
+    multiProjectWorkflowConfig({
+      topLevel: {
+        ...topLevel,
+        workspace: {
+          ...topLevel.workspace,
+          root: defaultReloadWorkspaceRoot,
+          state_dir: defaultReloadStateDir,
+          source: { kind: "copy", path: defaultReloadSourcePath, base_ref: "reloaded-main" },
+        },
+        review_loop: {
+          ...topLevel.review_loop,
+          review_states: ["Reloaded Human Review"],
+        },
+      },
+      projectContexts: [docsContext],
+    }),
+    workflowPath,
+    { LINEAR_API_KEY: "linear-test-key" },
+  );
+  const docsIssue = trackerIssue({
+    id: "issue-docs-approval-1",
+    identifier: "DOCS-404",
+    state: "Blocked",
+    labels: ["dogfood-ready"],
+    branchName: "symphony/docs/DOCS-404",
+    projectContextId: "docs",
+    projectContextLabel: "Documentation Site",
+    linearProjectSlug: "DOCS",
+  });
+  const docsProjectContext = projectContextResolutionFromIssue(docsIssue);
+  if (!docsProjectContext) throw new Error("Expected docs project context resolution");
+  return {
+    config,
+    reloadedConfig,
+    docsIssue,
+    docsProjectContext,
+    defaultStateDir,
+    defaultReloadStateDir,
+    docsStateDir,
+    docsWorkspacePath: path.join(docsWorkspaceRoot, docsIssue.identifier),
+  };
+}
+
 async function startApprovalRun(
   runStore: FileRunTranscriptStore,
   candidate: Issue,
   runId: string,
   root: string,
+  options: ApprovalRoutingOptions = {},
 ): Promise<void> {
   await runStore.startRun({
     runId,
@@ -6776,14 +7083,15 @@ async function startApprovalRun(
     role: "worker",
     issueId: candidate.id,
     issueIdentifier: candidate.identifier,
+    ...(options.projectContext === undefined ? {} : { projectContext: options.projectContext }),
     attempt: null,
     turnNumber: 1,
     prompt: "Worker submitted a completion report.",
     workspaceKey: candidate.identifier,
-    workspacePath: path.join(root, "workspace"),
+    workspacePath: options.workspacePath ?? path.join(root, "workspace"),
     gitBranchName: candidate.branchName ?? "symphony/TEST-1",
     repoPath: root,
-    baseRef: "main",
+    baseRef: options.baseBranch ?? "main",
   });
 }
 
@@ -6792,14 +7100,17 @@ function pendingApprovalLifecyclePatch(
   root: string,
   runId: string,
   blockedReason = PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+  options: ApprovalRoutingOptions = {},
 ): IssueLifecyclePatch {
   return {
+    ...(options.projectContext === undefined ? {} : { projectContext: options.projectContext }),
     phase: "blocked",
     blockedReason,
     lastCompletionReportId: `completion-report:${candidate.id}:idem-1`,
     completionReports: [
       {
         ...completionReportRecord(candidate),
+        ...(options.projectContext === undefined ? {} : { projectContext: options.projectContext }),
         runId,
         branchName: candidate.branchName,
         pullRequest: null,
@@ -6807,11 +7118,11 @@ function pendingApprovalLifecyclePatch(
     ],
     summaryPointers: {
       workspaceKey: candidate.identifier,
-      workspacePath: path.join(root, "workspace"),
+      workspacePath: options.workspacePath ?? path.join(root, "workspace"),
       branchName: candidate.branchName,
       gitBranchName: candidate.branchName,
       repoPath: root,
-      baseRef: "main",
+      baseRef: options.baseBranch ?? "main",
       lastRunId: runId,
     },
   };
@@ -6823,20 +7134,22 @@ function approvalRecordFor(
   runId: string,
   root: string,
   staleReason: string | null = null,
+  options: ApprovalRoutingOptions = {},
 ): OperatorApprovalRecord {
   return {
     requestId: `approval-${status}`,
     status,
     issueId: candidate.id,
     issueIdentifier: candidate.identifier,
+    ...(options.projectContext === undefined ? {} : { projectContext: options.projectContext }),
     runId,
     evidenceCursor: "idem-1",
     dedupeKey: `${runId}:idem-1:push_and_pr`,
     action: {
       kind: "push_and_pr",
       branchName: candidate.branchName ?? "symphony/TEST-1",
-      baseBranch: "main",
-      workspacePath: path.join(root, "workspace"),
+      baseBranch: options.baseBranch ?? "main",
+      workspacePath: options.workspacePath ?? path.join(root, "workspace"),
       title: `${candidate.identifier}: ${candidate.title}`,
       evidenceCursor: "idem-1",
       summaryPreview: "Implemented the requested handoff.",

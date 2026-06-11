@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
-import { normalizeProjectContextId, projectContextResolutionFromIssue } from "../config/ProjectContexts.js";
+import { normalizeProjectContextId, projectContextResolutionFromIssue, type ProjectContextResolution } from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
@@ -520,8 +520,7 @@ export class Orchestrator {
     this.promptTemplate = promptTemplate;
   }
 
-  private configForIssue(issue: Issue): ServiceConfig {
-    const projectContext = projectContextResolutionFromIssue(issue);
+  private configForProjectContext(projectContext: ProjectContextResolution | null | undefined): ServiceConfig {
     if (!projectContext) return this.config;
 
     let projectContextId: string;
@@ -544,6 +543,43 @@ export class Orchestrator {
       issueBreakdown: context.issueBreakdown,
       agent: context.agent,
     };
+  }
+
+  private configForIssue(issue: Issue): ServiceConfig {
+    return this.configForProjectContext(projectContextResolutionFromIssue(issue));
+  }
+
+  private configForApprovalRequest(
+    request: Pick<OperatorApprovalRecord, "projectContext">,
+    issue: Issue,
+    lifecycle: Pick<IssueLifecycleRecord, "projectContext"> | null = null,
+  ): ServiceConfig {
+    return this.configForProjectContext(request.projectContext ?? lifecycle?.projectContext ?? projectContextResolutionFromIssue(issue));
+  }
+
+  private completionReportServiceForConfig(
+    config: ServiceConfig,
+    options: { includePublisher?: boolean; includeOperatorApproval?: boolean } = {},
+  ): CompletionReportService {
+    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writebackProcessor = this.options.writeback?.forStore?.(writebackOutbox) ?? this.options.writeback;
+    return new CompletionReportService({
+      config,
+      lifecycleStore: this.options.lifecycleStore!,
+      writebackOutbox,
+      ...(writebackProcessor === undefined ? {} : { writebackProcessor }),
+      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+      ...(options.includePublisher
+        ? {
+            pullRequestPublisher:
+              this.options.completionReportPublisher ??
+              createGitHubPullRequestClientForCapability(config, "github.publication"),
+          }
+        : {}),
+      ...(options.includeOperatorApproval && this.options.operatorApproval
+        ? { operatorApproval: this.options.operatorApproval }
+        : {}),
+    });
   }
 
   private configForEntry(entry: RunningEntry): ServiceConfig {
@@ -1027,16 +1063,12 @@ export class Orchestrator {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
     const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
-    const publisher =
-      this.options.completionReportPublisher ??
-      createGitHubPullRequestClientForCapability(this.config, "github.publication");
-    const result = await new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
-      pullRequestPublisher: publisher,
+    const lifecycle =
+      (await this.options.lifecycleStore.get(request.issueId)) ??
+      (request.issueIdentifier ? await this.options.lifecycleStore.get(request.issueIdentifier) : null);
+    const issueConfig = this.configForApprovalRequest(request, issue, lifecycle);
+    const result = await this.completionReportServiceForConfig(issueConfig, {
+      includePublisher: true,
     }).resumeApprovedPublication({ approval: request, issue });
     if (!result) return false;
     return true;
@@ -1046,17 +1078,15 @@ export class Orchestrator {
     if (!this.options.lifecycleStore) return false;
     const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
     const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
-    const result = await new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
-    }).recordPublicationApprovalTerminal({ approval: request, issue });
-    if (result.length > 0) return true;
     const lifecycle =
       (await this.options.lifecycleStore.get(request.issueId)) ??
       (request.issueIdentifier ? await this.options.lifecycleStore.get(request.issueIdentifier) : null);
+    const issueConfig = this.configForApprovalRequest(request, issue, lifecycle);
+    const result = await this.completionReportServiceForConfig(issueConfig).recordPublicationApprovalTerminal({
+      approval: request,
+      issue,
+    });
+    if (result.length > 0) return true;
     return lifecycle?.phase === "blocked" && lifecycle.blockedReason === `publication approval ${request.status}`;
   }
 
@@ -1269,20 +1299,15 @@ export class Orchestrator {
       this.options.logger.warn("pending publication approval recovery issue refresh failed", { error: errorMessage(error) });
     }
     const issuesById = new Map(latestIssues.map((issue) => [issue.id, issue]));
-    const service = new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-      writebackProcessor: this.options.writeback,
-      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      pullRequestPublisher:
-        this.options.completionReportPublisher ??
-        createGitHubPullRequestClientForCapability(this.config, "github.publication"),
-      operatorApproval: this.options.operatorApproval,
-    });
 
     for (const lifecycle of candidates) {
-      const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
+      const latestIssue = issuesById.get(lifecycle.issueId);
+      const issueConfig = this.configForProjectContext(lifecycle.projectContext ?? projectContextResolutionFromIssue(latestIssue));
+      const issue = latestIssue ?? issueFromPendingPublicationLifecycle(lifecycle, issueConfig.writeback.dispatchState);
+      const service = this.completionReportServiceForConfig(issueConfig, {
+        includePublisher: true,
+        includeOperatorApproval: true,
+      });
       try {
         const result = await service.recoverPendingPublicationApproval({ issue, lifecycle });
         if (result.recovered) {
@@ -1353,7 +1378,7 @@ export class Orchestrator {
     const runId = entry.activeRunId ?? entry.runId;
     if (!store || !runId) return false;
     const lifecycle = await store.get(entry.issue.id);
-    const handoff = pendingPublicationHandoffForRun(lifecycle, { runId });
+    const handoff = pendingPublicationHandoffForRun(lifecycle, { runId }) ?? pendingPublicationHandoffForRun(lifecycle);
     if (!handoff) return false;
     entry.lifecycle = lifecycle;
     return true;
@@ -4306,13 +4331,14 @@ function isInfraFailureDiagnosticCode(code: string | null | undefined): boolean 
   return typeof code === "string" && INFRA_FAILURE_DIAGNOSTIC_CODES.has(code);
 }
 
-function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {
+function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue & { projectContext?: ProjectContextResolution } {
   const title = request.action.title.startsWith(`${request.issueIdentifier}: `)
     ? request.action.title.slice(request.issueIdentifier.length + 2)
     : request.action.title;
   return {
     id: request.issueId,
     identifier: request.issueIdentifier,
+    ...(request.projectContext === undefined ? {} : { projectContext: request.projectContext }),
     title,
     description: null,
     priority: null,
@@ -4333,7 +4359,10 @@ function hasRecoverablePendingPublicationApproval(lifecycle: IssueLifecycleRecor
   return pendingPublicationHandoffForRun(lifecycle) !== null;
 }
 
-function issueFromPendingPublicationLifecycle(lifecycle: IssueLifecycleRecord, state: string): Issue {
+function issueFromPendingPublicationLifecycle(
+  lifecycle: IssueLifecycleRecord,
+  state: string,
+): Issue & { projectContext?: ProjectContextResolution } {
   const report =
     (lifecycle.lastCompletionReportId === null
       ? undefined
@@ -4342,6 +4371,7 @@ function issueFromPendingPublicationLifecycle(lifecycle: IssueLifecycleRecord, s
   return {
     id: lifecycle.issueId,
     identifier: lifecycle.issueIdentifier,
+    ...(lifecycle.projectContext === undefined ? {} : { projectContext: lifecycle.projectContext }),
     title: lifecycle.issueIdentifier,
     description: null,
     priority: null,
