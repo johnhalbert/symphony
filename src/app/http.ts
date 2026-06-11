@@ -5,6 +5,7 @@ import { constants as fsConstants, promises as fs, type Stats } from "node:fs";
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
+import { projectContextResolutionFromIssue } from "../core/config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
   projectActivityModels,
@@ -952,7 +953,7 @@ export class StatusServer {
         if (request.method === "GET") {
           const approval = await this.options.operatorApproval?.get(requestId);
           if (!approval) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
-          sendJson(response, 200, approvalResponse(approval, this.options.operatorApproval?.isRequired(approval.projectContextId) ?? false));
+          sendJson(response, 200, approvalResponse(approval, this.approvalRequiredForProjectContext(approval.projectContextId)));
           return;
         }
         if (request.method === "POST") {
@@ -1003,17 +1004,24 @@ export class StatusServer {
             }
           }
           if (decision === "reject" && !result.replayed) {
-            try {
-              await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
-            } catch {
-              // The approval decision is already durable; worker exit recovery will retry terminal writeback.
+            const liveWaitingRun = await this.options.runStore?.getRun(result.request.runId);
+            const workerStillWaitingForApproval =
+              this.options.orchestrator.snapshot().counts.running > 0 &&
+              liveWaitingRun?.status === "running" &&
+              (await hasPendingPublicationLifecycle(result.request, this.options.lifecycleStore));
+            if (!workerStillWaitingForApproval) {
+              try {
+                await this.options.orchestrator.recordPublicationApprovalTerminal(result.request);
+              } catch {
+                // The approval decision is already durable; worker exit recovery will retry terminal writeback.
+              }
             }
-            if (this.options.operatorApproval?.rejectPolicyForProjectContext?.(result.request.projectContextId) === "cancel") {
+            if (this.rejectPolicyForApprovalRequest(result.request) === "cancel") {
               await this.options.orchestrator.cancelIssue(result.request.issueId);
             }
           }
           sendJson(response, 200, {
-            request: approvalResponse(result.request, this.options.operatorApproval?.isRequired(result.request.projectContextId) ?? false),
+            request: approvalResponse(result.request, this.approvalRequiredForProjectContext(result.request.projectContextId)),
             replayed: result.replayed,
           });
           return;
@@ -1172,7 +1180,8 @@ export class StatusServer {
         const keys = issueKeys(issueId, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
-        const pendingApprovalCandidate = await this.options.operatorApproval?.findPendingForIssue(keys);
+        const issueProjectContext = lifecycle?.projectContext ?? workspace?.projectContext ?? projectContextResolutionFromIssue(live) ?? latestRun?.projectContext;
+        const pendingApprovalCandidate = await this.options.operatorApproval?.findPendingForIssue(keys, issueProjectContext);
         const pendingApproval = pendingApprovalCandidate
           ? await currentPendingPublicationApproval({
               approval: pendingApprovalCandidate,
@@ -1237,12 +1246,12 @@ export class StatusServer {
             mutationHeader: "X-Symphony-Token",
             pendingApproval: approvalCapability(
               pendingApproval ?? null,
-              this.options.operatorApproval?.isRequired(pendingApproval?.projectContextId) ?? false,
+              this.approvalRequiredForProjectContext(pendingApproval?.projectContextId),
               this.options.openWorkspaceToken,
             ),
           },
           pendingApproval: pendingApproval
-            ? approvalResponse(pendingApproval, this.options.operatorApproval?.isRequired(pendingApproval.projectContextId) ?? false)
+            ? approvalResponse(pendingApproval, this.approvalRequiredForProjectContext(pendingApproval.projectContextId))
             : null,
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
@@ -1351,9 +1360,26 @@ export class StatusServer {
       const approval =
         approvalRecordFromDetails(error.details) ?? (await this.options.operatorApproval?.get(requestId)) ?? null;
       if (!approval || !isPublicationApprovalTerminal(approval)) return;
+      if (approval.status === "rejected") return;
       await this.options.orchestrator.recordPublicationApprovalTerminal(approval);
     } catch {
       // Recovery must not mask the approval API's original conflict response.
+    }
+  }
+
+  private rejectPolicyForApprovalRequest(request: OperatorApprovalRecord): "cancel" | "fail" {
+    try {
+      return this.options.operatorApproval?.rejectPolicyForProjectContext?.(request.projectContextId) ?? "cancel";
+    } catch {
+      return this.options.operatorApproval?.rejectPolicy ?? "cancel";
+    }
+  }
+
+  private approvalRequiredForProjectContext(projectContextId: string | null | undefined): boolean {
+    try {
+      return this.options.operatorApproval?.isRequired(projectContextId) ?? false;
+    } catch {
+      return this.options.operatorApproval?.isRequired() ?? false;
     }
   }
 
@@ -1361,7 +1387,7 @@ export class StatusServer {
     if (!this.options.runStore) return;
     const existing = await this.options.runStore.getRun(request.runId);
     const completedAt = existing?.completedAt ?? request.resolvedAt ?? new Date().toISOString();
-    const cancelPolicy = this.options.operatorApproval?.rejectPolicyForProjectContext?.(request.projectContextId) === "cancel";
+    const cancelPolicy = this.rejectPolicyForApprovalRequest(request) === "cancel";
     await this.options.runStore.updateRun(request.runId, {
       status: cancelPolicy ? "cancelled" : "failed",
       completedAt,
@@ -4587,6 +4613,7 @@ function approvalCapability(
     requestId: record?.requestId ?? null,
     status: record?.status ?? null,
     action: record?.action ?? null,
+    projectContext: record?.projectContext ?? null,
     requestedAt: record?.requestedAt ?? null,
     resolve: record === null ? null : approvalResolve(record),
     requiresToken: approvalMutationsRequireToken(enabled, openWorkspaceToken),

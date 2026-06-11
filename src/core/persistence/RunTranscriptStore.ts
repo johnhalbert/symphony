@@ -4,7 +4,12 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
 import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
-import { DEFAULT_PROJECT_CONTEXT_ID, DEFAULT_PROJECT_CONTEXT_LABEL } from "../config/ProjectContexts.js";
+import {
+  DEFAULT_PROJECT_CONTEXT_ID,
+  DEFAULT_PROJECT_CONTEXT_LABEL,
+  normalizeProjectContextResolution,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 import { isRunActivityCommandPolicyDecisionPayload } from "../runActivity/RunActivityEvent.js";
 import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
@@ -98,11 +103,13 @@ export interface WorkspaceRecord {
   gitBranchName?: string;
   projectContextId?: string;
   projectContextLabel?: string | null;
+  projectContext?: ProjectContextResolution | null;
   createdAt: string;
   updatedAt: string;
 }
 
 export interface RunMetadata {
+  projectContext?: ProjectContextResolution | null;
   prUrl?: string | null;
   prNumber?: number | null;
   prHeadSha?: string | null;
@@ -142,6 +149,7 @@ export interface RunMetadata {
 }
 
 export interface RunRecord {
+  projectContext?: ProjectContextResolution | null;
   runId: string;
   sessionId: string | null;
   agentId: string | null;
@@ -273,6 +281,7 @@ function transcriptPage(input: {
 }
 
 export interface StartRunInput {
+  projectContext?: ProjectContextResolution | null;
   runId: string;
   sessionId?: string | null;
   agentId?: string | null;
@@ -307,6 +316,9 @@ export interface StartRunInput {
 }
 
 export interface UpdateRunInput {
+  projectContext?: ProjectContextResolution | null;
+  projectContextId?: string;
+  projectContextLabel?: string | null;
   sessionId?: string | null;
   agentId?: string | null;
   status?: RunStatus;
@@ -426,12 +438,15 @@ export class FileRunTranscriptStore {
       ...(input.gitBranchName === undefined ? {} : { gitBranchName: input.gitBranchName }),
       ...(input.repoPath === undefined ? {} : { repoPath: input.repoPath }),
       ...(input.baseRef === undefined ? {} : { baseRef: input.baseRef }),
-      projectContextId: input.projectContextId ?? existing?.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID,
-      ...(input.projectContextLabel !== undefined
-        ? { projectContextLabel: input.projectContextLabel }
-        : existing?.projectContextLabel !== undefined
-          ? { projectContextLabel: existing.projectContextLabel }
-          : { projectContextLabel: defaultProjectContextLabel(input.projectContextId ?? existing?.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID) }),
+      ...(input.projectContext === undefined ? {} : { projectContext: input.projectContext }),
+      projectContextId: input.projectContext?.projectContextId ?? input.projectContextId ?? existing?.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID,
+      ...(input.projectContext?.projectContextLabel !== undefined
+        ? { projectContextLabel: input.projectContext.projectContextLabel }
+        : input.projectContextLabel !== undefined
+          ? { projectContextLabel: input.projectContextLabel }
+          : existing?.projectContextLabel !== undefined
+            ? { projectContextLabel: existing.projectContextLabel }
+            : { projectContextLabel: defaultProjectContextLabel(input.projectContext?.projectContextId ?? input.projectContextId ?? existing?.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID) }),
       status: existing?.status ?? "running",
       startedAt: existing?.startedAt ?? now,
       updatedAt: now,
@@ -449,6 +464,16 @@ export class FileRunTranscriptStore {
     return this.withRunUpdateLock(runId, async () => {
       const existing = await this.getRun(runId);
       if (!existing) return null;
+      const updatedProjectContextId = input.projectContext?.projectContextId ?? input.projectContextId ?? existing.projectContextId;
+      const updatedProjectContextLabel =
+        input.projectContext?.projectContextLabel ??
+        input.projectContextLabel ??
+        existing.projectContextLabel ??
+        defaultProjectContextLabel(updatedProjectContextId ?? DEFAULT_PROJECT_CONTEXT_ID);
+      const updatedProjectContext =
+        input.projectContext === undefined && input.projectContextId === undefined && input.projectContextLabel === undefined
+          ? existing.projectContext
+          : normalizeStoredProjectContext(input.projectContext, updatedProjectContextId, updatedProjectContextLabel);
       const updated: RunRecord = {
         ...existing,
         ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
@@ -457,6 +482,9 @@ export class FileRunTranscriptStore {
         ...(input.completedAt === undefined ? {} : { completedAt: input.completedAt }),
         ...(input.error === undefined ? {} : { error: input.error }),
         ...(input.tokens === undefined ? {} : { tokens: input.tokens }),
+        ...(updatedProjectContextId === undefined ? {} : { projectContextId: updatedProjectContextId }),
+        ...(updatedProjectContextLabel === undefined ? {} : { projectContextLabel: updatedProjectContextLabel }),
+        ...(updatedProjectContext === undefined ? {} : { projectContext: updatedProjectContext }),
         ...metadataPatch(input.metadata),
         updatedAt: new Date().toISOString(),
       };
@@ -707,8 +735,10 @@ function promptPreview(prompt: string): string {
 
 function normalizeRunRecord(record: RunRecord): RunRecord {
   const runPhase = record.runPhase ?? defaultRunPhase(record.role);
-  const projectContextId = record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
-  const projectContextLabel = record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  const projectContextId = record.projectContext?.projectContextId ?? record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+  const projectContextLabel =
+    record.projectContext?.projectContextLabel ?? record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  const projectContext = normalizeStoredProjectContext(record.projectContext, projectContextId, projectContextLabel);
   const harnessId =
     record.harnessId ??
     (record.cursorModel !== undefined ||
@@ -724,6 +754,7 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
     runKind: record.runKind ?? runKindForPhase(runPhase),
     projectContextId,
     ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+    ...(projectContext === null ? {} : { projectContext }),
     ...(harnessId === undefined ? {} : { harnessId }),
     ...(record.runtimeModel !== undefined
       ? {}
@@ -752,17 +783,42 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
 }
 
 function normalizeWorkspaceRecord(record: WorkspaceRecord): WorkspaceRecord {
-  const projectContextId = record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
-  const projectContextLabel = record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  const projectContextId = record.projectContext?.projectContextId ?? record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+  const projectContextLabel =
+    record.projectContext?.projectContextLabel ?? record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  const projectContext = normalizeStoredProjectContext(record.projectContext, projectContextId, projectContextLabel);
   return {
     ...record,
     projectContextId,
     ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+    ...(projectContext === null ? {} : { projectContext }),
   };
 }
 
 function defaultProjectContextLabel(projectContextId: string): string | null {
   return projectContextId === DEFAULT_PROJECT_CONTEXT_ID ? DEFAULT_PROJECT_CONTEXT_LABEL : null;
+}
+
+function normalizeStoredProjectContext(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  projectContextId: string | undefined,
+  projectContextLabel: string | null | undefined,
+): ProjectContextResolution | null {
+  const resolvedId = projectContext?.projectContextId ?? projectContextId;
+  if (!resolvedId) return null;
+  const base = {
+    ...(projectContext ?? {}),
+    projectContextId: resolvedId,
+    ...(projectContext?.projectContextLabel !== undefined
+      ? { projectContextLabel: projectContext.projectContextLabel }
+      : projectContextLabel === undefined || projectContextLabel === null
+        ? {}
+        : { projectContextLabel }),
+  };
+  const normalized = normalizeProjectContextResolution(base);
+  return projectContextLabel === null && projectContext?.projectContextLabel === undefined
+    ? ({ ...normalized, projectContextLabel: null } as unknown as ProjectContextResolution)
+    : normalized;
 }
 
 function defaultRunPhase(role: PersistedRunRole): AgentRunPhase {
@@ -783,6 +839,7 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.gitBranchName === undefined ? {} : { gitBranchName: metadata.gitBranchName }),
     ...(metadata.repoPath === undefined ? {} : { repoPath: metadata.repoPath }),
     ...(metadata.baseRef === undefined ? {} : { baseRef: metadata.baseRef }),
+    ...(metadata.projectContext === undefined ? {} : { projectContext: metadata.projectContext }),
     ...(metadata.projectContextId === undefined ? {} : { projectContextId: metadata.projectContextId }),
     ...(metadata.projectContextLabel === undefined ? {} : { projectContextLabel: metadata.projectContextLabel }),
     ...(metadata.cancellationRequestedAt === undefined ? {} : { cancellationRequestedAt: metadata.cancellationRequestedAt }),
@@ -1258,7 +1315,7 @@ function reduceCompletedEvent(
   payload: UnknownRecord | null,
   options: RunActivityReductionOptions,
 ): RunRecord {
-  if (record.runPhase === "issue_breakdown") {
+  if (record.runPhase === "issue_breakdown" && record.role !== "planner") {
     return reducePlanningRunFailedEvent(record, event, payload, options, PLANNING_NO_PLAN_ERROR, true);
   }
   return reduceTerminalEvent(record, event, "succeeded", null, options);

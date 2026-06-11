@@ -1,4 +1,4 @@
-import { DEFAULT_PROJECT_CONTEXT_ID } from "../config/ProjectContexts.js";
+import { DEFAULT_PROJECT_CONTEXT_ID, normalizeProjectContextResolution, type ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { IssueLifecycleRecord } from "../persistence/IssueLifecycleStore.js";
 import type { Issue } from "../types.js";
 import type { NewWritebackOperation } from "./WritebackOutbox.js";
@@ -6,6 +6,7 @@ import type { NewWritebackOperation } from "./WritebackOutbox.js";
 export interface WritebackProjectContext {
   projectContextId?: string;
   projectContextLabel?: string | null;
+  projectContext?: ProjectContextResolution | null;
 }
 
 export function writebackProjectContextFromIssue(
@@ -28,6 +29,7 @@ export function mergeWritebackProjectContexts(
 ): WritebackProjectContext {
   let projectContextId: string | undefined;
   let projectContextLabel: string | null | undefined;
+  let projectContext: ProjectContextResolution | null | undefined;
   for (const context of contexts) {
     if (projectContextId === undefined && context?.projectContextId !== undefined) {
       projectContextId = context.projectContextId;
@@ -35,8 +37,11 @@ export function mergeWritebackProjectContexts(
     if (projectContextLabel === undefined && context?.projectContextLabel !== undefined) {
       projectContextLabel = context.projectContextLabel;
     }
+    if (projectContext === undefined && context?.projectContext !== undefined) {
+      projectContext = context.projectContext;
+    }
   }
-  return compactProjectContext(projectContextId, projectContextLabel);
+  return compactProjectContext(projectContextId, projectContextLabel, projectContext);
 }
 
 export function stampWritebackProjectContext<T extends NewWritebackOperation>(
@@ -49,6 +54,7 @@ export function stampWritebackProjectContext<T extends NewWritebackOperation>(
     idempotencyKey: scopeWritebackIdempotencyKey(operation.idempotencyKey, context.projectContextId),
     projectContextId: context.projectContextId,
     ...(context.projectContextLabel === undefined ? {} : { projectContextLabel: context.projectContextLabel }),
+    ...(context.projectContext === undefined ? {} : { projectContext: context.projectContext }),
   } as T;
 }
 
@@ -68,10 +74,20 @@ function scopeWritebackIdempotencyKey(idempotencyKey: string, projectContextId: 
 function compactProjectContext(
   projectContextId: string | undefined,
   projectContextLabel: string | null | undefined,
+  projectContext?: ProjectContextResolution | null,
 ): WritebackProjectContext {
-  if (projectContextId === undefined) return {};
+  if (projectContextId === undefined && projectContext === undefined) return {};
+  const normalized =
+    projectContext ??
+    (projectContextId === undefined
+      ? null
+      : normalizeProjectContextResolution({
+          projectContextId,
+          ...(projectContextLabel === undefined || projectContextLabel === null ? {} : { projectContextLabel }),
+        }));
   return {
-    projectContextId,
+    ...(projectContextId === undefined ? {} : { projectContextId }),
     ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+    ...(normalized === null ? {} : { projectContext: normalized }),
   };
 }

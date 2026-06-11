@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { serviceConfigForProjectContext, type ServiceConfig } from "./config/Config.js";
+import { normalizeProjectContextResolution } from "./config/ProjectContexts.js";
 import { SymphonyError } from "./errors.js";
 import type {
   CompletionReportPullRequestRef,
@@ -53,6 +54,7 @@ export interface ReviewVerdictActiveContext {
   issue: Issue;
   activeRunId: string;
   role: ReviewVerdictSubmitterRole;
+  projectContext?: import("./config/ProjectContexts.js").ProjectContextResolution | null | undefined;
   token?: string | null;
   expectedToken?: string | null;
   reviewer?: string | null;
@@ -99,6 +101,18 @@ export class ReviewVerdictService {
     }
 
     const issueConfig = this.configForIssue(context.issue);
+    const derivedProjectContext =
+      context.projectContext ??
+      (context.issue.projectContextId
+        ? normalizeProjectContextResolution({
+            projectContextId: context.issue.projectContextId,
+            ...(context.issue.projectContextLabel === undefined || context.issue.projectContextLabel === null
+              ? {}
+              : { projectContextLabel: context.issue.projectContextLabel }),
+            linearProjectSlug: issueConfig.tracker.projectSlug ?? null,
+            routingSource: "candidate_poll",
+          })
+        : undefined);
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, issueConfig);
     this.validateIssueIsAcceptingVerdicts(context, lifecyclePhase, issueConfig);
     this.validateVerdictPayload(verdict);
@@ -125,6 +139,7 @@ export class ReviewVerdictService {
       findings: verdict.findings,
       evidence: verdict.evidence,
       reviewer: context.reviewer ?? null,
+      ...(derivedProjectContext === undefined ? {} : { projectContext: derivedProjectContext }),
       submittedAt: new Date().toISOString(),
       writebackOperationKeys: [],
     };
@@ -133,6 +148,13 @@ export class ReviewVerdictService {
         ? planBlockedEscalationWritebacks(
             {
               issue: context.issue,
+              ...(derivedProjectContext === undefined
+                ? {}
+                : {
+                    projectContext: derivedProjectContext,
+                    projectContextId: derivedProjectContext.projectContextId,
+                    projectContextLabel: derivedProjectContext.projectContextLabel,
+                  }),
               runId: verdict.runId,
               reason: `max review rounds reached (${reviewRound}/${issueConfig.reviewLoop.maxReviewRounds})`,
               incompleteTurnCount: lifecycle.incompleteTurnCount,
@@ -147,8 +169,8 @@ export class ReviewVerdictService {
             issueConfig,
           )
         : verdict.verdict === "fail"
-        ? planReviewFailWritebacks(reviewWritebackContext(context, verdict.runId), issueConfig, writebackDetails)
-        : planReviewPassWritebacks(reviewWritebackContext(context, verdict.runId), issueConfig, writebackDetails);
+        ? planReviewFailWritebacks(reviewWritebackContext({ ...context, ...(derivedProjectContext === undefined ? {} : { projectContext: derivedProjectContext }) }, verdict.runId), issueConfig, writebackDetails)
+        : planReviewPassWritebacks(reviewWritebackContext({ ...context, ...(derivedProjectContext === undefined ? {} : { projectContext: derivedProjectContext }) }, verdict.runId), issueConfig, writebackDetails);
     if (operations.length === 0) {
       throw new SymphonyError("invalid_request", "Review verdict cannot be accepted for the current issue state");
     }
@@ -170,6 +192,9 @@ export class ReviewVerdictService {
         ? `max review rounds reached (${reviewRound}/${issueConfig.reviewLoop.maxReviewRounds})`
         : null,
       lastReviewVerdictId: storedVerdict.id,
+      ...(derivedProjectContext === undefined ? {} : { projectContext: derivedProjectContext }),
+      ...(derivedProjectContext?.projectContextId === undefined ? {} : { projectContextId: derivedProjectContext.projectContextId }),
+      ...(derivedProjectContext?.projectContextLabel === undefined ? {} : { projectContextLabel: derivedProjectContext.projectContextLabel }),
       reviewVerdicts: [...lifecycle.reviewVerdicts, storedVerdict],
     });
     await appendLaneMemoTelemetry(this.options.runStore, context.activeRunId, updatedLifecycle, "review_verdict");
@@ -346,6 +371,13 @@ function normalizeAcceptanceResults(items: ReviewVerdictInput["acceptanceResults
 function reviewWritebackContext(context: ReviewVerdictActiveContext, runId: string) {
   return {
     issue: context.issue,
+    ...(context.projectContext == null
+      ? {}
+      : {
+          projectContext: context.projectContext,
+          projectContextId: context.projectContext.projectContextId,
+          projectContextLabel: context.projectContext.projectContextLabel,
+        }),
     runId,
     reviewer: context.reviewer ?? null,
   };

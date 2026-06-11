@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { serviceConfigForProjectContext, type ServiceConfig } from "./config/Config.js";
+import { normalizeProjectContextResolution } from "./config/ProjectContexts.js";
 import { createGitHubPullRequestClientForCapability } from "../integrations/github/GitHubCredentialResolver.js";
 import { SymphonyError } from "./errors.js";
 import type {
@@ -82,6 +83,7 @@ export interface CompletionReportActiveContext {
   issue: Issue;
   activeRunId: string;
   role: CompletionReportSubmitterRole;
+  projectContext?: import("./config/ProjectContexts.js").ProjectContextResolution | null | undefined;
   token?: string | null;
   expectedToken?: string | null;
   sessionId?: string | null;
@@ -181,7 +183,25 @@ export class CompletionReportService {
   constructor(private readonly options: CompletionReportServiceOptions) {}
 
   private configForIssue(issue: Issue): ServiceConfig {
-    return serviceConfigForProjectContext(this.options.config, issue.projectContextId);
+    const contextId = issue.projectContextId;
+    if (
+      contextId &&
+      !this.options.config.projectContexts.byId.has(contextId) &&
+      (((issue as { linearProjectIdentity?: unknown }).linearProjectIdentity !== undefined) ||
+        ((issue as { linearProjectSlug?: unknown }).linearProjectSlug !== undefined) ||
+        ((issue as { routingSource?: unknown }).routingSource !== undefined))
+    ) {
+      return this.options.config;
+    }
+    return serviceConfigForProjectContext(this.options.config, contextId);
+  }
+
+  private configForContext(issue: Issue, projectContext?: import("./config/ProjectContexts.js").ProjectContextResolution | null): ServiceConfig {
+    const contextId = projectContext?.projectContextId ?? issue.projectContextId;
+    if (contextId && !this.options.config.projectContexts.byId.has(contextId) && projectContext) {
+      return this.options.config;
+    }
+    return serviceConfigForProjectContext(this.options.config, contextId);
   }
 
   private pullRequestPublisherForIssue(issue: Issue): CompletionReportPullRequestPublisher | undefined {
@@ -209,7 +229,7 @@ export class CompletionReportService {
     if (existing && isLifecycleFinalizedCompletionReport(existingLifecycle, existing)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
     }
-    const issueConfig = this.configForIssue(context.issue);
+    const issueConfig = this.configForContext(context.issue, context.projectContext);
     const pendingPublicationHandoff =
       existing !== undefined && this.shouldPersistBeforePublicationApproval(issueConfig)
         ? pendingPublicationHandoffForRun(existingLifecycle, {
@@ -582,6 +602,7 @@ export class CompletionReportService {
       pullRequest,
       writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
       acceptedAt: input.existing?.acceptedAt ?? null,
+      ...(input.context.projectContext === undefined ? {} : { projectContext: input.context.projectContext }),
     });
     const enqueued: WritebackOperation[] = [];
     for (const operation of operations) {
@@ -593,6 +614,9 @@ export class CompletionReportService {
       phase: "review",
       blockedReason: null,
       incompleteTurnCount: 0,
+      ...(input.context.projectContext === undefined ? {} : { projectContext: input.context.projectContext }),
+      ...(input.context.projectContext?.projectContextId === undefined ? {} : { projectContextId: input.context.projectContext.projectContextId }),
+      ...(input.context.projectContext?.projectContextLabel === undefined ? {} : { projectContextLabel: input.context.projectContext.projectContextLabel }),
       lastCompletionReportId: storedReport.id,
       completionReports: upsertCompletionReport(lifecycle.completionReports, storedReport),
       summaryPointers: summaryPointersFor(input.context, pullRequest, input.publication, lifecycle),
@@ -657,7 +681,7 @@ export class CompletionReportService {
     const issueConfig = this.configForIssue(context.issue);
     if (!issueConfig.github.publishPullRequests) return null;
     if (this.shouldPersistBeforePublicationApproval(issueConfig)) return null;
-    const publisher = this.pullRequestPublisherForIssue(context.issue);
+    const publisher = this.options.pullRequestPublisher ?? (issueConfig.github.publishPullRequests ? createGitHubPullRequestClientForCapability(this.options.config, "github.publication", undefined, context.projectContext?.projectContextId ?? context.issue.projectContextId) : undefined);
     if (!publisher) {
       throw new SymphonyError("invalid_request", "PR publication is enabled but no GitHub publisher is configured");
     }
@@ -1068,6 +1092,7 @@ function buildCompletionReportRecord(input: {
   pullRequest: CompletionReportPullRequestRef | null;
   acceptedAt: string | null;
   writebackOperationKeys: string[];
+  projectContext?: import("./config/ProjectContexts.js").ProjectContextResolution | null;
 }): IssueCompletionReportRecord {
   return {
     id: reportIdFor(input.issue.id, input.report.idempotencyKey),
@@ -1075,6 +1100,18 @@ function buildCompletionReportRecord(input: {
     runId: input.report.runId,
     issueId: input.issue.id,
     issueIdentifier: input.issue.identifier,
+    ...(input.projectContext
+      ? { projectContext: input.projectContext }
+      : input.issue.projectContextId === undefined && input.issue.projectContextLabel === undefined
+        ? {}
+        : {
+            projectContext: normalizeProjectContextResolution({
+              projectContextId: input.issue.projectContextId ?? "default",
+              ...(input.issue.projectContextLabel === undefined || input.issue.projectContextLabel === null
+                ? {}
+                : { projectContextLabel: input.issue.projectContextLabel }),
+            }),
+          }),
     summary: input.report.summary,
     validationEvidence: input.report.validationEvidence,
     acceptanceChecklist: normalizeChecklist(input.report.acceptanceChecklist),
@@ -1189,6 +1226,13 @@ function recoveryContextFor(input: {
       branchName,
       ...projectContext,
     },
+    ...(projectContext.projectContext == null
+      ? {}
+      : {
+          projectContext: projectContext.projectContext,
+          projectContextId: projectContext.projectContext.projectContextId,
+          projectContextLabel: projectContext.projectContext.projectContextLabel,
+        }),
     activeRunId: input.pendingReport.runId,
     role: "worker",
     workspacePath,
@@ -1212,6 +1256,13 @@ function publicationApprovalRecoveryContext(input: {
       ...input.issue,
       ...projectContext,
     },
+    ...(projectContext.projectContext == null
+      ? {}
+      : {
+          projectContext: projectContext.projectContext,
+          projectContextId: projectContext.projectContext.projectContextId,
+          projectContextLabel: projectContext.projectContext.projectContextLabel,
+        }),
     activeRunId: input.approval.runId,
     role: "worker",
     sessionId: null,
@@ -1224,6 +1275,13 @@ function publicationApprovalRecoveryContext(input: {
 function runWritebackContext(context: CompletionReportActiveContext, runId: string) {
   return {
     issue: context.issue,
+    ...(context.projectContext === undefined || context.projectContext === null
+      ? {}
+      : {
+          projectContext: context.projectContext,
+          projectContextId: context.projectContext.projectContextId,
+          projectContextLabel: context.projectContext.projectContextLabel,
+        }),
     runId,
     sessionId: context.sessionId ?? null,
     workspacePath: context.workspacePath ?? context.workspace?.path ?? null,

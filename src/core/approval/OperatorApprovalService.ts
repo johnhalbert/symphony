@@ -2,9 +2,15 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { serviceConfigForProjectContext, type ServiceConfig } from "../config/Config.js";
-import { DEFAULT_PROJECT_CONTEXT_ID, DEFAULT_PROJECT_CONTEXT_LABEL } from "../config/ProjectContexts.js";
+import {
+  DEFAULT_PROJECT_CONTEXT_ID,
+  DEFAULT_PROJECT_CONTEXT_LABEL,
+  normalizeProjectContextResolution,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { SymphonyError } from "../errors.js";
-import type { RunTranscriptStore, TranscriptEvent } from "../persistence/RunTranscriptStore.js";
+import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
+import { FileRunTranscriptStore, type RunTranscriptStore, type TranscriptEvent } from "../persistence/RunTranscriptStore.js";
 
 export type OperatorApprovalDecision = "approve" | "reject";
 export type OperatorApprovalRejectPolicy = "cancel" | "fail";
@@ -39,6 +45,7 @@ export interface OperatorApprovalRecord {
   staleReason: string | null;
   projectContextId?: string;
   projectContextLabel?: string | null;
+  projectContext?: ProjectContextResolution | null;
 }
 
 export interface OperatorApprovalResolution {
@@ -54,6 +61,7 @@ export interface OperatorApprovalRequestInput {
   action: OperatorApprovalAction;
   projectContextId?: string;
   projectContextLabel?: string | null;
+  projectContext?: ProjectContextResolution | null;
 }
 
 export const OPERATOR_REJECTED_PUBLICATION_ERROR = "Operator rejected push/PR publication";
@@ -68,7 +76,16 @@ export class FileOperatorApprovalStore {
 
     const requestedAt = new Date().toISOString();
     const requestId = requestIdFor(dedupeKey(input.runId, input.evidenceCursor));
-    const projectContextId = input.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+    const activeRun = await new FileRunTranscriptStore(this.stateDir).getRun(input.runId).catch(() => null);
+    const lifecycle =
+      (await new FileIssueLifecycleStore(this.stateDir).get(input.issueId).catch(() => null)) ??
+      (input.issueIdentifier ? await new FileIssueLifecycleStore(this.stateDir).get(input.issueIdentifier).catch(() => null) : null);
+    const resolvedProjectContext =
+      input.projectContext ?? lifecycle?.projectContext ?? lifecycle?.summaryPointers.projectContext ?? activeRun?.projectContext ?? undefined;
+    const projectContextId = resolvedProjectContext?.projectContextId ?? input.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+    const projectContextLabel =
+      resolvedProjectContext?.projectContextLabel ?? input.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+    const projectContext = normalizeStoredProjectContext(resolvedProjectContext, projectContextId, projectContextLabel);
     const record: OperatorApprovalRecord = {
       requestId,
       status: "pending",
@@ -85,9 +102,8 @@ export class FileOperatorApprovalStore {
       decision: null,
       staleReason: null,
       projectContextId,
-      ...(input.projectContextLabel === undefined
-        ? { projectContextLabel: defaultProjectContextLabel(projectContextId) }
-        : { projectContextLabel: input.projectContextLabel }),
+      ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+      ...(projectContext === null ? {} : { projectContext }),
     };
     await this.write(record);
     return { record, created: true };
@@ -95,7 +111,7 @@ export class FileOperatorApprovalStore {
 
   async get(requestId: string): Promise<OperatorApprovalRecord | null> {
     const record = await readJsonIfExists<OperatorApprovalRecord>(this.recordPath(requestId));
-    return record ? normalizeOperatorApprovalRecord(record) : null;
+    return record ? this.repairProjectContext(record) : null;
   }
 
   async getByDedupe(runId: string, evidenceCursor: string): Promise<OperatorApprovalRecord | null> {
@@ -107,14 +123,14 @@ export class FileOperatorApprovalStore {
     return latestPending(records.filter((record) => record.runId === runId));
   }
 
-  async findPendingForIssue(keys: string[]): Promise<OperatorApprovalRecord | null> {
+  async findPendingForIssue(keys: string[], projectContext?: ProjectContextResolution | null): Promise<OperatorApprovalRecord | null> {
     const normalized = new Set(keys.map((key) => key.toLowerCase()));
     const records = await this.list();
-    return latestPending(
-      records.filter(
-        (record) => normalized.has(record.issueId.toLowerCase()) || normalized.has(record.issueIdentifier.toLowerCase()),
-      ),
+    const filtered = records.filter(
+      (record) => normalized.has(record.issueId.toLowerCase()) || normalized.has(record.issueIdentifier.toLowerCase()),
     );
+    if (!projectContext) return latestPending(filtered);
+    return latestPending(filtered.filter((record) => (record.projectContext?.projectContextId ?? record.projectContextId) === projectContext.projectContextId));
   }
 
   async list(): Promise<OperatorApprovalRecord[]> {
@@ -124,7 +140,11 @@ export class FileOperatorApprovalStore {
       const records = await Promise.all(
         entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<OperatorApprovalRecord>(path.join(this.recordsDir(), entry))),
       );
-      return records.filter((record): record is OperatorApprovalRecord => record !== null).map((record) => normalizeOperatorApprovalRecord(record));
+      return Promise.all(
+        records
+          .filter((record): record is OperatorApprovalRecord => record !== null)
+          .map((record) => this.repairProjectContext(record)),
+      );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
@@ -200,6 +220,32 @@ export class FileOperatorApprovalStore {
     return path.join(this.stateDir, "approval-requests");
   }
 
+  private async repairProjectContext(record: OperatorApprovalRecord): Promise<OperatorApprovalRecord> {
+    const normalized = normalizeOperatorApprovalRecord(record);
+    if (normalized.projectContext?.linearProjectSlug !== null && normalized.projectContext?.linearProjectSlug !== undefined) {
+      return normalized;
+    }
+    if (record.projectContextId === undefined && record.projectContextLabel === undefined && record.projectContext !== undefined) {
+      return normalized;
+    }
+    const run = await new FileRunTranscriptStore(this.stateDir).getRun(normalized.runId).catch(() => null);
+    const lifecycle =
+      (await new FileIssueLifecycleStore(this.stateDir).get(normalized.issueId).catch(() => null)) ??
+      (normalized.issueIdentifier ? await new FileIssueLifecycleStore(this.stateDir).get(normalized.issueIdentifier).catch(() => null) : null);
+    const runProjectContext = lifecycle?.projectContext ?? lifecycle?.summaryPointers.projectContext ?? run?.projectContext;
+    if (!runProjectContext) return normalized;
+    const repaired = normalizeOperatorApprovalRecord({
+      ...normalized,
+      projectContextId: runProjectContext.projectContextId,
+      projectContextLabel: runProjectContext.projectContextLabel,
+      projectContext: runProjectContext,
+    });
+    if (JSON.stringify(repaired) !== JSON.stringify(normalized)) {
+      await this.write(repaired);
+    }
+    return repaired;
+  }
+
   private recordPath(requestId: string): string {
     return path.join(this.recordsDir(), `${safeFileName(requestId)}.json`);
   }
@@ -223,31 +269,45 @@ export class OperatorApprovalService {
   }
 
   async requestPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
-    if (!this.isRequired(input.projectContextId)) {
+    const activeRun = await this.getRun(input.runId);
+    const activeProjectContext = input.projectContext ?? activeRun?.projectContext ?? undefined;
+    const resolvedInput: OperatorApprovalRequestInput = {
+      ...input,
+      ...(activeProjectContext === undefined ? {} : { projectContext: activeProjectContext }),
+      ...(input.projectContextId === undefined && activeProjectContext !== undefined
+        ? { projectContextId: activeProjectContext.projectContextId }
+        : {}),
+      ...(input.projectContextLabel === undefined && activeProjectContext !== undefined
+        ? { projectContextLabel: activeProjectContext.projectContextLabel }
+        : {}),
+    };
+    const policyContextId = this.effectivePolicyContextId(resolvedInput.projectContextId ?? resolvedInput.projectContext?.projectContextId);
+    if (!this.isRequired(policyContextId)) {
       return {
         requestId: "",
         status: "approved",
-        issueId: input.issueId,
-        issueIdentifier: input.issueIdentifier,
-        runId: input.runId,
-        evidenceCursor: input.evidenceCursor,
-        dedupeKey: dedupeKey(input.runId, input.evidenceCursor),
-        action: input.action,
+        issueId: resolvedInput.issueId,
+        issueIdentifier: resolvedInput.issueIdentifier,
+        runId: resolvedInput.runId,
+        evidenceCursor: resolvedInput.evidenceCursor,
+        dedupeKey: dedupeKey(resolvedInput.runId, resolvedInput.evidenceCursor),
+        action: resolvedInput.action,
         requestedAt: new Date().toISOString(),
         expiresAt: null,
         resolvedAt: new Date().toISOString(),
         resolvedBy: "system",
         decision: "approve",
         staleReason: null,
-        ...(input.projectContextId === undefined ? {} : { projectContextId: input.projectContextId }),
-        ...(input.projectContextLabel === undefined ? {} : { projectContextLabel: input.projectContextLabel }),
+        ...(resolvedInput.projectContextId === undefined ? {} : { projectContextId: resolvedInput.projectContextId }),
+        ...(resolvedInput.projectContextLabel === undefined ? {} : { projectContextLabel: resolvedInput.projectContextLabel }),
+        ...(resolvedInput.projectContext === undefined ? {} : { projectContext: resolvedInput.projectContext }),
       };
     }
 
-    await this.staleOtherPendingRequests(input.runId, input.evidenceCursor);
+    await this.staleOtherPendingRequests(resolvedInput.runId, resolvedInput.evidenceCursor);
     const { record, created } = await this.options.store.requestOrGetPending(
-      input,
-      operatorApprovalConfig(this.options.config, input.projectContextId).timeoutMs,
+      resolvedInput,
+      operatorApprovalConfig(this.options.config, policyContextId).timeoutMs,
     );
     if (record.status === "pending") {
       await this.recordPendingRun(record);
@@ -289,7 +349,7 @@ export class OperatorApprovalService {
 
     const result = await this.options.store.resolve(requestId, decision);
     if (!result.replayed) {
-      if (decision === "reject" && this.rejectPolicyForProjectContext(result.request.projectContextId) === "fail") {
+      if (decision === "reject" && this.rejectPolicyForProjectContext(this.effectivePolicyContextId(result.request.projectContextId)) === "fail") {
         await this.clearPendingRun(result.request);
         await this.markRunFailedForRejection(result.request);
       } else {
@@ -312,13 +372,19 @@ export class OperatorApprovalService {
     return this.options.store.findPendingForRun(runId);
   }
 
-  async findPendingForIssue(keys: string[]): Promise<OperatorApprovalRecord | null> {
-    return this.options.store.findPendingForIssue(keys);
+  async findPendingForIssue(keys: string[], projectContext?: ProjectContextResolution | null): Promise<OperatorApprovalRecord | null> {
+    return this.options.store.findPendingForIssue(keys, projectContext);
   }
 
   isRequired(projectContextId?: string | null): boolean {
     const config = serviceConfigForProjectContext(this.options.config, projectContextId);
     return config.github.publishPullRequests && operatorApprovalConfig(this.options.config, projectContextId).requiredForPublication;
+  }
+
+  private effectivePolicyContextId(projectContextId?: string | null): string | undefined {
+    if (projectContextId === undefined || projectContextId === null) return undefined;
+    if (projectContextId === DEFAULT_PROJECT_CONTEXT_ID) return projectContextId;
+    return this.options.config.projectContexts.byId.has(projectContextId) ? projectContextId : undefined;
   }
 
   private async waitForResolution(initial: OperatorApprovalRecord): Promise<OperatorApprovalRecord> {
@@ -351,7 +417,7 @@ export class OperatorApprovalService {
         continue;
       }
 
-      await sleep(operatorApprovalConfig(this.options.config, current.projectContextId).pollIntervalMs);
+      await sleep(operatorApprovalConfig(this.options.config, this.effectivePolicyContextId(current.projectContextId)).pollIntervalMs);
       current = (await this.options.store.get(current.requestId)) ?? current;
     }
   }
@@ -447,7 +513,7 @@ export class OperatorApprovalService {
       source: "orchestrator",
       eventType: "approval_resolved",
       message: `Operator approval ${record.status}: ${record.action.branchName} -> ${record.action.baseBranch}`,
-      payload: approvalResolvedPayload(record, operatorApprovalConfig(this.options.config, record.projectContextId).rejectPolicy),
+      payload: approvalResolvedPayload(record, operatorApprovalConfig(this.options.config, this.effectivePolicyContextId(record.projectContextId)).rejectPolicy),
     });
   }
 }
@@ -466,6 +532,7 @@ export function approvalRequestPayload(record: OperatorApprovalRecord): Record<s
     dedupeKey: { runId: record.runId, evidenceCursor: record.evidenceCursor },
     requestedAt: record.requestedAt,
     expiresAt: record.expiresAt,
+    ...(record.projectContext === undefined ? {} : { projectContext: record.projectContext }),
     resolve: approvalResolve(record),
   };
 }
@@ -486,6 +553,7 @@ function approvalResolvedPayload(record: OperatorApprovalRecord, rejectPolicy: O
     resolvedAt: record.resolvedAt,
     resolvedBy: record.resolvedBy,
     staleReason: record.staleReason,
+    ...(record.projectContext === undefined ? {} : { projectContext: record.projectContext }),
     rejectPolicy: record.status === "rejected" ? rejectPolicy : undefined,
   };
 }
@@ -501,15 +569,43 @@ function requestIdFor(value: string): string {
 function normalizeOperatorApprovalRecord(record: OperatorApprovalRecord): OperatorApprovalRecord {
   const projectContextId = record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
   const projectContextLabel = record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  const projectContext = normalizeStoredProjectContext(
+    record.projectContextId === undefined && record.projectContextLabel === undefined ? undefined : record.projectContext,
+    projectContextId,
+    projectContextLabel,
+  );
   return {
     ...record,
     projectContextId,
     ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+    ...(projectContext === null ? {} : { projectContext }),
   };
 }
 
 function defaultProjectContextLabel(projectContextId: string): string | null {
   return projectContextId === DEFAULT_PROJECT_CONTEXT_ID ? DEFAULT_PROJECT_CONTEXT_LABEL : null;
+}
+
+function normalizeStoredProjectContext(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  projectContextId: string | undefined,
+  projectContextLabel: string | null | undefined,
+): ProjectContextResolution | null {
+  const resolvedId = projectContext?.projectContextId ?? projectContextId;
+  if (!resolvedId) return null;
+  const base = {
+    ...(projectContext ?? {}),
+    projectContextId: resolvedId,
+    ...(projectContext?.projectContextLabel !== undefined
+      ? { projectContextLabel: projectContext.projectContextLabel }
+      : projectContextLabel === undefined || projectContextLabel === null
+        ? {}
+        : { projectContextLabel }),
+  };
+  const normalized = normalizeProjectContextResolution(base);
+  return projectContextLabel === null && projectContext?.projectContextLabel === undefined
+    ? ({ ...normalized, projectContextLabel: null } as unknown as ProjectContextResolution)
+    : normalized;
 }
 
 function latestPending(records: OperatorApprovalRecord[]): OperatorApprovalRecord | null {

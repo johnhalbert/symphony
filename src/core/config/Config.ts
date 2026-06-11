@@ -15,6 +15,7 @@ import {
   rawProjectContextsSchema,
   type NormalizedProjectContext,
   type ProjectContextRegistry,
+  type RawProjectContextConfig,
 } from "./ProjectContexts.js";
 
 const stringArray = z.array(z.string());
@@ -318,6 +319,7 @@ const rawConfigSchema = z
   .passthrough();
 
 export type RawWorkflowConfig = z.infer<typeof rawConfigSchema>;
+export type { RawProjectContextConfig } from "./ProjectContexts.js";
 
 export interface TrackerConfig {
   kind: "linear";
@@ -815,8 +817,10 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
   const serverWebAssetsRoot = resolveOptionalPathValue(raw.server?.web_assets_root, workflowDir, env);
   const database = normalizeDatabaseConfig(raw, workflowDir, env);
+  const rawDefaultContextCredentialProfiles =
+    raw.project_contexts?.find((context) => normalizeProjectContextId(context.id) === projectContexts.defaultContextId)?.credential_profiles;
   const credentialProfiles = createCredentialProfileRegistry({
-    raw: raw.credential_profiles,
+    raw: raw.credential_profiles ?? rawDefaultContextCredentialProfiles,
     env,
     workflowDir,
     fallbacks: {

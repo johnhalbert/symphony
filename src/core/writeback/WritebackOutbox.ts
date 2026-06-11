@@ -3,9 +3,15 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { ServiceConfig } from "../config/Config.js";
-import { DEFAULT_PROJECT_CONTEXT_ID, DEFAULT_PROJECT_CONTEXT_LABEL } from "../config/ProjectContexts.js";
+import {
+  DEFAULT_PROJECT_CONTEXT_ID,
+  DEFAULT_PROJECT_CONTEXT_LABEL,
+  normalizeProjectContextResolution,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { latestFreshIssueBreakdownPlan } from "../IssueBreakdownPlanService.js";
 import { mapWithFileReadConcurrency } from "../persistence/FileReadConcurrency.js";
+import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { IssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "../persistence/ProjectionRevision.js";
 import type { TrackerWriteEvidence, TrackerWriteResult, TrackerWriter } from "../tracker/TrackerWriter.js";
@@ -22,6 +28,7 @@ export type WritebackOperation =
       runId?: string;
       projectContextId?: string;
       projectContextLabel?: string | null;
+      projectContext?: ProjectContextResolution | null;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -40,6 +47,7 @@ export type WritebackOperation =
       runId?: string;
       projectContextId?: string;
       projectContextLabel?: string | null;
+      projectContext?: ProjectContextResolution | null;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -58,6 +66,7 @@ export type WritebackOperation =
       runId?: string;
       projectContextId?: string;
       projectContextLabel?: string | null;
+      projectContext?: ProjectContextResolution | null;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -87,6 +96,7 @@ export type WritebackOperation =
       runId?: string;
       projectContextId?: string;
       projectContextLabel?: string | null;
+      projectContext?: ProjectContextResolution | null;
       status: WritebackStatus;
       attempt: number;
       createdAt: string;
@@ -171,15 +181,33 @@ export class FileWritebackOutboxStore {
 
   async enqueueOnce(operation: NewWritebackOperation): Promise<WritebackOperation> {
     const existing = await this.get(operation.idempotencyKey);
-    if (existing) return existing;
+    if (existing) {
+      if (operation.projectContext && (existing.projectContext?.linearProjectSlug === null || existing.projectContext?.linearProjectSlug === undefined)) {
+        const repaired = normalizeWritebackOperation({
+          ...existing,
+          projectContextId: operation.projectContext.projectContextId,
+          projectContextLabel: operation.projectContext.projectContextLabel,
+          projectContext: operation.projectContext,
+        } as WritebackOperation);
+        if (JSON.stringify(repaired) !== JSON.stringify(existing)) {
+          await this.write(repaired);
+          return repaired;
+        }
+      }
+      return existing;
+    }
     const now = new Date().toISOString();
-    const projectContextId = operation.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+    const projectContextId = operation.projectContext?.projectContextId ?? operation.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+    const projectContextLabel =
+      operation.projectContext?.projectContextLabel ??
+      operation.projectContextLabel ??
+      defaultProjectContextLabel(projectContextId);
+    const projectContext = normalizeStoredProjectContext(operation.projectContext, projectContextId, projectContextLabel);
     const record = {
       ...operation,
       projectContextId,
-      ...(operation.projectContextLabel === undefined
-        ? { projectContextLabel: defaultProjectContextLabel(projectContextId) }
-        : { projectContextLabel: operation.projectContextLabel }),
+      ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+      ...(projectContext === null ? {} : { projectContext }),
       status: "pending",
       attempt: 0,
       createdAt: now,
@@ -269,11 +297,11 @@ export class FileWritebackOutboxStore {
 
   async get(idempotencyKey: string): Promise<WritebackOperation | null> {
     const current = await readJsonIfExists<WritebackOperation>(this.recordPath(idempotencyKey));
-    if (current) return normalizeWritebackOperation(current);
+    if (current) return this.repairProjectContext(current);
     const legacy = this.legacyRecordPath(idempotencyKey);
     if (legacy === this.recordPath(idempotencyKey)) return null;
     const record = await readJsonIfExists<WritebackOperation>(legacy);
-    return record ? normalizeWritebackOperation(record) : null;
+    return record ? this.repairProjectContext(record) : null;
   }
 
   async list(): Promise<WritebackOperation[]> {
@@ -283,7 +311,34 @@ export class FileWritebackOutboxStore {
       entries.filter((entry) => entry.endsWith(".json")).map((entry) => path.join(this.recordsDir(), entry)),
       (filePath) => readJsonIfExists<WritebackOperation>(filePath),
     );
-    return dedupeWritebackRecords(records.filter((record): record is WritebackOperation => record !== null).map((record) => normalizeWritebackOperation(record)));
+    return dedupeWritebackRecords(await Promise.all(records.filter((record): record is WritebackOperation => record !== null).map((record) => this.repairProjectContext(record))));
+  }
+
+  private async repairProjectContext(record: WritebackOperation): Promise<WritebackOperation> {
+    const normalized = normalizeWritebackOperation(record);
+    if (normalized.projectContext?.linearProjectSlug !== null && normalized.projectContext?.linearProjectSlug !== undefined) {
+      return normalized;
+    }
+    if (!normalized.runId) return normalized;
+    const run = await new FileRunTranscriptStore(this.stateDir).getRun(normalized.runId).catch(() => null);
+    const runProjectContext = run?.projectContext;
+    if (!runProjectContext) return normalized;
+    if (
+      normalized.projectContextId !== DEFAULT_PROJECT_CONTEXT_ID &&
+      runProjectContext.projectContextId !== normalized.projectContextId
+    ) {
+      return normalized;
+    }
+    const repaired = normalizeWritebackOperation({
+      ...normalized,
+      projectContextId: runProjectContext.projectContextId,
+      projectContextLabel: runProjectContext.projectContextLabel,
+      projectContext: runProjectContext,
+    } as WritebackOperation);
+    if (JSON.stringify(repaired) !== JSON.stringify(normalized)) {
+      await this.write(repaired);
+    }
+    return repaired;
   }
 
   private async update(record: WritebackOperation, patch: Partial<WritebackOperation>): Promise<WritebackOperation> {
@@ -606,9 +661,9 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
     return false;
   }
   if (record.runId !== operation.runId) return false;
-  if ((record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID) !== (operation.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID)) return false;
+  if ((record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID) !== (operation.projectContext?.projectContextId ?? operation.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID)) return false;
   if ((record.projectContextLabel ?? defaultProjectContextLabel(record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID)) !==
-      (operation.projectContextLabel ?? defaultProjectContextLabel(operation.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID))) return false;
+      (operation.projectContext?.projectContextLabel ?? operation.projectContextLabel ?? defaultProjectContextLabel(operation.projectContext?.projectContextId ?? operation.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID))) return false;
   if (record.kind === "transition" && operation.kind === "transition") {
     return (
       record.payload.toState === operation.payload.toState &&
@@ -638,17 +693,42 @@ function stringArraysEqual(left: string[] | undefined, right: string[] | undefin
 }
 
 function normalizeWritebackOperation(record: WritebackOperation): WritebackOperation {
-  const projectContextId = record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
-  const projectContextLabel = record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  const projectContextId = record.projectContext?.projectContextId ?? record.projectContextId ?? DEFAULT_PROJECT_CONTEXT_ID;
+  const projectContextLabel =
+    record.projectContext?.projectContextLabel ?? record.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  const projectContext = normalizeStoredProjectContext(record.projectContext, projectContextId, projectContextLabel);
   return {
     ...record,
     projectContextId,
     ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+    ...(projectContext === null ? {} : { projectContext }),
   };
 }
 
 function defaultProjectContextLabel(projectContextId: string): string | null {
   return projectContextId === DEFAULT_PROJECT_CONTEXT_ID ? DEFAULT_PROJECT_CONTEXT_LABEL : null;
+}
+
+function normalizeStoredProjectContext(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  projectContextId: string | undefined,
+  projectContextLabel: string | null | undefined,
+): ProjectContextResolution | null {
+  const resolvedId = projectContext?.projectContextId ?? projectContextId;
+  if (!resolvedId) return null;
+  const base = {
+    ...(projectContext ?? {}),
+    projectContextId: resolvedId,
+    ...(projectContext?.projectContextLabel !== undefined
+      ? { projectContextLabel: projectContext.projectContextLabel }
+      : projectContextLabel === undefined || projectContextLabel === null
+        ? {}
+        : { projectContextLabel }),
+  };
+  const normalized = normalizeProjectContextResolution(base);
+  return projectContextLabel === null && projectContext?.projectContextLabel === undefined
+    ? ({ ...normalized, projectContextLabel: null } as unknown as ProjectContextResolution)
+    : normalized;
 }
 
 function canRetrySkipped(

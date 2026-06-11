@@ -20,6 +20,13 @@ import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptSto
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import { issue } from "./helpers.js";
 
+const docsProjectContext = {
+  projectContextId: "docs",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
+
 describe("completion report MCP handoff", () => {
   let root: string;
 
@@ -58,6 +65,7 @@ describe("completion report MCP handoff", () => {
     });
     await writeCompletionReportMcpContext(contextFile, {
       issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      projectContext: docsProjectContext,
       activeRunId: "run-1",
       role: "worker",
       token: null,
@@ -112,15 +120,22 @@ describe("completion report MCP handoff", () => {
     const outbox = await new FileWritebackOutboxStore(stateDir).list();
     const comment = outbox.find((operation) => operation.kind === "comment");
     const transition = outbox.find((operation) => operation.kind === "transition");
+    expect(comment).toMatchObject({
+      kind: "comment",
+      projectContext: docsProjectContext,
+    });
     expect(comment?.kind === "comment" ? comment.payload.body : "").toContain(
       "https://github.com/acme/symphony/pull/42",
     );
     expect(transition).toMatchObject({
       kind: "transition",
+      projectContext: docsProjectContext,
       payload: { toState: "Human Review" },
     });
     await expect(new FileIssueLifecycleStore(stateDir).get("TEST-1")).resolves.toMatchObject({
       phase: "review",
+      projectContext: docsProjectContext,
+      completionReports: [expect.objectContaining({ projectContext: docsProjectContext })],
       summaryPointers: {
         prUrl: "https://github.com/acme/symphony/pull/42",
         prNumber: 42,

@@ -145,9 +145,17 @@ function addRequiredParseDependencies(env: Record<string, string>, config: Servi
   addWorkspaceParseRefs(env, raw.workspace, config.workspace);
   for (const rawContext of raw.project_contexts ?? []) {
     if (rawContext.enabled === false) continue;
-    const context = config.projectContexts.byId.get(normalizeProjectContextId(rawContext.id));
+    const contextId = normalizeProjectContextId(rawContext.id);
+    const context = config.projectContexts.byId.get(contextId);
     if (!context) continue;
+    const trackerApiKeyRef = envReference(rawContext.tracker?.api_key);
+    if (trackerApiKeyRef) env[trackerApiKeyRef] = context.tracker.apiKey;
+    const trackerProjectSlugRef = envReference(rawContext.tracker?.project_slug);
+    if (trackerProjectSlugRef) env[trackerProjectSlugRef] = context.tracker.projectSlug;
+    const trackerAssigneeRef = envReference(rawContext.tracker?.assignee);
+    if (trackerAssigneeRef) env[trackerAssigneeRef] = context.tracker.assignee ?? "";
     addWorkspaceParseRefs(env, rawContext.workspace, context.workspace);
+    addGitHubParseRefs(env, config, contextId);
   }
 }
 

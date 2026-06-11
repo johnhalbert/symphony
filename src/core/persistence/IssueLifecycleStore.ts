@@ -1,7 +1,12 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
-import { DEFAULT_PROJECT_CONTEXT_ID, DEFAULT_PROJECT_CONTEXT_LABEL } from "../config/ProjectContexts.js";
+import {
+  DEFAULT_PROJECT_CONTEXT_ID,
+  DEFAULT_PROJECT_CONTEXT_LABEL,
+  normalizeProjectContextResolution,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue } from "../types.js";
 import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
@@ -33,6 +38,7 @@ export interface IssueLifecycleSummaryPointers {
   lastEvidenceCursor: string | null;
   projectContextId?: string;
   projectContextLabel?: string | null;
+  projectContext?: ProjectContextResolution | null;
 }
 
 export type IssueLifecycleSummaryReferenceKind = "continuation_history" | "issue_breakdown_plan";
@@ -84,6 +90,7 @@ export interface IssueBreakdownPlanRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | null;
   summary: string;
   proposedIssues: ProposedIssueRecord[];
   transcriptPointers: string[];
@@ -154,6 +161,7 @@ export interface IssueCompletionReportRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | null;
   summary: string;
   validationEvidence: string[];
   acceptanceChecklist: CompletionReportChecklistItem[];
@@ -179,6 +187,7 @@ export interface IssueReviewVerdictRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | null;
   verdict: IssueReviewVerdict;
   acceptanceResults: ReviewVerdictAcceptanceResult[];
   findings: string[];
@@ -287,6 +296,7 @@ export interface IssueMergeConflictResolutionReportRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | null;
   resolutionStatus: "resolved" | "still_conflicted" | "blocked";
   summary: string;
   validationEvidence: string[];
@@ -360,6 +370,7 @@ export interface IssueLaneMemo {
   sizeChars: number;
   entries: string[];
   openFindings: string[];
+  projectContext?: ProjectContextResolution | null;
   pointers: IssueLifecycleSummaryPointers;
   lastWorkerRunId: string | null;
   lastReviewerRunId: string | null;
@@ -380,6 +391,7 @@ export interface WorkerHandoffPacket {
   memo: IssueLaneMemo;
   lastWorkerOutput: IssueWorkerOutputContract | null;
   lastReviewerOutput: IssueReviewerOutputContract | null;
+  projectContext?: ProjectContextResolution | null;
   pointers: IssueLifecycleSummaryPointers;
 }
 
@@ -399,6 +411,7 @@ export interface IssueLifecycleRecord {
   blockedReason: string | null;
   projectContextId?: string;
   projectContextLabel?: string | null;
+  projectContext?: ProjectContextResolution | null;
   summaryPointers: IssueLifecycleSummaryPointers;
   summaryReferences: IssueLifecycleSummaryReference[];
   issueBreakdownPlans: IssueBreakdownPlanRecord[];
@@ -429,6 +442,7 @@ export interface IssueLifecyclePatch {
   blockedReason?: string | null;
   projectContextId?: string;
   projectContextLabel?: string | null;
+  projectContext?: ProjectContextResolution | null;
   summaryPointers?: Partial<IssueLifecycleSummaryPointers>;
   summaryReferences?: IssueLifecycleSummaryReference[];
   issueBreakdownPlans?: IssueBreakdownPlanRecord[];
@@ -478,6 +492,27 @@ export class FileIssueLifecycleStore {
       existing?.projectContextLabel ??
       existing?.summaryPointers.projectContextLabel ??
       defaultProjectContextLabel(projectContextId);
+    const issueProjectContext =
+      issue.projectContextId === undefined
+        ? null
+        : normalizeProjectContextResolution({
+            projectContextId: issue.projectContextId,
+            ...(issue.projectContextLabel === undefined || issue.projectContextLabel === null
+              ? {}
+              : { projectContextLabel: issue.projectContextLabel }),
+            linearProjectSlug:
+              (issue as { linearProjectIdentity?: { slug?: string | null } }).linearProjectIdentity?.slug ??
+              (issue as { linearProjectSlug?: string | null }).linearProjectSlug ??
+              null,
+            routingSource: (issue as { routingSource?: string | null }).routingSource ?? "candidate_poll",
+          });
+    const projectContext =
+      patch.projectContext ??
+      patch.summaryPointers?.projectContext ??
+      issueProjectContext ??
+      existing?.projectContext ??
+      existing?.summaryPointers.projectContext ??
+      normalizeStoredProjectContext(undefined, projectContextId, projectContextLabel);
     const baseRecord = {
       issueId: issue.id,
       issueIdentifier: issue.identifier,
@@ -502,12 +537,14 @@ export class FileIssueLifecycleStore {
       blockedReason: patchValue(patch, "blockedReason", existing?.blockedReason ?? null),
       projectContextId,
       projectContextLabel,
+      projectContext,
       summaryPointers: {
         ...defaultSummaryPointers(),
         ...existing?.summaryPointers,
         ...patch.summaryPointers,
         projectContextId,
         projectContextLabel,
+        projectContext,
       },
       summaryReferences: patch.summaryReferences ?? existing?.summaryReferences ?? [],
       issueBreakdownPlans: patch.issueBreakdownPlans ?? existing?.issueBreakdownPlans ?? [],
@@ -614,6 +651,7 @@ export function buildWorkerHandoffPacket(
     memo: record.handoff.memo,
     lastWorkerOutput: record.handoff.lastWorkerOutput,
     lastReviewerOutput: record.handoff.lastReviewerOutput,
+    projectContext: record.projectContext ?? record.summaryPointers.projectContext ?? null,
     pointers: record.summaryPointers,
   };
 }
@@ -674,6 +712,7 @@ function buildLaneMemo(
     incompleteTurnCount: record.incompleteTurnCount,
     entries,
     openFindings,
+    projectContext: record.projectContext ?? record.summaryPointers.projectContext ?? null,
     pointers: record.summaryPointers,
     lastWorkerRunId: lastWorkerOutput?.runId ?? null,
     lastReviewerRunId: lastReviewerOutput?.runId ?? null,
@@ -883,6 +922,28 @@ function defaultProjectContextLabel(projectContextId: string): string | null {
   return projectContextId === DEFAULT_PROJECT_CONTEXT_ID ? DEFAULT_PROJECT_CONTEXT_LABEL : null;
 }
 
+function normalizeStoredProjectContext(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  projectContextId: string | undefined,
+  projectContextLabel: string | null | undefined,
+): ProjectContextResolution | null {
+  const resolvedId = projectContext?.projectContextId ?? projectContextId;
+  if (!resolvedId) return null;
+  const base = {
+    ...(projectContext ?? {}),
+    projectContextId: resolvedId,
+    ...(projectContext?.projectContextLabel !== undefined
+      ? { projectContextLabel: projectContext.projectContextLabel }
+      : projectContextLabel === undefined || projectContextLabel === null
+        ? {}
+        : { projectContextLabel }),
+  };
+  const normalized = normalizeProjectContextResolution(base);
+  return projectContextLabel === null && projectContext?.projectContextLabel === undefined
+    ? ({ ...normalized, projectContextLabel: null } as unknown as ProjectContextResolution)
+    : normalized;
+}
+
 function clip(value: string, maxChars = 500): string {
   return value.length <= maxChars ? value : `${value.slice(0, maxChars - 15)}...[truncated]`;
 }
@@ -904,6 +965,7 @@ function emptySummaryPointers(): IssueLifecycleSummaryPointers {
     lastPushedAt: null,
     lastEvidenceCursor: null,
     projectContextLabel: null,
+    projectContext: null,
   };
 }
 
@@ -912,6 +974,7 @@ function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
     ...emptySummaryPointers(),
     projectContextId: DEFAULT_PROJECT_CONTEXT_ID,
     projectContextLabel: DEFAULT_PROJECT_CONTEXT_LABEL,
+    projectContext: normalizeStoredProjectContext(undefined, DEFAULT_PROJECT_CONTEXT_ID, DEFAULT_PROJECT_CONTEXT_LABEL),
   };
 }
 
@@ -984,6 +1047,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
     projectContextId: optionalNullableString(value.projectContextId, filePath, "projectContextId") ?? undefined,
     projectContextLabel: optionalNullableString(value.projectContextLabel, filePath, "projectContextLabel") ?? null,
+    projectContext: isRecord(value.projectContext) ? (value.projectContext as Partial<ProjectContextResolution>) : undefined,
     summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath),
     summaryReferences: normalizeSummaryReferences(value.summaryReferences, filePath),
     issueBreakdownPlans: normalizeIssueBreakdownPlans(value.issueBreakdownPlans, filePath),
@@ -1003,23 +1067,66 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
   };
   const projectContextId = normalized.projectContextId || normalized.summaryPointers.projectContextId || DEFAULT_PROJECT_CONTEXT_ID;
   const projectContextLabel = normalized.projectContextLabel ?? normalized.summaryPointers.projectContextLabel ?? defaultProjectContextLabel(projectContextId);
+  const projectContext = normalizeStoredProjectContext(normalized.projectContext, projectContextId, projectContextLabel);
   const summaryPointers = {
     ...normalized.summaryPointers,
     projectContextId,
     projectContextLabel,
+    projectContext:
+      normalizeStoredProjectContext(normalized.summaryPointers.projectContext, projectContextId, projectContextLabel) ?? projectContext,
   };
-  return {
+  const propagatedProjectContext = projectContext ?? summaryPointers.projectContext ?? null;
+  const resolvedSummaryPointers =
+    propagatedProjectContext === null
+      ? summaryPointers
+      : {
+          ...summaryPointers,
+          projectContext: propagatedProjectContext,
+        };
+  const issueBreakdownPlans = normalized.issueBreakdownPlans.map((plan) =>
+    plan.projectContext === undefined || plan.projectContext === null ? { ...plan, projectContext: propagatedProjectContext } : plan,
+  );
+  const completionReports = normalized.completionReports.map((report) =>
+    report.projectContext === undefined || report.projectContext === null
+      ? { ...report, projectContext: propagatedProjectContext }
+      : report,
+  );
+  const reviewVerdicts = normalized.reviewVerdicts.map((verdict) =>
+    verdict.projectContext === undefined || verdict.projectContext === null
+      ? { ...verdict, projectContext: propagatedProjectContext }
+      : verdict,
+  );
+  const mergeConflictResolutionReports = normalized.mergeConflictResolutionReports.map((report) =>
+    report.projectContext === undefined || report.projectContext === null
+      ? { ...report, projectContext: propagatedProjectContext }
+      : report,
+  );
+  const withoutHandoff = {
     ...normalized,
     projectContextId,
     projectContextLabel,
-    summaryPointers,
-    handoff: normalizeHandoffState(value.handoff, { ...normalized, projectContextId, projectContextLabel, summaryPointers }, filePath),
+    projectContext,
+    summaryPointers: resolvedSummaryPointers,
+    issueBreakdownPlans,
+    completionReports,
+    reviewVerdicts,
+    mergeConflictResolutionReports,
+  };
+  return {
+    ...withoutHandoff,
+    handoff: buildIssueHandoffState(withoutHandoff),
   };
 }
 
 function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecycleSummaryPointers {
   if (!isRecord(value)) return emptySummaryPointers();
   const projectContextId = optionalNullableString(value.projectContextId, filePath, "summaryPointers.projectContextId");
+  const projectContextLabel = optionalNullableString(value.projectContextLabel, filePath, "summaryPointers.projectContextLabel") ?? null;
+  const projectContext = normalizeStoredProjectContext(
+    isRecord(value.projectContext) ? (value.projectContext as Partial<ProjectContextResolution>) : undefined,
+    projectContextId ?? undefined,
+    projectContextLabel,
+  );
   return {
     ...emptySummaryPointers(),
     workspaceKey: nullableString(value.workspaceKey, filePath, "summaryPointers.workspaceKey"),
@@ -1036,8 +1143,9 @@ function normalizeSummaryPointers(value: unknown, filePath: string): IssueLifecy
     ciStatus: optionalNullableString(value.ciStatus, filePath, "summaryPointers.ciStatus"),
     lastPushedAt: optionalNullableString(value.lastPushedAt, filePath, "summaryPointers.lastPushedAt"),
     lastEvidenceCursor: optionalNullableString(value.lastEvidenceCursor, filePath, "summaryPointers.lastEvidenceCursor"),
-    projectContextLabel: optionalNullableString(value.projectContextLabel, filePath, "summaryPointers.projectContextLabel") ?? null,
+    projectContextLabel,
     ...(projectContextId === null ? {} : { projectContextId }),
+    ...(projectContext === null ? {} : { projectContext }),
   };
 }
 
@@ -1420,6 +1528,11 @@ function normalizeCompletionReport(value: unknown, filePath: string, index: numb
     runId: requiredString(value.runId, filePath, `completionReports[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `completionReports[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `completionReports[${index}].issueIdentifier`),
+    projectContext: normalizeStoredProjectContext(
+      isRecord(value.projectContext) ? (value.projectContext as Partial<ProjectContextResolution>) : undefined,
+      undefined,
+      null,
+    ),
     summary: requiredString(value.summary, filePath, `completionReports[${index}].summary`),
     validationEvidence: requiredStringArray(value.validationEvidence, filePath, `completionReports[${index}].validationEvidence`),
     acceptanceChecklist: normalizeChecklist(value.acceptanceChecklist, filePath, index),
@@ -1443,6 +1556,11 @@ function normalizeReviewVerdict(value: unknown, filePath: string, index: number)
     runId: requiredString(value.runId, filePath, `reviewVerdicts[${index}].runId`),
     issueId: requiredString(value.issueId, filePath, `reviewVerdicts[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `reviewVerdicts[${index}].issueIdentifier`),
+    projectContext: normalizeStoredProjectContext(
+      isRecord(value.projectContext) ? (value.projectContext as Partial<ProjectContextResolution>) : undefined,
+      undefined,
+      null,
+    ),
     verdict: value.verdict,
     acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, index),
     findings: requiredStringArray(value.findings, filePath, `reviewVerdicts[${index}].findings`),

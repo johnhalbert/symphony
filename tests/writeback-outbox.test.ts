@@ -1,5 +1,5 @@
 import { promises as nodeFs } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -24,6 +24,7 @@ import {
   type IssueBreakdownPlanRecord,
   type IssueLifecycleRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
@@ -48,6 +49,12 @@ type CommentWriteback = Extract<NewWritebackOperation, { kind: "comment" }>;
 
 describe("FileWritebackOutboxStore", () => {
   let root: string;
+  const docsProjectContext = {
+    projectContextId: "docs",
+    projectContextLabel: "Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "candidate_poll",
+  } as const;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-writeback-"));
@@ -57,6 +64,160 @@ describe("FileWritebackOutboxStore", () => {
     vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });
   });
+
+  async function stripPersistedProjectContext(idempotencyKey: string): Promise<void> {
+    const recordsDir = path.join(root, "writeback");
+    let stripped = false;
+    for (const entry of await readdir(recordsDir)) {
+      const filePath = path.join(recordsDir, entry);
+      const parsed = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+      if (parsed.idempotencyKey !== idempotencyKey) continue;
+      delete parsed.projectContext;
+      await writeFile(filePath, `${JSON.stringify(parsed, null, 2)}
+`, "utf8");
+      stripped = true;
+    }
+    if (!stripped) throw new Error(`writeback record not found: ${idempotencyKey}`);
+  }
+
+  async function recordRunProjectContext(runId: string, issueId = "issue-docs-1", issueIdentifier = "DOCS-1"): Promise<void> {
+    const runStore = new FileRunTranscriptStore(root);
+    await runStore.startRun({
+      runId,
+      sessionId: `session-${runId}`,
+      agentId: `agent-${runId}`,
+      role: "worker",
+      issueId,
+      issueIdentifier,
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: issueIdentifier,
+      workspacePath: "/tmp/workspace",
+    });
+  }
+
+
+  it("normalizes durable project context attribution for new and legacy writebacks", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await store.enqueueOnce({
+      idempotencyKey: "comment:issue-docs-1:note",
+      kind: "comment",
+      issueId: "issue-docs-1",
+      projectContext: docsProjectContext,
+      runId: "run-docs-1",
+      payload: { body: "Docs updated", dedupeKey: "docs-comment" },
+    });
+    await store.enqueueOnce({
+      idempotencyKey: "comment:issue-legacy-1:note",
+      kind: "comment",
+      issueId: "issue-legacy-1",
+      runId: "run-legacy-1",
+      payload: { body: "Legacy note", dedupeKey: "legacy-comment" },
+    });
+
+    const recordsDir = path.join(root, "writeback");
+    for (const entry of await readdir(recordsDir)) {
+      const filePath = path.join(recordsDir, entry);
+      const parsed = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+      if (parsed.idempotencyKey === "comment:issue-legacy-1:note") {
+        delete parsed.projectContext;
+        await writeFile(filePath, `${JSON.stringify(parsed, null, 2)}
+`, "utf8");
+      }
+    }
+
+    await expect(store.get("comment:issue-docs-1:note")).resolves.toMatchObject({ projectContext: docsProjectContext });
+    await expect(store.get("comment:issue-legacy-1:note")).resolves.toMatchObject({
+      projectContext: {
+        projectContextId: "default",
+        projectContextLabel: "Default",
+        linearProjectSlug: null,
+        routingSource: "legacy_default",
+      },
+    });
+    await expect(store.list()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ idempotencyKey: "comment:issue-docs-1:note", projectContext: docsProjectContext }),
+        expect.objectContaining({
+          idempotencyKey: "comment:issue-legacy-1:note",
+          projectContext: expect.objectContaining({ projectContextId: "default" }),
+        }),
+      ]),
+    );
+  });
+
+  it("backfills missing project context when replaying an existing writeback", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const operation = {
+      idempotencyKey: "comment:issue-docs-replay:note",
+      kind: "comment" as const,
+      issueId: "issue-docs-replay",
+      projectContext: docsProjectContext,
+      runId: "run-docs-replay",
+      payload: { body: "Docs replay", dedupeKey: "docs-replay" },
+    };
+
+    await store.enqueueOnce(operation);
+    await stripPersistedProjectContext(operation.idempotencyKey);
+
+    await expect(store.enqueueOnce(operation)).resolves.toMatchObject({ projectContext: docsProjectContext });
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ projectContext: docsProjectContext });
+  });
+
+  it.each(["pending", "retrying"] as const)(
+    "backfills missing project context during plain processDue for %s legacy writebacks",
+    async (initialStatus) => {
+      const store = new FileWritebackOutboxStore(root);
+      const writer = new FakeWriter();
+      const processor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+      const runId = `run-docs-${initialStatus}`;
+      await recordRunProjectContext(runId, "issue-docs-process", "DOCS-PROCESS");
+      const operation = {
+        idempotencyKey: `comment:issue-docs-process:${initialStatus}`,
+        kind: "comment" as const,
+        issueId: "issue-docs-process",
+        projectContext: docsProjectContext,
+        runId,
+        payload: { body: `Docs ${initialStatus}`, dedupeKey: `docs-process-${initialStatus}` },
+      };
+
+      let record = await store.enqueueOnce(operation);
+      if (initialStatus === "retrying") {
+        record = await store.markRetry(record, "temporary outage", "1970-01-01T00:00:00.000Z");
+      }
+      await stripPersistedProjectContext(operation.idempotencyKey);
+
+      await processor.processDue({ idempotencyKeys: [operation.idempotencyKey] });
+
+      expect(writer.comments).toEqual([
+        expect.objectContaining({
+          issueId: "issue-docs-process",
+          body: `Docs ${initialStatus}`,
+          dedupeKey: `docs-process-${initialStatus}`,
+        }),
+      ]);
+      await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+        status: "succeeded",
+        projectContext: docsProjectContext,
+      });
+    },
+  );
+
 
   it("enqueues idempotently and processes due operations", async () => {
     const store = new FileWritebackOutboxStore(root);
@@ -644,6 +805,44 @@ describe("FileWritebackOutboxStore", () => {
       status: "succeeded",
     });
     expect(writer.transitions).toHaveLength(1);
+  });
+
+  it("requeues skipped operations after replay backfills missing project context", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const operation = {
+      idempotencyKey: "transition:issue-1:merge:issue-1:docs-head-sha-1:Done",
+      kind: "transition" as const,
+      issueId: "issue-1",
+      projectContext: docsProjectContext,
+      payload: { fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
+    };
+    const skippedProcessor = new WritebackProcessor(
+      store,
+      new FakeWriter({ transitionStatus: "skipped" }),
+      new StructuredLogger(() => undefined),
+      300_000,
+    );
+
+    await expect(skippedProcessor.enqueueAndProcess(operation)).resolves.toMatchObject({ status: "skipped" });
+    await stripPersistedProjectContext(operation.idempotencyKey);
+
+    const writer = new FakeWriter();
+    const recoveryProcessor = new WritebackProcessor(store, writer, new StructuredLogger(() => undefined), 300_000);
+    await expect(recoveryProcessor.enqueueAndProcess(operation, { retrySkipped: true })).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    expect(writer.transitions).toHaveLength(1);
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
   });
 
   it("does not requeue a skipped operation when the recovery payload does not match", async () => {

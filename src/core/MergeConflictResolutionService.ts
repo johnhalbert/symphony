@@ -1,5 +1,10 @@
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
+import {
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "./config/ProjectContexts.js";
 import { SymphonyError } from "./errors.js";
 import type {
   CompletionReportPullRequestRef,
@@ -42,6 +47,7 @@ export type MergeConflictResolutionSubmitterRole = "worker" | string;
 
 export interface MergeConflictResolutionActiveContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string;
   role: MergeConflictResolutionSubmitterRole;
   token?: string | null;
@@ -100,7 +106,11 @@ export class MergeConflictResolutionService {
 
     assertPullRequestMatchesConflict(report.pullRequest, mergeConflict);
     assertReportMatchesConflict(report, mergeConflict);
-    const storedReport = buildMergeConflictResolutionReport({ report, issue: context.issue });
+    const storedReport = buildMergeConflictResolutionReport({
+      report,
+      issue: context.issue,
+      projectContext: resolveMergeConflictProjectContext(context, lifecycle),
+    });
     const now = new Date().toISOString();
     const countedRunIds = new Set(mergeConflict.attemptRunIds);
     const shouldCountAttempt = report.resolutionStatus !== "resolved" && !countedRunIds.has(report.runId);
@@ -132,6 +142,7 @@ export class MergeConflictResolutionService {
 
     const writebackOperations = blocked ? await this.enqueueBlockedWritebacks(context, nextConflict) : [];
     const updated = await this.options.lifecycleStore.updateIssue(context.issue, {
+      projectContext: resolveMergeConflictProjectContext(context, lifecycle),
       phase: blocked ? "blocked" : report.resolutionStatus === "resolved" ? "passed" : "merge_conflict_resolution",
       blockedReason: blocked ? nextConflict.blockedReason : null,
       mergeConflict: {
@@ -198,6 +209,9 @@ export class MergeConflictResolutionService {
     const operations = planBlockedEscalationWritebacks(
       {
         issue: context.issue,
+        projectContext: resolveMergeConflictProjectContext(context),
+        projectContextId: resolveMergeConflictProjectContext(context).projectContextId,
+        projectContextLabel: resolveMergeConflictProjectContext(context).projectContextLabel,
         runId: context.activeRunId,
         reason: mergeConflict.blockedReason ?? conflictBlockedReason(mergeConflict.fixTurnCount, mergeConflict.maxFixTurns),
         requiredAction: [
@@ -224,9 +238,20 @@ function parseMergeConflictResolution(input: unknown): MergeConflictResolutionIn
   return parsed.data;
 }
 
+
+function resolveMergeConflictProjectContext(
+  context: MergeConflictResolutionActiveContext,
+  lifecycle: IssueLifecycleStore extends { get(issueIdOrIdentifier: string): Promise<infer T> } ? T | null : never = null,
+): ProjectContextResolution {
+  return normalizeProjectContextResolution(
+    context.projectContext ?? lifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
+}
+
 function buildMergeConflictResolutionReport(input: {
   report: MergeConflictResolutionInput;
   issue: Issue;
+  projectContext: ProjectContextResolution;
 }): IssueMergeConflictResolutionReportRecord {
   return {
     id: `merge-conflict-resolution:${input.issue.id}:${input.report.idempotencyKey}`,
@@ -234,6 +259,7 @@ function buildMergeConflictResolutionReport(input: {
     runId: input.report.runId,
     issueId: input.issue.id,
     issueIdentifier: input.issue.identifier,
+    projectContext: input.projectContext,
     resolutionStatus: input.report.resolutionStatus,
     summary: input.report.summary,
     validationEvidence: input.report.validationEvidence,

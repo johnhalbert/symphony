@@ -3,8 +3,10 @@ import path from "node:path";
 import { z } from "zod";
 import { SymphonyError } from "../errors.js";
 import {
+  rawCredentialProfilesSchema,
   rawCredentialRoleAssignmentsSchema,
   type CredentialCapability,
+  type RawCredentialProfilesConfig,
   type RawCredentialRoleAssignmentsConfig,
 } from "./CredentialProfiles.js";
 import type {
@@ -159,11 +161,7 @@ const rawAgentSchema = z
   })
   .passthrough();
 
-const rawProjectContextCredentialProfilesSchema = z
-  .object({
-    roles: rawCredentialRoleAssignmentsSchema.optional(),
-  })
-  .strict();
+const rawProjectContextCredentialProfilesSchema = rawCredentialProfilesSchema;
 
 export const rawProjectContextSchema = z
   .object({
@@ -197,13 +195,14 @@ export interface RawProjectContextDefaults {
   review_loop?: RawProjectContextReviewLoopConfig;
   issue_breakdown?: RawProjectContextIssueBreakdownConfig;
   agent?: RawProjectContextAgentConfig;
-  credential_profiles?: {
-    roles?: RawCredentialRoleAssignmentsConfig;
-  };
+  credential_profiles?: RawCredentialProfilesConfig;
 }
 
 export const DEFAULT_PROJECT_CONTEXT_ID = "default";
 export const DEFAULT_PROJECT_CONTEXT_LABEL = "Default";
+export const LEGACY_DEFAULT_PROJECT_CONTEXT_ID = DEFAULT_PROJECT_CONTEXT_ID;
+export const LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL = DEFAULT_PROJECT_CONTEXT_LABEL;
+export const LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE: ProjectContextRoutingSource = "legacy_default";
 
 export type ProjectContextId = string;
 export type ProjectContextSource = "legacy_default" | "explicit";
@@ -228,10 +227,22 @@ export interface ProjectContextCodebaseIdentity {
 export interface ProjectContextResolution {
   projectContextId: ProjectContextId;
   projectContextLabel: string;
-  codebase: ProjectContextCodebaseIdentity;
-  linearProject: ProjectContextLinearProjectIdentity;
-  routingSource: ProjectContextRoutingSource;
-  lockedAt: string;
+  linearProjectSlug?: string | null;
+  codebase?: ProjectContextCodebaseIdentity;
+  linearProject?: ProjectContextLinearProjectIdentity;
+  routingSource: ProjectContextRoutingSource | string;
+  lockedAt?: string;
+}
+
+export interface ProjectContextIssueLike {
+  projectContext?: Partial<ProjectContextResolution> | null;
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  linearProjectSlug?: string | null;
+  routingSource?: string | null;
+  linearProjectIdentity?: {
+    slug?: string | null;
+  } | null;
 }
 
 export interface ProjectContextCredentialAssignments {
@@ -254,13 +265,15 @@ export interface NormalizedProjectContext {
   credentialProfiles: ProjectContextCredentialAssignments;
   linearProjectIdentity: ProjectContextLinearProjectIdentity;
   codebaseIdentity: ProjectContextCodebaseIdentity;
+  publicMetadata?: ProjectContextPublicMetadata;
 }
 
 export interface ProjectContextRegistry {
-  contexts: NormalizedProjectContext[];
-  enabledContexts: NormalizedProjectContext[];
+  contexts: Array<NormalizedProjectContext & { publicMetadata: ProjectContextPublicMetadata }>;
+  enabledContexts: Array<NormalizedProjectContext & { publicMetadata: ProjectContextPublicMetadata }>;
   defaultContextId: ProjectContextId;
-  byId: Map<ProjectContextId, NormalizedProjectContext>;
+  defaultContext: NormalizedProjectContext & { publicMetadata: ProjectContextPublicMetadata };
+  byId: Map<ProjectContextId, NormalizedProjectContext & { publicMetadata: ProjectContextPublicMetadata }>;
 }
 
 export interface NormalizeProjectContextRegistryInput {
@@ -281,6 +294,11 @@ export interface ProjectContextPublicMetadata {
   label: string;
   enabled: boolean;
   source: ProjectContextSource;
+  linearProjectSlug: string | null;
+  workspaceRoot: string | null;
+  workspaceSourceKind: string | null;
+  repository: string | null;
+  path: string | null;
   tracker: {
     kind: "linear";
     endpoint: string;
@@ -417,7 +435,7 @@ export function normalizeProjectContextRegistry(
     if (seen.has(normalizedId)) {
       throw new SymphonyError(
         "config_validation_error",
-        `Duplicate project context id after normalization: "${normalizedId}"`,
+        `Duplicate project context id: ${normalizedId}`,
       );
     }
     seen.add(normalizedId);
@@ -509,7 +527,7 @@ export function normalizeProjectContextRegistry(
 export function normalizeProjectContextId(value: string): ProjectContextId {
   const trimmed = value.trim().toLowerCase();
   const normalized = trimmed
-    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/[^a-z0-9]+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^[-._]+|[-._]+$/g, "");
   if (normalized.length === 0) {
@@ -518,12 +536,157 @@ export function normalizeProjectContextId(value: string): ProjectContextId {
   return normalized;
 }
 
+export function defaultProjectContextLabel(projectContextId: string): string {
+  if (projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL;
+  return projectContextId
+    .split(/[-_]+/)
+    .filter((part) => part.length > 0)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+export function normalizeLegacyDefaultProjectContext(input: RawProjectContextDefaults): RawProjectContextConfig {
+  return {
+    id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+    enabled: true,
+    ...(input.tracker === undefined ? {} : { tracker: input.tracker }),
+    ...(input.workspace === undefined ? {} : { workspace: input.workspace }),
+    ...(input.github === undefined ? {} : { github: input.github }),
+    ...(input.review_loop === undefined ? {} : { review_loop: input.review_loop }),
+    ...(input.issue_breakdown === undefined ? {} : { issue_breakdown: input.issue_breakdown }),
+    ...(input.agent === undefined ? {} : { agent: input.agent }),
+    ...(input.credential_profiles === undefined ? {} : { credential_profiles: input.credential_profiles }),
+  };
+}
+
+export function normalizeProjectContextResolution(
+  value: Partial<ProjectContextResolution> | null | undefined,
+): ProjectContextResolution {
+  const rawProjectContextId = normalizeOptionalConfigString(value?.projectContextId);
+  const projectContextId =
+    rawProjectContextId === null ? LEGACY_DEFAULT_PROJECT_CONTEXT_ID : normalizeProjectContextId(rawProjectContextId);
+  const linearProjectSlug =
+    normalizeOptionalConfigString(value?.linearProjectSlug ?? undefined) ?? value?.linearProject?.slug ?? null;
+  return {
+    projectContextId,
+    projectContextLabel:
+      normalizeOptionalConfigString(value?.projectContextLabel) ?? defaultProjectContextLabel(projectContextId),
+    linearProjectSlug,
+    ...(value?.codebase === undefined ? {} : { codebase: value.codebase }),
+    ...(value?.linearProject === undefined ? {} : { linearProject: value.linearProject }),
+    routingSource:
+      normalizeOptionalConfigString(value?.routingSource) ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+    ...(value?.lockedAt === undefined ? {} : { lockedAt: value.lockedAt }),
+  };
+}
+
+export function projectContextResolutionFromIssue(issue: unknown): ProjectContextResolution | null {
+  if (typeof issue !== "object" || issue === null) return null;
+  const value = issue as ProjectContextIssueLike;
+  if (value.projectContext) {
+    return normalizeProjectContextResolution(value.projectContext);
+  }
+
+  const projectContextId = normalizeOptionalConfigString(value.projectContextId ?? undefined);
+  const projectContextLabel = normalizeOptionalConfigString(value.projectContextLabel ?? undefined);
+  const linearProjectSlug =
+    normalizeOptionalConfigString(value.linearProjectSlug ?? undefined) ??
+    normalizeOptionalConfigString(value.linearProjectIdentity?.slug ?? undefined);
+  const routingSource = normalizeOptionalConfigString(value.routingSource ?? undefined);
+
+  if (projectContextId === null && projectContextLabel === null && linearProjectSlug === null && routingSource === null) {
+    return null;
+  }
+
+  return normalizeProjectContextResolution({
+    ...(projectContextId === null ? {} : { projectContextId }),
+    ...(projectContextLabel === null ? {} : { projectContextLabel }),
+    ...(linearProjectSlug === null ? {} : { linearProjectSlug }),
+    ...(routingSource === null ? {} : { routingSource }),
+  });
+}
+
+export function projectContextMetadataForPublicRead(input: {
+  id: ProjectContextId;
+  label: string;
+  enabled: boolean;
+  tracker?: { projectSlug?: string | null } | null;
+  workspace?: {
+    root?: string | null;
+    source?: {
+      kind?: string | null;
+      repository?: string | null;
+      path?: string | null;
+    } | null;
+  } | null;
+}): {
+  id: ProjectContextId;
+  label: string;
+  enabled: boolean;
+  linearProjectSlug: string | null;
+  workspaceRoot: string | null;
+  workspaceSourceKind: string | null;
+  repository: string | null;
+  path: string | null;
+} {
+  return {
+    id: input.id,
+    label: input.label,
+    enabled: input.enabled,
+    linearProjectSlug: normalizeOptionalConfigString(input.tracker?.projectSlug ?? undefined),
+    workspaceRoot: normalizeOptionalConfigString(input.workspace?.root ?? undefined),
+    workspaceSourceKind: normalizeOptionalConfigString(input.workspace?.source?.kind ?? undefined),
+    repository: normalizeOptionalConfigString(input.workspace?.source?.repository ?? undefined),
+    path: normalizeOptionalConfigString(input.workspace?.source?.path ?? undefined),
+  };
+}
+
+export function buildProjectContextRegistry<TContext extends { id: ProjectContextId; enabled: boolean }>(
+  contexts: readonly TContext[],
+): {
+  contexts: TContext[];
+  enabledContexts: TContext[];
+  defaultContextId: ProjectContextId;
+  defaultContext: TContext;
+  byId: Map<ProjectContextId, TContext>;
+} {
+  if (contexts.length === 0) {
+    throw new SymphonyError("config_validation_error", "At least one project context is required");
+  }
+  const byId = new Map<ProjectContextId, TContext>();
+  for (const context of contexts) {
+    if (byId.has(context.id)) {
+      throw new SymphonyError("config_validation_error", `Duplicate project context id: ${context.id}`);
+    }
+    byId.set(context.id, context);
+  }
+  const enabledContexts = contexts.filter((context) => context.enabled);
+  const defaultContext =
+    enabledContexts.find((context) => context.id === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) ?? enabledContexts[0] ?? null;
+  if (defaultContext === null) {
+    throw new SymphonyError("config_validation_error", "At least one enabled project context is required");
+  }
+  return {
+    contexts: [...contexts],
+    enabledContexts,
+    defaultContextId: defaultContext.id,
+    defaultContext,
+    byId,
+  };
+}
+
 export function projectContextPublicMetadata(context: NormalizedProjectContext): ProjectContextPublicMetadata {
   return {
     id: context.id,
     label: context.label,
     enabled: context.enabled,
     source: context.source,
+    linearProjectSlug: context.tracker.projectSlug,
+    workspaceRoot: context.workspace.root,
+    workspaceSourceKind: context.workspace.source.kind,
+    repository: context.workspace.source.repository ?? null,
+    path: context.workspace.source.path ?? null,
     tracker: {
       kind: context.tracker.kind,
       endpoint: context.tracker.endpoint,
@@ -579,11 +742,24 @@ export function projectContextRegistryPublicMetadata(registry: ProjectContextReg
 }
 
 function buildRegistry(contexts: NormalizedProjectContext[], defaultContextId: ProjectContextId): ProjectContextRegistry {
-  const byId = new Map(contexts.map((context) => [context.id, context] as const));
+  const hydratedContexts = contexts.map((context) => ({
+    ...context,
+    publicMetadata: context.publicMetadata ?? projectContextPublicMetadata(context),
+  }));
+  const byId = new Map(hydratedContexts.map((context) => [context.id, context] as const));
+  const enabledContexts = hydratedContexts.filter((context) => context.enabled);
+  const defaultContext =
+    byId.get(defaultContextId) ??
+    enabledContexts.find((context) => context.id === DEFAULT_PROJECT_CONTEXT_ID) ??
+    enabledContexts[0];
+  if (!defaultContext) {
+    throw new SymphonyError("config_validation_error", "At least one enabled project context is required");
+  }
   return {
-    contexts,
-    enabledContexts: contexts.filter((context) => context.enabled),
-    defaultContextId,
+    contexts: hydratedContexts,
+    enabledContexts,
+    defaultContextId: defaultContext.id,
+    defaultContext,
     byId,
   };
 }
@@ -599,11 +775,11 @@ function normalizeTrackerConfig(
   }
   const apiKey = resolveConfigString(raw?.api_key, env) ?? resolveConfigString("$LINEAR_API_KEY", env) ?? "";
   if (input.requireApiKey && apiKey.length === 0) {
-    throw contextConfigError(input.contextId, "Linear API key is required");
+    throw new SymphonyError("config_validation_error", projectContextFieldMessage(input.contextId, "tracker.api_key", "is required"));
   }
   const projectSlug = resolveConfigString(raw?.project_slug, env) ?? "";
   if (input.requireProjectSlug && projectSlug.length === 0) {
-    throw contextConfigError(input.contextId, "Linear project slug is required");
+    throw new SymphonyError("config_validation_error", projectContextFieldMessage(input.contextId, "tracker.project_slug", "is required"));
   }
   const assignee = resolveConfigString(raw?.assignee, env) ?? resolveConfigString("$LINEAR_ASSIGNEE", env) ?? "";
   return {
@@ -721,7 +897,8 @@ function normalizeIssueBreakdownConfig(
   input: { contextId: string | null },
 ): IssueBreakdownConfig {
   const workspaceMode = raw?.workspace_mode ?? "none";
-  if (workspaceMode === "readonly_checkout") {
+  const enabled = raw?.enabled ?? false;
+  if ((input.contextId === null || enabled) && workspaceMode === "readonly_checkout") {
     if (workspaceSourceKind !== "git_worktree") {
       throw contextConfigError(
         input.contextId,
@@ -812,13 +989,7 @@ function buildCodebaseLabel(workspace: WorkspaceConfig): string {
 
 function validateWorkspaceSourceForEnabledContext(contextId: string | null, source: WorkspaceSourceConfig): void {
   if (source.kind === "none") {
-    throw contextConfigError(contextId, "enabled project contexts require workspace.source.kind other than none");
-  }
-  if (source.kind === "copy" && !source.path) {
-    throw contextConfigError(contextId, "workspace.source.path is required for copy project contexts");
-  }
-  if (source.kind === "git" && !source.repository) {
-    throw contextConfigError(contextId, "workspace.source.repository is required for git project contexts");
+    throw new SymphonyError("config_validation_error", projectContextFieldMessage(contextId, "workspace.source", "is required for enabled project contexts"));
   }
   if (source.kind === "git_worktree" && !source.repository) {
     throw contextConfigError(contextId, "workspace.source.repository is required for git_worktree project contexts");
@@ -1093,6 +1264,11 @@ function resolveRepositoryValue(value: string, baseDir: string, env: NodeJS.Proc
   if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(resolved)) return resolved;
   if (/^[^/\\]+@[^:]+:.+/.test(resolved)) return resolved;
   return resolvePathValue(resolved, baseDir, env);
+}
+
+function projectContextFieldMessage(contextId: string | null, field: string, detail: string): string {
+  if (contextId === null) return `${field} ${detail}`;
+  return `project_contexts["${defaultProjectContextLabel(contextId)}"].${field} ${detail}`;
 }
 
 function contextConfigError(contextId: string | null, message: string): SymphonyError {

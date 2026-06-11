@@ -80,6 +80,25 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("propagates project context onto completion reports, lifecycle state, and writeback operations", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+
+    const result = await service.submit_completion_report(report(), context({ projectContext: docsProjectContext }));
+    const lifecycle = await lifecycleStore.get("issue-1");
+    const operations = await outbox.list();
+
+    expect(result.report).toMatchObject({ projectContext: docsProjectContext });
+    expect(lifecycle).toMatchObject({
+      projectContext: docsProjectContext,
+      completionReports: [expect.objectContaining({ projectContext: docsProjectContext })],
+    });
+    expect(operations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectContext: docsProjectContext }),
+      ]),
+    );
+  });
+
   it("supersedes an old-head merge gate on new-head completion and scrubs stale repair state", async () => {
     const { service, lifecycleStore, outbox } = fixture();
     await lifecycleStore.ensureIssue(context().issue, {
@@ -904,6 +923,13 @@ function contextWithWorkspace(overrides: Partial<CompletionReportActiveContext> 
     ...overrides,
   });
 }
+
+const docsProjectContext = {
+  projectContextId: "docs-site",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
 
 function mergeGate(overrides: Partial<IssueMergeGateState> = {}): IssueMergeGateState {
   return {

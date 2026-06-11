@@ -7,6 +7,7 @@ import {
 import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
+import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
@@ -15,6 +16,7 @@ export const ISSUE_BREAKDOWN_PLAN_TOOL_NAME = "submit_issue_breakdown_plan";
 
 export interface IssueBreakdownPlanMcpContextFile {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string | null;
   role: "worker";
   phase: "issue_breakdown";

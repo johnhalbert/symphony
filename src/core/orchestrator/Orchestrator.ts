@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { serviceConfigForProjectContext, type ServiceConfig } from "../config/Config.js";
+import { normalizeProjectContextResolution, type ProjectContextResolution } from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
@@ -1785,6 +1786,7 @@ export class Orchestrator {
           prompt,
           attempt,
           turnNumber: 1,
+          ...(context.projectContext === undefined ? {} : { projectContext: context.projectContext }),
         });
         return;
       }
@@ -1812,6 +1814,7 @@ export class Orchestrator {
           prompt,
           attempt,
           turnNumber,
+          ...(context.projectContext === undefined ? {} : { projectContext: context.projectContext }),
         });
         if (entry.completionReportAccepted || entry.mergeConflictResolutionAccepted) break;
         if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) break;
@@ -1897,11 +1900,13 @@ export class Orchestrator {
           baseRef: workspace.baseRef ?? null,
         },
       );
-      await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
+      const context = this.buildRunContext(entry, workspace, null, 1);
+      await this.consumeHarnessEvents(entry, this.options.harness.run(context, prompt), {
         workspace,
         prompt,
         attempt: null,
         turnNumber: 1,
+        ...(context.projectContext === undefined ? {} : { projectContext: context.projectContext }),
       });
     } finally {
       if (workspace) {
@@ -1913,7 +1918,7 @@ export class Orchestrator {
   private async consumeHarnessEvents(
     entry: RunningEntry,
     events: AsyncIterable<AgentEvent>,
-    context: { workspace: Workspace; prompt: string; attempt: number | null; turnNumber: number },
+    context: { workspace: Workspace; prompt: string; attempt: number | null; turnNumber: number; projectContext?: ProjectContextResolution },
   ): Promise<void> {
     for await (const rawEvent of events) {
       const event = sanitizeAgentEventForPublicOutput(rawEvent);
@@ -1966,6 +1971,9 @@ export class Orchestrator {
           cursorWorkerAgentLifecycle: this.config.cursor.workerAgentLifecycle,
           workspaceKey: context.workspace.workspaceKey,
           workspacePath: context.workspace.path,
+          ...((((context as { projectContext?: ProjectContextResolution }).projectContext)) === undefined
+            ? {}
+            : { projectContext: (context as { projectContext?: ProjectContextResolution }).projectContext }),
           ...(entry.issue.projectContextId === undefined ? {} : { projectContextId: entry.issue.projectContextId }),
           ...(entry.issue.projectContextLabel === undefined ? {} : { projectContextLabel: entry.issue.projectContextLabel }),
           ...(context.workspace.gitBranchName === undefined ? {} : { gitBranchName: context.workspace.gitBranchName }),
@@ -2740,8 +2748,24 @@ export class Orchestrator {
       this.config.projectContexts.byId.has(contextId)
         ? serviceConfigForProjectContext(this.config, contextId)
         : this.config;
+    const configuredProjectContext = contextId ? this.config.projectContexts.byId.get(contextId) : undefined;
+    const issueLinearProjectSlug =
+      (entry.issue as { linearProjectSlug?: string | null }).linearProjectSlug ??
+      (entry.issue as { linearProjectIdentity?: { slug?: string | null } }).linearProjectIdentity?.slug ??
+      null;
+    const resolvedProjectContextLabel = entry.issue.projectContextLabel ?? configuredProjectContext?.label ?? null;
+    const projectContext =
+      contextId
+        ? normalizeProjectContextResolution({
+            projectContextId: contextId,
+            ...(resolvedProjectContextLabel === null ? {} : { projectContextLabel: resolvedProjectContextLabel }),
+            linearProjectSlug: configuredProjectContext?.tracker.projectSlug ?? issueLinearProjectSlug,
+            routingSource: (entry.issue as { routingSource?: string | null }).routingSource ?? "candidate_poll",
+          })
+        : undefined;
     return {
       issue: entry.issue,
+      ...(projectContext === undefined ? {} : { projectContext }),
       role: entry.role,
       runPhase: entry.runPhase,
       attempt,

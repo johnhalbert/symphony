@@ -16,6 +16,7 @@ import type {
 } from "./writeback/WritebackOutbox.js";
 import { ISSUE_BREAKDOWN_PLAN_STALE_REASON } from "./writeback/WritebackOutbox.js";
 import {
+  mergeWritebackProjectContexts,
   stampWritebackProjectContexts,
   writebackProjectContextFromIssue,
 } from "./writeback/ProjectContextAttribution.js";
@@ -226,7 +227,16 @@ export function planIssueBreakdownApplicationWritebacks(
         },
       };
     }),
-    writebackProjectContextFromIssue(issue),
+    mergeWritebackProjectContexts(
+      writebackProjectContextFromIssue(issue),
+      plan.projectContext == null
+        ? undefined
+        : {
+            projectContext: plan.projectContext,
+            projectContextId: plan.projectContext.projectContextId,
+            projectContextLabel: plan.projectContext.projectContextLabel,
+          },
+    ),
   );
 }
 
@@ -270,7 +280,19 @@ export function planIssueBreakdownFinalizationWritebacks(
       body: renderParentComment(issue, plan),
     },
   });
-  return stampWritebackProjectContexts(operations, writebackProjectContextFromIssue(issue));
+  return stampWritebackProjectContexts(
+    operations,
+    mergeWritebackProjectContexts(
+      writebackProjectContextFromIssue(issue),
+      plan.projectContext == null
+        ? undefined
+        : {
+            projectContext: plan.projectContext,
+            projectContextId: plan.projectContext.projectContextId,
+            projectContextLabel: plan.projectContext.projectContextLabel,
+          },
+    ),
+  );
 }
 
 function createdIssueRefFromOperation(operation: WritebackOperation): IssueBreakdownCreatedIssueRef | null {

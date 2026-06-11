@@ -77,11 +77,18 @@ import {
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import type { Issue, TokenCounts, TrackerStateLists } from "../src/core/types.js";
-import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, issue, testConfig, trackerIssue } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
 type CommentWriteback = Extract<NewWritebackOperation, { kind: "comment" }>;
+
+const docsProjectContext = {
+  projectContextId: "docs-site",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
 
 describe("Orchestrator", () => {
   let root: string;
@@ -215,18 +222,26 @@ describe("Orchestrator", () => {
       messageId: "client-message-1",
       statusServer: { baseUrl: "http://127.0.0.1:7331", mutationToken: "secret" },
     });
-    const run = await runStore.getRun("operator-run-1");
-    expect(run).toMatchObject({
-      runId: "operator-run-1",
-      role: "planner",
-      runPhase: "issue_breakdown",
-      runKind: "planning",
-      status: "succeeded",
-      runtimeModel: "test-planner",
-      runtimeAgentLifecycle: "reuse_by_conversation",
+    await eventually(async () => {
+      const run = await runStore.getRun("operator-run-1");
+      expect(run).toMatchObject({
+        runId: "operator-run-1",
+        role: "planner",
+        runPhase: "issue_breakdown",
+        runKind: "planning",
+        status: "succeeded",
+        runtimeModel: "test-planner",
+        runtimeAgentLifecycle: "reuse_by_conversation",
+      });
     });
     const transcript = await runStore.readTranscript("operator-run-1");
     expect(transcript.events.map((event) => event.eventType)).toContain("completed");
+    expect(await runStore.rebuildRunFromTranscript("operator-run-1")).toMatchObject({
+      runId: "operator-run-1",
+      status: "succeeded",
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+    });
   });
 
   it("persists distinct Hermes ACP runtime metadata on started runs", async () => {
@@ -2062,6 +2077,73 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
+  it("propagates non-default project context through dispatch harness, run records, and lifecycle state", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["Human Review"];
+    const candidate = trackerIssue({
+      id: "issue-1",
+      identifier: "TEST-1",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const stateDir = path.join(root, "state");
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 300_000);
+    const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(docsProjectContext);
+    expect(currentState).toBe("In Progress");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.comments[0]?.dedupeKey).toBe("fake-issue-1-1:run-started");
+    await expect(runStore.getRun("fake-issue-1-1")).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      incompleteTurnCount: 1,
+      projectContext: docsProjectContext,
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
   it("records max-turn exhaustion as incomplete turns instead of handoff", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 2;
@@ -3465,7 +3547,16 @@ describe("Orchestrator", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = trackerIssue({
+      id: "issue-1",
+      identifier: "TEST-1",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -3514,6 +3605,8 @@ describe("Orchestrator", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
+    const operations = await outboxStore.list();
+
     expect(harness.prompts).toHaveLength(1);
     expect(harness.prompts[0]).toContain("Work on TEST-1");
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
@@ -3525,7 +3618,9 @@ describe("Orchestrator", () => {
     expect(writer.comments[1]?.body).toContain("https://github.com/acme/symphony/pull/42");
     expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
     expect(writer.comments.some((comment) => comment.body.includes("without an accepted completion report"))).toBe(false);
+    expect(operations).toEqual(expect.arrayContaining([expect.objectContaining({ projectContext: docsProjectContext })]));
     await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
+      projectContext: docsProjectContext,
       prUrl: "https://github.com/acme/symphony/pull/42",
       prNumber: 42,
       prHeadSha: "abc123",
@@ -3535,6 +3630,8 @@ describe("Orchestrator", () => {
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
       phase: "review",
       incompleteTurnCount: 0,
+      projectContext: docsProjectContext,
+      completionReports: [expect.objectContaining({ projectContext: docsProjectContext })],
       summaryPointers: {
         prUrl: "https://github.com/acme/symphony/pull/42",
         prNumber: 42,
@@ -8071,6 +8168,7 @@ class ReportingHarness implements AgentHarness {
         },
         {
           issue: ctx.issue,
+          projectContext: ctx.projectContext,
           activeRunId: "report-run-1",
           role: "worker",
           sessionId: "report-session-1",

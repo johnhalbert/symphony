@@ -3,57 +3,137 @@
 -- Backward compatibility: legacy single-project rows remain readable through the
 -- default project context id/label until runtime dual-write/import arrives.
 
-ALTER TABLE symphony.workspace
-  ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default',
-  ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.workspace ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.workspace ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.issue ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.issue ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.run_session ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.run_session ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.run_session ADD COLUMN IF NOT EXISTS linear_project_identity jsonb;
+ALTER TABLE symphony.run_session ADD COLUMN IF NOT EXISTS codebase_identity jsonb;
+ALTER TABLE symphony.run_session ADD COLUMN IF NOT EXISTS routing_source text;
+ALTER TABLE symphony.run_activity_event ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.chat_message ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.writeback_operation ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.writeback_operation ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.approval_request ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.approval_request ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.projection_revision ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.projection_revision ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.dashboard_projection ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.dashboard_projection ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.issue_board_projection ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.issue_board_projection ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.sidebar_projection ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.sidebar_projection ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.history_projection ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.history_projection ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.transcript_projection ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.transcript_projection ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.orchestrator_chat_projection ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default';
+ALTER TABLE symphony.orchestrator_chat_projection ADD COLUMN IF NOT EXISTS project_context_label text;
 
-ALTER TABLE symphony.issue
-  ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default',
-  ADD COLUMN IF NOT EXISTS project_context_label text;
+ALTER TABLE symphony.workspace DROP CONSTRAINT IF EXISTS workspace_pkey;
+ALTER TABLE symphony.workspace ADD PRIMARY KEY (project_context_id, workspace_key);
+ALTER TABLE symphony.issue DROP CONSTRAINT IF EXISTS issue_pkey;
+ALTER TABLE symphony.issue ADD PRIMARY KEY (project_context_id, issue_key);
+DROP INDEX IF EXISTS symphony.issue_identifier_unique_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS issue_identifier_unique_idx ON symphony.issue (project_context_id, tracker_source, issue_identifier);
+ALTER TABLE symphony.run_session DROP CONSTRAINT IF EXISTS run_session_pkey;
+ALTER TABLE symphony.run_session ADD PRIMARY KEY (project_context_id, run_id);
+ALTER TABLE symphony.run_activity_event DROP CONSTRAINT IF EXISTS run_activity_event_run_session_id_sequence_key;
+ALTER TABLE symphony.run_activity_event ADD CONSTRAINT run_activity_event_run_session_id_sequence_key UNIQUE (project_context_id, run_session_id, sequence);
+DROP INDEX IF EXISTS symphony.run_activity_event_external_event_unique_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS run_activity_event_external_event_unique_idx ON symphony.run_activity_event (project_context_id, run_session_id, external_event_id) WHERE external_event_id IS NOT NULL;
+ALTER TABLE symphony.chat_message DROP CONSTRAINT IF EXISTS chat_message_message_id_key;
+ALTER TABLE symphony.chat_message ADD CONSTRAINT chat_message_message_id_key UNIQUE (project_context_id, message_id);
+ALTER TABLE symphony.chat_message DROP CONSTRAINT IF EXISTS chat_message_thread_key_message_index_key;
+ALTER TABLE symphony.chat_message ADD CONSTRAINT chat_message_thread_key_message_index_key UNIQUE (project_context_id, thread_key, message_index);
+ALTER TABLE symphony.writeback_operation DROP CONSTRAINT IF EXISTS writeback_operation_pkey;
+ALTER TABLE symphony.writeback_operation ADD PRIMARY KEY (project_context_id, idempotency_key);
+ALTER TABLE symphony.approval_request DROP CONSTRAINT IF EXISTS approval_request_pkey;
+ALTER TABLE symphony.approval_request ADD PRIMARY KEY (project_context_id, request_id);
+ALTER TABLE symphony.approval_request DROP CONSTRAINT IF EXISTS approval_request_dedupe_key_key;
+ALTER TABLE symphony.approval_request ADD CONSTRAINT approval_request_dedupe_key_key UNIQUE (project_context_id, dedupe_key);
 
-ALTER TABLE symphony.run_session
-  ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default',
-  ADD COLUMN IF NOT EXISTS project_context_label text;
+DROP INDEX IF EXISTS symphony.run_session_lookup_idx;
+DROP INDEX IF EXISTS symphony.issue_status_lookup_idx;
+DROP INDEX IF EXISTS symphony.issue_phase_lookup_idx;
+DROP INDEX IF EXISTS symphony.run_session_issue_status_idx;
+DROP INDEX IF EXISTS symphony.run_session_identifier_started_idx;
+DROP INDEX IF EXISTS symphony.run_session_workspace_idx;
+DROP INDEX IF EXISTS symphony.run_activity_event_ordering_idx;
+DROP INDEX IF EXISTS symphony.run_activity_event_run_ordering_idx;
+DROP INDEX IF EXISTS symphony.run_activity_event_time_ordering_idx;
+DROP INDEX IF EXISTS symphony.chat_message_ordering_idx;
+DROP INDEX IF EXISTS symphony.chat_message_issue_ordering_idx;
+DROP INDEX IF EXISTS symphony.chat_message_run_ordering_idx;
+DROP INDEX IF EXISTS symphony.chat_message_event_range_idx;
+DROP INDEX IF EXISTS symphony.writeback_operation_state_idx;
+DROP INDEX IF EXISTS symphony.writeback_operation_issue_idx;
+DROP INDEX IF EXISTS symphony.writeback_operation_run_idx;
+DROP INDEX IF EXISTS symphony.approval_request_state_idx;
+DROP INDEX IF EXISTS symphony.approval_request_issue_idx;
+DROP INDEX IF EXISTS symphony.approval_request_run_idx;
 
-ALTER TABLE symphony.writeback_operation
-  ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default',
-  ADD COLUMN IF NOT EXISTS project_context_label text;
+CREATE INDEX IF NOT EXISTS workspace_project_context_idx ON symphony.workspace (project_context_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS issue_project_context_idx ON symphony.issue (project_context_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS issue_status_lookup_idx ON symphony.issue (project_context_id, tracker_source, tracker_state, phase, updated_at DESC);
+CREATE INDEX IF NOT EXISTS issue_phase_lookup_idx ON symphony.issue (project_context_id, phase, blocked_reason, updated_at DESC);
+CREATE INDEX IF NOT EXISTS run_session_project_context_idx ON symphony.run_session (project_context_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS run_session_lookup_idx ON symphony.run_session (project_context_id, session_id, run_id);
+CREATE INDEX IF NOT EXISTS run_session_issue_status_idx ON symphony.run_session (project_context_id, issue_key, status, started_at DESC);
+CREATE INDEX IF NOT EXISTS run_session_identifier_started_idx ON symphony.run_session (project_context_id, issue_identifier, started_at DESC);
+CREATE INDEX IF NOT EXISTS run_session_workspace_idx ON symphony.run_session (project_context_id, workspace_key, started_at DESC);
+CREATE INDEX IF NOT EXISTS run_activity_event_ordering_idx ON symphony.run_activity_event (project_context_id, run_session_id, sequence);
+CREATE INDEX IF NOT EXISTS run_activity_event_run_ordering_idx ON symphony.run_activity_event (project_context_id, run_id, run_session_id, sequence);
+CREATE INDEX IF NOT EXISTS run_activity_event_time_ordering_idx ON symphony.run_activity_event (project_context_id, run_session_id, event_at, sequence);
+CREATE INDEX IF NOT EXISTS chat_message_ordering_idx ON symphony.chat_message (project_context_id, thread_key, message_index);
+CREATE INDEX IF NOT EXISTS chat_message_issue_ordering_idx ON symphony.chat_message (project_context_id, issue_key, created_at, message_index);
+CREATE INDEX IF NOT EXISTS chat_message_run_ordering_idx ON symphony.chat_message (project_context_id, run_id, message_index);
+CREATE INDEX IF NOT EXISTS chat_message_event_range_idx ON symphony.chat_message (project_context_id, run_id, event_sequence_start, event_sequence_end);
+CREATE INDEX IF NOT EXISTS writeback_operation_state_idx ON symphony.writeback_operation (project_context_id, status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS writeback_operation_issue_idx ON symphony.writeback_operation (project_context_id, issue_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS writeback_operation_run_idx ON symphony.writeback_operation (project_context_id, run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS approval_request_state_idx ON symphony.approval_request (project_context_id, status, expires_at, requested_at);
+CREATE INDEX IF NOT EXISTS approval_request_issue_idx ON symphony.approval_request (project_context_id, issue_key, requested_at DESC);
+CREATE INDEX IF NOT EXISTS approval_request_run_idx ON symphony.approval_request (project_context_id, run_id, requested_at DESC);
 
-ALTER TABLE symphony.approval_request
-  ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default',
-  ADD COLUMN IF NOT EXISTS project_context_label text;
+DROP INDEX IF EXISTS symphony.projection_revision_current_unique_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS projection_revision_current_unique_idx ON symphony.projection_revision (project_context_id, projection_name, scope_kind, scope_key) WHERE superseded_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS projection_revision_scope_revision_unique_idx ON symphony.projection_revision (project_context_id, projection_name, scope_kind, scope_key, revision);
+DROP INDEX IF EXISTS symphony.dashboard_projection_scope_revision_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS dashboard_projection_scope_revision_idx ON symphony.dashboard_projection (project_context_id, scope_key, revision);
+DROP INDEX IF EXISTS symphony.issue_board_projection_scope_revision_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS issue_board_projection_scope_revision_idx ON symphony.issue_board_projection (project_context_id, scope_key, revision);
+DROP INDEX IF EXISTS symphony.sidebar_projection_scope_revision_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS sidebar_projection_scope_revision_idx ON symphony.sidebar_projection (project_context_id, scope_key, revision);
+DROP INDEX IF EXISTS symphony.history_projection_scope_revision_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS history_projection_scope_revision_idx ON symphony.history_projection (project_context_id, scope_key, revision);
+DROP INDEX IF EXISTS symphony.transcript_projection_scope_revision_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS transcript_projection_scope_revision_idx ON symphony.transcript_projection (project_context_id, scope_key, revision);
+DROP INDEX IF EXISTS symphony.orchestrator_chat_projection_scope_revision_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS orchestrator_chat_projection_scope_revision_idx ON symphony.orchestrator_chat_projection (project_context_id, scope_key, conversation_key, revision);
 
-ALTER TABLE symphony.issue_board_projection
-  ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default',
-  ADD COLUMN IF NOT EXISTS project_context_label text;
+DROP INDEX IF EXISTS symphony.projection_revision_reads_idx;
+DROP INDEX IF EXISTS symphony.dashboard_projection_revision_reads_idx;
+DROP INDEX IF EXISTS symphony.issue_board_projection_revision_reads_idx;
+DROP INDEX IF EXISTS symphony.sidebar_projection_revision_reads_idx;
+DROP INDEX IF EXISTS symphony.history_projection_revision_reads_idx;
+DROP INDEX IF EXISTS symphony.history_projection_run_lookup_idx;
+DROP INDEX IF EXISTS symphony.transcript_projection_revision_reads_idx;
+DROP INDEX IF EXISTS symphony.transcript_projection_session_reads_idx;
+DROP INDEX IF EXISTS symphony.orchestrator_chat_projection_revision_reads_idx;
+DROP INDEX IF EXISTS symphony.orchestrator_chat_projection_issue_idx;
 
-ALTER TABLE symphony.history_projection
-  ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default',
-  ADD COLUMN IF NOT EXISTS project_context_label text;
-
-ALTER TABLE symphony.transcript_projection
-  ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default',
-  ADD COLUMN IF NOT EXISTS project_context_label text;
-
-ALTER TABLE symphony.orchestrator_chat_projection
-  ADD COLUMN IF NOT EXISTS project_context_id text NOT NULL DEFAULT 'default',
-  ADD COLUMN IF NOT EXISTS project_context_label text;
-
-CREATE INDEX IF NOT EXISTS workspace_project_context_idx
-  ON symphony.workspace (project_context_id, updated_at DESC);
-CREATE INDEX IF NOT EXISTS issue_project_context_idx
-  ON symphony.issue (project_context_id, updated_at DESC);
-CREATE INDEX IF NOT EXISTS run_session_project_context_idx
-  ON symphony.run_session (project_context_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS writeback_operation_project_context_idx
-  ON symphony.writeback_operation (project_context_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS approval_request_project_context_idx
-  ON symphony.approval_request (project_context_id, requested_at DESC);
-CREATE INDEX IF NOT EXISTS issue_board_projection_project_context_idx
-  ON symphony.issue_board_projection (project_context_id, revision DESC, updated_at DESC, generated_at DESC);
-CREATE INDEX IF NOT EXISTS history_projection_project_context_idx
-  ON symphony.history_projection (project_context_id, revision DESC, updated_at DESC, generated_at DESC);
-CREATE INDEX IF NOT EXISTS transcript_projection_project_context_idx
-  ON symphony.transcript_projection (project_context_id, revision DESC, updated_at DESC, generated_at DESC);
-CREATE INDEX IF NOT EXISTS orchestrator_chat_projection_project_context_idx
-  ON symphony.orchestrator_chat_projection (project_context_id, revision DESC, updated_at DESC, generated_at DESC);
+CREATE INDEX IF NOT EXISTS projection_revision_reads_idx ON symphony.projection_revision (project_context_id, projection_name, scope_kind, scope_key, revision DESC, updated_at DESC, generated_at DESC);
+CREATE INDEX IF NOT EXISTS projection_revision_scope_idx ON symphony.projection_revision (project_context_id, projection_name, scope_kind, scope_key);
+CREATE INDEX IF NOT EXISTS dashboard_projection_revision_reads_idx ON symphony.dashboard_projection (project_context_id, scope_key, revision DESC, updated_at DESC, generated_at DESC);
+CREATE INDEX IF NOT EXISTS issue_board_projection_project_context_idx ON symphony.issue_board_projection (project_context_id, scope_key, revision DESC, updated_at DESC, generated_at DESC);
+CREATE INDEX IF NOT EXISTS sidebar_projection_revision_reads_idx ON symphony.sidebar_projection (project_context_id, scope_key, revision DESC, updated_at DESC, generated_at DESC);
+CREATE INDEX IF NOT EXISTS history_projection_project_context_idx ON symphony.history_projection (project_context_id, scope_key, revision DESC, updated_at DESC, generated_at DESC);
+CREATE INDEX IF NOT EXISTS history_projection_run_lookup_idx ON symphony.history_projection (project_context_id, run_id, session_id, revision DESC);
+CREATE INDEX IF NOT EXISTS transcript_projection_project_context_idx ON symphony.transcript_projection (project_context_id, run_id, revision DESC, updated_at DESC, generated_at DESC);
+CREATE INDEX IF NOT EXISTS transcript_projection_session_reads_idx ON symphony.transcript_projection (project_context_id, session_id, revision DESC);
+CREATE INDEX IF NOT EXISTS orchestrator_chat_projection_project_context_idx ON symphony.orchestrator_chat_projection (project_context_id, scope_key, conversation_key, revision DESC, updated_at DESC, generated_at DESC);
+CREATE INDEX IF NOT EXISTS orchestrator_chat_projection_issue_idx ON symphony.orchestrator_chat_projection (project_context_id, issue_key, revision DESC);
