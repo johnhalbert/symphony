@@ -649,6 +649,98 @@ describe("project context normalization", () => {
     );
   });
 
+  it("inherits top-level workspace source values while rebasing state_dir to each context root", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear" },
+        workspace: {
+          root: "./global-workspaces",
+          state_dir: "./global-state",
+          source: {
+            kind: "git_worktree",
+            path: "$DEFAULT_SOURCE_PATH",
+            repository: "$DEFAULT_REPOSITORY",
+            base_ref: "$DEFAULT_BASE_REF",
+            branch_template: "$DEFAULT_BRANCH_TEMPLATE",
+            cleanup: "force",
+          },
+        },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: {
+              api_key: "$SYMPHONY_LINEAR_API_KEY",
+              project_slug: "SYMPHONY",
+            },
+            workspace: {
+              root: "./symphony-workspaces",
+            },
+          },
+          {
+            id: "docs",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              root: "./docs-workspaces",
+            },
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      {
+        DEFAULT_SOURCE_PATH: "./default-source",
+        DEFAULT_REPOSITORY: ".",
+        DEFAULT_BASE_REF: "origin/release",
+        DEFAULT_BRANCH_TEMPLATE: "global/{{ issue.identifier }}",
+        SYMPHONY_LINEAR_API_KEY: "symphony-linear-key",
+        DOCS_LINEAR_API_KEY: "docs-linear-key",
+      },
+    );
+
+    const symphonyContext = config.projectContexts.byId.get("symphony");
+    const docsContext = config.projectContexts.byId.get("docs");
+    const inheritedWorkspaceSource = {
+      kind: "git_worktree",
+      path: path.resolve("/repo", "./default-source"),
+      repository: path.resolve("/repo", "."),
+      baseRef: "origin/release",
+      branchTemplate: "global/{{ issue.identifier }}",
+      cleanup: "force",
+    };
+
+    expect(symphonyContext).toMatchObject({
+      workspace: {
+        root: path.resolve("/repo", "./symphony-workspaces"),
+        stateDir: path.resolve("/repo", "./symphony-workspaces", "./global-state"),
+        source: inheritedWorkspaceSource,
+      },
+      publicMetadata: {
+        workspaceRoot: path.resolve("/repo", "./symphony-workspaces"),
+        workspaceSourceKind: "git_worktree",
+        repository: path.resolve("/repo", "."),
+        path: path.resolve("/repo", "./default-source"),
+      },
+    });
+    expect(docsContext).toMatchObject({
+      workspace: {
+        root: path.resolve("/repo", "./docs-workspaces"),
+        stateDir: path.resolve("/repo", "./docs-workspaces", "./global-state"),
+        source: inheritedWorkspaceSource,
+      },
+      publicMetadata: {
+        workspaceRoot: path.resolve("/repo", "./docs-workspaces"),
+        workspaceSourceKind: "git_worktree",
+        repository: path.resolve("/repo", "."),
+        path: path.resolve("/repo", "./default-source"),
+      },
+    });
+    expect(config.workspace).toEqual(symphonyContext?.workspace);
+    expect(config.workspace.stateDir).toBe(path.resolve("/repo", "./symphony-workspaces", "./global-state"));
+    expect(config.workspace.source.branchTemplate).toBe("global/{{ issue.identifier }}");
+  });
+
   it("drops inherited git_worktree workspace.source fields when explicit contexts switch source kinds", () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
