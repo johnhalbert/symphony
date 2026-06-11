@@ -323,8 +323,6 @@ describe("Postgres Symphony-owned state migration", () => {
       "alter table symphony.issue add primary key (project_context_id, issue_key)",
       "drop index if exists symphony.issue_identifier_unique_idx",
       "create unique index if not exists issue_identifier_unique_idx on symphony.issue (project_context_id, tracker_source, issue_identifier)",
-      "alter table symphony.run_session drop constraint if exists run_session_pkey",
-      "alter table symphony.run_session add primary key (project_context_id, run_id)",
       "alter table symphony.run_activity_event drop constraint if exists run_activity_event_run_session_id_sequence_key",
       "alter table symphony.run_activity_event add constraint run_activity_event_run_session_id_sequence_key unique (project_context_id, run_session_id, sequence)",
       "drop index if exists symphony.run_activity_event_external_event_unique_idx",
@@ -342,6 +340,8 @@ describe("Postgres Symphony-owned state migration", () => {
       ]) {
         expect(normalized, `missing owned-state project context uniqueness fragment: ${fragment}`).toContain(fragment);
       }
+      expect(normalized).not.toContain("alter table symphony.run_session drop constraint if exists run_session_pkey");
+      expect(normalized).not.toContain("alter table symphony.run_session add primary key (project_context_id, run_id)");
 
       for (const fragment of [
       "drop index if exists symphony.run_session_lookup_idx",
@@ -433,6 +433,10 @@ describe("Postgres Symphony-owned state migration", () => {
       ]) {
         expect(normalized, `missing projection context uniqueness fragment: ${fragment}`).toContain(fragment);
       }
+      expect(normalized).toContain("from pg_constraint con");
+      expect(normalized).toContain("con.conrelid = 'symphony.projection_revision'::regclass");
+      expect(normalized).toContain("con.contype = 'u'");
+      expect(normalized).toContain("alter table symphony.projection_revision drop constraint");
 
       for (const fragment of [
       "drop index if exists symphony.projection_revision_reads_idx",
@@ -713,6 +717,7 @@ describe("Postgres Symphony-owned state migration", () => {
         if (hasProjectContextAttributionMigration) {
           await expectProjectContextScopedCoexistence(containerName);
           await expectProjectContextScopedRunActivityReplayAndReducedChatIsolation(connectionString);
+          await expectRunSessionForeignKeysPreserved(containerName);
         }
         await expectRunActivityAndChatMessageReplayAndDuplicateHandling(containerName);
         await expectDuplicateWorkspaceAndExternalIssueConstraints(containerName);
@@ -778,6 +783,7 @@ describe("Postgres Symphony-owned state migration", () => {
         await expectLegacyProjectionSourceFreshnessMigrated(containerName);
         if (hasProjectContextAttributionMigration) {
           await expectLegacyProjectContextAttributionMigrated(containerName);
+          await expectRunSessionForeignKeysPreserved(containerName);
         }
         await expectOperationalAndProjectionInsertQueryPaths(containerName);
         if (hasProjectContextAttributionMigration) {
@@ -1861,7 +1867,7 @@ async function expectLegacyProjectContextAttributionMigrated(containerName: stri
         and conname = 'run_session_pkey';
     `,
   );
-  expect(normalizedSql(runSessionPrimaryKey)).toContain("primary key (project_context_id, run_id)");
+  expect(normalizedSql(runSessionPrimaryKey)).toContain("primary key (run_id)");
 
   const writebackPrimaryKey = await psql(
     containerName,
@@ -2454,8 +2460,8 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
           started_at,
           updated_at
         ) values
-          ('symphony', 'run:context-shared', 'session:context-shared', 'worker', 'issue:context-shared', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/symphony/ENG-CTX-101', 1, 'running', now(), now()),
-          ('docs', 'run:context-shared', 'session:context-shared', 'worker', 'issue:context-shared', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/docs/ENG-CTX-101', 1, 'running', now(), now())
+          ('symphony', 'run:context-shared:symphony', 'session:context-shared', 'worker', 'issue:context-shared', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/symphony/ENG-CTX-101', 1, 'running', now(), now()),
+          ('docs', 'run:context-shared:docs', 'session:context-shared', 'worker', 'issue:context-shared', 'ENG-CTX-101', 'workspace:context-shared', '/tmp/docs/ENG-CTX-101', 1, 'running', now(), now())
         returning project_context_id, run_id
       ), inserted_run_activity_event as (
         insert into symphony.run_activity_event (
@@ -2863,7 +2869,7 @@ async function expectProjectContextScopedCoexistence(containerName: string): Pro
   expect(indexes.issue_identifier_unique_idx?.toLowerCase()).toContain(
     "(project_context_id, tracker_source, issue_identifier)",
   );
-  expect(indexes.run_session_pkey?.toLowerCase()).toContain("(project_context_id, run_id)");
+  expect(indexes.run_session_pkey?.toLowerCase()).toContain("(run_id)");
   expect(indexes.run_session_lookup_idx?.toLowerCase()).toContain("(project_context_id, session_id, run_id)");
   expect(indexes.run_activity_event_ordering_idx?.toLowerCase()).toContain(
     "(project_context_id, run_session_id, sequence)",
@@ -3532,6 +3538,35 @@ async function expectProjectContextScopedProjectionChildDuplicatesRejected(conta
   ]) {
     await expect(psql(containerName, duplicateInsert)).rejects.toThrow(/duplicate key value violates unique constraint/i);
   }
+}
+
+async function expectRunSessionForeignKeysPreserved(containerName: string): Promise<void> {
+  const foreignKeys = JSON.parse(
+    (
+      await psql(
+        containerName,
+        String.raw`
+          select coalesce(
+            jsonb_object_agg(conname, pg_get_constraintdef(oid) order by conname),
+            '{}'::jsonb
+          )::text
+          from pg_constraint
+          where conrelid in ('symphony.run_activity_event'::regclass, 'symphony.chat_message'::regclass)
+            and contype = 'f'
+            and confrelid = 'symphony.run_session'::regclass;
+        `,
+      )
+    ).trim(),
+  ) as Record<string, string>;
+
+  expect(foreignKeys.run_activity_event_run_id_fkey).toBeDefined();
+  expect(normalizedSql(foreignKeys.run_activity_event_run_id_fkey ?? "")).toContain(
+    "foreign key (run_id) references symphony.run_session(run_id) on delete cascade",
+  );
+  expect(foreignKeys.chat_message_run_id_fkey).toBeDefined();
+  expect(normalizedSql(foreignKeys.chat_message_run_id_fkey ?? "")).toContain(
+    "foreign key (run_id) references symphony.run_session(run_id) on delete set null",
+  );
 }
 
 async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolation(

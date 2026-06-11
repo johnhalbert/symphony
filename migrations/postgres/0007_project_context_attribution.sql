@@ -39,8 +39,9 @@ ALTER TABLE symphony.issue DROP CONSTRAINT IF EXISTS issue_pkey;
 ALTER TABLE symphony.issue ADD PRIMARY KEY (project_context_id, issue_key);
 DROP INDEX IF EXISTS symphony.issue_identifier_unique_idx;
 CREATE UNIQUE INDEX IF NOT EXISTS issue_identifier_unique_idx ON symphony.issue (project_context_id, tracker_source, issue_identifier);
-ALTER TABLE symphony.run_session DROP CONSTRAINT IF EXISTS run_session_pkey;
-ALTER TABLE symphony.run_session ADD PRIMARY KEY (project_context_id, run_id);
+-- Preserve the published 0002 run_session(run_id) foreign-key target for
+-- run_activity_event.run_id and chat_message.run_id while adding context
+-- attribution and context-scoped lookup indexes.
 ALTER TABLE symphony.run_activity_event DROP CONSTRAINT IF EXISTS run_activity_event_run_session_id_sequence_key;
 ALTER TABLE symphony.run_activity_event ADD CONSTRAINT run_activity_event_run_session_id_sequence_key UNIQUE (project_context_id, run_session_id, sequence);
 DROP INDEX IF EXISTS symphony.run_activity_event_external_event_unique_idx;
@@ -100,6 +101,30 @@ CREATE INDEX IF NOT EXISTS approval_request_issue_idx ON symphony.approval_reque
 CREATE INDEX IF NOT EXISTS approval_request_run_idx ON symphony.approval_request (project_context_id, run_id, requested_at DESC);
 
 DROP INDEX IF EXISTS symphony.projection_revision_current_unique_idx;
+DO $$
+DECLARE
+  legacy_projection_revision_constraint text;
+BEGIN
+  SELECT con.conname
+  INTO legacy_projection_revision_constraint
+  FROM pg_constraint con
+  WHERE con.conrelid = 'symphony.projection_revision'::regclass
+    AND con.contype = 'u'
+    AND con.conkey = ARRAY[
+      (SELECT attnum::smallint FROM pg_attribute WHERE attrelid = 'symphony.projection_revision'::regclass AND attname = 'projection_name'),
+      (SELECT attnum::smallint FROM pg_attribute WHERE attrelid = 'symphony.projection_revision'::regclass AND attname = 'scope_kind'),
+      (SELECT attnum::smallint FROM pg_attribute WHERE attrelid = 'symphony.projection_revision'::regclass AND attname = 'scope_key'),
+      (SELECT attnum::smallint FROM pg_attribute WHERE attrelid = 'symphony.projection_revision'::regclass AND attname = 'revision')
+    ]::smallint[]
+  LIMIT 1;
+
+  IF legacy_projection_revision_constraint IS NOT NULL THEN
+    EXECUTE format(
+      'ALTER TABLE symphony.projection_revision DROP CONSTRAINT %I',
+      legacy_projection_revision_constraint
+    );
+  END IF;
+END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS projection_revision_current_unique_idx ON symphony.projection_revision (project_context_id, projection_name, scope_kind, scope_key) WHERE superseded_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS projection_revision_scope_revision_unique_idx ON symphony.projection_revision (project_context_id, projection_name, scope_kind, scope_key, revision);
 DROP INDEX IF EXISTS symphony.dashboard_projection_scope_revision_idx;
