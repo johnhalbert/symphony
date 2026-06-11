@@ -87,6 +87,30 @@ export interface ProjectContextRegistry<TContext extends { id: ProjectContextId;
   byId: ReadonlyMap<ProjectContextId, TContext>;
 }
 
+export type ProjectContextRoutingProblemReason =
+  | "missing_context"
+  | "ambiguous_context"
+  | "disabled_context"
+  | "credential_unavailable"
+  | "codebase_unavailable"
+  | "stale_context";
+
+export interface ProjectContextRoutingProblem {
+  reason: ProjectContextRoutingProblemReason;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  candidateContextIds: ProjectContextId[];
+  safeMessage: string;
+}
+
+export type ProjectContextRoutingResult =
+  | { kind: "resolved"; projectContext: ProjectContextResolution }
+  | { kind: "problem"; problem: ProjectContextRoutingProblem };
+
+export interface ResolveProjectContextForIssueOptions {
+  persistedContext?: Partial<ProjectContextResolution> | null;
+}
+
 export interface LegacyProjectContextDefaults<
   TTracker = unknown,
   TWorkspace = unknown,
@@ -278,6 +302,154 @@ export function buildProjectContextRegistry<TContext extends { id: ProjectContex
   };
 }
 
+export function resolveProjectContextForIssue<
+  TContext extends {
+    id: ProjectContextId;
+    label: string;
+    enabled: boolean;
+    tracker?: { projectSlug?: string | null } | null;
+  },
+>(
+  issue: unknown,
+  registry: ProjectContextRegistry<TContext>,
+  options: ResolveProjectContextForIssueOptions = {},
+): ProjectContextRoutingResult {
+  if (options.persistedContext !== null && options.persistedContext !== undefined) {
+    return validatePersistedContextForResolution(issue, options.persistedContext);
+  }
+
+  const issueRouting = readIssueRoutingFields(issue);
+  if (issueRouting === null) {
+    if (registry.enabledContexts.length === 1) {
+      return {
+        kind: "resolved",
+        projectContext: projectContextResolutionFromConfiguredContext(registry.defaultContext, null),
+      };
+    }
+
+    return {
+      kind: "problem",
+      problem: createProjectContextRoutingProblem(
+        "ambiguous_context",
+        issue,
+        registry.enabledContexts.map((context) => context.id),
+        `Issue ${describeIssueForRouting(issue)} does not identify a single enabled project context`,
+      ),
+    };
+  }
+
+  const routingSource = issueRouting.routingSource ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE;
+  const replayLikeSource = isReplayLikeRoutingSource(routingSource);
+  if (issueRouting.projectContextId !== undefined) {
+    const normalizedProjectContextId = normalizeProjectContextId(issueRouting.projectContextId);
+    const configuredContext = registry.byId.get(normalizedProjectContextId);
+    if (configuredContext?.enabled) {
+      if (explicitRoutingMismatchesConfiguredSlug(configuredContext, issueRouting.linearProjectSlug)) {
+        return {
+          kind: "problem",
+          problem: createProjectContextRoutingProblem(
+            "stale_context",
+            issue,
+            [configuredContext.id],
+            `Issue ${describeIssueForRouting(issue)} declared project context ${configuredContext.id} with a mismatched Linear project slug`,
+          ),
+        };
+      }
+
+      return {
+        kind: "resolved",
+        projectContext: projectContextResolutionFromConfiguredContext(configuredContext, issueRouting),
+      };
+    }
+    if (configuredContext) {
+      if (replayLikeSource) {
+        return {
+          kind: "resolved",
+          projectContext: projectContextResolutionFromIssueRouting(issueRouting),
+        };
+      }
+
+      return {
+        kind: "problem",
+        problem: createProjectContextRoutingProblem(
+          "disabled_context",
+          issue,
+          [configuredContext.id],
+          `Issue ${describeIssueForRouting(issue)} matched disabled project context ${configuredContext.id}`,
+        ),
+      };
+    }
+
+    if (replayLikeSource) {
+      return {
+        kind: "resolved",
+        projectContext: projectContextResolutionFromIssueRouting(issueRouting),
+      };
+    }
+
+    return {
+      kind: "problem",
+      problem: createProjectContextRoutingProblem(
+        "missing_context",
+        issue,
+        [],
+        `Issue ${describeIssueForRouting(issue)} did not match any configured project context`,
+      ),
+    };
+  }
+
+  const matchingEnabledContexts = registry.enabledContexts.filter((context) =>
+    sameProjectSlug(context.tracker?.projectSlug, issueRouting.linearProjectSlug),
+  );
+  if (matchingEnabledContexts.length === 1) {
+    const matchedContext = matchingEnabledContexts[0]!;
+    return {
+      kind: "resolved",
+      projectContext: projectContextResolutionFromConfiguredContext(matchedContext, issueRouting),
+    };
+  }
+  if (matchingEnabledContexts.length > 1) {
+    return {
+      kind: "problem",
+      problem: createProjectContextRoutingProblem(
+        "ambiguous_context",
+        issue,
+        matchingEnabledContexts.map((context) => context.id),
+        `Issue ${describeIssueForRouting(issue)} matched multiple enabled project contexts: ${matchingEnabledContexts
+          .map((context) => context.id)
+          .join(", ")}`,
+      ),
+    };
+  }
+
+  const matchingDisabledContexts = registry.contexts.filter(
+    (context) => !context.enabled && sameProjectSlug(context.tracker?.projectSlug, issueRouting.linearProjectSlug),
+  );
+  if (matchingDisabledContexts.length > 0) {
+    return {
+      kind: "problem",
+      problem: createProjectContextRoutingProblem(
+        "disabled_context",
+        issue,
+        matchingDisabledContexts.map((context) => context.id),
+        `Issue ${describeIssueForRouting(issue)} matched only disabled project contexts: ${matchingDisabledContexts
+          .map((context) => context.id)
+          .join(", ")}`,
+      ),
+    };
+  }
+
+  return {
+    kind: "problem",
+    problem: createProjectContextRoutingProblem(
+      "missing_context",
+      issue,
+      [],
+      `Issue ${describeIssueForRouting(issue)} did not match any enabled project context`,
+    ),
+  };
+}
+
 function readExplicitProjectContextId(
   value: { projectContextId?: string | null } | null | undefined,
 ): string | undefined {
@@ -291,4 +463,176 @@ function normalizeOptionalNonEmptyString(value: string | null | undefined): stri
   if (value === null || value === undefined) return null;
   const normalized = value.trim();
   return normalized.length === 0 ? null : normalized;
+}
+
+function readIssueRoutingFields(issue: unknown): {
+  projectContextId?: string;
+  projectContextLabel: string | null;
+  linearProjectSlug: string | null;
+  routingSource: string | null;
+} | null {
+  if (typeof issue !== "object" || issue === null) return null;
+
+  const value = issue as ProjectContextIssueLike;
+  if (value.projectContext && typeof value.projectContext === "object") {
+    const explicitProjectContextId = readExplicitProjectContextId(value.projectContext);
+    const projectContextLabel = normalizeOptionalNonEmptyString(value.projectContext.projectContextLabel);
+    const linearProjectSlug = normalizeOptionalNonEmptyString(value.projectContext.linearProjectSlug);
+    const routingSource = normalizeOptionalNonEmptyString(value.projectContext.routingSource);
+    if (
+      explicitProjectContextId === undefined &&
+      projectContextLabel === null &&
+      linearProjectSlug === null &&
+      routingSource === null
+    ) {
+      return null;
+    }
+
+    return {
+      ...(explicitProjectContextId === undefined ? {} : { projectContextId: explicitProjectContextId }),
+      projectContextLabel,
+      linearProjectSlug,
+      routingSource,
+    };
+  }
+
+  const explicitProjectContextId = readExplicitProjectContextId(value);
+  const projectContextLabel = normalizeOptionalNonEmptyString(value.projectContextLabel);
+  const linearProjectSlug =
+    normalizeOptionalNonEmptyString(value.linearProjectSlug) ??
+    normalizeOptionalNonEmptyString(value.linearProjectIdentity?.slug);
+  const routingSource = normalizeOptionalNonEmptyString(value.routingSource);
+  if (
+    explicitProjectContextId === undefined &&
+    projectContextLabel === null &&
+    linearProjectSlug === null &&
+    routingSource === null
+  ) {
+    return null;
+  }
+
+  return {
+    ...(explicitProjectContextId === undefined ? {} : { projectContextId: explicitProjectContextId }),
+    projectContextLabel,
+    linearProjectSlug,
+    routingSource,
+  };
+}
+
+function validatePersistedContextForResolution(
+  issue: unknown,
+  persistedContext: Partial<ProjectContextResolution>,
+): ProjectContextRoutingResult {
+  if (readExplicitProjectContextId(persistedContext) === undefined) {
+    return {
+      kind: "problem",
+      problem: createProjectContextRoutingProblem(
+        "stale_context",
+        issue,
+        [],
+        `Issue ${describeIssueForRouting(issue)} has persisted project context metadata without an explicit project context id`,
+      ),
+    };
+  }
+
+  return {
+    kind: "resolved",
+    projectContext: normalizeProjectContextResolution(persistedContext),
+  };
+}
+
+function explicitRoutingMismatchesConfiguredSlug<
+  TContext extends {
+    id: ProjectContextId;
+    tracker?: { projectSlug?: string | null } | null;
+  },
+>(context: TContext, routedProjectSlug: string | null): boolean {
+  const configuredProjectSlug = normalizeOptionalNonEmptyString(context.tracker?.projectSlug);
+  if (configuredProjectSlug === null || routedProjectSlug === null) {
+    return false;
+  }
+  return !sameProjectSlug(configuredProjectSlug, routedProjectSlug);
+}
+
+function projectContextResolutionFromConfiguredContext<
+  TContext extends {
+    id: ProjectContextId;
+    label: string;
+    tracker?: { projectSlug?: string | null } | null;
+  },
+>(
+  context: TContext,
+  issueRouting: {
+    projectContextLabel: string | null;
+    linearProjectSlug: string | null;
+    routingSource: string | null;
+  } | null,
+): ProjectContextResolution {
+  return normalizeProjectContextResolution({
+    projectContextId: context.id,
+    projectContextLabel: issueRouting?.projectContextLabel ?? context.label,
+    linearProjectSlug: issueRouting?.linearProjectSlug ?? normalizeOptionalNonEmptyString(context.tracker?.projectSlug),
+    routingSource: issueRouting?.routingSource ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+  });
+}
+
+function projectContextResolutionFromIssueRouting(issueRouting: {
+  projectContextId?: string;
+  projectContextLabel: string | null;
+  linearProjectSlug: string | null;
+  routingSource: string | null;
+}): ProjectContextResolution {
+  return normalizeProjectContextResolution({
+    ...(issueRouting.projectContextId === undefined ? {} : { projectContextId: issueRouting.projectContextId }),
+    ...(issueRouting.projectContextLabel === null ? {} : { projectContextLabel: issueRouting.projectContextLabel }),
+    ...(issueRouting.linearProjectSlug === null ? {} : { linearProjectSlug: issueRouting.linearProjectSlug }),
+    ...(issueRouting.routingSource === null ? {} : { routingSource: issueRouting.routingSource }),
+  });
+}
+
+function sameProjectSlug(left: string | null | undefined, right: string | null | undefined): boolean {
+  const normalizedLeft = normalizeProjectSlug(left);
+  const normalizedRight = normalizeProjectSlug(right);
+  return normalizedLeft !== null && normalizedLeft === normalizedRight;
+}
+
+function normalizeProjectSlug(value: string | null | undefined): string | null {
+  const normalized = normalizeOptionalNonEmptyString(value);
+  return normalized === null ? null : normalized.toUpperCase();
+}
+
+function isReplayLikeRoutingSource(routingSource: string): boolean {
+  return routingSource === "replay" || routingSource === "state_refresh";
+}
+
+function createProjectContextRoutingProblem(
+  reason: ProjectContextRoutingProblemReason,
+  issue: unknown,
+  candidateContextIds: ProjectContextId[],
+  safeMessage: string,
+): ProjectContextRoutingProblem {
+  return {
+    reason,
+    issueId: readIssueIdentityField(issue, "id"),
+    issueIdentifier: readIssueIdentityField(issue, "identifier"),
+    candidateContextIds: [...candidateContextIds],
+    safeMessage,
+  };
+}
+
+function describeIssueForRouting(issue: unknown): string {
+  return readIssueIdentityField(issue, "identifier") ?? readIssueIdentityField(issue, "id") ?? "unknown issue";
+}
+
+function readIssueIdentityField(issue: unknown, key: "id" | "identifier"): string | null {
+  if (typeof issue !== "object" || issue === null || !Object.prototype.hasOwnProperty.call(issue, key)) {
+    return null;
+  }
+
+  const value = issue as { id?: unknown; identifier?: unknown };
+  return normalizeOptionalNonEmptyString(key === "id" ? asNullableString(value.id) : asNullableString(value.identifier));
+}
+
+function asNullableString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
 }
