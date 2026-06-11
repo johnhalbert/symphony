@@ -1590,6 +1590,54 @@ describe("project context workflow contracts", () => {
       env: { DOCS_LINEAR_API_KEY: "docs-linear-secret" },
       expectedMessage: 'project_contexts["Docs Site"].workspace.source is required for enabled project contexts',
     },
+    {
+      label: "missing git_worktree repository",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              root: "./docs-workspaces",
+              source: {
+                kind: "git_worktree",
+                base_ref: "origin/main",
+              },
+            },
+          },
+        ],
+      },
+      env: { DOCS_LINEAR_API_KEY: "docs-linear-secret" },
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source.repository is required for git_worktree',
+    },
+    {
+      label: "missing git_worktree base ref",
+      rawConfig: {
+        tracker: { kind: "linear" },
+        project_contexts: [
+          {
+            id: "Docs Site",
+            tracker: {
+              api_key: "$DOCS_LINEAR_API_KEY",
+              project_slug: "DOCS",
+            },
+            workspace: {
+              root: "./docs-workspaces",
+              source: {
+                kind: "git_worktree",
+                repository: "../docs-site",
+              },
+            },
+          },
+        ],
+      },
+      env: { DOCS_LINEAR_API_KEY: "docs-linear-secret" },
+      expectedMessage: 'project_contexts["Docs Site"].workspace.source.base_ref is required for git_worktree',
+    },
   ])("rejects enabled project contexts with $label", ({ rawConfig, env, expectedMessage }) => {
     expect(() => parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env)).toThrowError(expectedMessage);
   });
