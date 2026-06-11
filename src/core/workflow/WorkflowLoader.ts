@@ -23,15 +23,18 @@ export interface WorkflowReloadEvent {
 }
 
 export interface WorkflowReloadProjectContextDetails {
-  rawId: string;
+  contextPath: string;
+  rawId: string | null;
   projectContextId: string | null;
-  projectContextLabel: string;
-  enabled: boolean;
+  projectContextLabel: string | null;
+  enabled: boolean | null;
 }
 
 export interface WorkflowReloadErrorDetails {
-  contextPath: string;
-  projectContext: WorkflowReloadProjectContextDetails;
+  reason: "invalid_project_context_configuration" | "duplicate_project_context_id";
+  projectContexts: WorkflowReloadProjectContextDetails[];
+  projectContextFieldPaths?: string[];
+  duplicateProjectContextId?: string;
 }
 
 export class WorkflowLoader {
@@ -192,35 +195,137 @@ function isMissingFileError(error: unknown): boolean {
 }
 
 const PROJECT_CONTEXT_ERROR_PATH_PATTERN = /(project_contexts\[("(?:\\.|[^"])*")\])/;
+const PROJECT_CONTEXT_PATH_PATTERN = /^project_contexts\[("(?:\\.|[^"])*")\]$/;
+const PROJECT_CONTEXT_INDEX_PATH_PATTERN = /^project_contexts\[(\d+)\]$/;
+const DUPLICATE_PROJECT_CONTEXT_ID_PATTERN = /^Duplicate project context id: (.+)$/;
 
 function sanitizeWorkflowReloadError(error: unknown, config: RawWorkflowConfig | null): SymphonyError {
   const symphonyError =
     error instanceof SymphonyError ? error : new SymphonyError("workflow_parse_error", errorMessage(error), error);
-  const details = config === null ? null : workflowReloadErrorDetails(config, symphonyError.message);
+  const details = config === null ? null : workflowReloadErrorDetails(config, symphonyError);
   if (details === null) return symphonyError;
-  return new SymphonyError(symphonyError.code, symphonyError.message, details);
+  return new SymphonyError(symphonyError.code, workflowReloadErrorMessage(details), details);
 }
 
-function workflowReloadErrorDetails(config: RawWorkflowConfig, message: string): WorkflowReloadErrorDetails | null {
-  const rawContexts = config.project_contexts;
-  if (!rawContexts || rawContexts.length === 0) return null;
-  const match = PROJECT_CONTEXT_ERROR_PATH_PATTERN.exec(message);
-  if (!match) return null;
+function workflowReloadErrorDetails(config: RawWorkflowConfig, error: SymphonyError): WorkflowReloadErrorDetails | null {
+  const signal = workflowReloadErrorSignal(error, config);
+  if (signal === null || signal.projectContextPaths.length === 0) return null;
+  return {
+    reason: signal.duplicateProjectContextId === null ? "invalid_project_context_configuration" : "duplicate_project_context_id",
+    projectContexts: signal.projectContextPaths.map((contextPath) => workflowReloadProjectContextDetails(config, contextPath)),
+    ...(signal.projectContextFieldPaths.length === 0
+      ? {}
+      : { projectContextFieldPaths: signal.projectContextFieldPaths }),
+    ...(signal.duplicateProjectContextId === null
+      ? {}
+      : { duplicateProjectContextId: signal.duplicateProjectContextId }),
+  };
+}
 
-  const contextPath = match[1];
-  if (!contextPath) return null;
-  const rawId = parseWorkflowReloadContextRawId(match[2] ?? "");
-  const rawContext = rawContexts.find((context) => context.id === rawId);
-  const projectContextId = normalizeWorkflowReloadProjectContextId(rawContext?.id ?? rawId);
+function workflowReloadErrorMessage(details: WorkflowReloadErrorDetails): string {
+  const contextSummary = details.projectContexts.map((context) => context.contextPath).join(", ");
+  if (details.reason === "duplicate_project_context_id") {
+    return `Workflow reload validation failed for ${contextSummary}: duplicate normalized project context id`;
+  }
+  const fieldSummary = workflowReloadFieldSummary(details.projectContextFieldPaths ?? []);
+  if (fieldSummary !== null) {
+    return `Workflow reload validation failed for ${contextSummary}: invalid ${fieldSummary}`;
+  }
+  return `Workflow reload validation failed for ${contextSummary}: invalid project context configuration`;
+}
+
+function workflowReloadFieldSummary(fieldPaths: readonly string[]): string | null {
+  const uniqueFieldPaths = uniqueStrings(fieldPaths);
+  return uniqueFieldPaths.length === 0 ? null : uniqueFieldPaths.join(", ");
+}
+
+interface WorkflowReloadErrorSignal {
+  projectContextPaths: string[];
+  projectContextFieldPaths: string[];
+  duplicateProjectContextId: string | null;
+}
+
+function workflowReloadErrorSignal(error: SymphonyError, config: RawWorkflowConfig): WorkflowReloadErrorSignal | null {
+  const signaled = readWorkflowReloadErrorSignal(error.details);
+  if (signaled.projectContextPaths.length > 0) return signaled;
+
+  const pathMatch = PROJECT_CONTEXT_ERROR_PATH_PATTERN.exec(error.message);
+  if (pathMatch?.[1]) {
+    return {
+      projectContextPaths: [pathMatch[1]],
+      projectContextFieldPaths: extractProjectContextFieldPaths(error.message, pathMatch[1]),
+      duplicateProjectContextId: null,
+    };
+  }
+
+  const duplicateMatch = DUPLICATE_PROJECT_CONTEXT_ID_PATTERN.exec(error.message);
+  const duplicateProjectContextId = normalizeNonEmptyString(duplicateMatch?.[1]);
+  if (duplicateProjectContextId === null) return null;
+
+  const projectContextPaths = workflowReloadProjectContextPathsForDuplicateId(config, duplicateProjectContextId);
+  if (projectContextPaths.length === 0) return null;
+  return {
+    projectContextPaths,
+    projectContextFieldPaths: [],
+    duplicateProjectContextId,
+  };
+}
+
+function readWorkflowReloadErrorSignal(details: unknown): WorkflowReloadErrorSignal {
+  if (!isPlainObject(details)) {
+    return {
+      projectContextPaths: [],
+      projectContextFieldPaths: [],
+      duplicateProjectContextId: null,
+    };
+  }
+  return {
+    projectContextPaths: uniqueStrings(readStringArray(details.projectContextPaths)),
+    projectContextFieldPaths: uniqueStrings(readStringArray(details.projectContextFieldPaths)),
+    duplicateProjectContextId: normalizeNonEmptyString(details.duplicateProjectContextId),
+  };
+}
+
+function workflowReloadProjectContextPathsForDuplicateId(config: RawWorkflowConfig, duplicateProjectContextId: string): string[] {
+  return uniqueStrings(
+    readRawProjectContexts(config).flatMap((rawContext, index) => {
+      const rawId = readRawProjectContextId(rawContext);
+      if (rawId === null || normalizeWorkflowReloadProjectContextId(rawId) !== duplicateProjectContextId) return [];
+      return [workflowReloadContextPath(rawId, index)];
+    }),
+  );
+}
+
+function workflowReloadProjectContextDetails(
+  config: RawWorkflowConfig,
+  contextPath: string,
+): WorkflowReloadProjectContextDetails {
+  const rawContextMatch = PROJECT_CONTEXT_PATH_PATTERN.exec(contextPath);
+  const rawIdFromPath = rawContextMatch?.[1] ? parseWorkflowReloadContextRawId(rawContextMatch[1]) : null;
+  const contextIndex = parseWorkflowReloadContextIndex(contextPath);
+  const rawContexts = readRawProjectContexts(config);
+  const rawContext =
+    contextIndex !== null
+      ? (rawContexts[contextIndex] ?? null)
+      : rawIdFromPath === null
+        ? null
+        : rawContexts.find((candidate) => readRawProjectContextId(candidate) === rawIdFromPath) ?? null;
+  const rawId = readRawProjectContextId(rawContext) ?? rawIdFromPath;
+  const projectContextId = rawId === null ? null : normalizeWorkflowReloadProjectContextId(rawId);
   return {
     contextPath,
-    projectContext: {
-      rawId,
-      projectContextId,
-      projectContextLabel: workflowReloadProjectContextLabel(rawContext?.label, rawContext?.id ?? rawId, projectContextId),
-      enabled: rawContext?.enabled ?? true,
-    },
+    rawId,
+    projectContextId,
+    projectContextLabel: workflowReloadProjectContextLabel(readRawProjectContextLabel(rawContext), rawId, projectContextId),
+    enabled: readRawProjectContextEnabled(rawContext),
   };
+}
+
+function parseWorkflowReloadContextIndex(value: string): number | null {
+  const match = PROJECT_CONTEXT_INDEX_PATH_PATTERN.exec(value);
+  if (!match?.[1]) return null;
+  const parsed = Number(match[1]);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function parseWorkflowReloadContextRawId(value: string): string {
@@ -232,6 +337,24 @@ function parseWorkflowReloadContextRawId(value: string): string {
   }
 }
 
+function readRawProjectContexts(config: RawWorkflowConfig): unknown[] {
+  return Array.isArray(config.project_contexts) ? (config.project_contexts as unknown[]) : [];
+}
+
+function readRawProjectContextId(value: unknown): string | null {
+  return isPlainObject(value) && typeof value.id === "string" ? value.id : null;
+}
+
+function readRawProjectContextLabel(value: unknown): string | null {
+  return isPlainObject(value) && typeof value.label === "string" ? value.label : null;
+}
+
+function readRawProjectContextEnabled(value: unknown): boolean | null {
+  if (!isPlainObject(value)) return null;
+  if (!Object.prototype.hasOwnProperty.call(value, "enabled") || value.enabled === undefined) return true;
+  return typeof value.enabled === "boolean" ? value.enabled : null;
+}
+
 function normalizeWorkflowReloadProjectContextId(value: string): string | null {
   try {
     return normalizeProjectContextId(value);
@@ -241,13 +364,41 @@ function normalizeWorkflowReloadProjectContextId(value: string): string | null {
 }
 
 function workflowReloadProjectContextLabel(
-  value: string | undefined,
-  rawId: string,
+  value: string | null,
+  rawId: string | null,
   projectContextId: string | null,
-): string {
+): string | null {
   const normalizedLabel = value?.trim();
   if (normalizedLabel && normalizedLabel.length > 0) return normalizedLabel;
   if (projectContextId) return defaultProjectContextLabel(projectContextId);
-  const normalizedRawId = rawId.trim();
-  return normalizedRawId.length > 0 ? normalizedRawId : rawId;
+  const normalizedRawId = rawId?.trim();
+  return normalizedRawId && normalizedRawId.length > 0 ? normalizedRawId : rawId;
+}
+
+function workflowReloadContextPath(rawId: string | null, index: number): string {
+  return rawId === null ? `project_contexts[${index}]` : `project_contexts[${JSON.stringify(rawId)}]`;
+}
+
+function extractProjectContextFieldPaths(message: string, contextPath: string): string[] {
+  const prefix = `${contextPath}.`;
+  if (message.startsWith(prefix)) {
+    const remainder = message.slice(prefix.length);
+    const scopedMatch = /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(remainder);
+    if (scopedMatch?.[1]) return [scopedMatch[1]];
+  }
+  return uniqueStrings(message.match(/[a-z_]+(?:\.[a-z_]+|\[\d+\])+/g) ?? []);
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values.filter((value) => value.length > 0))];
+}
+
+function normalizeNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length === 0 ? null : normalized;
 }

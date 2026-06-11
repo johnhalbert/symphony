@@ -707,7 +707,7 @@ export function parseDatabaseConfig(rawInput: unknown, workflowPath: string, env
 export function parseServiceConfig(rawInput: unknown, workflowPath: string, env = process.env): ServiceConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
   if (!parsed.success) {
-    throw new SymphonyError("config_validation_error", "Workflow config is invalid", parsed.error.flatten());
+    throw new SymphonyError("config_validation_error", "Workflow config is invalid", buildWorkflowConfigValidationDetails(rawInput, parsed.error));
   }
 
   const raw = parsed.data;
@@ -936,6 +936,150 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   };
 }
 
+function buildWorkflowConfigValidationDetails(rawInput: unknown, error: z.ZodError): Record<string, unknown> {
+  const signals = projectContextValidationSignalsFromZodIssues(rawInput, error.issues);
+  return {
+    ...error.flatten(),
+    issues: error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
+    ...(signals.projectContextPaths.length === 0 ? {} : { projectContextPaths: signals.projectContextPaths }),
+    ...(signals.projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths: signals.projectContextFieldPaths }),
+  };
+}
+
+function projectContextValidationSignalsFromZodIssues(
+  rawInput: unknown,
+  issues: readonly z.ZodIssue[],
+): { projectContextPaths: string[]; projectContextFieldPaths: string[] } {
+  const projectContextPaths: string[] = [];
+  const projectContextFieldPaths: string[] = [];
+  for (const issue of issues) {
+    const signal = projectContextValidationSignalFromIssuePath(rawInput, issue.path);
+    if (signal === null) continue;
+    projectContextPaths.push(signal.contextPath);
+    if (signal.fieldPath !== null) projectContextFieldPaths.push(signal.fieldPath);
+  }
+  return {
+    projectContextPaths: uniqueStringValues(projectContextPaths),
+    projectContextFieldPaths: uniqueStringValues(projectContextFieldPaths),
+  };
+}
+
+function projectContextValidationSignalFromIssuePath(
+  rawInput: unknown,
+  issuePath: readonly PropertyKey[],
+): { contextPath: string; fieldPath: string | null } | null {
+  if (issuePath[0] !== "project_contexts") return null;
+  const contextIndex = issuePath[1];
+  if (typeof contextIndex !== "number" || contextIndex < 0) return null;
+  return {
+    contextPath: rawProjectContextPathFromInput(rawInput, contextIndex),
+    fieldPath: fieldPathFromSegments(issuePath.slice(2)),
+  };
+}
+
+function rawProjectContextPathFromInput(rawInput: unknown, index: number): string {
+  return rawProjectContextPath(readRawProjectContextsFromValue(rawInput)[index], index);
+}
+
+function rawProjectContextPath(rawContext: unknown, index: number): string {
+  const rawId = readRawProjectContextIdFromValue(rawContext);
+  return rawId === null ? `project_contexts[${index}]` : `project_contexts[${JSON.stringify(rawId)}]`;
+}
+
+function attachProjectContextValidationSignal(error: unknown, contextPath: string): SymphonyError {
+  const symphonyError =
+    error instanceof SymphonyError
+      ? error
+      : new SymphonyError("config_validation_error", error instanceof Error ? error.message : String(error));
+  const existingDetails = isObjectRecord(symphonyError.details) ? { ...symphonyError.details } : {};
+  const projectContextPaths = uniqueStringValues([
+    ...readStringArrayValues(existingDetails.projectContextPaths),
+    contextPath,
+  ]);
+  const projectContextFieldPaths = uniqueStringValues([
+    ...readStringArrayValues(existingDetails.projectContextFieldPaths),
+    ...extractProjectContextFieldPaths(symphonyError.message, contextPath),
+  ]);
+  return new SymphonyError(symphonyError.code, symphonyError.message, {
+    ...existingDetails,
+    projectContextPaths,
+    ...(projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths }),
+  });
+}
+
+function extractProjectContextFieldPaths(message: string, contextPath: string): string[] {
+  const prefix = `${contextPath}.`;
+  if (message.startsWith(prefix)) {
+    const remainder = message.slice(prefix.length);
+    const scopedMatch = /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(remainder);
+    if (scopedMatch?.[1]) return [scopedMatch[1]];
+  }
+  return uniqueStringValues(message.match(/[a-z_]+(?:\.[a-z_]+|\[\d+\])+/g) ?? []);
+}
+
+function duplicateProjectContextIdFromMessage(message: string): string | null {
+  const match = /^Duplicate project context id: (.+)$/.exec(message);
+  return normalizeOptionalSignalString(match?.[1]);
+}
+
+function rawProjectContextPathsByNormalizedId(rawContexts: readonly unknown[], duplicateProjectContextId: string): string[] {
+  return uniqueStringValues(
+    rawContexts.flatMap((rawContext, index) => {
+      const rawId = readRawProjectContextIdFromValue(rawContext);
+      if (rawId === null) return [];
+      try {
+        return normalizeProjectContextId(rawId) === duplicateProjectContextId ? [rawProjectContextPath(rawContext, index)] : [];
+      } catch {
+        return [];
+      }
+    }),
+  );
+}
+
+function rawProjectContextPaths(rawContexts: readonly unknown[]): string[] {
+  return uniqueStringValues(rawContexts.map((rawContext, index) => rawProjectContextPath(rawContext, index)));
+}
+
+function readRawProjectContextsFromValue(value: unknown): unknown[] {
+  return isObjectRecord(value) && Array.isArray(value.project_contexts) ? value.project_contexts : [];
+}
+
+function readRawProjectContextIdFromValue(value: unknown): string | null {
+  return isObjectRecord(value) && typeof value.id === "string" ? value.id : null;
+}
+
+function readStringArrayValues(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function normalizeOptionalSignalString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length === 0 ? null : normalized;
+}
+
+function fieldPathFromSegments(segments: readonly PropertyKey[]): string | null {
+  if (segments.length === 0) return null;
+  let fieldPath = "";
+  for (const segment of segments) {
+    if (typeof segment === "number") {
+      fieldPath += `[${segment}]`;
+      continue;
+    }
+    if (typeof segment !== "string") continue;
+    fieldPath = fieldPath.length === 0 ? segment : `${fieldPath}.${segment}`;
+  }
+  return fieldPath.length === 0 ? null : fieldPath;
+}
+
+function uniqueStringValues(values: readonly string[]): string[] {
+  return [...new Set(values.filter((value) => value.length > 0))];
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function normalizeWorkflowProjectContexts(
   raw: RawWorkflowConfig,
   workflowDir: string,
@@ -960,9 +1104,23 @@ function normalizeWorkflowProjectContexts(
   try {
     return buildProjectContextRegistry(contexts);
   } catch (error) {
+    const message = error instanceof Error ? error.message : "Project contexts are invalid";
+    const duplicateProjectContextId = duplicateProjectContextIdFromMessage(message);
+    const projectContextPaths =
+      duplicateProjectContextId !== null
+        ? rawProjectContextPathsByNormalizedId(raw.project_contexts ?? [], duplicateProjectContextId)
+        : message === "At least one enabled project context is required"
+          ? rawProjectContextPaths(raw.project_contexts ?? [])
+          : [];
     throw new SymphonyError(
       "config_validation_error",
-      error instanceof Error ? error.message : "Project contexts are invalid",
+      message,
+      projectContextPaths.length === 0 && duplicateProjectContextId === null
+        ? undefined
+        : {
+            ...(projectContextPaths.length === 0 ? {} : { projectContextPaths }),
+            ...(duplicateProjectContextId === null ? {} : { duplicateProjectContextId }),
+          },
     );
   }
 }
@@ -975,75 +1133,79 @@ function normalizeWorkflowProjectContext(
   options: { requireExplicitWorkspaceSource: boolean },
 ): WorkflowProjectContext {
   const contextPath = `project_contexts[${JSON.stringify(rawContext.id)}]`;
-  let id: string;
   try {
-    id = normalizeProjectContextId(rawContext.id);
-  } catch (error) {
-    throw new SymphonyError(
-      "config_validation_error",
-      `${contextPath}.id must contain at least one letter or number after normalization`,
-      { cause: error instanceof Error ? error.message : String(error) },
+    let id: string;
+    try {
+      id = normalizeProjectContextId(rawContext.id);
+    } catch (error) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `${contextPath}.id must contain at least one letter or number after normalization`,
+        { cause: error instanceof Error ? error.message : String(error) },
+      );
+    }
+
+    const enabled = rawContext.enabled ?? true;
+    const label = normalizeOptionalConfigString(rawContext.label) ?? defaultProjectContextLabel(id);
+    const merged = mergeWorkflowProjectContextDefaults(defaults, rawContext);
+    const tracker = normalizeTrackerConfigForProjectContext(merged.tracker, env, { enabled, contextPath });
+    const workspace = normalizeWorkspaceConfigForProjectContext(merged.workspace, workflowDir, env, {
+      enabled,
+      contextPath,
+      requireExplicitWorkspaceSource: options.requireExplicitWorkspaceSource,
+    });
+    const reviewLoop = normalizeReviewLoopConfigForProjectContext(merged.review_loop, tracker);
+    const github = normalizeGitHubConfigForProjectContext(
+      merged.github,
+      workflowDir,
+      env,
+      tracker.handoffStates,
+      reviewLoop.reviewStates,
     );
+    const issueBreakdown = normalizeIssueBreakdownConfigForProjectContext(
+      merged.issue_breakdown,
+      workspace.source.kind,
+      contextPath,
+      enabled,
+    );
+    const agent = normalizeAgentConfigForProjectContext(merged.agent);
+
+    if (enabled) {
+      validateStateBuckets({
+        activeStates: tracker.activeStates,
+        handoffStates: tracker.handoffStates,
+        terminalStates: tracker.terminalStates,
+        reviewStates: reviewLoop.reviewStates,
+        blockedStates: reviewLoop.blockedStates,
+        reviewPassState: reviewLoop.reviewPassState,
+      });
+      validatePullRequestHandoffPolicy({
+        publishPullRequests: github.publishPullRequests,
+        handoffStates: tracker.handoffStates,
+        reviewStates: reviewLoop.reviewStates,
+        blockedStates: reviewLoop.blockedStates,
+        reviewPassState: reviewLoop.reviewPassState,
+        prHandoff: github.prHandoff,
+      });
+    }
+
+    return {
+      id,
+      label,
+      enabled,
+      source: options.requireExplicitWorkspaceSource ? "explicit" : "legacy_default",
+      tracker,
+      workspace,
+      github,
+      reviewLoop,
+      issueBreakdown,
+      agent,
+      credentialProfiles: merged.credential_profiles,
+      publicMetadata: projectContextMetadataForPublicRead({ id, label, enabled, tracker, workspace }),
+    };
+  } catch (error) {
+    throw attachProjectContextValidationSignal(error, contextPath);
   }
-
-  const enabled = rawContext.enabled ?? true;
-  const label = normalizeOptionalConfigString(rawContext.label) ?? defaultProjectContextLabel(id);
-  const merged = mergeWorkflowProjectContextDefaults(defaults, rawContext);
-  const tracker = normalizeTrackerConfigForProjectContext(merged.tracker, env, { enabled, contextPath });
-  const workspace = normalizeWorkspaceConfigForProjectContext(merged.workspace, workflowDir, env, {
-    enabled,
-    contextPath,
-    requireExplicitWorkspaceSource: options.requireExplicitWorkspaceSource,
-  });
-  const reviewLoop = normalizeReviewLoopConfigForProjectContext(merged.review_loop, tracker);
-  const github = normalizeGitHubConfigForProjectContext(
-    merged.github,
-    workflowDir,
-    env,
-    tracker.handoffStates,
-    reviewLoop.reviewStates,
-  );
-  const issueBreakdown = normalizeIssueBreakdownConfigForProjectContext(
-    merged.issue_breakdown,
-    workspace.source.kind,
-    contextPath,
-    enabled,
-  );
-  const agent = normalizeAgentConfigForProjectContext(merged.agent);
-
-  if (enabled) {
-    validateStateBuckets({
-      activeStates: tracker.activeStates,
-      handoffStates: tracker.handoffStates,
-      terminalStates: tracker.terminalStates,
-      reviewStates: reviewLoop.reviewStates,
-      blockedStates: reviewLoop.blockedStates,
-      reviewPassState: reviewLoop.reviewPassState,
-    });
-    validatePullRequestHandoffPolicy({
-      publishPullRequests: github.publishPullRequests,
-      handoffStates: tracker.handoffStates,
-      reviewStates: reviewLoop.reviewStates,
-      blockedStates: reviewLoop.blockedStates,
-      reviewPassState: reviewLoop.reviewPassState,
-      prHandoff: github.prHandoff,
-    });
-  }
-
-  return {
-    id,
-    label,
-    enabled,
-    source: options.requireExplicitWorkspaceSource ? "explicit" : "legacy_default",
-    tracker,
-    workspace,
-    github,
-    reviewLoop,
-    issueBreakdown,
-    agent,
-    credentialProfiles: merged.credential_profiles,
-    publicMetadata: projectContextMetadataForPublicRead({ id, label, enabled, tracker, workspace }),
-  };
 }
 
 function mergeWorkflowProjectContextDefaults(
