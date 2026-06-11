@@ -577,6 +577,170 @@ Work on {{ issue.identifier }}.
     }
   });
 
+  it("does not surface dynamic agent state keys from Zod-derived reload field paths", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-agent-state-key-redaction-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            projectContextFixture({
+              id: "Docs Site",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+              agent: {
+                max_concurrent_agents_by_state: {
+                  "prod.secret": "nope" as unknown as number,
+                },
+              },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        'Workflow reload validation failed for project_contexts["Docs Site"]: invalid agent.max_concurrent_agents_by_state',
+      );
+      expect(event.error?.details).toEqual({
+        reason: "invalid_project_context_configuration",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["Docs Site"]',
+            rawId: "Docs Site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+        ],
+        projectContextFieldPaths: ["agent.max_concurrent_agents_by_state"],
+      });
+      expect(serializedError).not.toContain("prod.secret");
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not surface dynamic credential-profile role keys from Zod-derived reload field paths", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-credential-role-key-redaction-"));
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const loader = new WorkflowLoader(workflowPath);
+    const events: WorkflowReloadEvent[] = [];
+    const watcher = mockWorkflowWatcher();
+    try {
+      await writeFile(path.join(root, ".env"), workflowReloadEnvFile(), "utf8");
+      await writeFile(workflowPath, workflowReloadDocument({ promptTemplate: "Initial prompt." }), "utf8");
+
+      await loader.load();
+      loader.watch((event) => {
+        events.push(event);
+      });
+
+      await writeFile(
+        workflowPath,
+        multiProjectWorkflowDocument({
+          promptTemplate: "Broken prompt.",
+          topLevel: workflowReloadTopLevelConfig(),
+          projectContexts: [
+            projectContextFixture({
+              id: "symphony",
+              label: "Symphony",
+              projectSlug: "SYMPHONY",
+              repository: ".",
+            }),
+            projectContextFixture({
+              id: "Docs Site",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "$DOCS_REPOSITORY",
+              tracker: { api_key: "$DOCS_LINEAR_API_KEY" },
+              github: { token: "$DOCS_GITHUB_TOKEN" },
+              credential_profiles: {
+                roles: {
+                  worker: {
+                    "top.secret.profile": 123 as unknown as string,
+                  },
+                },
+              },
+            }),
+          ],
+        }),
+        "utf8",
+      );
+      watcher.triggerChange();
+      const event = await waitForWorkflowReloadEvent(events);
+      const serializedError = JSON.stringify({
+        message: event.error?.message,
+        code: event.error?.code,
+        details: event.error?.details,
+      });
+
+      expect(event.loaded).toBeNull();
+      expect(event.error).toBeInstanceOf(SymphonyError);
+      expect(event.error?.code).toBe("config_validation_error");
+      expect(event.error?.message).toBe(
+        'Workflow reload validation failed for project_contexts["Docs Site"]: invalid credential_profiles.roles.worker',
+      );
+      expect(event.error?.details).toEqual({
+        reason: "invalid_project_context_configuration",
+        projectContexts: [
+          {
+            contextPath: 'project_contexts["Docs Site"]',
+            rawId: "Docs Site",
+            projectContextId: "docs-site",
+            projectContextLabel: "Documentation Site",
+            enabled: true,
+          },
+        ],
+        projectContextFieldPaths: ["credential_profiles.roles.worker"],
+      });
+      expect(serializedError).not.toContain("top.secret.profile");
+      expect(loader.getLastGood()?.definition.promptTemplate).toBe("Initial prompt.");
+      expectWorkflowReloadErrorToRedactSecrets(serializedError);
+    } finally {
+      watcher.restore();
+      await loader.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reports sibling project-context validator failures during reload with context-specific redacted metadata", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-workflow-reload-state-bucket-error-"));
     const workflowPath = path.join(root, "WORKFLOW.md");

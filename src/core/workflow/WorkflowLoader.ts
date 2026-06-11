@@ -2,7 +2,12 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import chokidar, { type FSWatcher } from "chokidar";
 import YAML from "yaml";
-import { type RawWorkflowConfig, type ServiceConfig, parseServiceConfig } from "../config/Config.js";
+import {
+  type RawWorkflowConfig,
+  type ServiceConfig,
+  normalizeProjectContextValidationFieldPath,
+  parseServiceConfig,
+} from "../config/Config.js";
 import { defaultProjectContextLabel, normalizeProjectContextId } from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 
@@ -281,7 +286,12 @@ function readWorkflowReloadErrorSignal(details: unknown): WorkflowReloadErrorSig
   }
   return {
     projectContextPaths: uniqueStrings(readStringArray(details.projectContextPaths)),
-    projectContextFieldPaths: uniqueStrings(readStringArray(details.projectContextFieldPaths)),
+    projectContextFieldPaths: uniqueStrings(
+      readStringArray(details.projectContextFieldPaths).flatMap((fieldPath) => {
+        const normalized = normalizeProjectContextValidationFieldPath(fieldPath);
+        return normalized === null ? [] : [normalized];
+      }),
+    ),
     duplicateProjectContextId: normalizeNonEmptyString(details.duplicateProjectContextId),
   };
 }

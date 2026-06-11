@@ -1004,7 +1004,7 @@ function rawProjectContextIdIsAmbiguous(rawContexts: readonly unknown[], rawId: 
   return false;
 }
 
-const KNOWN_PROJECT_CONTEXT_MESSAGE_FIELD_PATHS = new Set<string>([
+const KNOWN_PROJECT_CONTEXT_VALIDATION_FIELD_PATHS = new Set<string>([
   "id",
   "enabled",
   "tracker.kind",
@@ -1024,22 +1024,27 @@ const KNOWN_PROJECT_CONTEXT_MESSAGE_FIELD_PATHS = new Set<string>([
   "review_loop.review_pass_state",
   "github.pr_handoff.target_state",
   "issue_breakdown.workspace_mode",
+  "agent.max_concurrent_agents_by_state",
+  "credential_profiles.roles.worker",
+  "credential_profiles.roles.reviewer",
+  "credential_profiles.roles.service",
+  "credential_profiles.profiles",
 ]);
 
-function normalizeKnownProjectContextMessageFieldPath(value: unknown): string | null {
+export function normalizeProjectContextValidationFieldPath(value: unknown): string | null {
   if (typeof value !== "string" || value.length === 0) return null;
-  return KNOWN_PROJECT_CONTEXT_MESSAGE_FIELD_PATHS.has(value) ? value : null;
+  return longestKnownProjectContextFieldPath(projectContextFieldPathSegments(value));
 }
 
 function extractScopedProjectContextFieldPath(remainder: string): string | null {
   const scopedMatch = /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(remainder);
-  return normalizeKnownProjectContextMessageFieldPath(scopedMatch?.[1]);
+  return normalizeProjectContextValidationFieldPath(scopedMatch?.[1]);
 }
 
 function configValidationError(message: string, projectContextFieldPaths?: readonly string[]): SymphonyError {
   const normalizedFieldPaths = uniqueStringValues(
     (projectContextFieldPaths ?? []).flatMap((fieldPath) => {
-      const normalizedFieldPath = normalizeKnownProjectContextMessageFieldPath(fieldPath);
+      const normalizedFieldPath = normalizeProjectContextValidationFieldPath(fieldPath);
       return normalizedFieldPath === null ? [] : [normalizedFieldPath];
     }),
   );
@@ -1120,17 +1125,49 @@ function normalizeOptionalSignalString(value: unknown): string | null {
 }
 
 function fieldPathFromSegments(segments: readonly PropertyKey[]): string | null {
+  return longestKnownProjectContextFieldPath(
+    segments.flatMap((segment): Array<string | number> => {
+      if (typeof segment === "string" || typeof segment === "number") return [segment];
+      return [];
+    }),
+  );
+}
+
+function longestKnownProjectContextFieldPath(segments: readonly (string | number)[]): string | null {
   if (segments.length === 0) return null;
   let fieldPath = "";
+  let knownFieldPath: string | null = null;
   for (const segment of segments) {
     if (typeof segment === "number") {
       fieldPath += `[${segment}]`;
-      continue;
+    } else {
+      fieldPath = fieldPath.length === 0 ? segment : `${fieldPath}.${segment}`;
     }
-    if (typeof segment !== "string") continue;
-    fieldPath = fieldPath.length === 0 ? segment : `${fieldPath}.${segment}`;
+    if (KNOWN_PROJECT_CONTEXT_VALIDATION_FIELD_PATHS.has(fieldPath)) {
+      knownFieldPath = fieldPath;
+    }
   }
-  return fieldPath.length === 0 ? null : fieldPath;
+  return knownFieldPath;
+}
+
+function projectContextFieldPathSegments(value: string): Array<string | number> {
+  const segments: Array<string | number> = [];
+  for (const part of value.split(".")) {
+    if (part.length === 0) return [];
+    let remainder = part;
+    const baseMatch = /^([^\[]+)/.exec(remainder);
+    if (baseMatch?.[1]) {
+      segments.push(baseMatch[1]);
+      remainder = remainder.slice(baseMatch[1].length);
+    }
+    while (remainder.length > 0) {
+      const indexMatch = /^\[(\d+)\]/.exec(remainder);
+      if (!indexMatch?.[1]) return [];
+      segments.push(Number.parseInt(indexMatch[1], 10));
+      remainder = remainder.slice(indexMatch[0].length);
+    }
+  }
+  return segments;
 }
 
 function uniqueStringValues(values: readonly string[]): string[] {
@@ -1698,11 +1735,8 @@ function mergeCredentialProfileDefinitionMap(
 
 function inferRawCredentialProfileKind(
   profile: NonNullable<RawCredentialProfilesConfig["profiles"]>[string],
-): keyof NonNullable<RawCredentialProfilesConfig["profiles"]>[string] {
-  if ("env" in profile) return "env";
-  if ("git_credential" in profile) return "git_credential";
-  if ("github_app" in profile) return "github_app";
-  return "env";
+): "github_app" | "static_token" {
+  return profile.kind === "github_app" ? "github_app" : "static_token";
 }
 
 function mergeCredentialProfileRoleAssignments(
