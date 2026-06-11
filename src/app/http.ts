@@ -47,8 +47,13 @@ import type {
 } from "../core/persistence/IssueLifecycleStore.js";
 import { latestCurrentApprovalPassVerdict } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
-import type { OperatorApprovalService, OperatorApprovalRecord } from "../core/approval/OperatorApprovalService.js";
+import type {
+  OperatorApprovalRejectPolicy,
+  OperatorApprovalService,
+  OperatorApprovalRecord,
+} from "../core/approval/OperatorApprovalService.js";
 import { OPERATOR_REJECTED_PUBLICATION_ERROR, approvalResolve } from "../core/approval/OperatorApprovalService.js";
+import type { ProjectContextResolution } from "../core/config/ProjectContexts.js";
 import {
   approvalMatchesReport,
   isAwaitingPublicationApprovalLifecycle,
@@ -280,7 +285,8 @@ export interface StatusServerOptions {
   operatorApproval?: Pick<
     OperatorApprovalService,
     "get" | "resolve" | "findPendingForIssue" | "findPendingForRun" | "rejectPolicy" | "isRequired"
-  >;
+  > &
+    Partial<Pick<OperatorApprovalService, "rejectPolicyFor">>;
   host: string;
   port: number;
   openWorkspaceToken: string | null;
@@ -952,18 +958,18 @@ export class StatusServer {
         if (request.method === "GET") {
           const approval = await this.options.operatorApproval?.get(requestId);
           if (!approval) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
-          sendJson(response, 200, approvalResponse(approval, this.options.operatorApproval?.isRequired() ?? false));
+          sendJson(response, 200, approvalResponse(approval, this.operatorApprovalRequired(approval.projectContext)));
           return;
         }
         if (request.method === "POST") {
-          this.requireApprovalMutationToken(request);
-          const decision = parseApprovalDecision(await readJsonBody(request));
           let existingApproval: OperatorApprovalRecord | null = null;
           try {
             existingApproval = (await this.options.operatorApproval?.get(requestId)) ?? null;
           } catch {
             existingApproval = null;
           }
+          this.requireApprovalMutationToken(request, existingApproval?.projectContext);
+          const decision = parseApprovalDecision(await readJsonBody(request));
           if (existingApproval?.status === "pending") {
             const currentApproval = await currentPendingPublicationApproval({
               approval: existingApproval,
@@ -1001,12 +1007,12 @@ export class StatusServer {
             } catch {
               // The approval decision is already durable; worker exit recovery will retry terminal writeback.
             }
-            if (this.options.operatorApproval?.rejectPolicy === "cancel") {
+            if (this.operatorApprovalRejectPolicy(result.request.projectContext) === "cancel") {
               await this.options.orchestrator.cancelIssue(result.request.issueId);
             }
           }
           sendJson(response, 200, {
-            request: approvalResponse(result.request, this.options.operatorApproval?.isRequired() ?? false),
+            request: approvalResponse(result.request, this.operatorApprovalRequired(result.request.projectContext)),
             replayed: result.replayed,
           });
           return;
@@ -1173,6 +1179,7 @@ export class StatusServer {
               runStore: this.options.runStore,
             })
           : null;
+        const pendingApprovalRequired = this.operatorApprovalRequired(pendingApproval?.projectContext);
         const operatorLiveness = await issueOperatorLiveness({
           live,
           latestRun: publicRunRecordOrNull(latestRun),
@@ -1230,11 +1237,11 @@ export class StatusServer {
             mutationHeader: "X-Symphony-Token",
             pendingApproval: approvalCapability(
               pendingApproval ?? null,
-              this.options.operatorApproval?.isRequired() ?? false,
+              pendingApprovalRequired,
               this.options.openWorkspaceToken,
             ),
           },
-          pendingApproval: pendingApproval ? approvalResponse(pendingApproval, this.options.operatorApproval?.isRequired() ?? false) : null,
+          pendingApproval: pendingApproval ? approvalResponse(pendingApproval, pendingApprovalRequired) : null,
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
         });
         return;
@@ -1321,8 +1328,11 @@ export class StatusServer {
     }
   }
 
-  private requireApprovalMutationToken(request: IncomingMessage): void {
-    if (!(this.options.operatorApproval?.isRequired() ?? false)) {
+  private requireApprovalMutationToken(
+    request: IncomingMessage,
+    projectContext?: ProjectContextResolution | null,
+  ): void {
+    if (!this.operatorApprovalRequired(projectContext)) {
       this.requireMutationToken(request);
       return;
     }
@@ -1352,7 +1362,7 @@ export class StatusServer {
     if (!this.options.runStore) return;
     const existing = await this.options.runStore.getRun(request.runId);
     const completedAt = existing?.completedAt ?? request.resolvedAt ?? new Date().toISOString();
-    const cancelPolicy = this.options.operatorApproval?.rejectPolicy === "cancel";
+    const cancelPolicy = this.operatorApprovalRejectPolicy(request.projectContext) === "cancel";
     await this.options.runStore.updateRun(request.runId, {
       status: cancelPolicy ? "cancelled" : "failed",
       completedAt,
@@ -1362,6 +1372,14 @@ export class StatusServer {
         pendingApprovalRequestedAt: null,
       },
     });
+  }
+
+  private operatorApprovalRequired(projectContext?: ProjectContextResolution | null): boolean {
+    return this.options.operatorApproval?.isRequired(projectContext) ?? false;
+  }
+
+  private operatorApprovalRejectPolicy(projectContext?: ProjectContextResolution | null): OperatorApprovalRejectPolicy {
+    return this.options.operatorApproval?.rejectPolicyFor?.(projectContext) ?? this.options.operatorApproval?.rejectPolicy ?? "cancel";
   }
 
   private requireMutationToken(request: IncomingMessage): void {

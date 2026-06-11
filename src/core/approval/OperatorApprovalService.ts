@@ -443,7 +443,7 @@ export class OperatorApprovalService {
     });
   }
 
-  private rejectPolicyFor(projectContext?: ProjectContextResolution | null): OperatorApprovalRejectPolicy {
+  rejectPolicyFor(projectContext?: ProjectContextResolution | null): OperatorApprovalRejectPolicy {
     return this.operatorApprovalConfigFor(projectContext).rejectPolicy;
   }
 

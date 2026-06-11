@@ -18,7 +18,8 @@ import {
   type OperatorApprovalAction,
   type OperatorApprovalRecord,
 } from "../src/core/approval/OperatorApprovalService.js";
-import type { ServiceConfig } from "../src/core/config/Config.js";
+import type { ProjectContextResolution } from "../src/core/config/ProjectContexts.js";
+import { parseServiceConfig, type ServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
@@ -32,7 +33,7 @@ import type { Issue } from "../src/core/types.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, projectContextFixture, testConfig } from "./helpers.js";
 
 describe("approval status API", () => {
   let root: string;
@@ -41,6 +42,13 @@ describe("approval status API", () => {
   let lifecycleStore: FileIssueLifecycleStore;
   let store: FileOperatorApprovalStore;
   let service: OperatorApprovalService;
+
+  const docsProjectContext: ProjectContextResolution = {
+    projectContextId: "docs",
+    projectContextLabel: "Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "operator_request",
+  };
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-approval-api-"));
@@ -102,6 +110,144 @@ describe("approval status API", () => {
       expect(approvedBody.request.status).toBe("approved");
       expect(issueBody.capabilities.pendingApproval.active).toBe(false);
       expect(resumed).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("uses the approval request project context for HTTP approval payloads and token enforcement", async () => {
+    configureMultiProjectApprovalConfig({
+      topLevelGithub: {
+        publish_pull_requests: false,
+        operator_approval: {
+          required_for_publication: false,
+          reject_policy: "cancel",
+          poll_interval_ms: 5,
+        },
+      },
+      docsGithub: {
+        publish_pull_requests: true,
+        operator_approval: {
+          required_for_publication: true,
+          reject_policy: "fail",
+          poll_interval_ms: 5,
+        },
+      },
+    });
+    const pending = await createPending("idem-docs-required", null, docsProjectContext);
+    const resumed: OperatorApprovalRecord[] = [];
+    const server = statusServer({ resumed });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const approvalResponseRaw = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`);
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const denied = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const approved = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const approvalBody = (await approvalResponseRaw.json()) as { capabilities: { enabled: boolean } };
+      const issueBody = (await issueResponse.json()) as {
+        capabilities: {
+          pendingApproval: { active: boolean; enabled: boolean; requiresToken: boolean };
+        };
+        pendingApproval: { capabilities: { enabled: boolean } } | null;
+      };
+      const approvedBody = (await approved.json()) as {
+        request: { status: string; capabilities: { enabled: boolean } };
+      };
+
+      expect(approvalResponseRaw.status).toBe(200);
+      expect(approvalBody.capabilities.enabled).toBe(true);
+      expect(issueResponse.status).toBe(200);
+      expect(issueBody.capabilities.pendingApproval).toMatchObject({
+        active: true,
+        enabled: true,
+        requiresToken: true,
+      });
+      expect(issueBody.pendingApproval).toMatchObject({
+        capabilities: { enabled: true },
+      });
+      expect(denied.status).toBe(401);
+      expect(approved.status).toBe(200);
+      expect(approvedBody.request).toMatchObject({
+        status: "approved",
+        capabilities: { enabled: true },
+      });
+      expect(resumed).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("uses the approval request project context reject policy for rejection side effects", async () => {
+    configureMultiProjectApprovalConfig({
+      topLevelGithub: {
+        publish_pull_requests: true,
+        operator_approval: {
+          required_for_publication: true,
+          reject_policy: "cancel",
+          poll_interval_ms: 5,
+        },
+      },
+      docsGithub: {
+        publish_pull_requests: true,
+        operator_approval: {
+          required_for_publication: true,
+          reject_policy: "fail",
+          poll_interval_ms: 5,
+        },
+      },
+    });
+    const pending = await createPending("idem-docs-fail", null, docsProjectContext);
+    const cancelled: string[] = [];
+    const server = statusServer({ cancelled });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "reject" }),
+      });
+      const body = (await response.json()) as {
+        request: { status: string; capabilities: { enabled: boolean } };
+        replayed: boolean;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({
+        replayed: false,
+        request: {
+          status: "rejected",
+          capabilities: { enabled: true },
+        },
+      });
+      expect(cancelled).toEqual([]);
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({
+        status: "rejected",
+        projectContext: docsProjectContext,
+      });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+        status: "failed",
+        completedAt: expect.any(String),
+        error: OPERATOR_REJECTED_PUBLICATION_ERROR,
+        pendingApprovalRequestId: null,
+      });
+      await expect(runStore.getRun("run-1")).resolves.not.toMatchObject({
+        status: "cancelled",
+        error: "Operator cancelled issue",
+      });
+      const transcript = await runStore.readTranscript("run-1");
+      expect(transcript.events.at(-1)).toMatchObject({
+        eventType: "approval_resolved",
+        payload: { status: "rejected", rejectPolicy: "fail" },
+      });
     } finally {
       await server.stop();
     }
@@ -1529,7 +1675,95 @@ describe("approval status API", () => {
     }
   });
 
-  async function createPending(evidenceCursor: string, timeoutMs: number | null = null) {
+  function configureMultiProjectApprovalConfig(input: {
+    topLevelGithub?: Record<string, unknown>;
+    docsGithub?: Record<string, unknown>;
+  } = {}) {
+    const parsed = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          tracker: {
+            project_slug: "TEST",
+            active_states: ["Todo", "In Progress"],
+            handoff_states: ["In Review"],
+          },
+          workspace: {
+            root: config.workspace.root,
+            state_dir: config.workspace.stateDir,
+            source: {
+              kind: "git_worktree",
+              repository: root,
+              base_ref: "main",
+              branch_template: "symphony/{{ issue.identifier }}",
+              cleanup: "refuse_dirty",
+            },
+          },
+          github: {
+            owner: "acme",
+            repo: "symphony",
+            token: "github-token",
+            api_base_url: "https://api.github.test",
+            publish_pull_requests: false,
+            pr_handoff: { enabled: false },
+            operator_approval: {
+              required_for_publication: false,
+              reject_policy: "cancel",
+              poll_interval_ms: 5,
+            },
+            ...input.topLevelGithub,
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "TEST",
+            workspaceRoot: config.workspace.root,
+            stateDir: config.workspace.stateDir,
+            repository: root,
+            baseRef: "main",
+            branchTemplate: "symphony/{{ issue.identifier }}",
+          }),
+          projectContextFixture({
+            id: docsProjectContext.projectContextId,
+            label: docsProjectContext.projectContextLabel,
+            projectSlug: docsProjectContext.linearProjectSlug,
+            workspaceRoot: config.workspace.root,
+            stateDir: config.workspace.stateDir,
+            repository: root,
+            baseRef: "main",
+            branchTemplate: "symphony/{{ issue.identifier }}",
+            github: {
+              owner: "acme",
+              repo: "docs-site",
+              token: "docs-github-token",
+              api_base_url: "https://api.github.test",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+              operator_approval: {
+                required_for_publication: true,
+                reject_policy: "fail",
+                poll_interval_ms: 5,
+              },
+              ...input.docsGithub,
+            },
+          }),
+        ],
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+
+    config.github = parsed.github;
+    config.projectContexts = parsed.projectContexts;
+    service = new OperatorApprovalService({ config, store, runStore });
+  }
+
+  async function createPending(
+    evidenceCursor: string,
+    timeoutMs: number | null = null,
+    projectContext?: ProjectContextResolution,
+  ) {
     const { record } = await store.requestOrGetPending(
       {
         issueId: "issue-1",
@@ -1537,6 +1771,7 @@ describe("approval status API", () => {
         runId: "run-1",
         evidenceCursor,
         action: action(evidenceCursor),
+        ...(projectContext === undefined ? {} : { projectContext }),
       },
       timeoutMs,
     );
