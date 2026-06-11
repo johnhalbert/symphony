@@ -545,13 +545,13 @@ describe("StatusServer durable API", () => {
       linearProjectSlug: "SYMPHONY",
       routingSource: "candidate_poll",
     } as const;
-    const docsWorkspacePath = path.join(config.workspace.root, "docs__ENG-123");
-    const symphonyWorkspacePath = path.join(config.workspace.root, "symphony__ENG-123");
+    const docsWorkspacePath = path.join(config.workspace.root, "ctx__docs__ENG-123");
+    const symphonyWorkspacePath = path.join(config.workspace.root, "ctx__symphony__ENG-123");
     await (await import("node:fs/promises")).mkdir(docsWorkspacePath, { recursive: true });
     await (await import("node:fs/promises")).mkdir(symphonyWorkspacePath, { recursive: true });
 
     await runStore.upsertWorkspace({
-      workspaceKey: "docs__ENG-123",
+      workspaceKey: "ctx__docs__ENG-123",
       issueId: "issue-docs-123",
       issueIdentifier: "ENG-123",
       projectContext: docsProjectContext,
@@ -562,7 +562,7 @@ describe("StatusServer durable API", () => {
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
     await runStore.upsertWorkspace({
-      workspaceKey: "symphony__ENG-123",
+      workspaceKey: "ctx__symphony__ENG-123",
       issueId: "issue-symphony-123",
       issueIdentifier: "ENG-123",
       projectContext: symphonyProjectContext,
@@ -583,7 +583,7 @@ describe("StatusServer durable API", () => {
       attempt: null,
       turnNumber: 1,
       prompt: "docs work",
-      workspaceKey: "docs__ENG-123",
+      workspaceKey: "ctx__docs__ENG-123",
       workspacePath: docsWorkspacePath,
       gitBranchName: "symphony/docs/ENG-123",
       repoPath: "/repo",
@@ -600,7 +600,7 @@ describe("StatusServer durable API", () => {
       attempt: null,
       turnNumber: 1,
       prompt: "runtime work",
-      workspaceKey: "symphony__ENG-123",
+      workspaceKey: "ctx__symphony__ENG-123",
       workspacePath: symphonyWorkspacePath,
       gitBranchName: "symphony/runtime/ENG-123",
       repoPath: "/repo",
@@ -629,7 +629,7 @@ describe("StatusServer durable API", () => {
       {
         phase: "implementation",
         summaryPointers: {
-          workspaceKey: "docs__ENG-123",
+          workspaceKey: "ctx__docs__ENG-123",
           workspacePath: docsWorkspacePath,
           branchName: "symphony/docs/ENG-123",
           gitBranchName: "symphony/docs/ENG-123",
@@ -644,7 +644,7 @@ describe("StatusServer durable API", () => {
       {
         phase: "implementation",
         summaryPointers: {
-          workspaceKey: "symphony__ENG-123",
+          workspaceKey: "ctx__symphony__ENG-123",
           workspacePath: symphonyWorkspacePath,
           branchName: "symphony/runtime/ENG-123",
           gitBranchName: "symphony/runtime/ENG-123",
@@ -687,7 +687,7 @@ describe("StatusServer durable API", () => {
         headers: { "x-symphony-token": "secret" },
       });
       const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-docs`);
-      const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/docs__ENG-123`);
+      const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/ctx__docs__ENG-123`);
 
       expect(ambiguousIssueResponse.status).toBe(409);
       expect(ambiguousRunsResponse.status).toBe(409);
@@ -717,8 +717,165 @@ describe("StatusServer durable API", () => {
       });
       expect(workspaceResponse.status).toBe(200);
       await expect(workspaceResponse.json()).resolves.toMatchObject({
-        workspaceKey: "docs__ENG-123",
+        workspaceKey: "ctx__docs__ENG-123",
         issueId: "issue-docs-123",
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("supports exact-id continuation-summary readback for duplicate identifiers across project contexts", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    const docsProjectContext = {
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const runtimeProjectContext = {
+      projectContextId: "runtime",
+      projectContextLabel: "Runtime",
+      linearProjectSlug: "RUNTIME",
+      routingSource: "candidate_poll",
+    } as const;
+    const docsIssue = {
+      ...issue({ id: "issue-docs-123", identifier: "ENG-123", branchName: "symphony/docs/ENG-123" }),
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectIdentity: { slug: "DOCS" },
+      routingSource: "candidate_poll",
+    } as const;
+    const runtimeIssue = {
+      ...issue({ id: "issue-runtime-123", identifier: "ENG-123", branchName: "symphony/runtime/ENG-123" }),
+      projectContextId: "runtime",
+      projectContextLabel: "Runtime",
+      linearProjectIdentity: { slug: "RUNTIME" },
+      routingSource: "candidate_poll",
+    } as const;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [];
+      },
+    };
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness: new PlanningRunRecordingHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+
+    await runStore.startRun({
+      runId: "run-docs",
+      sessionId: "session-docs",
+      agentId: "agent-docs",
+      role: "worker",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      workspaceKey: "docs-workspace",
+      workspacePath: path.join(config.workspace.root, "docs-workspace"),
+      gitBranchName: docsIssue.branchName ?? "symphony/docs/ENG-123",
+      repoPath: root,
+      baseRef: "origin/main",
+    });
+    await runStore.appendEvent({
+      runId: "run-docs",
+      at: "2026-01-01T00:00:01Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Docs context work.",
+    });
+    await runStore.startRun({
+      runId: "run-runtime",
+      sessionId: "session-runtime",
+      agentId: "agent-runtime",
+      role: "worker",
+      issueId: runtimeIssue.id,
+      issueIdentifier: runtimeIssue.identifier,
+      projectContext: runtimeProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "runtime work",
+      workspaceKey: "runtime-workspace",
+      workspacePath: path.join(config.workspace.root, "runtime-workspace"),
+      gitBranchName: runtimeIssue.branchName ?? "symphony/runtime/ENG-123",
+      repoPath: root,
+      baseRef: "origin/main",
+    });
+    await runStore.appendEvent({
+      runId: "run-runtime",
+      at: "2026-01-01T00:00:02Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Runtime context work.",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, { phase: "implementation", projectContext: docsProjectContext });
+    await lifecycleStore.ensureIssue(runtimeIssue, { phase: "implementation", projectContext: runtimeProjectContext });
+
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const ambiguousResponse = await fetch(`${baseUrl}/api/v1/issues/ENG-123/continuation-summary`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const exactResponse = await fetch(`${baseUrl}/api/v1/issues/issue-docs-123/continuation-summary`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+
+      expect(ambiguousResponse.status).toBe(409);
+      await expect(ambiguousResponse.json()).resolves.toMatchObject({ error: { code: "conflict" } });
+      expect(exactResponse.status).toBe(201);
+      await expect(exactResponse.json()).resolves.toMatchObject({
+        issue: "issue-docs-123",
+        summaryReference: {
+          runIds: ["run-docs"],
+          transcriptPointers: ["/api/v1/runs/run-docs/transcript"],
+          statusApiPointers: [
+            "/api/v1/issues/issue-docs-123",
+            "/api/v1/issues/issue-docs-123/runs",
+            "/api/v1/runs/run-docs",
+          ],
+        },
+        lifecycle: {
+          issueId: "issue-docs-123",
+          issueIdentifier: "ENG-123",
+        },
       });
     } finally {
       await server.stop();

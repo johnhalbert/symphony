@@ -46,6 +46,60 @@ describe("git worktree workspace source", () => {
     expect(workspace.workspaceKey).toBe("TEST-2");
   });
 
+  it("namespaces fallback branches per project context when tracker branch metadata is absent", async () => {
+    const manager = newManager(root, repo);
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-branch",
+      identifier: "ENG-BRANCH-CTX",
+      branchName: null,
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "SYMPHONY",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-branch",
+      identifier: "ENG-BRANCH-CTX",
+      branchName: null,
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyBranch = await git(["branch", "--show-current"], symphonyWorkspace.path);
+    const docsBranch = await git(["branch", "--show-current"], docsWorkspace.path);
+
+    expect(symphonyBranch.trim()).toBe("symphony/symphony/ENG-BRANCH-CTX");
+    expect(docsBranch.trim()).toBe("symphony/docs/ENG-BRANCH-CTX");
+    expect(symphonyWorkspace.workspaceKey).toBe("ctx__symphony__ENG-BRANCH-CTX");
+    expect(docsWorkspace.workspaceKey).toBe("ctx__docs__ENG-BRANCH-CTX");
+  });
+
+  it("avoids collisions between legacy identifiers and context-qualified workspace keys", async () => {
+    const manager = newManager(root, repo);
+    const legacyIssue = issue({ id: "issue-legacy-collision", identifier: "docs__ENG-LEGACY", branchName: "symphony/docs__ENG-LEGACY" });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-collision",
+      identifier: "ENG-LEGACY",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+
+    const legacyWorkspace = await manager.createForIssue(legacyIssue);
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const legacyRecord = await manager.getWorkspaceRecord(legacyWorkspace.workspaceKey);
+    const docsRecord = await manager.getWorkspaceRecord(docsWorkspace.workspaceKey);
+
+    expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-LEGACY");
+    expect(docsWorkspace.workspaceKey).toBe("ctx__docs__ENG-LEGACY");
+    expect(legacyWorkspace.path).not.toBe(docsWorkspace.path);
+    expect(legacyRecord?.issueId).toBe("issue-legacy-collision");
+    expect(docsRecord?.issueId).toBe("issue-docs-collision");
+    expect(docsRecord?.projectContext?.projectContextId).toBe("docs");
+  });
+
   it("namespaces workspace keys, paths, and durable metadata for overlapping identifiers across project contexts", async () => {
     const manager = newManager(root, repo);
     const symphonyIssue = trackerIssue({

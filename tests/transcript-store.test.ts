@@ -1221,21 +1221,21 @@ describe("FileRunTranscriptStore", () => {
     } as const;
 
     await store.upsertWorkspace({
-      workspaceKey: "docs__ENG-123",
+      workspaceKey: "ctx__docs__ENG-123",
       issueId: "issue-docs-123",
       issueIdentifier: "ENG-123",
       projectContext: docsProjectContext,
-      path: "/tmp/docs__ENG-123",
+      path: "/tmp/ctx__docs__ENG-123",
       sourceKind: "git_worktree",
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
     await store.upsertWorkspace({
-      workspaceKey: "symphony__ENG-123",
+      workspaceKey: "ctx__symphony__ENG-123",
       issueId: "issue-symphony-123",
       issueIdentifier: "ENG-123",
       projectContext: symphonyProjectContext,
-      path: "/tmp/symphony__ENG-123",
+      path: "/tmp/ctx__symphony__ENG-123",
       sourceKind: "git_worktree",
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
@@ -1243,24 +1243,24 @@ describe("FileRunTranscriptStore", () => {
     await startBasicRun(store, "run-docs-context", {
       issueId: "issue-docs-123",
       issueIdentifier: "ENG-123",
-      workspaceKey: "docs__ENG-123",
-      workspacePath: "/tmp/docs__ENG-123",
+      workspaceKey: "ctx__docs__ENG-123",
+      workspacePath: "/tmp/ctx__docs__ENG-123",
       projectContext: docsProjectContext,
     });
     await startBasicRun(store, "run-symphony-context", {
       issueId: "issue-symphony-123",
       issueIdentifier: "ENG-123",
-      workspaceKey: "symphony__ENG-123",
-      workspacePath: "/tmp/symphony__ENG-123",
+      workspaceKey: "ctx__symphony__ENG-123",
+      workspacePath: "/tmp/ctx__symphony__ENG-123",
       projectContext: symphonyProjectContext,
     });
 
     await expect(store.findWorkspace("ENG-123", { includeWorkspaceKey: false })).rejects.toBeInstanceOf(SymphonyError);
     await expect(store.listRunsForIssue("ENG-123")).rejects.toBeInstanceOf(SymphonyError);
-    await expect(store.getWorkspace("docs__ENG-123")).resolves.toMatchObject({ workspaceKey: "docs__ENG-123" });
+    await expect(store.getWorkspace("ctx__docs__ENG-123")).resolves.toMatchObject({ workspaceKey: "ctx__docs__ENG-123" });
     await expect(
       store.findWorkspace("ENG-123", { projectContextId: "docs", includeWorkspaceKey: false }),
-    ).resolves.toMatchObject({ workspaceKey: "docs__ENG-123", projectContext: docsProjectContext });
+    ).resolves.toMatchObject({ workspaceKey: "ctx__docs__ENG-123", projectContext: docsProjectContext });
     await expect(store.listRunsForIssue("ENG-123", { projectContextId: "docs" })).resolves.toMatchObject([
       { runId: "run-docs-context", projectContext: docsProjectContext },
     ]);

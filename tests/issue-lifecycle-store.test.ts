@@ -411,6 +411,42 @@ describe("FileIssueLifecycleStore", () => {
     });
   });
 
+  it("preserves existing project context on unscoped lifecycle updates", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const docsIssue = {
+      ...issue({ id: "issue-docs-ctx", identifier: "ENG-CTX-1" }),
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectIdentity: { slug: "DOCS" },
+      routingSource: "candidate_poll",
+    };
+
+    await store.ensureIssue(docsIssue, { phase: "implementation" });
+
+    const updated = await store.updateIssue(
+      { id: "issue-docs-ctx", identifier: "ENG-CTX-1" },
+      { reviewRound: 2, blockedReason: "awaiting docs review" },
+    );
+
+    expect(updated).toMatchObject({
+      reviewRound: 2,
+      blockedReason: "awaiting docs review",
+      projectContext: {
+        projectContextId: "docs-site",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+      summaryPointers: {
+        projectContext: {
+          projectContextId: "docs-site",
+          projectContextLabel: "Documentation Site",
+          linearProjectSlug: "DOCS",
+          routingSource: "candidate_poll",
+        },
+      },
+    });
+  });
 
   it("rejects ambiguous identifier lifecycle lookups across project contexts unless scoped", async () => {
     const store = new FileIssueLifecycleStore(root);
@@ -430,6 +466,7 @@ describe("FileIssueLifecycleStore", () => {
       projectContextId: "symphony",
       projectContextLabel: "Symphony Runtime",
     } as const;
+
     await store.ensureIssue(docsIssue, { phase: "implementation" });
     await store.ensureIssue(symphonyIssue, { phase: "review" });
 

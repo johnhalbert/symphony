@@ -6317,6 +6317,7 @@ describe("Orchestrator", () => {
     expect(harness.runs[1]?.prompt).toContain("Mode: summary");
     expect(harness.runs[1]?.prompt).toContain("Transcript/status pointers:");
     expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/fake-issue-1-1/transcript");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/issue-1");
     expect(harness.runs[1]?.prompt).not.toContain("completed: fake completed");
     expect(harness.runs[1]?.prompt).not.toContain("Continue working on the issue. Check current issue state");
   });
@@ -6396,8 +6397,8 @@ describe("Orchestrator", () => {
     expect(createdSummary.summaryReference.transcriptEventCount).toBe(2);
     expect(createdSummary.summaryReference.transcriptPointers).toEqual(["/api/v1/runs/prior-run-1/transcript"]);
     expect(createdSummary.summaryReference.statusApiPointers).toEqual([
-      "/api/v1/issues/TEST-1",
-      "/api/v1/issues/TEST-1/runs",
+      "/api/v1/issues/issue-1",
+      "/api/v1/issues/issue-1/runs",
       "/api/v1/runs/prior-run-1",
     ]);
     expect(storedLifecycle?.summaryReferences).toEqual([createdSummary.summaryReference]);
@@ -6406,9 +6407,127 @@ describe("Orchestrator", () => {
     expect(harness.runs[1]?.prompt).toContain(`Reference: ${createdSummary.summaryReference.id}`);
     expect(harness.runs[1]?.prompt).toContain("Continuation history summarization is not automated yet.");
     expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1/transcript");
-    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/TEST-1");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/issue-1");
     expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1");
     expect(harness.runs[1]?.prompt).not.toContain("Full relevant history:");
+  });
+
+  it("scopes exact-id continuation summaries to the lifecycle project context for duplicate identifiers", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-123",
+      identifier: "ENG-123",
+      title: "Docs issue",
+      branchName: "symphony/docs/ENG-123",
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+    const runtimeIssue = trackerIssue({
+      id: "issue-runtime-123",
+      identifier: "ENG-123",
+      title: "Runtime issue",
+      branchName: "symphony/runtime/ENG-123",
+      projectContextId: "runtime",
+      projectContextLabel: "Runtime",
+      linearProjectSlug: "RUNTIME",
+    });
+    const runtimeProjectContext = {
+      projectContextId: "runtime",
+      projectContextLabel: "Runtime",
+      linearProjectSlug: "RUNTIME",
+      routingSource: "candidate_poll",
+    } as const;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [];
+      },
+    };
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+
+    await runStore.startRun({
+      runId: "run-docs",
+      sessionId: "session-docs",
+      agentId: "agent-docs",
+      role: "worker",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      workspaceKey: "docs-workspace",
+      workspacePath: path.join(root, "docs-workspace"),
+      gitBranchName: docsIssue.branchName ?? "symphony/docs/ENG-123",
+      repoPath: root,
+      baseRef: "origin/main",
+    });
+    await runStore.appendEvent({
+      runId: "run-docs",
+      at: "2026-01-01T00:00:01Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Docs context work.",
+    });
+    await runStore.startRun({
+      runId: "run-runtime",
+      sessionId: "session-runtime",
+      agentId: "agent-runtime",
+      role: "worker",
+      issueId: runtimeIssue.id,
+      issueIdentifier: runtimeIssue.identifier,
+      projectContext: runtimeProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "runtime work",
+      workspaceKey: "runtime-workspace",
+      workspacePath: path.join(root, "runtime-workspace"),
+      gitBranchName: runtimeIssue.branchName ?? "symphony/runtime/ENG-123",
+      repoPath: root,
+      baseRef: "origin/main",
+    });
+    await runStore.appendEvent({
+      runId: "run-runtime",
+      at: "2026-01-01T00:00:02Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Runtime context work.",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, { phase: "implementation", projectContext: docsProjectContext });
+    await lifecycleStore.ensureIssue(runtimeIssue, { phase: "implementation", projectContext: runtimeProjectContext });
+
+    const createdSummary = await orchestrator.createContinuationSummary(docsIssue.id);
+    const storedLifecycle = await lifecycleStore.get(docsIssue.id);
+
+    expect(createdSummary.summaryReference.runIds).toEqual(["run-docs"]);
+    expect(createdSummary.summaryReference.transcriptPointers).toEqual(["/api/v1/runs/run-docs/transcript"]);
+    expect(createdSummary.summaryReference.statusApiPointers).toEqual([
+      "/api/v1/issues/issue-docs-123",
+      "/api/v1/issues/issue-docs-123/runs",
+      "/api/v1/runs/run-docs",
+    ]);
+    expect(storedLifecycle?.summaryReferences).toEqual([createdSummary.summaryReference]);
   });
 });
 

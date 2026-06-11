@@ -467,9 +467,10 @@ export class FileIssueLifecycleStore {
   }
 
   async ensureIssue(issue: Pick<Issue, "id" | "identifier">, patch: IssueLifecyclePatch = {}): Promise<IssueLifecycleRecord> {
-    const requestedProjectContext = normalizeProjectContextResolution(
-      patch.projectContext ?? projectContextResolutionFromIssue(issue),
-    );
+    const requestedProjectContext =
+      patch.projectContext === undefined
+        ? (projectContextResolutionFromIssue(issue) ?? undefined)
+        : normalizeProjectContextResolution(patch.projectContext);
     const existing = await this.find(issue.id, issue.identifier, requestedProjectContext?.projectContextId);
     const now = new Date().toISOString();
     const projectContext = normalizeProjectContextResolution(

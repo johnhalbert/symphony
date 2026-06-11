@@ -36,6 +36,8 @@ export interface WorkspaceMetadata {
   gitBranchName?: string;
 }
 
+const CONTEXTUAL_WORKSPACE_KEY_PREFIX = "ctx";
+
 export class WorkspaceManager {
   private readonly branchRenderer = new Liquid({ strictVariables: true });
   private readonly store: FileRunTranscriptStore;
@@ -390,7 +392,7 @@ export class WorkspaceManager {
 
   private async resolveBranchName(issue: WorkspaceIssue): Promise<string> {
     const source = this.options.workspace.source;
-    const template = source.branchTemplate ?? "symphony/{{ issue.identifier }}";
+    const template = source.branchTemplate ?? defaultBranchTemplateForIssue(issue);
     const branchName =
       issue.branchName ??
       (await this.branchRenderer.parseAndRender(template, {
@@ -398,6 +400,7 @@ export class WorkspaceManager {
           id: issue.id,
           identifier: issue.identifier,
           branchName: issue.branchName,
+          projectContext: issue.projectContext,
         },
       }));
     const trimmed = String(branchName).trim();
@@ -444,7 +447,7 @@ function workspaceKeyForIssue(issue: WorkspaceIssue): string {
   if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
     return identifierKey;
   }
-  return `${sanitizeWorkspaceKey(projectContextId)}__${identifierKey}`;
+  return `${CONTEXTUAL_WORKSPACE_KEY_PREFIX}__${sanitizeWorkspaceKey(projectContextId)}__${identifierKey}`;
 }
 
 function workspaceKeyForPlanning(issue: WorkspaceIssue): string {
@@ -454,6 +457,14 @@ function workspaceKeyForPlanning(issue: WorkspaceIssue): string {
 export function sanitizeWorkspaceKey(identifier: string): string {
   const sanitized = identifier.replace(/[^A-Za-z0-9._-]/g, "_");
   return sanitized.length > 0 ? sanitized : "issue";
+}
+
+function defaultBranchTemplateForIssue(issue: WorkspaceIssue): string {
+  const projectContextId = issue.projectContext?.projectContextId;
+  if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+    return "symphony/{{ issue.identifier }}";
+  }
+  return "symphony/{{ issue.projectContext.projectContextId }}/{{ issue.identifier }}";
 }
 
 export function assertPathInsideRoot(workspacePath: string, workspaceRoot: string): void {
