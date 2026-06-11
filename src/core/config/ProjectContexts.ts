@@ -87,6 +87,24 @@ export interface ProjectContextRegistry<TContext extends { id: ProjectContextId;
   byId: ReadonlyMap<ProjectContextId, TContext>;
 }
 
+export interface LegacyProjectContextDefaults<
+  TTracker = unknown,
+  TWorkspace = unknown,
+  TGitHub = unknown,
+  TReviewLoop = unknown,
+  TIssueBreakdown = unknown,
+  TAgent = unknown,
+  TCredentialProfiles = unknown,
+> {
+  tracker?: TTracker;
+  workspace?: TWorkspace;
+  github?: TGitHub;
+  review_loop?: TReviewLoop;
+  issue_breakdown?: TIssueBreakdown;
+  agent?: TAgent;
+  credential_profiles?: TCredentialProfiles;
+}
+
 export function normalizeProjectContextId(raw: string): ProjectContextId {
   const normalized = raw
     .trim()
@@ -106,6 +124,47 @@ export function defaultProjectContextLabel(id: string): string {
     .filter((part) => part.length > 0)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
+}
+
+export function normalizeLegacyDefaultProjectContext<
+  TTracker = unknown,
+  TWorkspace = unknown,
+  TGitHub = unknown,
+  TReviewLoop = unknown,
+  TIssueBreakdown = unknown,
+  TAgent = unknown,
+  TCredentialProfiles = unknown,
+>(
+  input: LegacyProjectContextDefaults<
+    TTracker,
+    TWorkspace,
+    TGitHub,
+    TReviewLoop,
+    TIssueBreakdown,
+    TAgent,
+    TCredentialProfiles
+  >,
+): ProjectContextConfig<
+  TTracker,
+  TWorkspace,
+  TGitHub,
+  TReviewLoop,
+  TIssueBreakdown,
+  TAgent,
+  TCredentialProfiles
+> {
+  return {
+    id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+    enabled: true,
+    ...(input.tracker === undefined ? {} : { tracker: input.tracker }),
+    ...(input.workspace === undefined ? {} : { workspace: input.workspace }),
+    ...(input.github === undefined ? {} : { github: input.github }),
+    ...(input.review_loop === undefined ? {} : { review_loop: input.review_loop }),
+    ...(input.issue_breakdown === undefined ? {} : { issue_breakdown: input.issue_breakdown }),
+    ...(input.agent === undefined ? {} : { agent: input.agent }),
+    ...(input.credential_profiles === undefined ? {} : { credential_profiles: input.credential_profiles }),
+  };
 }
 
 export function normalizeProjectContextResolution(

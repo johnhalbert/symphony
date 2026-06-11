@@ -10,9 +10,9 @@ import {
 } from "./CredentialProfiles.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
-  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
   buildProjectContextRegistry,
   defaultProjectContextLabel,
+  normalizeLegacyDefaultProjectContext,
   normalizeProjectContextId,
   projectContextMetadataForPublicRead,
   type NormalizedProjectContext,
@@ -349,7 +349,7 @@ const rawConfigSchema = z
   .passthrough();
 
 export type RawWorkflowConfig = z.infer<typeof rawConfigSchema>;
-type RawProjectContextConfig = z.infer<typeof rawProjectContextSchema>;
+export type RawProjectContextConfig = z.infer<typeof rawProjectContextSchema>;
 
 export type WorkflowProjectContextConfig = ProjectContextConfig<
   RawWorkflowConfig["tracker"],
@@ -924,9 +924,7 @@ function normalizeWorkflowProjectContexts(
   workflowDir: string,
   env: NodeJS.ProcessEnv,
 ): WorkflowProjectContextRegistry {
-  const defaults: WorkflowProjectContextConfig = {
-    id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
-    label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  const legacyDefaultContext = normalizeLegacyDefaultProjectContext({
     tracker: raw.tracker,
     workspace: raw.workspace,
     github: raw.github,
@@ -934,7 +932,8 @@ function normalizeWorkflowProjectContexts(
     issue_breakdown: raw.issue_breakdown,
     agent: raw.agent,
     credential_profiles: raw.credential_profiles,
-  };
+  }) as RawProjectContextConfig;
+  const defaults = legacyDefaultContext as WorkflowProjectContextConfig;
 
   const contexts =
     raw.project_contexts?.map((context) =>
@@ -942,7 +941,13 @@ function normalizeWorkflowProjectContexts(
         requireExplicitWorkspaceSource: true,
         source: "explicit",
       }),
-    ) ?? [normalizeLegacyWorkflowProjectContext(defaults, workflowDir, env)];
+    ) ??
+    [
+      normalizeWorkflowProjectContext(legacyDefaultContext, {}, workflowDir, env, {
+        requireExplicitWorkspaceSource: false,
+        source: "legacy_default",
+      }),
+    ];
 
   try {
     return buildProjectContextRegistry(contexts);
@@ -952,31 +957,6 @@ function normalizeWorkflowProjectContexts(
       error instanceof Error ? error.message : "Project contexts are invalid",
     );
   }
-}
-
-function normalizeLegacyWorkflowProjectContext(
-  defaults: WorkflowProjectContextConfig,
-  workflowDir: string,
-  env: NodeJS.ProcessEnv,
-): WorkflowProjectContext {
-  return normalizeWorkflowProjectContext(
-    {
-      id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
-      label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
-      enabled: true,
-      tracker: defaults.tracker,
-      workspace: defaults.workspace,
-      github: defaults.github,
-      review_loop: defaults.review_loop,
-      issue_breakdown: defaults.issue_breakdown,
-      agent: defaults.agent,
-      credential_profiles: defaults.credential_profiles,
-    },
-    {},
-    workflowDir,
-    env,
-    { requireExplicitWorkspaceSource: false, source: "legacy_default" },
-  );
 }
 
 function normalizeWorkflowProjectContext(
