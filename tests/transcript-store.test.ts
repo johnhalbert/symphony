@@ -1138,6 +1138,12 @@ describe("FileRunTranscriptStore", () => {
       linearProjectSlug: "DOCS",
       routingSource: "candidate_poll",
     } as const;
+    const legacyDefaultProjectContext = {
+      projectContextId: "default",
+      projectContextLabel: "Default",
+      linearProjectSlug: null,
+      routingSource: "legacy_default",
+    } as const;
 
     await store.upsertWorkspace({
       workspaceKey: "docs-workspace",
@@ -1184,25 +1190,27 @@ describe("FileRunTranscriptStore", () => {
     delete legacyWorkspace.projectContext;
     await writeFile(legacyWorkspacePath, `${JSON.stringify(legacyWorkspace, null, 2)}
 `, "utf8");
+    const legacyRunBeforeRead = await readFile(legacyRunPath, "utf8");
+    const legacyWorkspaceBeforeRead = await readFile(legacyWorkspacePath, "utf8");
 
     await expect(store.getRun("run-explicit")).resolves.toMatchObject({ projectContext: docsProjectContext });
     await expect(store.getWorkspace("docs-workspace")).resolves.toMatchObject({ projectContext: docsProjectContext });
     await expect(store.getRun("run-legacy")).resolves.toMatchObject({
-      projectContext: {
-        projectContextId: "default",
-        projectContextLabel: "Default",
-        linearProjectSlug: null,
-        routingSource: "legacy_default",
-      },
+      projectContext: legacyDefaultProjectContext,
     });
     await expect(store.getWorkspace("legacy-workspace")).resolves.toMatchObject({
-      projectContext: {
-        projectContextId: "default",
-        projectContextLabel: "Default",
-        linearProjectSlug: null,
-        routingSource: "legacy_default",
-      },
+      projectContext: legacyDefaultProjectContext,
     });
+    await expect(store.listRuns()).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ runId: "run-legacy", projectContext: legacyDefaultProjectContext })]),
+    );
+    await expect(store.listWorkspaces()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ workspaceKey: "legacy-workspace", projectContext: legacyDefaultProjectContext }),
+      ]),
+    );
+    await expect(readFile(legacyRunPath, "utf8")).resolves.toBe(legacyRunBeforeRead);
+    await expect(readFile(legacyWorkspacePath, "utf8")).resolves.toBe(legacyWorkspaceBeforeRead);
   });
 
   it("updates run project context attribution while preserving existing context on unrelated updates", async () => {
