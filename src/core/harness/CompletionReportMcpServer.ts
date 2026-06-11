@@ -5,7 +5,7 @@ import {
   type CompletionReportActiveContext,
   type CompletionReportPullRequestPublisher,
 } from "../CompletionReportService.js";
-import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
+import { FileIssueLifecycleStore, type IssueLifecycleRecord } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore, type RunRecord } from "../persistence/RunTranscriptStore.js";
 import { normalizeProjectContextResolution, type ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { Issue, Workspace } from "../types.js";
@@ -57,9 +57,10 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const config = loaded.serviceConfig;
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-    const activeRun = await runStore.getRun(loadedContext.activeRunId);
-    validateCompletionReportMcpActiveContext(loadedContext, activeRun);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const activeRun = await runStore.getRun(loadedContext.activeRunId);
+    const lifecycle = await lifecycleStore.get(activeRun?.issueId ?? loadedContext.issue.id);
+    validateCompletionReportMcpActiveContext({ context: loadedContext, input, activeRun, lifecycle });
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writebackProcessor =
       config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
@@ -139,15 +140,22 @@ async function readCompletionReportContext(filePath: string): Promise<Completion
   return parsed;
 }
 
-function validateCompletionReportMcpActiveContext(
-  context: CompletionReportMcpContextFile,
-  activeRun: RunRecord | null,
-): void {
+function validateCompletionReportMcpActiveContext(input: {
+  context: CompletionReportMcpContextFile;
+  input: unknown;
+  activeRun: RunRecord | null;
+  lifecycle: IssueLifecycleRecord | null;
+}): void {
+  const { context, activeRun, lifecycle } = input;
   if (!activeRun || activeRun.role !== "worker") {
     throw new SymphonyError("invalid_request", "Completion report MCP context does not match the active worker run");
   }
 
   const mismatches: string[] = [];
+  const allowsTerminalReplay = allowsTerminalCompletionReportReplay(input.lifecycle, input.input, activeRun.runId);
+  if (!lifecycle || lifecycle.summaryPointers.lastRunId !== activeRun.runId) mismatches.push("summaryPointers.lastRunId");
+  if (activeRun.runPhase !== "implementation") mismatches.push("runPhase");
+  if (activeRun.status !== "running" && !allowsTerminalReplay) mismatches.push("status");
   if (activeRun.issueId !== context.issue.id) mismatches.push("issue.id");
   if (activeRun.issueIdentifier !== context.issue.identifier) mismatches.push("issue.identifier");
   if (activeRun.workspaceKey !== context.workspace.workspaceKey) mismatches.push("workspace.workspaceKey");
@@ -155,6 +163,7 @@ function validateCompletionReportMcpActiveContext(
   if (context.workspacePath !== null && activeRun.workspacePath !== context.workspacePath) mismatches.push("workspacePath");
   if (context.workspace.issueId !== activeRun.issueId) mismatches.push("workspace.issueId");
   if (context.workspace.issueIdentifier !== activeRun.issueIdentifier) mismatches.push("workspace.issueIdentifier");
+  if (context.sessionId !== null && (activeRun.sessionId ?? null) !== context.sessionId) mismatches.push("sessionId");
   if ((context.workspace.gitBranchName ?? null) !== (activeRun.gitBranchName ?? null)) {
     mismatches.push("workspace.gitBranchName");
   }
@@ -164,9 +173,7 @@ function validateCompletionReportMcpActiveContext(
   if ((context.workspace.baseRef ?? null) !== (activeRun.baseRef ?? null)) {
     mismatches.push("workspace.baseRef");
   }
-  if (projectContextIdFor(context.projectContext) !== projectContextIdFor(activeRun.projectContext)) {
-    mismatches.push("projectContext.projectContextId");
-  }
+  mismatches.push(...projectContextMismatches(context.projectContext, activeRun.projectContext));
 
   if (mismatches.length > 0) {
     throw new SymphonyError(
@@ -176,8 +183,36 @@ function validateCompletionReportMcpActiveContext(
   }
 }
 
-function projectContextIdFor(context: ProjectContextResolution | undefined): string | null {
-  return normalizeProjectContextResolution(context).projectContextId;
+function allowsTerminalCompletionReportReplay(
+  lifecycle: IssueLifecycleRecord | null,
+  input: unknown,
+  runId: string,
+): boolean {
+  const idempotencyKey = completionReportIdempotencyKeyFromInput(input);
+  if (!lifecycle || !idempotencyKey) return false;
+  return lifecycle.completionReports.some(
+    (report) => report.idempotencyKey === idempotencyKey && report.runId === runId && report.acceptedAt !== null,
+  );
+}
+
+function completionReportIdempotencyKeyFromInput(input: unknown): string | null {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
+  const idempotencyKey = (input as { idempotencyKey?: unknown }).idempotencyKey;
+  return typeof idempotencyKey === "string" && idempotencyKey.trim().length > 0 ? idempotencyKey : null;
+}
+
+function projectContextMismatches(
+  context: ProjectContextResolution | undefined,
+  activeRunContext: ProjectContextResolution | undefined,
+): string[] {
+  const expected = normalizeProjectContextResolution(activeRunContext);
+  const actual = normalizeProjectContextResolution(context);
+  const mismatches: string[] = [];
+  if (actual.projectContextId !== expected.projectContextId) mismatches.push("projectContext.projectContextId");
+  if (actual.projectContextLabel !== expected.projectContextLabel) mismatches.push("projectContext.projectContextLabel");
+  if (actual.linearProjectSlug !== expected.linearProjectSlug) mismatches.push("projectContext.linearProjectSlug");
+  if (actual.routingSource !== expected.routingSource) mismatches.push("projectContext.routingSource");
+  return mismatches;
 }
 
 function completionReportInputSchema(): Record<string, unknown> {

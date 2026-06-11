@@ -71,6 +71,11 @@ describe("completion report MCP handoff", () => {
       repoPath: "/repo",
       baseRef: "main",
     });
+    await new FileIssueLifecycleStore(stateDir).ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-1" },
+    });
     await writeCompletionReportMcpContext(contextFile, {
       issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
       projectContext: docsProjectContext,
@@ -183,6 +188,11 @@ describe("completion report MCP handoff", () => {
       repoPath: "/repo",
       baseRef: "main",
     });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-issue-mismatch" },
+    });
     await writeCompletionReportMcpContext(contextFile, {
       issue: issue({ id: "issue-2", identifier: "TEST-2", state: "In Progress", branchName: "symphony/TEST-1" }),
       activeRunId: "run-issue-mismatch",
@@ -211,7 +221,11 @@ describe("completion report MCP handoff", () => {
       }),
     ).rejects.toThrow("Completion report MCP context does not match the active worker run");
     await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
-    await expect(new FileIssueLifecycleStore(stateDir).get("TEST-1")).resolves.toBeNull();
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-issue-mismatch" },
+      completionReports: [],
+    });
   });
 
   it("rejects completion report MCP submission when the project context does not match the active run", async () => {
@@ -236,6 +250,12 @@ describe("completion report MCP handoff", () => {
       gitBranchName: "symphony/TEST-1",
       repoPath: "/repo",
       baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-project-context-mismatch" },
     });
     await writeCompletionReportMcpContext(contextFile, {
       issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
@@ -266,7 +286,314 @@ describe("completion report MCP handoff", () => {
       }),
     ).rejects.toThrow("Completion report MCP context does not match the active worker run");
     await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
-    await expect(new FileIssueLifecycleStore(stateDir).get("TEST-1")).resolves.toBeNull();
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "implementation",
+      projectContext: docsProjectContext,
+      summaryPointers: { lastRunId: "run-project-context-mismatch" },
+      completionReports: [],
+    });
+  });
+
+  it("rejects completion report MCP submission when service-owned project context fields drift for the same project context id", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir, false), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-project-context-field-mismatch",
+      sessionId: "agent-1:run-project-context-field-mismatch",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-project-context-field-mismatch" },
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      projectContext: {
+        projectContextId: docsProjectContext.projectContextId,
+        projectContextLabel: "Documentation Site Drift",
+        linearProjectSlug: "DOCS-ALT",
+        routingSource: "state_refresh",
+      },
+      activeRunId: "run-project-context-field-mismatch",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-project-context-field-mismatch",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+
+    await expect(
+      submitCompletionReportFromMcp(report("context-project-fields-mismatch"), {
+        workflowPath,
+        contextFile,
+      }),
+    ).rejects.toThrow("Completion report MCP context does not match the active worker run");
+    await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "implementation",
+      projectContext: docsProjectContext,
+      summaryPointers: { lastRunId: "run-project-context-field-mismatch" },
+      completionReports: [],
+    });
+  });
+
+  it("rejects completion report MCP submission when activeRunId is swapped to a completed sibling run", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir, false), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-old",
+      sessionId: "agent-old:run-old",
+      agentId: "agent-old",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await runStore.updateRun("run-old", { status: "succeeded", completedAt: new Date().toISOString() });
+    await runStore.startRun({
+      runId: "run-current",
+      sessionId: "agent-current:run-current",
+      agentId: "agent-current",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 2,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-current" },
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      projectContext: docsProjectContext,
+      activeRunId: "run-old",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-current:run-current",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+
+    await expect(
+      submitCompletionReportFromMcp(report("context-alt-run-mismatch"), {
+        workflowPath,
+        contextFile,
+      }),
+    ).rejects.toThrow("Completion report MCP context does not match the active worker run");
+    await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "implementation",
+      projectContext: docsProjectContext,
+      summaryPointers: { lastRunId: "run-current" },
+      completionReports: [],
+    });
+    await expect(runStore.getRun("run-old")).resolves.toMatchObject({ status: "succeeded" });
+    await expect(runStore.getRun("run-current")).resolves.toMatchObject({ status: "running" });
+  });
+
+  it("rejects completion report MCP submission when activeRunId targets a non-implementation worker run", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir, false), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-merge-repair",
+      sessionId: "agent-1:run-merge-repair",
+      agentId: "agent-1",
+      role: "worker",
+      runPhase: "merge_conflict_resolution",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-merge-repair" },
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      projectContext: docsProjectContext,
+      activeRunId: "run-merge-repair",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-merge-repair",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+
+    await expect(
+      submitCompletionReportFromMcp(report("context-run-phase-mismatch"), {
+        workflowPath,
+        contextFile,
+      }),
+    ).rejects.toThrow("Completion report MCP context does not match the active worker run");
+    await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "implementation",
+      projectContext: docsProjectContext,
+      summaryPointers: { lastRunId: "run-merge-repair" },
+      completionReports: [],
+    });
+  });
+
+  it("replays duplicate completion report MCP submission after the originating run completes", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir, false), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-replay-after-completion",
+      sessionId: "agent-1:run-replay-after-completion",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-replay-after-completion" },
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      projectContext: docsProjectContext,
+      activeRunId: "run-replay-after-completion",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-replay-after-completion",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+
+    const first = await submitCompletionReportFromMcp(report("replay-after-completion"), {
+      workflowPath,
+      contextFile,
+    });
+    await runStore.updateRun("run-replay-after-completion", { status: "succeeded", completedAt: new Date().toISOString() });
+    const second = await submitCompletionReportFromMcp(report("replay-after-completion"), {
+      workflowPath,
+      contextFile,
+    });
+
+    expect(first).toMatchObject({ accepted: true, replayed: false });
+    expect(second).toMatchObject({
+      accepted: true,
+      replayed: true,
+      reportId: "completion-report:issue-1:replay-after-completion",
+    });
+    await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toHaveLength(2);
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "review",
+      lastCompletionReportId: "completion-report:issue-1:replay-after-completion",
+      summaryPointers: { lastRunId: "run-replay-after-completion" },
+      completionReports: [
+        expect.objectContaining({ runId: "run-replay-after-completion", idempotencyKey: "replay-after-completion" }),
+      ],
+    });
   });
 
   it("uses service GitHub publication profile for default PR publication", async () => {
@@ -293,6 +620,10 @@ describe("completion report MCP handoff", () => {
       gitBranchName: "symphony/TEST-1",
       repoPath: workspace,
       baseRef: "main",
+    });
+    await new FileIssueLifecycleStore(stateDir).ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-publication-profile" },
     });
     await writeCompletionReportMcpContext(contextFile, {
       issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
@@ -374,6 +705,10 @@ describe("completion report MCP handoff", () => {
       gitBranchName: "symphony/TEST-1",
       repoPath: "/repo",
       baseRef: "main",
+    });
+    await new FileIssueLifecycleStore(stateDir).ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-stdio-1" },
     });
     await writeCompletionReportMcpContext(contextFile, {
       issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
