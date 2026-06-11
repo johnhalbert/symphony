@@ -15,6 +15,7 @@ import {
   IssueBreakdownPlanService,
 } from "../src/core/IssueBreakdownPlanService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import { planMergeCompletedWritebacks } from "../src/core/writeback/TransitionPolicy.js";
 import {
   FileIssueLifecycleStore,
   type IssueBreakdownCreatedIssueRef,
@@ -621,6 +622,96 @@ describe("FileWritebackOutboxStore", () => {
     },
   );
 
+  it.each(["short", "full"] as const)(
+    "preserves legacy default-context transition writebacks without runId when a sibling context reuses the same payload via the %s legacy path",
+    async (targetKind) => {
+      const store = new FileWritebackOutboxStore(root);
+      const defaultWriter = new FakeWriter();
+      const docsWriter = new FakeWriter();
+      const processor = new WritebackProcessor(
+        store,
+        defaultWriter,
+        new StructuredLogger(() => undefined),
+        300_000,
+        undefined,
+        false,
+        undefined,
+        (projectContext) => (projectContext?.projectContextId === docsProjectContext.projectContextId ? docsWriter : defaultWriter),
+      );
+      const config = testConfig(root);
+      config.writeback.enabled = true;
+      const mergeContext = {
+        issue: issue({
+          id: `issue-legacy-default-transition-${targetKind}`,
+          identifier: `TEST-LEGACY-TRANS-${targetKind.toUpperCase()}`,
+          state: "Ready to Merge",
+        }),
+        mergeId: `merge-${targetKind}`,
+        fromState: "Ready to Merge",
+        doneState: "Done",
+      } as const;
+      const legacyOperation = planMergeCompletedWritebacks(mergeContext, config)[0];
+      const docsOperation = planMergeCompletedWritebacks({ ...mergeContext, projectContext: docsProjectContext }, config)[0];
+      if (!legacyOperation || !docsOperation) {
+        throw new Error("expected merge-completed writebacks to be enabled for legacy sibling replay regression");
+      }
+
+      expect(legacyOperation).toMatchObject({ kind: "transition" });
+      expect(legacyOperation.runId).toBeUndefined();
+      expect(docsOperation).toMatchObject({ kind: "transition", projectContext: docsProjectContext });
+      expect(docsOperation.runId).toBeUndefined();
+      expect(docsOperation.idempotencyKey).toBe(legacyOperation.idempotencyKey);
+      expect(docsOperation.payload).toEqual(legacyOperation.payload);
+
+      await store.enqueueOnce(legacyOperation);
+      await relocatePersistedWritebackToLegacyPath(legacyOperation.idempotencyKey, targetKind);
+
+      await expect(store.enqueueOnce(docsOperation)).resolves.toMatchObject({
+        status: "pending",
+        projectContext: docsProjectContext,
+        payload: docsOperation.payload,
+      });
+
+      await expect(store.list()).resolves.toHaveLength(2);
+      await expect(store.get(legacyOperation.idempotencyKey, legacyDefaultProjectContext)).resolves.toMatchObject({
+        status: "pending",
+        projectContext: legacyDefaultProjectContext,
+        payload: legacyOperation.payload,
+      });
+      await expect(store.get(docsOperation.idempotencyKey, docsProjectContext)).resolves.toMatchObject({
+        status: "pending",
+        projectContext: docsProjectContext,
+        payload: docsOperation.payload,
+      });
+
+      await processor.processDue({ projectContext: docsProjectContext, idempotencyKeys: [docsOperation.idempotencyKey] });
+
+      expect(docsWriter.transitions).toEqual([
+        expect.objectContaining({
+          issueId: mergeContext.issue.id,
+          fromStates: ["Ready to Merge"],
+          toState: "Done",
+          reason: "Symphony reviewer-approved merge completed",
+        }),
+      ]);
+      expect(defaultWriter.transitions).toEqual([]);
+      await expect(store.get(docsOperation.idempotencyKey, docsProjectContext)).resolves.toMatchObject({ status: "succeeded" });
+      await expect(store.get(legacyOperation.idempotencyKey, legacyDefaultProjectContext)).resolves.toMatchObject({ status: "pending" });
+
+      await processor.processDue({ projectContext: legacyDefaultProjectContext, idempotencyKeys: [legacyOperation.idempotencyKey] });
+
+      expect(defaultWriter.transitions).toEqual([
+        expect.objectContaining({
+          issueId: mergeContext.issue.id,
+          fromStates: ["Ready to Merge"],
+          toState: "Done",
+          reason: "Symphony reviewer-approved merge completed",
+        }),
+      ]);
+      await expect(store.get(legacyOperation.idempotencyKey, legacyDefaultProjectContext)).resolves.toMatchObject({ status: "succeeded" });
+    },
+  );
+
   it("matches processDue project context by id even when attribution metadata changes", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
@@ -1134,7 +1225,7 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.transitions).toHaveLength(1);
   });
 
-  it("requeues skipped operations after replay backfills missing project context", async () => {
+  it("requeues skipped operations after replay backfills missing project context when run provenance exists", async () => {
     const store = new FileWritebackOutboxStore(root);
     const docsProjectContext = {
       projectContextId: "docs",
@@ -1142,11 +1233,14 @@ describe("FileWritebackOutboxStore", () => {
       linearProjectSlug: "DOCS",
       routingSource: "candidate_poll",
     } as const;
+    const runId = "run-docs-skipped-recovery";
+    await recordRunProjectContext(runId, "issue-1", "DOCS-1", docsProjectContext);
     const operation = {
       idempotencyKey: "transition:issue-1:merge:issue-1:docs-head-sha-1:Done",
       kind: "transition" as const,
       issueId: "issue-1",
       projectContext: docsProjectContext,
+      runId,
       payload: { fromStates: ["Ready to Merge"], toState: "Done", reason: "Symphony reviewer-approved merge completed" },
     };
     const skippedProcessor = new WritebackProcessor(

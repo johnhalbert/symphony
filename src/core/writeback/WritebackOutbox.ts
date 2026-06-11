@@ -767,6 +767,7 @@ function matchesNewWritebackOperationIgnoringProjectContext(
   record: WritebackOperation,
   operation: NewWritebackOperation,
 ): boolean {
+  if (!record.runId || !operation.runId) return false;
   return matchesNewWritebackOperation(
     {
       ...record,
