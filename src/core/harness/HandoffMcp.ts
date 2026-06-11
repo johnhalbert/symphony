@@ -307,6 +307,7 @@ export function completionReportMcpServerConfig(
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
+    projectContext: ctx.projectContext,
   });
 }
 
@@ -321,6 +322,7 @@ export function mergeConflictResolutionMcpServerConfig(
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
+    projectContext: ctx.projectContext,
   });
 }
 
@@ -335,6 +337,7 @@ export function issueBreakdownPlanMcpServerConfig(
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
+    projectContext: ctx.projectContext,
   });
 }
 
@@ -349,6 +352,7 @@ export function reviewVerdictMcpServerConfig(
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
+    projectContext: ctx.projectContext,
   });
 }
 
@@ -363,6 +367,7 @@ export function reviewFeedbackMcpServerConfig(
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
+    projectContext: ctx.projectContext,
   });
 }
 
@@ -377,6 +382,7 @@ export function transcriptRecallMcpServerConfig(
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
+    projectContext: ctx.projectContext,
   });
 }
 
