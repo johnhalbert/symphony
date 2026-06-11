@@ -164,7 +164,10 @@ export function projectContextSummaryDoctorCheck(config: ServiceConfig): DoctorC
     id: context.id,
     label: context.label,
     enabled: context.enabled,
-    tracker: { projectSlug: context.tracker.projectSlug },
+    tracker: {
+      projectSlug: context.tracker.projectSlug,
+      apiKeyPresent: context.tracker.apiKey !== "",
+    },
     workspace: {
       source: {
         kind: context.workspace.source.kind,
