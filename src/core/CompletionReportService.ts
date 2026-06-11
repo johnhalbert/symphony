@@ -774,12 +774,12 @@ export class CompletionReportService {
     if (!workspacePath) {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree workspace path");
     }
-    const branchName =
-      context.workspace?.gitBranchName ??
-      report.branchName ??
-      existingLifecycle?.summaryPointers.gitBranchName ??
-      existingLifecycle?.summaryPointers.branchName ??
-      context.issue.branchName;
+    const branchName = resolveServiceOwnedCompletionReportBranchName({
+      workspaceGitBranchName: context.workspace?.gitBranchName ?? null,
+      lifecycleGitBranchName: existingLifecycle?.summaryPointers.gitBranchName ?? null,
+      lifecycleBranchName: existingLifecycle?.summaryPointers.branchName ?? null,
+      issueBranchName: context.issue.branchName,
+    });
     if (!branchName) {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree branch");
     }
@@ -1059,11 +1059,16 @@ function summaryPointersFor(
   publication: CompletionReportPullRequestPublication | null,
   existingLifecycle: ExistingIssueLifecycle,
 ) {
+  const branchName = resolveServiceOwnedCompletionReportBranchName({
+    workspaceGitBranchName: context.workspace?.gitBranchName ?? null,
+    lifecycleGitBranchName: existingLifecycle?.summaryPointers.gitBranchName ?? null,
+    lifecycleBranchName: existingLifecycle?.summaryPointers.branchName ?? null,
+    issueBranchName: context.issue.branchName,
+  });
   return {
     workspacePath: context.workspacePath ?? context.workspace?.path ?? existingLifecycle?.summaryPointers.workspacePath ?? null,
-    branchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? existingLifecycle?.summaryPointers.branchName ?? null,
-    gitBranchName:
-      context.workspace?.gitBranchName ?? context.issue.branchName ?? existingLifecycle?.summaryPointers.gitBranchName ?? null,
+    branchName,
+    gitBranchName: branchName,
     repoPath: context.workspace?.repoPath ?? existingLifecycle?.summaryPointers.repoPath ?? null,
     baseRef: context.workspace?.baseRef ?? existingLifecycle?.summaryPointers.baseRef ?? null,
     lastRunId: context.activeRunId,
@@ -1074,6 +1079,23 @@ function summaryPointersFor(
     lastPushedAt: publication?.lastPushedAt ?? existingLifecycle?.summaryPointers.lastPushedAt ?? null,
     lastEvidenceCursor: publication?.evidenceCursor ?? existingLifecycle?.summaryPointers.lastEvidenceCursor ?? null,
   };
+}
+
+function resolveServiceOwnedCompletionReportBranchName(input: {
+  workspaceGitBranchName?: string | null;
+  lifecycleGitBranchName?: string | null;
+  lifecycleBranchName?: string | null;
+  runGitBranchName?: string | null;
+  issueBranchName?: string | null;
+}): string | null {
+  return (
+    input.workspaceGitBranchName ??
+    input.lifecycleGitBranchName ??
+    input.lifecycleBranchName ??
+    input.runGitBranchName ??
+    input.issueBranchName ??
+    null
+  );
 }
 
 function normalizeChecklist(items: CompletionReportInput["acceptanceChecklist"]): CompletionReportChecklistItem[] {
@@ -1113,12 +1135,12 @@ function recoveryContextFor(input: {
   run: ExistingRunRecord;
   config: ServiceConfig;
 }): CompletionReportActiveContext {
-  const branchName =
-    input.pendingReport.branchName ??
-    input.lifecycle.summaryPointers.gitBranchName ??
-    input.lifecycle.summaryPointers.branchName ??
-    input.run?.gitBranchName ??
-    input.issue.branchName;
+  const branchName = resolveServiceOwnedCompletionReportBranchName({
+    lifecycleGitBranchName: input.lifecycle.summaryPointers.gitBranchName,
+    lifecycleBranchName: input.lifecycle.summaryPointers.branchName,
+    runGitBranchName: input.run?.gitBranchName ?? null,
+    issueBranchName: input.issue.branchName,
+  });
   const workspacePath = input.lifecycle.summaryPointers.workspacePath ?? input.run?.workspacePath ?? null;
   const baseRef = input.lifecycle.summaryPointers.baseRef ?? input.run?.baseRef ?? input.config.workspace.source.baseRef;
   const repoPath = input.lifecycle.summaryPointers.repoPath ?? input.run?.repoPath ?? null;

@@ -337,6 +337,98 @@ describe("completion report MCP handoff", () => {
     expect(publisher.inputs[0]?.body).not.toContain("FORGED TITLE FROM WORKER CONTEXT");
   });
 
+  it("ignores forged completion report branchName when lifecycle summaryPointers own the service branch", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-branch-fallback",
+      sessionId: "agent-1:run-branch-fallback",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: null }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: {
+        lastRunId: "run-branch-fallback",
+        branchName: "service-owned-branch",
+        gitBranchName: "service-owned-branch",
+      },
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: null }),
+      projectContext: docsProjectContext,
+      activeRunId: "run-branch-fallback",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-branch-fallback",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      headBranch: "service-owned-branch",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "branch-fallback-idem",
+    });
+
+    const result = await submitCompletionReportFromMcp(
+      { ...report("branch-fallback-idem"), branchName: "forged-report-branch" },
+      mcpOptions(workflowPath, contextFile, {
+        pullRequestPublisher: publisher,
+        tracker: fakeTracker(issue({ state: "In Progress", branchName: null, title: "Do work" })),
+      }),
+    );
+
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      reportId: "completion-report:issue-1:branch-fallback-idem",
+    });
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      branchName: "service-owned-branch",
+      title: "TEST-1: Do work",
+    });
+    expect(publisher.inputs[0]?.branchName).not.toBe("forged-report-branch");
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "review",
+      summaryPointers: {
+        branchName: "service-owned-branch",
+        gitBranchName: "service-owned-branch",
+        prBranch: "service-owned-branch",
+        lastEvidenceCursor: "branch-fallback-idem",
+      },
+    });
+  });
+
   it("rejects completion report MCP submission when the authoritative issue state is no longer the active implementation state", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
