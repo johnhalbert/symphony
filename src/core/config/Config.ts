@@ -18,7 +18,6 @@ import {
   type NormalizedProjectContext,
   type ProjectContextConfig,
   type ProjectContextRegistry,
-  type ProjectContextSource,
 } from "./ProjectContexts.js";
 
 const stringArray = z.array(z.string());
@@ -937,17 +936,8 @@ function normalizeWorkflowProjectContexts(
 
   const contexts =
     raw.project_contexts?.map((context) =>
-      normalizeWorkflowProjectContext(context, defaults, workflowDir, env, {
-        requireExplicitWorkspaceSource: true,
-        source: "explicit",
-      }),
-    ) ??
-    [
-      normalizeWorkflowProjectContext(legacyDefaultContext, {}, workflowDir, env, {
-        requireExplicitWorkspaceSource: false,
-        source: "legacy_default",
-      }),
-    ];
+      normalizeWorkflowProjectContext(context, defaults, workflowDir, env, { requireExplicitWorkspaceSource: true }),
+    ) ?? [normalizeWorkflowProjectContext(legacyDefaultContext, {}, workflowDir, env, { requireExplicitWorkspaceSource: false })];
 
   try {
     return buildProjectContextRegistry(contexts);
@@ -964,7 +954,7 @@ function normalizeWorkflowProjectContext(
   defaults: Partial<WorkflowProjectContextConfig>,
   workflowDir: string,
   env: NodeJS.ProcessEnv,
-  options: { requireExplicitWorkspaceSource: boolean; source: ProjectContextSource },
+  options: { requireExplicitWorkspaceSource: boolean },
 ): WorkflowProjectContext {
   const contextPath = `project_contexts[${JSON.stringify(rawContext.id)}]`;
   let id: string;
@@ -1026,7 +1016,7 @@ function normalizeWorkflowProjectContext(
     id,
     label,
     enabled,
-    source: options.source,
+    source: options.requireExplicitWorkspaceSource ? "explicit" : "legacy_default",
     tracker,
     workspace,
     github,
