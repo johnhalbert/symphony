@@ -1819,6 +1819,28 @@ describe("/api/v1/web route contracts", () => {
     }
   });
 
+  it("can disable the projection-backed status routes while keeping the legacy server alive", async () => {
+    const webAssetsRoot = await createWebAssets(root);
+    const { server } = createStatusServer(root, { webAssetsRoot, enableStatusServer: false });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const rootDashboard = await getText(`${baseUrl}/`);
+      expect(rootDashboard.response.status).toBe(200);
+      expect(rootDashboard.response.headers.get("content-type")).toContain("text/html");
+
+      const state = await getJson(`${baseUrl}/api/v1/state`);
+      expect(state.response.status).toBe(200);
+
+      for (const route of ["/api/v1/web/dashboard", "/api/v1/web/issues", "/api/v1/web/orchestrator-chat", "/web/"]) {
+        const response = await fetch(`${baseUrl}${route}`);
+        expect({ route, status: response.status }).toEqual({ route, status: 404 });
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("serves configured production web assets under /web after API routes have precedence", async () => {
     const webAssetsRoot = await createWebAssets(root);
     const { server } = createStatusServer(root, { webAssetsRoot });
@@ -2014,6 +2036,7 @@ interface OrchestratorCallCounts {
 
 interface CreateStatusServerOptions {
   webAssetsRoot?: string | null;
+  enableStatusServer?: boolean;
   projectionWriter?: StatusServerProjectionWriter;
   projectionReader?: StatusServerProjectionReader;
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
@@ -2342,6 +2365,7 @@ function createStatusServer(
       trackerStateLists: testTrackerStateLists(),
       staleThresholdMs: 300_000,
       webAssetsRoot: options.webAssetsRoot,
+      ...(options.enableStatusServer === undefined ? {} : { enableStatusServer: options.enableStatusServer }),
       ...(options.runStore ? { runStore: options.runStore } : {}),
       ...(options.tracker ? { tracker: options.tracker } : {}),
       ...(options.webProjectionContextClock ? { webProjectionContextClock: options.webProjectionContextClock } : {}),

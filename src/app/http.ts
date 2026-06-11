@@ -1,6 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Stats } from "node:fs";
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
@@ -294,6 +294,8 @@ export interface StatusServerOptions {
    * Undefined or blank values default to `process.cwd()/web/dist`; null disables static serving.
    */
   webAssetsRoot?: string | null | undefined;
+  /** Enables the projection-backed `/api/v1/web/*` routes and `/web` assets. Defaults to true for direct callers. */
+  enableStatusServer?: boolean;
   webProjectionContextClock?: WebProjectionClock;
   webProjectionContextBuilder?: StatusServerWebProjectionContextBuilder;
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
@@ -307,6 +309,7 @@ export class StatusServer {
   private issueBoardTrackerCache: IssueBoardTrackerCache | null = null;
   private completedWebProjectionContext: StatusServerWebProjectionContext | null = null;
   private readonly pendingWebProjectionContexts = new Map<string, Promise<StatusServerWebProjectionContext>>();
+  private readonly projectionStatusEnabled: boolean;
   private readonly webAssetsRoot: string | null;
   private readonly webProjectionRevisionProviders: readonly WebProjectionRevisionProvider[];
   private readonly webProjectionRepositories: WebProjectionReadRepositories;
@@ -320,8 +323,9 @@ export class StatusServer {
   private webProjectionDirtyGeneration = 0;
 
   constructor(private readonly options: StatusServerOptions) {
-    this.webAssetsRoot = resolveWebAssetsRootOption(options.webAssetsRoot);
-    this.webProjectionRevisionProviders = createStatusServerWebProjectionRevisionProviders(options);
+    this.projectionStatusEnabled = options.enableStatusServer ?? true;
+    this.webAssetsRoot = this.projectionStatusEnabled ? resolveWebAssetsRootOption(options.webAssetsRoot) : null;
+    this.webProjectionRevisionProviders = this.projectionStatusEnabled ? createStatusServerWebProjectionRevisionProviders(options) : [];
     this.webProjectionRepositories = createWebProjectionReadRepositories({
       ...(options.projectionReader ? { reader: options.projectionReader } : {}),
       isRecordCurrent: (record) => this.isDurableProjectionRecordCurrent(record),
@@ -537,11 +541,11 @@ export class StatusServer {
         );
         return;
       }
-      if (request.method === "GET" && url.pathname === "/api/v1/web/events") {
+      if (this.projectionStatusEnabled && request.method === "GET" && url.pathname === "/api/v1/web/events") {
         this.handleWebProjectionEvents(request, response);
         return;
       }
-      if (request.method === "POST" && url.pathname === "/api/v1/web/projections/rebuild") {
+      if (this.projectionStatusEnabled && request.method === "POST" && url.pathname === "/api/v1/web/projections/rebuild") {
         this.requireMutationToken(request);
         let rebuildOptions: StatusServerProjectionRebuildOptions;
         try {
@@ -577,7 +581,7 @@ export class StatusServer {
         return;
       }
       const webIssueMatch = /^\/api\/v1\/web\/issues\/([^/]+)$/.exec(url.pathname);
-      if (request.method === "GET" && webIssueMatch) {
+      if (this.projectionStatusEnabled && request.method === "GET" && webIssueMatch) {
         const issueId = decodeURIComponent(webIssueMatch[1] ?? "");
         const detail = await this.fetchWebIssueDetail(
           issueId,
@@ -601,7 +605,7 @@ export class StatusServer {
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/api/v1/web/reference-data") {
+      if (this.projectionStatusEnabled && request.method === "GET" && url.pathname === "/api/v1/web/reference-data") {
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
         const durableIssues = await this.webProjectionRepositories.issueBoard.readDefaultBoard({ forceRefresh });
         if (durableIssues.status === "hit" && durableIssues.record) {
@@ -635,12 +639,12 @@ export class StatusServer {
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/api/v1/web/dashboard") {
+      if (this.projectionStatusEnabled && request.method === "GET" && url.pathname === "/api/v1/web/dashboard") {
         const dashboard = await this.fetchWebDashboard(isWebProjectionRefreshRequested(url.searchParams.get("refresh")));
         sendJson(response, 200, dashboard.body, dashboard.headers);
         return;
       }
-      if (request.method === "GET" && url.pathname === "/api/v1/web/sidebar") {
+      if (this.projectionStatusEnabled && request.method === "GET" && url.pathname === "/api/v1/web/sidebar") {
         const sidebar = await this.fetchWebSidebar(isWebProjectionRefreshRequested(url.searchParams.get("refresh")));
         sendJson(response, 200, sidebar.body, sidebar.headers);
         return;
@@ -657,7 +661,7 @@ export class StatusServer {
         );
         return;
       }
-      if (request.method === "GET" && url.pathname === "/api/v1/web/issues") {
+      if (this.projectionStatusEnabled && request.method === "GET" && url.pathname === "/api/v1/web/issues") {
         const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
         const durableIssues = await this.webProjectionRepositories.issueBoard.readDefaultBoard({ forceRefresh });
         if (durableIssues.status === "hit" && durableIssues.record) {
@@ -710,12 +714,16 @@ export class StatusServer {
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/v1/web/history") {
+        if (!this.projectionStatusEnabled) {
+          sendJson(response, 404, { error: { code: "not_found", message: "Route not found" } });
+          return;
+        }
         const history = await this.fetchWebHistory(isWebProjectionRefreshRequested(url.searchParams.get("refresh")), url);
         sendJson(response, 200, history.body, history.headers);
         return;
       }
       const webTranscriptMatch = /^\/api\/v1\/web\/sessions\/([^/]+)\/transcript$/.exec(url.pathname);
-      if (request.method === "GET" && webTranscriptMatch) {
+      if (this.projectionStatusEnabled && request.method === "GET" && webTranscriptMatch) {
         const sessionIdOrRunId = decodeURIComponent(webTranscriptMatch[1] ?? "").trim();
         const requestedFullTranscript = parseBooleanWebQueryParam(url.searchParams, "full");
         const requestedTranscriptPage = parseWebTranscriptPagination(url);
@@ -823,7 +831,7 @@ export class StatusServer {
         sendJson(response, 200, transcriptPayload, durableProjectionReadHeaders(durableTranscript));
         return;
       }
-      if (url.pathname === "/api/v1/web/orchestrator-chat") {
+      if (this.projectionStatusEnabled && url.pathname === "/api/v1/web/orchestrator-chat") {
         const conversationId = parseWebOrchestratorChatConversationId(url.searchParams.get("conversationId"));
         if (request.method === "GET") {
           const forceRefresh = isWebProjectionRefreshRequested(url.searchParams.get("refresh"));
@@ -1296,7 +1304,7 @@ export class StatusServer {
         return;
       }
 
-      if ((request.method === "GET" || request.method === "HEAD") && isWebAssetRoute(url.pathname)) {
+      if (this.projectionStatusEnabled && (request.method === "GET" || request.method === "HEAD") && isWebAssetRoute(url.pathname)) {
         if (await serveWebAsset(response, request.method, url.pathname, this.webAssetsRoot)) return;
       }
 
@@ -3989,22 +3997,38 @@ function trackerSourceStatusKey(trackerIssues: BuiltWebProjectionSourceIndex["tr
   return JSON.stringify({
     status: trackerIssues.status,
     fetchedStateKey: trackerIssues.fetchedStateKey,
-    fetchedAt: trackerIssues.fetchedAt,
-    cached: trackerIssues.cached,
     error: trackerIssues.error ? { code: trackerIssues.error.code, message: trackerIssues.error.message } : null,
     issueCount: trackerIssues.issues.length,
-    latestIssueRevision: latestTrackerIssueRevision(trackerIssues.issues),
+    issueDigest: trackerIssueContentDigest(trackerIssues.issues),
   });
 }
 
-function latestTrackerIssueRevision(issues: readonly Issue[]): string | null {
-  let latest: string | null = null;
-  for (const issue of issues) {
-    const revision = issue.updatedAt ?? issue.createdAt ?? issue.id;
-    if (!revision) continue;
-    if (latest === null || revision > latest) latest = revision;
-  }
-  return latest;
+function trackerIssueContentDigest(issues: readonly Issue[]): string {
+  const canonical = issues
+    .map((issue) => ({
+      id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      description: issue.description,
+      priority: issue.priority,
+      state: issue.state,
+      branchName: issue.branchName,
+      url: issue.url,
+      assigneeId: issue.assigneeId,
+      delegateId: issue.delegateId,
+      labels: [...issue.labels].sort(compareString),
+      blockedBy: issue.blockedBy
+        .map((blocker) => ({
+          id: blocker.id,
+          identifier: blocker.identifier,
+          state: blocker.state,
+        }))
+        .sort((left, right) => compareString(left.identifier ?? left.id ?? "", right.identifier ?? right.id ?? "")),
+      createdAt: issue.createdAt,
+      updatedAt: issue.updatedAt,
+    }))
+    .sort((left, right) => compareString(left.identifier, right.identifier) || compareString(left.id, right.id));
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
 function webProjectionJsonResponse<TBody>(

@@ -245,6 +245,8 @@ const rawConfigSchema = z
         host: z.string().optional(),
         open_workspace_token: z.string().optional(),
         web_assets_root: z.string().nullable().optional(),
+        enable_status_server: z.boolean().optional(),
+        "enable-status-server": z.boolean().optional(),
       })
       .passthrough()
       .optional(),
@@ -442,6 +444,7 @@ export interface ServerConfig {
   host: string;
   openWorkspaceToken: string | null;
   webAssetsRoot: string | null;
+  enableStatusServer: boolean;
 }
 
 export interface WritebackConfig {
@@ -788,6 +791,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const cursorRuntimeApiKey = normalizeOptionalConfigString(resolveConfigString("$CURSOR_API_KEY", env));
   const serverOpenWorkspaceToken = resolveConfigString(raw.server?.open_workspace_token, env) ?? null;
   const serverWebAssetsRoot = resolveOptionalPathValue(raw.server?.web_assets_root, workflowDir, env);
+  const serverEnableStatusServer = raw.server?.enable_status_server ?? raw.server?.["enable-status-server"] ?? false;
   const database = normalizeDatabaseConfig(raw, workflowDir, env);
   const credentialProfiles = createCredentialProfileRegistry({
     raw: raw.credential_profiles,
@@ -928,6 +932,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       host: raw.server?.host ?? "127.0.0.1",
       openWorkspaceToken: serverOpenWorkspaceToken,
       webAssetsRoot: serverWebAssetsRoot,
+      enableStatusServer: serverEnableStatusServer,
     },
     writeback: {
       enabled: raw.writeback?.enabled ?? false,

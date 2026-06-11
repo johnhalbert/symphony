@@ -238,7 +238,8 @@ program
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const mcpExposureDiagnosticsStore = new FileMcpExposureDiagnosticsStore(config.workspace.stateDir);
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
-    const projectionPersistence = config.server.port === null ? null : await createRuntimeProjectionPersistence(config);
+    const projectionPersistence =
+      config.server.port === null || !config.server.enableStatusServer ? null : await createRuntimeProjectionPersistence(config);
     const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
     const operatorApproval = new OperatorApprovalService({ config, store: operatorApprovalStore, runStore });
     const writeback = createRuntimeWritebackProcessor(() => configRef.value, logger);
@@ -303,6 +304,7 @@ program
             staleThresholdMs: config.polling.intervalMs,
             dashboard: statusDashboardConfig(config),
             webAssetsRoot: config.server.webAssetsRoot,
+            enableStatusServer: config.server.enableStatusServer,
             ...(projectionPersistence
               ? {
                   projectionWriter: projectionPersistence.writer,

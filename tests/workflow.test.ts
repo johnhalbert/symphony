@@ -89,6 +89,7 @@ Work on {{ issue.identifier }}.`,
       host: "127.0.0.1",
       openWorkspaceToken: null,
       webAssetsRoot: null,
+      enableStatusServer: false,
     });
     expect(config.issueBreakdown).toEqual({
       enabled: false,
@@ -224,6 +225,7 @@ github:
 server:
   open_workspace_token: $WORKFLOW_TEST_WORKSPACE
   web_assets_root: $WORKFLOW_TEST_WEB_ASSETS
+  enable-status-server: true
 ---
 Work on {{ issue.identifier }}.
 `,
@@ -237,6 +239,7 @@ Work on {{ issue.identifier }}.
       expect(loaded.serviceConfig.github.token).toBe("github-secret");
       expect(loaded.serviceConfig.server.openWorkspaceToken).toBe("workspace-secret");
       expect(loaded.serviceConfig.server.webAssetsRoot?.replace(/\\/g, "/")).toMatch(/\/dist-web$/);
+      expect(loaded.serviceConfig.server.enableStatusServer).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
