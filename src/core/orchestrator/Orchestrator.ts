@@ -1051,7 +1051,7 @@ export class Orchestrator {
       runs,
       transcriptEvents,
       transcriptPointers: transcriptPointersForRuns(runs),
-      statusApiPointers: statusApiPointersForIssue(lifecycle.issueIdentifier, runs),
+      statusApiPointers: statusApiPointersForIssue(lifecycle.issueId, runs),
     });
     const updated = await lifecycleStore.updateIssue(
       { id: lifecycle.issueId, identifier: lifecycle.issueIdentifier },
@@ -3363,7 +3363,7 @@ export class Orchestrator {
     const pointers = lifecycle?.summaryPointers;
     const latestRun = runs[runs.length - 1] ?? null;
     const transcriptPointers = transcriptPointersForRuns(runs);
-    const statusApiPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
+    const statusApiPointers = statusApiPointersForIssue(entry.issue.id, runs);
 
     return [
       "Structured continuation brief:",
@@ -3402,7 +3402,7 @@ export class Orchestrator {
       "",
       "Transcript/status pointers:",
       ...formatPointerList(summaryReference?.transcriptPointers ?? transcriptPointers),
-      ...formatPointerList(summaryReference?.statusApiPointers ?? statusApiPointers),
+      ...formatPointerList(statusApiPointers),
     ].join("\n");
   }
 
@@ -3500,7 +3500,7 @@ export class Orchestrator {
     const currentLifecycle = currentPromptLifecycle(lifecycle);
     const packet = buildWorkerHandoffPacket(currentLifecycle);
     const transcriptPointers = transcriptPointersForRuns(runs);
-    const statusPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
+    const statusPointers = statusApiPointersForIssue(entry.issue.id, runs);
     const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(isActiveReviewEvidenceItem);
     return [
       "",
@@ -4053,10 +4053,16 @@ async function listRunsForLifecycle(
   lifecycle: IssueLifecycleRecord,
 ): Promise<RunRecord[]> {
   const byId = new Map<string, RunRecord>();
-  for (const key of new Set([lifecycle.issueId, lifecycle.issueIdentifier])) {
-    for (const run of await runStore.listRunsForIssue(key)) {
-      byId.set(run.runId, run);
-    }
+  for (const run of await runStore.listRunsForIssue(lifecycle.issueId)) {
+    byId.set(run.runId, run);
+  }
+  if (byId.size > 0 || lifecycle.issueIdentifier === lifecycle.issueId) {
+    return [...byId.values()].sort(compareRunChronology);
+  }
+  const projectContextId = lifecycle.projectContext?.projectContextId;
+  if (!projectContextId) return [];
+  for (const run of await runStore.listRunsForIssue(lifecycle.issueIdentifier, { projectContextId })) {
+    byId.set(run.runId, run);
   }
   return [...byId.values()].sort(compareRunChronology);
 }
@@ -4092,10 +4098,10 @@ function transcriptPointersForRuns(runs: RunRecord[]): string[] {
   return runs.slice(-5).map((run) => `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript`);
 }
 
-function statusApiPointersForIssue(issueIdentifier: string, runs: RunRecord[]): string[] {
+function statusApiPointersForIssue(issueKey: string, runs: RunRecord[]): string[] {
   return [
-    `/api/v1/issues/${encodeURIComponent(issueIdentifier)}`,
-    `/api/v1/issues/${encodeURIComponent(issueIdentifier)}/runs`,
+    `/api/v1/issues/${encodeURIComponent(issueKey)}`,
+    `/api/v1/issues/${encodeURIComponent(issueKey)}/runs`,
     ...runs.slice(-5).map((run) => `/api/v1/runs/${encodeURIComponent(run.runId)}`),
   ];
 }

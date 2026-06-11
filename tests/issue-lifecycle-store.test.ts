@@ -411,6 +411,83 @@ describe("FileIssueLifecycleStore", () => {
     });
   });
 
+  it("preserves existing project context on unscoped lifecycle updates", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const docsIssue = {
+      ...issue({ id: "issue-docs-ctx", identifier: "ENG-CTX-1" }),
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectIdentity: { slug: "DOCS" },
+      routingSource: "candidate_poll",
+    };
+
+    await store.ensureIssue(docsIssue, { phase: "implementation" });
+
+    const updated = await store.updateIssue(
+      { id: "issue-docs-ctx", identifier: "ENG-CTX-1" },
+      { reviewRound: 2, blockedReason: "awaiting docs review" },
+    );
+
+    expect(updated).toMatchObject({
+      reviewRound: 2,
+      blockedReason: "awaiting docs review",
+      projectContext: {
+        projectContextId: "docs-site",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+      summaryPointers: {
+        projectContext: {
+          projectContextId: "docs-site",
+          projectContextLabel: "Documentation Site",
+          linearProjectSlug: "DOCS",
+          routingSource: "candidate_poll",
+        },
+      },
+    });
+  });
+
+  it("rejects ambiguous identifier lifecycle lookups across project contexts unless scoped", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const docsIssue = {
+      ...issue({
+        id: "issue-docs-123",
+        identifier: "ENG-123",
+      }),
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+    } as const;
+    const symphonyIssue = {
+      ...issue({
+        id: "issue-symphony-123",
+        identifier: "ENG-123",
+      }),
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony Runtime",
+    } as const;
+
+    await store.ensureIssue(docsIssue, { phase: "implementation" });
+    await store.ensureIssue(symphonyIssue, { phase: "review" });
+
+    await expect(store.get("ENG-123")).rejects.toMatchObject({ code: "conflict" });
+    await expect(store.get("ENG-123", { projectContextId: "docs" })).resolves.toMatchObject({
+      issueId: "issue-docs-123",
+      issueIdentifier: "ENG-123",
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      },
+    });
+    await expect(store.get("issue-symphony-123")).resolves.toMatchObject({
+      issueId: "issue-symphony-123",
+      issueIdentifier: "ENG-123",
+      projectContext: {
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony Runtime",
+      },
+    });
+  });
 
   it("surfaces corrupt lifecycle records", async () => {
     await mkdir(path.join(root, "issue-lifecycle"), { recursive: true });

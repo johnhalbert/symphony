@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SymphonyError } from "../src/core/errors.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 
 async function startBasicRun(
@@ -11,8 +12,6 @@ async function startBasicRun(
   overrides: Partial<Parameters<FileRunTranscriptStore["startRun"]>[0]> = {},
 ): Promise<void> {
   await store.startRun({
-    ...overrides,
-    runId,
     role: "worker",
     issueId: "issue-1",
     issueIdentifier: "TEST-1",
@@ -27,8 +26,11 @@ async function startBasicRun(
     gitBranchName: "symphony/TEST-1",
     repoPath: "/repo",
     baseRef: "main",
+    ...overrides,
+    runId,
   });
 }
+
 
 describe("FileRunTranscriptStore", () => {
   let root: string;
@@ -1176,14 +1178,12 @@ describe("FileRunTranscriptStore", () => {
     const legacyRunPath = path.join(root, "runs", "run-legacy", "meta.json");
     const legacyRun = JSON.parse(await readFile(legacyRunPath, "utf8")) as Record<string, unknown>;
     delete legacyRun.projectContext;
-    await writeFile(legacyRunPath, `${JSON.stringify(legacyRun, null, 2)}
-`, "utf8");
+    await writeFile(legacyRunPath, `${JSON.stringify(legacyRun, null, 2)}\n`, "utf8");
 
     const legacyWorkspacePath = path.join(root, "workspaces", "legacy-workspace.json");
     const legacyWorkspace = JSON.parse(await readFile(legacyWorkspacePath, "utf8")) as Record<string, unknown>;
     delete legacyWorkspace.projectContext;
-    await writeFile(legacyWorkspacePath, `${JSON.stringify(legacyWorkspace, null, 2)}
-`, "utf8");
+    await writeFile(legacyWorkspacePath, `${JSON.stringify(legacyWorkspace, null, 2)}\n`, "utf8");
 
     await expect(store.getRun("run-explicit")).resolves.toMatchObject({ projectContext: docsProjectContext });
     await expect(store.getWorkspace("docs-workspace")).resolves.toMatchObject({ projectContext: docsProjectContext });
@@ -1205,8 +1205,74 @@ describe("FileRunTranscriptStore", () => {
     });
   });
 
+  it("rejects ambiguous identifier lookups across project contexts while allowing scoped readback", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony Runtime",
+      linearProjectSlug: "SYMPHONY",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await store.upsertWorkspace({
+      workspaceKey: "ctx__docs__ENG-123",
+      issueId: "issue-docs-123",
+      issueIdentifier: "ENG-123",
+      projectContext: docsProjectContext,
+      path: "/tmp/ctx__docs__ENG-123",
+      sourceKind: "git_worktree",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await store.upsertWorkspace({
+      workspaceKey: "ctx__symphony__ENG-123",
+      issueId: "issue-symphony-123",
+      issueIdentifier: "ENG-123",
+      projectContext: symphonyProjectContext,
+      path: "/tmp/ctx__symphony__ENG-123",
+      sourceKind: "git_worktree",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await startBasicRun(store, "run-docs-context", {
+      issueId: "issue-docs-123",
+      issueIdentifier: "ENG-123",
+      workspaceKey: "ctx__docs__ENG-123",
+      workspacePath: "/tmp/ctx__docs__ENG-123",
+      projectContext: docsProjectContext,
+    });
+    await startBasicRun(store, "run-symphony-context", {
+      issueId: "issue-symphony-123",
+      issueIdentifier: "ENG-123",
+      workspaceKey: "ctx__symphony__ENG-123",
+      workspacePath: "/tmp/ctx__symphony__ENG-123",
+      projectContext: symphonyProjectContext,
+    });
+
+    await expect(store.findWorkspace("ENG-123", { includeWorkspaceKey: false })).rejects.toBeInstanceOf(SymphonyError);
+    await expect(store.listRunsForIssue("ENG-123")).rejects.toBeInstanceOf(SymphonyError);
+    await expect(store.getWorkspace("ctx__docs__ENG-123")).resolves.toMatchObject({ workspaceKey: "ctx__docs__ENG-123" });
+    await expect(
+      store.findWorkspace("ENG-123", { projectContextId: "docs", includeWorkspaceKey: false }),
+    ).resolves.toMatchObject({ workspaceKey: "ctx__docs__ENG-123", projectContext: docsProjectContext });
+    await expect(store.listRunsForIssue("ENG-123", { projectContextId: "docs" })).resolves.toMatchObject([
+      { runId: "run-docs-context", projectContext: docsProjectContext },
+    ]);
+    await expect(store.latestRunForIssue("ENG-123", { projectContextId: "symphony" })).resolves.toMatchObject({
+      runId: "run-symphony-context",
+      projectContext: symphonyProjectContext,
+    });
+  });
+
   it("updates run project context attribution while preserving existing context on unrelated updates", async () => {
     const store = new FileRunTranscriptStore(root);
+
     const docsProjectContext = {
       projectContextId: "docs",
       projectContextLabel: "Documentation Site",
