@@ -2827,6 +2827,9 @@ describe("project context redaction", () => {
       },
       github: { tokenPresent: true },
     });
+    expect(config.projectContexts.byId.get("docs")?.publicMetadata.repository).toBe("https://example.com/org/docs.git");
+    expect(config.projectContexts.byId.get("docs")?.publicMetadata.repository).not.toContain("repo-secret");
+    expect(config.projectContexts.byId.get("docs")?.publicMetadata.repository).not.toContain("x-access-token");
     expect(serialized).not.toContain("linear-secret");
     expect(serialized).not.toContain("root-gh-secret");
     expect(serialized).not.toContain("docs-gh-secret");

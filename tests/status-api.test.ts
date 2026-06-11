@@ -639,6 +639,124 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("strips unexpected project context repository/source fields across durable status routes", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const expectedProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "DOCS-CTX",
+      issueId: "issue-docs-ctx",
+      issueIdentifier: "DOCS-CTX",
+      projectContext: expectedProjectContext,
+      path: path.join(config.workspace.root, "DOCS-CTX"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/DOCS-CTX",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-docs-ctx",
+      sessionId: "session-docs-ctx",
+      agentId: "agent-docs-ctx",
+      role: "worker",
+      issueId: "issue-docs-ctx",
+      issueIdentifier: "DOCS-CTX",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "DOCS-CTX",
+      workspacePath: path.join(config.workspace.root, "DOCS-CTX"),
+      gitBranchName: "symphony/DOCS-CTX",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+      projectContext: expectedProjectContext,
+    });
+    await lifecycleStore.ensureIssue(issue({ id: "issue-docs-ctx", identifier: "DOCS-CTX" }), {
+      phase: "implementation",
+      projectContext: expectedProjectContext,
+    } as IssueLifecyclePatch);
+
+    const injectedProjectContext = {
+      ...expectedProjectContext,
+      repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+      path: "packages/site",
+      token: "workspace-secret",
+      profile: { value: "profile-secret" },
+    };
+    const runPath = path.join(config.workspace.stateDir, "runs", "run-docs-ctx", "meta.json");
+    const rawRun = JSON.parse(await readFile(runPath, "utf8")) as Record<string, unknown>;
+    rawRun.projectContext = injectedProjectContext;
+    await writeFile(runPath, `${JSON.stringify(rawRun, null, 2)}\n`, "utf8");
+
+    const workspacePath = path.join(config.workspace.stateDir, "workspaces", "DOCS-CTX.json");
+    const rawWorkspace = JSON.parse(await readFile(workspacePath, "utf8")) as Record<string, unknown>;
+    rawWorkspace.projectContext = injectedProjectContext;
+    await writeFile(workspacePath, `${JSON.stringify(rawWorkspace, null, 2)}\n`, "utf8");
+
+    const lifecyclePath = path.join(config.workspace.stateDir, "issue-lifecycle", "issue-docs-ctx.json");
+    const rawLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as Record<string, unknown>;
+    rawLifecycle.projectContext = injectedProjectContext;
+    await writeFile(lifecyclePath, `${JSON.stringify(rawLifecycle, null, 2)}\n`, "utf8");
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/DOCS-CTX`);
+      const runsResponse = await fetch(`${baseUrl}/api/v1/issues/DOCS-CTX/runs`);
+      const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-docs-ctx`);
+      const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/DOCS-CTX`);
+
+      const issueBody = (await issueResponse.json()) as {
+        workspace: { projectContext: typeof expectedProjectContext } | null;
+        latestRun: { projectContext: typeof expectedProjectContext } | null;
+        lifecycle: { projectContext: typeof expectedProjectContext } | null;
+      };
+      const runsBody = (await runsResponse.json()) as { runs: Array<{ projectContext: typeof expectedProjectContext }> };
+      const runBody = (await runResponse.json()) as { projectContext: typeof expectedProjectContext };
+      const workspaceBody = (await workspaceResponse.json()) as { projectContext: typeof expectedProjectContext };
+
+      expect(issueBody.workspace?.projectContext).toEqual(expectedProjectContext);
+      expect(issueBody.latestRun?.projectContext).toEqual(expectedProjectContext);
+      expect(issueBody.lifecycle?.projectContext).toEqual(expectedProjectContext);
+      expect(runsBody.runs).toHaveLength(1);
+      expect(runsBody.runs[0]?.projectContext).toEqual(expectedProjectContext);
+      expect(runBody.projectContext).toEqual(expectedProjectContext);
+      expect(workspaceBody.projectContext).toEqual(expectedProjectContext);
+
+      const serialized = JSON.stringify({ issueBody, runsBody, runBody, workspaceBody });
+      expect(serialized).not.toContain("repo-secret");
+      expect(serialized).not.toContain("x-access-token");
+      expect(serialized).not.toContain("workspace-secret");
+      expect(serialized).not.toContain("profile-secret");
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("surfaces provider-limit gates in state and dashboard and lets operators clear them", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     config.hermes.provider = "openai-codex";
@@ -2580,6 +2698,275 @@ describe("StatusServer durable API", () => {
           workspace: { workspaceKey: null, path: null, sourceKind: null },
         });
       }
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("proves the public issue metadata redaction matrix across status and web routes", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const liveWorkspacePath = path.join(config.workspace.root, "TEST-LIVE");
+    const durableWorkspacePath = path.join(config.workspace.root, "TEST-DURABLE");
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "TEST-LIVE",
+      issueId: "issue-live",
+      issueIdentifier: "TEST-LIVE",
+      path: liveWorkspacePath,
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/TEST-LIVE",
+      repoPath: "/repo",
+      baseRef: "main",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.upsertWorkspace({
+      workspaceKey: "TEST-DURABLE",
+      issueId: "issue-durable",
+      issueIdentifier: "TEST-DURABLE",
+      path: durableWorkspacePath,
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/TEST-DURABLE",
+      repoPath: "/repo",
+      baseRef: "main",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-live",
+      sessionId: "session-live",
+      agentId: "agent-live",
+      role: "worker",
+      issueId: "issue-live",
+      issueIdentifier: "TEST-LIVE",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-LIVE",
+      workspacePath: liveWorkspacePath,
+      gitBranchName: "symphony/TEST-LIVE",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await lifecycleStore.ensureIssue(
+      { id: "issue-live", identifier: "TEST-LIVE" },
+      {
+        phase: "implementation",
+        blockedReason: null,
+        summaryPointers: {
+          workspaceKey: "TEST-LIVE",
+          workspacePath: liveWorkspacePath,
+          branchName: "symphony/TEST-LIVE",
+          gitBranchName: "symphony/TEST-LIVE",
+          repoPath: "/repo",
+          baseRef: "main",
+          lastRunId: "run-live",
+        },
+      },
+    );
+    await lifecycleStore.ensureIssue(
+      { id: "issue-durable", identifier: "TEST-DURABLE" },
+      {
+        phase: "blocked",
+        blockedReason: "needs operator",
+        summaryPointers: {
+          workspaceKey: "TEST-DURABLE",
+          workspacePath: durableWorkspacePath,
+          branchName: "symphony/TEST-DURABLE",
+          gitBranchName: "symphony/TEST-DURABLE",
+          repoPath: "/repo",
+          baseRef: "main",
+        },
+      },
+    );
+
+    const liveRunning = liveRunningFixture(config, "TEST-LIVE", "In Progress");
+    liveRunning.issueId = "issue-live";
+    liveRunning.runId = "run-live";
+    liveRunning.sessionId = "session-live";
+    liveRunning.workspacePath = liveWorkspacePath;
+    liveRunning.liveness.activeRunId = "run-live";
+    liveRunning.metadata.branchName = "symphony/TEST-LIVE";
+    liveRunning.metadata.gitBranchName = "symphony/TEST-LIVE";
+    liveRunning.metadata.repoPath = "/repo";
+    liveRunning.metadata.baseRef = "main";
+    liveRunning.issueDetails = issueDetailsFixture({
+      id: "issue-live",
+      identifier: "TEST-LIVE",
+      title: "Visible tracker title",
+      description: "Visible tracker description.\n\nSecond public paragraph.",
+      priority: 3,
+      state: "In Progress",
+      branchName: "symphony/TEST-LIVE",
+      url: "https://linear.app/acme/issue/TEST-LIVE/visible-tracker-title",
+      assigneeId: "user-live",
+      delegateId: "delegate-live",
+      labels: ["visible-label"],
+      blockedBy: [{ id: "issue-blocker", identifier: "TEST-BLOCKER", state: "In Progress" }],
+      updatedAt: "2026-01-01T00:09:00.000Z",
+    });
+
+    const tracker = new FakeTracker([
+      issue({
+        id: "issue-live",
+        identifier: "TEST-LIVE",
+        title: "Visible tracker title",
+        description: "Visible tracker description.\n\nSecond public paragraph.",
+        priority: 3,
+        state: "In Progress",
+        branchName: "symphony/TEST-LIVE",
+        url: "https://linear.app/acme/issue/TEST-LIVE/visible-tracker-title",
+        assigneeId: "user-live",
+        delegateId: "delegate-live",
+        labels: ["visible-label"],
+        blockedBy: [{ id: "issue-blocker", identifier: "TEST-BLOCKER", state: "In Progress" }],
+        updatedAt: "2026-01-01T00:09:00.000Z",
+      }),
+    ]);
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([liveRunning], { paused: ["TEST-DURABLE"] }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      tracker,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const liveIssueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-LIVE`);
+      const durableIssueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-DURABLE`);
+      const durableRunsResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-DURABLE/runs`);
+      const referenceDataResponse = await fetch(`${baseUrl}/api/v1/web/reference-data`);
+      const webIssuesResponse = await fetch(`${baseUrl}/api/v1/web/issues`);
+      const webLiveResponse = await fetch(`${baseUrl}/api/v1/web/issues/TEST-LIVE`);
+      const webDurableResponse = await fetch(`${baseUrl}/api/v1/web/issues/TEST-DURABLE`);
+
+      const liveIssueBody = (await liveIssueResponse.json()) as { issueDetails: IssueDetailsEnvelope };
+      const durableIssueBody = (await durableIssueResponse.json()) as { issueDetails: IssueDetailsEnvelope };
+      const durableRunsBody = (await durableRunsResponse.json()) as { issueDetails: IssueDetailsEnvelope };
+      const webIssuesBody = (await webIssuesResponse.json()) as {
+        issues: Array<Record<string, unknown>>;
+        lanes: { progress: Array<{ id: string }>; review: Array<{ id: string }> };
+      };
+      const webLiveBody = (await webLiveResponse.json()) as { issue: Record<string, unknown> & { desc?: string[] } };
+      const webDurableBody = (await webDurableResponse.json()) as { issue: Record<string, unknown> & { desc?: string[] } };
+      const referenceDataBody = (await referenceDataResponse.json()) as {
+        labels: Record<string, { name: string }>;
+        users: Record<string, { name: string }>;
+      };
+
+      expect(liveIssueResponse.status).toBe(200);
+      expect(durableIssueResponse.status).toBe(200);
+      expect(durableRunsResponse.status).toBe(200);
+      expect(webIssuesResponse.status).toBe(200);
+      expect(webLiveResponse.status).toBe(200);
+      expect(webDurableResponse.status).toBe(200);
+      expect(referenceDataResponse.status).toBe(200);
+
+      expect(liveIssueBody.issueDetails).toMatchObject({
+        source: "live",
+        completeness: "full",
+        issue: {
+          id: "issue-live",
+          identifier: "TEST-LIVE",
+          title: "Visible tracker title",
+          description: "Visible tracker description.\n\nSecond public paragraph.",
+          priority: 3,
+          state: "In Progress",
+          branchName: "symphony/TEST-LIVE",
+          url: "https://linear.app/acme/issue/TEST-LIVE/visible-tracker-title",
+          assigneeId: "user-live",
+          delegateId: "delegate-live",
+          labels: ["visible-label"],
+          blockedBy: [{ id: "issue-blocker", identifier: "TEST-BLOCKER", state: "In Progress" }],
+        },
+        blockers: { available: true, totalCount: 1, openCount: 1, blocked: false },
+      });
+
+      expect(durableIssueBody.issueDetails).toMatchObject({
+        source: "durable",
+        completeness: "partial",
+        issue: {
+          id: "issue-durable",
+          identifier: "TEST-DURABLE",
+          title: null,
+          description: null,
+          priority: null,
+          state: null,
+          branchName: "symphony/TEST-DURABLE",
+          url: null,
+          assigneeId: null,
+          delegateId: null,
+          labels: [],
+          blockedBy: [],
+        },
+        tracker: { generatedAt: null, stale: null, classification: null },
+        blockers: { available: false, totalCount: 0, openCount: 0, blocked: true, humanBlockedReason: "needs operator" },
+      });
+      expect(durableRunsBody.issueDetails).toMatchObject(durableIssueBody.issueDetails);
+
+      const webLiveIssue = webIssuesBody.issues.find((item) => item.id === "TEST-LIVE") as
+        | (Record<string, unknown> & { desc?: string[] })
+        | undefined;
+      const webDurableIssue = webIssuesBody.issues.find((item) => item.id === "TEST-DURABLE") as
+        | (Record<string, unknown> & { desc?: string[] })
+        | undefined;
+      expect(webIssuesBody.lanes.progress.map((item) => item.id)).toContain("TEST-LIVE");
+      expect(webIssuesBody.lanes.progress.map((item) => item.id)).toContain("TEST-DURABLE");
+      expect(webIssuesBody.lanes.review).toEqual([]);
+      expect(webLiveIssue).toMatchObject({
+        id: "TEST-LIVE",
+        title: "Visible tracker title",
+        labels: ["visible-label"],
+        assignee: "user-live",
+      });
+      expect(webLiveIssue?.desc).toEqual([
+        "Visible tracker description.",
+        "Second public paragraph.",
+        "Blocked by TEST-BLOCKER",
+      ]);
+      expect(webDurableIssue).toMatchObject({
+        id: "TEST-DURABLE",
+        title: "TEST-DURABLE",
+        labels: [],
+        assignee: "unassigned",
+      });
+      expect(webDurableIssue?.desc).toEqual(["Blocked: needs operator", "needs operator"]);
+
+      expect(webLiveBody.issue).toMatchObject({
+        id: "TEST-LIVE",
+        title: "Visible tracker title",
+        labels: ["visible-label"],
+        assignee: "user-live",
+      });
+      expect(webLiveBody.issue.desc).toEqual([
+        "Visible tracker description.",
+        "Second public paragraph.",
+        "Blocked by TEST-BLOCKER",
+      ]);
+      expect(webDurableBody.issue).toMatchObject({
+        id: "TEST-DURABLE",
+        title: "TEST-DURABLE",
+        labels: [],
+        assignee: "unassigned",
+      });
+      expect(webDurableBody.issue.desc).toEqual(["Blocked: needs operator", "needs operator"]);
+
+      expect(Object.keys(referenceDataBody.labels)).toEqual(["visible-label"]);
+      expect(Object.keys(referenceDataBody.users)).toEqual(["delegate-live", "unassigned", "user-live"]);
     } finally {
       await server.stop();
     }
