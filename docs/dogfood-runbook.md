@@ -22,6 +22,11 @@ unique IDs and non-empty requirement text. Use the same section names for
 docs-only drafting and implementation drafting so workers, reviewers, and
 doctor lint evaluate one contract.
 
+Spec Kit artifacts under `specs/` are planning records only for this workflow.
+Operators, workers, and reviewers should treat the promoted Linear issue's
+fenced JSON `Issue Contract` as the canonical work assignment unless a human
+explicitly invokes a Spec Kit workflow for that feature.
+
 Roadmap placeholder issues for continuation search or richer summarization stay `Backlog` with `dogfood-blocked`. Do not add `dogfood-ready` to those placeholders until the issue includes a concrete implementation path beyond interfaces, configuration flags, or docs.
 
 Do not run Symphony against the Engineering project before the gate work lands.
@@ -125,7 +130,7 @@ Set `LINEAR_API_KEY`, `SYMPHONY_WORKSPACE_TOKEN`, and the GitHub credential vari
 
 Existing single-project workflows stay valid. When `project_contexts` is absent, Symphony synthesizes one default project context from the top-level `tracker`, `workspace`, `github`, `review_loop`, `issue_breakdown`, `agent`, and `credential_profiles` blocks. Keep the current top-level-only `WORKFLOW.md` shape when every issue routes to one Linear project and one codebase.
 
-When one workflow must dispatch into multiple repositories or multiple Linear projects, keep truly service-wide settings at the top level and move per-project routing into `project_contexts`. The first enabled explicit context becomes the compatibility default context for legacy code paths, so list the primary project first.
+When one workflow needs to carry configuration for more than one project context, keep truly service-wide settings at the top level and move per-project overrides into `project_contexts`. In the current dogfood runtime, the first enabled explicit context becomes the compatibility default context for legacy code paths and remains the active dispatch context for polling and workspace creation, so list the primary project first. Additional contexts are still useful for workflow authoring, `doctor` validation, and future routing work, but one live dogfood workflow process does not yet poll or create worktrees for every listed context.
 
 ```yaml
 tracker:
@@ -137,7 +142,7 @@ workspace:
   source:
     kind: git_worktree
     base_ref: origin/main
-    branch_template: "symphony/{{ project.id }}/{{ issue.identifier }}"
+    branch_template: "symphony/{{ issue.identifier }}"
     cleanup: refuse_dirty
 github:
   owner: johnhalbert
@@ -168,6 +173,7 @@ Use that pattern as the operator-facing baseline:
 
 - Each enabled context needs its own `tracker.project_slug` and enough `workspace.source` fields for the selected source kind.
 - Top-level `workspace`, `github`, `review_loop`, `issue_breakdown`, `agent`, and `credential_profiles` blocks act as defaults; a context should override only the fields it actually needs to change.
+- `workspace.source.branch_template` currently renders only `issue.*` fields. Use supported values such as `{{ issue.identifier }}` and do not document `project.*` template variables until the renderer exposes them.
 - Do not inline API keys, tokens, private keys, or repository URLs with embedded credentials in `project_contexts`. Use environment references or named `credential_profiles` instead. If a context truly needs different credentials, keep them env-backed or app-backed just like the examples in [`trust-and-safety.md`](./trust-and-safety.md#credential-profiles).
 
 ### Project-context redaction rules
