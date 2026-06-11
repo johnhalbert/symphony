@@ -10,7 +10,7 @@ const REPOSITORY_SCP_STYLE_PATTERN = /^([^/\\]+)@([^:]+):(.+)$/;
 const URL_HOST_QUERY_OR_FRAGMENT_BEFORE_AT_PATTERN =
   /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/(?:localhost|(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+|(?:\d{1,3}\.){3}\d{1,3}|\[[^\]]+\])(?::\d+)?[?#][^/\s]*@/i;
 const URL_USERINFO_WITH_RAW_QUERY_OR_FRAGMENT_PATTERN =
-  /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s]*[?#][^/\s]*)@([^/\s]+\/.*)$/i;
+  /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s]*[?#][^/\s]*)@([^/\s]+(?:\/.*)?)$/i;
 const URL_USERINFO_PATTERN = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s?#]*)@/i;
 
 export interface ProjectContextResolution {

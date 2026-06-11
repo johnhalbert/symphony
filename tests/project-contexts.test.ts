@@ -161,6 +161,24 @@ describe("project context normalization", () => {
         leakedSubstring: "https://user",
       },
       {
+        name: "raw question mark in pathless HTTPS URL userinfo",
+        repository: "https://token:pa?ss@example.com",
+        expected: "https://[redacted]@example.com",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw question mark in pathless generic FTP URL userinfo",
+        repository: "ftp://token:pa?ss@example.com",
+        expected: "ftp://[redacted]@example.com",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw question mark in pathless username-only HTTPS URL userinfo",
+        repository: "https://user?name@example.com",
+        expected: "https://[redacted]@example.com",
+        leakedSubstring: "https://user",
+      },
+      {
         name: "raw hash in HTTPS URL userinfo",
         repository: "https://token:pa#ss@example.com/acme/docs-site.git",
         expected: "https://[redacted]@example.com/acme/docs-site.git",
@@ -171,6 +189,24 @@ describe("project context normalization", () => {
         repository: "custom://token:pa#ss@example.com/acme/docs-site.git",
         expected: "custom://[redacted]@example.com/acme/docs-site.git",
         leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw hash in pathless HTTPS URL userinfo",
+        repository: "https://token:pa#ss@example.com",
+        expected: "https://[redacted]@example.com",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw hash in pathless generic custom-scheme URL userinfo",
+        repository: "custom://token:pa#ss@example.com",
+        expected: "custom://[redacted]@example.com",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "pathless host-like query-before-at URL",
+        repository: "https://example.com?foo@bar",
+        expected: "https://example.com",
+        leakedSubstring: "foo@bar",
       },
       {
         name: "query token URL",
@@ -324,6 +360,24 @@ describe("project context normalization", () => {
         leakedSubstring: "https://user",
       },
       {
+        name: "raw question mark in pathless HTTPS URL userinfo",
+        repository: "https://token:pa?ss@example.com",
+        expected: "https://[redacted]@example.com",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw question mark in pathless generic FTP URL userinfo",
+        repository: "ftp://token:pa?ss@example.com",
+        expected: "ftp://[redacted]@example.com",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw question mark in pathless username-only HTTPS URL userinfo",
+        repository: "https://user?name@example.com",
+        expected: "https://[redacted]@example.com",
+        leakedSubstring: "https://user",
+      },
+      {
         name: "raw hash in HTTPS URL userinfo",
         repository: "https://token:pa#ss@example.com/acme/symphony.git",
         expected: "https://[redacted]@example.com/acme/symphony.git",
@@ -334,6 +388,24 @@ describe("project context normalization", () => {
         repository: "custom://token:pa#ss@example.com/acme/symphony.git",
         expected: "custom://[redacted]@example.com/acme/symphony.git",
         leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw hash in pathless HTTPS URL userinfo",
+        repository: "https://token:pa#ss@example.com",
+        expected: "https://[redacted]@example.com",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "raw hash in pathless generic custom-scheme URL userinfo",
+        repository: "custom://token:pa#ss@example.com",
+        expected: "custom://[redacted]@example.com",
+        leakedSubstring: "token:pa",
+      },
+      {
+        name: "pathless host-like query-before-at URL",
+        repository: "https://example.com?foo@bar",
+        expected: "https://example.com",
+        leakedSubstring: "foo@bar",
       },
       {
         name: "query token URL",
