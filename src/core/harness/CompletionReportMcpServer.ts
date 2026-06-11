@@ -16,7 +16,8 @@ import { createGitHubPullRequestClientForCapability } from "../../integrations/g
 import { SymphonyError } from "../errors.js";
 import { FileOperatorApprovalStore, OperatorApprovalService } from "../approval/OperatorApprovalService.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
-import { createRuntimeWritebackProcessor } from "../../app/RuntimeDependencies.js";
+import { createRuntimeTrackerClient, createRuntimeWritebackProcessor } from "../../app/RuntimeDependencies.js";
+import type { TrackerClient } from "../tracker/TrackerClient.js";
 
 export const COMPLETION_REPORT_TOOL_NAME = "submit_completion_report";
 
@@ -41,11 +42,14 @@ export async function writeCompletionReportMcpContext(
   await fs.writeFile(filePath, `${JSON.stringify(context, null, 2)}\n`, "utf8");
 }
 
-export async function submitCompletionReportFromMcp(input: unknown, options: {
+export interface CompletionReportMcpSubmitOptions {
   workflowPath: string;
   contextFile: string;
   pullRequestPublisher?: CompletionReportPullRequestPublisher;
-}): Promise<unknown> {
+  tracker?: Pick<TrackerClient, "fetchIssueStatesByIds">;
+}
+
+export async function submitCompletionReportFromMcp(input: unknown, options: CompletionReportMcpSubmitOptions): Promise<unknown> {
   const loadedContext = await readCompletionReportContext(options.contextFile);
   if (!loadedContext.activeRunId) {
     throw new SymphonyError("invalid_request", "Completion report context is not ready for the active run");
@@ -61,6 +65,15 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const activeRun = await runStore.getRun(loadedContext.activeRunId);
     const lifecycle = await lifecycleStore.get(activeRun?.issueId ?? loadedContext.issue.id);
     validateCompletionReportMcpActiveContext({ context: loadedContext, input, activeRun, lifecycle });
+    if (!activeRun || !lifecycle) {
+      throw new SymphonyError("invalid_request", "Completion report MCP context does not match the active worker run");
+    }
+    const tracker = options.tracker ?? createRuntimeTrackerClient(config);
+    const authoritativeIssue = await resolveAuthoritativeCompletionReportIssue(
+      tracker,
+      activeRun.issueId,
+      activeRun.issueIdentifier,
+    );
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writebackProcessor =
       config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
@@ -86,18 +99,12 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       ...(pullRequestPublisher === undefined ? {} : { pullRequestPublisher }),
       operatorApproval,
     });
-    const context: CompletionReportActiveContext = {
-      issue: loadedContext.issue,
-      projectContext: loadedContext.projectContext,
-      activeRunId: loadedContext.activeRunId,
-      role: loadedContext.role,
-      token: loadedContext.token ?? null,
-      expectedToken: loadedContext.expectedToken ?? null,
-      sessionId: loadedContext.sessionId ?? null,
-      workspacePath: loadedContext.workspacePath,
-      workspace: loadedContext.workspace,
-      phase: loadedContext.phase,
-    };
+    const context = completionReportContextFromAuthoritativeState({
+      context: loadedContext,
+      activeRun,
+      lifecycle,
+      issue: authoritativeIssue,
+    });
     const result = await service.submit_completion_report(completionReportInputFromMcp(input, context), context);
     return {
       accepted: result.accepted,
@@ -111,9 +118,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
   }
 }
 
-export async function runCompletionReportMcpServer(options: {
-  workflowPath: string;
-  contextFile: string;
+export async function runCompletionReportMcpServer(options: CompletionReportMcpSubmitOptions & {
   input?: NodeJS.ReadStream;
   output?: NodeJS.WriteStream;
 }): Promise<void> {
@@ -138,6 +143,66 @@ async function readCompletionReportContext(filePath: string): Promise<Completion
     throw new SymphonyError("invalid_request", "Completion report MCP context is invalid");
   }
   return parsed;
+}
+
+async function resolveAuthoritativeCompletionReportIssue(
+  tracker: Pick<TrackerClient, "fetchIssueStatesByIds">,
+  issueId: string,
+  issueIdentifier: string,
+): Promise<Issue> {
+  try {
+    const issue = (await tracker.fetchIssueStatesByIds([issueId]))[0] ?? null;
+    if (!issue) {
+      throw new SymphonyError("tracker_error", "Completion report MCP could not load the authoritative issue state", {
+        issueId,
+        issueIdentifier,
+      });
+    }
+    if (issue.id !== issueId || issue.identifier !== issueIdentifier) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Completion report MCP authoritative issue does not match the active worker run",
+      );
+    }
+    return issue;
+  } catch (error) {
+    if (error instanceof SymphonyError) throw error;
+    throw new SymphonyError("tracker_error", "Completion report MCP could not load the authoritative issue state", {
+      issueId,
+      issueIdentifier,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function completionReportContextFromAuthoritativeState(input: {
+  context: CompletionReportMcpContextFile;
+  activeRun: RunRecord;
+  lifecycle: IssueLifecycleRecord;
+  issue: Issue;
+}): CompletionReportActiveContext {
+  const { context, activeRun, lifecycle, issue } = input;
+  return {
+    issue,
+    projectContext: activeRun.projectContext,
+    activeRunId: activeRun.runId,
+    role: context.role,
+    token: context.token ?? null,
+    expectedToken: context.expectedToken ?? null,
+    sessionId: activeRun.sessionId ?? null,
+    workspacePath: activeRun.workspacePath,
+    workspace: {
+      path: activeRun.workspacePath,
+      workspaceKey: activeRun.workspaceKey,
+      createdNow: context.workspace.createdNow,
+      issueId: activeRun.issueId,
+      issueIdentifier: activeRun.issueIdentifier,
+      ...(activeRun.gitBranchName == null ? {} : { gitBranchName: activeRun.gitBranchName }),
+      ...(activeRun.repoPath == null ? {} : { repoPath: activeRun.repoPath }),
+      ...(activeRun.baseRef == null ? {} : { baseRef: activeRun.baseRef }),
+    },
+    phase: lifecycle.phase,
+  };
 }
 
 function validateCompletionReportMcpActiveContext(input: {

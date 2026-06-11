@@ -107,11 +107,10 @@ describe("completion report MCP handoff", () => {
       evidenceCursor: "idem-1",
     });
 
-    const result = await submitCompletionReportFromMcp(report(), {
-      workflowPath,
-      contextFile,
-      pullRequestPublisher: publisher,
-    });
+    const result = await submitCompletionReportFromMcp(
+      report(),
+      mcpOptions(workflowPath, contextFile, { pullRequestPublisher: publisher }),
+    );
 
     expect(result).toMatchObject({
       accepted: true,
@@ -128,8 +127,10 @@ describe("completion report MCP handoff", () => {
     expect(publisher.inputs[0]).toMatchObject({
       branchName: "symphony/TEST-1",
       baseBranch: "main",
+      title: "TEST-1: Do work",
       evidenceCursor: "idem-1",
     });
+    expect(publisher.inputs[0]?.body).toContain("Issue: TEST-1");
     const outbox = await new FileWritebackOutboxStore(stateDir).list();
     const comment = outbox.find((operation) => operation.kind === "comment");
     const transition = outbox.find((operation) => operation.kind === "transition");
@@ -163,6 +164,255 @@ describe("completion report MCP handoff", () => {
       prHeadSha: "abc123",
       prBranch: "symphony/TEST-1",
       lastEvidenceCursor: "idem-1",
+    });
+  });
+
+  it("rejects completion report MCP submission when the persisted lifecycle phase is no longer implementation", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-stale-lifecycle-phase",
+      sessionId: "agent-1:run-stale-lifecycle-phase",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "review",
+      summaryPointers: { lastRunId: "run-stale-lifecycle-phase" },
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({
+        state: "In Progress",
+        branchName: "symphony/TEST-1",
+        title: "FORGED TITLE FROM WORKER CONTEXT",
+      }),
+      projectContext: docsProjectContext,
+      activeRunId: "run-stale-lifecycle-phase",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-stale-lifecycle-phase",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      headBranch: "symphony/TEST-1",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "stale-phase-idem",
+    });
+
+    await expect(
+      submitCompletionReportFromMcp(
+        report("stale-lifecycle-phase-idem"),
+        mcpOptions(workflowPath, contextFile, {
+          pullRequestPublisher: publisher,
+          tracker: fakeTracker(issue({ state: "In Progress", branchName: "symphony/TEST-1" })),
+        }),
+      ),
+    ).rejects.toThrow("Completion report cannot be accepted while lifecycle phase is review");
+    expect(publisher.inputs).toEqual([]);
+    await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "review",
+      lastCompletionReportId: null,
+      completionReports: [],
+      summaryPointers: { lastRunId: "run-stale-lifecycle-phase" },
+    });
+  });
+
+  it("uses authoritative tracker issue metadata for PR publication instead of worker-supplied MCP issue fields", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-authoritative-issue-metadata",
+      sessionId: "agent-1:run-authoritative-issue-metadata",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-authoritative-issue-metadata" },
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({
+        state: "In Review",
+        branchName: "forged-branch",
+        title: "FORGED TITLE FROM WORKER CONTEXT",
+      }),
+      projectContext: docsProjectContext,
+      activeRunId: "run-authoritative-issue-metadata",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-authoritative-issue-metadata",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      headBranch: "symphony/TEST-1",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "authoritative-issue-idem",
+    });
+
+    const result = await submitCompletionReportFromMcp(
+      report("authoritative-issue-idem"),
+      mcpOptions(workflowPath, contextFile, {
+        pullRequestPublisher: publisher,
+        tracker: fakeTracker(issue({ state: "In Progress", branchName: "symphony/TEST-1", title: "Do work" })),
+      }),
+    );
+
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      reportId: "completion-report:issue-1:authoritative-issue-idem",
+    });
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      branchName: "symphony/TEST-1",
+      title: "TEST-1: Do work",
+    });
+    expect(publisher.inputs[0]?.title).not.toContain("FORGED TITLE FROM WORKER CONTEXT");
+    expect(publisher.inputs[0]?.body).toContain("Issue: TEST-1");
+    expect(publisher.inputs[0]?.body).not.toContain("FORGED TITLE FROM WORKER CONTEXT");
+  });
+
+  it("rejects completion report MCP submission when the authoritative issue state is no longer the active implementation state", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-authoritative-issue-state",
+      sessionId: "agent-1:run-authoritative-issue-state",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-authoritative-issue-state" },
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      projectContext: docsProjectContext,
+      activeRunId: "run-authoritative-issue-state",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-authoritative-issue-state",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      headBranch: "symphony/TEST-1",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "authoritative-state-idem",
+    });
+
+    await expect(
+      submitCompletionReportFromMcp(
+        report("authoritative-state-idem"),
+        mcpOptions(workflowPath, contextFile, {
+          pullRequestPublisher: publisher,
+          tracker: fakeTracker(issue({ state: "In Review", branchName: "symphony/TEST-1" })),
+        }),
+      ),
+    ).rejects.toThrow("Completion report requires the issue to be in the active implementation state");
+    expect(publisher.inputs).toEqual([]);
+    await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "implementation",
+      lastCompletionReportId: null,
+      completionReports: [],
+      summaryPointers: { lastRunId: "run-authoritative-issue-state" },
     });
   });
 
@@ -215,10 +465,7 @@ describe("completion report MCP handoff", () => {
     });
 
     await expect(
-      submitCompletionReportFromMcp(report("context-issue-mismatch"), {
-        workflowPath,
-        contextFile,
-      }),
+      submitCompletionReportFromMcp(report("context-issue-mismatch"), mcpOptions(workflowPath, contextFile)),
     ).rejects.toThrow("Completion report MCP context does not match the active worker run");
     await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
@@ -280,10 +527,7 @@ describe("completion report MCP handoff", () => {
     });
 
     await expect(
-      submitCompletionReportFromMcp(report("context-project-mismatch"), {
-        workflowPath,
-        contextFile,
-      }),
+      submitCompletionReportFromMcp(report("context-project-mismatch"), mcpOptions(workflowPath, contextFile)),
     ).rejects.toThrow("Completion report MCP context does not match the active worker run");
     await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
@@ -351,10 +595,7 @@ describe("completion report MCP handoff", () => {
     });
 
     await expect(
-      submitCompletionReportFromMcp(report("context-project-fields-mismatch"), {
-        workflowPath,
-        contextFile,
-      }),
+      submitCompletionReportFromMcp(report("context-project-fields-mismatch"), mcpOptions(workflowPath, contextFile)),
     ).rejects.toThrow("Completion report MCP context does not match the active worker run");
     await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
@@ -435,10 +676,7 @@ describe("completion report MCP handoff", () => {
     });
 
     await expect(
-      submitCompletionReportFromMcp(report("context-alt-run-mismatch"), {
-        workflowPath,
-        contextFile,
-      }),
+      submitCompletionReportFromMcp(report("context-alt-run-mismatch"), mcpOptions(workflowPath, contextFile)),
     ).rejects.toThrow("Completion report MCP context does not match the active worker run");
     await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
@@ -504,10 +742,7 @@ describe("completion report MCP handoff", () => {
     });
 
     await expect(
-      submitCompletionReportFromMcp(report("context-run-phase-mismatch"), {
-        workflowPath,
-        contextFile,
-      }),
+      submitCompletionReportFromMcp(report("context-run-phase-mismatch"), mcpOptions(workflowPath, contextFile)),
     ).rejects.toThrow("Completion report MCP context does not match the active worker run");
     await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
@@ -569,15 +804,15 @@ describe("completion report MCP handoff", () => {
       phase: "implementation",
     });
 
-    const first = await submitCompletionReportFromMcp(report("replay-after-completion"), {
-      workflowPath,
-      contextFile,
-    });
+    const first = await submitCompletionReportFromMcp(
+      report("replay-after-completion"),
+      mcpOptions(workflowPath, contextFile),
+    );
     await runStore.updateRun("run-replay-after-completion", { status: "succeeded", completedAt: new Date().toISOString() });
-    const second = await submitCompletionReportFromMcp(report("replay-after-completion"), {
-      workflowPath,
-      contextFile,
-    });
+    const second = await submitCompletionReportFromMcp(
+      report("replay-after-completion"),
+      mcpOptions(workflowPath, contextFile),
+    );
 
     expect(first).toMatchObject({ accepted: true, replayed: false });
     expect(second).toMatchObject({
@@ -667,10 +902,10 @@ describe("completion report MCP handoff", () => {
       return jsonResponse([]);
     });
 
-    const result = await submitCompletionReportFromMcp(report("publication-profile-idem"), {
-      workflowPath,
-      contextFile,
-    });
+    const result = await submitCompletionReportFromMcp(
+      report("publication-profile-idem"),
+      mcpOptions(workflowPath, contextFile),
+    );
 
     expect(result).toMatchObject({
       accepted: true,
@@ -732,8 +967,7 @@ describe("completion report MCP handoff", () => {
     const output = new PassThrough();
     const responses = collectJsonRpcResponses(output);
     const server = runCompletionReportMcpServer({
-      workflowPath,
-      contextFile,
+      ...mcpOptions(workflowPath, contextFile),
       input: input as unknown as NodeJS.ReadStream,
       output: output as unknown as NodeJS.WriteStream,
     });
@@ -911,6 +1145,34 @@ function report(idempotencyKey = "idem-1") {
     pullRequest: null,
     risks: [],
     idempotencyKey,
+  };
+}
+
+function mcpOptions(
+  workflowPath: string,
+  contextFile: string,
+  overrides: Record<string, unknown> = {},
+): {
+  workflowPath: string;
+  contextFile: string;
+  tracker: { fetchIssueStatesByIds(issueIds: string[]): Promise<ReturnType<typeof issue>[]> };
+  pullRequestPublisher?: CompletionReportPullRequestPublisher;
+} {
+  return {
+    workflowPath,
+    contextFile,
+    tracker: fakeTracker(),
+    ...(overrides as { pullRequestPublisher?: CompletionReportPullRequestPublisher; tracker?: ReturnType<typeof fakeTracker> }),
+  };
+}
+
+function fakeTracker(latestIssue = issue({ state: "In Progress", branchName: "symphony/TEST-1" })) {
+  return {
+    async fetchIssueStatesByIds(issueIds: string[]) {
+      return issueIds.some((candidate) => candidate === latestIssue.id || candidate === latestIssue.identifier)
+        ? [latestIssue]
+        : [];
+    },
   };
 }
 
