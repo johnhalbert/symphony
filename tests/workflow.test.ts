@@ -170,6 +170,29 @@ Work on {{ issue.identifier }}.`,
     });
   });
 
+  it("preserves flattened schema details for non-attributable project_contexts boundary errors", () => {
+    expect.assertions(2);
+
+    try {
+      parseServiceConfig(
+        {
+          tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+          project_contexts: [],
+        },
+        "/repo/WORKFLOW.md",
+        { LINEAR_API_KEY: "secret" },
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(SymphonyError);
+      expect((error as SymphonyError).details).toEqual({
+        formErrors: [],
+        fieldErrors: {
+          project_contexts: ["Too small: expected array to have >=1 items"],
+        },
+      });
+    }
+  });
+
   it("resolves typed config defaults and env indirection", () => {
     const config = parseServiceConfig(
       {

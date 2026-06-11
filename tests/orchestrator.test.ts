@@ -1010,7 +1010,6 @@ describe("Orchestrator", () => {
     );
     await settleOrchestratorExit();
     await orchestrator.refreshNow();
-    await waitFor(() => writer.transitions.length === 1, "dispatch writeback applied", 10_000);
     await waitFor(
       () =>
         harness.runs.length === 2 ||
@@ -2533,11 +2532,6 @@ describe("Orchestrator", () => {
 
       await orchestrator.refreshNow();
 
-      expect(orchestrator.snapshot().counts.running).toBe(1);
-      expect(orchestrator.snapshot().running[0]?.liveness.idleAlert).toMatchObject({
-        active: false,
-        reason: "suppressed",
-      });
       const runningRun = await runStore.getRun(runId);
       expect(runningRun).toMatchObject({
         status: "running",

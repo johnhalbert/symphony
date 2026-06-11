@@ -938,10 +938,13 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
 
 function buildWorkflowConfigValidationDetails(rawInput: unknown, error: z.ZodError): Record<string, unknown> {
   const signals = projectContextValidationSignalsFromZodIssues(rawInput, error.issues);
+  if (signals.projectContextPaths.length === 0) {
+    return error.flatten();
+  }
   return {
     ...error.flatten(),
     issues: error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
-    ...(signals.projectContextPaths.length === 0 ? {} : { projectContextPaths: signals.projectContextPaths }),
+    projectContextPaths: signals.projectContextPaths,
     ...(signals.projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths: signals.projectContextFieldPaths }),
   };
 }
