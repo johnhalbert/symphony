@@ -85,3 +85,26 @@ After the implementation tasks complete, run:
 ```powershell
 npm test -- tests/workflow.test.ts tests/doctor.test.ts tests/orchestrator.test.ts tests/git-worktree.test.ts tests/status-api.test.ts tests/web-projection.test.ts tests/web-history-projection.test.ts tests/web-transcript-projection.test.ts tests/web-route-contract.test.ts tests/web-projection-context.test.ts tests/completion-report-mcp.test.ts tests/review-verdict-mcp.test.ts tests/review-feedback-mcp.test.ts tests/writeback-outbox.test.ts tests/postgres-schema.test.ts tests/mcp-subprocess-environment.test.ts tests/cursor-harness.test.ts tests/hermes-harness.test.ts tests/hermes-acp-harness.test.ts
 ```
+
+## Legacy backfill disposition note (ENG-443 / T088)
+
+Checked-in planning for this legacy/default project-context work lives under `specs/003-multi-project-config/`, even though the ENG-838 issue description points at a non-present `specs/008-eng-443-legacy-backfill-resolution/tasks.md` source path.
+
+Current-base proof recorded for `ENG-838`:
+
+- `git diff --name-status origin/main -- src/core/persistence/RunTranscriptStore.ts src/core/workspace/WorkspaceManager.ts src/app/WebHistoryProjection.ts src/app/WebTranscriptProjection.ts src/app/WebProjectionContext.ts tests/transcript-store.test.ts tests/workspace.test.ts tests/web-history-projection.test.ts tests/transcript-replay.test.ts tests/web-transcript-projection.test.ts tests/web-projection-context.test.ts` returned no output, so the expected validation surface in this worktree already matched `origin/main`.
+- `npm test -- tests/transcript-store.test.ts tests/transcript-replay.test.ts tests/workspace.test.ts` passed (`24 passed`).
+- `npm test -- tests/web-history-projection.test.ts tests/web-transcript-projection.test.ts tests/web-projection-context.test.ts` passed (`46 passed`).
+- `npm test -- tests/status-api.test.ts -t "surfaces legacy/default project context attribution across durable status records"` passed, proving the durable status API still backfills legacy/default project context metadata.
+- `npm test -- tests/web-history-transcript-durable-projection.test.ts -t "passes the legacy/default project context id into durable transcript rebuild reads for persisted runs missing projectContext metadata"` passed, proving downstream durable transcript rebuilds still scope legacy records to the default context.
+- The underlying read-time fallback is already present on `origin/main` in `src/core/persistence/RunTranscriptStore.ts`, where `normalizeWorkspaceRecord(...)` and `normalizeRunRecord(...)` both call `normalizeProjectContextResolution(record.projectContext)`.
+
+Active PR classification recorded for `ENG-443`:
+
+- `gh pr view 289 --json files,commits,url,title,headRefName,baseRefName` reported `https://github.com/johnhalbert/symphony/pull/289` with `files: []`, so GitHub currently shows no net file diff for the active `ENG-443` PR.
+- `git merge-base origin/main origin/sinfonista/eng-443-t088-backfill-legacy-run-and-workspace-context-on-read` produced `1a719acc78d7f31178391c042775bd0c534946e2`, and both that merge-base tree and the PR branch tree resolved to `f73a18e97e2765d7f8ed2d54304c87d87115ef10`, proving the PR branch tip is content-identical to its merge base.
+
+Selected service-owned disposition:
+
+- GitHub follow-up target: close `https://github.com/johnhalbert/symphony/pull/289` without merge because the branch is an empty / behaviorally redundant no-op against the already-passing current base.
+- Linear follow-up target: record on `https://linear.app/john-halbert/issue/ENG-443/t088-backfill-legacy-run-and-workspace-context-on-read` and `https://linear.app/john-halbert/issue/ENG-838/eng-443a-prove-base-legacy-backfill-and-classify-no-op-pr` that `origin/main` already satisfies the legacy run/workspace read-time backfill proof for T088, then continue remaining ENG-443 legacy backfill work through the still-distinct sibling tasks (`T089-T094`) instead of merging PR #289.
