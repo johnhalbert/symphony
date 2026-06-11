@@ -2682,9 +2682,23 @@ export class Orchestrator {
 
   private resolvedProjectContext(entry: RunningEntry): ProjectContextResolution | undefined {
     const resolvedFromLifecycleOrIssue = entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue);
-    if (resolvedFromLifecycleOrIssue) return resolvedFromLifecycleOrIssue;
-
     const defaultContext = this.config.projectContexts.defaultContext;
+
+    if (resolvedFromLifecycleOrIssue) {
+      if (
+        defaultContext.source === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE &&
+        resolvedFromLifecycleOrIssue.projectContextId === defaultContext.id &&
+        resolvedFromLifecycleOrIssue.routingSource === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE &&
+        resolvedFromLifecycleOrIssue.linearProjectSlug === null
+      ) {
+        return {
+          ...resolvedFromLifecycleOrIssue,
+          linearProjectSlug: defaultContext.tracker.projectSlug,
+        };
+      }
+      return resolvedFromLifecycleOrIssue;
+    }
+
     if (defaultContext.source !== LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE) return undefined;
 
     return {

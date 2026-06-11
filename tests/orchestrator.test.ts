@@ -2071,6 +2071,71 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
+  it("rehydrates stale legacy-default lifecycle records on dispatch recovery", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["Human Review"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const stateDir = path.join(root, "state");
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 300_000);
+    const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await lifecycleStore.updateIssue(candidate, {
+      projectContext: {
+        ...legacyDefaultProjectContext,
+        linearProjectSlug: null,
+      },
+    });
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(legacyDefaultProjectContext);
+    expect(currentState).toBe("In Progress");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.comments[0]?.dedupeKey).toBe("fake-issue-1-1:run-started");
+    await expect(runStore.getRun("fake-issue-1-1")).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      incompleteTurnCount: 1,
+      projectContext: legacyDefaultProjectContext,
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
   it("records max-turn exhaustion as incomplete turns instead of handoff", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 2;
