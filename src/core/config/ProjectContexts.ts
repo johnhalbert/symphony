@@ -35,6 +35,34 @@ export interface ProjectContextPublicMetadata {
   path: string | null;
 }
 
+export interface ProjectContextPublicWorkspaceSourceSummary {
+  kind: string | null;
+  pathConfigured: boolean;
+  repositoryConfigured: boolean;
+  refConfigured: boolean;
+  baseRefConfigured: boolean;
+  branchTemplateConfigured: boolean;
+  cachePathConfigured: boolean;
+  cleanup: string | null;
+}
+
+export interface ProjectContextPublicSummary {
+  id: ProjectContextId;
+  label: string;
+  enabled: boolean;
+  publicMetadata: ProjectContextPublicMetadata;
+  tracker: {
+    projectSlug: string | null;
+    apiKeyPresent: boolean;
+  };
+  workspace: {
+    source: ProjectContextPublicWorkspaceSourceSummary;
+  };
+  github: {
+    tokenPresent: boolean;
+  };
+}
+
 export interface ProjectContextConfig<
   TTracker = unknown,
   TWorkspace = unknown,
@@ -77,6 +105,7 @@ export interface NormalizedProjectContext<
   agent: TAgent;
   credentialProfiles?: TCredentialProfiles;
   publicMetadata: ProjectContextPublicMetadata;
+  publicSummary: ProjectContextPublicSummary;
 }
 
 export interface ProjectContextRegistry<TContext extends { id: ProjectContextId; enabled: boolean }> {
@@ -266,6 +295,68 @@ export function projectContextMetadataForPublicRead(input: {
     workspaceSourceKind: normalizeOptionalNonEmptyString(input.workspace?.source?.kind),
     repository: publicRepositorySummary(input.workspace?.source?.repository),
     path: normalizeOptionalNonEmptyString(input.workspace?.source?.path),
+  };
+}
+
+export function projectContextSummaryForPublicRead(input: {
+  id: ProjectContextId;
+  label: string;
+  enabled: boolean;
+  tracker?: { projectSlug?: string | null; apiKey?: string | null } | null;
+  workspace?: {
+    root?: string | null;
+    source?: {
+      kind?: string | null;
+      repository?: string | null;
+      path?: string | null;
+      ref?: string | null;
+      baseRef?: string | null;
+      branchTemplate?: string | null;
+      cachePath?: string | null;
+      cleanup?: string | null;
+    } | null;
+  } | null;
+  github?: { token?: string | null } | null;
+}): ProjectContextPublicSummary {
+  const publicMetadata = projectContextMetadataForPublicRead({
+    id: input.id,
+    label: input.label,
+    enabled: input.enabled,
+    tracker: { projectSlug: input.tracker?.projectSlug ?? null },
+    workspace: {
+      root: input.workspace?.root ?? null,
+      source: {
+        kind: input.workspace?.source?.kind ?? null,
+        repository: input.workspace?.source?.repository ?? null,
+        path: input.workspace?.source?.path ?? null,
+      },
+    },
+  });
+
+  return {
+    id: input.id,
+    label: input.label,
+    enabled: input.enabled,
+    publicMetadata,
+    tracker: {
+      projectSlug: publicMetadata.linearProjectSlug,
+      apiKeyPresent: normalizeOptionalNonEmptyString(input.tracker?.apiKey) !== null,
+    },
+    workspace: {
+      source: {
+        kind: publicMetadata.workspaceSourceKind,
+        pathConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.path) !== null,
+        repositoryConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.repository) !== null,
+        refConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.ref) !== null,
+        baseRefConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.baseRef) !== null,
+        branchTemplateConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.branchTemplate) !== null,
+        cachePathConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.cachePath) !== null,
+        cleanup: normalizeOptionalNonEmptyString(input.workspace?.source?.cleanup),
+      },
+    },
+    github: {
+      tokenPresent: normalizeOptionalNonEmptyString(input.github?.token) !== null,
+    },
   };
 }
 

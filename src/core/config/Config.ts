@@ -15,7 +15,7 @@ import {
   defaultProjectContextLabel,
   normalizeLegacyDefaultProjectContext,
   normalizeProjectContextId,
-  projectContextMetadataForPublicRead,
+  projectContextSummaryForPublicRead,
   type NormalizedProjectContext,
   type ProjectContextConfig,
   type ProjectContextRegistry,
@@ -1070,14 +1070,31 @@ function normalizeWorkflowProjectContext(
       workspace.source.kind === "git" || workspace.source.kind === "git_worktree"
         ? resolveOptionalConfigStringValue(merged.workspace?.source?.repository, env)
         : undefined;
-    const publicMetadataWorkspace = {
-      root: workspace.root,
-      source: {
-        kind: workspace.source.kind,
-        repository: publicMetadataRepository ?? null,
-        path: workspace.source.path ?? null,
+    const publicSummary = projectContextSummaryForPublicRead({
+      id,
+      label,
+      enabled,
+      tracker: {
+        projectSlug: tracker.projectSlug,
+        apiKey: tracker.apiKey,
       },
-    };
+      workspace: {
+        root: workspace.root,
+        source: {
+          kind: workspace.source.kind,
+          repository: publicMetadataRepository ?? null,
+          path: workspace.source.path ?? null,
+          ref: workspace.source.ref ?? null,
+          baseRef: workspace.source.baseRef ?? null,
+          branchTemplate: workspace.source.branchTemplate ?? null,
+          cachePath: workspace.source.cachePath ?? null,
+          cleanup: workspace.source.cleanup ?? null,
+        },
+      },
+      github: {
+        token: github.token,
+      },
+    });
 
     return {
       id,
@@ -1091,13 +1108,8 @@ function normalizeWorkflowProjectContext(
       issueBreakdown,
       agent,
       credentialProfiles: merged.credential_profiles,
-      publicMetadata: projectContextMetadataForPublicRead({
-        id,
-        label,
-        enabled,
-        tracker,
-        workspace: publicMetadataWorkspace,
-      }),
+      publicMetadata: publicSummary.publicMetadata,
+      publicSummary,
     };
   } catch (error) {
     throw attachProjectContextValidationSignal(error, contextPath);
