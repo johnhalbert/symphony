@@ -47,7 +47,7 @@ describe("git worktree workspace source", () => {
     expect(workspace.workspaceKey).toBe("TEST-2");
   });
 
-  it("namespaces fallback branches per project context when tracker branch metadata is absent", async () => {
+  it("uses distinct contextual fallback branches when tracker branch metadata is truly absent", async () => {
     const manager = newManager(root, repo);
     const symphonyIssue = trackerIssue({
       id: "issue-symphony-branch",
@@ -66,13 +66,20 @@ describe("git worktree workspace source", () => {
       linearProjectSlug: "DOCS",
     });
 
+    expect(symphonyIssue.branchName).toBeNull();
+    expect(docsIssue.branchName).toBeNull();
+
     const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
     const docsWorkspace = await manager.createForIssue(docsIssue);
     const symphonyBranch = await git(["branch", "--show-current"], symphonyWorkspace.path);
     const docsBranch = await git(["branch", "--show-current"], docsWorkspace.path);
 
+    expect(symphonyWorkspace.createdNow).toBe(true);
+    expect(docsWorkspace.createdNow).toBe(true);
     expect(symphonyBranch.trim()).toBe("symphony/symphony/ENG-BRANCH-CTX");
     expect(docsBranch.trim()).toBe("symphony/docs/ENG-BRANCH-CTX");
+    expect(symphonyWorkspace.gitBranchName).toBe("symphony/symphony/ENG-BRANCH-CTX");
+    expect(docsWorkspace.gitBranchName).toBe("symphony/docs/ENG-BRANCH-CTX");
     expect(symphonyWorkspace.workspaceKey).toBe("ctx__symphony__ENG-BRANCH-CTX");
     expect(docsWorkspace.workspaceKey).toBe("ctx__docs__ENG-BRANCH-CTX");
   });

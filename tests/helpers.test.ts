@@ -118,6 +118,19 @@ describe("test helper fixtures", () => {
     expect(issue.resolvedAt).toBe("2026-02-02T12:00:00Z");
   });
 
+  it("preserves explicit null branch metadata overrides for tracker issues", () => {
+    const docsIssue = trackerIssue({
+      id: "issue-docs-null-branch",
+      identifier: "ENG-NULL-BRANCH",
+      branchName: null,
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+
+    expect(docsIssue.branchName).toBeNull();
+  });
+
   it("builds tracker clients that record routing lookups", async () => {
     const todo = trackerIssue({ id: "issue-todo", state: "Todo" });
     const review = trackerIssue({ id: "issue-review", state: "In Review", routingSource: "state_refresh" });

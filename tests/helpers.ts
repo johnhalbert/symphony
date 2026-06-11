@@ -319,7 +319,10 @@ export function trackerIssue(overrides: TrackerIssueFixtureOverrides = {}): Trac
     url: overrides.url ?? `https://linear.app/example/issue/${identifier.toLowerCase()}-${projectContextId}`,
     priority: overrides.priority ?? 1,
     state: overrides.state ?? "Todo",
-    branchName: overrides.branchName ?? `symphony/${projectContextId}/${identifier}`,
+    branchName:
+      Object.prototype.hasOwnProperty.call(overrides, "branchName") && overrides.branchName !== undefined
+        ? overrides.branchName
+        : `symphony/${projectContextId}/${identifier}`,
     assigneeId: overrides.assigneeId ?? null,
     delegateId: overrides.delegateId ?? null,
     assignedToWorker: overrides.assignedToWorker ?? true,

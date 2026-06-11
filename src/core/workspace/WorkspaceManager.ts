@@ -43,6 +43,7 @@ const LEGACY_RESERVED_WORKSPACE_KEY_ESCAPE_PREFIX = "~";
 export class WorkspaceManager {
   private readonly branchRenderer = new Liquid({ strictVariables: true });
   private readonly store: FileRunTranscriptStore;
+  private readonly branchTemplateCollisionSafetyCache = new Map<string, boolean>();
 
   constructor(private readonly options: WorkspaceManagerOptions) {
     this.store = new FileRunTranscriptStore(options.workspace.stateDir);
@@ -478,21 +479,83 @@ export class WorkspaceManager {
   }
 
   private async resolveBranchName(issue: WorkspaceIssue): Promise<string> {
-    const source = this.options.workspace.source;
-    const template = source.branchTemplate ?? defaultBranchTemplateForIssue(issue);
     const branchName =
       issue.branchName ??
-      (await this.branchRenderer.parseAndRender(template, {
-        issue: {
-          id: issue.id,
-          identifier: issue.identifier,
-          branchName: issue.branchName,
-          projectContext: issue.projectContext,
-        },
-      }));
+      (await this.branchRenderer.parseAndRender(
+        await this.resolveFallbackBranchTemplate(issue),
+        branchTemplateContext(issue),
+      ));
     const trimmed = String(branchName).trim();
     if (trimmed.length === 0) throw new SymphonyError("workspace_error", "Resolved git branch name is empty");
     return trimmed;
+  }
+
+  private async resolveFallbackBranchTemplate(issue: WorkspaceIssue): Promise<string> {
+    const configuredTemplate = this.options.workspace.source.branchTemplate;
+    if (!configuredTemplate) {
+      return defaultBranchTemplateForIssue(issue);
+    }
+    if (await this.configuredBranchTemplateDifferentiatesDuplicateContexts(configuredTemplate, issue)) {
+      return configuredTemplate;
+    }
+    this.options.logger.warn(
+      "configured branch template is not collision-safe for contextual issues without tracker branch metadata; falling back to contextual default branch template",
+      {
+        configured_branch_template: configuredTemplate,
+        issue_identifier: issue.identifier,
+        issue_id: issue.id,
+        project_context_id: issue.projectContext?.projectContextId ?? null,
+      },
+    );
+    return defaultBranchTemplateForIssue(issue);
+  }
+
+  private async configuredBranchTemplateDifferentiatesDuplicateContexts(
+    configuredTemplate: string,
+    issue: WorkspaceIssue,
+  ): Promise<boolean> {
+    const projectContextId = issue.projectContext?.projectContextId;
+    if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+      return true;
+    }
+
+    const cacheKey = `${issue.id === null ? "no-issue-id" : "with-issue-id"}:${configuredTemplate}`;
+    const cached = this.branchTemplateCollisionSafetyCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const probeIdentifier = issue.identifier;
+    const probeIssues: [WorkspaceIssue, WorkspaceIssue] = [
+      {
+        id: issue.id === null ? null : "issue-context-a",
+        identifier: probeIdentifier,
+        branchName: null,
+        projectContext: {
+          projectContextId: "context-a",
+          projectContextLabel: "Context A",
+          linearProjectSlug: "CTX_A",
+          routingSource: "probe",
+        },
+      },
+      {
+        id: issue.id === null ? null : "issue-context-b",
+        identifier: probeIdentifier,
+        branchName: null,
+        projectContext: {
+          projectContextId: "context-b",
+          projectContextLabel: "Context B",
+          linearProjectSlug: "CTX_B",
+          routingSource: "probe",
+        },
+      },
+    ];
+    const renderedBranches = await Promise.all(
+      probeIssues.map((probeIssue) => this.branchRenderer.parseAndRender(configuredTemplate, branchTemplateContext(probeIssue))),
+    );
+    const differentiates = renderedBranches[0].trim() !== renderedBranches[1].trim();
+    this.branchTemplateCollisionSafetyCache.set(cacheKey, differentiates);
+    return differentiates;
   }
 
   private async assertExistingWorktree(workspaceKey: string, workspacePath: string): Promise<void> {
@@ -529,6 +592,17 @@ interface LegacyWorkspaceMigrationPlan {
   toWorkspaceKey: string;
   toWorkspacePath: string;
   expectedIssueIdentifierKey: string;
+}
+
+function branchTemplateContext(issue: WorkspaceIssue): { issue: WorkspaceIssue } {
+  return {
+    issue: {
+      id: issue.id,
+      identifier: issue.identifier,
+      branchName: issue.branchName,
+      ...(issue.projectContext === undefined ? {} : { projectContext: issue.projectContext }),
+    },
+  };
 }
 
 function normalizeIssueInput(input: WorkspaceIssueInput): WorkspaceIssue {
