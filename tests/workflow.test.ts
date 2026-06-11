@@ -7,7 +7,7 @@ import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Conf
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
 import { WorkflowLoader, parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
-import { issue, multiProjectWorkflowConfig, projectContextFixture } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, multiProjectWorkflowDocument, projectContextFixture } from "./helpers.js";
 
 describe("workflow loading and prompt rendering", () => {
   it("parses YAML front matter and markdown body", () => {
@@ -24,6 +24,47 @@ Work on {{ issue.identifier }}.`,
 
     expect(workflow.config.tracker?.project_slug).toBe("TEST");
     expect(workflow.promptTemplate).toBe("Work on {{ issue.identifier }}.");
+  });
+
+  it("parses two named project contexts with distinct codebases and Linear projects from workflow front matter", () => {
+    const workflow = parseWorkflowFile(
+      multiProjectWorkflowDocument({
+        projectContexts: [
+          projectContextFixture({ id: "api", label: "API", projectSlug: "API", repository: "../api-repo" }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+          }),
+        ],
+        promptTemplate: "Route {{ issue.identifier }}.",
+      }),
+      "/repo/WORKFLOW.md",
+    );
+    const rawConfig = workflow.config as ReturnType<typeof multiProjectWorkflowConfig>;
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", { LINEAR_API_KEY: "secret" });
+
+    expect(workflow.promptTemplate).toBe("Route {{ issue.identifier }}.");
+    expect(rawConfig.tracker?.api_key).toBe("$LINEAR_API_KEY");
+    expect(rawConfig.project_contexts.map((context) => context.id)).toEqual(["api", "docs"]);
+    expect(rawConfig.project_contexts.map((context) => context.tracker?.project_slug)).toEqual(["API", "DOCS"]);
+    expect(rawConfig.project_contexts.map((context) => context.workspace?.source?.repository)).toEqual([
+      "../api-repo",
+      "../docs-site",
+    ]);
+    expect(config.projectContexts.defaultContextId).toBe("api");
+    expect(config.projectContexts.contexts.map((context) => context.id)).toEqual(["api", "docs"]);
+    expect(config.projectContexts.byId.get("api")).toMatchObject({
+      id: "api",
+      tracker: { projectSlug: "API" },
+      workspace: { source: { repository: path.resolve("/repo", "../api-repo") } },
+    });
+    expect(config.projectContexts.byId.get("docs")).toMatchObject({
+      id: "docs",
+      tracker: { projectSlug: "DOCS" },
+      workspace: { source: { repository: path.resolve("/repo", "../docs-site") } },
+    });
   });
 
   it("resolves typed config defaults and env indirection", () => {
