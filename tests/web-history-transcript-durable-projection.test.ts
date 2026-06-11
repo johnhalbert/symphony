@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http.js";
 import {
@@ -12,7 +15,7 @@ import {
 } from "../src/core/persistence/RunActivityAppendStore.js";
 import type { OrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
 import type { IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
-import type { RunRecord, RunTranscriptStore, TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileRunTranscriptStore, type RunRecord, type RunTranscriptStore, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
 import { mapRunActivityEventToTranscriptEvent } from "../src/core/transcript/RunActivityEventMapper.js";
 import type { Issue, TrackerStateLists } from "../src/core/types.js";
 
@@ -555,21 +558,44 @@ describe("web history/transcript durable projection writes", () => {
 
 
 
-  it("passes the legacy/default project context id into durable transcript rebuild reads", async () => {
+  it("passes the legacy/default project context id into durable transcript rebuild reads for persisted runs missing projectContext metadata", async () => {
     const projectionWriter = recordingProjectionWriter();
-    const run = runFixture({
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-web-transcript-legacy-"));
+    const runStore = new FileRunTranscriptStore(root);
+    const run = await runStore.startRun({
       runId: "legacy-default-run",
       sessionId: "legacy-default-session",
+      agentId: "agent-legacy-default",
+      role: "worker",
       issueId: "issue-legacy-default",
       issueIdentifier: "LEGACY-1",
-      transcriptEventCount: 2,
-      projectContext: {
-        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
-        projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
-        linearProjectSlug: null,
-        routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
-      },
+      attempt: 1,
+      turnNumber: 1,
+      prompt: "Repair legacy/default projection attribution coverage",
+      workspaceKey: "LEGACY-1",
+      workspacePath: "/tmp/workspaces/LEGACY-1",
+      gitBranchName: "symphony/LEGACY-1",
+      repoPath: "/tmp/repo",
+      baseRef: "origin/main",
     });
+
+    const runMetaPath = path.join(root, "runs", run.runId, "meta.json");
+    const legacyRun = JSON.parse(await readFile(runMetaPath, "utf8")) as Record<string, unknown>;
+    delete legacyRun.projectContext;
+    await writeFile(runMetaPath, `${JSON.stringify(legacyRun, null, 2)}\n`, "utf8");
+
+    await expect(runStore.listRuns()).resolves.toMatchObject([
+      {
+        runId: "legacy-default-run",
+        projectContext: {
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+          linearProjectSlug: null,
+          routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+        },
+      },
+    ]);
+
     const durableActivityStore = new InMemoryRunActivityAppendStore();
     const appended = await durableActivityStore.appendEvents([
       runActivityInputFixture({
@@ -605,30 +631,40 @@ describe("web history/transcript durable projection writes", () => {
       },
     };
     let rawTranscriptReads = 0;
+    const instrumentedRunStore = new Proxy(runStore as RunTranscriptStore, {
+      get(target, prop, receiver) {
+        if (prop === "readTranscript" || prop === "readTranscriptTail") {
+          return async () => {
+            rawTranscriptReads += 1;
+            throw new Error("legacy/default scoped durable rebuild should not hydrate raw transcript pages");
+          };
+        }
+        const value = Reflect.get(target as object, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as RunTranscriptStore;
     const server = createStatusServer({
-      runStore: runStoreFixture({
-        runs: [run],
-        beforeReadTranscript: () => {
-          rawTranscriptReads += 1;
-          throw new Error("legacy/default scoped durable rebuild should not hydrate raw transcript pages");
-        },
-      }),
+      runStore: instrumentedRunStore,
       runActivitySourceStore,
       projectionWriter,
     });
 
-    const result = await server.rebuildDurableWebProjections({
-      projections: ["transcript_projection"],
-      transcriptPageLimit: 2,
-    });
+    try {
+      const result = await server.rebuildDurableWebProjections({
+        projections: ["transcript_projection"],
+        transcriptPageLimit: 2,
+      });
 
-    expect(result).toMatchObject({ attempted: 2, written: 2, unchanged: 0, skipped: 0, failed: 0 });
-    expect(rawTranscriptReads).toBe(0);
-    expect(durableReadCalls).toEqual([
-      { runId: "legacy-default-run", offset: 0, limit: 1, projectContextId: "default" },
-      { runId: "legacy-default-run", offset: 0, limit: 500, projectContextId: "default" },
-      { runId: "legacy-default-run", offset: 0, limit: 2, projectContextId: "default" },
-    ]);
+      expect(result).toMatchObject({ attempted: 2, written: 2, unchanged: 0, skipped: 0, failed: 0 });
+      expect(rawTranscriptReads).toBe(0);
+      expect(durableReadCalls).toEqual([
+        { runId: "legacy-default-run", offset: 0, limit: 1, projectContextId: "default" },
+        { runId: "legacy-default-run", offset: 0, limit: 500, projectContextId: "default" },
+        { runId: "legacy-default-run", offset: 0, limit: 2, projectContextId: "default" },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("serves large history views from bounded run slices without transcript hydration", async () => {
