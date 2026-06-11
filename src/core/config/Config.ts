@@ -696,53 +696,77 @@ export function resolveProjectContextCredentialProfiles(
   return raw.credential_profiles;
 }
 
+type RawCredentialProfileDefinition = NonNullable<NonNullable<RawCredentialProfilesConfig["profiles"]>[string]>;
+
 function mergeCredentialProfileConfigs(
   defaults: RawCredentialProfilesConfig | undefined,
   context: RawCredentialProfilesConfig | undefined,
 ): RawCredentialProfilesConfig | undefined {
-  if (!defaults) return context;
-  if (!context) return defaults;
+  if (!defaults && !context) return undefined;
 
-  const profiles = mergeCredentialProfileDefinitions(defaults.profiles, context.profiles);
-  const roles = mergeCredentialProfileRoleAssignments(defaults.roles, context.roles);
-
-  return {
-    ...defaults,
-    ...context,
-    ...(profiles === undefined ? {} : { profiles }),
-    ...(roles === undefined ? {} : { roles }),
+  const profiles = mergeCredentialProfileDefinitions(defaults?.profiles, context?.profiles);
+  const roles = mergeCredentialProfileRoleAssignments(defaults?.roles, context?.roles);
+  const merged: RawCredentialProfilesConfig = {
+    ...(defaults ?? {}),
+    ...(context ?? {}),
   };
+
+  if (profiles === undefined) {
+    delete merged.profiles;
+  } else {
+    merged.profiles = profiles;
+  }
+
+  if (roles === undefined) {
+    delete merged.roles;
+  } else {
+    merged.roles = roles;
+  }
+
+  return Object.keys(merged).length === 0 ? undefined : merged;
 }
 
 function mergeCredentialProfileDefinitions(
   defaults: RawCredentialProfilesConfig["profiles"] | undefined,
   context: RawCredentialProfilesConfig["profiles"] | undefined,
 ): RawCredentialProfilesConfig["profiles"] | undefined {
-  if (!defaults) return context;
-  if (!context) return defaults;
+  const mergedProfiles: Record<string, RawCredentialProfileDefinition> = {};
+  for (const [name, defaultProfile] of Object.entries(defaults ?? {})) {
+    if (defaultProfile !== null) {
+      mergedProfiles[name] = defaultProfile;
+    }
+  }
 
-  const mergedProfiles: NonNullable<RawCredentialProfilesConfig["profiles"]> = {
-    ...defaults,
-  };
+  for (const [name, contextProfile] of Object.entries(context ?? {})) {
+    if (contextProfile === null) {
+      delete mergedProfiles[name];
+      continue;
+    }
 
-  for (const [name, contextProfile] of Object.entries(context)) {
-    const defaultProfile = defaults[name];
-    mergedProfiles[name] = defaultProfile ? { ...defaultProfile, ...contextProfile } : contextProfile;
+    const defaultProfile = mergedProfiles[name];
+    mergedProfiles[name] = canMergeCredentialProfileDefinition(defaultProfile, contextProfile)
+      ? { ...defaultProfile, ...contextProfile }
+      : contextProfile;
   }
 
   return Object.keys(mergedProfiles).length === 0 ? undefined : mergedProfiles;
+}
+
+function canMergeCredentialProfileDefinition(
+  defaults: RawCredentialProfileDefinition | undefined,
+  context: RawCredentialProfileDefinition,
+): boolean {
+  if (defaults === undefined) return false;
+  return (defaults.kind === "github_app") === (context.kind === "github_app");
 }
 
 function mergeCredentialProfileRoleAssignments(
   defaults: RawCredentialProfilesConfig["roles"] | undefined,
   context: RawCredentialProfilesConfig["roles"] | undefined,
 ): RawCredentialProfilesConfig["roles"] | undefined {
-  if (!defaults) return context;
-  if (!context) return defaults;
-
-  const worker = mergeCredentialProfileRoleAssignment(defaults.worker, context.worker);
-  const reviewer = mergeCredentialProfileRoleAssignment(defaults.reviewer, context.reviewer);
-  const service = mergeCredentialProfileRoleAssignment(defaults.service, context.service);
+  const worker = mergeCredentialProfileRoleAssignment(defaults?.worker, context?.worker);
+  const reviewer = mergeCredentialProfileRoleAssignment(defaults?.reviewer, context?.reviewer);
+  const service = mergeCredentialProfileRoleAssignment(defaults?.service, context?.service);
 
   const mergedRoles = {
     ...(worker === undefined ? {} : { worker }),
@@ -754,15 +778,25 @@ function mergeCredentialProfileRoleAssignments(
 }
 
 function mergeCredentialProfileRoleAssignment(
-  defaults: Record<string, string> | undefined,
-  context: Record<string, string> | undefined,
+  defaults: Record<string, string | null> | undefined,
+  context: Record<string, string | null> | undefined,
 ): Record<string, string> | undefined {
-  if (!defaults) return context;
-  if (!context) return defaults;
-  return {
-    ...defaults,
-    ...context,
-  };
+  if (context && Object.keys(context).length === 0) return undefined;
+
+  const mergedAssignment: Record<string, string> = {};
+  for (const [capability, profileName] of Object.entries(defaults ?? {})) {
+    if (typeof profileName === "string") {
+      mergedAssignment[capability] = profileName;
+    }
+  }
+  for (const [capability, profileName] of Object.entries(context ?? {})) {
+    if (profileName === null) {
+      delete mergedAssignment[capability];
+      continue;
+    }
+    mergedAssignment[capability] = profileName;
+  }
+  return Object.keys(mergedAssignment).length === 0 ? undefined : mergedAssignment;
 }
 
 const DEFAULT_ACTIVE_STATES = ["Todo", "In Progress"];

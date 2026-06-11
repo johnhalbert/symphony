@@ -1227,24 +1227,24 @@ export class Orchestrator {
 
     for (const lifecycle of candidates) {
       const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
-      const projectContext = pendingPublicationProjectContext(lifecycle, issue);
-      const projectContextId = projectContext?.projectContextId;
-      const github = resolveProjectContextConfig(this.config, projectContextId).github;
-      if (!github.publishPullRequests || !(github.operatorApproval?.requiredForPublication ?? false)) {
-        continue;
-      }
-      const service = new CompletionReportService({
-        config: this.config,
-        lifecycleStore: this.options.lifecycleStore,
-        writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-        writebackProcessor: this.options.writeback,
-        ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-        pullRequestPublisher:
-          this.options.completionReportPublisher ??
-          createGitHubPullRequestClientForCapability(this.config, "github.publication", undefined, projectContextId),
-        operatorApproval: this.options.operatorApproval,
-      });
       try {
+        const projectContext = pendingPublicationProjectContext(lifecycle, issue);
+        const projectContextId = projectContext?.projectContextId;
+        const github = resolveProjectContextConfig(this.config, projectContextId).github;
+        if (!github.publishPullRequests || !(github.operatorApproval?.requiredForPublication ?? false)) {
+          continue;
+        }
+        const service = new CompletionReportService({
+          config: this.config,
+          lifecycleStore: this.options.lifecycleStore,
+          writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
+          writebackProcessor: this.options.writeback,
+          ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+          pullRequestPublisher:
+            this.options.completionReportPublisher ??
+            createGitHubPullRequestClientForCapability(this.config, "github.publication", undefined, projectContextId),
+          operatorApproval: this.options.operatorApproval,
+        });
         const result = await service.recoverPendingPublicationApproval({ issue, lifecycle });
         if (result.recovered) {
           this.options.logger.info("pending publication approval recovered", {
@@ -1896,7 +1896,6 @@ export class Orchestrator {
         entry.activeRunId = entry.runId;
         entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
         const runtimeMetadata = runtimeMetadataForEntry(this.options.harness.id, entry, this.config, event);
-        await this.updateLifecycle(entry, { summaryPointers: { lastRunId: entry.runId } });
         await this.options.runStore?.startRun({
           runId: entry.runId,
           sessionId: event.sessionId,
@@ -1924,6 +1923,7 @@ export class Orchestrator {
           ...(context.workspace.repoPath === undefined ? {} : { repoPath: context.workspace.repoPath }),
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),
         });
+        await this.updateLifecycle(entry, { summaryPointers: { lastRunId: entry.runId } });
         if (entry.runPhase !== "issue_breakdown") {
           await this.discoverPullRequestForEntry(entry, context.workspace);
         }

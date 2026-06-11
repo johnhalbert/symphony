@@ -221,4 +221,62 @@ describe("Linear credential resolver", () => {
       credential: { source: "profile", profileName: "writeback", value: "default-writeback-secret" },
     });
   });
+
+  it("allows project contexts to clear inherited Linear profile assignments and fall back to context API keys", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          tracker: { kind: "linear", api_key: "$DEFAULT_LINEAR_TOKEN", project_slug: "SYMPHONY" },
+          credential_profiles: {
+            profiles: {
+              tracker: { value: "$DEFAULT_TRACKER_TOKEN", capabilities: ["linear.tracker"] },
+              writeback: { value: "$DEFAULT_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
+            },
+            roles: {
+              worker: { "linear.tracker": "tracker" },
+              service: { "linear.writeback": "writeback" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            tracker: { api_key: "$DOCS_LINEAR_TOKEN", project_slug: "DOCS" },
+            credential_profiles: {
+              profiles: {
+                writeback: null,
+              },
+              roles: {
+                service: {},
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        DEFAULT_LINEAR_TOKEN: "default-linear-secret",
+        DEFAULT_TRACKER_TOKEN: "default-tracker-secret",
+        DEFAULT_WRITEBACK_TOKEN: "default-writeback-secret",
+        DOCS_LINEAR_TOKEN: "docs-linear-secret",
+      },
+    );
+
+    expect(resolveLinearClientConfig(config, "linear.writeback")).toMatchObject({
+      tracker: { projectSlug: "SYMPHONY", apiKey: "default-writeback-secret" },
+      credential: { source: "profile", profileName: "writeback", value: "default-writeback-secret" },
+    });
+    expect(resolveLinearClientConfig(config, "linear.writeback", "docs")).toMatchObject({
+      tracker: { projectSlug: "DOCS", apiKey: "docs-linear-secret" },
+      credential: { source: "legacy", profileName: null, value: "docs-linear-secret" },
+    });
+    expect(resolveLinearClientConfig(config, "linear.tracker", "docs")).toMatchObject({
+      tracker: { projectSlug: "DOCS", apiKey: "default-tracker-secret" },
+      credential: { source: "profile", profileName: "tracker", value: "default-tracker-secret" },
+    });
+  });
 });

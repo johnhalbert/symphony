@@ -334,4 +334,83 @@ describe("project context normalization", () => {
       },
     });
   });
+
+  it("allows project contexts to clear inherited credential assignments and profile definitions", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: { owner: "acme", repo: "symphony", token: "$DEFAULT_GITHUB_TOKEN" },
+          tracker: { kind: "linear", api_key: "$DEFAULT_LINEAR_TOKEN", project_slug: "SYMPHONY" },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DEFAULT_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              tracker: { value: "$DEFAULT_TRACKER_TOKEN", capabilities: ["linear.tracker"] },
+              writeback: { value: "$DEFAULT_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
+            },
+            roles: {
+              service: { "github.publication": "publication", "linear.writeback": "writeback" },
+              worker: { "linear.tracker": "tracker" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: { owner: "acme", repo: "docs-site", token: "$DOCS_GITHUB_TOKEN" },
+            tracker: { api_key: "$DOCS_LINEAR_TOKEN", project_slug: "DOCS" },
+            credential_profiles: {
+              profiles: {
+                publication: null,
+                writeback: null,
+              },
+              roles: {
+                service: {},
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "legacy-linear-secret",
+        DEFAULT_GITHUB_TOKEN: "default-github-secret",
+        DEFAULT_LINEAR_TOKEN: "default-linear-secret",
+        DEFAULT_PUBLICATION_TOKEN: "default-publication-secret",
+        DEFAULT_TRACKER_TOKEN: "default-tracker-secret",
+        DEFAULT_WRITEBACK_TOKEN: "default-writeback-secret",
+        DOCS_GITHUB_TOKEN: "docs-github-secret",
+        DOCS_LINEAR_TOKEN: "docs-linear-secret",
+      },
+    );
+
+    const docsRegistry = config.credentialProfileRegistries.get("docs");
+    expect(config.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      source: "profile",
+      profileName: "publication",
+      value: "default-publication-secret",
+    });
+    expect(docsRegistry?.assignmentRolesFor("github.publication")).toEqual([]);
+    expect(docsRegistry?.assignmentRolesFor("linear.writeback")).toEqual([]);
+    expect(docsRegistry?.resolveForRole("service", "github.publication")).toMatchObject({
+      source: "legacy",
+      profileName: null,
+      value: "docs-github-secret",
+    });
+    expect(docsRegistry?.resolveForRole("service", "linear.writeback")).toMatchObject({
+      source: "legacy",
+      profileName: null,
+      value: "docs-linear-secret",
+    });
+    expect(docsRegistry?.resolveForRole("worker", "linear.tracker")).toMatchObject({
+      source: "profile",
+      profileName: "tracker",
+      value: "default-tracker-secret",
+    });
+    expect(docsRegistry?.toJSON().profiles).not.toHaveProperty("publication");
+    expect(docsRegistry?.toJSON().profiles).not.toHaveProperty("writeback");
+  });
 });

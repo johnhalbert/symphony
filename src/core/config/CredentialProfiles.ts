@@ -49,14 +49,14 @@ export const rawCredentialProfilesSchema = z
     profiles: z
       .record(
         z.string(),
-        z.union([rawGitHubAppCredentialProfileSchema, rawStaticCredentialProfileSchema]),
+        z.union([rawGitHubAppCredentialProfileSchema, rawStaticCredentialProfileSchema]).nullable(),
       )
       .optional(),
     roles: z
       .object({
-        worker: z.record(z.string(), z.string()).optional(),
-        reviewer: z.record(z.string(), z.string()).optional(),
-        service: z.record(z.string(), z.string()).optional(),
+        worker: z.record(z.string(), z.string().nullable()).optional(),
+        reviewer: z.record(z.string(), z.string().nullable()).optional(),
+        service: z.record(z.string(), z.string().nullable()).optional(),
       })
       .strict()
       .optional(),
@@ -274,6 +274,7 @@ function parseProfiles(
 ): Map<string, CredentialProfileDefinition> {
   const profiles = new Map<string, CredentialProfileDefinition>();
   for (const [name, rawProfile] of Object.entries(rawProfiles ?? {})) {
+    if (rawProfile === null) continue;
     const trimmedName = name.trim();
     if (trimmedName.length === 0) {
       throw new SymphonyError("config_validation_error", "Credential profile names must not be empty");
@@ -315,6 +316,7 @@ function parseRoleAssignments(
   for (const role of ROLE_NAMES) {
     const assignments = new Map<CredentialCapability, string>();
     for (const [capabilityName, profileName] of Object.entries(rawRoles?.[role] ?? {})) {
+      if (profileName === null) continue;
       const capability = parseCapabilityName(capabilityName, `credential_profiles.roles.${role}`);
       const profile = profiles.get(profileName);
       if (profile === undefined) {

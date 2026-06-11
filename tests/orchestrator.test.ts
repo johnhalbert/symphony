@@ -3001,6 +3001,96 @@ describe("Orchestrator", () => {
     }
   });
 
+
+  it("skips stale-context pending publication approval recovery candidates without blocking dispatch", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.github.publishPullRequests = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.requiredForPublication = true;
+    config.workspace.source.baseRef = "main";
+    const staleBlocked = issue({
+      id: "issue-blocked",
+      identifier: "TEST-BLOCKED",
+      state: "Blocked",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-BLOCKED",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      routingSource: docsProjectContext.routingSource,
+    } as Partial<Issue>);
+    const candidate = issue({
+      id: "issue-active",
+      identifier: "TEST-ACTIVE",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-ACTIVE",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(ids) {
+        return ids
+          .map((id) => {
+            if (id === staleBlocked.id) return staleBlocked;
+            if (id === candidate.id) return candidate;
+            return null;
+          })
+          .filter((issue): issue is Issue => issue !== null);
+      },
+    };
+    const logs: string[] = [];
+    const logger = new StructuredLogger((line) => logs.push(line));
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter(() => undefined);
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const approvalStore = new FileOperatorApprovalStore(stateDir);
+    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    await lifecycleStore.ensureIssue(staleBlocked, pendingApprovalLifecyclePatch(staleBlocked, root, "stale-run"));
+    const harness = new BlockingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      operatorApproval,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => orchestrator.snapshot().running.some((entry) => entry.issueId === candidate.id), "active dispatch");
+
+      expect(orchestrator.snapshot().counts.running).toBe(1);
+      expect(orchestrator.snapshot().running[0]?.issueIdentifier).toBe(candidate.identifier);
+      expect(await approvalStore.list()).toHaveLength(0);
+      await expect(runStore.getRun("stale-run")).resolves.toBeNull();
+      expect(logs.some((line) => line.includes("pending publication approval recovery failed"))).toBe(true);
+      await expect(lifecycleStore.get(staleBlocked.id)).resolves.toMatchObject({
+        phase: "blocked",
+        projectContext: docsProjectContext,
+      });
+    } finally {
+      await orchestrator.stop();
+    }
+  });
   it("leaves audit_not_settled pending publication approval recovery unfinalized during orchestrator ticks", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;

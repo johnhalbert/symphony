@@ -448,6 +448,118 @@ describe("GitHub credential resolver", () => {
       credential: { kind: "github_app", source: "profile", profileName: "feedback" },
     });
   });
+
+  it("allows project contexts to clear inherited GitHub profile assignments and fall back to context tokens", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: { owner: "acme", repo: "symphony", token: "$DEFAULT_GITHUB_TOKEN" },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DEFAULT_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: { owner: "acme", repo: "docs-site", token: "$DOCS_GITHUB_TOKEN" },
+            credential_profiles: {
+              profiles: {
+                publication: null,
+              },
+              roles: {
+                service: {},
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        DEFAULT_GITHUB_TOKEN: "default-github-secret",
+        DEFAULT_PUBLICATION_TOKEN: "default-publication-secret",
+        DOCS_GITHUB_TOKEN: "docs-github-secret",
+      },
+    );
+
+    expect(resolveGitHubClientConfig(config, "github.publication")).toMatchObject({
+      github: { owner: "acme", repo: "symphony", token: "default-publication-secret" },
+      credential: { source: "profile", profileName: "publication", value: "default-publication-secret" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.publication", "docs")).toMatchObject({
+      github: { owner: "acme", repo: "docs-site", token: "docs-github-secret" },
+      credential: { source: "legacy", profileName: null, value: "docs-github-secret" },
+    });
+  });
+
+  it("treats same-named static-token context profiles as full overrides of default github_app profiles", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          github: { owner: "acme", repo: "symphony" },
+          credential_profiles: {
+            profiles: {
+              publication: {
+                kind: "github_app",
+                app_id: "$DEFAULT_PUBLICATION_APP_ID",
+                client_id: "$DEFAULT_PUBLICATION_APP_CLIENT_ID",
+                installation_id: "$DEFAULT_PUBLICATION_APP_INSTALLATION_ID",
+                private_key_path: "$DEFAULT_PUBLICATION_APP_PRIVATE_KEY_PATH",
+                capabilities: ["github.publication"],
+              },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: { owner: "acme", repo: "docs-site" },
+            credential_profiles: {
+              profiles: {
+                publication: {
+                  value: "$DOCS_PUBLICATION_TOKEN",
+                  capabilities: ["github.publication"],
+                },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        DEFAULT_PUBLICATION_APP_ID: "111",
+        DEFAULT_PUBLICATION_APP_CLIENT_ID: "Iv1.default-publication",
+        DEFAULT_PUBLICATION_APP_INSTALLATION_ID: "222",
+        DEFAULT_PUBLICATION_APP_PRIVATE_KEY_PATH: "/secrets/default-publication.pem",
+        DOCS_PUBLICATION_TOKEN: "docs-publication-secret",
+      },
+    );
+
+    expect(resolveGitHubClientConfig(config, "github.publication", "docs")).toMatchObject({
+      github: { owner: "acme", repo: "docs-site", token: "docs-publication-secret" },
+      credential: { kind: "static_token", source: "profile", profileName: "publication", value: "docs-publication-secret" },
+    });
+  });
 });
 
 function githubCapabilities(): GitHubCredentialCapability[] {
