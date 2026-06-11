@@ -6,8 +6,8 @@ import {
   type CompletionReportPullRequestPublisher,
 } from "../CompletionReportService.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
-import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
-import type { ProjectContextResolution } from "../config/ProjectContexts.js";
+import { FileRunTranscriptStore, type RunRecord } from "../persistence/RunTranscriptStore.js";
+import { normalizeProjectContextResolution, type ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -57,6 +57,8 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const config = loaded.serviceConfig;
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const activeRun = await runStore.getRun(loadedContext.activeRunId);
+    validateCompletionReportMcpActiveContext(loadedContext, activeRun);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writebackProcessor =
@@ -135,6 +137,47 @@ async function readCompletionReportContext(filePath: string): Promise<Completion
     throw new SymphonyError("invalid_request", "Completion report MCP context is invalid");
   }
   return parsed;
+}
+
+function validateCompletionReportMcpActiveContext(
+  context: CompletionReportMcpContextFile,
+  activeRun: RunRecord | null,
+): void {
+  if (!activeRun || activeRun.role !== "worker") {
+    throw new SymphonyError("invalid_request", "Completion report MCP context does not match the active worker run");
+  }
+
+  const mismatches: string[] = [];
+  if (activeRun.issueId !== context.issue.id) mismatches.push("issue.id");
+  if (activeRun.issueIdentifier !== context.issue.identifier) mismatches.push("issue.identifier");
+  if (activeRun.workspaceKey !== context.workspace.workspaceKey) mismatches.push("workspace.workspaceKey");
+  if (activeRun.workspacePath !== context.workspace.path) mismatches.push("workspace.path");
+  if (context.workspacePath !== null && activeRun.workspacePath !== context.workspacePath) mismatches.push("workspacePath");
+  if (context.workspace.issueId !== activeRun.issueId) mismatches.push("workspace.issueId");
+  if (context.workspace.issueIdentifier !== activeRun.issueIdentifier) mismatches.push("workspace.issueIdentifier");
+  if ((context.workspace.gitBranchName ?? null) !== (activeRun.gitBranchName ?? null)) {
+    mismatches.push("workspace.gitBranchName");
+  }
+  if ((context.workspace.repoPath ?? null) !== (activeRun.repoPath ?? null)) {
+    mismatches.push("workspace.repoPath");
+  }
+  if ((context.workspace.baseRef ?? null) !== (activeRun.baseRef ?? null)) {
+    mismatches.push("workspace.baseRef");
+  }
+  if (projectContextIdFor(context.projectContext) !== projectContextIdFor(activeRun.projectContext)) {
+    mismatches.push("projectContext.projectContextId");
+  }
+
+  if (mismatches.length > 0) {
+    throw new SymphonyError(
+      "invalid_request",
+      `Completion report MCP context does not match the active worker run (${mismatches.join(", ")})`,
+    );
+  }
+}
+
+function projectContextIdFor(context: ProjectContextResolution | undefined): string | null {
+  return normalizeProjectContextResolution(context).projectContextId;
 }
 
 function completionReportInputSchema(): Record<string, unknown> {
