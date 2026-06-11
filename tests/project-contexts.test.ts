@@ -181,6 +181,7 @@ describe("project context normalization", () => {
       label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
       source: "legacy_default",
       tracker: { projectSlug: "TEST" },
+      agent: { maxConcurrentAgents: 2, maxTurns: 1 },
       github: { owner: "acme", repo: "symphony", token: "github-test-token" },
       reviewLoop: { reviewStates: ["In Review"], maxReviewRounds: 5 },
       publicMetadata: {
@@ -189,6 +190,8 @@ describe("project context normalization", () => {
     });
     expect(config.github).toMatchObject({ owner: "acme", repo: "symphony", token: "github-test-token" });
     expect(config.reviewLoop).toMatchObject({ reviewStates: ["In Review"], maxReviewRounds: 5 });
+    expect(config.agent).toEqual(config.projectContexts.defaultContext.agent);
+    expect(config.agent).toMatchObject({ maxConcurrentAgents: 2, maxTurns: 1 });
   });
 
   it("skips readonly checkout issue-breakdown validation for disabled project contexts", () => {
@@ -241,6 +244,10 @@ describe("project context normalization", () => {
             planning_labels: ["legacy-plan"],
             workspace_mode: "none",
           },
+          agent: {
+            max_concurrent_agents: 9,
+            max_turns: 4,
+          },
         },
         projectContexts: [
           projectContextFixture({
@@ -262,6 +269,10 @@ describe("project context normalization", () => {
               planning_labels: ["context-plan"],
               workspace_mode: "none",
             },
+            agent: {
+              max_concurrent_agents: 3,
+              max_turns: 2,
+            },
           }),
           projectContextFixture({
             id: "docs",
@@ -280,6 +291,10 @@ describe("project context normalization", () => {
             issue_breakdown: {
               planning_labels: ["docs-plan"],
               workspace_mode: "none",
+            },
+            agent: {
+              max_concurrent_agents: 6,
+              max_turns: 5,
             },
           }),
         ],
@@ -308,6 +323,10 @@ describe("project context normalization", () => {
       issueBreakdown: {
         planningLabels: ["context-plan"],
         workspaceMode: "none",
+      },
+      agent: {
+        maxConcurrentAgents: 3,
+        maxTurns: 2,
       },
     });
 
@@ -339,6 +358,7 @@ describe("project context normalization", () => {
     expect(config.github).toEqual(defaultContext.github);
     expect(config.reviewLoop).toEqual(defaultContext.reviewLoop);
     expect(config.issueBreakdown).toEqual(defaultContext.issueBreakdown);
+    expect(config.agent).toEqual(defaultContext.agent);
     expect(config.tracker.projectSlug).toBe("SYMPHONY");
     expect(config.workspace.source?.repository).toMatch(/repo$/i);
     expect(config.workspace.source?.repository).not.toMatch(/legacy-repo$/i);
@@ -349,6 +369,8 @@ describe("project context normalization", () => {
     expect(config.reviewLoop.reviewPassState).toBe("Context Ready");
     expect(config.issueBreakdown.planningLabels).toEqual(["context-plan"]);
     expect(config.issueBreakdown.workspaceMode).toBe("none");
+    expect(config.agent.maxConcurrentAgents).toBe(3);
+    expect(config.agent.maxTurns).toBe(2);
   });
 
   it("keeps raw project_contexts alongside the normalized project context registry", () => {
