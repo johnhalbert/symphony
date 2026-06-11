@@ -3065,7 +3065,10 @@ async function readRunActivityTranscriptPage(
   run: RunRecord,
   options: { offset: number; limit: number },
 ): Promise<TranscriptPage | null> {
-  const sourcePage = await sourceStore.readRunEvents(run.runId, options);
+  const sourcePage = await sourceStore.readRunEvents(run.runId, {
+    ...options,
+    projectContextId: run.projectContext?.projectContextId ?? null,
+  });
   if (sourcePage.total === 0) return null;
   return runActivityEventsPageToTranscriptPage(sourcePage, run);
 }
@@ -3075,11 +3078,19 @@ async function readRunActivityTranscriptTail(
   run: RunRecord,
   options: { limit: number },
 ): Promise<TranscriptPage | null> {
-  const sourceHead = await sourceStore.readRunEvents(run.runId, { offset: 0, limit: 1 });
+  const sourceHead = await sourceStore.readRunEvents(run.runId, {
+    offset: 0,
+    limit: 1,
+    projectContextId: run.projectContext?.projectContextId ?? null,
+  });
   if (sourceHead.total === 0) return null;
   const offset = Math.max(0, sourceHead.total - options.limit);
   return runActivityEventsPageToTranscriptPage(
-    await sourceStore.readRunEvents(run.runId, { offset, limit: options.limit }),
+    await sourceStore.readRunEvents(run.runId, {
+      offset,
+      limit: options.limit,
+      projectContextId: run.projectContext?.projectContextId ?? null,
+    }),
     run,
     "tail",
   );

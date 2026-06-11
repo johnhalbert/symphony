@@ -140,6 +140,7 @@ describe("RunActivityAppendStore", () => {
         revision: 1,
         detail: {
           source: "run_activity",
+          projectContextId: "default",
           runId: "run-append",
           sessionId: "session-append",
           runSessionId: "run-append:session-append",
@@ -288,6 +289,76 @@ describe("RunActivityAppendStore", () => {
     expect(client.insertValues[0]?.[0]).toBe("red");
   });
 
+  it("keeps append duplicate state scoped by project context when raw run_session_id values are reused across contexts", async () => {
+    const client = new FakeRunActivityPostgresClient({
+      runSessionRows: [
+        { run_id: "run-postgres", session_id: "session-blue", project_context_id: "blue" },
+        { run_id: "run-postgres", session_id: "session-red", project_context_id: "red" },
+      ],
+    });
+    const store = new PostgresRunActivityAppendStore({ connect: async () => client });
+
+    const batch = await store.appendEvents([
+      statusActivityInput({
+        id: "activity-postgres-blue",
+        runId: "run-postgres",
+        sessionId: "session-blue",
+        runSessionId: "shared-run-session",
+        externalEventId: "external-shared",
+        sequence: null,
+      }),
+      statusActivityInput({
+        id: "activity-postgres-red",
+        runId: "run-postgres",
+        sessionId: "session-red",
+        runSessionId: "shared-run-session",
+        externalEventId: "external-shared",
+        sequence: null,
+      }),
+    ]);
+
+    expect(batch.accepted).toHaveLength(2);
+    expect(
+      batch.accepted.map((result) => ({
+        projectContextId: result.metadata.projectContextId,
+        runSessionId: result.event.runSessionId,
+        sequence: result.event.sequence,
+        externalEventId: result.event.externalEventId,
+      })),
+    ).toEqual([
+      {
+        projectContextId: "blue",
+        runSessionId: "shared-run-session",
+        sequence: 1,
+        externalEventId: "external-shared",
+      },
+      {
+        projectContextId: "red",
+        runSessionId: "shared-run-session",
+        sequence: 1,
+        externalEventId: "external-shared",
+      },
+    ]);
+    expect(client.insertValues.map((values) => values[0])).toEqual(["blue", "red"]);
+
+    const duplicate = await store.appendEvent(
+      statusActivityInput({
+        id: "activity-postgres-blue-duplicate",
+        runId: "run-postgres",
+        sessionId: "session-blue",
+        runSessionId: "shared-run-session",
+        externalEventId: "external-shared",
+        sequence: null,
+      }),
+    );
+
+    expect(duplicate).toMatchObject({
+      status: "duplicate",
+      reason: "external_event_id",
+      metadata: { projectContextId: "blue", sequence: 1 },
+    });
+  });
+
   it("rolls back ambiguous Postgres appends when a run id maps to multiple project contexts without a unique match", async () => {
     const client = new FakeRunActivityPostgresClient({
       runSessionRows: [
@@ -330,7 +401,44 @@ describe("RunActivityAppendStore", () => {
     expect(page).toMatchObject({ runId: "run-postgres", offset: 0, limit: 1, nextOffset: 1, total: 2 });
     expect(page.events.map((stored) => stored.event.eventId)).toEqual(["activity-page-1"]);
     expect(client.released).toBe(true);
-    expect(client.normalizedStatements.some((statement) => statement.includes("WHERE run_id = $1"))).toBe(true);
+    expect(
+      client.normalizedStatements.some((statement) =>
+        statement.includes("WHERE run_id = $1 AND ($2::text IS NULL OR project_context_id = $2)"),
+      ),
+    ).toBe(true);
+  });
+
+  it("filters paginated Postgres source-table events by project context when duplicate run ids exist across contexts", async () => {
+    const client = new FakeRunActivityPostgresClient({
+      runSessionRows: [
+        { run_id: "run-postgres", session_id: "session-blue", project_context_id: "blue" },
+        { run_id: "run-postgres", session_id: "session-red", project_context_id: "red" },
+      ],
+    });
+    const store = new PostgresRunActivityAppendStore({ connect: async () => client });
+
+    await store.appendEvents([
+      statusActivityInput({
+        id: "activity-page-blue",
+        runId: "run-postgres",
+        sessionId: "session-blue",
+        runSessionId: "shared-run-session:blue",
+        sequence: 1,
+      }),
+      statusActivityInput({
+        id: "activity-page-red",
+        runId: "run-postgres",
+        sessionId: "session-red",
+        runSessionId: "shared-run-session:red",
+        sequence: 1,
+      }),
+    ]);
+
+    const page = await store.readRunEvents("run-postgres", { offset: 0, limit: 10, projectContextId: "red" });
+
+    expect(page).toMatchObject({ runId: "run-postgres", offset: 0, limit: 10, nextOffset: null, total: 1 });
+    expect(page.events.map((stored) => stored.metadata.projectContextId)).toEqual(["red"]);
+    expect(page.events.map((stored) => stored.event.eventId)).toEqual(["activity-page-red"]);
   });
 
   it("rolls back and releases the Postgres client when a transactional append fails", async () => {
@@ -385,23 +493,45 @@ class FakeRunActivityPostgresClient implements PostgresRunActivityAppendClient {
 
     if (normalized.startsWith("SELECT count(*)::bigint AS total FROM symphony.run_activity_event")) {
       const runId = values?.[0];
-      const total = this.rows.filter((row) => row.run_id === runId).length;
+      const projectContextId = values?.[1];
+      const total = this.rows.filter(
+        (row) => row.run_id === runId && (projectContextId == null || row.project_context_id === projectContextId),
+      ).length;
       return { rows: [{ total: String(total) } as unknown as T] };
     }
 
     if (normalized.startsWith("SELECT run_activity_event_id::text AS append_revision")) {
       if (normalized.includes("WHERE run_id = $1")) {
         const runId = values?.[0];
-        const limit = Number(values?.[1] ?? 100);
-        const offset = Number(values?.[2] ?? 0);
+        const projectContextId = values?.[1];
+        const limit = Number(values?.[2] ?? 100);
+        const offset = Number(values?.[3] ?? 0);
         return {
           rows: this.rows
-            .filter((row) => row.run_id === runId)
+            .filter(
+              (row) => row.run_id === runId && (projectContextId == null || row.project_context_id === projectContextId),
+            )
             .sort((left, right) => Number(left.sequence) - Number(right.sequence))
             .slice(offset, offset + limit) as T[],
         };
       }
       return { rows: this.rows as T[] };
+    }
+
+    if (normalized.startsWith("WITH requested_run_sessions AS")) {
+      const projectContextIds = (values?.[0] as readonly string[]) ?? [];
+      const runSessionIds = (values?.[1] as readonly string[]) ?? [];
+      const eventIds = new Set(((values?.[2] as readonly string[]) ?? []).map(String));
+      const requestedScopes = new Set(
+        projectContextIds.map((projectContextId, index) => `${projectContextId}\u0000${String(runSessionIds[index] ?? "")}`),
+      );
+      return {
+        rows: this.rows.filter(
+          (row) =>
+            requestedScopes.has(`${String(row.project_context_id)}\u0000${String(row.run_session_id)}`) ||
+            eventIds.has(String(row.event_id)),
+        ) as T[],
+      };
     }
 
     if (normalized.startsWith("INSERT INTO symphony.run_activity_event")) {

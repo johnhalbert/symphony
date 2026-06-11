@@ -349,7 +349,7 @@ ALTER TABLE symphony.chat_message
   ADD CONSTRAINT chat_message_run_context_fkey
   FOREIGN KEY (project_context_id, run_id)
   REFERENCES symphony.run_session (project_context_id, run_id)
-  ON DELETE SET NULL;
+  ON DELETE SET NULL (run_id);
 
 DROP INDEX IF EXISTS symphony.run_session_lookup_idx;
 DROP INDEX IF EXISTS symphony.issue_status_lookup_idx;

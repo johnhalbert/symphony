@@ -56,8 +56,14 @@ export interface RunActivityEventsPage {
   readonly events: readonly RunActivityStoredEvent[];
 }
 
+export interface RunActivityReadOptions {
+  readonly offset?: number;
+  readonly limit?: number;
+  readonly projectContextId?: string | null;
+}
+
 export interface RunActivityEventSourceStore {
-  readRunEvents(runId: string, options?: { offset?: number; limit?: number }): Promise<RunActivityEventsPage>;
+  readRunEvents(runId: string, options?: RunActivityReadOptions): Promise<RunActivityEventsPage>;
   projectionRevision?(): number;
   onProjectionChanged?(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe;
 }
@@ -217,10 +223,15 @@ export class InMemoryRunActivityAppendStore implements RunActivityAppendStore {
       .sort((left, right) => compareAppendRevision(left.metadata.appendRevision, right.metadata.appendRevision));
   }
 
-  async readRunEvents(runId: string, options: { offset?: number; limit?: number } = {}): Promise<RunActivityEventsPage> {
+  async readRunEvents(runId: string, options: RunActivityReadOptions = {}): Promise<RunActivityEventsPage> {
     const page = normalizeRunActivityReadPageOptions(options);
+    const projectContextId = normalizeOptionalString(options.projectContextId);
     const events = this.storedEvents
-      .filter((stored) => stored.metadata.runId === runId)
+      .filter(
+        (stored) =>
+          stored.metadata.runId === runId &&
+          (projectContextId === null || stored.metadata.projectContextId === projectContextId),
+      )
       .sort(compareRunActivityTranscriptOrder);
     const pageEvents = events.slice(page.offset, page.offset + page.limit);
     const nextOffset = page.offset + pageEvents.length < events.length ? page.offset + pageEvents.length : null;
@@ -274,8 +285,9 @@ export class PostgresRunActivityAppendStore implements RunActivityAppendStore {
     }
   }
 
-  async readRunEvents(runId: string, options: { offset?: number; limit?: number } = {}): Promise<RunActivityEventsPage> {
+  async readRunEvents(runId: string, options: RunActivityReadOptions = {}): Promise<RunActivityEventsPage> {
     const page = normalizeRunActivityReadPageOptions(options);
+    const projectContextId = normalizeOptionalString(options.projectContextId);
     const client = await this.connections.connect();
     try {
       const rows = await client.query<RunActivityEventRow>(
@@ -283,14 +295,20 @@ export class PostgresRunActivityAppendStore implements RunActivityAppendStore {
           SELECT ${runActivityEventSelectColumns()}
           FROM symphony.run_activity_event
           WHERE run_id = $1
+            AND ($2::text IS NULL OR project_context_id = $2)
           ORDER BY sequence ASC, event_at ASC, run_activity_event_id ASC
-          LIMIT $2 OFFSET $3
+          LIMIT $3 OFFSET $4
         `,
-        [runId, page.limit, page.offset],
+        [runId, projectContextId, page.limit, page.offset],
       );
       const count = await client.query<{ total: string | number | bigint }>(
-        `SELECT count(*)::bigint AS total FROM symphony.run_activity_event WHERE run_id = $1`,
-        [runId],
+        `
+          SELECT count(*)::bigint AS total
+          FROM symphony.run_activity_event
+          WHERE run_id = $1
+            AND ($2::text IS NULL OR project_context_id = $2)
+        `,
+        [runId, projectContextId],
       );
       const total = nullableNumber(count.rows[0]?.total ?? 0) ?? 0;
       const events = rows.rows.map(storedEventFromPostgresRow);
@@ -312,10 +330,32 @@ export async function appendRunActivityEventsWithPostgresClient(
   const runSessions = await lockRunActivityAppendRuns(client, runIds);
   const runSessionsByRunId = indexRunSessionsByRunId(runSessions);
 
-  const runSessionIds = sortedUnique(inputs.map((input) => deriveRunActivityRunSessionId(input)));
+  const persistenceContextsByEventId = new Map<string, RunActivityAppendPersistenceContext>();
+  const requestedRunSessionScopes = new Map<string, { projectContextId: string; runSessionId: string }>();
+  for (const input of inputs) {
+    const eventInput = eventInputForAppend(input);
+    const eventId = eventIdForAppendInput(eventInput);
+    const persistenceContext = persistenceContextForPostgresAppendInput(eventInput, runSessionsByRunId);
+    const runSessionId = deriveRunActivityRunSessionId(eventInput);
+    persistenceContextsByEventId.set(eventId, persistenceContext);
+    requestedRunSessionScopes.set(scopedKey(persistenceContext.projectContextId, runSessionId), {
+      projectContextId: persistenceContext.projectContextId,
+      runSessionId,
+    });
+  }
+
+  const requestedScopes = Array.from(requestedRunSessionScopes.entries())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, scope]) => scope);
+  const requestedProjectContextIds = requestedScopes.map((scope) => scope.projectContextId);
+  const requestedRunSessionIds = requestedScopes.map((scope) => scope.runSessionId);
   const eventIds = sortedUnique(inputs.map(eventIdForAppendInput));
   const existingRows = await client.query<RunActivityEventRow>(
     `
+      WITH requested_run_sessions AS (
+        SELECT DISTINCT requested.project_context_id, requested.run_session_id
+        FROM unnest($1::text[], $2::text[]) AS requested(project_context_id, run_session_id)
+      )
       SELECT
         run_activity_event_id::text AS append_revision,
         project_context_id,
@@ -341,11 +381,15 @@ export async function appendRunActivityEventsWithPostgresClient(
         metadata,
         created_at
       FROM symphony.run_activity_event
-      WHERE run_session_id = ANY($1::text[]) OR event_id = ANY($2::text[])
+      WHERE (project_context_id, run_session_id) IN (
+          SELECT project_context_id, run_session_id
+          FROM requested_run_sessions
+        )
+        OR event_id = ANY($3::text[])
       ORDER BY run_activity_event_id
       FOR UPDATE
     `,
-    [runSessionIds, eventIds],
+    [requestedProjectContextIds, requestedRunSessionIds, eventIds],
   );
   const state = new RunActivityAppendAccumulator(existingRows.rows.map(storedEventFromPostgresRow));
 
@@ -356,7 +400,9 @@ export async function appendRunActivityEventsWithPostgresClient(
       const row = await insertRunActivityEventRow(client, event, storage, context);
       return storedEventFromPostgresRow(row);
     },
-    (eventInput) => persistenceContextForPostgresAppendInput(eventInput, runSessionsByRunId),
+    (eventInput) =>
+      persistenceContextsByEventId.get(eventIdForAppendInput(eventInput)) ??
+      persistenceContextForPostgresAppendInput(eventInput, runSessionsByRunId),
   );
 }
 
@@ -364,11 +410,20 @@ async function reduceAcceptedRunActivityMessageEventsWithPostgresClient(
   client: PostgresQueryClient,
   accepted: readonly RunActivityAcceptedAppendResult[],
 ): Promise<void> {
-  const runSessionIds = sortedUnique(
-    accepted.filter((result) => isChatMessageReductionTrigger(result.event)).map((result) => result.event.runSessionId),
-  );
-  for (const runSessionId of runSessionIds) {
-    await reduceRunActivityChatMessagesWithPostgresClient(client, runSessionId);
+  const reductionScopes = new Map<string, { projectContextId: string; runSessionId: string }>();
+  for (const result of accepted.filter((entry) => isChatMessageReductionTrigger(entry.event))) {
+    reductionScopes.set(scopedKey(result.metadata.projectContextId, result.event.runSessionId), {
+      projectContextId: result.metadata.projectContextId,
+      runSessionId: result.event.runSessionId,
+    });
+  }
+
+  for (const scope of Array.from(reductionScopes.entries())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, value]) => value)) {
+    await reduceRunActivityChatMessagesWithPostgresClient(client, scope.runSessionId, {
+      projectContextId: scope.projectContextId,
+    });
   }
 }
 
@@ -393,7 +448,7 @@ async function appendRunActivityEventsWithState(
     const eventInput = eventInputForAppend(input);
     const runSessionId = deriveRunActivityRunSessionId(eventInput);
     const persistenceContext = resolvePersistenceContext(eventInput);
-    const currentState = state.orderingStateFor(runSessionId);
+    const currentState = state.orderingStateFor(runSessionId, persistenceContext.projectContextId);
 
     const existingByEventId = state.findByEventId(eventIdForAppendInput(eventInput));
     if (existingByEventId !== null) {
@@ -411,7 +466,7 @@ async function appendRunActivityEventsWithState(
 
     const ordering = applyRunActivityOrdering(eventInput, currentState);
     if (ordering.status === "duplicate") {
-      const existing = state.findDuplicate(eventInput, ordering.reason, currentState);
+      const existing = state.findDuplicate(eventInput, ordering.reason, currentState, persistenceContext.projectContextId);
       const duplicateResult: RunActivityDuplicateAppendResult = {
         status: "duplicate",
         reason: ordering.reason,
@@ -501,27 +556,31 @@ function sessionIdForAppendInput(input: RunActivityEventInput): string | null {
 }
 
 class RunActivityAppendAccumulator {
-  private readonly stateByRunSessionId = new Map<string, RunActivityOrderingState>();
+  private readonly stateByRunSessionScope = new Map<string, RunActivityOrderingState>();
   private readonly byEventId = new Map<string, RunActivityStoredEvent>();
   private readonly byRunSessionSequence = new Map<string, RunActivityStoredEvent>();
   private readonly byRunSessionExternalId = new Map<string, RunActivityStoredEvent>();
 
   constructor(initialEvents: readonly RunActivityStoredEvent[]) {
-    const eventsByRunSessionId = new Map<string, RunActivityStoredEvent[]>();
+    const eventsByRunSessionScope = new Map<string, RunActivityStoredEvent[]>();
     for (const stored of initialEvents) {
       this.index(stored);
-      const events = eventsByRunSessionId.get(stored.event.runSessionId) ?? [];
+      const runSessionScope = scopedKey(stored.metadata.projectContextId, stored.event.runSessionId);
+      const events = eventsByRunSessionScope.get(runSessionScope) ?? [];
       events.push(stored);
-      eventsByRunSessionId.set(stored.event.runSessionId, events);
+      eventsByRunSessionScope.set(runSessionScope, events);
     }
 
-    for (const [runSessionId, events] of eventsByRunSessionId) {
-      this.stateByRunSessionId.set(runSessionId, orderingStateFromStoredEvents(runSessionId, events));
+    for (const [runSessionScope, events] of eventsByRunSessionScope) {
+      this.stateByRunSessionScope.set(
+        runSessionScope,
+        orderingStateFromStoredEvents(events[0]?.event.runSessionId ?? "unknown-run", events),
+      );
     }
   }
 
-  orderingStateFor(runSessionId: string): RunActivityOrderingState {
-    return this.stateByRunSessionId.get(runSessionId) ?? createRunActivityOrderingState(runSessionId);
+  orderingStateFor(runSessionId: string, projectContextId: string): RunActivityOrderingState {
+    return this.stateByRunSessionScope.get(scopedKey(projectContextId, runSessionId)) ?? createRunActivityOrderingState(runSessionId);
   }
 
   findByEventId(eventId: string): RunActivityStoredEvent | null {
@@ -532,16 +591,18 @@ class RunActivityAppendAccumulator {
     input: RunActivityEventInput,
     reason: RunActivityDuplicateReason,
     currentState: RunActivityOrderingState,
+    projectContextId: string,
   ): RunActivityStoredEvent {
     const runSessionId = currentState.runSessionId;
+    const runSessionScope = scopedKey(projectContextId, runSessionId);
     const stored = (() => {
       if (reason === "event_id") return this.byEventId.get(eventIdForAppendInput(input));
       if (reason === "external_event_id") {
         const externalEventId = normalizeOptionalString(input.externalEventId);
-        return externalEventId === null ? undefined : this.byRunSessionExternalId.get(scopedKey(runSessionId, externalEventId));
+        return externalEventId === null ? undefined : this.byRunSessionExternalId.get(scopedKey(runSessionScope, externalEventId));
       }
       const sequence = positiveIntegerOrNull(input.sequence) ?? currentState.highWatermark + 1;
-      return this.byRunSessionSequence.get(scopedKey(runSessionId, String(sequence)));
+      return this.byRunSessionSequence.get(scopedKey(runSessionScope, String(sequence)));
     })();
 
     if (stored === undefined) {
@@ -555,15 +616,16 @@ class RunActivityAppendAccumulator {
 
   accept(stored: RunActivityStoredEvent, nextState: RunActivityOrderingState): void {
     this.index(stored);
-    this.stateByRunSessionId.set(stored.event.runSessionId, nextState);
+    this.stateByRunSessionScope.set(scopedKey(stored.metadata.projectContextId, stored.event.runSessionId), nextState);
   }
 
   private index(stored: RunActivityStoredEvent): void {
+    const runSessionScope = scopedKey(stored.metadata.projectContextId, stored.event.runSessionId);
     this.byEventId.set(stored.event.eventId, stored);
-    this.byRunSessionSequence.set(scopedKey(stored.event.runSessionId, String(runActivityEventSequence(stored.event))), stored);
+    this.byRunSessionSequence.set(scopedKey(runSessionScope, String(runActivityEventSequence(stored.event))), stored);
     const externalEventId = normalizeOptionalString(stored.event.externalEventId);
     if (externalEventId !== null) {
-      this.byRunSessionExternalId.set(scopedKey(stored.event.runSessionId, externalEventId), stored);
+      this.byRunSessionExternalId.set(scopedKey(runSessionScope, externalEventId), stored);
     }
   }
 }
@@ -866,7 +928,7 @@ function groupAcceptedRunActivityChanges(
 ): RunActivityAcceptedAppendResult[][] {
   const groups = new Map<string, RunActivityAcceptedAppendResult[]>();
   for (const result of accepted) {
-    const key = `${result.metadata.runId}\u0000${result.metadata.runSessionId}`;
+    const key = `${result.metadata.projectContextId}\u0000${result.metadata.runId}\u0000${result.metadata.runSessionId}`;
     const group = groups.get(key);
     if (group) {
       group.push(result);
@@ -888,6 +950,7 @@ function runActivityProjectionChangeDetail(
   const lastSequence = sequences.length > 0 ? Math.max(...sequences) : null;
   return {
     source: "run_activity",
+    projectContextId: first.metadata.projectContextId,
     runId: first.metadata.runId,
     sessionId: first.metadata.sessionId ?? null,
     runSessionId: first.metadata.runSessionId,

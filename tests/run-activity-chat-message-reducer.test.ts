@@ -417,6 +417,7 @@ describe("RunActivityChatMessageReducer", () => {
     expect(client.normalizedStatements[0]).toBe("BEGIN");
     expect(client.normalizedStatements.at(-1)).toBe("COMMIT");
     expect(client.normalizedStatements).not.toContain("ROLLBACK");
+    expect(client.selectValues).toEqual([["run-chat:session-chat", null]]);
     expect(client.insertValues).toHaveLength(2);
     expect(client.insertValues[0]?.slice(0, 14)).toEqual([
       "default",
@@ -441,6 +442,54 @@ describe("RunActivityChatMessageReducer", () => {
       sourceEventIds: ["activity:pg:assistant"],
       sourceEventSequences: [2],
     });
+  });
+
+  it("filters direct Postgres reductions by project context when raw run_session_id values overlap", async () => {
+    const client = new FakeChatReducerPostgresClient([
+      postgresActivityRow({
+        project_context_id: "blue",
+        run_id: "run-blue",
+        session_id: "session-blue",
+        run_session_id: "shared-run-session",
+        event_id: "activity:pg:blue",
+        sequence: 1,
+        actor: "assistant",
+        kind: "assistant_message_completed",
+        text: "blue durable message",
+        payload: { messageId: "shared-message", final: true },
+      }),
+      postgresActivityRow({
+        project_context_id: "red",
+        run_id: "run-red",
+        session_id: "session-red",
+        run_session_id: "shared-run-session",
+        event_id: "activity:pg:red",
+        sequence: 1,
+        actor: "assistant",
+        kind: "assistant_message_completed",
+        text: "red durable message",
+        payload: { messageId: "shared-message", final: true },
+      }),
+    ]);
+    const reducer = new PostgresRunActivityChatMessageReducer({ connect: async () => client });
+
+    const result = await reducer.reduceRunSession("shared-run-session", {
+      projectContextId: "red",
+      threadKey: "thread:red",
+    });
+
+    expect(result).toMatchObject({ runSessionId: "shared-run-session", threadKey: "thread:red", upsertedCount: 1, deletedCount: 0 });
+    expect(client.selectValues).toEqual([["shared-run-session", "red"]]);
+    expect(client.insertValues).toHaveLength(1);
+    expect(client.insertValues[0]?.slice(0, 7)).toEqual([
+      "red",
+      "run_activity:shared-run-session:assistant_response:shared-message",
+      "thread:red",
+      "issue:eng-198",
+      "ENG-198",
+      "run-red",
+      null,
+    ]);
   });
 
   it("reduces accepted message appends into chat_message rows in the same Postgres append transaction", async () => {
@@ -480,6 +529,7 @@ describe("RunActivityChatMessageReducer", () => {
     expect(
       client.normalizedStatements.findIndex((statement) => statement.startsWith("INSERT INTO symphony.run_activity_event")),
     ).toBeLessThan(client.normalizedStatements.findIndex((statement) => statement.startsWith("INSERT INTO symphony.chat_message")));
+    expect(client.reducerSelectValues).toEqual([["run-chat:session-chat", "default"]]);
   });
 
   it("reduces accepted tool appends into chat_message rows in the same Postgres append transaction", async () => {
@@ -513,6 +563,52 @@ describe("RunActivityChatMessageReducer", () => {
       1,
       2,
     ]);
+    expect(client.reducerSelectValues).toEqual([["run-chat:session-chat", "default"]]);
+  });
+
+  it("keeps append-triggered Postgres chat reductions scoped by project context when raw run_session_id values overlap", async () => {
+    const client = new FakeAppendAndChatReducerPostgresClient({
+      runSessionRows: [
+        { run_id: "run-chat", session_id: "session-blue", project_context_id: "blue" },
+        { run_id: "run-chat", session_id: "session-red", project_context_id: "red" },
+      ],
+    });
+    const store = new PostgresRunActivityAppendStore({ connect: async () => client });
+
+    const result = await store.appendEvents([
+      messageAppendInput({
+        id: "activity:append:blue",
+        runId: "run-chat",
+        sessionId: "session-blue",
+        runSessionId: "shared-run-session",
+        actor: "assistant",
+        kind: "assistant_message_completed",
+        text: "blue append reduction",
+        payload: { messageId: "shared-message", final: true },
+      }),
+      messageAppendInput({
+        id: "activity:append:red",
+        runId: "run-chat",
+        sessionId: "session-red",
+        runSessionId: "shared-run-session",
+        actor: "assistant",
+        kind: "assistant_message_completed",
+        text: "red append reduction",
+        payload: { messageId: "shared-message", final: true },
+      }),
+    ]);
+
+    expect(result.accepted).toHaveLength(2);
+    expect(client.reducerSelectValues).toEqual([
+      ["shared-run-session", "blue"],
+      ["shared-run-session", "red"],
+    ]);
+    expect(client.chatInsertValues).toHaveLength(2);
+    expect(client.chatInsertValues.map((values) => values.slice(0, 3))).toEqual([
+      ["blue", "run_activity:shared-run-session:assistant_response:shared-message", "shared-run-session"],
+      ["red", "run_activity:shared-run-session:assistant_response:shared-message", "shared-run-session"],
+    ]);
+    expect(client.chatInsertValues.map((values) => values[11])).toEqual(["blue append reduction", "red append reduction"]);
   });
 
   it("re-runs reduction for accepted terminal failure appends but not duplicate appends", async () => {
@@ -550,6 +646,7 @@ describe("RunActivityChatMessageReducer", () => {
 class FakeChatReducerPostgresClient implements PostgresRunActivityChatMessageReducerClient {
   readonly normalizedStatements: string[] = [];
   readonly insertValues: readonly unknown[][] = [];
+  readonly selectValues: Array<readonly [string, string | null]> = [];
   released = false;
 
   constructor(private readonly rows: QueryResultRow[]) {}
@@ -563,8 +660,16 @@ class FakeChatReducerPostgresClient implements PostgresRunActivityChatMessageRed
     }
 
     if (normalized.startsWith("SELECT event.run_activity_event_id::text AS append_revision")) {
-      expect(values).toEqual(["run-chat:session-chat"]);
-      return { rows: this.rows as T[] };
+      const runSessionId = String(values?.[0] ?? "");
+      const projectContextId = values?.[1] == null ? null : String(values[1]);
+      this.selectValues.push([runSessionId, projectContextId]);
+      return {
+        rows: this.rows.filter(
+          (row) =>
+            String(row.run_session_id) === runSessionId &&
+            (projectContextId === null || String(row.project_context_id) === projectContextId),
+        ) as T[],
+      };
     }
 
     if (normalized.startsWith("WITH numbered AS")) {
@@ -592,7 +697,10 @@ class FakeAppendAndChatReducerPostgresClient implements PostgresRunActivityChatM
   readonly normalizedStatements: string[] = [];
   readonly activityRows: QueryResultRow[] = [];
   readonly chatInsertValues: readonly unknown[][] = [];
+  readonly reducerSelectValues: Array<readonly [string, string | null]> = [];
   released = false;
+
+  constructor(private readonly options: { runSessionRows?: readonly QueryResultRow[] } = {}) {}
 
   async query<T extends QueryResultRow = QueryResultRow>(text: string, values?: readonly unknown[]): Promise<{ rows: T[] }> {
     const normalized = text.replace(/\s+/g, " ").trim();
@@ -604,13 +712,30 @@ class FakeAppendAndChatReducerPostgresClient implements PostgresRunActivityChatM
 
     if (normalized.startsWith("SELECT run_id, session_id, project_context_id FROM symphony.run_session")) {
       const runIds = values?.[0] as readonly string[];
+      if (this.options.runSessionRows) {
+        return {
+          rows: this.options.runSessionRows.filter((row) => runIds.includes(String(row.run_id))) as T[],
+        };
+      }
       return {
         rows: runIds.map((run_id) => ({ run_id, session_id: "session-chat", project_context_id: "default" }) as unknown as T),
       };
     }
 
-    if (normalized.startsWith("SELECT run_activity_event_id::text AS append_revision")) {
-      return { rows: this.activityRows as T[] };
+    if (normalized.startsWith("WITH requested_run_sessions AS")) {
+      const projectContextIds = (values?.[0] as readonly string[]) ?? [];
+      const runSessionIds = (values?.[1] as readonly string[]) ?? [];
+      const eventIds = new Set(((values?.[2] as readonly string[]) ?? []).map(String));
+      const requestedScopes = new Set(
+        projectContextIds.map((projectContextId, index) => `${projectContextId} ${String(runSessionIds[index] ?? "")}`),
+      );
+      return {
+        rows: this.activityRows.filter(
+          (row) =>
+            requestedScopes.has(`${String(row.project_context_id)} ${String(row.run_session_id)}`) ||
+            eventIds.has(String(row.event_id)),
+        ) as T[],
+      };
     }
 
     if (normalized.startsWith("INSERT INTO symphony.run_activity_event")) {
@@ -645,7 +770,16 @@ class FakeAppendAndChatReducerPostgresClient implements PostgresRunActivityChatM
     }
 
     if (normalized.startsWith("SELECT event.run_activity_event_id::text AS append_revision")) {
-      return { rows: this.activityRows as T[] };
+      const runSessionId = String(values?.[0] ?? "");
+      const projectContextId = values?.[1] == null ? null : String(values[1]);
+      this.reducerSelectValues.push([runSessionId, projectContextId]);
+      return {
+        rows: this.activityRows.filter(
+          (row) =>
+            String(row.run_session_id) === runSessionId &&
+            (projectContextId === null || String(row.project_context_id) === projectContextId),
+        ) as T[],
+      };
     }
 
     if (normalized.startsWith("WITH numbered AS")) {

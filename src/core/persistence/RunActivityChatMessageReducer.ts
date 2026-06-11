@@ -55,6 +55,7 @@ export interface RunActivityChatMessageContext {
   readonly threadKey?: string | null;
   readonly issueKey?: string | null;
   readonly issueIdentifier?: string | null;
+  readonly projectContextId?: string | null;
 }
 
 export interface RunActivityChatReductionResult {
@@ -254,6 +255,7 @@ export async function reduceRunActivityChatMessagesWithPostgresClient(
   context: RunActivityChatMessageContext = {},
 ): Promise<RunActivityChatReductionResult> {
   const normalizedRunSessionId = normalizeRequiredString(runSessionId, "runSessionId");
+  const normalizedProjectContextId = normalizeOptionalString(context.projectContextId);
   const rows = await client.query<RunActivityChatReducerPostgresRow>(
     `
       SELECT
@@ -285,10 +287,11 @@ export async function reduceRunActivityChatMessagesWithPostgresClient(
       FROM symphony.run_activity_event event
       JOIN symphony.run_session run ON run.project_context_id = event.project_context_id AND run.run_id = event.run_id
       WHERE event.run_session_id = $1
+        AND ($2::text IS NULL OR event.project_context_id = $2)
       ORDER BY event.sequence, event.event_at, event.event_id
       FOR UPDATE OF event
     `,
-    [normalizedRunSessionId],
+    [normalizedRunSessionId, normalizedProjectContextId],
   );
 
   const envelopes = rows.rows.map(envelopeFromPostgresRow);
