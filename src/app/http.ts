@@ -53,7 +53,7 @@ import type {
   OperatorApprovalRecord,
 } from "../core/approval/OperatorApprovalService.js";
 import { OPERATOR_REJECTED_PUBLICATION_ERROR, approvalResolve } from "../core/approval/OperatorApprovalService.js";
-import type { ProjectContextResolution } from "../core/config/ProjectContexts.js";
+import { projectContextResolutionFromIssue, type ProjectContextResolution } from "../core/config/ProjectContexts.js";
 import {
   approvalMatchesReport,
   isAwaitingPublicationApprovalLifecycle,
@@ -290,6 +290,7 @@ export interface StatusServerOptions {
   host: string;
   port: number;
   openWorkspaceToken: string | null;
+  resolveOpenWorkspaceToken?: (projectContextId?: string | null) => string | null;
   tracker?: TrackerClient;
   trackerStateLists: TrackerStateLists;
   issueBoardColumns?: IssueBoardColumnMapping;
@@ -534,7 +535,7 @@ export class StatusServer {
           response,
           await renderDashboard(
             snapshot,
-            Boolean(this.options.openWorkspaceToken),
+            this.mutationsConfigured(),
             this.options.runStore,
             this.options.lifecycleStore,
             this.options.trackerStateLists,
@@ -568,7 +569,7 @@ export class StatusServer {
           ...snapshot,
           operatorView: await operatorSnapshotView(
             snapshot,
-            Boolean(this.options.openWorkspaceToken),
+            this.mutationsConfigured(),
             this.options.runStore,
             this.options.lifecycleStore,
             this.options.trackerStateLists,
@@ -1021,8 +1022,8 @@ export class StatusServer {
 
       const pauseMatch = /^\/api\/v1\/issues\/([^/]+)\/pause$/.exec(url.pathname);
       if (request.method === "POST" && pauseMatch) {
-        this.requireMutationToken(request);
         const issueId = decodeURIComponent(pauseMatch[1] ?? "");
+        await this.requireIssueMutationToken(request, issueId);
         this.options.orchestrator.pauseIssue(issueId);
         sendJson(response, 202, { paused: true, issue: issueId });
         return;
@@ -1030,8 +1031,8 @@ export class StatusServer {
 
       const resumeMatch = /^\/api\/v1\/issues\/([^/]+)\/resume$/.exec(url.pathname);
       if (request.method === "POST" && resumeMatch) {
-        this.requireMutationToken(request);
         const issueId = decodeURIComponent(resumeMatch[1] ?? "");
+        await this.requireIssueMutationToken(request, issueId);
         this.options.orchestrator.resumeIssue(issueId);
         sendJson(response, 202, { paused: false, issue: issueId });
         return;
@@ -1039,8 +1040,8 @@ export class StatusServer {
 
       const cancelMatch = /^\/api\/v1\/issues\/([^/]+)\/cancel$/.exec(url.pathname);
       if (request.method === "POST" && cancelMatch) {
-        this.requireMutationToken(request);
         const issueId = decodeURIComponent(cancelMatch[1] ?? "");
+        await this.requireIssueMutationToken(request, issueId);
         await this.options.orchestrator.cancelIssue(issueId);
         sendJson(response, 202, { cancelled: true, issue: issueId });
         return;
@@ -1111,8 +1112,8 @@ export class StatusServer {
 
       const continuationSummaryMatch = /^\/api\/v1\/issues\/([^/]+)\/continuation-summary$/.exec(url.pathname);
       if (request.method === "POST" && continuationSummaryMatch) {
-        this.requireMutationToken(request);
         const issueId = decodeURIComponent(continuationSummaryMatch[1] ?? "");
+        await this.requireIssueMutationToken(request, issueId);
         const result = await this.options.orchestrator.createContinuationSummary(issueId);
         sendJson(response, 201, {
           issue: issueId,
@@ -1124,8 +1125,8 @@ export class StatusServer {
 
       const issueBreakdownMatch = /^\/api\/v1\/issues\/([^/]+)\/planning-run$/.exec(url.pathname);
       if (request.method === "POST" && issueBreakdownMatch) {
-        this.requireMutationToken(request);
         const issueId = decodeURIComponent(issueBreakdownMatch[1] ?? "");
+        await this.requireIssueMutationToken(request, issueId);
         const result = await this.options.orchestrator.requestIssueBreakdown(issueId);
         sendJson(response, result.queued ? 202 : 200, {
           queued: result.queued,
@@ -1140,8 +1141,8 @@ export class StatusServer {
 
       const issueBreakdownApplyMatch = /^\/api\/v1\/issues\/([^/]+)\/planning-run\/apply$/.exec(url.pathname);
       if (request.method === "POST" && issueBreakdownApplyMatch) {
-        this.requireIssueBreakdownApplyToken(request);
         const issueId = decodeURIComponent(issueBreakdownApplyMatch[1] ?? "");
+        await this.requireIssueBreakdownApplyToken(request, issueId);
         const options = parseIssueBreakdownApplyRequest(await readJsonBody(request));
         const result = await this.options.orchestrator.applyIssueBreakdownPlan(issueId, options);
         sendJson(response, result.status === "pending" ? 202 : 200, {
@@ -1179,7 +1180,9 @@ export class StatusServer {
               runStore: this.options.runStore,
             })
           : null;
-        const pendingApprovalRequired = this.operatorApprovalRequired(pendingApproval?.projectContext);
+        const issueProjectContext =
+          pendingApproval?.projectContext ?? (await this.resolveIssueProjectContext(issueId, { lifecycle, latestRun }));
+        const pendingApprovalRequired = this.operatorApprovalRequired(pendingApproval?.projectContext ?? issueProjectContext);
         const operatorLiveness = await issueOperatorLiveness({
           live,
           latestRun: publicRunRecordOrNull(latestRun),
@@ -1188,7 +1191,12 @@ export class StatusServer {
           resolvedAgentId,
           runStore: this.options.runStore,
         });
-        const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: Boolean(this.options.openWorkspaceToken) });
+        const controls = operatorControls({
+          issueKnown: true,
+          live,
+          paused,
+          mutationsConfigured: this.mutationsConfigured(issueProjectContext),
+        });
         const affordances = operatorAffordances({
           issueKey: issueId,
           lifecycle,
@@ -1238,7 +1246,7 @@ export class StatusServer {
             pendingApproval: approvalCapability(
               pendingApproval ?? null,
               pendingApprovalRequired,
-              this.options.openWorkspaceToken,
+              this.statusMutationToken(pendingApproval?.projectContext ?? issueProjectContext),
             ),
           },
           pendingApproval: pendingApproval ? approvalResponse(pendingApproval, pendingApprovalRequired) : null,
@@ -1289,8 +1297,8 @@ export class StatusServer {
 
       const openMatch = /^\/api\/v1\/issues\/([^/]+)\/open-workspace$/.exec(url.pathname);
       if (request.method === "POST" && openMatch) {
-        this.requireMutationToken(request);
         const issueId = decodeURIComponent(openMatch[1] ?? "");
+        await this.requireIssueMutationToken(request, issueId);
         const details = this.options.orchestrator.getIssueDetails(issueId);
         const workspace = await this.options.runStore?.findWorkspace(issueId);
         const workspacePath =
@@ -1333,10 +1341,10 @@ export class StatusServer {
     projectContext?: ProjectContextResolution | null,
   ): void {
     if (!this.operatorApprovalRequired(projectContext)) {
-      this.requireMutationToken(request);
+      this.requireMutationTokenForProjectContext(request, projectContext);
       return;
     }
-    const expected = this.options.openWorkspaceToken?.trim() ?? "";
+    const expected = this.statusMutationToken(projectContext)?.trim() ?? "";
     if (expected.length === 0) {
       throw new SymphonyError("invalid_request", "Missing or invalid open-workspace token");
     }
@@ -1382,8 +1390,24 @@ export class StatusServer {
     return this.options.operatorApproval?.rejectPolicyFor?.(projectContext) ?? this.options.operatorApproval?.rejectPolicy ?? "cancel";
   }
 
+  private async requireIssueMutationToken(
+    request: IncomingMessage,
+    issueIdOrIdentifier: string,
+  ): Promise<ProjectContextResolution | null> {
+    const projectContext = await this.resolveIssueProjectContext(issueIdOrIdentifier);
+    this.requireMutationTokenForProjectContext(request, projectContext);
+    return projectContext;
+  }
+
   private requireMutationToken(request: IncomingMessage): void {
-    const expected = this.options.openWorkspaceToken;
+    this.requireMutationTokenForProjectContext(request, null);
+  }
+
+  private requireMutationTokenForProjectContext(
+    request: IncomingMessage,
+    projectContext?: ProjectContextResolution | null,
+  ): void {
+    const expected = this.statusMutationToken(projectContext);
     if (!expected) return;
     const provided = request.headers["x-symphony-token"];
     if (provided !== expected) {
@@ -1391,14 +1415,59 @@ export class StatusServer {
     }
   }
 
-  private requireIssueBreakdownApplyToken(request: IncomingMessage): void {
-    const expected = this.options.openWorkspaceToken?.trim() ?? "";
+  private async requireIssueBreakdownApplyToken(
+    request: IncomingMessage,
+    issueIdOrIdentifier: string,
+  ): Promise<ProjectContextResolution | null> {
+    const projectContext = await this.resolveIssueProjectContext(issueIdOrIdentifier);
+    const expected = this.statusMutationToken(projectContext)?.trim() ?? "";
     if (!expected) {
       throw new SymphonyError("invalid_request", "Issue breakdown apply requires a configured X-Symphony-Token");
     }
     const provided = request.headers["x-symphony-token"];
     if (typeof provided !== "string" || provided.trim().length === 0 || provided !== expected) {
       throw new SymphonyError("invalid_request", "Missing or invalid issue breakdown apply token");
+    }
+    return projectContext;
+  }
+
+  private statusMutationToken(projectContext?: ProjectContextResolution | null): string | null {
+    return this.options.resolveOpenWorkspaceToken
+      ? this.options.resolveOpenWorkspaceToken(projectContext?.projectContextId ?? null)
+      : this.options.openWorkspaceToken;
+  }
+
+  private mutationsConfigured(projectContext?: ProjectContextResolution | null): boolean {
+    return Boolean(this.statusMutationToken(projectContext)?.trim());
+  }
+
+  private async resolveIssueProjectContext(
+    issueIdOrIdentifier: string,
+    options: { lifecycle?: IssueLifecycleRecord | null | undefined; latestRun?: RunRecord | null | undefined } = {},
+  ): Promise<ProjectContextResolution | null> {
+    if (options.lifecycle?.projectContext) return options.lifecycle.projectContext;
+    if (options.latestRun?.projectContext) return options.latestRun.projectContext;
+
+    const storedLifecycle = options.lifecycle ?? (await this.options.lifecycleStore?.get(issueIdOrIdentifier)) ?? null;
+    if (storedLifecycle?.projectContext) return storedLifecycle.projectContext;
+
+    const live = this.options.orchestrator.getIssueDetails(issueIdOrIdentifier);
+    if (live?.lifecycle?.projectContext) return live.lifecycle.projectContext;
+
+    const latestRun = options.latestRun ?? (await this.options.runStore?.latestRunForIssue(issueIdOrIdentifier)) ?? null;
+    if (latestRun?.projectContext) return latestRun.projectContext;
+
+    const lookupKeys = new Set<string>([issueIdOrIdentifier]);
+    if (latestRun?.issueId) lookupKeys.add(latestRun.issueId);
+    if (latestRun?.issueIdentifier) lookupKeys.add(latestRun.issueIdentifier);
+
+    if (!this.options.tracker) return null;
+    try {
+      const issues = await this.options.tracker.fetchIssueStatesByIds([...lookupKeys]);
+      const issue = issues.find((item) => lookupKeys.has(item.id) || lookupKeys.has(item.identifier)) ?? issues[0] ?? null;
+      return issue ? projectContextResolutionFromIssue(issue) : null;
+    } catch {
+      return null;
     }
   }
 
@@ -2598,7 +2667,7 @@ export class StatusServer {
   ): Promise<IssueBoardResponse> {
     return buildIssueBoard({
       sourceIndex,
-      mutationsConfigured: Boolean(this.options.openWorkspaceToken),
+      mutationsConfigured: this.mutationsConfigured(),
       runStore: this.options.runStore,
       trackerStateLists: this.options.trackerStateLists,
       issueBoardColumns,
@@ -2616,7 +2685,7 @@ export class StatusServer {
     } else {
       board = await buildIssueBoard({
         sourceIndex,
-        mutationsConfigured: Boolean(this.options.openWorkspaceToken),
+        mutationsConfigured: this.mutationsConfigured(),
         runStore: this.options.runStore,
         trackerStateLists: this.options.trackerStateLists,
         issueBoardColumns,
@@ -2630,7 +2699,7 @@ export class StatusServer {
       requestKey: issueId,
       card,
       sourceIndex,
-      mutationsConfigured: Boolean(this.options.openWorkspaceToken),
+      mutationsConfigured: this.mutationsConfigured(),
       runStore: this.options.runStore,
       mcpExposureDiagnosticsStore: this.options.mcpExposureDiagnosticsStore,
       trackerStateLists: this.options.trackerStateLists,

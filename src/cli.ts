@@ -297,6 +297,7 @@ program
             host: config.server.host,
             port: config.server.port,
             openWorkspaceToken: statusMutationToken,
+            resolveOpenWorkspaceToken: (projectContextId) => resolveStatusMutationToken(configRef.value, projectContextId),
             tracker,
             trackerStateLists: resolveTrackerStateLists(config),
             issueBoardColumns: config.issueBoard.columns,

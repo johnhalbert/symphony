@@ -20,7 +20,7 @@ import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import type { Issue, IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } from "../src/core/types.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, projectContextFixture, testConfig } from "./helpers.js";
 
 describe("StatusServer durable API", () => {
   let root: string;
@@ -2373,6 +2373,142 @@ describe("StatusServer durable API", () => {
 
       expect(legacyPauseResponse.status).toBe(401);
       expect(profilePauseResponse.status).toBe(202);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("uses the active project context server.open_workspace token for issue mutations", async () => {
+    const workspaceRoot = path.join(root, "workspaces");
+    const stateDir = path.join(root, "state");
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "operator_request",
+    } as const;
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          tracker: {
+            project_slug: "TEST",
+            active_states: ["Todo", "In Progress"],
+            handoff_states: ["In Review"],
+          },
+          workspace: {
+            root: workspaceRoot,
+            state_dir: stateDir,
+            source: {
+              kind: "git_worktree",
+              repository: root,
+              base_ref: "main",
+              branch_template: "symphony/{{ issue.identifier }}",
+              cleanup: "refuse_dirty",
+            },
+          },
+          server: {
+            open_workspace_token: "$LEGACY_OPEN_WORKSPACE_TOKEN",
+          },
+          credential_profiles: {
+            profiles: {
+              "open-workspace": {
+                value: "$DEFAULT_OPEN_WORKSPACE_TOKEN",
+                capabilities: ["server.open_workspace"],
+              },
+            },
+            roles: {
+              worker: {
+                "server.open_workspace": "open-workspace",
+              },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "TEST",
+            workspaceRoot,
+            stateDir,
+            repository: root,
+            baseRef: "main",
+            branchTemplate: "symphony/{{ issue.identifier }}",
+          }),
+          projectContextFixture({
+            id: docsProjectContext.projectContextId,
+            label: docsProjectContext.projectContextLabel,
+            projectSlug: docsProjectContext.linearProjectSlug,
+            workspaceRoot,
+            stateDir,
+            repository: root,
+            baseRef: "main",
+            branchTemplate: "symphony/{{ issue.identifier }}",
+            credential_profiles: {
+              profiles: {
+                "open-workspace": {
+                  value: "$DOCS_OPEN_WORKSPACE_TOKEN",
+                  capabilities: ["server.open_workspace"],
+                },
+              },
+              roles: {
+                worker: {
+                  "server.open_workspace": "open-workspace",
+                },
+              },
+            },
+          }),
+        ],
+      }),
+      path.join(root, "WORKFLOW.md"),
+      {
+        LINEAR_API_KEY: "linear-secret",
+        LEGACY_OPEN_WORKSPACE_TOKEN: "legacy-open-secret",
+        DEFAULT_OPEN_WORKSPACE_TOKEN: "default-open-secret",
+        DOCS_OPEN_WORKSPACE_TOKEN: "docs-open-secret",
+      },
+    );
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(issue({ id: "issue-docs-1", identifier: "DOCS-1", state: "In Progress" }), {
+      projectContext: docsProjectContext,
+    });
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: resolveStatusMutationToken(config),
+      resolveOpenWorkspaceToken: (projectContextId) => resolveStatusMutationToken(config, projectContextId),
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/DOCS-1`);
+      const defaultPauseResponse = await fetch(`${baseUrl}/api/v1/issues/DOCS-1/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "default-open-secret" },
+      });
+      const docsPauseResponse = await fetch(`${baseUrl}/api/v1/issues/DOCS-1/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "docs-open-secret" },
+      });
+      const issueBody = (await issueResponse.json()) as {
+        capabilities: {
+          mutationsRequireToken: boolean;
+        };
+      };
+
+      expect(issueResponse.status).toBe(200);
+      expect(issueBody.capabilities.mutationsRequireToken).toBe(true);
+      expect(defaultPauseResponse.status).toBe(401);
+      expect(docsPauseResponse.status).toBe(202);
     } finally {
       await server.stop();
     }

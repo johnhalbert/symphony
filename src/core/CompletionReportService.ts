@@ -524,8 +524,9 @@ export class CompletionReportService {
             draft: input.publication.draft ?? null,
           }
         : null;
-    const handoffChecks = await this.evaluatePullRequestHandoffChecks(verifiedPullRequest);
-    if (this.options.config.github.prHandoff.enabled && (!verifiedPullRequest || !handoffChecks)) {
+    const github = this.githubConfigFor(input.context, input.lifecycle);
+    const handoffChecks = await this.evaluatePullRequestHandoffChecks(verifiedPullRequest, github);
+    if (github.prHandoff.enabled && (!verifiedPullRequest || !handoffChecks)) {
       throw new SymphonyError(
         "invalid_request",
         "Completion report handoff requires a verified pull request that satisfies the handoff policy",
@@ -537,9 +538,10 @@ export class CompletionReportService {
     });
     const writebackContext = runWritebackContext(input.context, input.report.runId);
     const writebackReport = completionReportWritebackDetails(input.report, input.context.issue, pullRequest);
-    const operations = this.options.config.github.prHandoff.enabled
+    const handoffConfig = { ...this.options.config, github };
+    const operations = github.prHandoff.enabled
       ? verifiedPullRequest && handoffChecks
-        ? planPullRequestHandoffWritebacks(writebackContext, this.options.config, {
+        ? planPullRequestHandoffWritebacks(writebackContext, handoffConfig, {
             pullRequest: verifiedPullRequest,
             report: writebackReport,
             ci: handoffChecks,
@@ -549,7 +551,7 @@ export class CompletionReportService {
     if (operations.length === 0) {
       throw new SymphonyError(
         "invalid_request",
-        this.options.config.github.prHandoff.enabled
+        github.prHandoff.enabled
           ? "Completion report handoff requires a verified pull request that satisfies the handoff policy"
           : "Completion report cannot be accepted for the current issue state",
       );
@@ -649,14 +651,13 @@ export class CompletionReportService {
 
   private async evaluatePullRequestHandoffChecks(
     pullRequest: CompletionReportPullRequestRef | null,
+    github = this.options.config.github,
   ): Promise<{ requiredChecks: string[]; passedChecks: string[]; noCiEvidence: string | null } | null> {
-    if (!this.options.config.github.prHandoff.enabled) return null;
-    if (pullRequest?.draft === true && !this.options.config.github.prHandoff.allowDrafts) return null;
-    const requiredChecks = this.options.config.github.prHandoff.requiredChecks;
+    if (!github.prHandoff.enabled) return null;
+    if (pullRequest?.draft === true && !github.prHandoff.allowDrafts) return null;
+    const requiredChecks = github.prHandoff.requiredChecks;
     if (requiredChecks.length === 0) {
-      const noCiEvidence = this.options.config.github.prHandoff.noCiAllowed
-        ? this.options.config.github.prHandoff.noCiEvidence
-        : null;
+      const noCiEvidence = github.prHandoff.noCiAllowed ? github.prHandoff.noCiEvidence : null;
       return noCiEvidence === null
         ? null
         : {

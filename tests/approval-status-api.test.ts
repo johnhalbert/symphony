@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StatusServer } from "../src/app/http.js";
+import { resolveStatusMutationToken } from "../src/app/RuntimeDependencies.js";
 import {
   CompletionReportService,
   PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
@@ -133,10 +134,42 @@ describe("approval status API", () => {
           poll_interval_ms: 5,
         },
       },
+      topLevelCredentialProfiles: {
+        profiles: {
+          "open-workspace": {
+            value: "$DEFAULT_OPEN_WORKSPACE_TOKEN",
+            capabilities: ["server.open_workspace"],
+          },
+        },
+        roles: {
+          worker: {
+            "server.open_workspace": "open-workspace",
+          },
+        },
+      },
+      docsCredentialProfiles: {
+        profiles: {
+          "open-workspace": {
+            value: "$DOCS_OPEN_WORKSPACE_TOKEN",
+            capabilities: ["server.open_workspace"],
+          },
+        },
+        roles: {
+          worker: {
+            "server.open_workspace": "open-workspace",
+          },
+        },
+      },
     });
     const pending = await createPending("idem-docs-required", null, docsProjectContext);
     const resumed: OperatorApprovalRecord[] = [];
-    const server = statusServer({ resumed });
+    const defaultToken = resolveStatusMutationToken(config);
+    const docsToken = resolveStatusMutationToken(config, docsProjectContext.projectContextId);
+    const server = statusServer({
+      resumed,
+      openWorkspaceToken: defaultToken,
+      resolveOpenWorkspaceToken: (projectContextId) => resolveStatusMutationToken(config, projectContextId),
+    });
     const address = await server.start();
     try {
       const baseUrl = `http://${address.host}:${address.port}`;
@@ -147,9 +180,14 @@ describe("approval status API", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ decision: "approve" }),
       });
+      const wrongContextToken = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": defaultToken ?? "missing-default-token" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
       const approved = await fetch(`${baseUrl}/api/v1/approval-requests/${pending.requestId}`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        headers: { "content-type": "application/json", "x-symphony-token": docsToken ?? "missing-docs-token" },
         body: JSON.stringify({ decision: "approve" }),
       });
       const approvalBody = (await approvalResponseRaw.json()) as { capabilities: { enabled: boolean } };
@@ -163,6 +201,8 @@ describe("approval status API", () => {
         request: { status: string; capabilities: { enabled: boolean } };
       };
 
+      expect(defaultToken).toBe("default-open-secret");
+      expect(docsToken).toBe("docs-open-secret");
       expect(approvalResponseRaw.status).toBe(200);
       expect(approvalBody.capabilities.enabled).toBe(true);
       expect(issueResponse.status).toBe(200);
@@ -175,6 +215,7 @@ describe("approval status API", () => {
         capabilities: { enabled: true },
       });
       expect(denied.status).toBe(401);
+      expect(wrongContextToken.status).toBe(401);
       expect(approved.status).toBe(200);
       expect(approvedBody.request).toMatchObject({
         status: "approved",
@@ -1678,6 +1719,9 @@ describe("approval status API", () => {
   function configureMultiProjectApprovalConfig(input: {
     topLevelGithub?: Record<string, unknown>;
     docsGithub?: Record<string, unknown>;
+    topLevelServer?: Record<string, unknown>;
+    topLevelCredentialProfiles?: Record<string, unknown>;
+    docsCredentialProfiles?: Record<string, unknown>;
   } = {}) {
     const parsed = parseServiceConfig(
       multiProjectWorkflowConfig({
@@ -1698,6 +1742,10 @@ describe("approval status API", () => {
               cleanup: "refuse_dirty",
             },
           },
+          ...(input.topLevelServer === undefined ? {} : { server: input.topLevelServer }),
+          ...(input.topLevelCredentialProfiles === undefined
+            ? {}
+            : { credential_profiles: input.topLevelCredentialProfiles }),
           github: {
             owner: "acme",
             repo: "symphony",
@@ -1747,15 +1795,28 @@ describe("approval status API", () => {
               },
               ...input.docsGithub,
             },
+            ...(input.docsCredentialProfiles === undefined
+              ? {}
+              : { credential_profiles: input.docsCredentialProfiles }),
           }),
         ],
       }),
       path.join(root, "WORKFLOW.md"),
-      { LINEAR_API_KEY: "linear-test-key" },
+      {
+        LINEAR_API_KEY: "linear-test-key",
+        DEFAULT_OPEN_WORKSPACE_TOKEN: "default-open-secret",
+        DOCS_OPEN_WORKSPACE_TOKEN: "docs-open-secret",
+      },
     );
 
-    config.github = parsed.github;
-    config.projectContexts = parsed.projectContexts;
+    config = {
+      ...config,
+      server: parsed.server,
+      github: parsed.github,
+      credentialProfiles: parsed.credentialProfiles,
+      credentialProfileRegistries: parsed.credentialProfileRegistries,
+      projectContexts: parsed.projectContexts,
+    };
     service = new OperatorApprovalService({ config, store, runStore });
   }
 
@@ -1943,6 +2004,7 @@ describe("approval status API", () => {
       terminalRecords?: OperatorApprovalRecord[];
       terminalError?: Error;
       openWorkspaceToken?: string | null;
+      resolveOpenWorkspaceToken?: (projectContextId?: string | null) => string | null;
       operatorApproval?: ConstructorParameters<typeof StatusServer>[0]["operatorApproval"];
       resumeResult?: boolean | null;
     } = {},
@@ -1977,6 +2039,9 @@ describe("approval status API", () => {
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: options.openWorkspaceToken === undefined ? "secret" : options.openWorkspaceToken,
+      ...(options.resolveOpenWorkspaceToken === undefined
+        ? {}
+        : { resolveOpenWorkspaceToken: options.resolveOpenWorkspaceToken }),
       trackerStateLists: {
         activeStates: ["Todo", "In Progress"],
         handoffStates: ["In Review"],

@@ -399,6 +399,15 @@ describe("completion report MCP handoff", () => {
       workflowPath,
       contextFile,
     });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const outbox = new FileWritebackOutboxStore(stateDir);
+    const operations = await outbox.list();
+    const transitionTargets = operations
+      .filter((operation) => operation.kind === "transition")
+      .map((operation) => (operation.kind === "transition" ? operation.payload.toState : null));
+    const commentBodies = operations
+      .filter((operation) => operation.kind === "comment")
+      .map((operation) => (operation.kind === "comment" ? operation.payload.body : ""));
 
     expect(result).toMatchObject({
       accepted: true,
@@ -409,6 +418,13 @@ describe("completion report MCP handoff", () => {
         branch: "symphony/TEST-1",
       },
     });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+      phase: "review",
+    });
+    expect(transitionTargets).toContain("Human Review");
+    expect(transitionTargets).not.toContain("In Review");
+    expect(commentBodies.some((body) => body.includes("## Symphony PR Handoff"))).toBe(true);
     expect(authorizations).toEqual([
       "Bearer docs-publication-token",
       "Bearer docs-publication-token",
