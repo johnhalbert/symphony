@@ -45,6 +45,7 @@ import {
   resolveStatusMutationToken,
   resolveTrackerStateLists,
 } from "./app/RuntimeDependencies.js";
+import { createProjectContextRuntimeDependencies } from "./app/ProjectContextRuntime.js";
 import {
   applyConfiguredPostgresMigrations,
   validateConfiguredPostgresMigrations,
@@ -233,23 +234,18 @@ program
     const configRef = { value: config };
 
     const tracker = createRuntimeTrackerClient(config);
-    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const runtimeDependencies = createProjectContextRuntimeDependencies(config, logger);
+    const { workspaceManager, runStore, lifecycleStore, writebackOutbox, operatorApprovalStore } = runtimeDependencies;
     const orchestratorConversationStore = new FileOrchestratorConversationStore(config.workspace.stateDir);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const mcpExposureDiagnosticsStore = new FileMcpExposureDiagnosticsStore(config.workspace.stateDir);
-    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const projectionPersistence = config.server.port === null ? null : await createRuntimeProjectionPersistence(config);
-    const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
-    const operatorApproval = new OperatorApprovalService({ config, store: operatorApprovalStore, runStore });
-    const writeback = createRuntimeWritebackProcessor(() => configRef.value, logger);
+    const operatorApproval = new OperatorApprovalService({ config: () => configRef.value, store: operatorApprovalStore, runStore });
+    const writeback = createRuntimeWritebackProcessor(() => configRef.value, logger, undefined, {
+      outboxStore: writebackOutbox,
+      lifecycleStore,
+    });
     const statusMutationToken = resolveStatusMutationToken(config);
     let statusServerBaseUrl: string | null = null;
-    const workspaceManager = new WorkspaceManager({
-      workspace: config.workspace,
-      hooks: config.hooks,
-      logger,
-      planningWorkspaceMode: config.issueBreakdown.workspaceMode,
-    });
     const harness = createAgentHarness(config, { runStore });
     const orchestrator = new Orchestrator({
       config,
@@ -270,6 +266,7 @@ program
     loader.watch((event) => {
       if (event.loaded) {
         configRef.value = event.loaded.serviceConfig;
+        runtimeDependencies.updateConfig(event.loaded.serviceConfig);
         orchestrator.updateConfig(event.loaded.serviceConfig, event.loaded.definition.promptTemplate);
         logger.info("workflow reloaded", { workflow_path: event.loaded.definition.workflowPath });
       } else if (event.error) {

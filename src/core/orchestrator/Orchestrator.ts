@@ -1978,7 +1978,6 @@ export class Orchestrator {
         entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
         const entryConfig = this.configForEntry(entry);
         const runtimeMetadata = runtimeMetadataForEntry(this.options.harness.id, entry, entryConfig, event);
-        await this.updateLifecycle(entry, { summaryPointers: { lastRunId: entry.runId } });
         await this.options.runStore?.startRun({
           runId: entry.runId,
           sessionId: event.sessionId,
@@ -2006,6 +2005,7 @@ export class Orchestrator {
           ...(context.workspace.repoPath === undefined ? {} : { repoPath: context.workspace.repoPath }),
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),
         });
+        await this.updateLifecycle(entry, { summaryPointers: { lastRunId: entry.runId } });
         if (entry.runPhase !== "issue_breakdown") {
           await this.discoverPullRequestForEntry(entry, context.workspace);
         }

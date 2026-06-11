@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StatusServer } from "../src/app/http.js";
+import { createProjectContextRuntimeDependencies } from "../src/app/ProjectContextRuntime.js";
 import { projectWebTranscript } from "../src/app/WebTranscriptProjection.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import {
@@ -20,7 +21,7 @@ import {
   type OperatorApprovalRecord,
 } from "../src/core/approval/OperatorApprovalService.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
-import { normalizeProjectContextId, projectContextResolutionFromIssue, type ProjectContextResolution } from "../src/core/config/ProjectContexts.js";
+import { projectContextResolutionFromIssue, type ProjectContextResolution } from "../src/core/config/ProjectContexts.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type {
@@ -2089,18 +2090,17 @@ describe("Orchestrator", () => {
     });
     const logger = new StructuredLogger(() => undefined);
     const harness = new RunActivityHarness([{ type: "completed" }]);
-    const workspaceManager = new RoutedWorkspaceManager(config, logger);
-    const lifecycleStore = new RoutedLifecycleStore(config);
-    const runStore = new RoutedRunStore(config);
+    const runtimeDependencies = createProjectContextRuntimeDependencies(config, logger);
+    const { workspaceManager, lifecycleStore, runStore } = runtimeDependencies;
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: workspaceManager as unknown as WorkspaceManager,
+      workspaceManager,
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
-      lifecycleStore: lifecycleStore as unknown as FileIssueLifecycleStore,
-      runStore: runStore as unknown as FileRunTranscriptStore,
+      lifecycleStore,
+      runStore,
     });
 
     await orchestrator.refreshNow();
@@ -2188,18 +2188,17 @@ describe("Orchestrator", () => {
     const tracker = trackerClientFixture({ candidates: [docsIssue], issues: [docsIssue] });
     const logger = new StructuredLogger(() => undefined);
     const harness = new HeldCompletionHarness();
-    const workspaceManager = new RoutedWorkspaceManager(config, logger);
-    const lifecycleStore = new RoutedLifecycleStore(config);
-    const runStore = new RoutedRunStore(config);
+    const runtimeDependencies = createProjectContextRuntimeDependencies(config, logger);
+    const { workspaceManager, lifecycleStore, runStore } = runtimeDependencies;
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: workspaceManager as unknown as WorkspaceManager,
+      workspaceManager,
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
-      lifecycleStore: lifecycleStore as unknown as FileIssueLifecycleStore,
-      runStore: runStore as unknown as FileRunTranscriptStore,
+      lifecycleStore,
+      runStore,
     });
 
     await orchestrator.refreshNow();
@@ -2250,13 +2249,12 @@ describe("Orchestrator", () => {
       { LINEAR_API_KEY: "linear-test-key" },
     );
 
-    workspaceManager.updateConfig(reloadedConfig);
-    lifecycleStore.updateConfig(reloadedConfig);
-    runStore.updateConfig(reloadedConfig);
+    runtimeDependencies.updateConfig(reloadedConfig);
     orchestrator.updateConfig(reloadedConfig, "Work on {{ issue.identifier }}");
     await orchestrator.refreshNow();
 
     expect(orchestrator.snapshot().counts.running).toBe(1);
+
     expect(harness.stoppedRunIds).toEqual([]);
     expect(orchestrator.snapshot().running[0]?.workspacePath?.startsWith(docsWorkspaceRoot)).toBe(true);
 
@@ -7539,289 +7537,6 @@ class HeldCompletionHarness implements AgentHarness {
   async stop(runId: string): Promise<void> {
     this.stoppedRunIds.push(runId);
     this.release();
-  }
-}
-
-function routedProjectContextId(config: ParsedServiceConfig, issue: unknown): string {
-  const resolution = projectContextResolutionFromIssue(issue);
-  return resolution ? normalizeProjectContextId(resolution.projectContextId) : config.projectContexts.defaultContextId;
-}
-
-class RoutedWorkspaceManager {
-  private config: ParsedServiceConfig;
-  private readonly currentManagersByProjectContextId = new Map<string, WorkspaceManager>();
-  private readonly managersByIssueKey = new Map<string, WorkspaceManager>();
-  private readonly managersByWorkspacePath = new Map<string, WorkspaceManager>();
-
-  constructor(config: ParsedServiceConfig, private readonly logger: StructuredLogger) {
-    this.config = config;
-    this.rebuildCurrentManagers(config);
-  }
-
-  updateConfig(config: ParsedServiceConfig): void {
-    this.config = config;
-    this.rebuildCurrentManagers(config);
-  }
-
-  private rebuildCurrentManagers(config: ParsedServiceConfig): void {
-    this.currentManagersByProjectContextId.clear();
-    for (const context of config.projectContexts.contexts) {
-      this.currentManagersByProjectContextId.set(
-        context.id,
-        new WorkspaceManager({ workspace: context.workspace, hooks: config.hooks, logger: this.logger }),
-      );
-    }
-  }
-
-  private currentManagerForProjectContextId(projectContextId: string): WorkspaceManager {
-    const manager = this.currentManagersByProjectContextId.get(projectContextId);
-    if (!manager) throw new Error(`No workspace manager configured for project context ${projectContextId}`);
-    return manager;
-  }
-
-  private rememberIssueManager(issue: Issue, manager: WorkspaceManager): void {
-    this.managersByIssueKey.set(issue.id, manager);
-    this.managersByIssueKey.set(issue.identifier, manager);
-  }
-
-  private managerForIssue(issue: Issue): WorkspaceManager {
-    return (
-      this.managersByIssueKey.get(issue.id) ??
-      this.managersByIssueKey.get(issue.identifier) ??
-      this.currentManagerForProjectContextId(routedProjectContextId(this.config, issue))
-    );
-  }
-
-  async createForIssue(issue: Issue) {
-    const manager = this.managerForIssue(issue);
-    this.rememberIssueManager(issue, manager);
-    const workspace = await manager.createForIssue(issue);
-    this.managersByWorkspacePath.set(workspace.path, manager);
-    return workspace;
-  }
-
-  async createForPlanning(issue: Issue) {
-    const manager = this.managerForIssue(issue);
-    this.rememberIssueManager(issue, manager);
-    const workspace = await manager.createForPlanning(issue);
-    this.managersByWorkspacePath.set(workspace.path, manager);
-    return workspace;
-  }
-
-  async beforeRun(workspacePath: string): Promise<void> {
-    const manager = this.managersByWorkspacePath.get(workspacePath);
-    if (manager) await manager.beforeRun(workspacePath);
-  }
-
-  async afterRun(workspacePath: string): Promise<void> {
-    const manager = this.managersByWorkspacePath.get(workspacePath);
-    if (manager) await manager.afterRun(workspacePath);
-  }
-
-  async removeForIssue(issue: Issue): Promise<void> {
-    await this.managerForIssue(issue).removeForIssue(issue);
-  }
-
-  async removeForPlanning(issue: Issue): Promise<void> {
-    await this.managerForIssue(issue).removeForPlanning(issue);
-  }
-}
-
-class RoutedLifecycleStore {
-  private config: ParsedServiceConfig;
-  private readonly currentStoresByProjectContextId = new Map<string, FileIssueLifecycleStore>();
-  private readonly storesByIssueKey = new Map<string, FileIssueLifecycleStore>();
-
-  constructor(config: ParsedServiceConfig) {
-    this.config = config;
-    this.rebuildCurrentStores(config);
-  }
-
-  updateConfig(config: ParsedServiceConfig): void {
-    this.config = config;
-    this.rebuildCurrentStores(config);
-  }
-
-  private rebuildCurrentStores(config: ParsedServiceConfig): void {
-    this.currentStoresByProjectContextId.clear();
-    for (const context of config.projectContexts.contexts) {
-      this.currentStoresByProjectContextId.set(context.id, new FileIssueLifecycleStore(context.workspace.stateDir));
-    }
-  }
-
-  private currentStoreForProjectContextId(projectContextId: string): FileIssueLifecycleStore {
-    const store = this.currentStoresByProjectContextId.get(projectContextId);
-    if (!store) throw new Error(`No lifecycle store configured for project context ${projectContextId}`);
-    return store;
-  }
-
-  private candidateStores(): FileIssueLifecycleStore[] {
-    return [...new Set([...this.currentStoresByProjectContextId.values(), ...this.storesByIssueKey.values()])];
-  }
-
-  private rememberIssueStore(issue: Pick<Issue, "id" | "identifier">, store: FileIssueLifecycleStore): void {
-    this.storesByIssueKey.set(issue.id, store);
-    this.storesByIssueKey.set(issue.identifier, store);
-  }
-
-  private storeForIssue(issue: Issue): FileIssueLifecycleStore {
-    return (
-      this.storesByIssueKey.get(issue.id) ??
-      this.storesByIssueKey.get(issue.identifier) ??
-      this.currentStoreForProjectContextId(routedProjectContextId(this.config, issue))
-    );
-  }
-
-  async get(issueIdOrIdentifier: string) {
-    const knownStore = this.storesByIssueKey.get(issueIdOrIdentifier);
-    if (knownStore) return knownStore.get(issueIdOrIdentifier);
-    for (const store of this.candidateStores()) {
-      const record = await store.get(issueIdOrIdentifier);
-      if (record) {
-        this.storesByIssueKey.set(issueIdOrIdentifier, store);
-        return record;
-      }
-    }
-    return null;
-  }
-
-  async updateIssue(issue: Issue, patch: IssueLifecyclePatch) {
-    const store = this.storeForIssue(issue);
-    this.rememberIssueStore(issue, store);
-    return store.updateIssue(issue, patch);
-  }
-
-  async list() {
-    return (await Promise.all(this.candidateStores().map((store) => store.list()))).flat();
-  }
-}
-
-class RoutedRunStore {
-  private config: ParsedServiceConfig;
-  private readonly currentStoresByProjectContextId = new Map<string, FileRunTranscriptStore>();
-  private readonly storesByIssueKey = new Map<string, FileRunTranscriptStore>();
-  private readonly storesByRunId = new Map<string, FileRunTranscriptStore>();
-
-  constructor(config: ParsedServiceConfig) {
-    this.config = config;
-    this.rebuildCurrentStores(config);
-  }
-
-  updateConfig(config: ParsedServiceConfig): void {
-    this.config = config;
-    this.rebuildCurrentStores(config);
-  }
-
-  private rebuildCurrentStores(config: ParsedServiceConfig): void {
-    this.currentStoresByProjectContextId.clear();
-    for (const context of config.projectContexts.contexts) {
-      this.currentStoresByProjectContextId.set(context.id, new FileRunTranscriptStore(context.workspace.stateDir));
-    }
-  }
-
-  private currentStoreForProjectContextId(projectContextId: string): FileRunTranscriptStore {
-    const store = this.currentStoresByProjectContextId.get(projectContextId);
-    if (!store) throw new Error(`No run store configured for project context ${projectContextId}`);
-    return store;
-  }
-
-  private candidateStores(): FileRunTranscriptStore[] {
-    return [...new Set([...this.currentStoresByProjectContextId.values(), ...this.storesByIssueKey.values(), ...this.storesByRunId.values()])];
-  }
-
-  private rememberIssueStore(issueId: string | null, issueIdentifier: string, store: FileRunTranscriptStore): void {
-    if (issueId) this.storesByIssueKey.set(issueId, store);
-    this.storesByIssueKey.set(issueIdentifier, store);
-  }
-
-  private rememberRunStore(runId: string, store: FileRunTranscriptStore): void {
-    this.storesByRunId.set(runId, store);
-  }
-
-  private storeForIssueRouting(issueId: string | null, issueIdentifier: string, projectContext: Parameters<FileRunTranscriptStore["startRun"]>[0]["projectContext"]) {
-    return (
-      (issueId ? this.storesByIssueKey.get(issueId) : undefined) ??
-      this.storesByIssueKey.get(issueIdentifier) ??
-      this.currentStoreForProjectContextId(
-        projectContext ? normalizeProjectContextId(projectContext.projectContextId) : this.config.projectContexts.defaultContextId,
-      )
-    );
-  }
-
-  private async storeForRun(runId: string): Promise<FileRunTranscriptStore | null> {
-    const knownStore = this.storesByRunId.get(runId);
-    if (knownStore) return knownStore;
-    for (const store of this.candidateStores()) {
-      const record = await store.getRun(runId);
-      if (record) {
-        this.rememberRunStore(runId, store);
-        this.rememberIssueStore(record.issueId, record.issueIdentifier, store);
-        return store;
-      }
-    }
-    return null;
-  }
-
-  async startRun(input: Parameters<FileRunTranscriptStore["startRun"]>[0]) {
-    const store = this.storeForIssueRouting(input.issueId, input.issueIdentifier, input.projectContext);
-    this.rememberRunStore(input.runId, store);
-    this.rememberIssueStore(input.issueId, input.issueIdentifier, store);
-    return store.startRun(input);
-  }
-
-  async appendEvent(input: Parameters<FileRunTranscriptStore["appendEvent"]>[0]) {
-    const store = await this.storeForRun(input.runId);
-    if (!store) return;
-    return store.appendEvent(input);
-  }
-
-  async updateRun(runId: string, patch: Parameters<FileRunTranscriptStore["updateRun"]>[1]) {
-    const store = await this.storeForRun(runId);
-    if (!store) return null;
-    return store.updateRun(runId, patch);
-  }
-
-  async getRun(runId: string) {
-    const store = await this.storeForRun(runId);
-    return store ? store.getRun(runId) : null;
-  }
-
-  async listRunsForIssue(issueIdOrIdentifier: string) {
-    const knownStore = this.storesByIssueKey.get(issueIdOrIdentifier);
-    if (knownStore) return knownStore.listRunsForIssue(issueIdOrIdentifier);
-    const results = await Promise.all(this.candidateStores().map((store) => store.listRunsForIssue(issueIdOrIdentifier)));
-    return results.flat();
-  }
-
-  async latestRunForIssue(issueIdOrIdentifier: string) {
-    const knownStore = this.storesByIssueKey.get(issueIdOrIdentifier);
-    if (knownStore) return knownStore.latestRunForIssue(issueIdOrIdentifier);
-
-    let latest = null;
-    let latestStore: FileRunTranscriptStore | null = null;
-    for (const store of this.candidateStores()) {
-      const candidate = await store.latestRunForIssue(issueIdOrIdentifier);
-      if (!candidate) continue;
-      if (!latest || candidate.startedAt > latest.startedAt) {
-        latest = candidate;
-        latestStore = store;
-      }
-    }
-    if (latest && latestStore) {
-      this.rememberIssueStore(latest.issueId, latest.issueIdentifier, latestStore);
-    }
-    return latest;
-  }
-
-  async readTranscript(runId: string, options?: Parameters<FileRunTranscriptStore["readTranscript"]>[1]) {
-    const store = await this.storeForRun(runId);
-    return store ? store.readTranscript(runId, options) : null;
-  }
-
-  async recordPullRequestEvent(input: Parameters<FileRunTranscriptStore["recordPullRequestEvent"]>[0]) {
-    const store = await this.storeForRun(input.runId);
-    if (!store) return;
-    return store.recordPullRequestEvent(input);
   }
 }
 

@@ -279,14 +279,18 @@ export class FileOperatorApprovalStore {
 export class OperatorApprovalService {
   constructor(
     private readonly options: {
-      config: ServiceConfig;
+      config: ServiceConfig | (() => ServiceConfig);
       store: FileOperatorApprovalStore;
       runStore: Pick<RunTranscriptStore, "appendEvent" | "getRun" | "updateRun">;
     },
   ) {}
 
+  private config(): ServiceConfig {
+    return typeof this.options.config === "function" ? this.options.config() : this.options.config;
+  }
+
   get rejectPolicy(): OperatorApprovalRejectPolicy {
-    return operatorApprovalConfig(this.options.config).rejectPolicy;
+    return operatorApprovalConfig(this.config()).rejectPolicy;
   }
 
   async requestPublicationApproval(input: OperatorApprovalRequestInput): Promise<OperatorApprovalRecord> {
@@ -315,7 +319,7 @@ export class OperatorApprovalService {
     const requestInput = { ...input, projectContext };
     const { record, created } = await this.options.store.requestOrGetPending(
       requestInput,
-      operatorApprovalConfig(this.options.config).timeoutMs,
+      operatorApprovalConfig(this.config()).timeoutMs,
     );
     if (record.status === "pending") {
       await this.recordPendingRun(record);
@@ -388,7 +392,7 @@ export class OperatorApprovalService {
   }
 
   isRequired(): boolean {
-    return this.options.config.github.publishPullRequests && operatorApprovalConfig(this.options.config).requiredForPublication;
+    return this.config().github.publishPullRequests && operatorApprovalConfig(this.config()).requiredForPublication;
   }
 
   private async waitForResolution(initial: OperatorApprovalRecord): Promise<OperatorApprovalRecord> {
@@ -421,7 +425,7 @@ export class OperatorApprovalService {
         continue;
       }
 
-      await sleep(operatorApprovalConfig(this.options.config).pollIntervalMs);
+      await sleep(operatorApprovalConfig(this.config()).pollIntervalMs);
       current = (await this.options.store.get(current.requestId)) ?? current;
     }
   }
@@ -527,7 +531,7 @@ export class OperatorApprovalService {
       source: "orchestrator",
       eventType: "approval_resolved",
       message: `Operator approval ${record.status}: ${record.action.branchName} -> ${record.action.baseBranch}`,
-      payload: approvalResolvedPayload(record, operatorApprovalConfig(this.options.config).rejectPolicy),
+      payload: approvalResolvedPayload(record, operatorApprovalConfig(this.config()).rejectPolicy),
     });
   }
 }
