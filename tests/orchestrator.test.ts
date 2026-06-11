@@ -4311,6 +4311,108 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("resumes approved docs-context publication through the orchestrator after the worker exits when tracker refresh throws", async () => {
+    const config = multiProjectPublicationApprovalConfig(root);
+    const candidate = trackerIssue({
+      id: "issue-docs-approved-throw",
+      identifier: "DOCS-APPROVED-THROW",
+      state: "Blocked",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/docs-site/DOCS-APPROVED-THROW",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    let currentState = "Blocked";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        throw new Error("default tracker cannot access docs issue");
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await startApprovalRun(runStore, candidate, "run-1", root);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/docs-site/pull/42",
+      number: 42,
+      headBranch: "symphony/docs-site/DOCS-APPROVED-THROW",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      completionReportPublisher: publisher,
+    });
+
+    await expect(orchestrator.resumeApprovedPublication(approvalRecordFor("approved", candidate, "run-1", root))).resolves.toBe(
+      true,
+    );
+
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      workspacePath: path.join(root, "workspace"),
+      branchName: "symphony/docs-site/DOCS-APPROVED-THROW",
+      evidenceCursor: "idem-1",
+    });
+    expect(writer.comments).toHaveLength(1);
+    expect(writer.comments[0]?.body).toContain("## Symphony Completion Report");
+    expect(writer.transitions).toHaveLength(1);
+    expect(writer.transitions[0]).toMatchObject({ toState: "In Review" });
+    expect(currentState).toBe("In Review");
+    expect(await outboxStore.list()).toEqual(expect.arrayContaining([expect.objectContaining({ projectContext: docsProjectContext })]));
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "review",
+      blockedReason: null,
+      projectContext: docsProjectContext,
+      completionReports: [
+        expect.objectContaining({
+          runId: "run-1",
+          idempotencyKey: "idem-1",
+          projectContext: docsProjectContext,
+          pullRequest: {
+            url: "https://github.com/acme/docs-site/pull/42",
+            number: 42,
+            headSha: "abc123",
+            branch: "symphony/docs-site/DOCS-APPROVED-THROW",
+          },
+        }),
+      ],
+    });
+    await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+      prUrl: "https://github.com/acme/docs-site/pull/42",
+      prNumber: 42,
+      prHeadSha: "abc123",
+      prBranch: "symphony/docs-site/DOCS-APPROVED-THROW",
+    });
+    await orchestrator.stop();
+  });
+
   it.each([
     ["stale", "run cancellation has been requested"],
     ["expired", "approval request expired"],
@@ -4376,6 +4478,192 @@ describe("Orchestrator", () => {
         phase: "blocked",
         blockedReason: `publication approval ${status}`,
       });
+    },
+  );
+
+  it.each([
+    ["fail", "cancel", "failed", OPERATOR_REJECTED_PUBLICATION_ERROR],
+    ["cancel", "fail", "cancelled", "Operator cancelled issue"],
+  ] as const)(
+    "uses the docs-context reject policy for rejected publication approvals after worker exit when tracker refresh throws (%s)",
+    async (docsRejectPolicy, defaultRejectPolicy, expectedStatus, expectedError) => {
+      const config = multiProjectPublicationApprovalConfig(root, {
+        topLevelGithub: {
+          publish_pull_requests: true,
+          operator_approval: {
+            required_for_publication: true,
+            reject_policy: defaultRejectPolicy,
+            poll_interval_ms: 5,
+          },
+        },
+        docsGithub: {
+          publish_pull_requests: true,
+          operator_approval: {
+            required_for_publication: true,
+            reject_policy: docsRejectPolicy,
+            poll_interval_ms: 5,
+          },
+        },
+      });
+      const candidate = trackerIssue({
+        id: `issue-docs-rejected-throw-${docsRejectPolicy}`,
+        identifier: `DOCS-REJECT-THROW-${docsRejectPolicy.toUpperCase()}`,
+        state: "Blocked",
+        labels: ["dogfood-ready"],
+        branchName: `symphony/docs-site/DOCS-REJECT-THROW-${docsRejectPolicy.toUpperCase()}`,
+        projectContextId: docsProjectContext.projectContextId,
+        projectContextLabel: docsProjectContext.projectContextLabel,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+      });
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          throw new Error("default tracker cannot access docs issue");
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const stateDir = config.workspace.stateDir;
+      const outboxStore = new FileWritebackOutboxStore(stateDir);
+      const writer = new StateChangingWriter(() => undefined);
+      const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+      const runStore = new FileRunTranscriptStore(stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+      await startApprovalRun(runStore, candidate, "run-1", root);
+      await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+      await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        harness: new FakeHarness(),
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+        runStore,
+        writeback,
+      });
+      const approval = approvalRecordFor("rejected", candidate, "run-1", root);
+
+      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+
+      expect(writer.comments).toHaveLength(1);
+      expect(writer.comments[0]?.body).toContain("Status: rejected");
+      expect(writer.transitions).toEqual([]);
+      expect(await outboxStore.list()).toEqual(expect.arrayContaining([expect.objectContaining({ projectContext: docsProjectContext })]));
+      await expect(waitForTerminalRunRecord(runStore, "run-1")).resolves.toMatchObject({
+        projectContext: docsProjectContext,
+        status: expectedStatus,
+        completedAt: expect.any(String),
+        error: expectedError,
+        pendingApprovalRequestId: null,
+      });
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: "publication approval rejected",
+        projectContext: docsProjectContext,
+      });
+      await orchestrator.stop();
+    },
+  );
+
+  it.each([
+    ["stale", "run cancellation has been requested", "Publication approval stale"],
+    ["expired", "approval request expired", "Publication approval expired"],
+    ["cancelled", null, "Publication approval cancelled"],
+  ] as const)(
+    "preserves docs-context terminal approval routing for %s after worker exit when tracker refresh throws",
+    async (status, staleReason, expectedError) => {
+      const config = multiProjectPublicationApprovalConfig(root, {
+        topLevelGithub: {
+          publish_pull_requests: true,
+          operator_approval: {
+            required_for_publication: true,
+            reject_policy: "cancel",
+            poll_interval_ms: 5,
+          },
+        },
+        docsGithub: {
+          publish_pull_requests: true,
+          operator_approval: {
+            required_for_publication: true,
+            reject_policy: "fail",
+            poll_interval_ms: 5,
+          },
+        },
+      });
+      const candidate = trackerIssue({
+        id: `issue-docs-terminal-throw-${status}`,
+        identifier: `DOCS-TERM-THROW-${status.toUpperCase()}`,
+        state: "Blocked",
+        labels: ["dogfood-ready"],
+        branchName: `symphony/docs-site/DOCS-TERM-THROW-${status.toUpperCase()}`,
+        projectContextId: docsProjectContext.projectContextId,
+        projectContextLabel: docsProjectContext.projectContextLabel,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+      });
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          throw new Error("default tracker cannot access docs issue");
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const stateDir = config.workspace.stateDir;
+      const outboxStore = new FileWritebackOutboxStore(stateDir);
+      const writer = new StateChangingWriter(() => undefined);
+      const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+      const runStore = new FileRunTranscriptStore(stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+      await startApprovalRun(runStore, candidate, "run-1", root);
+      await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+      await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        harness: new FakeHarness(),
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+        runStore,
+        writeback,
+      });
+      const approval = approvalRecordFor(status, candidate, "run-1", root, staleReason);
+
+      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+
+      expect(writer.comments).toHaveLength(1);
+      expect(writer.comments[0]?.body).toContain(`Status: ${status}`);
+      if (staleReason !== null) {
+        expect(writer.comments[0]?.body).toContain(`Reason: ${staleReason}`);
+      }
+      expect(writer.transitions).toEqual([]);
+      expect(await outboxStore.list()).toEqual(expect.arrayContaining([expect.objectContaining({ projectContext: docsProjectContext })]));
+      await expect(waitForTerminalRunRecord(runStore, "run-1")).resolves.toMatchObject({
+        projectContext: docsProjectContext,
+        status: "failed",
+        completedAt: expect.any(String),
+        error: expectedError,
+        pendingApprovalRequestId: null,
+      });
+      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+        phase: "blocked",
+        blockedReason: `publication approval ${status}`,
+        projectContext: docsProjectContext,
+      });
+      await orchestrator.stop();
     },
   );
 

@@ -34,7 +34,7 @@ import type { Issue } from "../src/core/types.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { issue, multiProjectWorkflowConfig, projectContextFixture, testConfig } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, projectContextFixture, testConfig, trackerIssue } from "./helpers.js";
 
 describe("approval status API", () => {
   let root: string;
@@ -1522,6 +1522,149 @@ describe("approval status API", () => {
     }
   });
 
+  it("approves persisted docs-context publication through a real orchestrator after the worker exits when tracker refresh throws", async () => {
+    configureMultiProjectApprovalConfig();
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.workspace.source.baseRef = "main";
+
+    const pullRequestUrl = "https://github.com/acme/docs-site/pull/42";
+    const evidenceCursor = "idem-docs-throw";
+    const candidate = trackerIssue({
+      id: "issue-1",
+      identifier: "TEST-1",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug ?? "DOCS",
+    });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        throw new Error("default tracker cannot access docs issue");
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: pullRequestUrl,
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor,
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      completionReportPublisher: publisher,
+      operatorApproval: service,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      writebackOutbox: outboxStore,
+      operatorApproval: service,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: {
+        activeStates: ["Todo", "In Progress"],
+        handoffStates: ["In Review"],
+        reviewStates: ["In Review"],
+        blockedStates: ["Blocked"],
+        terminalStates: ["Done"],
+      },
+      staleThresholdMs: 300_000,
+    });
+
+    const pending = await createPending(evidenceCursor, null, docsProjectContext);
+    const address = await server.start();
+    try {
+      const approve = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${pending.requestId}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const approveBody = (await approve.json()) as { request: { status: string }; replayed: boolean };
+
+      expect(approve.status).toBe(200);
+      expect(approveBody).toMatchObject({
+        request: { status: "approved" },
+        replayed: false,
+      });
+      await expect(store.get(pending.requestId)).resolves.toMatchObject({
+        status: "approved",
+        projectContext: docsProjectContext,
+      });
+      expect(publisher.inputs).toHaveLength(1);
+      expect(publisher.inputs[0]).toMatchObject({
+        evidenceCursor,
+        workspacePath: "/tmp/workspace",
+      });
+      expect(writer.comments.filter((comment) => comment.body.includes("## Symphony Completion Report"))).toHaveLength(1);
+      expect(writer.transitions.filter((transition) => transition.toState === "In Review")).toHaveLength(1);
+      expect(currentState).toBe("In Review");
+      expect(await outboxStore.list()).toEqual(expect.arrayContaining([expect.objectContaining({ projectContext: docsProjectContext })]));
+      await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+        phase: "review",
+        blockedReason: null,
+        projectContext: docsProjectContext,
+        completionReports: [
+          expect.objectContaining({
+            idempotencyKey: evidenceCursor,
+            projectContext: docsProjectContext,
+            pullRequest: {
+              url: pullRequestUrl,
+              number: 42,
+              headSha: "abc123",
+              branch: "symphony/TEST-1",
+            },
+          }),
+        ],
+      });
+      await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+        pendingApprovalRequestId: null,
+        prUrl: pullRequestUrl,
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+      });
+    } finally {
+      await server.stop();
+      await orchestrator.stop();
+    }
+  });
+
   it("records terminal recovery when pending requests expire during status API resolution after worker exit", async () => {
     const pending = await createPending("idem-expired", -1);
     await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
@@ -1842,6 +1985,7 @@ describe("approval status API", () => {
     await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
       phase: "blocked",
       blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      ...(projectContext === undefined ? {} : { projectContext }),
       lastCompletionReportId: `completion-report:issue-1:${evidenceCursor}`,
       completionReports: [
         {
@@ -1850,6 +1994,7 @@ describe("approval status API", () => {
           runId: "run-1",
           issueId: "issue-1",
           issueIdentifier: "TEST-1",
+          ...(projectContext === undefined ? {} : { projectContext }),
           summary: "Implemented the service contract.",
           validationEvidence: ["npm test -- approval-status-api"],
           acceptanceChecklist: [

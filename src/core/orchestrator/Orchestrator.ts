@@ -985,9 +985,8 @@ export class Orchestrator {
 
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
-    const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
-    const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
-    const projectContextId = request.projectContext?.projectContextId ?? projectContextResolutionFromIssue(issue)?.projectContextId;
+    const { issue } = await this.resolvePublicationApprovalIssue(request, this.config.writeback.dispatchState);
+    const projectContextId = projectContextResolutionFromIssue(issue)?.projectContextId;
     const publisher =
       this.options.completionReportPublisher ??
       createGitHubPullRequestClientForCapability(this.config, "github.publication", undefined, projectContextId);
@@ -1005,8 +1004,7 @@ export class Orchestrator {
 
   async recordPublicationApprovalTerminal(request: OperatorApprovalRecord): Promise<boolean> {
     if (!this.options.lifecycleStore) return false;
-    const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
-    const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
+    const { issue, lifecycle } = await this.resolvePublicationApprovalIssue(request, "Blocked");
     const result = await new CompletionReportService({
       config: this.config,
       lifecycleStore: this.options.lifecycleStore,
@@ -1015,10 +1013,41 @@ export class Orchestrator {
       ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
     }).recordPublicationApprovalTerminal({ approval: request, issue });
     if (result.length > 0) return true;
-    const lifecycle =
-      (await this.options.lifecycleStore.get(request.issueId)) ??
-      (request.issueIdentifier ? await this.options.lifecycleStore.get(request.issueIdentifier) : null);
     return lifecycle?.phase === "blocked" && lifecycle.blockedReason === `publication approval ${request.status}`;
+  }
+
+  private async resolvePublicationApprovalIssue(
+    request: OperatorApprovalRecord,
+    fallbackState: string,
+  ): Promise<{ issue: Issue; lifecycle: IssueLifecycleRecord | null }> {
+    const lifecycle =
+      (await this.options.lifecycleStore?.get(request.issueId)) ??
+      (request.issueIdentifier ? await this.options.lifecycleStore?.get(request.issueIdentifier) : null) ??
+      null;
+
+    let refreshedIssue: Issue | null = null;
+    try {
+      refreshedIssue = (await this.options.tracker.fetchIssueStatesByIds([request.issueId]))[0] ?? null;
+    } catch (error) {
+      this.options.logger.warn("publication approval issue refresh failed", {
+        issue_id: request.issueId,
+        issue_identifier: request.issueIdentifier,
+        approval_status: request.status,
+        error: errorMessage(error),
+      });
+    }
+
+    const fallbackIssue = lifecycle ? issueFromPendingPublicationLifecycle(lifecycle, fallbackState) : issueFromApprovalRequest(request);
+    const issue = refreshedIssue ?? fallbackIssue;
+    const projectContext =
+      (lifecycle ? pendingPublicationProjectContext(lifecycle, issue) : undefined) ??
+      request.projectContext ??
+      projectContextResolutionFromIssue(issue) ??
+      undefined;
+    return {
+      issue: withProjectContextIssueMetadata(issue, projectContext),
+      lifecycle,
+    };
   }
 
   async createContinuationSummary(
