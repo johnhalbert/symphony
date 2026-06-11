@@ -1195,20 +1195,19 @@ describe("FileRunTranscriptStore", () => {
 
     await expect(store.getRun("run-explicit")).resolves.toMatchObject({ projectContext: docsProjectContext });
     await expect(store.getWorkspace("docs-workspace")).resolves.toMatchObject({ projectContext: docsProjectContext });
-    await expect(store.getRun("run-legacy")).resolves.toMatchObject({
-      projectContext: legacyDefaultProjectContext,
-    });
-    await expect(store.getWorkspace("legacy-workspace")).resolves.toMatchObject({
-      projectContext: legacyDefaultProjectContext,
-    });
-    await expect(store.listRuns()).resolves.toEqual(
-      expect.arrayContaining([expect.objectContaining({ runId: "run-legacy", projectContext: legacyDefaultProjectContext })]),
-    );
-    await expect(store.listWorkspaces()).resolves.toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ workspaceKey: "legacy-workspace", projectContext: legacyDefaultProjectContext }),
-      ]),
-    );
+
+    const legacyRunRecord = await store.getRun("run-legacy");
+    expect(legacyRunRecord?.projectContext).toEqual(legacyDefaultProjectContext);
+
+    const legacyWorkspaceRecord = await store.getWorkspace("legacy-workspace");
+    expect(legacyWorkspaceRecord?.projectContext).toEqual(legacyDefaultProjectContext);
+
+    const listedLegacyRun = (await store.listRuns()).find((record) => record.runId === "run-legacy");
+    expect(listedLegacyRun?.projectContext).toEqual(legacyDefaultProjectContext);
+
+    const listedLegacyWorkspace = (await store.listWorkspaces()).find((record) => record.workspaceKey === "legacy-workspace");
+    expect(listedLegacyWorkspace?.projectContext).toEqual(legacyDefaultProjectContext);
+
     await expect(readFile(legacyRunPath, "utf8")).resolves.toBe(legacyRunBeforeRead);
     await expect(readFile(legacyWorkspacePath, "utf8")).resolves.toBe(legacyWorkspaceBeforeRead);
   });

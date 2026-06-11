@@ -704,10 +704,19 @@ function promptPreview(prompt: string): string {
   return oneLine.length <= 240 ? oneLine : `${oneLine.slice(0, 225)}...[truncated]`;
 }
 
+function legacyReadableProjectContext(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+): ProjectContextResolution {
+  // Legacy single-project run/workspace records can predate explicit project-context
+  // attribution. Read paths must synthesize the stable default legacy attribution
+  // without requiring the stored JSON to be rewritten first.
+  return normalizeProjectContextResolution(projectContext);
+}
+
 function normalizeWorkspaceRecord(record: WorkspaceRecord): WorkspaceRecord {
   return {
     ...record,
-    projectContext: normalizeProjectContextResolution(record.projectContext),
+    projectContext: legacyReadableProjectContext(record.projectContext),
   };
 }
 
@@ -724,7 +733,7 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
   const shouldBackfillCursorRuntime = harnessId === "cursor";
   return {
     ...record,
-    projectContext: normalizeProjectContextResolution(record.projectContext),
+    projectContext: legacyReadableProjectContext(record.projectContext),
     runPhase,
     runKind: record.runKind ?? runKindForPhase(runPhase),
     ...(harnessId === undefined ? {} : { harnessId }),
