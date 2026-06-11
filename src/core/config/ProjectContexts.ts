@@ -285,7 +285,7 @@ function sanitizePublicRepositoryValue(value: string | null | undefined): string
   const scpStyleMatch = REPOSITORY_SCP_STYLE_PATTERN.exec(normalized);
   if (scpStyleMatch) {
     const [, _username, host, repositoryPath] = scpStyleMatch;
-    return `${REDACTED}@${host}:${repositoryPath}`;
+    return `${REDACTED}@${host}:${repositoryPath}`.replace(/[?#].*$/, "");
   }
   if (!REPOSITORY_URL_PATTERN.test(normalized)) return normalized;
   return normalized.replace(URL_USERINFO_PATTERN, `$1${REDACTED}@`).replace(/[?#].*$/, "");

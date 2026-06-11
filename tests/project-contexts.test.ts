@@ -172,6 +172,18 @@ describe("project context normalization", () => {
         expected: "[redacted]@example.com:acme/docs-site.git",
         leakedSubstring: "user@example.com",
       },
+      {
+        name: "SCP-style remote with query token",
+        repository: "secret-user@example.com:acme/docs-site.git?access_token=secret",
+        expected: "[redacted]@example.com:acme/docs-site.git",
+        leakedSubstring: "access_token=secret",
+      },
+      {
+        name: "SCP-style remote with whitespace username and fragment token",
+        repository: "secret user@example.com:acme/docs-site.git#token=secret",
+        expected: "[redacted]@example.com:acme/docs-site.git",
+        leakedSubstring: "token=secret",
+      },
     ] as const;
 
     for (const repositoryCase of repositoryCases) {
@@ -292,6 +304,18 @@ describe("project context normalization", () => {
         repository: "secret@user@example.com:acme/symphony.git",
         expected: "[redacted]@example.com:acme/symphony.git",
         leakedSubstring: "user@example.com",
+      },
+      {
+        name: "SCP-style remote with query token",
+        repository: "secret-user@example.com:acme/symphony.git?access_token=secret",
+        expected: "[redacted]@example.com:acme/symphony.git",
+        leakedSubstring: "access_token=secret",
+      },
+      {
+        name: "SCP-style remote with whitespace username and fragment token",
+        repository: "secret user@example.com:acme/symphony.git#token=secret",
+        expected: "[redacted]@example.com:acme/symphony.git",
+        leakedSubstring: "token=secret",
       },
     ] as const;
 
