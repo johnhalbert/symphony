@@ -5,6 +5,11 @@ import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
 import YAML from "yaml";
 import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Config.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { PromptRenderer } from "../src/core/workflow/PromptRenderer.js";
 import { WorkflowLoader, parseWorkflowFile } from "../src/core/workflow/WorkflowLoader.js";
@@ -1471,6 +1476,38 @@ Work on {{ issue.identifier }}.
 });
 
 describe("project context workflow contracts", () => {
+  it("normalizes legacy single-project workflows without project_contexts into one default context", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        workspace: { root: "./workspaces" },
+        github: { owner: "acme", repo: "symphony", token: "$GITHUB_TOKEN" },
+        review_loop: { review_states: ["In Review"], max_review_rounds: 5 },
+        polling: { interval_ms: 60_000 },
+        agent: { max_concurrent_agents: 2, max_turns: 1 },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key", GITHUB_TOKEN: "github-test-token" },
+    );
+
+    expect(config.projectContexts.contexts).toHaveLength(1);
+    expect(config.projectContexts.defaultContextId).toBe(LEGACY_DEFAULT_PROJECT_CONTEXT_ID);
+    expect(config.projectContexts.defaultContext).toMatchObject({
+      id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      source: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+      tracker: { projectSlug: "TEST" },
+      github: { owner: "acme", repo: "symphony", token: "github-test-token" },
+      reviewLoop: { reviewStates: ["In Review"], maxReviewRounds: 5 },
+      agent: { maxConcurrentAgents: 2, maxTurns: 1 },
+    });
+    expect(config.projectContexts.defaultContext.publicMetadata).toMatchObject({
+      id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      label: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      linearProjectSlug: "TEST",
+    });
+  });
+
   it("normalizes project context ids into safe workflow identifiers", () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({

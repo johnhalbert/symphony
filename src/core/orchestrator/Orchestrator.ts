@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
   projectContextResolutionFromIssue,
   resolveProjectContextForIssue,
   type ProjectContextResolution,
@@ -1919,7 +1920,7 @@ export class Orchestrator {
           runKind: runKindForPhase(entry.runPhase),
           issueId: entry.issue.id,
           issueIdentifier: entry.issue.identifier,
-          projectContext: entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
+          projectContext: this.resolvedProjectContext(entry),
           attempt: context.attempt,
           turnNumber: context.turnNumber,
           prompt: context.prompt,
@@ -1945,7 +1946,7 @@ export class Orchestrator {
             planRunStartedComment(
               {
                 issue: entry.issue,
-                projectContext: entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
+                projectContext: this.resolvedProjectContext(entry),
                 runId: entry.runId,
                 sessionId: entry.sessionId,
                 workspacePath: entry.workspacePath,
@@ -2690,8 +2691,37 @@ export class Orchestrator {
     this.retryAttempts.delete(issueId);
   }
 
+  private resolvedProjectContext(entry: RunningEntry): ProjectContextResolution | undefined {
+    const resolvedFromLifecycleOrIssue = entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue);
+    const defaultContext = this.config.projectContexts.defaultContext;
+
+    if (resolvedFromLifecycleOrIssue) {
+      if (
+        defaultContext.source === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE &&
+        resolvedFromLifecycleOrIssue.projectContextId === defaultContext.id &&
+        resolvedFromLifecycleOrIssue.routingSource === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE &&
+        resolvedFromLifecycleOrIssue.linearProjectSlug === null
+      ) {
+        return {
+          ...resolvedFromLifecycleOrIssue,
+          linearProjectSlug: defaultContext.tracker.projectSlug,
+        };
+      }
+      return resolvedFromLifecycleOrIssue;
+    }
+
+    if (defaultContext.source !== LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE) return undefined;
+
+    return {
+      projectContextId: defaultContext.id,
+      projectContextLabel: defaultContext.label,
+      linearProjectSlug: defaultContext.tracker.projectSlug,
+      routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+    };
+  }
+
   private async resolveWorkerProjectContext(entry: RunningEntry): Promise<ProjectContextResolution | null> {
-    const persistedOrIssueResolution = entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? null;
+    const persistedOrIssueResolution = this.resolvedProjectContext(entry) ?? null;
     const usesConfiguredRouting =
       entry.runPhase === "implementation" && this.config.projectContexts.contexts.some((context) => context.source === "explicit");
     if (!usesConfiguredRouting) {
@@ -2727,7 +2757,7 @@ export class Orchestrator {
   ) {
     return {
       issue: entry.issue,
-      projectContext: entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
+      projectContext: this.resolvedProjectContext(entry),
       role: entry.role,
       runPhase: entry.runPhase,
       attempt,
@@ -3133,7 +3163,7 @@ export class Orchestrator {
     if (!store) return;
     entry.lifecycle = await store.updateIssue(entry.issue, {
       ...patch,
-      projectContext: patch.projectContext ?? entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue) ?? undefined,
+      projectContext: patch.projectContext ?? this.resolvedProjectContext(entry),
     });
     await appendLaneMemoTelemetry(this.options.runStore, entry.activeRunId, entry.lifecycle, "orchestrator_update");
   }

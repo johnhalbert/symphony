@@ -20,6 +20,11 @@ import {
   type OperatorApprovalRecord,
 } from "../src/core/approval/OperatorApprovalService.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type {
@@ -80,6 +85,13 @@ const docsProjectContext = {
   projectContextLabel: "Documentation Site",
   linearProjectSlug: "DOCS",
   routingSource: "candidate_poll",
+} as const;
+
+const legacyDefaultProjectContext = {
+  projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  linearProjectSlug: "TEST",
+  routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
 } as const;
 
 describe("Orchestrator", () => {
@@ -1996,6 +2008,130 @@ describe("Orchestrator", () => {
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
       incompleteTurnCount: 1,
       projectContext: docsProjectContext,
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("dispatches legacy single-project workflows as the synthesized default context", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["Human Review"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const stateDir = path.join(root, "state");
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 300_000);
+    const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(legacyDefaultProjectContext);
+    expect(currentState).toBe("In Progress");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.comments[0]?.dedupeKey).toBe("fake-issue-1-1:run-started");
+    await expect(runStore.getRun("fake-issue-1-1")).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      incompleteTurnCount: 1,
+      projectContext: legacyDefaultProjectContext,
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("rehydrates stale legacy-default lifecycle records on dispatch recovery", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["Human Review"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const stateDir = path.join(root, "state");
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 300_000);
+    const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await lifecycleStore.updateIssue(candidate, {
+      projectContext: {
+        ...legacyDefaultProjectContext,
+        linearProjectSlug: null,
+      },
+    });
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(legacyDefaultProjectContext);
+    expect(currentState).toBe("In Progress");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.comments[0]?.dedupeKey).toBe("fake-issue-1-1:run-started");
+    await expect(runStore.getRun("fake-issue-1-1")).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      incompleteTurnCount: 1,
+      projectContext: legacyDefaultProjectContext,
     });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
