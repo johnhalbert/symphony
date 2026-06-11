@@ -3,6 +3,7 @@ import path from "node:path";
 import chokidar, { type FSWatcher } from "chokidar";
 import YAML from "yaml";
 import { type RawWorkflowConfig, type ServiceConfig, parseServiceConfig } from "../config/Config.js";
+import { defaultProjectContextLabel, normalizeProjectContextId } from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 
 export interface WorkflowDefinition {
@@ -21,6 +22,18 @@ export interface WorkflowReloadEvent {
   error: SymphonyError | null;
 }
 
+export interface WorkflowReloadProjectContextDetails {
+  rawId: string;
+  projectContextId: string | null;
+  projectContextLabel: string;
+  enabled: boolean;
+}
+
+export interface WorkflowReloadErrorDetails {
+  contextPath: string;
+  projectContext: WorkflowReloadProjectContextDetails;
+}
+
 export class WorkflowLoader {
   readonly workflowPath: string;
   private lastGood: LoadedWorkflow | null = null;
@@ -31,12 +44,7 @@ export class WorkflowLoader {
   }
 
   async load(): Promise<LoadedWorkflow> {
-    const contents = await readWorkflowFile(this.workflowPath);
-    const definition = parseWorkflowFile(contents, this.workflowPath);
-    const serviceConfig = parseServiceConfig(definition.config, this.workflowPath, await loadWorkflowEnvironment(this.workflowPath));
-    const loaded = { definition, serviceConfig };
-    this.lastGood = loaded;
-    return loaded;
+    return this.loadInternal({ sanitizeReloadErrors: false });
   }
 
   getLastGood(): LoadedWorkflow | null {
@@ -47,7 +55,7 @@ export class WorkflowLoader {
     if (this.watcher) return;
     this.watcher = chokidar.watch(this.workflowPath, { ignoreInitial: true });
     this.watcher.on("change", () => {
-      void this.load()
+      void this.loadInternal({ sanitizeReloadErrors: true })
         .then((loaded) => onReload({ loaded, error: null }))
         .catch((error: unknown) =>
           onReload({
@@ -66,6 +74,21 @@ export class WorkflowLoader {
     const watcher = this.watcher;
     this.watcher = null;
     await watcher.close();
+  }
+
+  private async loadInternal(options: { sanitizeReloadErrors: boolean }): Promise<LoadedWorkflow> {
+    let definition: WorkflowDefinition | null = null;
+    try {
+      const contents = await readWorkflowFile(this.workflowPath);
+      definition = parseWorkflowFile(contents, this.workflowPath);
+      const serviceConfig = parseServiceConfig(definition.config, this.workflowPath, await loadWorkflowEnvironment(this.workflowPath));
+      const loaded = { definition, serviceConfig };
+      this.lastGood = loaded;
+      return loaded;
+    } catch (error) {
+      if (!options.sanitizeReloadErrors) throw error;
+      throw sanitizeWorkflowReloadError(error, definition?.config ?? null);
+    }
   }
 }
 
@@ -166,4 +189,65 @@ function parseDotEnvValue(value: string): string {
 
 function isMissingFileError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "ENOENT";
+}
+
+const PROJECT_CONTEXT_ERROR_PATH_PATTERN = /(project_contexts\[("(?:\\.|[^"])*")\])/;
+
+function sanitizeWorkflowReloadError(error: unknown, config: RawWorkflowConfig | null): SymphonyError {
+  const symphonyError =
+    error instanceof SymphonyError ? error : new SymphonyError("workflow_parse_error", errorMessage(error), error);
+  const details = config === null ? null : workflowReloadErrorDetails(config, symphonyError.message);
+  if (details === null) return symphonyError;
+  return new SymphonyError(symphonyError.code, symphonyError.message, details);
+}
+
+function workflowReloadErrorDetails(config: RawWorkflowConfig, message: string): WorkflowReloadErrorDetails | null {
+  const rawContexts = config.project_contexts;
+  if (!rawContexts || rawContexts.length === 0) return null;
+  const match = PROJECT_CONTEXT_ERROR_PATH_PATTERN.exec(message);
+  if (!match) return null;
+
+  const contextPath = match[1];
+  if (!contextPath) return null;
+  const rawId = parseWorkflowReloadContextRawId(match[2] ?? "");
+  const rawContext = rawContexts.find((context) => context.id === rawId);
+  const projectContextId = normalizeWorkflowReloadProjectContextId(rawContext?.id ?? rawId);
+  return {
+    contextPath,
+    projectContext: {
+      rawId,
+      projectContextId,
+      projectContextLabel: workflowReloadProjectContextLabel(rawContext?.label, rawContext?.id ?? rawId, projectContextId),
+      enabled: rawContext?.enabled ?? true,
+    },
+  };
+}
+
+function parseWorkflowReloadContextRawId(value: string): string {
+  try {
+    const parsed = JSON.parse(value);
+    return typeof parsed === "string" ? parsed : value;
+  } catch {
+    return value;
+  }
+}
+
+function normalizeWorkflowReloadProjectContextId(value: string): string | null {
+  try {
+    return normalizeProjectContextId(value);
+  } catch {
+    return null;
+  }
+}
+
+function workflowReloadProjectContextLabel(
+  value: string | undefined,
+  rawId: string,
+  projectContextId: string | null,
+): string {
+  const normalizedLabel = value?.trim();
+  if (normalizedLabel && normalizedLabel.length > 0) return normalizedLabel;
+  if (projectContextId) return defaultProjectContextLabel(projectContextId);
+  const normalizedRawId = rawId.trim();
+  return normalizedRawId.length > 0 ? normalizedRawId : rawId;
 }
