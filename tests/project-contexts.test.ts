@@ -209,6 +209,24 @@ describe("project context normalization", () => {
         leakedSubstring: "foo@bar",
       },
       {
+        name: "pathless single-label host-like query-before-at URL",
+        repository: "https://intranet?foo@bar",
+        expected: "https://intranet",
+        leakedSubstring: "foo@bar",
+      },
+      {
+        name: "pathless single-label host-like fragment-before-at URL",
+        repository: "https://intranet#foo@bar",
+        expected: "https://intranet",
+        leakedSubstring: "foo@bar",
+      },
+      {
+        name: "pathless single-label host-like query-before-at FTP URL",
+        repository: "ftp://gitlab?foo@bar",
+        expected: "ftp://gitlab",
+        leakedSubstring: "foo@bar",
+      },
+      {
         name: "query token URL",
         repository: "https://example.com/acme/docs-site.git?access_token=secret",
         expected: "https://example.com/acme/docs-site.git",
@@ -405,6 +423,24 @@ describe("project context normalization", () => {
         name: "pathless host-like query-before-at URL",
         repository: "https://example.com?foo@bar",
         expected: "https://example.com",
+        leakedSubstring: "foo@bar",
+      },
+      {
+        name: "pathless single-label host-like query-before-at URL",
+        repository: "https://intranet?foo@bar",
+        expected: "https://intranet",
+        leakedSubstring: "foo@bar",
+      },
+      {
+        name: "pathless single-label host-like fragment-before-at URL",
+        repository: "https://intranet#foo@bar",
+        expected: "https://intranet",
+        leakedSubstring: "foo@bar",
+      },
+      {
+        name: "pathless single-label host-like query-before-at FTP URL",
+        repository: "ftp://gitlab?foo@bar",
+        expected: "ftp://gitlab",
         leakedSubstring: "foo@bar",
       },
       {
