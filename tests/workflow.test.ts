@@ -1,7 +1,8 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { performance } from "node:perf_hooks";
+import { describe, expect, it, vi } from "vitest";
 import YAML from "yaml";
 import { parseDatabaseConfig, parseServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
@@ -1442,6 +1443,69 @@ describe("project context workflow contracts", () => {
       tracker: { projectSlug: "OPS" },
       workspace: { source: { repository: path.resolve("/repo", "../ops-portal") } },
     });
+  });
+
+  it("normalizes three configured project contexts within the performance budget without network calls", () => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      const rawConfig = multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "Docs Site",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../shared-platform",
+          }),
+          projectContextFixture({
+            id: "ops_portal",
+            label: "Ops Portal",
+            projectSlug: "OPS",
+            repository: "../shared-platform",
+          }),
+          projectContextFixture({
+            id: "Status Board",
+            label: "Status Board",
+            projectSlug: "STATUS",
+            repository: "../status-board",
+          }),
+        ],
+      });
+      const env = { LINEAR_API_KEY: "secret" };
+      const warmup = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+      expect(warmup.projectContexts.contexts.map((context) => context.id)).toEqual([
+        "docs-site",
+        "ops-portal",
+        "status-board",
+      ]);
+      expect(warmup.projectContexts.defaultContextId).toBe("docs-site");
+
+      const iterations = 200;
+      const startedAt = performance.now();
+      let lastConfig = warmup;
+      for (let index = 0; index < iterations; index += 1) {
+        lastConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+      }
+      const averageMs = (performance.now() - startedAt) / iterations;
+
+      expect(lastConfig.projectContexts.contexts).toHaveLength(3);
+      expect(lastConfig.projectContexts.byId.get("docs-site")).toMatchObject({
+        id: "docs-site",
+        tracker: { projectSlug: "DOCS" },
+      });
+      expect(lastConfig.projectContexts.byId.get("ops-portal")).toMatchObject({
+        id: "ops-portal",
+        tracker: { projectSlug: "OPS" },
+      });
+      expect(lastConfig.projectContexts.byId.get("status-board")).toMatchObject({
+        id: "status-board",
+        tracker: { projectSlug: "STATUS" },
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(averageMs).toBeLessThan(20);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("rejects duplicate project context ids after normalization", () => {
