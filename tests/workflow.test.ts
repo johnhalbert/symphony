@@ -2778,28 +2778,7 @@ describe("project context redaction", () => {
       },
     );
 
-    const metadata = config.projectContexts.contexts.map((context) => ({
-      id: context.id,
-      label: context.label,
-      enabled: context.enabled,
-      tracker: {
-        projectSlug: context.tracker.projectSlug,
-        apiKeyPresent: context.tracker.apiKey !== "",
-      },
-      workspace: {
-        source: {
-          kind: context.workspace.source.kind,
-          pathConfigured: context.workspace.source.path != null,
-          repositoryConfigured: context.workspace.source.repository != null,
-          refConfigured: context.workspace.source.ref != null,
-          baseRefConfigured: context.workspace.source.baseRef != null,
-          branchTemplateConfigured: context.workspace.source.branchTemplate != null,
-          cachePathConfigured: context.workspace.source.cachePath != null,
-          cleanup: context.workspace.source.cleanup,
-        },
-      },
-      github: { tokenPresent: context.github.token !== null },
-    }));
+    const metadata = config.projectContexts.contexts.map((context) => context.publicSummary);
     const serialized = JSON.stringify(metadata);
 
     expect(config.projectContexts.defaultContextId).toBe("symphony");
@@ -2825,11 +2804,20 @@ describe("project context redaction", () => {
           cleanup: "refuse_dirty",
         },
       },
+      publicMetadata: {
+        repository: "https://example.com/org/docs.git",
+      },
       github: { tokenPresent: true },
     });
-    expect(config.projectContexts.byId.get("docs")?.publicMetadata.repository).toBe("https://example.com/org/docs.git");
-    expect(config.projectContexts.byId.get("docs")?.publicMetadata.repository).not.toContain("repo-secret");
-    expect(config.projectContexts.byId.get("docs")?.publicMetadata.repository).not.toContain("x-access-token");
+    expect(config.projectContexts.byId.get("docs")?.publicSummary.publicMetadata).toEqual(
+      config.projectContexts.byId.get("docs")?.publicMetadata,
+    );
+    expect(config.projectContexts.byId.get("docs")?.publicSummary.publicMetadata.repository).toBe(
+      "https://example.com/org/docs.git",
+    );
+    expect(config.projectContexts.byId.get("docs")?.publicSummary.publicMetadata.repository).not.toContain("repo-secret");
+    expect(config.projectContexts.byId.get("docs")?.publicSummary.publicMetadata.repository).not.toContain("x-access-token");
+
     expect(serialized).not.toContain("linear-secret");
     expect(serialized).not.toContain("root-gh-secret");
     expect(serialized).not.toContain("docs-gh-secret");
