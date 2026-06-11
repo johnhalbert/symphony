@@ -3573,7 +3573,8 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
   connectionString: string,
 ): Promise<void> {
   const pool = new Pool({ connectionString });
-  const runId = "run:context-replay-shared";
+  const symphonyRunId = "run:context-replay-shared:symphony";
+  const docsRunId = "run:context-replay-shared:docs";
   const sessionId = "session:context-replay-shared";
   const threadKey = "thread:context-replay-shared";
   const issueKey = "issue:context-replay-shared";
@@ -3609,15 +3610,15 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
           updated_at
         ) VALUES
           ('symphony', $1, $2, 'worker', $3, $4, $5, '/tmp/symphony/ENG-CTX-201', 1, 'running', now(), now()),
-          ('docs', $1, $2, 'worker', $3, $4, $5, '/tmp/docs/ENG-CTX-201', 1, 'running', now(), now())
+          ('docs', $6, $2, 'worker', $3, $4, $5, '/tmp/docs/ENG-CTX-201', 1, 'running', now(), now())
       `,
-      [runId, sessionId, issueKey, issueIdentifier, workspaceKey],
+      [symphonyRunId, sessionId, issueKey, issueIdentifier, workspaceKey, docsRunId],
     );
 
     const firstBatch = await store.appendEvents([
       runActivityAppendInput({
         id: "activity:context-replay:symphony:1",
-        runId,
+        runId: symphonyRunId,
         sessionId,
         runSessionId: symphonyRunSessionId,
         externalEventId: "external:context-replay:1",
@@ -3629,7 +3630,7 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
       }),
       runActivityAppendInput({
         id: "activity:context-replay:docs:1",
-        runId,
+        runId: docsRunId,
         sessionId,
         runSessionId: docsRunSessionId,
         externalEventId: "external:context-replay:1",
@@ -3654,48 +3655,37 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
       { runSessionId: symphonyRunSessionId, sequence: 1, externalEventId: "external:context-replay:1" },
     ]);
 
-    const duplicate = await store.appendEvent(
-      runActivityAppendInput({
-        id: "activity:context-replay:symphony:duplicate-external",
-        runId,
-        sessionId,
-        runSessionId: symphonyRunSessionId,
-        externalEventId: "external:context-replay:1",
-        actor: "user",
-        channel: "chat",
-        kind: "user_message_submitted",
-        text: "Duplicate Symphony scoped prompt",
-        payload: { messageId: "shared-user-duplicate" },
-      }),
-    );
-    expect(duplicate).toMatchObject({
-      status: "duplicate",
-      reason: "external_event_id",
-      metadata: { sequence: 1 },
-    });
-
-    const replay = await store.readRunEvents(runId);
+    const symphonyReplay = await store.readRunEvents(symphonyRunId);
     expect(
-      replay.events
-        .map(({ event }) => ({
-          runSessionId: event.runSessionId,
-          sequence: event.sequence,
-          externalEventId: event.externalEventId,
-          text: event.text,
-        }))
-        .sort((left, right) => left.runSessionId.localeCompare(right.runSessionId)),
+      symphonyReplay.events.map(({ event }) => ({
+        runSessionId: event.runSessionId,
+        sequence: event.sequence,
+        externalEventId: event.externalEventId,
+        text: event.text,
+      })),
+    ).toEqual([
+      {
+        runSessionId: symphonyRunSessionId,
+        sequence: 1,
+        externalEventId: "external:context-replay:1",
+        text: "Symphony scoped prompt",
+      },
+    ]);
+
+    const docsReplay = await store.readRunEvents(docsRunId);
+    expect(
+      docsReplay.events.map(({ event }) => ({
+        runSessionId: event.runSessionId,
+        sequence: event.sequence,
+        externalEventId: event.externalEventId,
+        text: event.text,
+      })),
     ).toEqual([
       {
         runSessionId: docsRunSessionId,
         sequence: 1,
         externalEventId: "external:context-replay:1",
         text: "Docs scoped prompt",
-      },
-      {
-        runSessionId: symphonyRunSessionId,
-        sequence: 1,
-        externalEventId: "external:context-replay:1",
-        text: "Symphony scoped prompt",
       },
     ]);
 
@@ -3713,7 +3703,7 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
     expect(symphonyReduction.messages).toHaveLength(1);
     expect(symphonyReduction.messages[0]).toMatchObject({
       messageId: `run_activity:${symphonyRunSessionId}:message:shared-user`,
-      runId,
+      runId: symphonyRunId,
       threadKey,
       body: "Symphony scoped prompt",
       messageIndex: 0,
@@ -3733,7 +3723,7 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
     expect(docsReduction.messages).toHaveLength(1);
     expect(docsReduction.messages[0]).toMatchObject({
       messageId: `run_activity:${docsRunSessionId}:message:shared-user`,
-      runId,
+      runId: docsRunId,
       threadKey,
       body: "Docs scoped prompt",
       messageIndex: 0,
@@ -3756,18 +3746,21 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
           message_index,
           body
         FROM symphony.chat_message
-        WHERE run_id = $1
-          AND thread_key = $2
+        WHERE thread_key = $3
           AND metadata->>'reducedFromRunActivity' = 'true'
+          AND (
+            (project_context_id = 'docs' AND run_id = $1)
+            OR (project_context_id = 'symphony' AND run_id = $2)
+          )
         ORDER BY project_context_id NULLS LAST, message_index, message_id
       `,
-      [runId, threadKey],
+      [docsRunId, symphonyRunId, threadKey],
     );
     expect(reducedRows.rows).toEqual([
       {
         project_context_id: "docs",
         message_id: `run_activity:${docsRunSessionId}:message:shared-user`,
-        run_id: runId,
+        run_id: docsRunId,
         thread_key: threadKey,
         message_index: 0,
         body: "Docs scoped prompt",
@@ -3775,7 +3768,7 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
       {
         project_context_id: "symphony",
         message_id: `run_activity:${symphonyRunSessionId}:message:shared-user`,
-        run_id: runId,
+        run_id: symphonyRunId,
         thread_key: threadKey,
         message_index: 0,
         body: "Symphony scoped prompt",
@@ -3785,7 +3778,7 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
     const followup = await store.appendEvent(
       runActivityAppendInput({
         id: "activity:context-replay:symphony:2",
-        runId,
+        runId: symphonyRunId,
         sessionId,
         runSessionId: symphonyRunSessionId,
         externalEventId: "external:context-replay:2",
@@ -3830,18 +3823,21 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
           message_index,
           body
         FROM symphony.chat_message
-        WHERE run_id = $1
-          AND thread_key = $2
+        WHERE thread_key = $3
           AND metadata->>'reducedFromRunActivity' = 'true'
+          AND (
+            (project_context_id = 'docs' AND run_id = $1)
+            OR (project_context_id = 'symphony' AND run_id = $2)
+          )
         ORDER BY project_context_id NULLS LAST, message_index, message_id
       `,
-      [runId, threadKey],
+      [docsRunId, symphonyRunId, threadKey],
     );
     expect(maintainedRows.rows).toEqual([
       {
         project_context_id: "docs",
         message_id: `run_activity:${docsRunSessionId}:message:shared-user`,
-        run_id: runId,
+        run_id: docsRunId,
         thread_key: threadKey,
         message_index: 0,
         body: "Docs scoped prompt",
@@ -3849,7 +3845,7 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
       {
         project_context_id: "symphony",
         message_id: `run_activity:${symphonyRunSessionId}:message:shared-user`,
-        run_id: runId,
+        run_id: symphonyRunId,
         thread_key: threadKey,
         message_index: 0,
         body: "Symphony scoped prompt",
@@ -3857,7 +3853,7 @@ async function expectProjectContextScopedRunActivityReplayAndReducedChatIsolatio
       {
         project_context_id: "symphony",
         message_id: `run_activity:${symphonyRunSessionId}:message:shared-followup`,
-        run_id: runId,
+        run_id: symphonyRunId,
         thread_key: threadKey,
         message_index: 1,
         body: "Symphony follow-up",

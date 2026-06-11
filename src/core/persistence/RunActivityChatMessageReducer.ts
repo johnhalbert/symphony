@@ -145,6 +145,7 @@ interface RunActivityChatReducerPostgresRow extends QueryResultRow {
   created_at: string | Date;
   issue_key: string | null;
   issue_identifier: string | null;
+  project_context_id: string | null;
 }
 
 export class InMemoryRunActivityChatMessageReducer {
@@ -268,7 +269,8 @@ export async function reduceRunActivityChatMessagesWithPostgresClient(
         event.metadata,
         event.created_at,
         run.issue_key,
-        run.issue_identifier
+        run.issue_identifier,
+        run.project_context_id
       FROM symphony.run_activity_event event
       JOIN symphony.run_session run ON run.run_id = event.run_id
       WHERE event.run_session_id = $1
@@ -288,16 +290,29 @@ export async function reduceRunActivityChatMessagesWithPostgresClient(
   const messages = reduceRunActivityEventsToChatMessages(envelopes.map(storedEventFromEnvelope), resolvedContext);
   const threadKey = messages[0]?.threadKey ?? resolveThreadKey(normalizedRunSessionId, context.threadKey);
   const runId = messages[0]?.runId ?? firstRow?.run_id ?? null;
+  const projectContextId = normalizeOptionalString(firstRow?.project_context_id);
 
   let deletedCount = 0;
   let upsertedCount = 0;
   if (threadKey !== null && runId !== null) {
-    await moveExistingReducedChatRowsOutOfMessageIndexRange(client, runId, threadKey);
+    if (projectContextId === null) {
+      throw new SymphonyError(
+        "conflict",
+        `Run activity chat message reduction requires project context attribution for run session ${normalizedRunSessionId}`,
+      );
+    }
+    await moveExistingReducedChatRowsOutOfMessageIndexRange(client, projectContextId, runId, threadKey);
     for (const message of messages) {
-      await upsertChatMessage(client, message);
+      await upsertChatMessage(client, projectContextId, message);
       upsertedCount += 1;
     }
-    deletedCount = await deleteStaleReducedChatRows(client, runId, threadKey, messages.map((message) => message.messageId));
+    deletedCount = await deleteStaleReducedChatRows(
+      client,
+      projectContextId,
+      runId,
+      threadKey,
+      messages.map((message) => message.messageId),
+    );
   }
 
   const reducedEventIds = new Set(messages.flatMap((message) => sourceEventIdsFromMetadata(message.metadata)));
@@ -914,6 +929,7 @@ function sourceEventIdsFromMetadata(metadata: Record<string, unknown>): string[]
 
 async function moveExistingReducedChatRowsOutOfMessageIndexRange(
   client: PostgresQueryClient,
+  projectContextId: string,
   runId: string,
   threadKey: string,
 ): Promise<void> {
@@ -924,8 +940,9 @@ async function moveExistingReducedChatRowsOutOfMessageIndexRange(
           chat_message_id,
           (2147483647 - row_number() OVER (ORDER BY chat_message_id))::integer AS temporary_message_index
         FROM symphony.chat_message
-        WHERE run_id = $1
-          AND thread_key = $2
+        WHERE project_context_id = $1
+          AND run_id = $2
+          AND thread_key = $3
           AND metadata->>'reducedFromRunActivity' = 'true'
       )
       UPDATE symphony.chat_message message
@@ -933,14 +950,19 @@ async function moveExistingReducedChatRowsOutOfMessageIndexRange(
       FROM numbered
       WHERE message.chat_message_id = numbered.chat_message_id
     `,
-    [runId, threadKey],
+    [projectContextId, runId, threadKey],
   );
 }
 
-async function upsertChatMessage(client: PostgresQueryClient, message: ChatMessageRecord): Promise<void> {
+async function upsertChatMessage(
+  client: PostgresQueryClient,
+  projectContextId: string,
+  message: ChatMessageRecord,
+): Promise<void> {
   await client.query(
     `
       INSERT INTO symphony.chat_message (
+        project_context_id,
         message_id,
         thread_key,
         issue_key,
@@ -979,13 +1001,14 @@ async function upsertChatMessage(client: PostgresQueryClient, message: ChatMessa
         $14,
         $15,
         $16,
-        $17::jsonb,
-        $18,
-        $19::jsonb,
-        $20,
-        $21
+        $17,
+        $18::jsonb,
+        $19,
+        $20::jsonb,
+        $21,
+        $22
       )
-      ON CONFLICT (message_id) DO UPDATE SET
+      ON CONFLICT (project_context_id, message_id) DO UPDATE SET
         thread_key = EXCLUDED.thread_key,
         issue_key = EXCLUDED.issue_key,
         issue_identifier = EXCLUDED.issue_identifier,
@@ -1008,6 +1031,7 @@ async function upsertChatMessage(client: PostgresQueryClient, message: ChatMessa
         updated_at = GREATEST(symphony.chat_message.updated_at, EXCLUDED.updated_at)
     `,
     [
+      projectContextId,
       message.messageId,
       message.threadKey,
       message.issueKey,
@@ -1035,6 +1059,7 @@ async function upsertChatMessage(client: PostgresQueryClient, message: ChatMessa
 
 async function deleteStaleReducedChatRows(
   client: PostgresQueryClient,
+  projectContextId: string,
   runId: string,
   threadKey: string,
   messageIds: readonly string[],
@@ -1043,15 +1068,16 @@ async function deleteStaleReducedChatRows(
     `
       WITH deleted AS (
         DELETE FROM symphony.chat_message
-        WHERE run_id = $1
-          AND thread_key = $2
+        WHERE project_context_id = $1
+          AND run_id = $2
+          AND thread_key = $3
           AND metadata->>'reducedFromRunActivity' = 'true'
-          AND NOT (message_id = ANY($3::text[]))
+          AND NOT (message_id = ANY($4::text[]))
         RETURNING 1
       )
       SELECT count(*)::text AS deleted_count FROM deleted
     `,
-    [runId, threadKey, messageIds],
+    [projectContextId, runId, threadKey, messageIds],
   );
   return Number(rows.rows[0]?.deleted_count ?? 0);
 }

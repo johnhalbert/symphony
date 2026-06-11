@@ -417,7 +417,8 @@ describe("RunActivityChatMessageReducer", () => {
     expect(client.normalizedStatements.at(-1)).toBe("COMMIT");
     expect(client.normalizedStatements).not.toContain("ROLLBACK");
     expect(client.insertValues).toHaveLength(2);
-    expect(client.insertValues[0]?.slice(0, 13)).toEqual([
+    expect(client.insertValues[0]?.slice(0, 14)).toEqual([
+      "symphony",
       "run_activity:run-chat:session-chat:message:user-pg",
       "thread:pg",
       "issue:eng-198",
@@ -432,8 +433,9 @@ describe("RunActivityChatMessageReducer", () => {
       "Persist this request",
       20,
     ]);
-    expect(client.insertValues[1]?.[17]).toBe("77");
-    const metadata = JSON.parse(String(client.insertValues[1]?.[18]));
+    expect(client.normalizedStatements.some((statement) => statement.includes("ON CONFLICT (project_context_id, message_id) DO UPDATE SET"))).toBe(true);
+    expect(client.insertValues[1]?.[18]).toBe("77");
+    const metadata = JSON.parse(String(client.insertValues[1]?.[19]));
     expect(metadata).toMatchObject({
       reducedFromRunActivity: true,
       sourceEventIds: ["activity:pg:assistant"],
@@ -461,7 +463,8 @@ describe("RunActivityChatMessageReducer", () => {
     expect(client.normalizedStatements.at(-1)).toBe("COMMIT");
     expect(client.activityRows).toHaveLength(1);
     expect(client.chatInsertValues).toHaveLength(1);
-    expect(client.chatInsertValues[0]?.slice(0, 11)).toEqual([
+    expect(client.chatInsertValues[0]?.slice(0, 12)).toEqual([
+      "symphony",
       "run_activity:run-chat:session-chat:message:append-user",
       "run-chat:session-chat",
       "issue:eng-198",
@@ -474,6 +477,7 @@ describe("RunActivityChatMessageReducer", () => {
       "completed",
       "Append and reduce me",
     ]);
+    expect(client.normalizedStatements.some((statement) => statement.includes("ON CONFLICT (project_context_id, message_id) DO UPDATE SET"))).toBe(true);
     expect(
       client.normalizedStatements.findIndex((statement) => statement.startsWith("INSERT INTO symphony.run_activity_event")),
     ).toBeLessThan(client.normalizedStatements.findIndex((statement) => statement.startsWith("INSERT INTO symphony.chat_message")));
@@ -491,7 +495,8 @@ describe("RunActivityChatMessageReducer", () => {
     expect(result.accepted).toHaveLength(2);
     expect(client.activityRows).toHaveLength(2);
     expect(client.chatInsertValues).toHaveLength(1);
-    expect(client.chatInsertValues[0]?.slice(0, 16)).toEqual([
+    expect(client.chatInsertValues[0]?.slice(0, 17)).toEqual([
+      "symphony",
       "run_activity:run-chat:session-chat:tool_call:append-tool",
       "run-chat:session-chat",
       "issue:eng-198",
@@ -521,7 +526,7 @@ describe("RunActivityChatMessageReducer", () => {
     ]);
     expect(first.accepted).toHaveLength(2);
     expect(client.chatInsertValues).toHaveLength(1);
-    expect(client.chatInsertValues[0]?.slice(7, 16)).toEqual([
+    expect(client.chatInsertValues[0]?.slice(8, 17)).toEqual([
       "assistant",
       "assistant_response",
       "failed",
@@ -532,7 +537,7 @@ describe("RunActivityChatMessageReducer", () => {
       1,
       2,
     ]);
-    const metadata = JSON.parse(String(client.chatInsertValues[0]?.[18]));
+    const metadata = JSON.parse(String(client.chatInsertValues[0]?.[19]));
     expect(metadata).toMatchObject({ sourceEventIds: ["activity:append:assistant-delta", "activity:append:run-failed"], sourceEventSequences: [1, 2] });
 
     const duplicate = await store.appendEvent(
@@ -743,6 +748,7 @@ function postgresActivityRow(overrides: Record<string, unknown> = {}): QueryResu
     created_at: `2026-05-31T00:00:0${sequence}.000Z`,
     issue_key: "issue:eng-198",
     issue_identifier: "ENG-198",
+    project_context_id: "symphony",
     ...overrides,
   } satisfies QueryResultRow;
 }
