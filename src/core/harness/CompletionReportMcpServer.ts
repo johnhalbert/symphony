@@ -61,7 +61,13 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writebackProcessor =
       config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
-        ? createRuntimeWritebackProcessor(() => config, logger, undefined, { outboxStore: writebackOutbox, lifecycleStore })
+        ? createRuntimeWritebackProcessor(
+            () => config,
+            logger,
+            undefined,
+            { outboxStore: writebackOutbox, lifecycleStore },
+            { projectContext: loadedContext.projectContext },
+          )
         : undefined;
     const operatorApproval = new OperatorApprovalService({
       config,
@@ -72,7 +78,9 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const pullRequestPublisher =
       options.pullRequestPublisher ??
       (config.github.publishPullRequests && !approvalRequiredForPublication
-        ? createGitHubPullRequestClientForCapability(config, "github.publication")
+        ? createGitHubPullRequestClientForCapability(config, "github.publication", undefined, {
+            projectContext: loadedContext.projectContext,
+          })
         : undefined);
     const service = new CompletionReportService({
       config,

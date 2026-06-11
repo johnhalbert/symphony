@@ -71,6 +71,70 @@ describe("runtime dependency credential wiring", () => {
     expect(authorizations).toEqual(["linear-writeback-secret", "linear-writeback-secret"]);
   });
 
+  it("resolves runtime tracker, cursor, and status-mutation credentials by project context", async () => {
+    const env = {
+      LINEAR_TRACKER_TOKEN: "linear-tracker-secret",
+      LINEAR_WRITEBACK_TOKEN: "linear-writeback-secret",
+      WORKER_CURSOR_TOKEN: "worker-cursor-secret",
+      REVIEWER_CURSOR_TOKEN: "reviewer-cursor-secret",
+      OPEN_WORKSPACE_PROFILE_TOKEN: "open-workspace-secret",
+      SYMPHONY_LINEAR_TRACKER_TOKEN: "symphony-linear-tracker-secret",
+      DOCS_LINEAR_TRACKER_TOKEN: "docs-linear-tracker-secret",
+      SYMPHONY_CURSOR_TOKEN: "symphony-cursor-secret",
+      DOCS_CURSOR_TOKEN: "docs-cursor-secret",
+      SYMPHONY_OPEN_WORKSPACE_TOKEN: "symphony-open-workspace-secret",
+      DOCS_OPEN_WORKSPACE_TOKEN: "docs-open-workspace-secret",
+    };
+    const config = runtimeConfig({
+      projectContexts: [
+        {
+          id: "symphony",
+          tracker: { project_slug: "SYMPHONY" },
+          workspace: { source: { kind: "git", repository: "." } },
+          credential_profiles: {
+            profiles: {
+              "linear-tracker": { value: "$SYMPHONY_LINEAR_TRACKER_TOKEN" },
+              "worker-cursor": { value: "$SYMPHONY_CURSOR_TOKEN" },
+              "open-workspace": { value: "$SYMPHONY_OPEN_WORKSPACE_TOKEN" },
+            },
+          },
+        },
+        {
+          id: "docs",
+          tracker: { project_slug: "DOCS" },
+          workspace: { source: { kind: "git", repository: "../docs-site" } },
+          credential_profiles: {
+            profiles: {
+              "linear-tracker": { value: "$DOCS_LINEAR_TRACKER_TOKEN" },
+              "worker-cursor": { value: "$DOCS_CURSOR_TOKEN" },
+              "open-workspace": { value: "$DOCS_OPEN_WORKSPACE_TOKEN" },
+            },
+          },
+        },
+      ],
+      env,
+    });
+    const docsContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "test",
+    } as const;
+    const trackerAuthorizations: string[] = [];
+    await createRuntimeTrackerClient(
+      config,
+      async (_input, init) => {
+        trackerAuthorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+        return jsonResponse({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
+      },
+      { projectContext: docsContext, env },
+    ).fetchCandidateIssues();
+
+    expect(trackerAuthorizations).toEqual(["docs-linear-tracker-secret"]);
+    expect(resolveCursorRuntimeApiKey(config, "worker", { projectContext: docsContext, env })).toBe("docs-cursor-secret");
+    expect(resolveStatusMutationToken(config, { projectContext: docsContext, env })).toBe("docs-open-workspace-secret");
+  });
+
   it("rejects wrong-role-only service writeback assignments in runtime writeback construction", () => {
     const config = runtimeConfig({
       credentialProfiles: {
@@ -196,6 +260,7 @@ describe("runtime dependency credential wiring", () => {
 function runtimeConfig(
   overrides: {
     credentialProfiles?: Record<string, unknown>;
+    projectContexts?: Record<string, unknown>[];
     env?: NodeJS.ProcessEnv;
   } = {},
 ) {
@@ -205,6 +270,7 @@ function runtimeConfig(
       workspace: { root, state_dir: path.join(root, "state") },
       writeback: { enabled: true, mode: "live" },
       server: { open_workspace_token: "$LEGACY_OPEN_WORKSPACE_TOKEN" },
+      project_contexts: overrides.projectContexts,
       credential_profiles:
         overrides.credentialProfiles ?? {
           profiles: {

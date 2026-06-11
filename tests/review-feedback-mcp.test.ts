@@ -12,6 +12,13 @@ import {
 import { FileIssueLifecycleStore, type IssueCompletionReportRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import { issue } from "./helpers.js";
 
+const docsProjectContext = {
+  projectContextId: "docs",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
+
 let root: string;
 
 describe("review feedback MCP handoff", () => {
@@ -22,6 +29,8 @@ describe("review feedback MCP handoff", () => {
     vi.stubEnv("GITHUB_APP_INSTALLATION_ID", "");
     vi.stubEnv("GITHUB_APP_PRIVATE_KEY", "");
     vi.stubEnv("GITHUB_APP_PRIVATE_KEY_PATH", "");
+    vi.stubEnv("GLOBAL_GITHUB_FEEDBACK_TOKEN", "global-feedback-secret");
+    vi.stubEnv("DOCS_GITHUB_FEEDBACK_TOKEN", "docs-feedback-secret");
   });
 
   afterEach(async () => {
@@ -41,15 +50,18 @@ describe("review feedback MCP handoff", () => {
     expect(output).toContain("idempotencyKey");
   });
 
-  it("submits PR review feedback and returns durable structured URLs without exposing tokens", async () => {
+  it("submits PR review feedback with project-context GitHub credentials and returns durable structured URLs without exposing tokens", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "review-feedback-context.json");
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     await writeFile(workflowPath, workflow(stateDir), "utf8");
+    vi.stubEnv("GLOBAL_GITHUB_FEEDBACK_TOKEN", "global-feedback-secret");
+    vi.stubEnv("DOCS_GITHUB_FEEDBACK_TOKEN", "docs-feedback-secret");
     await seedLifecycle(lifecycleStore);
     await writeReviewFeedbackMcpContext(contextFile, {
       issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      projectContext: docsProjectContext,
       activeRunId: "review-run-1",
       role: "reviewer",
       token: null,
@@ -81,8 +93,8 @@ describe("review feedback MCP handoff", () => {
       { workflowPath, contextFile },
     );
 
-    expect(authorizations).toEqual(["Bearer github-secret"]);
-    expect(JSON.stringify(result)).not.toContain("github-secret");
+    expect(authorizations).toEqual(["Bearer docs-feedback-secret"]);
+    expect(JSON.stringify(result)).not.toContain("docs-feedback-secret");
     expect(result).toMatchObject({
       accepted: true,
       replayed: false,
@@ -144,7 +156,7 @@ describe("review feedback MCP handoff", () => {
       phase: "review",
     });
     vi.stubGlobal("fetch", async () =>
-      new Response(JSON.stringify({ message: "Cannot approve with github-secret" }), {
+      new Response(JSON.stringify({ message: "Cannot approve with global-feedback-secret" }), {
         status: 422,
         headers: { "content-type": "application/json" },
       }),
@@ -159,7 +171,7 @@ describe("review feedback MCP handoff", () => {
     } catch (error) {
       const message = String((error as Error).message);
       expect(message).toContain("[redacted]");
-      expect(message).not.toContain("github-secret");
+      expect(message).not.toContain("global-feedback-secret");
     }
   });
 });
@@ -258,6 +270,38 @@ review_loop:
 workspace:
   root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
   state_dir: "${slash(stateDir)}"
+credential_profiles:
+  profiles:
+    feedback:
+      value: $GLOBAL_GITHUB_FEEDBACK_TOKEN
+      capabilities:
+        - github.review_feedback_write
+  roles:
+    reviewer:
+      github.review_feedback_write: feedback
+project_contexts:
+  - id: symphony
+    tracker:
+      project_slug: TEST
+    workspace:
+      source:
+        kind: git
+        repository: .
+    credential_profiles:
+      profiles:
+        feedback:
+          value: $GLOBAL_GITHUB_FEEDBACK_TOKEN
+  - id: docs
+    tracker:
+      project_slug: DOCS
+    workspace:
+      source:
+        kind: git
+        repository: ../docs-site
+    credential_profiles:
+      profiles:
+        feedback:
+          value: $DOCS_GITHUB_FEEDBACK_TOKEN
 ---
 Work on {{ issue.identifier }}.
 `;

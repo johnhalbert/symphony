@@ -1,6 +1,6 @@
 import path from "node:path";
 import YAML from "yaml";
-import type { RawWorkflowConfig, ServiceConfig } from "../src/core/config/Config.js";
+import type { RawProjectContextConfig, RawWorkflowConfig, ServiceConfig } from "../src/core/config/Config.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { Issue } from "../src/core/types.js";
@@ -58,6 +58,7 @@ type TestReviewLoopConfig = NonNullable<RawWorkflowConfig["review_loop"]>;
 type TestIssueBreakdownConfig = NonNullable<RawWorkflowConfig["issue_breakdown"]>;
 type TestAgentConfig = NonNullable<RawWorkflowConfig["agent"]>;
 type TestCredentialProfilesConfig = NonNullable<RawWorkflowConfig["credential_profiles"]>;
+type TestProjectContextCredentialProfilesConfig = NonNullable<RawProjectContextConfig["credential_profiles"]>;
 
 export type TestProjectRoutingSource =
   | "candidate_poll"
@@ -77,7 +78,7 @@ export interface TestProjectContextFixture {
   review_loop?: TestReviewLoopConfig;
   issue_breakdown?: TestIssueBreakdownConfig;
   agent?: TestAgentConfig;
-  credential_profiles?: TestCredentialProfilesConfig;
+  credential_profiles?: TestProjectContextCredentialProfilesConfig;
 }
 
 export interface TestMultiProjectWorkflowConfig extends RawWorkflowConfig {
@@ -120,7 +121,7 @@ export interface ProjectContextFixtureOverrides {
   review_loop?: Partial<TestReviewLoopConfig>;
   issue_breakdown?: Partial<TestIssueBreakdownConfig>;
   agent?: Partial<TestAgentConfig>;
-  credential_profiles?: TestCredentialProfilesConfig;
+  credential_profiles?: TestProjectContextCredentialProfilesConfig;
 }
 
 export interface MultiProjectWorkflowConfigOverrides {

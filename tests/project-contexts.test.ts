@@ -943,6 +943,101 @@ describe("project context normalization", () => {
     });
   });
 
+  it("inherits omitted credential profile fields for partial project-context overrides", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          credential_profiles: {
+            profiles: {
+              publication: {
+                value: "$GLOBAL_GITHUB_PUBLICATION_TOKEN",
+                capabilities: ["github.publication", "github.merge"],
+              },
+            },
+            roles: {
+              service: {
+                "github.publication": "publication",
+                "github.merge": "publication",
+              },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$CONTEXT_GITHUB_PUBLICATION_TOKEN" },
+              },
+            },
+          }),
+          projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-test-key",
+        GLOBAL_GITHUB_PUBLICATION_TOKEN: "global-publication-secret",
+        CONTEXT_GITHUB_PUBLICATION_TOKEN: "context-publication-secret",
+      },
+    );
+
+    expect(config.projectContexts.defaultContext.credentialProfiles).toMatchObject({
+      profiles: {
+        publication: {
+          value: "$CONTEXT_GITHUB_PUBLICATION_TOKEN",
+          capabilities: ["github.publication", "github.merge"],
+        },
+      },
+      roles: {
+        service: {
+          "github.publication": "publication",
+          "github.merge": "publication",
+        },
+      },
+    });
+    expect(config.credentialProfiles.resolveForRole("service", "github.merge")).toMatchObject({
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+  });
+
+  it("fails closed when partial project-context overrides still leave required credential profile fields missing", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [
+            projectContextFixture({
+              id: "docs",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "../docs-site",
+              credential_profiles: {
+                profiles: {
+                  publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN" },
+                },
+                roles: {
+                  service: {
+                    "github.publication": "publication",
+                  },
+                },
+              },
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        {
+          LINEAR_API_KEY: "linear-test-key",
+          DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+        },
+      ),
+    ).toThrow(/credential_profiles\.profiles\.publication/);
+  });
+
   it("replaces inherited GitHub App profiles when project contexts override them with static-token shorthand", () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({

@@ -153,14 +153,15 @@ describe("completion report MCP handoff", () => {
     });
   });
 
-  it("uses service GitHub publication profile for default PR publication", async () => {
+  it("uses project-context GitHub publication profiles for default PR publication", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "context.json");
     const workspace = await initPublishRepo(root, { remote: true });
     await writeFile(path.join(workspace, "feature.txt"), "changed\n", "utf8");
-    await writeFile(workflowPath, workflowWithPublicationProfile(stateDir), "utf8");
-    vi.stubEnv("GITHUB_PUBLICATION_TOKEN", "publication-token");
+    await writeFile(workflowPath, workflowWithContextualPublicationProfile(stateDir), "utf8");
+    vi.stubEnv("GLOBAL_GITHUB_PUBLICATION_TOKEN", "global-publication-token");
+    vi.stubEnv("DOCS_GITHUB_PUBLICATION_TOKEN", "docs-publication-token");
     const runStore = new FileRunTranscriptStore(stateDir);
     await runStore.startRun({
       runId: "run-publication-profile",
@@ -180,6 +181,7 @@ describe("completion report MCP handoff", () => {
     });
     await writeCompletionReportMcpContext(contextFile, {
       issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      projectContext: docsProjectContext,
       activeRunId: "run-publication-profile",
       role: "worker",
       token: "handoff-token",
@@ -234,7 +236,7 @@ describe("completion report MCP handoff", () => {
         branch: "symphony/TEST-1",
       },
     });
-    expect(authorizations).toEqual(["Bearer publication-token", "Bearer publication-token"]);
+    expect(authorizations).toEqual(["Bearer docs-publication-token", "Bearer docs-publication-token"]);
   });
 
   it("exposes a documented stdio MCP tool and submits without caller-supplied run identity", async () => {
@@ -397,7 +399,7 @@ Work on {{ issue.identifier }}.
 `;
 }
 
-function workflowWithPublicationProfile(stateDir: string): string {
+function workflowWithContextualPublicationProfile(stateDir: string): string {
   return `---
 tracker:
   kind: linear
@@ -433,12 +435,35 @@ github:
 credential_profiles:
   profiles:
     publication:
-      value: $GITHUB_PUBLICATION_TOKEN
+      value: $GLOBAL_GITHUB_PUBLICATION_TOKEN
       capabilities:
         - github.publication
   roles:
     service:
       github.publication: publication
+project_contexts:
+  - id: symphony
+    tracker:
+      project_slug: TEST
+    workspace:
+      source:
+        kind: git
+        repository: .
+    credential_profiles:
+      profiles:
+        publication:
+          value: $GLOBAL_GITHUB_PUBLICATION_TOKEN
+  - id: docs
+    tracker:
+      project_slug: DOCS
+    workspace:
+      source:
+        kind: git
+        repository: ../docs-site
+    credential_profiles:
+      profiles:
+        publication:
+          value: $DOCS_GITHUB_PUBLICATION_TOKEN
 ---
 Work on {{ issue.identifier }}.
 `;

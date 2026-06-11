@@ -683,12 +683,20 @@ export class CursorHarness implements AgentHarness {
     const cliPath = currentSymphonyCliPath();
     await writeInitialHandoffMcpContexts(ctx);
     const mcpServers = symphonyRoleMcpServers(ctx, { cliPath });
-    const createOptions = cursorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
-      mcpServers,
-    });
-    const resumeOptions = cursorAgentBaseOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
-      mcpServers,
-    });
+    const createOptions = cursorAgentCreateOptions(
+      ctx,
+      resolveCursorRuntimeApiKey(ctx.config, ctx.role, { projectContext: ctx.projectContext }),
+      {
+        mcpServers,
+      },
+    );
+    const resumeOptions = cursorAgentBaseOptions(
+      ctx,
+      resolveCursorRuntimeApiKey(ctx.config, ctx.role, { projectContext: ctx.projectContext }),
+      {
+        mcpServers,
+      },
+    );
     const latestRun =
       options.allowResume && ctx.role === "worker" && cursorRunPhase(ctx) === "implementation"
         ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker", runPhase: "implementation" })
@@ -924,7 +932,9 @@ function safeJsonPreview(value: unknown): string {
 
 export function cursorAgentCreateOptions(
   ctx: AgentRunContext,
-  apiKey: string | null | undefined = resolveCursorRuntimeApiKey(ctx.config, ctx.role),
+  apiKey: string | null | undefined = resolveCursorRuntimeApiKey(ctx.config, ctx.role, {
+    projectContext: ctx.projectContext,
+  }),
   options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
 ): Parameters<typeof Agent.create>[0] {
   return {
