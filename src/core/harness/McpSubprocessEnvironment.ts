@@ -291,9 +291,10 @@ function addCommandCapabilitySlice(
   parentEnv: NodeJS.ProcessEnv,
   projectContextId?: string | null,
 ): void {
-  if (command === "completion-report-mcp" && config.github.publishPullRequests) {
+  const github = resolveProjectContextConfig(config, projectContextId).github;
+  if (command === "completion-report-mcp" && github.publishPullRequests) {
     addGitHubParseRefs(env, config, projectContextId);
-    if (!(config.github.operatorApproval?.requiredForPublication ?? false)) {
+    if (!(github.operatorApproval?.requiredForPublication ?? false)) {
       addGitHubCapabilityEnvironment(env, config, parentEnv, "service", "github.publication", projectContextId);
     }
   }

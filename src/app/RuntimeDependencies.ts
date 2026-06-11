@@ -30,18 +30,25 @@ export function createRuntimeWritebackProcessor(
   projectContextId?: string | null,
 ): WritebackProcessor | undefined {
   const getConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
-  const config = getConfig();
-  if (!config.writeback.enabled) return undefined;
+  const initialConfig = getConfig();
+  if (!initialConfig.writeback.enabled) return undefined;
   const resolveProjectContextId = (operationProjectContextId?: string | null) => operationProjectContextId ?? projectContextId;
-  const resolveTrackerWriter = (operationProjectContextId?: string | null) =>
-    createLinearTrackerClientForCapability(config, "linear.writeback", fetchImpl, resolveProjectContextId(operationProjectContextId));
+  const resolveTrackerWriter = (operationProjectContextId?: string | null) => {
+    const currentConfig = getConfig();
+    return createLinearTrackerClientForCapability(
+      currentConfig,
+      "linear.writeback",
+      fetchImpl,
+      resolveProjectContextId(operationProjectContextId),
+    );
+  };
   return new WritebackProcessor(
-    stores.outboxStore ?? new FileWritebackOutboxStore(config.workspace.stateDir),
+    stores.outboxStore ?? new FileWritebackOutboxStore(initialConfig.workspace.stateDir),
     resolveTrackerWriter(projectContextId),
     logger,
-    config.writeback.maxBackoffMs,
-    stores.lifecycleStore ?? new FileIssueLifecycleStore(config.workspace.stateDir),
-    config.writeback.mode === "dry_run",
+    initialConfig.writeback.maxBackoffMs,
+    stores.lifecycleStore ?? new FileIssueLifecycleStore(initialConfig.workspace.stateDir),
+    initialConfig.writeback.mode === "dry_run",
     {
       getConfig,
       resolveIssue: (issueId, operationProjectContextId) =>

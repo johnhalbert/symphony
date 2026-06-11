@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { ServiceConfig } from "./config/Config.js";
+import { resolveProjectContextConfig, type ServiceConfig } from "./config/Config.js";
 import { normalizeProjectContextResolution, projectContextResolutionFromIssue, type ProjectContextResolution } from "./config/ProjectContexts.js";
 import { SymphonyError } from "./errors.js";
 import type {
@@ -190,7 +190,7 @@ export class CompletionReportService {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
     }
     const pendingPublicationHandoff =
-      existing !== undefined && this.shouldPersistBeforePublicationApproval()
+      existing !== undefined && this.shouldPersistBeforePublicationApproval(this.githubConfigFor(context, existingLifecycle))
         ? pendingPublicationHandoffForRun(existingLifecycle, {
             runId: existing.runId,
             idempotencyKey: existing.idempotencyKey,
@@ -200,13 +200,14 @@ export class CompletionReportService {
       existing !== undefined && pendingPublicationHandoff?.pendingReport.id === existing.id;
 
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
+    const activeGithub = this.githubConfigFor(context, existingLifecycle);
     const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
     let lifecycle = existingLifecycle;
     if (!resumingPendingPublication) {
       this.validateIssueIsAcceptingReports(context, lifecyclePhase);
     }
 
-    if (this.shouldPersistBeforePublicationApproval()) {
+    if (this.shouldPersistBeforePublicationApproval(activeGithub)) {
       const enqueuedPendingOperations: WritebackOperation[] = [];
       if (resumingPendingPublication) {
         const pendingReport = pendingPublicationHandoff.pendingReport;
@@ -329,17 +330,11 @@ export class CompletionReportService {
   }
 
   async resumeApprovedPublication(input: PublicationApprovalResumeInput): Promise<CompletionReportResult | null> {
-    if (input.approval.status !== "approved") return null;
-    if (!this.options.config.github.publishPullRequests) return null;
-    if (!this.options.pullRequestPublisher) {
-      throw new SymphonyError("invalid_request", "PR publication is enabled but no GitHub publisher is configured");
-    }
-
     const lifecycle = await this.options.lifecycleStore.get(input.approval.issueId);
     const existing = lifecycle?.completionReports.find(
       (item) => item.runId === input.approval.runId && item.idempotencyKey === input.approval.evidenceCursor,
     );
-    if (!lifecycle || !existing) return null;
+    if (input.approval.status !== "approved" || !lifecycle || !existing) return null;
     if (isFinalizedCompletionReport(existing)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
     }
@@ -358,6 +353,7 @@ export class CompletionReportService {
     const report = completionReportInputFromRecord(existing);
     const context: CompletionReportActiveContext = {
       issue: input.issue,
+      projectContext: pendingReport.projectContext,
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -365,6 +361,10 @@ export class CompletionReportService {
       workspace: workspaceFromApproval(input.approval, lifecycle),
       phase: "blocked",
     };
+    if (!this.githubConfigFor(context, lifecycle).publishPullRequests) return null;
+    if (!this.options.pullRequestPublisher) {
+      throw new SymphonyError("invalid_request", "PR publication is enabled but no GitHub publisher is configured");
+    }
     const publicationInput = this.buildPublicationInput(report, context, lifecycle);
     const publication = await this.options.pullRequestPublisher.publishPullRequest(publicationInput);
     const result = await this.finalizeCompletionReport({
@@ -416,9 +416,6 @@ export class CompletionReportService {
   async recoverPendingPublicationApproval(
     input: PendingPublicationApprovalRecoveryInput,
   ): Promise<PendingPublicationApprovalRecoveryResult> {
-    if (!this.shouldPersistBeforePublicationApproval()) {
-      return { recovered: false, reason: "not_applicable" };
-    }
     const lifecycle =
       input.lifecycle ?? (await this.options.lifecycleStore.get(input.issue.id)) ?? (await this.options.lifecycleStore.get(input.issue.identifier));
     const handoff = pendingPublicationHandoffForRun(lifecycle);
@@ -454,6 +451,9 @@ export class CompletionReportService {
       run: run ?? null,
       config: this.options.config,
     });
+    if (!this.shouldPersistBeforePublicationApproval(this.githubConfigFor(context, handoffLifecycle))) {
+      return { recovered: false, reason: "not_applicable", report: pendingReport };
+    }
     const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
     const publicationInput = this.buildPublicationInput(report, context, handoffLifecycle);
     const existingApproval = await this.currentPublicationApproval(pendingReport, run.pendingApprovalRequestId ?? null);
@@ -636,8 +636,9 @@ export class CompletionReportService {
     context: CompletionReportActiveContext,
     existingLifecycle: ExistingIssueLifecycle,
   ): Promise<CompletionReportPullRequestPublication | null> {
-    if (!this.options.config.github.publishPullRequests) return null;
-    if (this.shouldPersistBeforePublicationApproval()) return null;
+    const github = this.githubConfigFor(context, existingLifecycle);
+    if (!github.publishPullRequests) return null;
+    if (this.shouldPersistBeforePublicationApproval(github)) return null;
     if (!this.options.pullRequestPublisher) {
       throw new SymphonyError("invalid_request", "PR publication is enabled but no GitHub publisher is configured");
     }
@@ -797,11 +798,19 @@ export class CompletionReportService {
     };
   }
 
-  private shouldPersistBeforePublicationApproval(): boolean {
+  private shouldPersistBeforePublicationApproval(github: ServiceConfig["github"]): boolean {
     return (
-      this.options.config.github.publishPullRequests &&
-      (this.options.config.github.operatorApproval?.requiredForPublication ?? false)
+      github.publishPullRequests &&
+      (github.operatorApproval?.requiredForPublication ?? false)
     );
+  }
+
+  private githubConfigFor(
+    context: CompletionReportActiveContext,
+    existingLifecycle: ExistingIssueLifecycle = null,
+  ): ServiceConfig["github"] {
+    const projectContext = resolveCompletionReportProjectContext(context, existingLifecycle);
+    return resolveProjectContextConfig(this.options.config, projectContext.projectContextId).github;
   }
 
   private async processAndVerifyPendingPublicationApprovalWritebacks(

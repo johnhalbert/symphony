@@ -703,18 +703,34 @@ function mergeCredentialProfileConfigs(
   if (!defaults) return context;
   if (!context) return defaults;
 
-  const profiles = {
-    ...(defaults.profiles ?? {}),
-    ...(context.profiles ?? {}),
-  };
+  const profiles = mergeCredentialProfileDefinitions(defaults.profiles, context.profiles);
   const roles = mergeCredentialProfileRoleAssignments(defaults.roles, context.roles);
 
   return {
     ...defaults,
     ...context,
-    ...(Object.keys(profiles).length === 0 ? {} : { profiles }),
+    ...(profiles === undefined ? {} : { profiles }),
     ...(roles === undefined ? {} : { roles }),
   };
+}
+
+function mergeCredentialProfileDefinitions(
+  defaults: RawCredentialProfilesConfig["profiles"] | undefined,
+  context: RawCredentialProfilesConfig["profiles"] | undefined,
+): RawCredentialProfilesConfig["profiles"] | undefined {
+  if (!defaults) return context;
+  if (!context) return defaults;
+
+  const mergedProfiles: NonNullable<RawCredentialProfilesConfig["profiles"]> = {
+    ...defaults,
+  };
+
+  for (const [name, contextProfile] of Object.entries(context)) {
+    const defaultProfile = defaults[name];
+    mergedProfiles[name] = defaultProfile ? { ...defaultProfile, ...contextProfile } : contextProfile;
+  }
+
+  return Object.keys(mergedProfiles).length === 0 ? undefined : mergedProfiles;
 }
 
 function mergeCredentialProfileRoleAssignments(

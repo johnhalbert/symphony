@@ -8,6 +8,7 @@ import {
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { ProjectContextResolution } from "../config/ProjectContexts.js";
+import { resolveProjectContextConfig } from "../config/Config.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -60,8 +61,10 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     const projectContextId = loadedContext.projectContext?.projectContextId;
+    const github = resolveProjectContextConfig(config, projectContextId).github;
+    const approvalRequiredForPublication = github.operatorApproval?.requiredForPublication ?? false;
     const writebackProcessor =
-      config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
+      config.writeback.enabled && approvalRequiredForPublication
         ? createRuntimeWritebackProcessor(
             () => config,
             logger,
@@ -75,10 +78,9 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       store: new FileOperatorApprovalStore(config.workspace.stateDir),
       runStore,
     });
-    const approvalRequiredForPublication = config.github.operatorApproval?.requiredForPublication ?? false;
     const pullRequestPublisher =
       options.pullRequestPublisher ??
-      (config.github.publishPullRequests && !approvalRequiredForPublication
+      (github.publishPullRequests && !approvalRequiredForPublication
         ? createGitHubPullRequestClientForCapability(config, "github.publication", undefined, projectContextId)
         : undefined);
     const service = new CompletionReportService({

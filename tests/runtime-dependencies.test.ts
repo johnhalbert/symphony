@@ -251,6 +251,45 @@ describe("runtime dependency credential wiring", () => {
 
     expect(authorizations).toEqual(["docs-writeback-secret", "docs-writeback-secret"]);
   });
+
+  it("refreshes project-context writeback writers from config getters before each operation", async () => {
+    let currentConfig = runtimeProjectContextConfig();
+    const authorizations: string[] = [];
+    const processor = createRuntimeWritebackProcessor(
+      () => currentConfig,
+      new StructuredLogger(() => undefined),
+      async (_input, init) => {
+        authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+        const body = JSON.parse(String(init?.body)) as { query?: string };
+        if (body.query?.includes("issueUpdate")) {
+          return jsonResponse({ data: { issueUpdate: { success: true } } });
+        }
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "issue-docs-2",
+              identifier: "DOCS-2",
+              state: { id: "state-ready", name: "Ready to Merge" },
+              team: { states: { nodes: [{ id: "state-done", name: "Done" }] } },
+              comments: { nodes: [] },
+            },
+          },
+        });
+      },
+    );
+
+    currentConfig = runtimeProjectContextConfig({ env: { DOCS_WRITEBACK_TOKEN: "docs-writeback-rotated-secret" } });
+
+    await processor?.enqueueAndProcess({
+      kind: "transition",
+      idempotencyKey: "transition:issue-docs-2:Done",
+      issueId: "issue-docs-2",
+      projectContext: docsProjectContext,
+      payload: { toState: "Done", fromStates: ["Ready to Merge"] },
+    });
+
+    expect(authorizations).toEqual(["docs-writeback-rotated-secret", "docs-writeback-rotated-secret"]);
+  });
 });
 
 const docsProjectContext = {
@@ -311,7 +350,7 @@ function runtimeConfig(
   );
 }
 
-function runtimeProjectContextConfig() {
+function runtimeProjectContextConfig(overrides: { env?: NodeJS.ProcessEnv } = {}) {
   return parseServiceConfig(
     multiProjectWorkflowConfig({
       topLevel: {
@@ -372,6 +411,7 @@ function runtimeProjectContextConfig() {
       DOCS_TRACKER_TOKEN: "docs-tracker-secret",
       DOCS_WRITEBACK_TOKEN: "docs-writeback-secret",
       DOCS_CURSOR_TOKEN: "docs-worker-cursor-secret",
+      ...overrides.env,
     },
   );
 }

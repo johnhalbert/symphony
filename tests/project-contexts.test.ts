@@ -267,4 +267,71 @@ describe("project context normalization", () => {
       profileName: "tracker",
     });
   });
+
+  it("inherits unspecified github_app profile fields from the default context when a project context overrides the same profile name", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          credential_profiles: {
+            profiles: {
+              publication: {
+                kind: "github_app",
+                app_id: "$DEFAULT_PUBLICATION_APP_ID",
+                client_id: "$DEFAULT_PUBLICATION_APP_CLIENT_ID",
+                installation_id: "$DEFAULT_PUBLICATION_APP_INSTALLATION_ID",
+                private_key_path: "$DEFAULT_PUBLICATION_APP_PRIVATE_KEY_PATH",
+                token_refresh_buffer_seconds: 123,
+                capabilities: ["github.publication"],
+              },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            credential_profiles: {
+              profiles: {
+                publication: {
+                  kind: "github_app",
+                  installation_id: "$DOCS_PUBLICATION_APP_INSTALLATION_ID",
+                  capabilities: ["github.publication"],
+                },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+              },
+            },
+          }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "legacy-linear-secret",
+        DEFAULT_PUBLICATION_APP_ID: "111",
+        DEFAULT_PUBLICATION_APP_CLIENT_ID: "Iv1.default-publication",
+        DEFAULT_PUBLICATION_APP_INSTALLATION_ID: "222",
+        DEFAULT_PUBLICATION_APP_PRIVATE_KEY_PATH: "/secrets/default-publication.pem",
+        DOCS_PUBLICATION_APP_INSTALLATION_ID: "333",
+      },
+    );
+
+    expect(config.credentialProfileRegistries.get("docs")?.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "github_app",
+      profileName: "publication",
+      app: {
+        appId: "111",
+        clientId: "Iv1.default-publication",
+        installationId: "333",
+        privateKeyPath: expect.stringContaining("default-publication.pem"),
+        tokenRefreshBufferSeconds: 123,
+      },
+    });
+  });
 });
