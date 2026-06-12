@@ -264,6 +264,9 @@ describe("IssueContractLint", () => {
     expect(description).toContain("git status --short -- hermes/upstream-src");
     expect(description).toContain("reviewLoop.lastCompletionReport.runId");
     expect(description).toContain("/api/v1/runs/<handoffWorkerRunId>/transcript?offset=<max(transcriptEventCount-15,0)>&limit=15");
+    expect(description).toContain("run.prompt");
+    expect(description).toContain("~/.hermes/logs/*.log");
+    expect(description).toContain("prompt, log, transcript, or documentation excerpt");
   });
 
   it("documents the ENG-371 promotion evidence packet and vendored-Hermes no-touch checks", () => {
@@ -282,13 +285,22 @@ describe("IssueContractLint", () => {
     expect(quickstart).toContain("reviewLoop.lastCompletionReport.acceptedAt");
     expect(quickstart).toContain("/api/v1/runs/<handoffWorkerRunId>");
     expect(quickstart).toContain("/api/v1/runs/<handoffWorkerRunId>/transcript?offset=<max(transcriptEventCount-15,0)>&limit=15");
+    expect(quickstart).toContain("RUN_ID='<handoffWorkerRunId>' python - <<'PY'");
+    expect(quickstart).toContain("run.prompt");
+    expect(quickstart).toContain("~/.hermes/logs/");
+    expect(quickstart).toContain("surfacesChecked");
+    expect(quickstart).toContain("findings");
+    expect(quickstart).toContain("prompt/log/transcript/doc sweep");
     expect(quickstart).toContain("completed");
     expect(quickstart).toContain("message_complete");
     expect(quickstart).toContain("lastEvidenceCursor");
     expect(quickstart).toContain("Do not cite `workspacePath` or `repoPath`");
     expect(quickstart).toContain("Do not paste credential values");
     expect(quickstart).toContain("credential-bearing repository URLs");
+    expect(quickstart).toContain("workflow, doctor, prompt, log, transcript, or documentation excerpt");
+    expect(quickstart).toContain("raw log lines");
     expect(quickstart).not.toContain("tool_call_completed");
+    expect(quickstart).not.toContain("operator-only private logs");
   });
 });
 

@@ -224,8 +224,8 @@ Document the redaction-promotion evidence packet so manual reviewers can verify 
 
 ## Acceptance Criteria
 
-- The evidence instructions identify the exact commands and public-safe fields reviewers should cite, including `reviewLoop.lastCompletionReport.runId` and a transcript tail window that reaches the accepted handoff on long runs while clamping to `0` on shorter runs.
-- The instructions tell reviewers to stop if credential values, private keys, or credential-bearing URLs appear.
+- The evidence instructions identify the exact commands and public-safe fields reviewers should cite, including `reviewLoop.lastCompletionReport.runId`, the transcript tail window, and the bounded prompt/log/transcript/doc sweep.
+- The instructions tell reviewers to stop if any prompt, log, transcript, or documentation excerpt pastes resolved secret values, credential values, private keys, or credential-bearing URLs.
 
 ## Contract Checklist
 
@@ -235,7 +235,7 @@ Document the redaction-promotion evidence packet so manual reviewers can verify 
 - Empty/missing/stale/fallback state: missing handoff metadata is called out explicitly.
 - Replay/restart/idempotency: rerunning the evidence commands produces the same safe field set.
 - Credential/security boundary: reviewers must never paste credential values into docs or comments.
-- Side-effect verification: reviewers confirm top-level issue handoff fields, run summary, transcript tail, and vendored-Hermes no-touch status directly.
+- Side-effect verification: reviewers confirm top-level issue handoff fields, run summary, transcript tail, the bounded prompt/log/transcript/doc sweep, and vendored-Hermes no-touch status directly.
 
 ## Validation Requirements
 
@@ -245,11 +245,12 @@ Document the redaction-promotion evidence packet so manual reviewers can verify 
 - GET /api/v1/issues/<issue-identifier> and read `reviewLoop.lastCompletionReport.runId`
 - GET /api/v1/runs/<handoffWorkerRunId>
 - GET /api/v1/runs/<handoffWorkerRunId>/transcript?offset=<max(transcriptEventCount-15,0)>&limit=15
+- bounded prompt/log/transcript/doc secret-output scan that checks `run.prompt`, `transcript.tail`, `~/.hermes/logs/*.log`, and the promotion docs while recording only surface labels and zero-findings output
 
 ## Out Of Scope
 
 - Editing vendored Hermes source.
-- Recording raw transcript payloads or credential material in docs.
+- Recording raw prompt bodies, raw log lines, transcript payloads, or credential material in docs.
 
 ## Promotion Readiness
 
