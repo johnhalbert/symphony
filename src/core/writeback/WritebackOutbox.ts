@@ -4,8 +4,6 @@ import path from "node:path";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { ServiceConfig } from "../config/Config.js";
 import {
-  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
-  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
   normalizeProjectContextResolution,
   type ProjectContextResolution,
 } from "../config/ProjectContexts.js";
@@ -137,12 +135,13 @@ export type IssueBreakdownIssueLookupResult =
   | { status: "transient_error"; message: string };
 
 export type IssueBreakdownFreshnessGuard = {
-  getConfig: () => ServiceConfig;
-  resolveIssue: (issueId: string) => Promise<IssueBreakdownIssueLookupResult>;
+  getConfig: (projectContext?: ProjectContextResolution) => ServiceConfig;
+  resolveIssue: (issueId: string, projectContext?: ProjectContextResolution) => Promise<IssueBreakdownIssueLookupResult>;
 };
 
 export type ProcessDueOptions = {
   idempotencyKeys?: readonly string[];
+  projectContext?: ProjectContextResolution | undefined;
 };
 
 export type EnqueueWritebackOptions = {
@@ -171,13 +170,10 @@ export class FileWritebackOutboxStore {
   }
 
   async enqueueOnce(operation: NewWritebackOperation): Promise<WritebackOperation> {
-    const existingRaw = await this.readStoredRecord(operation.idempotencyKey);
-    if (existingRaw) {
-      return this.backfillProjectContextOnReplay(
-        normalizeWritebackOperation(existingRaw as WritebackOperation),
-        operation,
-        existingRaw,
-      );
+    const existing = await this.readPreferredStoredRecord(operation.idempotencyKey, operation.projectContext);
+    if (existing) {
+      const replay = await this.backfillProjectContextOnReplay(existing.record, operation, existing.rawRecord);
+      if (replay) return replay;
     }
     const now = new Date().toISOString();
     const record = normalizeWritebackOperation({
@@ -197,9 +193,13 @@ export class FileWritebackOutboxStore {
     return record;
   }
 
-  async claimDue(now = new Date(), options: { idempotencyKeys?: readonly string[] } = {}): Promise<WritebackOperation[]> {
+  async claimDue(
+    now = new Date(),
+    options: { idempotencyKeys?: readonly string[]; projectContext?: ProjectContextResolution | undefined } = {},
+  ): Promise<WritebackOperation[]> {
     const records = await this.list();
     const allowed = options.idempotencyKeys === undefined ? null : new Set(options.idempotencyKeys);
+    const expectedProjectContext = options.projectContext;
     const due = records
       .filter((record) => ["pending", "retrying"].includes(record.status))
       .filter((record) => Date.parse(record.nextAttemptAt) <= now.getTime())
@@ -207,22 +207,24 @@ export class FileWritebackOutboxStore {
       .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
     const claimed: WritebackOperation[] = [];
     for (const record of due) {
-      if (this.claimLocks.has(record.idempotencyKey)) continue;
-      this.claimLocks.add(record.idempotencyKey);
+      const identityKey = writebackIdentityKey(record.idempotencyKey, record.projectContext);
+      if (this.claimLocks.has(identityKey)) continue;
+      this.claimLocks.add(identityKey);
       try {
-        let current = await this.get(record.idempotencyKey);
+        let current = await this.get(record.idempotencyKey, record.projectContext);
         if (!current) continue;
         if (!["pending", "retrying"].includes(current.status)) continue;
         if (Date.parse(current.nextAttemptAt) > now.getTime()) continue;
         if (allowed !== null && !allowed.has(current.idempotencyKey)) continue;
         current = await this.repairProjectContextIfMissing(current);
+        if (!matchesProjectContextScope(current.projectContext, expectedProjectContext)) continue;
         current.status = "in_flight";
         current.updatedAt = new Date().toISOString();
         await this.write(current);
         this.notifyProjectionChanged();
         claimed.push(current);
       } finally {
-        this.claimLocks.delete(record.idempotencyKey);
+        this.claimLocks.delete(identityKey);
       }
     }
     return claimed;
@@ -270,10 +272,10 @@ export class FileWritebackOutboxStore {
     return this.update(record, { status: "dead_letter", attempt: record.attempt + 1, lastError: error });
   }
 
-  async get(idempotencyKey: string): Promise<WritebackOperation | null> {
-    const stored = await this.readPreferredStoredRecord(idempotencyKey);
+  async get(idempotencyKey: string, projectContext?: ProjectContextResolution): Promise<WritebackOperation | null> {
+    const stored = await this.readPreferredStoredRecord(idempotencyKey, projectContext);
     if (stored === null) return null;
-    return this.repairProjectContextIfMissing(stored.record, undefined, stored.rawRecord);
+    return this.repairProjectContextIfMissing(stored.record, projectContext, stored.rawRecord);
   }
 
   async list(): Promise<WritebackOperation[]> {
@@ -284,11 +286,7 @@ export class FileWritebackOutboxStore {
       async (filePath): Promise<StoredWritebackRecord | null> => {
         const rawRecord = await readJsonIfExists<Record<string, unknown>>(filePath);
         if (rawRecord === null) return null;
-        return {
-          filePath,
-          rawRecord,
-          record: normalizeWritebackOperation(rawRecord as WritebackOperation),
-        };
+        return this.toStoredWritebackRecord(filePath, rawRecord);
       },
     );
     return Promise.all(
@@ -298,36 +296,78 @@ export class FileWritebackOutboxStore {
     );
   }
 
-  private async readStoredRecord(idempotencyKey: string): Promise<Record<string, unknown> | null> {
-    return (await this.readPreferredStoredRecord(idempotencyKey))?.rawRecord ?? null;
+  private async readStoredRecord(
+    idempotencyKey: string,
+    projectContext?: ProjectContextResolution,
+  ): Promise<Record<string, unknown> | null> {
+    return (await this.readPreferredStoredRecord(idempotencyKey, projectContext))?.rawRecord ?? null;
   }
 
-  private async readPreferredStoredRecord(idempotencyKey: string): Promise<StoredWritebackRecord | null> {
-    const records = await mapWithFileReadConcurrency(
-      this.recordCandidatePaths(idempotencyKey),
+  private async readPreferredStoredRecord(
+    idempotencyKey: string,
+    projectContext?: ProjectContextResolution,
+  ): Promise<StoredWritebackRecord | null> {
+    const directRecords = await mapWithFileReadConcurrency(
+      this.recordCandidatePaths(idempotencyKey, projectContext),
       async (filePath): Promise<StoredWritebackRecord | null> => {
         const rawRecord = await readJsonIfExists<Record<string, unknown>>(filePath);
-        if (rawRecord === null) return null;
-        return {
-          filePath,
-          rawRecord,
-          record: normalizeWritebackOperation(rawRecord as WritebackOperation),
-        };
+        if (rawRecord === null || !matchesReplayLookupScope(rawRecord, projectContext)) return null;
+        return this.toStoredWritebackRecord(filePath, rawRecord);
       },
     );
-    return dedupeStoredWritebackRecords(records.filter((record): record is StoredWritebackRecord => record !== null))[0] ?? null;
+    const directMatches = dedupeStoredWritebackRecords(
+      directRecords.filter((record): record is StoredWritebackRecord => record !== null),
+    );
+    if (directMatches.length > 0) return directMatches[0] ?? null;
+
+    const entries = await fs.readdir(this.recordsDir()).catch(() => [] as string[]);
+    const scannedRecords = await mapWithFileReadConcurrency(
+      entries.filter((entry) => entry.endsWith(".json")).map((entry) => path.join(this.recordsDir(), entry)),
+      async (filePath): Promise<StoredWritebackRecord | null> => {
+        const rawRecord = await readJsonIfExists<Record<string, unknown>>(filePath);
+        if (rawRecord === null || rawRecord.idempotencyKey !== idempotencyKey) return null;
+        return this.toStoredWritebackRecord(filePath, rawRecord);
+      },
+    );
+    const matches = dedupeStoredWritebackRecords(
+      scannedRecords.filter((record): record is StoredWritebackRecord => record !== null),
+    );
+    if (projectContext === undefined) {
+      return matches.length === 1 ? (matches[0] ?? null) : null;
+    }
+    const scopedMatches = matches.filter(
+      ({ record, rawRecord }) => needsProjectContextBackfill(rawRecord) || matchesProjectContextScope(record.projectContext, projectContext),
+    );
+    return scopedMatches.length === 1 ? (scopedMatches[0] ?? null) : null;
+  }
+
+  private async toStoredWritebackRecord(
+    filePath: string,
+    rawRecord: Record<string, unknown>,
+  ): Promise<StoredWritebackRecord> {
+    const record = normalizeWritebackOperation(rawRecord as WritebackOperation);
+    const dedupeProjectContext = needsProjectContextBackfill(rawRecord)
+      ? normalizeProjectContextResolution(await this.readRunProjectContext(record.runId))
+      : normalizeProjectContextResolution(record.projectContext);
+    return {
+      filePath,
+      rawRecord,
+      record,
+      dedupeProjectContext,
+    };
   }
 
   private async backfillProjectContextOnReplay(
     existing: WritebackOperation,
     operation: NewWritebackOperation,
     rawRecord: Record<string, unknown> | null | undefined = undefined,
-  ): Promise<WritebackOperation> {
-    const raw = rawRecord ?? (await this.readStoredRecord(existing.idempotencyKey));
-    if (needsProjectContextBackfill(raw) && shouldPromoteReplayProjectContext(existing.projectContext, operation.projectContext)) {
-      return this.update(existing, { projectContext: normalizeProjectContextResolution(operation.projectContext) });
+  ): Promise<WritebackOperation | null> {
+    const raw = rawRecord ?? (await this.readStoredRecord(existing.idempotencyKey, operation.projectContext ?? existing.projectContext));
+    if (needsProjectContextBackfill(raw) && matchesNewWritebackOperationIgnoringProjectContext(existing, operation)) {
+      return this.repairProjectContextIfMissing(existing, operation.projectContext, raw);
     }
-    return this.repairProjectContextIfMissing(existing, operation.projectContext, raw);
+    const repaired = await this.repairProjectContextIfMissing(existing, undefined, raw);
+    return matchesProjectContextScope(repaired.projectContext, operation.projectContext) ? repaired : null;
   }
 
   private async repairProjectContextIfMissing(
@@ -335,12 +375,12 @@ export class FileWritebackOutboxStore {
     projectContext: ProjectContextResolution | undefined = undefined,
     rawRecord: Record<string, unknown> | null | undefined = undefined,
   ): Promise<WritebackOperation> {
-    const raw = rawRecord ?? (await this.readStoredRecord(record.idempotencyKey));
+    const raw = rawRecord ?? (await this.readStoredRecord(record.idempotencyKey, projectContext ?? record.projectContext));
     if (!needsProjectContextBackfill(raw)) return record;
     const resolvedProjectContext = normalizeProjectContextResolution(projectContext ?? (await this.readRunProjectContext(record.runId)));
     let repaired = record;
-    await this.withWriteLock(record.idempotencyKey, async () => {
-      const latest = await this.readPreferredStoredRecord(record.idempotencyKey);
+    await this.withWriteLock(writebackIdentityKey(record.idempotencyKey, resolvedProjectContext), async () => {
+      const latest = await this.readPreferredStoredRecord(record.idempotencyKey, resolvedProjectContext);
       const currentRecord = latest?.record ?? record;
       const currentRaw = latest?.rawRecord ?? raw ?? null;
       if (!needsProjectContextBackfill(currentRaw)) {
@@ -376,52 +416,61 @@ export class FileWritebackOutboxStore {
     this.projectionNotifier.notify("writeback");
   }
 
-  private async withWriteLock(idempotencyKey: string, action: () => Promise<void>): Promise<void> {
-    const previous = this.writeLocks.get(idempotencyKey) ?? Promise.resolve();
+  private async withWriteLock(identityKey: string, action: () => Promise<void>): Promise<void> {
+    const previous = this.writeLocks.get(identityKey) ?? Promise.resolve();
     let current!: Promise<void>;
     current = (async () => {
       await previous.catch(() => undefined);
       try {
         await action();
       } finally {
-        if (this.writeLocks.get(idempotencyKey) === current) {
-          this.writeLocks.delete(idempotencyKey);
+        if (this.writeLocks.get(identityKey) === current) {
+          this.writeLocks.delete(identityKey);
         }
       }
     })();
-    this.writeLocks.set(idempotencyKey, current);
+    this.writeLocks.set(identityKey, current);
     await current;
   }
 
   private async write(record: WritebackOperation): Promise<void> {
-    await this.withWriteLock(record.idempotencyKey, () => this.writeUnlocked(record));
+    await this.withWriteLock(writebackIdentityKey(record.idempotencyKey, record.projectContext), () => this.writeUnlocked(record));
   }
 
   private async writeUnlocked(record: WritebackOperation): Promise<void> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
-    const target = this.recordPath(record.idempotencyKey);
+    const target = this.recordPath(record.idempotencyKey, record.projectContext);
     const temp = path.join(this.recordsDir(), `${path.basename(target)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
     await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
     if (process.platform === "win32") {
       await fs.rm(target, { force: true });
     }
     await fs.rename(temp, target);
-    const legacy = this.legacyRecordPath(record.idempotencyKey);
-    if (legacy !== target) await rmIfExists(legacy);
+    for (const legacy of [this.previousShortRecordPath(record.idempotencyKey), this.legacyRecordPath(record.idempotencyKey)]) {
+      if (legacy !== target) await rmIfExists(legacy);
+    }
   }
 
   private recordsDir(): string {
     return path.join(this.stateDir, "writeback");
   }
 
-  private recordPath(idempotencyKey: string): string {
-    return path.join(this.recordsDir(), shortRecordFileName(idempotencyKey));
+  private recordPath(idempotencyKey: string, projectContext?: ProjectContextResolution): string {
+    return path.join(this.recordsDir(), shortRecordFileName(idempotencyKey, projectContext));
   }
 
-  private recordCandidatePaths(idempotencyKey: string): string[] {
-    const currentPath = this.recordPath(idempotencyKey);
-    const legacyPath = this.legacyRecordPath(idempotencyKey);
-    return legacyPath === currentPath ? [currentPath] : [currentPath, legacyPath];
+  private recordCandidatePaths(idempotencyKey: string, projectContext?: ProjectContextResolution): string[] {
+    return Array.from(
+      new Set([
+        this.recordPath(idempotencyKey, projectContext),
+        this.previousShortRecordPath(idempotencyKey),
+        this.legacyRecordPath(idempotencyKey),
+      ]),
+    );
+  }
+
+  private previousShortRecordPath(idempotencyKey: string): string {
+    return path.join(this.recordsDir(), legacyShortRecordFileName(idempotencyKey));
   }
 
   private legacyRecordPath(idempotencyKey: string): string {
@@ -438,6 +487,7 @@ export class WritebackProcessor {
     private readonly lifecycleStore?: Pick<IssueLifecycleStore, "get">,
     private readonly dryRun = false,
     private readonly issueBreakdownFreshnessGuard?: IssueBreakdownFreshnessGuard,
+    private readonly writerResolver?: (projectContext?: ProjectContextResolution) => TrackerWriter,
   ) {}
 
   async enqueueAndProcess(operation: NewWritebackOperation, options: EnqueueWritebackOptions = {}): Promise<WritebackOperation> {
@@ -447,11 +497,14 @@ export class WritebackProcessor {
       record = await this.store.requeueSkipped(record);
     }
     await this.processDue();
-    return (await this.store.get(record.idempotencyKey)) ?? record;
+    return (await this.store.get(record.idempotencyKey, record.projectContext)) ?? record;
   }
 
   async processDue(options: ProcessDueOptions = {}): Promise<void> {
-    const claimOptions = options.idempotencyKeys === undefined ? {} : { idempotencyKeys: options.idempotencyKeys };
+    const claimOptions = {
+      ...(options.idempotencyKeys === undefined ? {} : { idempotencyKeys: options.idempotencyKeys }),
+      ...(options.projectContext === undefined ? {} : { projectContext: options.projectContext }),
+    };
     for (const record of await this.store.claimDue(new Date(), claimOptions)) {
       try {
         const guard = await this.verifyLifecycleBoundOperation(record);
@@ -509,8 +562,8 @@ export class WritebackProcessor {
       if (!this.issueBreakdownFreshnessGuard) {
         return { status: "blocked", message: "issue breakdown writeback requires freshness guard" };
       }
-      const config = this.issueBreakdownFreshnessGuard.getConfig();
-      const lookup = await this.issueBreakdownFreshnessGuard.resolveIssue(record.issueId);
+      const config = this.issueBreakdownFreshnessGuard.getConfig(record.projectContext);
+      const lookup = await this.issueBreakdownFreshnessGuard.resolveIssue(record.issueId, record.projectContext);
       if (lookup.status === "transient_error") {
         return { status: "retry", message: `issue breakdown freshness lookup failed: ${lookup.message}` };
       }
@@ -539,8 +592,9 @@ export class WritebackProcessor {
     if (this.dryRun) {
       return dryRunResult(record);
     }
+    const writer = this.writerResolver?.(record.projectContext) ?? this.writer;
     if (record.kind === "transition") {
-      return this.writer.transitionIssueState({
+      return writer.transitionIssueState({
         issueId: record.issueId,
         toState: record.payload.toState,
         ...(record.payload.fromStates === undefined ? {} : { fromStates: record.payload.fromStates }),
@@ -548,17 +602,17 @@ export class WritebackProcessor {
       });
     }
     if (record.kind === "comment") {
-      return this.writer.createIssueComment({
+      return writer.createIssueComment({
         issueId: record.issueId,
         body: record.payload.body,
         dedupeKey: record.payload.dedupeKey,
       });
     }
     if (record.kind === "issue_relation") {
-      if (!this.writer.createIssueRelation) {
+      if (!writer.createIssueRelation) {
         throw new Error("Tracker writer does not support issue_relation writeback operations");
       }
-      return this.writer.createIssueRelation({
+      return writer.createIssueRelation({
         sourceIssueId: record.payload.sourceIssueId,
         targetIssueId: record.payload.targetIssueId,
         type: record.payload.type,
@@ -567,10 +621,10 @@ export class WritebackProcessor {
         dependency: record.payload.dependency,
       });
     }
-    if (!this.writer.createIssueFromPlan) {
+    if (!writer.createIssueFromPlan) {
       throw new Error("Tracker writer does not support issue_create writeback operations");
     }
-    return this.writer.createIssueFromPlan({
+    return writer.createIssueFromPlan({
       parentIssueId: record.payload.parentIssueId,
       planId: record.payload.planId,
       proposedIssueIndex: record.payload.proposedIssueIndex,
@@ -654,11 +708,19 @@ function safeFileName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "record";
 }
 
-function shortRecordFileName(idempotencyKey: string): string {
+function shortRecordFileName(idempotencyKey: string, projectContext?: ProjectContextResolution): string {
+  return buildShortRecordFileName(idempotencyKey, writebackIdentityKey(idempotencyKey, projectContext));
+}
+
+function legacyShortRecordFileName(idempotencyKey: string): string {
+  return buildShortRecordFileName(idempotencyKey, idempotencyKey);
+}
+
+function buildShortRecordFileName(idempotencyKey: string, digestSource: string): string {
   const [rawKind, rawIssueId] = idempotencyKey.split(":");
   const kind = truncateFileSegment(safeFileName(rawKind ?? "record"), 16);
   const issueId = truncateFileSegment(safeFileName(rawIssueId ?? "unknown"), 48);
-  const digest = createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 20);
+  const digest = createHash("sha256").update(digestSource).digest("hex").slice(0, 20);
   return `wb_${kind}_${issueId}_${digest}.json`;
 }
 
@@ -678,31 +740,28 @@ function needsProjectContextBackfill(record: Record<string, unknown> | null): bo
   return record !== null && (!Object.prototype.hasOwnProperty.call(record, "projectContext") || record.projectContext === null);
 }
 
+function matchesReplayLookupScope(
+  record: Record<string, unknown> | null,
+  expectedProjectContext: ProjectContextResolution | undefined,
+): boolean {
+  return needsProjectContextBackfill(record) || matchesProjectContextScope(record?.projectContext as ProjectContextResolution | undefined, expectedProjectContext);
+}
+
 function projectContextEquals(
   left: ProjectContextResolution | undefined,
   right: ProjectContextResolution | undefined,
 ): boolean {
-  const normalizedLeft = normalizeProjectContextResolution(left);
-  const normalizedRight = normalizeProjectContextResolution(right);
-  return (
-    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
-    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
-    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
-    normalizedLeft.routingSource === normalizedRight.routingSource
-  );
+  return normalizeProjectContextResolution(left).projectContextId === normalizeProjectContextResolution(right).projectContextId;
 }
 
-function shouldPromoteReplayProjectContext(
-  existing: ProjectContextResolution | undefined,
-  incoming: ProjectContextResolution | undefined,
+function matchesProjectContextScope(
+  recordProjectContext: ProjectContextResolution | undefined,
+  expectedProjectContext: ProjectContextResolution | undefined,
 ): boolean {
-  if (incoming === undefined || projectContextEquals(existing, incoming)) return false;
-  const normalizedExisting = normalizeProjectContextResolution(existing);
-  const normalizedIncoming = normalizeProjectContextResolution(incoming);
+  if (!expectedProjectContext) return true;
   return (
-    normalizedExisting.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
-    && normalizedExisting.routingSource === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE
-    && normalizedIncoming.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+    normalizeProjectContextResolution(recordProjectContext).projectContextId ===
+    normalizeProjectContextResolution(expectedProjectContext).projectContextId
   );
 }
 
@@ -710,14 +769,16 @@ type StoredWritebackRecord = {
   filePath: string;
   rawRecord: Record<string, unknown>;
   record: WritebackOperation;
+  dedupeProjectContext: ProjectContextResolution;
 };
 
 function dedupeStoredWritebackRecords(records: StoredWritebackRecord[]): StoredWritebackRecord[] {
   const byKey = new Map<string, StoredWritebackRecord>();
   for (const record of records) {
-    const existing = byKey.get(record.record.idempotencyKey);
+    const key = writebackIdentityKey(record.record.idempotencyKey, record.dedupeProjectContext);
+    const existing = byKey.get(key);
     if (!existing || compareStoredWritebackRecords(record, existing) >= 0) {
-      byKey.set(record.record.idempotencyKey, record);
+      byKey.set(key, record);
     }
   }
   return Array.from(byKey.values());
@@ -726,14 +787,33 @@ function dedupeStoredWritebackRecords(records: StoredWritebackRecord[]): StoredW
 function compareStoredWritebackRecords(left: StoredWritebackRecord, right: StoredWritebackRecord): number {
   const updatedAtDelta = Date.parse(left.record.updatedAt) - Date.parse(right.record.updatedAt);
   if (updatedAtDelta !== 0) return updatedAtDelta;
-  const leftCanonical = isCanonicalRecordPath(left.filePath, left.record.idempotencyKey);
-  const rightCanonical = isCanonicalRecordPath(right.filePath, right.record.idempotencyKey);
-  if (leftCanonical === rightCanonical) return 0;
-  return leftCanonical ? 1 : -1;
+  const pathRankDelta = storedRecordPathRank(left) - storedRecordPathRank(right);
+  if (pathRankDelta !== 0) return pathRankDelta;
+  return 0;
 }
 
-function isCanonicalRecordPath(filePath: string, idempotencyKey: string): boolean {
-  return path.basename(filePath) === shortRecordFileName(idempotencyKey);
+function storedRecordPathRank(record: StoredWritebackRecord): number {
+  const fileName = path.basename(record.filePath);
+  if (fileName === shortRecordFileName(record.record.idempotencyKey, record.dedupeProjectContext)) return 2;
+  if (fileName === legacyShortRecordFileName(record.record.idempotencyKey)) return 1;
+  if (fileName === `${safeFileName(record.record.idempotencyKey)}.json`) return 0;
+  return -1;
+}
+
+function dedupeWritebackRecords(records: WritebackOperation[]): WritebackOperation[] {
+  const byKey = new Map<string, WritebackOperation>();
+  for (const record of records) {
+    const key = writebackIdentityKey(record.idempotencyKey, record.projectContext);
+    const existing = byKey.get(key);
+    if (!existing || Date.parse(record.updatedAt) >= Date.parse(existing.updatedAt)) {
+      byKey.set(key, record);
+    }
+  }
+  return Array.from(byKey.values());
+}
+
+function writebackIdentityKey(idempotencyKey: string, projectContext?: ProjectContextResolution): string {
+  return `${normalizeProjectContextResolution(projectContext).projectContextId}\u0000${idempotencyKey}`;
 }
 
 function matchesNewWritebackOperation(record: WritebackOperation, operation: NewWritebackOperation): boolean {
@@ -763,6 +843,20 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
     return JSON.stringify(record.payload) === JSON.stringify(operation.payload);
   }
   return false;
+}
+
+function matchesNewWritebackOperationIgnoringProjectContext(
+  record: WritebackOperation,
+  operation: NewWritebackOperation,
+): boolean {
+  if (!record.runId || !operation.runId) return false;
+  return matchesNewWritebackOperation(
+    {
+      ...record,
+      projectContext: normalizeProjectContextResolution(operation.projectContext),
+    } as WritebackOperation,
+    operation,
+  );
 }
 
 function stringArraysEqual(left: string[] | undefined, right: string[] | undefined): boolean {
