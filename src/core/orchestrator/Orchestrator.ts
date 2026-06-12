@@ -130,6 +130,7 @@ import type {
 export interface OrchestratorOptions {
   config: ServiceConfig;
   tracker: TrackerClient;
+  trackerResolver?: (projectContext?: ProjectContextResolution) => TrackerClient;
   workspaceManager: WorkspaceManager;
   harness: AgentHarness;
   logger: Logger;
@@ -936,7 +937,10 @@ export class Orchestrator {
     if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
   }
 
-  async requestIssueBreakdown(issueIdOrIdentifier: string): Promise<{ queued: boolean; issue: Issue; reason: string }> {
+  async requestIssueBreakdown(
+    issueIdOrIdentifier: string,
+    options: { projectContext?: ProjectContextResolution } = {},
+  ): Promise<{ queued: boolean; issue: Issue; reason: string }> {
     const gate = await this.activeProviderDispatchGate();
     if (gate) {
       throw new SymphonyError("conflict", providerGateDispatchBlockedMessage(gate));
@@ -950,8 +954,9 @@ export class Orchestrator {
     if (this.availableSlots() <= 0) {
       throw new SymphonyError("conflict", "No agent slots are available for issue breakdown planning");
     }
-    const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
-    const issue = refreshed[0];
+    const issue = await this.resolveTrackedIssue(issueIdOrIdentifier, options.projectContext, {
+      allowCandidateIdentifierLookup: true,
+    });
     if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
     if (this.running.has(issue.id)) throw new SymphonyError("conflict", "Issue already has a running Symphony agent");
     if (this.isMergeConflictState(issue.state)) {
@@ -971,15 +976,19 @@ export class Orchestrator {
     return { queued: true, issue, reason: "explicit_request" };
   }
 
-  async applyIssueBreakdownPlan(issueIdOrIdentifier: string, options: { dryRun?: boolean } = {}) {
+  async applyIssueBreakdownPlan(
+    issueIdOrIdentifier: string,
+    options: { dryRun?: boolean; projectContext?: ProjectContextResolution } = {},
+  ) {
     if (!this.config.issueBreakdown.enabled || !this.config.issueBreakdown.applyToLinear.enabled) {
       throw new SymphonyError("invalid_request", "Issue breakdown Linear application is disabled");
     }
     if (!this.options.lifecycleStore) {
       throw new SymphonyError("invalid_request", "Issue breakdown Linear application requires a lifecycle store");
     }
-    const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
-    const issue = refreshed[0];
+    const issue = await this.resolveTrackedIssue(issueIdOrIdentifier, options.projectContext, {
+      allowCandidateIdentifierLookup: true,
+    });
     if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
     const service = new IssueBreakdownPlanApplyService({
       config: this.config,
@@ -987,6 +996,26 @@ export class Orchestrator {
       writeback: this.options.writeback,
     });
     return options.dryRun === true ? service.previewLatestFreshPlan(issue) : service.applyLatestFreshPlan(issue);
+  }
+
+  private trackerClientForProjectContext(projectContext?: ProjectContextResolution): TrackerClient {
+    return this.options.trackerResolver?.(projectContext) ?? this.options.tracker;
+  }
+
+  private async resolveTrackedIssue(
+    issueIdOrIdentifier: string,
+    projectContext: ProjectContextResolution | undefined,
+    options: { allowCandidateIdentifierLookup?: boolean } = {},
+  ): Promise<Issue | null> {
+    const tracker = this.trackerClientForProjectContext(projectContext);
+    const direct = (await tracker.fetchIssueStatesByIds([issueIdOrIdentifier]))[0] ?? null;
+    if (direct) return direct;
+    if (options.allowCandidateIdentifierLookup !== true) return null;
+    return (
+      (await tracker.fetchCandidateIssues()).find(
+        (candidate) => candidate.id === issueIdOrIdentifier || candidate.identifier === issueIdOrIdentifier,
+      ) ?? null
+    );
   }
 
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {

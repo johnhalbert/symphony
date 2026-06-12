@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -25,7 +25,7 @@ import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import type { Issue, IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } from "../src/core/types.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
-import { issue, multiProjectWorkflowConfig, testConfig } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, testConfig, trackerClientFixture, trackerIssue } from "./helpers.js";
 
 describe("StatusServer durable API", () => {
   let root: string;
@@ -1131,6 +1131,108 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("opens the workspace resolved from the request issue context when identifiers collide across project contexts", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "workspaces"),
+            state_dir: path.join(root, ".symphony"),
+          },
+        },
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "SYMPHONY",
+      routingSource: "candidate_poll",
+    } as const;
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyPath = path.join(config.workspace.root, "symphony", "ENG-179");
+    const docsPath = path.join(config.workspace.root, "docs", "ENG-179");
+    await mkdir(symphonyPath, { recursive: true });
+    await mkdir(docsPath, { recursive: true });
+    await runStore.upsertWorkspace({
+      workspaceKey: "ENG-179",
+      issueId: "issue-symphony-open-workspace-1",
+      issueIdentifier: "ENG-179",
+      path: symphonyPath,
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/ENG-179",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      projectContext: symphonyProjectContext,
+    });
+    await runStore.upsertWorkspace({
+      workspaceKey: "docs-ENG-179",
+      issueId: "issue-docs-open-workspace-1",
+      issueIdentifier: "ENG-179",
+      path: docsPath,
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/docs/ENG-179",
+      createdAt: "2026-01-01T00:00:01.000Z",
+      updatedAt: "2026-01-01T00:00:01.000Z",
+      projectContext: docsProjectContext,
+    });
+    const openedPaths: string[] = [];
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: {
+        async open(workspacePath: string) {
+          openedPaths.push(workspacePath);
+        },
+      },
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const defaultResponse = await fetch(`${baseUrl}/api/v1/issues/ENG-179/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const docsResponse = await fetch(`${baseUrl}/api/v1/issues/docs:ENG-179/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const defaultBody = (await defaultResponse.json()) as { error: { code: string; message: string } };
+      const docsBody = (await docsResponse.json()) as { workspace_path: string };
+
+      expect(defaultResponse.status).toBe(404);
+      expect(docsResponse.status).toBe(202);
+      expect(defaultBody).toMatchObject({
+        error: {
+          code: "not_found",
+          message: "Issue alias is ambiguous across project contexts: ENG-179. Use a context-qualified alias.",
+        },
+      });
+      expect(docsBody.workspace_path).toBe(docsPath);
+      expect(openedPaths).toEqual([docsPath]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("derives qualified workspace context from runs and lifecycles when the durable workspace record is legacy-default", async () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
@@ -2124,6 +2226,119 @@ describe("StatusServer durable API", () => {
     } finally {
       await identifierFixture.orchestrator.stop();
       await identifierFixture.server.stop();
+    }
+  });
+
+  it("routes planning-run identifier lookups through the resolved issue project context", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "planning-context-workspaces"),
+            state_dir: path.join(root, "planning-context-state"),
+          },
+        },
+      }),
+      path.join(root, "planning-context-WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    const docsCandidate = trackerIssue({
+      id: "issue-docs-planning-1",
+      identifier: "ENG-179",
+      state: "Todo",
+      labels: ["planning"],
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    });
+    const symphonyTracker = trackerClientFixture({ candidates: [], issues: [] });
+    const docsTracker = trackerClientFixture({ candidates: [docsCandidate], issues: [docsCandidate] });
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new PlanningRunRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: symphonyTracker,
+      trackerResolver: (projectContext) => (projectContext?.projectContextId === "docs" ? docsTracker : symphonyTracker),
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:ENG-179/planning-run`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const body = (await response.json()) as {
+        queued: boolean;
+        issue: string;
+        issueId: string;
+        runPhase: string;
+        runKind: string;
+        reason: string;
+      };
+
+      expect(response.status).toBe(202);
+      expect(body).toMatchObject({
+        queued: true,
+        issue: "ENG-179",
+        issueId: "issue-docs-planning-1",
+        runPhase: "issue_breakdown",
+        runKind: "planning",
+        reason: "explicit_request",
+      });
+      expect(symphonyTracker.requestedIds).toEqual([]);
+      expect(symphonyTracker.candidateFetchCount).toBe(0);
+      expect(docsTracker.requestedIds[0]).toEqual(["ENG-179"]);
+      expect(docsTracker.candidateFetchCount).toBe(1);
+      await waitForStatusApiAsync(
+        async () =>
+          ((await runStore.latestRunForIssue(docsCandidate.id, {
+            role: "worker",
+            runPhase: "issue_breakdown",
+          }))?.runKind ?? null) === "planning",
+        "context-routed durable planning run",
+      );
+      await expect(
+        runStore.latestRunForIssue(docsCandidate.id, {
+          role: "worker",
+          runPhase: "issue_breakdown",
+        }),
+      ).resolves.toMatchObject({
+        issueId: docsCandidate.id,
+        issueIdentifier: docsCandidate.identifier,
+        runPhase: "issue_breakdown",
+        runKind: "planning",
+        projectContext: expect.objectContaining({ projectContextId: "docs" }),
+      });
+      expect(harness.runs[0]?.ctx.issue.id).toBe(docsCandidate.id);
+      expect(harness.runs[0]?.ctx.projectContext).toMatchObject({ projectContextId: "docs" });
+    } finally {
+      await orchestrator.stop();
+      await server.stop();
     }
   });
 

@@ -254,6 +254,7 @@ program
     const orchestrator = new Orchestrator({
       config,
       tracker,
+      trackerResolver: (projectContext) => createRuntimeTrackerClient(configRef.value, undefined, projectContext),
       workspaceManager,
       harness,
       logger,
