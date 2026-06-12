@@ -1172,8 +1172,12 @@ describe("MCP subprocess environment", () => {
 
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     expect(childConfig.workspace).toEqual(config.workspace);
-    expect(childConfig.projectContexts.byId.get("symphony")).toEqual(config.projectContexts.byId.get("symphony"));
-    expect(childConfig.projectContexts.byId.get("docs")).toEqual(config.projectContexts.byId.get("docs"));
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("symphony"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("symphony")),
+    );
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("docs")),
+    );
   });
 
   it("preserves inherited top-level git refs when the default context overrides them", () => {
@@ -1246,8 +1250,12 @@ describe("MCP subprocess environment", () => {
 
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     expect(childConfig.workspace).toEqual(config.workspace);
-    expect(childConfig.projectContexts.byId.get("symphony")).toEqual(config.projectContexts.byId.get("symphony"));
-    expect(childConfig.projectContexts.byId.get("docs")).toEqual(config.projectContexts.byId.get("docs"));
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("symphony"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("symphony")),
+    );
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("docs")),
+    );
   });
 
   it("carries project-context parse dependencies needed for child config parsing", () => {
@@ -1348,7 +1356,9 @@ describe("MCP subprocess environment", () => {
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     const expectedDocsContext = config.projectContexts.byId.get("docs");
     expect(expectedDocsContext).toBeDefined();
-    expect(childConfig.projectContexts.byId.get("docs")).toMatchObject(expectedDocsContext!);
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toMatchObject(
+      comparableProjectContext(expectedDocsContext!),
+    );
   });
 
   it("keeps non-GitHub MCPs free of default GitHub parse refs while preserving explicit project-context refs", () => {
@@ -1445,7 +1455,9 @@ describe("MCP subprocess environment", () => {
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     const expectedDocsContext = config.projectContexts.byId.get("docs");
     expect(expectedDocsContext).toBeDefined();
-    expect(childConfig.projectContexts.byId.get("docs")).toMatchObject(expectedDocsContext!);
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toMatchObject(
+      comparableProjectContext(expectedDocsContext!),
+    );
   });
 
   it("exports only non-secret project-context parse refs while omitting project-context GitHub secrets and profile values", () => {
@@ -1773,7 +1785,9 @@ describe("MCP subprocess environment", () => {
       headOwner: expectedDocsContext.github.headOwner,
       apiBaseUrl: expectedDocsContext.github.apiBaseUrl,
     });
-    expect(childConfig.projectContexts.byId.get("docs")).toEqual(expectedDocsContext);
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toEqual(
+      comparableProjectContext(expectedDocsContext),
+    );
   });
 
   it.each([
@@ -2390,6 +2404,38 @@ describe("MCP subprocess environment", () => {
     ).toThrow(/MISSING_GITHUB_PUBLICATION_TOKEN/);
   });
 });
+
+
+type ComparableProjectContext = {
+  workspace?: { source?: { repository?: string | null } };
+  publicMetadata?: { repository?: string | null } | null;
+  publicSummary?: { publicMetadata?: { repository?: string | null } | null } | null;
+};
+
+function comparableProjectContext<T extends ComparableProjectContext | undefined>(context: T): T {
+  if (!context) return context;
+  const repository = context.workspace?.source?.repository ?? null;
+  return {
+    ...context,
+    publicMetadata: context.publicMetadata
+      ? {
+          ...context.publicMetadata,
+          repository,
+        }
+      : context.publicMetadata,
+    publicSummary: context.publicSummary
+      ? {
+          ...context.publicSummary,
+          publicMetadata: context.publicSummary.publicMetadata
+            ? {
+                ...context.publicSummary.publicMetadata,
+                repository,
+              }
+            : context.publicSummary.publicMetadata,
+        }
+      : context.publicSummary,
+  };
+}
 
 function githubEnvKeys(env: Record<string, string>): string[] {
   return Object.keys(env)

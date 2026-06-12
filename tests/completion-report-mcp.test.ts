@@ -429,87 +429,6 @@ describe("completion report MCP handoff", () => {
     });
   });
 
-  it("falls back to the report branchName when service-owned branch metadata is unavailable", async () => {
-    const stateDir = path.join(root, "state");
-    const workflowPath = path.join(root, "WORKFLOW.md");
-    const contextFile = path.join(root, "context.json");
-    await writeFile(workflowPath, workflow(stateDir), "utf8");
-    const runStore = new FileRunTranscriptStore(stateDir);
-    await runStore.startRun({
-      runId: "run-report-branch-fallback",
-      sessionId: "agent-1:run-report-branch-fallback",
-      agentId: "agent-1",
-      role: "worker",
-      issueId: "issue-1",
-      issueIdentifier: "TEST-1",
-      projectContext: docsProjectContext,
-      attempt: null,
-      turnNumber: 1,
-      prompt: "work",
-      workspaceKey: "TEST-1",
-      workspacePath: "/tmp/workspace",
-      repoPath: "/repo",
-      baseRef: "main",
-    });
-    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
-    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: null }), {
-      projectContext: docsProjectContext,
-      phase: "implementation",
-      summaryPointers: { lastRunId: "run-report-branch-fallback" },
-    });
-    await writeCompletionReportMcpContext(contextFile, {
-      issue: issue({ state: "In Progress", branchName: null }),
-      projectContext: docsProjectContext,
-      activeRunId: "run-report-branch-fallback",
-      role: "worker",
-      token: null,
-      expectedToken: null,
-      sessionId: "agent-1:run-report-branch-fallback",
-      workspacePath: "/tmp/workspace",
-      workspace: {
-        path: "/tmp/workspace",
-        workspaceKey: "TEST-1",
-        createdNow: false,
-        issueId: "issue-1",
-        issueIdentifier: "TEST-1",
-        repoPath: "/repo",
-        baseRef: "main",
-      },
-      phase: "implementation",
-    });
-    const publisher = new FakePublisher({
-      action: "created",
-      url: "https://github.com/acme/symphony/pull/44",
-      number: 44,
-      headSha: "def456",
-      headBranch: "report-only-branch",
-      lastPushedAt: "2026-01-01T00:00:01Z",
-      evidenceCursor: "report-branch-idem",
-    });
-
-    await submitCompletionReportFromMcp(
-      { ...report("report-branch-idem"), branchName: "report-only-branch" },
-      mcpOptions(workflowPath, contextFile, {
-        pullRequestPublisher: publisher,
-        tracker: fakeTracker(issue({ state: "In Progress", branchName: null, title: "Do work" })),
-      }),
-    );
-
-    expect(publisher.inputs).toHaveLength(1);
-    expect(publisher.inputs[0]).toMatchObject({
-      branchName: "report-only-branch",
-      title: "TEST-1: Do work",
-    });
-    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
-      summaryPointers: {
-        branchName: null,
-        gitBranchName: null,
-        prBranch: "report-only-branch",
-        lastEvidenceCursor: "report-branch-idem",
-      },
-    });
-  });
-
   it("rejects completion report MCP submission when the authoritative issue state is no longer the active implementation state", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
@@ -1170,9 +1089,7 @@ describe("completion report MCP handoff", () => {
         expect.objectContaining({ idempotencyKey: "pending-replay", writebackOperationKeys: [] }),
       ],
     });
-  });
-
-  it("uses service GitHub publication profile for default PR publication", async () => {
+  });  it("uses service GitHub publication profile for default PR publication", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "context.json");
@@ -1490,8 +1407,200 @@ describe("completion report MCP handoff", () => {
       ],
     });
   });
-});
+  it("falls back to the report branchName when service-owned branch metadata is unavailable", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-report-branch-fallback",
+      sessionId: "agent-1:run-report-branch-fallback",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: null }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: { lastRunId: "run-report-branch-fallback" },
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: null }),
+      projectContext: docsProjectContext,
+      activeRunId: "run-report-branch-fallback",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-report-branch-fallback",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/44",
+      number: 44,
+      headSha: "def456",
+      headBranch: "report-only-branch",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "report-branch-idem",
+    });
 
+    await submitCompletionReportFromMcp(
+      { ...report("report-branch-idem"), branchName: "report-only-branch" },
+      mcpOptions(workflowPath, contextFile, {
+        pullRequestPublisher: publisher,
+        tracker: fakeTracker(issue({ state: "In Progress", branchName: null, title: "Do work" })),
+      }),
+    );
+
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      branchName: "report-only-branch",
+      title: "TEST-1: Do work",
+    });
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      summaryPointers: {
+        branchName: null,
+        gitBranchName: null,
+        prBranch: "report-only-branch",
+        lastEvidenceCursor: "report-branch-idem",
+      },
+    });
+  });
+
+  it("uses the active run project context for authoritative tracker lookups", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "context.json");
+    await writeFile(workflowPath, workflowWithProjectContextPublicationProfile(stateDir), "utf8");
+    vi.stubEnv("GITHUB_PUBLICATION_TOKEN", "publication-token");
+    vi.stubEnv("DOCS_GITHUB_PUBLICATION_TOKEN", "docs-publication-token");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "run-active-context-tracker",
+      sessionId: "agent-1:run-active-context-tracker",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await new FileIssueLifecycleStore(stateDir).ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      projectContext: docsProjectContext,
+      phase: "implementation",
+      summaryPointers: {
+        lastRunId: "run-active-context-tracker",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+      },
+    });
+    await writeCompletionReportMcpContext(contextFile, {
+      issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+      projectContext: docsProjectContext,
+      activeRunId: "run-active-context-tracker",
+      role: "worker",
+      token: null,
+      expectedToken: null,
+      sessionId: "agent-1:run-active-context-tracker",
+      workspacePath: "/tmp/workspace",
+      workspace: {
+        path: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        createdNow: false,
+        issueId: "issue-1",
+        issueIdentifier: "TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+      phase: "implementation",
+    });
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/docs-site/pull/45",
+      number: 45,
+      headSha: "ghi789",
+      headBranch: "symphony/TEST-1",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "active-context-tracker-idem",
+    });
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", async (_input: unknown, init?: RequestInit) => {
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      return jsonResponse({
+        data: {
+          issues: {
+            nodes: [
+              {
+                id: "issue-1",
+                identifier: "TEST-1",
+                title: "Do work",
+                description: null,
+                priority: null,
+                branchName: "symphony/TEST-1",
+                url: null,
+                createdAt: "2026-01-01T00:00:00Z",
+                updatedAt: "2026-01-01T00:00:00Z",
+                state: { name: "In Progress" },
+                assignee: null,
+                delegate: null,
+                labels: { nodes: [] },
+                inverseRelations: { nodes: [] },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    const result = await submitCompletionReportFromMcp(
+      report("active-context-tracker-idem"),
+      mcpOptions(workflowPath, contextFile, {
+        tracker: undefined,
+        pullRequestPublisher: publisher,
+      }),
+    );
+
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      reportId: "completion-report:issue-1:active-context-tracker-idem",
+    });
+    expect(authorizations).toEqual(["docs-linear-test-key"]);
+  });
+
+
+
+
+});
 function workflow(stateDir: string, publishPullRequests = true): string {
   return `---
 tracker:

@@ -30,7 +30,12 @@ export function createRuntimeTrackerClient(
   fetchImpl?: FetchLike,
   projectContext?: ProjectContextResolution,
 ) {
-  return createLinearTrackerClientForCapability(config, "linear.tracker", fetchImpl, { projectContext });
+  return createLinearTrackerClientForCapability(
+    resolveServiceConfigForProjectContext(config, projectContext),
+    "linear.tracker",
+    fetchImpl,
+    { projectContext },
+  );
 }
 
 export function createRuntimeWritebackProcessor(
@@ -120,7 +125,12 @@ export function createRuntimeWritebackClient(
   fetchImpl?: FetchLike,
   projectContext?: ProjectContextResolution,
 ) {
-  return createLinearTrackerClientForCapability(config, "linear.writeback", fetchImpl, { projectContext });
+  return createLinearTrackerClientForCapability(
+    resolveServiceConfigForProjectContext(config, projectContext),
+    "linear.writeback",
+    fetchImpl,
+    { projectContext },
+  );
 }
 
 export function resolveCursorRuntimeApiKey(config: ServiceConfig, role: AgentRunRole): string | null {

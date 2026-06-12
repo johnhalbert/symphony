@@ -357,11 +357,9 @@ export class CompletionReportService {
     }
 
     const report = completionReportInputFromRecord(existing);
+    const issueTitle = lifecycle.summaryPointers.issueTitle ?? input.issue.title;
     const context: CompletionReportActiveContext = {
-      issue: {
-        ...input.issue,
-        title: lifecycle.summaryPointers.issueTitle ?? input.issue.title,
-      },
+      issue: { ...input.issue, title: issueTitle },
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -405,11 +403,9 @@ export class CompletionReportService {
     }
 
     const report = completionReportInputFromRecord(existing);
+    const issueTitle = lifecycle.summaryPointers.issueTitle ?? input.issue.title;
     const context: CompletionReportActiveContext = {
-      issue: {
-        ...input.issue,
-        title: lifecycle.summaryPointers.issueTitle ?? input.issue.title,
-      },
+      issue: { ...input.issue, title: issueTitle },
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -787,7 +783,7 @@ export class CompletionReportService {
         lifecycleGitBranchName: existingLifecycle?.summaryPointers.gitBranchName ?? null,
         lifecycleBranchName: existingLifecycle?.summaryPointers.branchName ?? null,
         issueBranchName: context.issue.branchName,
-      }) ?? report.branchName ?? null;
+      }) || report.branchName || null;
     if (!branchName) {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree branch");
     }

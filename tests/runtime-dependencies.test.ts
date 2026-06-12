@@ -110,22 +110,6 @@ describe("runtime dependency credential wiring", () => {
     expect(authorizations).toEqual(["linear-writeback-secret", "linear-writeback-secret"]);
   });
 
-  it("uses the selected project-context writeback profile and slug for scoped runtime writeback clients", async () => {
-    const config = scopedRuntimeConfig();
-    const seen: Array<{ authorization: string; projectSlug: string | null }> = [];
-
-    await createRuntimeWritebackClient(config, async (_input, init) => {
-      const body = JSON.parse(String(init?.body)) as { variables?: { projectSlug?: string } };
-      seen.push({
-        authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
-        projectSlug: body.variables?.projectSlug ?? null,
-      });
-      return jsonResponse({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
-    }, docsProjectContext).fetchCandidateIssues();
-
-    expect(seen).toEqual([{ authorization: "docs-writeback-secret", projectSlug: "DOCS" }]);
-  });
-
   it("uses the selected project-context linear.writeback profile for scoped writeback drains", async () => {
     const config = parseServiceConfig(
       {
@@ -299,6 +283,26 @@ describe("runtime dependency credential wiring", () => {
       /linear\.writeback is owned by service/,
     );
   });
+
+  it("uses the selected project-context writeback profile and slug for scoped runtime writeback clients", async () => {
+    const config = scopedRuntimeConfig();
+    const seen: Array<{ authorization: string; projectSlug: string | null }> = [];
+
+    await createRuntimeWritebackClient(config, async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { variables?: { projectSlug?: string } };
+      seen.push({
+        authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+        projectSlug: body.variables?.projectSlug ?? null,
+      });
+      return jsonResponse({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
+    }, docsProjectContext).fetchCandidateIssues();
+
+    expect(seen).toEqual([{ authorization: "docs-writeback-secret", projectSlug: "DOCS" }]);
+  });
+
+
+
+
 
   it("resolves status mutation auth from the worker server.open_workspace profile", () => {
     const config = runtimeConfig();

@@ -2671,10 +2671,10 @@ const docsProjectContext = {
       await orchestrator.refreshNow();
       await waitFor(() => typeof orchestrator.snapshot().running[0]?.runId === "string", "worker run start");
       const runId = orchestrator.snapshot().running[0]?.runId ?? "";
-      await lifecycleStore.ensureIssue(
-        candidate,
-        pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
-      );
+      await lifecycleStore.ensureIssue(candidate, {
+        ...pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
+        phase: "implementation",
+      });
       await runStore.updateRun(runId, {
         metadata: {
           pendingApprovalRequestId: null,
@@ -2692,7 +2692,7 @@ const docsProjectContext = {
       expect(runningRun?.pendingApprovalRequestId ?? null).toBeNull();
       expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-        phase: "blocked",
+        phase: "implementation",
         blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
         incompleteTurnCount: 0,
       });
