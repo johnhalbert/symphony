@@ -248,8 +248,11 @@ export class WorkspaceManager {
   async removeForIssue(issueInput: WorkspaceIssueInput): Promise<void> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
-    const workspaceKey = workspaceKeyForIssue(issue);
-    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+    const persistedWorkspace = await this.findWorkspaceForRemoval(issue);
+    const resolvedIssue =
+      !issue.projectContext && persistedWorkspace?.projectContext ? { ...issue, projectContext: persistedWorkspace.projectContext } : issue;
+    const workspaceKey = persistedWorkspace?.workspaceKey ?? workspaceKeyForIssue(resolvedIssue);
+    const workspacePath = persistedWorkspace?.path ?? path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
 
     if (!(await pathExists(workspacePath))) {
@@ -258,7 +261,7 @@ export class WorkspaceManager {
     }
     await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
     await this.runHook("before_remove", this.options.hooks.beforeRemove, workspacePath, false);
-    const metadata = await this.store.getWorkspace(workspaceKey);
+    const metadata = persistedWorkspace ?? (await this.store.getWorkspace(workspaceKey));
     if (metadata?.sourceKind === "git_worktree" && metadata.repoPath) {
       await removeGitWorktree({
         repoPath: metadata.repoPath,
@@ -284,6 +287,18 @@ export class WorkspaceManager {
       issue_identifier: issueIdentifier,
       workspace_path: workspacePath,
     });
+  }
+
+  private async findWorkspaceForRemoval(issue: WorkspaceIssue): Promise<WorkspaceRecord | null> {
+    if (issue.id) {
+      return issue.projectContext
+        ? this.store.findWorkspace(issue.id, { projectContext: issue.projectContext })
+        : this.store.findWorkspace(issue.id);
+    }
+    if (issue.projectContext) {
+      return this.store.findWorkspace(issue.identifier, { projectContext: issue.projectContext });
+    }
+    return null;
   }
 
   private async removePlanningWorkspace(

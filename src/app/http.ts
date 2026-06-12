@@ -1018,11 +1018,7 @@ export class StatusServer {
       if (request.method === "POST" && pauseMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(pauseMatch[1] ?? "");
-        const lookup = await resolveIssueLookupKey(issueId, {
-          snapshot: this.options.orchestrator.snapshot(),
-          lifecycleStore: this.options.lifecycleStore,
-          runStore: this.options.runStore,
-        });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
         if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
         const lookupIssueId = lookup.issueId ?? issueId;
         this.options.orchestrator.pauseIssue(lookupIssueId);
@@ -1034,11 +1030,7 @@ export class StatusServer {
       if (request.method === "POST" && resumeMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(resumeMatch[1] ?? "");
-        const lookup = await resolveIssueLookupKey(issueId, {
-          snapshot: this.options.orchestrator.snapshot(),
-          lifecycleStore: this.options.lifecycleStore,
-          runStore: this.options.runStore,
-        });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
         if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
         const lookupIssueId = lookup.issueId ?? issueId;
         this.options.orchestrator.resumeIssue(lookupIssueId);
@@ -1050,11 +1042,7 @@ export class StatusServer {
       if (request.method === "POST" && cancelMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(cancelMatch[1] ?? "");
-        const lookup = await resolveIssueLookupKey(issueId, {
-          snapshot: this.options.orchestrator.snapshot(),
-          lifecycleStore: this.options.lifecycleStore,
-          runStore: this.options.runStore,
-        });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
         if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
         const lookupIssueId = lookup.issueId ?? issueId;
         await this.options.orchestrator.cancelIssue(lookupIssueId);
@@ -1080,11 +1068,7 @@ export class StatusServer {
       if (request.method === "GET" && issueRunsMatch) {
         const issueId = decodeURIComponent(issueRunsMatch[1] ?? "");
         const snapshot = this.options.orchestrator.snapshot();
-        const lookup = await resolveIssueLookupKey(issueId, {
-          snapshot,
-          lifecycleStore: this.options.lifecycleStore,
-          runStore: this.options.runStore,
-        });
+        const lookup = await this.resolveRouteIssueLookup(issueId, snapshot);
         if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
         const lookupIssueId = lookup.issueId ?? issueId;
         const live = this.options.orchestrator.getIssueDetails(lookupIssueId);
@@ -1137,11 +1121,7 @@ export class StatusServer {
       if (request.method === "POST" && continuationSummaryMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(continuationSummaryMatch[1] ?? "");
-        const lookup = await resolveIssueLookupKey(issueId, {
-          snapshot: this.options.orchestrator.snapshot(),
-          lifecycleStore: this.options.lifecycleStore,
-          runStore: this.options.runStore,
-        });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
         if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
         const lookupIssueId = lookup.issueId ?? issueId;
         const result = await this.options.orchestrator.createContinuationSummary(lookupIssueId);
@@ -1187,11 +1167,7 @@ export class StatusServer {
       if (request.method === "GET" && issueMatch) {
         const issueId = decodeURIComponent(issueMatch[1] ?? "");
         const snapshot = this.options.orchestrator.snapshot();
-        const lookup = await resolveIssueLookupKey(issueId, {
-          snapshot,
-          lifecycleStore: this.options.lifecycleStore,
-          runStore: this.options.runStore,
-        });
+        const lookup = await this.resolveRouteIssueLookup(issueId, snapshot);
         if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
         const lookupIssueId = lookup.issueId ?? issueId;
         const live = this.options.orchestrator.getIssueDetails(lookupIssueId);
@@ -1325,11 +1301,7 @@ export class StatusServer {
         const directWorkspace = await this.options.runStore?.getWorkspace(workspaceKey);
         const lookup = directWorkspace
           ? { issueId: directWorkspace.issueId ?? null, ambiguousCandidates: [] }
-          : await resolveIssueLookupKey(workspaceKey, {
-              snapshot: this.options.orchestrator.snapshot(),
-              lifecycleStore: this.options.lifecycleStore,
-              runStore: this.options.runStore,
-            });
+          : await this.resolveRouteIssueLookup(workspaceKey);
         if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(workspaceKey, lookup.ambiguousCandidates);
         const workspace = directWorkspace ?? (lookup.issueId ? await this.options.runStore?.findWorkspace(lookup.issueId) : null);
         if (!workspace) throw new SymphonyError("not_found", `Workspace not found: ${workspaceKey}`);
@@ -1341,11 +1313,7 @@ export class StatusServer {
       if (request.method === "POST" && openMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(openMatch[1] ?? "");
-        const lookup = await resolveIssueLookupKey(issueId, {
-          snapshot: this.options.orchestrator.snapshot(),
-          lifecycleStore: this.options.lifecycleStore,
-          runStore: this.options.runStore,
-        });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
         if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
         const lookupIssueId = lookup.issueId ?? issueId;
         const details = this.options.orchestrator.getIssueDetails(lookupIssueId);
@@ -2815,8 +2783,33 @@ export class StatusServer {
     return this.options.issueBoardColumns ?? defaultWebProjectionIssueBoardColumns(this.options.trackerStateLists);
   }
 
+  private async resolveRouteIssueLookup(
+    issueKey: string,
+    snapshot: RuntimeSnapshot = this.options.orchestrator.snapshot(),
+  ): Promise<{ issueId: string | null; ambiguousCandidates: IssueLookupCandidate[] }> {
+    return resolveIssueLookupKey(issueKey, {
+      snapshot,
+      lifecycleStore: this.options.lifecycleStore,
+      runStore: this.options.runStore,
+      trackerIssues: await this.loadTrackerIssuesForRouteLookup(),
+    });
+  }
+
+  private async loadTrackerIssuesForRouteLookup(): Promise<readonly Issue[]> {
+    if (!this.options.tracker) return [];
+    try {
+      const projection = await this.fetchIssueBoardTrackerProjection(this.resolveWebProjectionIssueBoardColumns(), false);
+      return projection.trackerIssues;
+    } catch (error) {
+      if (error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")) {
+        return [];
+      }
+      throw error;
+    }
+  }
+
   private async createWebProjectionContextFingerprint(
-    snapshot: ReturnType<Orchestrator["snapshot"]>,
+    snapshot: RuntimeSnapshot,
     issueBoardColumns: IssueBoardColumnMapping,
   ): Promise<WebProjectionCacheFingerprint> {
     const fetchedStates = webProjectionIssueBoardFetchStates(issueBoardColumns);

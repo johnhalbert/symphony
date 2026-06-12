@@ -628,6 +628,7 @@ describe("StatusServer durable API", () => {
     });
     await lifecycleStore.ensureIssue(docsIssue, { phase: "implementation" });
     await lifecycleStore.ensureIssue(symphonyIssue, { phase: "implementation" });
+    const openedWorkspaces: string[] = [];
 
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
@@ -636,7 +637,11 @@ describe("StatusServer durable API", () => {
         hooks: config.hooks,
         logger: new StructuredLogger(() => undefined),
       }),
-      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      workspaceOpener: {
+        async open(workspacePath: string) {
+          openedWorkspaces.push(workspacePath);
+        },
+      },
       runStore,
       lifecycleStore,
       host: "127.0.0.1",
@@ -708,6 +713,7 @@ describe("StatusServer durable API", () => {
         opened: true,
         workspace_path: path.join(config.workspace.root, "docs__ENG-123"),
       });
+      expect(openedWorkspaces).toEqual([path.join(config.workspace.root, "docs__ENG-123")]);
       expect(ambiguousIssueResponse.status).toBe(409);
       expect(ambiguousRunsResponse.status).toBe(409);
       expect(ambiguousWorkspaceResponse.status).toBe(409);
@@ -733,6 +739,172 @@ describe("StatusServer durable API", () => {
     }
   });
 
+
+  it("treats tracker-only duplicate siblings as ambiguous for issue, workspace, and mutation lookups", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-tracker-gap-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-tracker-gap-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-123",
+    });
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "docs__ENG-123",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      path: path.join(config.workspace.root, "docs__ENG-123"),
+      sourceKind: "git_worktree",
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await mkdir(path.join(config.workspace.root, "docs__ENG-123"), { recursive: true });
+    await runStore.startRun({
+      runId: "docs-tracker-gap-run-1",
+      sessionId: "docs-tracker-gap-session-1",
+      agentId: "docs-tracker-gap-agent-1",
+      role: "worker",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs tracker gap work",
+      workspaceKey: "docs__ENG-123",
+      workspacePath: path.join(config.workspace.root, "docs__ENG-123"),
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, { phase: "implementation" });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: {
+        async open(): Promise<void> {
+          throw new Error("open should not be reached for ambiguous identifier lookups");
+        },
+      },
+      tracker: new FakeTracker([docsIssue, symphonyIssue]),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const exactIssueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}`);
+      const exactWorkspaceKeyResponse = await fetch(`${baseUrl}/api/v1/workspaces/${encodeURIComponent("docs__ENG-123")}`);
+      const ambiguousIssueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}`);
+      const ambiguousRunsResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/runs`);
+      const ambiguousWorkspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/${encodeURIComponent(docsIssue.identifier)}`);
+      const ambiguousOpenResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousPauseResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousResumeResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/resume`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousCancelResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/cancel`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousContinuationResponse = await fetch(
+        `${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/continuation-summary`,
+        {
+          method: "POST",
+          headers: { "x-symphony-token": "secret" },
+        },
+      );
+
+      const exactIssueBody = (await exactIssueResponse.json()) as {
+        workspace: { workspaceKey: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+        latestRun: { runId: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+      };
+      const exactWorkspaceKeyBody = (await exactWorkspaceKeyResponse.json()) as {
+        workspaceKey: string;
+        issueId: string;
+        projectContext?: { projectContextId?: string };
+      };
+      const conflictBodies = await Promise.all(
+        [
+          ambiguousIssueResponse,
+          ambiguousRunsResponse,
+          ambiguousWorkspaceResponse,
+          ambiguousOpenResponse,
+          ambiguousPauseResponse,
+          ambiguousResumeResponse,
+          ambiguousCancelResponse,
+          ambiguousContinuationResponse,
+        ].map(async (response) => ({
+          status: response.status,
+          body: (await response.json()) as { error: { code: string; message: string } },
+        })),
+      );
+
+      expect(exactIssueResponse.status).toBe(200);
+      expect(exactIssueBody.workspace).toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(exactIssueBody.latestRun).toMatchObject({
+        runId: "docs-tracker-gap-run-1",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(exactWorkspaceKeyResponse.status).toBe(200);
+      expect(exactWorkspaceKeyBody).toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      for (const { status, body } of conflictBodies) {
+        expect(status).toBe(409);
+        expect(body.error).toMatchObject({
+          code: "conflict",
+          message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
+        });
+      }
+    } finally {
+      await server.stop();
+    }
+  });
 
   it("preserves both exact-id siblings on symphony-only board cards when visible identifiers collide", async () => {
     const config = testConfig(path.join(root, "workspaces"));
