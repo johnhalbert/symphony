@@ -1,12 +1,16 @@
 import type { Logger } from "../core/logging/StructuredLogger.js";
 import type { AgentRunRole, TrackerStateLists } from "../core/types.js";
 import type { ServiceConfig } from "../core/config/Config.js";
+import type { ProjectContextResolution } from "../core/config/ProjectContexts.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../core/config/CredentialProfiles.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import { FileIssueLifecycleStore, type IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
 import type { IssueBreakdownIssueLookupResult } from "../core/writeback/WritebackOutbox.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../core/writeback/WritebackOutbox.js";
-import { createLinearTrackerClientForCapability } from "../integrations/linear/LinearCredentialResolver.js";
+import {
+  createLinearTrackerClientForCapability,
+  createLinearTrackerClientForProjectContext,
+} from "../integrations/linear/LinearCredentialResolver.js";
 
 type FetchLike = typeof fetch;
 
@@ -26,9 +30,11 @@ export function createRuntimeWritebackProcessor(
   const getConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
   const config = getConfig();
   if (!config.writeback.enabled) return undefined;
+  const resolveWritebackWriter = (projectContext?: ProjectContextResolution) =>
+    createLinearTrackerClientForProjectContext(getConfig(), "linear.writeback", projectContext, fetchImpl);
   return new WritebackProcessor(
     stores.outboxStore ?? new FileWritebackOutboxStore(config.workspace.stateDir),
-    createLinearTrackerClientForCapability(config, "linear.writeback", fetchImpl),
+    resolveWritebackWriter(),
     logger,
     config.writeback.maxBackoffMs,
     stores.lifecycleStore ?? new FileIssueLifecycleStore(config.workspace.stateDir),
@@ -37,6 +43,7 @@ export function createRuntimeWritebackProcessor(
       getConfig,
       resolveIssue: (issueId) => resolveIssueForBreakdownFreshness(issueId, getConfig, fetchImpl),
     },
+    resolveWritebackWriter,
   );
 }
 

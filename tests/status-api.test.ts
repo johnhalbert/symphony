@@ -17,7 +17,7 @@ import {
 } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "../src/core/persistence/McpExposureDiagnosticsStore.js";
 import { FileRunTranscriptStore, type RunRecord } from "../src/core/persistence/RunTranscriptStore.js";
-import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
+import { FileWritebackOutboxStore, writebackIdentityKey } from "../src/core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
@@ -1535,11 +1535,28 @@ describe("StatusServer durable API", () => {
       payload: { secret: "PAYLOAD_SECRET_B_LATEST" },
     });
     const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
-    const writebackOperation = await writebackOutbox.enqueueOnce({
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "explicit",
+    };
+    const defaultWritebackOperation = await writebackOutbox.enqueueOnce({
       idempotencyKey: "comment:issue-b:report",
       kind: "comment",
       issueId: "issue-b",
       runId: "run-b",
+      payload: {
+        body: "WRITEBACK_BODY_SECRET /local/workspace/path",
+        dedupeKey: "report",
+      },
+    });
+    const docsWritebackOperation = await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-b:report",
+      kind: "comment",
+      issueId: "issue-b",
+      runId: "run-b",
+      projectContext: docsProjectContext,
       payload: {
         body: "WRITEBACK_BODY_SECRET /local/workspace/path",
         dedupeKey: "report",
@@ -1625,14 +1642,14 @@ describe("StatusServer durable API", () => {
       });
       expect(firstPage.nextOffset).toBe(1);
       expect(firstPage.counts).toMatchObject({
-        totalItems: 504,
+        totalItems: 505,
         distinctRunsConsidered: 2,
         transcriptEventsConsidered: 501,
         transcriptEventsTotal: 1_002,
         transcriptEventsIncluded: 501,
         transcriptEventsTruncated: true,
         syntheticRunEvents: 2,
-        writebackOperationsConsidered: 1,
+        writebackOperationsConsidered: 2,
       });
       expect(firstPage.source.runStoreAvailable).toBe(true);
       expect(firstPage.source.writebackOutboxAvailable).toBe(true);
@@ -1642,9 +1659,13 @@ describe("StatusServer durable API", () => {
       expect(secondPage.activity[0]?.issue.identifier).toBe("TEST-A");
       expect(issueBody.activity.map((item) => item.issue.identifier)).toEqual(["TEST-A", "TEST-A"]);
       expect(issueBody.counts.distinctRunsConsidered).toBe(1);
-      const writebackItem = writebackBody.activity.find((item) => item.id === "writeback:comment:issue-b:report");
-      expect(writebackItem).toMatchObject({
-        at: writebackOperation.updatedAt,
+      const defaultWritebackItemId = `writeback:${writebackIdentityKey(defaultWritebackOperation.idempotencyKey, defaultWritebackOperation.projectContext)}`;
+      const docsWritebackItemId = `writeback:${writebackIdentityKey(docsWritebackOperation.idempotencyKey, docsWritebackOperation.projectContext)}`;
+      const defaultWritebackItem = writebackBody.activity.find((item) => item.id === defaultWritebackItemId);
+      const docsWritebackItem = writebackBody.activity.find((item) => item.id === docsWritebackItemId);
+      expect(defaultWritebackItemId).not.toBe(docsWritebackItemId);
+      expect(defaultWritebackItem).toMatchObject({
+        at: defaultWritebackOperation.updatedAt,
         kind: "writeback_operation",
         source: "writeback",
         issue: { id: "issue-b", identifier: "TEST-B" },
@@ -1666,7 +1687,30 @@ describe("StatusServer durable API", () => {
           transcript: null,
         },
       });
-      expect(writebackBody.counts.writebackOperationsConsidered).toBe(1);
+      expect(docsWritebackItem).toMatchObject({
+        at: docsWritebackOperation.updatedAt,
+        kind: "writeback_operation",
+        source: "writeback",
+        issue: { id: "issue-b", identifier: "TEST-B" },
+        run: { runId: "run-b" },
+        transcript: null,
+        writeback: {
+          operationKind: "comment",
+          status: "pending",
+          attempt: 0,
+          comment: {
+            dedupeKey: "report",
+            bodyLength: "WRITEBACK_BODY_SECRET /local/workspace/path".length,
+            bodyRedacted: true,
+          },
+        },
+        links: {
+          issue: "/api/v1/board/issues/TEST-B",
+          run: "/api/v1/runs/run-b",
+          transcript: null,
+        },
+      });
+      expect(writebackBody.counts.writebackOperationsConsidered).toBe(2);
       expect(writebackText).not.toContain("WRITEBACK_BODY_SECRET");
       expect(writebackText).not.toContain("/local/workspace/path");
       expect(clampedBody.limit).toBe(100);

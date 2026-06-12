@@ -310,7 +310,17 @@ describe("WebProjectionContext contracts and cache key utilities", () => {
       updatedAt: "2026-01-01T00:00:02.000Z",
     };
     const lifecycle = lifecycleRecordFixture({ updatedAt: "2026-01-01T00:00:04.000Z" });
-    const writeback = writebackOperationFixture({ issueId: "issue-id-1", runId: "run-latest" });
+    const defaultWriteback = writebackOperationFixture({ issueId: "issue-id-1", runId: "run-latest" });
+    const docsWriteback = {
+      ...writebackOperationFixture({ issueId: "issue-id-1", runId: "run-latest" }),
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "explicit",
+      },
+      updatedAt: "2026-01-01T00:00:03.000Z",
+    };
     const snapshot = runtimeSnapshotFixture({ runId: "run-latest", sessionId: "session-latest" });
 
     const sourceIndex = await buildWebProjectionSourceIndex({
@@ -340,7 +350,7 @@ describe("WebProjectionContext contracts and cache key utilities", () => {
       writebackOutbox: {
         async list() {
           writebackListCalls += 1;
-          return [writeback];
+          return [defaultWriteback, docsWriteback];
         },
       },
       clock: () => new Date("2026-01-01T00:00:06.000Z"),
@@ -368,8 +378,14 @@ describe("WebProjectionContext contracts and cache key utilities", () => {
     expect(sourceIndex.transcript.eventCountsByRunId.get("run-latest")).toBe(7);
     expect(sourceIndex.workspaces.workspaceByIssueKey.get("workspace-1")).toBe(workspace);
     expect(sourceIndex.lifecycles.lifecycleByIssueKey.get("ENG-1")).toBe(lifecycle);
-    expect(sourceIndex.writebacks.writebacksByIssueKey.get("ENG-1")?.map((operation) => operation.idempotencyKey)).toEqual([
-      "writeback-1",
+    expect(
+      sourceIndex.writebacks.writebacksByIssueKey.get("ENG-1")?.map((operation) => ({
+        idempotencyKey: operation.idempotencyKey,
+        projectContextId: operation.projectContext?.projectContextId ?? "default",
+      })),
+    ).toEqual([
+      { idempotencyKey: "writeback-1", projectContextId: "default" },
+      { idempotencyKey: "writeback-1", projectContextId: "docs" },
     ]);
     expect(sourceIndex.transcript.hydration).toBe("excluded");
     expect(sourceIndex.durableSourceRevisions.map((revision) => revision.source)).toEqual([

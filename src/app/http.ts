@@ -76,6 +76,7 @@ import {
   issueBreakdownPlanIdForOperation,
   type FileWritebackOutboxStore,
   type WritebackOperation,
+  writebackIdentityKey,
 } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import { sanitizedPreviewValue, sanitizeCommandPolicyReplayStateForPublicOutput, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
@@ -5206,7 +5207,7 @@ function activityItemForWritebackOperation(
     lifecycles.find((candidate) => candidate.issueId === operation.issueId || candidate.issueIdentifier === operation.issueId) ?? null;
   const issueIdentifier = run?.issueIdentifier ?? lifecycle?.issueIdentifier ?? operation.issueId;
   return {
-    id: `writeback:${operation.idempotencyKey}`,
+    id: `writeback:${writebackIdentityKey(operation.idempotencyKey, operation.projectContext)}`,
     at: operation.updatedAt,
     kind: "writeback_operation",
     source: "writeback",

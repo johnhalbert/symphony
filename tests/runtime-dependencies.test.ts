@@ -71,6 +71,60 @@ describe("runtime dependency credential wiring", () => {
     expect(authorizations).toEqual(["linear-writeback-secret", "linear-writeback-secret"]);
   });
 
+  it("selects service writeback credentials per operation project context in runtime writeback processing", async () => {
+    const config = multiProjectRuntimeConfig();
+    const authorizations: string[] = [];
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "explicit",
+    };
+    const processor = createRuntimeWritebackProcessor(
+      config,
+      new StructuredLogger(() => undefined),
+      async (_input, init) => {
+        authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+        const body = JSON.parse(String(init?.body)) as { query?: string };
+        if (body.query?.includes("issueUpdate")) {
+          return jsonResponse({ data: { issueUpdate: { success: true } } });
+        }
+        return jsonResponse({
+          data: {
+            issue: {
+              id: "issue-1",
+              identifier: "TEST-1",
+              state: { id: "state-ready", name: "Ready to Merge" },
+              team: { states: { nodes: [{ id: "state-done", name: "Done" }] } },
+              comments: { nodes: [] },
+            },
+          },
+        });
+      },
+    );
+
+    await processor?.enqueueAndProcess({
+      kind: "transition",
+      idempotencyKey: "transition:issue-1:Done",
+      issueId: "issue-1",
+      payload: { toState: "Done", fromStates: ["Ready to Merge"] },
+    });
+    await processor?.enqueueAndProcess({
+      kind: "transition",
+      idempotencyKey: "transition:issue-2:Done",
+      issueId: "issue-2",
+      projectContext: docsProjectContext,
+      payload: { toState: "Done", fromStates: ["Ready to Merge"] },
+    });
+
+    expect(authorizations).toEqual([
+      "default-writeback-secret",
+      "default-writeback-secret",
+      "docs-writeback-secret",
+      "docs-writeback-secret",
+    ]);
+  });
+
   it("rejects wrong-role-only service writeback assignments in runtime writeback construction", () => {
     const config = runtimeConfig({
       credentialProfiles: {
@@ -240,6 +294,59 @@ function runtimeConfig(
       LEGACY_OPEN_WORKSPACE_TOKEN: "legacy-open-secret",
       OPEN_WORKSPACE_PROFILE_TOKEN: "open-workspace-secret",
       ...overrides.env,
+    },
+  );
+}
+
+
+function multiProjectRuntimeConfig() {
+  return parseServiceConfig(
+    {
+      tracker: { kind: "linear", api_key: "$DEFAULT_LINEAR_READ_TOKEN", project_slug: "TEST" },
+      workspace: { root, state_dir: path.join(root, "state") },
+      writeback: { enabled: true, mode: "live" },
+      credential_profiles: {
+        profiles: {
+          "default-writeback": { value: "$DEFAULT_LINEAR_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
+        },
+        roles: {
+          service: {
+            "linear.writeback": "default-writeback",
+          },
+        },
+      },
+      project_contexts: [
+        {
+          id: "default",
+          workspace: {
+            source: { kind: "git_worktree", repository: ".", base_ref: "origin/main" },
+          },
+        },
+        {
+          id: "docs",
+          tracker: { api_key: "$DOCS_LINEAR_READ_TOKEN", project_slug: "DOCS" },
+          workspace: {
+            source: { kind: "git_worktree", repository: ".", base_ref: "origin/main" },
+          },
+          credential_profiles: {
+            profiles: {
+              "docs-writeback": { value: "$DOCS_LINEAR_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
+            },
+            roles: {
+              service: {
+                "linear.writeback": "docs-writeback",
+              },
+            },
+          },
+        },
+      ],
+    },
+    path.join(root, "WORKFLOW.md"),
+    {
+      DEFAULT_LINEAR_READ_TOKEN: "default-read-secret",
+      DEFAULT_LINEAR_WRITEBACK_TOKEN: "default-writeback-secret",
+      DOCS_LINEAR_READ_TOKEN: "docs-read-secret",
+      DOCS_LINEAR_WRITEBACK_TOKEN: "docs-writeback-secret",
     },
   );
 }

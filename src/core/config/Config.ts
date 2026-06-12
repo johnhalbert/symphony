@@ -610,8 +610,10 @@ export type WorkflowProjectContext = NormalizedProjectContext<
   ReviewLoopConfig,
   IssueBreakdownConfig,
   AgentConfig,
-  RawWorkflowConfig["credential_profiles"]
->;
+  RawCredentialProfilesConfig
+> & {
+  credentialProfileRegistry: CredentialProfileRegistry;
+};
 
 export type WorkflowProjectContextRegistry = ProjectContextRegistry<WorkflowProjectContext>;
 
@@ -1011,6 +1013,17 @@ function normalizeWorkflowProjectContext(
     enabled,
   );
   const agent = normalizeAgentConfigForProjectContext(merged.agent);
+  const credentialProfileRegistry = createCredentialProfileRegistry({
+    raw: merged.credential_profiles,
+    env,
+    workflowDir,
+    fallbacks: {
+      githubToken: github.token,
+      linearApiKey: tracker.apiKey,
+      cursorRuntimeApiKey: null,
+      openWorkspaceToken: null,
+    },
+  });
 
   if (enabled) {
     validateStateBuckets({
@@ -1042,7 +1055,8 @@ function normalizeWorkflowProjectContext(
     reviewLoop,
     issueBreakdown,
     agent,
-    credentialProfiles: merged.credential_profiles,
+    ...(merged.credential_profiles === undefined ? {} : { credentialProfiles: merged.credential_profiles }),
+    credentialProfileRegistry,
     publicMetadata: projectContextMetadataForPublicRead({ id, label, enabled, tracker, workspace }),
   };
 }
