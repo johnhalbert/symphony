@@ -273,6 +273,8 @@ describe("IssueContractLint", () => {
 
   it("documents the ENG-371 promotion evidence packet and vendored-Hermes no-touch checks", () => {
     const quickstart = eng371Quickstart();
+    const credentialUrlDetector = extractDocumentedPythonRawRegex(quickstart, "credential_url");
+    const openaiKeyDetector = extractDocumentedPythonRawRegex(quickstart, "openai_key");
 
     expect(quickstart).toContain("REQ-ENG371-REDACTION-PARITY-001");
     expect(quickstart).toContain("REQ-ENG371-REPOSITORY-AMBIGUITY-001");
@@ -301,6 +303,14 @@ describe("IssueContractLint", () => {
     expect(quickstart).toContain("credential-bearing repository URLs");
     expect(quickstart).toContain("workflow, doctor, prompt, log, transcript, or documentation excerpt");
     expect(quickstart).toContain("raw log lines");
+    expect(credentialUrlDetector.test("https://alice:token@example.com/repo.git")).toBe(true);
+    expect(credentialUrlDetector.test("https://user:pass@example.com/repo.git")).toBe(true);
+    expect(credentialUrlDetector.test("https://svc-user:token@example.com/repo.git")).toBe(true);
+    expect(credentialUrlDetector.test("https://github.com/org/repo.git")).toBe(false);
+    expect(openaiKeyDetector.test("sk-abcdefghijklmnopqrstuvwxyz1234")).toBe(true);
+    expect(openaiKeyDetector.test("sk-proj-abcdefghijklmnopqrstuvwxyz1234")).toBe(true);
+    expect(openaiKeyDetector.test("sk-svcacct-abcdefghijklmnopqrstuvwxyz1234")).toBe(true);
+    expect(openaiKeyDetector.test("https://example.com/sk-proj-not-a-key")).toBe(false);
     expect(quickstart).not.toContain("tool_call_completed");
     expect(quickstart).not.toContain("operator-only private logs");
   });
@@ -331,4 +341,12 @@ function extractIssueContractRequirementIds(description: string): string[] {
 
 function eng371Quickstart(): string {
   return readFileSync(new URL("../specs/005-eng-371-public-metadata-closure/quickstart.md", import.meta.url), "utf8");
+}
+
+function extractDocumentedPythonRawRegex(document: string, detectorName: string): RegExp {
+  const escapedDetectorName = detectorName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = document.match(new RegExp(`'${escapedDetectorName}': re\\.compile\\(r'([^']+)'\\),`));
+
+  expect(match, `${detectorName} detector must be documented`).not.toBeNull();
+  return new RegExp(match?.[1] ?? "");
 }
