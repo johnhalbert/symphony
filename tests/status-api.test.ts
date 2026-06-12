@@ -2244,6 +2244,15 @@ describe("StatusServer durable API", () => {
     );
     config.issueBreakdown.enabled = true;
     config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.promptTemplate = "Default planning prompt for {{ issue.identifier }}";
+    config.issueBreakdown.cursorMode = "agent";
+    const docsContext = config.projectContexts.byId.get("docs");
+    expect(docsContext).toBeDefined();
+    if (!docsContext) throw new Error("Expected docs project context in planning route fixture");
+    docsContext.issueBreakdown.enabled = true;
+    docsContext.issueBreakdown.planningLabels = ["docs-planning"];
+    docsContext.issueBreakdown.promptTemplate = "Docs planning prompt for {{ issue.identifier }}";
+    docsContext.issueBreakdown.cursorMode = "plan";
     const docsCandidate = trackerIssue({
       id: "issue-docs-planning-1",
       identifier: "ENG-179",
@@ -2336,6 +2345,267 @@ describe("StatusServer durable API", () => {
       });
       expect(harness.runs[0]?.ctx.issue.id).toBe(docsCandidate.id);
       expect(harness.runs[0]?.ctx.projectContext).toMatchObject({ projectContextId: "docs" });
+      expect(harness.runs[0]?.ctx.config.issueBreakdown.planningLabels).toEqual(["docs-planning"]);
+      expect(harness.runs[0]?.ctx.runModeOverride).toBe("plan");
+      expect(harness.runs[0]?.prompt).toContain("Docs planning prompt for ENG-179");
+    } finally {
+      await orchestrator.stop();
+      await server.stop();
+    }
+  });
+
+  it("fails closed for context-qualified planning-run internal-id requests that resolve outside the requested context", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "planning-context-mismatch-workspaces"),
+            state_dir: path.join(root, "planning-context-mismatch-state"),
+          },
+        },
+      }),
+      path.join(root, "planning-context-mismatch-WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    const wrongContextIssue = trackerIssue({
+      id: "linear-symphony-179",
+      identifier: "ENG-179",
+      state: "Todo",
+      labels: ["planning"],
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "SYMPHONY",
+      routingSource: "candidate_poll",
+    });
+    const sharedTracker = trackerClientFixture({ candidates: [wrongContextIssue], issues: [wrongContextIssue] });
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new PlanningRunRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: sharedTracker,
+      trackerResolver: () => sharedTracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(
+        `http://${address.host}:${address.port}/api/v1/issues/docs:linear-symphony-179/planning-run`,
+        {
+          method: "POST",
+          headers: { "x-symphony-token": "secret" },
+        },
+      );
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(404);
+      expect(body.error.code).toBe("not_found");
+      expect(body.error.message).toContain("Issue not found");
+      expect(sharedTracker.requestedIds[0]).toEqual(["linear-symphony-179"]);
+      expect(sharedTracker.candidateFetchCount).toBe(1);
+      expect(harness.runs).toHaveLength(0);
+      await expect(
+        runStore.latestRunForIssue(wrongContextIssue.id, {
+          role: "worker",
+          runPhase: "issue_breakdown",
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      await orchestrator.stop();
+      await server.stop();
+    }
+  });
+
+  it("rejects planning-run requests when the resolved issue context disables issue breakdown", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "planning-context-disabled-workspaces"),
+            state_dir: path.join(root, "planning-context-disabled-state"),
+          },
+        },
+      }),
+      path.join(root, "planning-context-disabled-WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    const docsContext = config.projectContexts.byId.get("docs");
+    expect(docsContext).toBeDefined();
+    if (!docsContext) throw new Error("Expected docs project context in planning disabled fixture");
+    docsContext.issueBreakdown.enabled = false;
+    const docsCandidate = trackerIssue({
+      id: "issue-docs-disabled-1",
+      identifier: "ENG-179",
+      state: "Todo",
+      labels: ["planning"],
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    });
+    const symphonyTracker = trackerClientFixture({ candidates: [], issues: [] });
+    const docsTracker = trackerClientFixture({ candidates: [docsCandidate], issues: [docsCandidate] });
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new PlanningRunRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: symphonyTracker,
+      trackerResolver: (projectContext) => (projectContext?.projectContextId === "docs" ? docsTracker : symphonyTracker),
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:ENG-179/planning-run`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(401);
+      expect(body.error.code).toBe("invalid_request");
+      expect(body.error.message).toBe("Issue breakdown planning is disabled");
+      expect(symphonyTracker.requestedIds).toEqual([]);
+      expect(symphonyTracker.candidateFetchCount).toBe(0);
+      expect(docsTracker.requestedIds[0]).toEqual(["ENG-179"]);
+      expect(docsTracker.candidateFetchCount).toBe(1);
+      expect(harness.runs).toHaveLength(0);
+      await expect(
+        runStore.latestRunForIssue(docsCandidate.id, {
+          role: "worker",
+          runPhase: "issue_breakdown",
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      await orchestrator.stop();
+      await server.stop();
+    }
+  });
+
+  it("rejects planning-run apply requests when the resolved issue context disables Linear application", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "planning-context-apply-disabled-workspaces"),
+            state_dir: path.join(root, "planning-context-apply-disabled-state"),
+          },
+        },
+      }),
+      path.join(root, "planning-context-apply-disabled-WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    const docsContext = config.projectContexts.byId.get("docs");
+    expect(docsContext).toBeDefined();
+    if (!docsContext) throw new Error("Expected docs project context in planning apply fixture");
+    docsContext.issueBreakdown.enabled = true;
+    docsContext.issueBreakdown.applyToLinear.enabled = false;
+    const docsCandidate = trackerIssue({
+      id: "issue-docs-apply-disabled-1",
+      identifier: "ENG-179",
+      state: "Todo",
+      labels: ["planning"],
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    });
+    const symphonyTracker = trackerClientFixture({ candidates: [], issues: [] });
+    const docsTracker = trackerClientFixture({ candidates: [docsCandidate], issues: [docsCandidate] });
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new PlanningRunRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: symphonyTracker,
+      trackerResolver: (projectContext) => (projectContext?.projectContextId === "docs" ? docsTracker : symphonyTracker),
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:ENG-179/planning-run/apply`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(401);
+      expect(body.error.code).toBe("invalid_request");
+      expect(body.error.message).toBe("Issue breakdown Linear application is disabled");
+      expect(symphonyTracker.requestedIds).toEqual([]);
+      expect(symphonyTracker.candidateFetchCount).toBe(0);
+      expect(docsTracker.requestedIds[0]).toEqual(["ENG-179"]);
+      expect(docsTracker.candidateFetchCount).toBe(1);
+      expect(harness.runs).toHaveLength(0);
     } finally {
       await orchestrator.stop();
       await server.stop();

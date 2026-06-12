@@ -1,17 +1,9 @@
 import type { Logger } from "../core/logging/StructuredLogger.js";
 import type { AgentRunRole, TrackerStateLists } from "../core/types.js";
 import type { ServiceConfig } from "../core/config/Config.js";
-import {
-  createCredentialProfileRegistry,
-  type CredentialCapability,
-  type CredentialRole,
-  type ResolvedCredential,
-} from "../core/config/CredentialProfiles.js";
-import {
-  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
-  normalizeProjectContextId,
-  type ProjectContextResolution,
-} from "../core/config/ProjectContexts.js";
+import { type CredentialCapability, type CredentialRole, type ResolvedCredential } from "../core/config/CredentialProfiles.js";
+import { type ProjectContextResolution } from "../core/config/ProjectContexts.js";
+import { resolveServiceConfigForProjectContext } from "../core/config/ProjectContextServiceConfig.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import { FileIssueLifecycleStore, type IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
 import type { IssueBreakdownIssueLookupResult } from "../core/writeback/WritebackOutbox.js";
@@ -79,45 +71,6 @@ export async function resolveIssueForBreakdownFreshness(
   } catch (error) {
     return { status: "transient_error", message: errorMessage(error) };
   }
-}
-
-export function resolveServiceConfigForProjectContext(
-  config: ServiceConfig,
-  projectContext?: ProjectContextResolution,
-): ServiceConfig {
-  if (!projectContext) return config;
-  const requestedProjectContextId = normalizeProjectContextId(projectContext.projectContextId);
-  const projectContextId =
-    requestedProjectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
-      ? config.projectContexts.defaultContextId
-      : requestedProjectContextId;
-  if (projectContextId === config.projectContexts.defaultContextId) return config;
-
-  const context = config.projectContexts.byId.get(projectContextId);
-  if (!context) {
-    throw new SymphonyError("config_validation_error", `Resolved project context "${projectContextId}" is not configured`);
-  }
-
-  return {
-    ...config,
-    tracker: context.tracker,
-    workspace: context.workspace,
-    github: context.github,
-    reviewLoop: context.reviewLoop,
-    issueBreakdown: context.issueBreakdown,
-    agent: context.agent,
-    credentialProfiles: createCredentialProfileRegistry({
-      raw: context.credentialProfiles,
-      env: config.environment,
-      workflowDir: config.workflowDir,
-      fallbacks: {
-        githubToken: context.github.token,
-        linearApiKey: context.tracker.apiKey,
-        cursorRuntimeApiKey: null,
-        openWorkspaceToken: config.server.openWorkspaceToken,
-      },
-    }),
-  };
 }
 
 export function createRuntimeWritebackClient(

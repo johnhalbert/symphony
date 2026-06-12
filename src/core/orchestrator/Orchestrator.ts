@@ -2,11 +2,14 @@ import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
   LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+  normalizeProjectContextId,
   projectContextResolutionFromIssue,
   resolveProjectContextForIssue,
   type ProjectContextResolution,
 } from "../config/ProjectContexts.js";
+import { resolveServiceConfigForProjectContext } from "../config/ProjectContextServiceConfig.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
@@ -170,6 +173,7 @@ export interface ContinuationSummaryCreationResult {
 
 export interface RunningEntry {
   issue: Issue;
+  projectContext: ProjectContextResolution | null;
   role: AgentRunRole;
   runPhase: AgentRunPhase;
   workspacePath: string | null;
@@ -225,7 +229,7 @@ interface ReviewerDispatchEvidence {
 }
 
 type WorkerDispatchDecision =
-  | { action: "dispatch"; runPhase: AgentRunPhase }
+  | { action: "dispatch"; runPhase: AgentRunPhase; projectContext?: ProjectContextResolution | undefined }
   | { action: "skip"; reason: string };
 
 export interface RetryEntry {
@@ -945,9 +949,6 @@ export class Orchestrator {
     if (gate) {
       throw new SymphonyError("conflict", providerGateDispatchBlockedMessage(gate));
     }
-    if (!this.config.issueBreakdown.enabled) {
-      throw new SymphonyError("invalid_request", "Issue breakdown planning is disabled");
-    }
     if (!this.options.lifecycleStore) {
       throw new SymphonyError("invalid_request", "Issue breakdown planning requires a lifecycle store");
     }
@@ -958,6 +959,11 @@ export class Orchestrator {
       allowCandidateIdentifierLookup: true,
     });
     if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    const projectContext = this.requestedProjectContextForIssue(issue, options.projectContext);
+    const config = this.configForProjectContext(projectContext);
+    if (!config.issueBreakdown.enabled) {
+      throw new SymphonyError("invalid_request", "Issue breakdown planning is disabled");
+    }
     if (this.running.has(issue.id)) throw new SymphonyError("conflict", "Issue already has a running Symphony agent");
     if (this.isMergeConflictState(issue.state)) {
       throw new SymphonyError("conflict", "Merge conflict states are only eligible for conflict-fix workers");
@@ -965,14 +971,14 @@ export class Orchestrator {
     if (!this.shouldDispatchWorker(issue, false, "issue_breakdown")) {
       throw new SymphonyError("conflict", "Issue is not currently eligible for worker dispatch");
     }
-    if (!(await this.lifecycleAllowsDispatch(issue, "worker", "issue_breakdown"))) {
+    if (!(await this.lifecycleAllowsDispatch(issue, "worker", "issue_breakdown", projectContext))) {
       throw new SymphonyError("conflict", "Issue lifecycle does not currently allow issue breakdown planning");
     }
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
-    if (latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) !== null) {
+    if (latestFreshIssueBreakdownPlan(lifecycle, issue, config) !== null) {
       return { queued: false, issue, reason: "fresh_plan_exists" };
     }
-    this.dispatchIssue(issue, null, "worker", null, "issue_breakdown");
+    this.dispatchIssue(issue, null, "worker", null, "issue_breakdown", projectContext ?? null);
     return { queued: true, issue, reason: "explicit_request" };
   }
 
@@ -980,9 +986,6 @@ export class Orchestrator {
     issueIdOrIdentifier: string,
     options: { dryRun?: boolean; projectContext?: ProjectContextResolution } = {},
   ) {
-    if (!this.config.issueBreakdown.enabled || !this.config.issueBreakdown.applyToLinear.enabled) {
-      throw new SymphonyError("invalid_request", "Issue breakdown Linear application is disabled");
-    }
     if (!this.options.lifecycleStore) {
       throw new SymphonyError("invalid_request", "Issue breakdown Linear application requires a lifecycle store");
     }
@@ -990,8 +993,13 @@ export class Orchestrator {
       allowCandidateIdentifierLookup: true,
     });
     if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    const projectContext = this.requestedProjectContextForIssue(issue, options.projectContext);
+    const config = this.configForProjectContext(projectContext);
+    if (!config.issueBreakdown.enabled || !config.issueBreakdown.applyToLinear.enabled) {
+      throw new SymphonyError("invalid_request", "Issue breakdown Linear application is disabled");
+    }
     const service = new IssueBreakdownPlanApplyService({
-      config: this.config,
+      config,
       lifecycleStore: this.options.lifecycleStore,
       writeback: this.options.writeback,
     });
@@ -1002,6 +1010,42 @@ export class Orchestrator {
     return this.options.trackerResolver?.(projectContext) ?? this.options.tracker;
   }
 
+  private configForProjectContext(projectContext?: ProjectContextResolution): ServiceConfig {
+    try {
+      return resolveServiceConfigForProjectContext(this.config, projectContext);
+    } catch (error) {
+      if (error instanceof SymphonyError && error.code === "config_validation_error") {
+        return this.config;
+      }
+      throw error;
+    }
+  }
+
+  private requestedProjectContextForIssue(
+    issue: Issue,
+    requestedProjectContext?: ProjectContextResolution,
+  ): ProjectContextResolution | undefined {
+    return requestedProjectContext ?? projectContextResolutionFromIssue(issue) ?? undefined;
+  }
+
+  private comparableProjectContextId(projectContext?: ProjectContextResolution | null): string | null {
+    if (!projectContext) return null;
+    const normalizedProjectContextId = normalizeProjectContextId(projectContext.projectContextId);
+    return normalizedProjectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+      ? this.config.projectContexts.defaultContextId
+      : normalizedProjectContextId;
+  }
+
+  private issueMatchesRequestedProjectContext(
+    issue: Issue,
+    requestedProjectContext?: ProjectContextResolution,
+  ): boolean {
+    if (!requestedProjectContext) return true;
+    const issueProjectContext = projectContextResolutionFromIssue(issue);
+    if (!issueProjectContext) return true;
+    return this.comparableProjectContextId(issueProjectContext) === this.comparableProjectContextId(requestedProjectContext);
+  }
+
   private async resolveTrackedIssue(
     issueIdOrIdentifier: string,
     projectContext: ProjectContextResolution | undefined,
@@ -1009,11 +1053,13 @@ export class Orchestrator {
   ): Promise<Issue | null> {
     const tracker = this.trackerClientForProjectContext(projectContext);
     const direct = (await tracker.fetchIssueStatesByIds([issueIdOrIdentifier]))[0] ?? null;
-    if (direct) return direct;
+    if (direct && this.issueMatchesRequestedProjectContext(direct, projectContext)) return direct;
     if (options.allowCandidateIdentifierLookup !== true) return null;
     return (
       (await tracker.fetchCandidateIssues()).find(
-        (candidate) => candidate.id === issueIdOrIdentifier || candidate.identifier === issueIdOrIdentifier,
+        (candidate) =>
+          (candidate.id === issueIdOrIdentifier || candidate.identifier === issueIdOrIdentifier) &&
+          this.issueMatchesRequestedProjectContext(candidate, projectContext),
       ) ?? null
     );
   }
@@ -1426,6 +1472,7 @@ export class Orchestrator {
     issue: Issue,
     role: AgentRunRole,
     runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
+    projectContext?: ProjectContextResolution,
   ): Promise<boolean> {
     const store = this.options.lifecycleStore;
     if (!store) return true;
@@ -1469,16 +1516,22 @@ export class Orchestrator {
     }
 
     if (role === "worker" && runPhase === "issue_breakdown") {
-      if (lifecycle.planningFailureCount >= this.config.issueBreakdown.maxPlanningFailures) {
+      const issueBreakdownConfig = this.configForProjectContext(
+        projectContext ?? lifecycle.projectContext ?? projectContextResolutionFromIssue(issue) ?? undefined,
+      );
+      if (lifecycle.planningFailureCount >= issueBreakdownConfig.issueBreakdown.maxPlanningFailures) {
         await this.escalateLifecycleBlocked(
           issue,
           lifecycle,
           lifecycle.summaryPointers.lastRunId ?? issue.id,
-          maxPlanningFailuresReason(lifecycle.planningFailureCount, this.config.issueBreakdown.maxPlanningFailures),
+          maxPlanningFailuresReason(
+            lifecycle.planningFailureCount,
+            issueBreakdownConfig.issueBreakdown.maxPlanningFailures,
+          ),
         );
         return false;
       }
-      if (planningBackoffRemainingMs(lifecycle, this.config) > 0) return false;
+      if (planningBackoffRemainingMs(lifecycle, issueBreakdownConfig) > 0) return false;
     }
     if (role === "worker" && runPhase === "merge_conflict_resolution") {
       if (!conflict || conflict.status !== "open") return false;
@@ -1652,11 +1705,13 @@ export class Orchestrator {
     role: AgentRunRole,
     reviewEvidence: ReviewerDispatchEvidence | null,
     runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
+    projectContext: ProjectContextResolution | null = null,
   ): void {
     const abortController = new AbortController();
     const retryAttempt = attempt ?? 0;
     const entry: RunningEntry = {
       issue,
+      projectContext,
       role,
       runPhase,
       workspacePath: null,
@@ -1745,7 +1800,9 @@ export class Orchestrator {
     try {
       entry.lifecycle ??= await this.options.lifecycleStore?.get(entry.issue.id) ?? null;
       const resolvedProjectContext =
-        entry.runPhase === "issue_breakdown" ? null : await this.resolveWorkerProjectContext(entry);
+        entry.runPhase === "issue_breakdown"
+          ? this.resolvedProjectContext(entry) ?? null
+          : await this.resolveWorkerProjectContext(entry);
       if (
         entry.runPhase !== "issue_breakdown" &&
         entry.lifecycle !== null &&
@@ -1762,7 +1819,10 @@ export class Orchestrator {
       await this.updateLifecycle(
         entry,
         entry.runPhase === "issue_breakdown"
-          ? { phase: phaseForIssueState(entry.issue.state, this.config) }
+          ? {
+              phase: phaseForIssueState(entry.issue.state, this.config),
+              ...(resolvedProjectContext === null ? {} : { projectContext: resolvedProjectContext }),
+            }
           : {
               phase: phaseForIssueState(entry.issue.state, this.config),
               ...(resolvedProjectContext === null ? {} : { projectContext: resolvedProjectContext }),
@@ -2743,7 +2803,8 @@ export class Orchestrator {
   }
 
   private resolvedProjectContext(entry: RunningEntry): ProjectContextResolution | undefined {
-    const resolvedFromLifecycleOrIssue = entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue);
+    const resolvedFromLifecycleOrIssue =
+      entry.projectContext ?? entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue);
     const defaultContext = this.config.projectContexts.defaultContext;
 
     if (resolvedFromLifecycleOrIssue) {
@@ -2806,16 +2867,18 @@ export class Orchestrator {
     attempt: number | null,
     turnNumber: number,
   ) {
+    const projectContext = this.resolvedProjectContext(entry);
+    const config = this.configForProjectContext(projectContext);
     return {
       issue: entry.issue,
-      projectContext: this.resolvedProjectContext(entry),
+      projectContext,
       role: entry.role,
       runPhase: entry.runPhase,
       attempt,
       workspace,
-      config: this.config,
+      config,
       turnNumber,
-      ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: this.config.issueBreakdown.cursorMode } : {}),
+      ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: config.issueBreakdown.cursorMode } : {}),
       abortSignal: entry.abortController.signal,
       logger: this.options.logger,
     };
@@ -3363,7 +3426,8 @@ export class Orchestrator {
   }
 
   private async renderIssueBreakdownPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
-    const basePrompt = await this.promptRenderer.render(this.config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
+    const config = this.configForProjectContext(this.resolvedProjectContext(entry));
+    const basePrompt = await this.promptRenderer.render(config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
     return [basePrompt, this.issueBreakdownMcpPrompt(entry)].join("\n");
   }
 
