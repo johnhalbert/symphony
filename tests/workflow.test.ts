@@ -1231,6 +1231,41 @@ Work on {{ issue.identifier }}.
     });
   });
 
+  it("parses handoff repair and Hermes merge-conflict session reuse policy", () => {
+    const base = { tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" } };
+    const defaults = parseServiceConfig(base, "/repo/WORKFLOW.md", { LINEAR_API_KEY: "secret" });
+    expect(defaults.handoffRepair).toEqual({
+      enabled: false,
+      maxAttempts: 1,
+      phases: ["implementation", "review", "issue_breakdown", "issue_triage", "merge_conflict_resolution"],
+    });
+    expect(defaults.hermes.mergeConflictSessionReuse).toBe("implementation_worker");
+
+    const configured = parseServiceConfig(
+      {
+        ...base,
+        handoff_repair: {
+          enabled: true,
+          max_attempts: 2,
+          phases: ["review", "merge_conflict_resolution"],
+        },
+        hermes: {
+          worker_session_lifecycle: "fresh_per_run",
+          merge_conflict_session_reuse: "fresh_per_run",
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+    expect(configured.handoffRepair).toEqual({
+      enabled: true,
+      maxAttempts: 2,
+      phases: ["review", "merge_conflict_resolution"],
+    });
+    expect(configured.hermes.workerSessionLifecycle).toBe("fresh_per_run");
+    expect(configured.hermes.mergeConflictSessionReuse).toBe("fresh_per_run");
+  });
+
   it("parses hermes_acp host harness defaults, overrides, and legacy compatibility aliases", () => {
     const config = parseServiceConfig(
       {
@@ -1374,6 +1409,7 @@ Work on {{ issue.identifier }}.
     const rawHermes = parsed.config.hermes as {
       model?: unknown;
       worker_session_lifecycle?: unknown;
+      merge_conflict_session_reuse?: unknown;
       keep_profiles?: unknown;
     } | undefined;
 
@@ -1401,8 +1437,15 @@ Work on {{ issue.identifier }}.
     });
     expect(rawHermes?.worker_session_lifecycle).toBe("reuse_by_issue");
     expect(config.hermes.workerSessionLifecycle).toBe(rawHermes?.worker_session_lifecycle);
+    expect(rawHermes?.merge_conflict_session_reuse).toBe("implementation_worker");
+    expect(config.hermes.mergeConflictSessionReuse).toBe(rawHermes?.merge_conflict_session_reuse);
     expect(rawHermes?.keep_profiles).toBe("always");
     expect(config.hermes.keepProfiles).toBe(rawHermes?.keep_profiles);
+    expect(config.handoffRepair).toEqual({
+      enabled: true,
+      maxAttempts: 1,
+      phases: ["implementation", "review", "issue_breakdown", "issue_triage", "merge_conflict_resolution"],
+    });
     expect(config.agent.workerExcludeLabels).toEqual(["review_only"]);
     expect(config.agent.protectedPaths).toContain("hermes/src/**");
     const expectedReasoningEffortByTemplate = new Map([

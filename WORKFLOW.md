@@ -62,6 +62,16 @@ issue_triage:
   mode: classify_only
   max_attempts_per_trigger: 1
 
+handoff_repair:
+  enabled: true
+  max_attempts: 1
+  phases:
+    - implementation
+    - review
+    - issue_breakdown
+    - issue_triage
+    - merge_conflict_resolution
+
 database:
   postgres:
     url: $SYMPHONY_POSTGRES_URL
@@ -125,6 +135,7 @@ hermes:
     providers:
       - openai-codex
   worker_session_lifecycle: reuse_by_issue
+  merge_conflict_session_reuse: implementation_worker
   keep_profiles: always
 
 server:

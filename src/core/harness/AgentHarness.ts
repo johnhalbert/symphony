@@ -5,6 +5,21 @@ import type { RunActivityEvent } from "../runActivity/RunActivityEvent.js";
 import type { AgentRunPhase, AgentRunRole, Issue, TokenCounts, Workspace } from "../types.js";
 
 export type AgentRunMode = "agent" | "plan";
+export type AgentHandoffRepairKind =
+  | "completion_report"
+  | "review_verdict"
+  | "issue_breakdown_plan"
+  | "issue_triage_report"
+  | "merge_conflict_resolution";
+export type AgentHermesResumeReason = "handoff_repair" | "merge_conflict_original_worker";
+
+export interface AgentHermesResumeContext {
+  sourceRunId: string;
+  reason: AgentHermesResumeReason;
+  profileKey: string;
+  profileDir: string;
+  sessionKey: string;
+}
 
 export interface AgentHarnessCapabilities {
   readonly mcpHandoff?: boolean;
@@ -27,6 +42,12 @@ export interface AgentRunContext {
     messageId: string;
     statusServer?: OperatorChatRunContext["statusServer"];
   };
+  handoffRepair?: {
+    sourceRunId: string;
+    kind: AgentHandoffRepairKind;
+    attempt: number;
+  } | null;
+  hermesResume?: AgentHermesResumeContext | null;
   abortSignal: AbortSignal;
   logger: Logger;
 }

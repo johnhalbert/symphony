@@ -43,6 +43,7 @@ import {
   type IssueBreakdownCreatedIssueRef,
   type IssueBreakdownPlanRecord,
   type IssueLifecyclePatch,
+  type IssueMergeConflictMetadata,
   type IssueReviewFeedbackRecord,
   type IssueReviewVerdictRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
@@ -4638,6 +4639,180 @@ describe("Orchestrator", () => {
     expect(prompt).not.toContain("writeback/outbox");
   });
 
+  it("repairs a missing reviewer verdict by resuming the Hermes source session once", async () => {
+    const config = testConfig(root);
+    config.handoffRepair.enabled = true;
+    config.handoffRepair.phases = ["review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    config.writeback.enabled = true;
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("In Review") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    await runStore.startRun({
+      runId: report.runId,
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    const harness = new MissingReviewVerdictThenRepairHarness(lifecycleStore, outboxStore, runStore);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2, "review handoff repair dispatch");
+    await orchestrator.stop();
+
+    expect(harness.runs.map((run) => [run.runId, run.ctx.handoffRepair?.kind ?? null])).toEqual([
+      ["review-source-run-1", null],
+      ["review-repair-run-1", "review_verdict"],
+    ]);
+    expect(harness.runs[1]?.ctx.hermesResume).toMatchObject({
+      sourceRunId: "review-source-run-1",
+      reason: "handoff_repair",
+      profileKey: "review-source-profile",
+      sessionKey: "review-source-session-key",
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      lastReviewVerdictId: "review-verdict:issue-1:review-repair-verdict",
+      reviewVerdicts: [
+        {
+          runId: "review-repair-run-1",
+          verdict: "fail",
+        },
+      ],
+    });
+    await expect(runStore.getRun("review-repair-run-1")).resolves.toMatchObject({
+      status: "succeeded",
+      handoffRepairSourceRunId: "review-source-run-1",
+      handoffRepairKind: "review_verdict",
+      handoffRepairAttempt: 1,
+      hermesResumeSourceRunId: "review-source-run-1",
+      hermesResumeReason: "handoff_repair",
+    });
+  });
+
+  it("dispatches merge-conflict repair with the original implementation worker Hermes session", async () => {
+    const config = testConfig(root);
+    config.agent.harness = "hermes";
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.conflictsState = "Merge Conflicts";
+    config.hermes.workerSessionLifecycle = "reuse_by_issue";
+    config.hermes.mergeConflictSessionReuse = "implementation_worker";
+    const candidate = issue({ state: "Merge Conflicts", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "merge_conflict_resolution",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      mergeConflict: openMergeConflict(candidate),
+    });
+    await runStore.startRun({
+      runId: report.runId,
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      runPhase: "implementation",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      harnessId: "hermes",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    await runStore.updateRun(report.runId, {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      metadata: {
+        hermesProfileKey: "implementation-profile",
+        hermesProfileDir: path.join(config.hermes.stateDir, "profiles", "implementation-profile"),
+        hermesSessionKey: "implementation-session-key",
+      },
+    });
+    const harness = new ContextRecordingHermesHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "merge conflict repair dispatch");
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx.runPhase).toBe("merge_conflict_resolution");
+    expect(harness.runs[0]?.ctx.hermesResume).toMatchObject({
+      sourceRunId: report.runId,
+      reason: "merge_conflict_original_worker",
+      profileKey: "implementation-profile",
+      sessionKey: "implementation-session-key",
+    });
+    expect(harness.runs[0]?.prompt).toContain("submit_merge_conflict_resolution");
+  });
+
   it("processes a live fail verdict submitted by a reviewer harness run", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
@@ -6574,6 +6749,39 @@ function completionReportRecord(candidate = issue()): IssueCompletionReportRecor
   };
 }
 
+function openMergeConflict(candidate = issue()): IssueMergeConflictMetadata {
+  return {
+    id: `merge-conflict:${candidate.id}:42`,
+    status: "open",
+    resolutionStatus: "still_conflicted",
+    pullRequest: {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "conflict-head",
+      branch: candidate.branchName,
+    },
+    approvedHeadSha: "approved-head",
+    currentHeadSha: "conflict-head",
+    resolvedHeadSha: null,
+    baseBranch: "main",
+    baseHeadSha: "base-head",
+    sourceState: "Ready to Merge",
+    conflictsState: "Merge Conflicts",
+    reason: "merge conflicts",
+    mergeableState: "dirty",
+    detectedAt: "2026-01-01T00:00:03.000Z",
+    updatedAt: "2026-01-01T00:00:03.000Z",
+    fixTurnCount: 0,
+    maxFixTurns: 3,
+    lastConflictFixRunId: null,
+    lastConflictResolutionReportId: null,
+    attemptRunIds: [],
+    writebackOperationKeys: [],
+    blockedAt: null,
+    blockedReason: null,
+  };
+}
+
 async function appendApprovalFeedback(
   lifecycleStore: FileIssueLifecycleStore,
   candidate: Issue,
@@ -8030,6 +8238,81 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
         phase: "review",
       },
     );
+    yield { type: "completed" };
+  }
+}
+
+class MissingReviewVerdictThenRepairHarness implements AgentHarness {
+  readonly id = "hermes";
+  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string; runId: string }> = [];
+
+  constructor(
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly outboxStore: FileWritebackOutboxStore,
+    private readonly runStore: FileRunTranscriptStore,
+  ) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    const isRepair = ctx.handoffRepair?.kind === "review_verdict";
+    const runId = isRepair ? "review-repair-run-1" : "review-source-run-1";
+    this.runs.push({ ctx, prompt, runId });
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    await this.runStore.updateRun(runId, {
+      metadata: {
+        hermesProfileKey: isRepair ? "review-source-profile" : "review-source-profile",
+        hermesProfileDir: path.join(ctx.config.hermes.stateDir, "profiles", "review-source-profile"),
+        hermesSessionKey: isRepair ? "review-repair-session-key" : "review-source-session-key",
+        hermesResumeSourceRunId: ctx.hermesResume?.sourceRunId ?? null,
+        hermesResumeReason: ctx.hermesResume?.reason ?? null,
+        handoffRepairSourceRunId: ctx.handoffRepair?.sourceRunId ?? null,
+        handoffRepairKind: ctx.handoffRepair?.kind ?? null,
+        handoffRepairAttempt: ctx.handoffRepair?.attempt ?? null,
+      },
+    });
+    if (isRepair) {
+      await new ReviewVerdictService({
+        config: ctx.config,
+        lifecycleStore: this.lifecycleStore,
+        writebackOutbox: this.outboxStore,
+        runStore: this.runStore,
+      }).submitReviewVerdict(
+        {
+          runId,
+          issueId: ctx.issue.id,
+          verdict: "fail",
+          acceptanceResults: [
+            {
+              text: "Reviewer handoff repair submits the missing verdict.",
+              satisfied: false,
+              evidence: "Repair run resumed the reviewer session and submitted this verdict.",
+            },
+          ],
+          findings: ["Repair path submitted the previously missing verdict."],
+          evidence: ["handoff repair test"],
+          idempotencyKey: "review-repair-verdict",
+        },
+        {
+          issue: ctx.issue,
+          activeRunId: runId,
+          role: "reviewer",
+          reviewer: `${runId}-session`,
+          phase: "review",
+        },
+      );
+    }
+    yield { type: "completed" };
+  }
+}
+
+class ContextRecordingHermesHarness implements AgentHarness {
+  readonly id = "hermes";
+  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    yield { type: "session_started", sessionId: `context-session-${this.runs.length}`, runId: `context-run-${this.runs.length}` };
     yield { type: "completed" };
   }
 }

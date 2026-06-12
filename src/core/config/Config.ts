@@ -2,7 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { SymphonyError } from "../errors.js";
-import type { IssueBoardColumnId, IssueBoardColumnMapping } from "../types.js";
+import type { AgentRunPhase, IssueBoardColumnId, IssueBoardColumnMapping } from "../types.js";
 import {
   createCredentialProfileRegistry,
   rawCredentialProfilesSchema,
@@ -136,6 +136,18 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    handoff_repair: z
+      .object({
+        enabled: z.boolean().optional(),
+        max_attempts: z.number().int().positive().optional(),
+        phases: z
+          .array(
+            z.enum(["implementation", "review", "issue_breakdown", "issue_triage", "merge_conflict_resolution"]),
+          )
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
     polling: z
       .object({
         interval_ms: z.number().int().positive().optional(),
@@ -226,6 +238,7 @@ const rawConfigSchema = z
         model: z.string().optional(),
         provider: z.string().optional(),
         worker_session_lifecycle: z.enum(["fresh_per_run", "reuse_by_issue"]).optional(),
+        merge_conflict_session_reuse: z.enum(["fresh_per_run", "implementation_worker"]).optional(),
         keep_profiles: z.enum(["always", "failed", "never"]).optional(),
         startup_timeout_ms: z.number().int().positive().optional(),
         request_timeout_ms: z.number().int().positive().optional(),
@@ -409,6 +422,7 @@ export interface CursorModelParameter {
 }
 
 export type HermesWorkerSessionLifecycle = "fresh_per_run" | "reuse_by_issue";
+export type HermesMergeConflictSessionReuse = "fresh_per_run" | "implementation_worker";
 export type HermesProfileRetention = "always" | "failed" | "never";
 
 export interface HermesRoleTemplatesConfig {
@@ -440,6 +454,7 @@ export interface HermesConfig {
   model: string | null;
   provider: string | null;
   workerSessionLifecycle: HermesWorkerSessionLifecycle;
+  mergeConflictSessionReuse: HermesMergeConflictSessionReuse;
   keepProfiles: HermesProfileRetention;
   startupTimeoutMs: number;
   requestTimeoutMs: number;
@@ -582,6 +597,12 @@ export interface IssueTriageConfig {
   maxAttemptsPerTrigger: number;
 }
 
+export interface HandoffRepairConfig {
+  enabled: boolean;
+  maxAttempts: number;
+  phases: AgentRunPhase[];
+}
+
 export interface IssueBoardConfig {
   columns: IssueBoardColumnMapping;
 }
@@ -610,6 +631,7 @@ export interface ServiceConfig {
   database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
   issueTriage: IssueTriageConfig;
+  handoffRepair: HandoffRepairConfig;
   raw: RawWorkflowConfig;
 }
 
@@ -635,6 +657,13 @@ const DEFAULT_HERMES_SHUTDOWN_GRACE_MS = 2_000;
 const DEFAULT_HERMES_WORKER_SESSION_LIFECYCLE: HermesWorkerSessionLifecycle = "reuse_by_issue";
 const DEFAULT_HERMES_PROFILE_RETENTION: HermesProfileRetention = "failed";
 const DEFAULT_HERMES_ACP_PROFILE_PREFIX = "symphony";
+const DEFAULT_HANDOFF_REPAIR_PHASES: AgentRunPhase[] = [
+  "implementation",
+  "review",
+  "issue_breakdown",
+  "issue_triage",
+  "merge_conflict_resolution",
+];
 const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
   "Break down {{ issue.identifier }} before implementation.",
   "",
@@ -811,6 +840,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const hermesModel = normalizeOptionalConfigString(resolveConfigString(raw.hermes?.model, env));
   const hermesProvider = normalizeOptionalConfigString(resolveConfigString(raw.hermes?.provider, env));
   const hermesWorkerSessionLifecycle = raw.hermes?.worker_session_lifecycle ?? DEFAULT_HERMES_WORKER_SESSION_LIFECYCLE;
+  const hermesMergeConflictSessionReuse =
+    raw.hermes?.merge_conflict_session_reuse ??
+    (hermesWorkerSessionLifecycle === "reuse_by_issue" ? "implementation_worker" : "fresh_per_run");
   const hermesKeepProfiles = raw.hermes?.keep_profiles ?? DEFAULT_HERMES_PROFILE_RETENTION;
   const hermesStartupTimeoutMs = raw.hermes?.startup_timeout_ms ?? DEFAULT_HERMES_STARTUP_TIMEOUT_MS;
   const hermesRequestTimeoutMs = raw.hermes?.request_timeout_ms ?? DEFAULT_HERMES_REQUEST_TIMEOUT_MS;
@@ -940,6 +972,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       model: hermesModel,
       provider: hermesProvider,
       workerSessionLifecycle: hermesWorkerSessionLifecycle,
+      mergeConflictSessionReuse: hermesMergeConflictSessionReuse,
       keepProfiles: hermesKeepProfiles,
       startupTimeoutMs: hermesStartupTimeoutMs,
       requestTimeoutMs: hermesRequestTimeoutMs,
@@ -1032,6 +1065,11 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       enabled: raw.issue_triage?.enabled ?? false,
       mode: raw.issue_triage?.mode ?? "classify_only",
       maxAttemptsPerTrigger: raw.issue_triage?.max_attempts_per_trigger ?? 1,
+    },
+    handoffRepair: {
+      enabled: raw.handoff_repair?.enabled ?? false,
+      maxAttempts: raw.handoff_repair?.max_attempts ?? 1,
+      phases: [...(raw.handoff_repair?.phases ?? DEFAULT_HANDOFF_REPAIR_PHASES)],
     },
     raw,
   };

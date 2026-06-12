@@ -135,6 +135,66 @@ describe("HermesHarness", () => {
     expect(clients[1]?.killed).toContain("hermes.run_finished");
   });
 
+  it("resumes an explicit Hermes session with current phase MCP tools", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const harness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`);
+        clients.push(client);
+        return client;
+      },
+    });
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "implementation"));
+    const profile = JSON.parse(
+      await readFile(path.join(clients[0]!.env.hermesHome, ".symphony-hermes-profile.json"), "utf8"),
+    ) as { profileKey: string };
+
+    await collect(
+      harness.run(
+        {
+          ...context(config, {
+            workspacePath,
+            runPhase: "merge_conflict_resolution",
+            turnNumber: 2,
+          }),
+          hermesResume: {
+            sourceRunId: "implementation-run-1",
+            reason: "merge_conflict_original_worker",
+            profileKey: profile.profileKey,
+            profileDir: clients[0]!.env.hermesHome,
+            sessionKey: "hermes-gw-1",
+          },
+        },
+        "resolve conflicts",
+      ),
+    );
+
+    expect(clients).toHaveLength(2);
+    expect(clients[1]?.env.hermesHome).toBe(clients[0]?.env.hermesHome);
+    expect(clients[1]?.requests).toContainEqual({
+      method: "session.resume",
+      params: { cols: 120, session_id: "hermes-gw-1" },
+    });
+    const resumedConfig = YAML.parse(await readFile(path.join(clients[1]!.env.hermesHome, "config.yaml"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(resumedConfig).toMatchObject({
+      mcp_servers: {
+        symphony_conflicts: {
+          command: process.execPath,
+        },
+      },
+    });
+    expect((resumedConfig.mcp_servers as Record<string, unknown>).symphony).toBeUndefined();
+  });
+
   it("stops before creating a session when Hermes setup reports no provider configured", async () => {
     const clients: FakeGatewayClient[] = [];
     const harness = new HermesHarness({
@@ -765,7 +825,7 @@ function context(
   input: {
     workspacePath: string;
     role?: "worker" | "reviewer";
-    runPhase?: "implementation" | "review";
+    runPhase?: "implementation" | "review" | "merge_conflict_resolution";
     turnNumber: number;
   },
 ): AgentRunContext {

@@ -5,7 +5,9 @@ import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
   AgentEvent,
+  AgentHandoffRepairKind,
   AgentHarness,
+  AgentHermesResumeContext,
   AgentRunSdkStatus,
   OperatorChatRunContext,
 } from "../harness/AgentHarness.js";
@@ -204,6 +206,12 @@ export interface RunningEntry {
   pullRequestHandoffAccepted: boolean;
   reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
+  handoffRepair: {
+    sourceRunId: string;
+    kind: AgentHandoffRepairKind;
+    attempt: number;
+  } | null;
+  hermesResume: AgentHermesResumeContext | null;
   cancellationRequestedAt: Date | null;
   cancellationSource: RunCancellationSource | null;
   cancellationReason: string | null;
@@ -246,6 +254,7 @@ type AcceptedHandoffKind =
   | "issue_breakdown_plan"
   | "issue_triage_report"
   | "merge_conflict_resolution";
+type RepairableHandoffKind = AgentHandoffRepairKind;
 
 interface OperatorChatQueueEntry {
   conversationId: string;
@@ -1677,8 +1686,10 @@ export class Orchestrator {
     return this.config.issueBreakdown.planningLabels.some((label) => labels.has(label));
   }
 
-  private isMergeConflictState(_state: string): boolean {
-    return false;
+  private isMergeConflictState(state: string): boolean {
+    return this.config.mergePolicy.mode === "gated" && this.config.mergePolicy.conflictsState !== null
+      ? isStateIn(state, [this.config.mergePolicy.conflictsState])
+      : false;
   }
 
   private dispatchIssue(
@@ -1727,6 +1738,8 @@ export class Orchestrator {
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence,
+      handoffRepair: null,
+      hermesResume: null,
       cancellationRequestedAt: null,
       cancellationSource: null,
       cancellationReason: null,
@@ -1805,6 +1818,9 @@ export class Orchestrator {
       if (entry.runPhase !== "issue_breakdown") {
         await this.options.workspaceManager.beforeRun(workspace.path);
       }
+      if (entry.runPhase === "merge_conflict_resolution" && entry.hermesResume === null) {
+        entry.hermesResume = await this.resolveMergeConflictOriginalWorkerResume(entry);
+      }
       await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, 1));
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, 1));
 
@@ -1818,6 +1834,7 @@ export class Orchestrator {
           attempt,
           turnNumber: 1,
         });
+        await this.runHandoffRepairIfNeeded(entry, workspace, attempt, 2);
         return;
       }
 
@@ -1845,6 +1862,8 @@ export class Orchestrator {
           attempt,
           turnNumber,
         });
+        const repair = await this.runHandoffRepairIfNeeded(entry, workspace, attempt, turnNumber + 1);
+        if (repair.attempted) break;
         if (entry.completionReportAccepted || entry.mergeConflictResolutionAccepted) break;
         if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) break;
 
@@ -1935,6 +1954,7 @@ export class Orchestrator {
         attempt: null,
         turnNumber: 1,
       });
+      await this.runHandoffRepairIfNeeded(entry, workspace, null, 2);
     } finally {
       if (workspace) {
         await this.options.workspaceManager.afterRun(workspace.path);
@@ -1980,6 +2000,7 @@ export class Orchestrator {
         attempt: null,
         turnNumber: 1,
       });
+      await this.runHandoffRepairIfNeeded(entry, workspace, null, 2);
     } finally {
       if (workspace) {
         await this.options.workspaceManager.afterRun(workspace.path);
@@ -2856,9 +2877,227 @@ export class Orchestrator {
       config: this.config,
       turnNumber,
       ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: this.config.issueBreakdown.cursorMode } : {}),
+      ...(entry.handoffRepair === null ? {} : { handoffRepair: entry.handoffRepair }),
+      ...(entry.hermesResume === null ? {} : { hermesResume: entry.hermesResume }),
       abortSignal: entry.abortController.signal,
       logger: this.options.logger,
     };
+  }
+
+  private async runHandoffRepairIfNeeded(
+    entry: RunningEntry,
+    workspace: Workspace,
+    attempt: number | null,
+    turnNumber: number,
+  ): Promise<{ attempted: boolean; accepted: boolean }> {
+    if (entry.handoffRepair !== null) return { attempted: false, accepted: false };
+    const kind = await this.missingRepairableHandoffKind(entry);
+    if (kind === null) return { attempted: false, accepted: false };
+    if (!this.isHandoffRepairEnabled(kind)) return { attempted: false, accepted: false };
+    const sourceRunId = entry.activeRunId ?? entry.runId;
+    if (!sourceRunId) return { attempted: false, accepted: false };
+    const resume = await this.resolveHandoffRepairHermesResume(entry, sourceRunId, kind);
+    if (resume === null) return { attempted: false, accepted: false };
+    const repairAttempt = await this.nextHandoffRepairAttempt(entry, sourceRunId, kind);
+    if (repairAttempt === null) return { attempted: false, accepted: false };
+
+    entry.handoffRepair = { sourceRunId, kind, attempt: repairAttempt };
+    entry.hermesResume = resume;
+    entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    const prompt = this.renderHandoffRepairPrompt(entry, kind, sourceRunId, repairAttempt);
+    await this.options.runStore?.appendEvent({
+      runId: sourceRunId,
+      at: new Date().toISOString(),
+      source: "orchestrator",
+      eventType: "handoff_repair_dispatched",
+      message: `Dispatching MCP handoff repair for ${formatRepairableHandoffKind(kind)}`,
+      payload: {
+        kind,
+        repairAttempt,
+        maxAttempts: this.config.handoffRepair.maxAttempts,
+      },
+    });
+    this.options.logger.warn("dispatching MCP handoff repair", {
+      issue_id: entry.issue.id,
+      issue_identifier: entry.issue.identifier,
+      source_run_id: sourceRunId,
+      kind,
+      repair_attempt: repairAttempt,
+    });
+    await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, turnNumber));
+    await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, turnNumber));
+    await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, attempt, turnNumber), prompt), {
+      workspace,
+      prompt,
+      attempt,
+      turnNumber,
+    });
+    const accepted = await this.reconcileRepairableHandoff(entry, kind);
+    if (!accepted) {
+      this.options.logger.warn("MCP handoff repair finished without required handoff", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        source_run_id: sourceRunId,
+        repair_run_id: entry.activeRunId ?? entry.runId,
+        kind,
+        repair_attempt: repairAttempt,
+      });
+    }
+    return { attempted: true, accepted };
+  }
+
+  private async missingRepairableHandoffKind(entry: RunningEntry): Promise<RepairableHandoffKind | null> {
+    if (entry.role === "triage") {
+      return entry.issueTriageReportAccepted || (await this.reconcileIssueTriageHandoff(entry))
+        ? null
+        : "issue_triage_report";
+    }
+    if (entry.role === "reviewer") {
+      return entry.reviewVerdictAccepted || (await this.reconcileReviewVerdictHandoff(entry)) ? null : "review_verdict";
+    }
+    if (entry.role !== "worker") return null;
+    if (entry.runPhase === "issue_breakdown") {
+      return entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry))
+        ? null
+        : "issue_breakdown_plan";
+    }
+    if (entry.runPhase === "merge_conflict_resolution") {
+      return entry.mergeConflictResolutionAccepted || (await this.reconcileMergeConflictResolutionHandoff(entry))
+        ? null
+        : "merge_conflict_resolution";
+    }
+    return (await this.reconcileCompletionReportHandoff(entry)) || entry.completionReportAccepted || entry.pullRequestHandoffAccepted
+      ? null
+      : "completion_report";
+  }
+
+  private async reconcileRepairableHandoff(entry: RunningEntry, kind: RepairableHandoffKind): Promise<boolean> {
+    switch (kind) {
+      case "completion_report":
+        return (await this.reconcileCompletionReportHandoff(entry)) || entry.completionReportAccepted || entry.pullRequestHandoffAccepted;
+      case "review_verdict":
+        return entry.reviewVerdictAccepted || (await this.reconcileReviewVerdictHandoff(entry));
+      case "issue_breakdown_plan":
+        return entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
+      case "issue_triage_report":
+        return entry.issueTriageReportAccepted || (await this.reconcileIssueTriageHandoff(entry));
+      case "merge_conflict_resolution":
+        return entry.mergeConflictResolutionAccepted || (await this.reconcileMergeConflictResolutionHandoff(entry));
+    }
+  }
+
+  private isHandoffRepairEnabled(kind: RepairableHandoffKind): boolean {
+    return (
+      this.config.handoffRepair.enabled &&
+      this.config.handoffRepair.maxAttempts > 0 &&
+      this.config.handoffRepair.phases.includes(phaseForRepairableHandoffKind(kind))
+    );
+  }
+
+  private async resolveHandoffRepairHermesResume(
+    entry: RunningEntry,
+    sourceRunId: string,
+    kind: RepairableHandoffKind,
+  ): Promise<AgentHermesResumeContext | null> {
+    if (this.options.harness.id !== "hermes") return null;
+    const sourceRun = await this.options.runStore?.getRun(sourceRunId);
+    if (!sourceRun || sourceRun.harnessId !== "hermes" || sourceRun.handoffRepairSourceRunId) return null;
+    const resume = hermesResumeContextFromRun(sourceRun, "handoff_repair");
+    if (resume === null) {
+      this.options.logger.warn("MCP handoff repair skipped because source run is not resumable", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        source_run_id: sourceRunId,
+        kind,
+      });
+    }
+    return resume;
+  }
+
+  private async nextHandoffRepairAttempt(
+    entry: RunningEntry,
+    sourceRunId: string,
+    kind: RepairableHandoffKind,
+  ): Promise<number | null> {
+    const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id)) ?? [];
+    const priorAttempts = runs.filter(
+      (run) => run.handoffRepairSourceRunId === sourceRunId && run.handoffRepairKind === kind,
+    ).length;
+    if (priorAttempts >= this.config.handoffRepair.maxAttempts) return null;
+    return priorAttempts + 1;
+  }
+
+  private renderHandoffRepairPrompt(
+    entry: RunningEntry,
+    kind: RepairableHandoffKind,
+    sourceRunId: string,
+    repairAttempt: number,
+  ): string {
+    return [
+      "Symphony MCP handoff repair:",
+      `- Issue: ${entry.issue.identifier} (${entry.issue.id})`,
+      `- Source run: ${sourceRunId}`,
+      `- Repair attempt: ${repairAttempt} / ${this.config.handoffRepair.maxAttempts}`,
+      `- Missing required handoff: ${formatRepairableHandoffKind(kind)}`,
+      `- Required tool: ${repairToolName(kind)}`,
+      "",
+      "You are resuming the same Hermes session only to complete the missing Symphony MCP handoff.",
+      "Use the findings and conclusion already present in this session. Do not perform broad new investigation, edit files, create commits, push branches, transition Linear state, or write directly to GitHub/Linear.",
+      "Call the required MCP tool now, then stop. If the prior findings are insufficient for a confident success report, submit the safest valid fail/blocked/still-conflicted disposition the tool supports and include that limitation in the evidence.",
+      "",
+      this.repairMcpPrompt(entry, kind),
+    ].join("\n");
+  }
+
+  private repairMcpPrompt(entry: RunningEntry, kind: RepairableHandoffKind): string {
+    switch (kind) {
+      case "completion_report":
+        return this.workerMcpPrompt(entry) ?? "";
+      case "review_verdict": {
+        this.requireMcpHandoff("review");
+        const workspace = entry.workspace;
+        return renderReviewMcpHandoffPrompt({
+          issue: entry.issue,
+          role: entry.role,
+          workspacePath: workspace?.path ?? entry.workspacePath,
+          branchName: workspace?.gitBranchName ?? entry.issue.branchName ?? null,
+          repoPath: workspace?.repoPath ?? null,
+          baseRef: workspace?.baseRef ?? null,
+        });
+      }
+      case "issue_breakdown_plan":
+        return this.issueBreakdownMcpPrompt(entry);
+      case "issue_triage_report":
+        return this.issueTriageMcpPrompt(entry);
+      case "merge_conflict_resolution":
+        return this.mergeConflictResolutionMcpPrompt(entry) ?? "";
+    }
+  }
+
+  private async resolveMergeConflictOriginalWorkerResume(entry: RunningEntry): Promise<AgentHermesResumeContext | null> {
+    if (this.options.harness.id !== "hermes") return null;
+    if (this.config.hermes.mergeConflictSessionReuse !== "implementation_worker") return null;
+    if (this.config.hermes.workerSessionLifecycle !== "reuse_by_issue") return null;
+    const runStore = this.options.runStore;
+    if (!runStore) return null;
+    const lifecycle = entry.lifecycle ?? (await this.options.lifecycleStore?.get(entry.issue.id)) ?? null;
+    const reportRunId = lifecycle ? latestCompletionReport(lifecycle)?.runId ?? null : null;
+    const reportRun = reportRunId ? await runStore.getRun(reportRunId) : null;
+    const fallbackRun =
+      reportRun ??
+      [...(await runStore.listRunsForIssue(entry.issue.id))]
+        .reverse()
+        .find((run) => run.role === "worker" && run.runPhase === "implementation" && run.status === "succeeded") ??
+      null;
+    const resume = fallbackRun ? hermesResumeContextFromRun(fallbackRun, "merge_conflict_original_worker") : null;
+    if (fallbackRun && resume === null) {
+      this.options.logger.warn("merge conflict worker session reuse skipped because implementation run is not resumable", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        implementation_run_id: fallbackRun.runId,
+      });
+    }
+    return resume;
   }
 
   private applyTokenUpdate(entry: RunningEntry, tokens: Partial<TokenCounts>): void {
@@ -3956,6 +4195,58 @@ function isLifecycleHumanBlocked(lifecycle: IssueLifecycleRecord | null): boolea
 
 function hasOpenBlocker(issue: Issue, terminalStates: string[]): boolean {
   return issue.blockedBy.some((blocker) => blocker.state === null || !isStateIn(blocker.state, terminalStates));
+}
+
+function hermesResumeContextFromRun(run: RunRecord, reason: AgentHermesResumeContext["reason"]): AgentHermesResumeContext | null {
+  const profileKey = nonEmptyString(run.hermesProfileKey);
+  const profileDir = nonEmptyString(run.hermesProfileDir);
+  const sessionKey = nonEmptyString(run.hermesSessionKey);
+  if (!profileKey || !profileDir || !sessionKey) return null;
+  return {
+    sourceRunId: run.runId,
+    reason,
+    profileKey,
+    profileDir,
+    sessionKey,
+  };
+}
+
+function phaseForRepairableHandoffKind(kind: RepairableHandoffKind): AgentRunPhase {
+  switch (kind) {
+    case "completion_report":
+      return "implementation";
+    case "review_verdict":
+      return "review";
+    case "issue_breakdown_plan":
+      return "issue_breakdown";
+    case "issue_triage_report":
+      return "issue_triage";
+    case "merge_conflict_resolution":
+      return "merge_conflict_resolution";
+  }
+}
+
+function formatRepairableHandoffKind(kind: RepairableHandoffKind): string {
+  return kind.replace(/_/g, " ");
+}
+
+function repairToolName(kind: RepairableHandoffKind): string {
+  switch (kind) {
+    case "completion_report":
+      return "submit_completion_report";
+    case "review_verdict":
+      return "submit_review_verdict";
+    case "issue_breakdown_plan":
+      return "submit_issue_breakdown_plan";
+    case "issue_triage_report":
+      return "submit_issue_triage_report";
+    case "merge_conflict_resolution":
+      return "submit_merge_conflict_resolution";
+  }
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
 function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {

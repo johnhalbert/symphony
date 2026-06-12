@@ -133,6 +133,18 @@ export interface RunMetadata {
   pendingApprovalRequestedAt?: string | null;
   providerLimit?: ProviderLimitSignal | null;
   commandPolicy?: PersistedCommandPolicyReplayState;
+  hermesProfileKey?: string | null;
+  hermesProfileDir?: string | null;
+  hermesTemplateDir?: string | null;
+  hermesGatewaySessionId?: string | null;
+  hermesSessionKey?: string | null;
+  hermesSessionResumed?: boolean;
+  hermesSessionReusable?: boolean;
+  hermesResumeSourceRunId?: string | null;
+  hermesResumeReason?: string | null;
+  handoffRepairSourceRunId?: string | null;
+  handoffRepairKind?: string | null;
+  handoffRepairAttempt?: number | null;
 }
 
 export interface RunRecord {
@@ -204,6 +216,18 @@ export interface RunRecord {
   pendingApprovalRequestedAt?: string | null;
   providerLimit?: ProviderLimitSignal | null;
   commandPolicy?: PersistedCommandPolicyReplayState;
+  hermesProfileKey?: string | null;
+  hermesProfileDir?: string | null;
+  hermesTemplateDir?: string | null;
+  hermesGatewaySessionId?: string | null;
+  hermesSessionKey?: string | null;
+  hermesSessionResumed?: boolean;
+  hermesSessionReusable?: boolean;
+  hermesResumeSourceRunId?: string | null;
+  hermesResumeReason?: string | null;
+  handoffRepairSourceRunId?: string | null;
+  handoffRepairKind?: string | null;
+  handoffRepairAttempt?: number | null;
 }
 
 export interface TranscriptEvent {
@@ -864,6 +888,18 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.pendingApprovalRequestedAt === undefined ? {} : { pendingApprovalRequestedAt: metadata.pendingApprovalRequestedAt }),
     ...(metadata.providerLimit === undefined ? {} : { providerLimit: metadata.providerLimit }),
     ...(metadata.commandPolicy === undefined ? {} : { commandPolicy: commandPolicyReplayStateFromExisting(metadata.commandPolicy) }),
+    ...(metadata.hermesProfileKey === undefined ? {} : { hermesProfileKey: metadata.hermesProfileKey }),
+    ...(metadata.hermesProfileDir === undefined ? {} : { hermesProfileDir: metadata.hermesProfileDir }),
+    ...(metadata.hermesTemplateDir === undefined ? {} : { hermesTemplateDir: metadata.hermesTemplateDir }),
+    ...(metadata.hermesGatewaySessionId === undefined ? {} : { hermesGatewaySessionId: metadata.hermesGatewaySessionId }),
+    ...(metadata.hermesSessionKey === undefined ? {} : { hermesSessionKey: metadata.hermesSessionKey }),
+    ...(metadata.hermesSessionResumed === undefined ? {} : { hermesSessionResumed: metadata.hermesSessionResumed }),
+    ...(metadata.hermesSessionReusable === undefined ? {} : { hermesSessionReusable: metadata.hermesSessionReusable }),
+    ...(metadata.hermesResumeSourceRunId === undefined ? {} : { hermesResumeSourceRunId: metadata.hermesResumeSourceRunId }),
+    ...(metadata.hermesResumeReason === undefined ? {} : { hermesResumeReason: metadata.hermesResumeReason }),
+    ...(metadata.handoffRepairSourceRunId === undefined ? {} : { handoffRepairSourceRunId: metadata.handoffRepairSourceRunId }),
+    ...(metadata.handoffRepairKind === undefined ? {} : { handoffRepairKind: metadata.handoffRepairKind }),
+    ...(metadata.handoffRepairAttempt === undefined ? {} : { handoffRepairAttempt: metadata.handoffRepairAttempt }),
   };
 }
 
@@ -983,6 +1019,18 @@ function resetReplayableRunState(record: RunRecord): RunRecord {
     pendingApprovalRequestedAt: null,
     providerLimit: null,
     commandPolicy: emptyCommandPolicyReplayState(),
+    hermesProfileKey: null,
+    hermesProfileDir: null,
+    hermesTemplateDir: null,
+    hermesGatewaySessionId: null,
+    hermesSessionKey: null,
+    hermesSessionResumed: false,
+    hermesSessionReusable: false,
+    hermesResumeSourceRunId: null,
+    hermesResumeReason: null,
+    handoffRepairSourceRunId: null,
+    handoffRepairKind: null,
+    handoffRepairAttempt: null,
     updatedAt: record.startedAt,
   });
 }

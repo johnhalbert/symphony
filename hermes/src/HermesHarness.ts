@@ -35,7 +35,12 @@ import {
   verifyHermesAgentCommandPolicyHookInstallation,
   writeHermesMcpConfig,
 } from "./HermesMcpConfig.js";
-import { hermesAcpProfileName, HermesProfileManager, type HermesProfile } from "./HermesProfileManager.js";
+import {
+  ensureProfileShape,
+  hermesAcpProfileName,
+  HermesProfileManager,
+  type HermesProfile,
+} from "./HermesProfileManager.js";
 
 export interface HermesHarnessOptions {
   runStore?: RunTranscriptStore;
@@ -223,15 +228,10 @@ export class HermesHarness implements AgentHarness {
         source: "runtime",
         eventType: "hermes_profile",
         message: `Hermes profile ${lease.profile.profileKey}`,
-        payload: {
-          harnessId: this.id,
-          profileDir: lease.profile.profileDir,
-          templateDir: lease.profile.templateDir,
-          gatewaySessionId,
-          hermesSessionKey: lease.hermesSessionKey,
-          sessionResumed: lease.gatewaySessionResumed,
-          reusable: lease.reusable,
-        },
+        payload: hermesProfileMetadataPayload(this.id, lease, gatewaySessionId, ctx),
+      });
+      await this.options.runStore?.updateRun?.(runId, {
+        metadata: hermesProfileMetadataPayload(this.id, lease, gatewaySessionId, ctx),
       });
 
       const promptSubmitError = await promptSubmit;
@@ -288,9 +288,10 @@ export class HermesHarness implements AgentHarness {
 
   private async getOrCreateLease(ctx: AgentRunContext): Promise<HermesLease> {
     const reusable = shouldReuseLease(ctx);
+    const resume = ctx.hermesResume ?? null;
     const freshLeaseId = reusable ? null : randomUUID();
-    const key = reusable ? reusableLeaseKey(ctx) : `fresh:${freshLeaseId}`;
-    const existing = reusable ? this.leases.get(key) : undefined;
+    const key = resume ? resumedLeaseKey(resume) : reusable ? reusableLeaseKey(ctx) : `fresh:${freshLeaseId}`;
+    const existing = resume || reusable ? this.leases.get(key) : undefined;
     if (existing && !existing.disposed) {
       await this.disposeLease(existing, "superseded_reusable_run");
     }
@@ -298,15 +299,17 @@ export class HermesHarness implements AgentHarness {
     const manager = this.effectiveProfileManager(ctx);
     const phase = currentRunPhase(ctx);
     const cliPath = this.cliPath();
-    const profileKey = hermesRunProfileKey(ctx, phase, reusable, freshLeaseId);
-    const profile = await manager.materialize({
-      workspaceKey: ctx.workspace.workspaceKey,
-      role: ctx.role,
-      phase,
-      template: templateForRun(ctx),
-      profileKey,
-      mode: reusable ? "reuse" : "fresh",
-    });
+    const profile =
+      resume === null
+        ? await manager.materialize({
+            workspaceKey: ctx.workspace.workspaceKey,
+            role: ctx.role,
+            phase,
+            template: templateForRun(ctx),
+            profileKey: hermesRunProfileKey(ctx, phase, reusable, freshLeaseId),
+            mode: reusable ? "reuse" : "fresh",
+          })
+        : await this.materializeResumedProfile(ctx, manager, resume);
     const commandPolicyHookOptions = agentCommandPolicyHookOptionsForRun(ctx, phase, cliPath, profile.profileDir);
     const commandPolicyHooks =
       commandPolicyHookOptions === undefined ? undefined : buildHermesAgentCommandPolicyHookConfig(commandPolicyHookOptions);
@@ -337,9 +340,14 @@ export class HermesHarness implements AgentHarness {
       await this.effectiveAuthManager(ctx).requireProviders(requiredAuthProviders);
     }
 
-    const persistedHermesSessionKey = reusable ? await readHermesSessionKey(profile.profileDir, ctx.logger.warn.bind(ctx.logger)) : null;
-    const hermesSessionKey = reusable ? this.reusableSessionKeys.get(key) ?? persistedHermesSessionKey : null;
-    if (reusable && hermesSessionKey) this.reusableSessionKeys.set(key, hermesSessionKey);
+    const persistedHermesSessionKey =
+      resume || reusable ? await readHermesSessionKey(profile.profileDir, ctx.logger.warn.bind(ctx.logger)) : null;
+    const hermesSessionKey = resume
+      ? resume.sessionKey
+      : reusable
+        ? this.reusableSessionKeys.get(key) ?? persistedHermesSessionKey
+        : null;
+    if ((resume || reusable) && hermesSessionKey) this.reusableSessionKeys.set(key, hermesSessionKey);
 
     const credential = requiredAuthProviders.length > 0 ? null : resolveRuntimeCredential(ctx.config, ctx.role, this.id);
     const extraEnv: Record<string, string> = {};
@@ -358,7 +366,7 @@ export class HermesHarness implements AgentHarness {
     });
     const lease: HermesLease = {
       key,
-      reusable,
+      reusable: resume !== null || reusable,
       profile,
       client,
       startupTimeoutMs: ctx.config.hermes.startupTimeoutMs,
@@ -371,8 +379,23 @@ export class HermesHarness implements AgentHarness {
       commandPolicyDecisionJournalPath: commandPolicyHookOptions?.decisionJournalPath ?? null,
       disposed: false,
     };
-    if (reusable) this.leases.set(key, lease);
+    if (resume || reusable) this.leases.set(key, lease);
     return lease;
+  }
+
+  private async materializeResumedProfile(
+    ctx: AgentRunContext,
+    manager: HermesProfileManager,
+    resume: NonNullable<AgentRunContext["hermesResume"]>,
+  ): Promise<HermesProfile> {
+    assertPathInsideRoot(resume.profileDir, ctx.config.hermes.stateDir);
+    await ensureProfileShape(resume.profileDir);
+    return {
+      profileDir: path.resolve(resume.profileDir),
+      templateDir: manager.resolveTemplateDir(templateForRun(ctx)),
+      profileKey: resume.profileKey,
+      createdFresh: false,
+    };
   }
 
   private effectiveProfileManager(ctx: AgentRunContext): HermesProfileManager {
@@ -434,12 +457,14 @@ export class HermesHarness implements AgentHarness {
     if (!gatewaySessionId) throw new SymphonyError("agent_error", "Hermes gateway did not return a session_id");
     lease.gatewaySessionId = gatewaySessionId;
     lease.gatewaySessionResumed = false;
+    const hermesSessionKey = nonEmptyString(response.session_key);
     if (lease.reusable) {
-      const hermesSessionKey = nonEmptyString(response.session_key);
       if (!hermesSessionKey) {
         throw new SymphonyError("agent_error", "Hermes gateway did not return a session_key for reusable worker session");
       }
       await this.rememberHermesSessionKey(lease, hermesSessionKey);
+    } else if (hermesSessionKey) {
+      lease.hermesSessionKey = hermesSessionKey;
     }
     return gatewaySessionId;
   }
@@ -634,6 +659,38 @@ function shouldReuseLease(ctx: AgentRunContext): boolean {
 function reusableLeaseKey(ctx: AgentRunContext): string {
   if (ctx.operatorChat) return `${ctx.workspace.path}:operator:${ctx.operatorChat.conversationId}`;
   return `${ctx.workspace.path}:worker:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
+}
+
+function resumedLeaseKey(resume: NonNullable<AgentRunContext["hermesResume"]>): string {
+  return `resume:${resume.sourceRunId}:${resume.reason}:${resume.profileDir}`;
+}
+
+function hermesProfileMetadataPayload(
+  harnessId: string,
+  lease: HermesLease,
+  gatewaySessionId: string,
+  ctx: AgentRunContext,
+) {
+  return {
+    harnessId,
+    profileDir: lease.profile.profileDir,
+    templateDir: lease.profile.templateDir,
+    gatewaySessionId,
+    sessionResumed: lease.gatewaySessionResumed,
+    reusable: lease.reusable,
+    hermesProfileKey: lease.profile.profileKey,
+    hermesProfileDir: lease.profile.profileDir,
+    hermesTemplateDir: lease.profile.templateDir,
+    hermesGatewaySessionId: gatewaySessionId,
+    hermesSessionKey: lease.hermesSessionKey,
+    hermesSessionResumed: lease.gatewaySessionResumed,
+    hermesSessionReusable: lease.reusable,
+    hermesResumeSourceRunId: ctx.hermesResume?.sourceRunId ?? null,
+    hermesResumeReason: ctx.hermesResume?.reason ?? null,
+    handoffRepairSourceRunId: ctx.handoffRepair?.sourceRunId ?? null,
+    handoffRepairKind: ctx.handoffRepair?.kind ?? null,
+    handoffRepairAttempt: ctx.handoffRepair?.attempt ?? null,
+  };
 }
 
 function templateForRun(ctx: AgentRunContext): string {
@@ -1352,6 +1409,14 @@ export function looksLikeProviderLimit(value: string): boolean {
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function assertPathInsideRoot(targetPath: string, rootPath: string): void {
+  const root = path.resolve(rootPath);
+  const target = path.resolve(targetPath);
+  const relative = path.relative(root, target);
+  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) return;
+  throw new SymphonyError("config_validation_error", `Hermes resume profile path escapes state root: ${target}`);
 }
 
 async function readHermesSessionKey(
