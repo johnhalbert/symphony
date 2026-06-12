@@ -17,6 +17,11 @@ import { FileIssueLifecycleStore, type IssueLifecycleStore } from "../core/persi
 import type { IssueBreakdownIssueLookupResult } from "../core/writeback/WritebackOutbox.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../core/writeback/WritebackOutbox.js";
 import { createLinearTrackerClientForCapability } from "../integrations/linear/LinearCredentialResolver.js";
+import {
+  resolveProjectContextCredentialView,
+  type ProjectContextCredentialResolutionOptions,
+} from "../core/config/ProjectContextCredentialView.js";
+import type { CredentialProfileRegistry } from "../core/config/CredentialProfiles.js";
 
 type FetchLike = typeof fetch;
 
@@ -29,6 +34,7 @@ export function createRuntimeTrackerClient(
     resolveServiceConfigForProjectContext(config, projectContext),
     "linear.tracker",
     fetchImpl,
+    { projectContext },
   );
 }
 
@@ -114,7 +120,7 @@ export function resolveServiceConfigForProjectContext(
   };
 }
 
-function createRuntimeWritebackClient(
+export function createRuntimeWritebackClient(
   config: ServiceConfig,
   fetchImpl?: FetchLike,
   projectContext?: ProjectContextResolution,
@@ -123,6 +129,7 @@ function createRuntimeWritebackClient(
     resolveServiceConfigForProjectContext(config, projectContext),
     "linear.writeback",
     fetchImpl,
+    { projectContext },
   );
 }
 
@@ -130,40 +137,76 @@ export function resolveCursorRuntimeApiKey(config: ServiceConfig, role: AgentRun
   return resolveRuntimeApiKey(config, role, "cursor");
 }
 
-export function resolveCursorRuntimeCredential(config: ServiceConfig, role: AgentRunRole): ResolvedCredential | null {
-  return resolveRuntimeCredential(config, role, "cursor");
+export function resolveScopedCursorRuntimeApiKey(
+  config: ServiceConfig,
+  role: AgentRunRole,
+  options: RuntimeDependencyResolutionOptions = {},
+): string | null {
+  return resolveRuntimeApiKey(config, role, "cursor", options);
 }
 
-export function resolveRuntimeApiKey(config: ServiceConfig, role: AgentRunRole, harnessId: string): string | null {
-  return resolveRuntimeCredential(config, role, harnessId)?.value ?? null;
+export interface RuntimeDependencyResolutionOptions extends ProjectContextCredentialResolutionOptions {}
+
+export function resolveCursorRuntimeCredential(
+  config: ServiceConfig,
+  role: AgentRunRole,
+  options: RuntimeDependencyResolutionOptions = {},
+): ResolvedCredential | null {
+  return resolveRuntimeCredential(config, role, "cursor", options);
+}
+
+export function resolveRuntimeApiKey(
+  config: ServiceConfig,
+  role: AgentRunRole,
+  harnessId: string,
+  options: RuntimeDependencyResolutionOptions = {},
+): string | null {
+  return resolveRuntimeCredential(config, role, harnessId, options)?.value ?? null;
 }
 
 export function resolveRuntimeCredential(
   config: ServiceConfig,
   role: AgentRunRole,
   harnessId: string,
+  options: RuntimeDependencyResolutionOptions = {},
 ): ResolvedCredential | null {
+  const view = resolveProjectContextCredentialView({
+    config,
+    projectContext: options.projectContext,
+    env: options.env,
+  });
   if (harnessId === "cursor") {
-    enforceCapabilityOwner(config, role, "runtime.cursor", "CURSOR_API_KEY");
+    enforceCapabilityOwner(view.credentialProfiles, role, "runtime.cursor", "CURSOR_API_KEY");
     return (
-      config.credentialProfiles.resolveForRole(role, "runtime.cursor") ??
-      config.credentialProfiles.resolveForRole(role, "cursor.runtime")
+      view.credentialProfiles.resolveForRole(role, "runtime.cursor") ??
+      view.credentialProfiles.resolveForRole(role, "cursor.runtime")
     );
   }
   if (harnessId === "hermes") {
-    enforceCapabilityOwner(config, role, "runtime.hermes", "runtime.hermes credential profile");
-    return config.credentialProfiles.resolveForRole(role, "runtime.hermes");
+    enforceCapabilityOwner(view.credentialProfiles, role, "runtime.hermes", "runtime.hermes credential profile");
+    return view.credentialProfiles.resolveForRole(role, "runtime.hermes");
   }
   return null;
 }
 
-export function resolveStatusMutationToken(config: ServiceConfig): string | null {
-  return resolveStatusMutationCredential(config)?.value ?? null;
+export function resolveStatusMutationToken(
+  config: ServiceConfig,
+  options: RuntimeDependencyResolutionOptions = {},
+): string | null {
+  return resolveStatusMutationCredential(config, options)?.value ?? null;
 }
 
-export function resolveStatusMutationCredential(config: ServiceConfig): ResolvedCredential | null {
-  enforceCapabilityOwner(config, "worker", "server.open_workspace", "server.open_workspace_token");
-  return config.credentialProfiles.resolveForRole("worker", "server.open_workspace");
+export function resolveStatusMutationCredential(
+  config: ServiceConfig,
+  options: RuntimeDependencyResolutionOptions = {},
+): ResolvedCredential | null {
+  const view = resolveProjectContextCredentialView({
+    config,
+    projectContext: options.projectContext,
+    env: options.env,
+  });
+  enforceCapabilityOwner(view.credentialProfiles, "worker", "server.open_workspace", "server.open_workspace_token");
+  return view.credentialProfiles.resolveForRole("worker", "server.open_workspace");
 }
 
 export function resolveTrackerStateLists(config: ServiceConfig): TrackerStateLists {
@@ -177,13 +220,13 @@ export function resolveTrackerStateLists(config: ServiceConfig): TrackerStateLis
 }
 
 function enforceCapabilityOwner(
-  config: ServiceConfig,
+  credentialProfiles: CredentialProfileRegistry,
   owner: CredentialRole,
   capability: CredentialCapability,
   legacyFallbackLabel: string,
 ): void {
-  const assignedRoles = config.credentialProfiles.assignmentRolesFor(capability);
-  if (config.credentialProfiles.hasAssignment(owner, capability) || assignedRoles.length === 0) return;
+  const assignedRoles = credentialProfiles.assignmentRolesFor(capability);
+  if (credentialProfiles.hasAssignment(owner, capability) || assignedRoles.length === 0) return;
   throw new SymphonyError(
     "config_validation_error",
     `Credential capability ${capability} is owned by ${owner}, but is assigned only to ${assignedRoles.join(

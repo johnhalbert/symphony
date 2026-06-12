@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
+import { normalizeProjectContextResolution } from "../src/core/config/ProjectContexts.js";
 import {
   buildMcpCliSpawnArgs,
   buildMcpSubprocessEnvironment,
@@ -1171,8 +1172,12 @@ describe("MCP subprocess environment", () => {
 
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     expect(childConfig.workspace).toEqual(config.workspace);
-    expect(childConfig.projectContexts.byId.get("symphony")).toEqual(config.projectContexts.byId.get("symphony"));
-    expect(childConfig.projectContexts.byId.get("docs")).toEqual(config.projectContexts.byId.get("docs"));
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("symphony"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("symphony")),
+    );
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("docs")),
+    );
   });
 
   it("preserves inherited top-level git refs when the default context overrides them", () => {
@@ -1245,8 +1250,12 @@ describe("MCP subprocess environment", () => {
 
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     expect(childConfig.workspace).toEqual(config.workspace);
-    expect(childConfig.projectContexts.byId.get("symphony")).toEqual(config.projectContexts.byId.get("symphony"));
-    expect(childConfig.projectContexts.byId.get("docs")).toEqual(config.projectContexts.byId.get("docs"));
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("symphony"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("symphony")),
+    );
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("docs")),
+    );
   });
 
   it("carries project-context parse dependencies needed for child config parsing", () => {
@@ -1347,7 +1356,9 @@ describe("MCP subprocess environment", () => {
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     const expectedDocsContext = config.projectContexts.byId.get("docs");
     expect(expectedDocsContext).toBeDefined();
-    expect(childConfig.projectContexts.byId.get("docs")).toMatchObject(expectedDocsContext!);
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toMatchObject(
+      comparableProjectContext(expectedDocsContext!),
+    );
   });
 
   it("keeps non-GitHub MCPs free of default GitHub parse refs while preserving explicit project-context refs", () => {
@@ -1444,7 +1455,9 @@ describe("MCP subprocess environment", () => {
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     const expectedDocsContext = config.projectContexts.byId.get("docs");
     expect(expectedDocsContext).toBeDefined();
-    expect(childConfig.projectContexts.byId.get("docs")).toMatchObject(expectedDocsContext!);
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toMatchObject(
+      comparableProjectContext(expectedDocsContext!),
+    );
   });
 
   it("exports only non-secret project-context parse refs while omitting project-context GitHub secrets and profile values", () => {
@@ -1772,7 +1785,9 @@ describe("MCP subprocess environment", () => {
       headOwner: expectedDocsContext.github.headOwner,
       apiBaseUrl: expectedDocsContext.github.apiBaseUrl,
     });
-    expect(childConfig.projectContexts.byId.get("docs")).toEqual(expectedDocsContext);
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toEqual(
+      comparableProjectContext(expectedDocsContext),
+    );
   });
 
   it.each([
@@ -1880,6 +1895,132 @@ describe("MCP subprocess environment", () => {
     expect(env).not.toHaveProperty(excludedEnvVar);
     expect(env).not.toHaveProperty("GITHUB_TOKEN");
   });
+
+  it.each([
+    {
+      command: "completion-report-mcp",
+      role: "service",
+      capability: "github.publication",
+      envVar: "DOCS_GITHUB_PUBLICATION_TOKEN",
+      excludedEnvVar: "SYMPHONY_GITHUB_PUBLICATION_TOKEN",
+      expectedSecret: "docs-publication-secret",
+      profileName: "publication",
+    },
+    {
+      command: "review-feedback-mcp",
+      role: "reviewer",
+      capability: "github.review_feedback_write",
+      envVar: "DOCS_GITHUB_FEEDBACK_TOKEN",
+      excludedEnvVar: "SYMPHONY_GITHUB_FEEDBACK_TOKEN",
+      expectedSecret: "docs-feedback-secret",
+      profileName: "feedback",
+    },
+  ] as const)(
+    "maps persisted legacy-default project context to the configured default credential slice for %s",
+    ({ command, role, capability, envVar, excludedEnvVar, expectedSecret, profileName }) => {
+      const rawConfig = multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: {
+              owner: "$DOCS_GITHUB_OWNER",
+              repo: "$DOCS_GITHUB_REPO",
+              head_owner: "$DOCS_GITHUB_HEAD_OWNER",
+              api_base_url: "$DOCS_GITHUB_API_BASE_URL",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+            },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+                feedback: { value: "$DOCS_GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+            github: {
+              owner: "$SYMPHONY_GITHUB_OWNER",
+              repo: "$SYMPHONY_GITHUB_REPO",
+              head_owner: "$SYMPHONY_GITHUB_HEAD_OWNER",
+              api_base_url: "$SYMPHONY_GITHUB_API_BASE_URL",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+            },
+            credential_profiles: {
+              profiles: {
+                publication: {
+                  value: "$SYMPHONY_GITHUB_PUBLICATION_TOKEN",
+                  capabilities: ["github.publication"],
+                },
+                feedback: {
+                  value: "$SYMPHONY_GITHUB_FEEDBACK_TOKEN",
+                  capabilities: ["github.review_feedback_write"],
+                },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+        ],
+      });
+      const sourceEnv = {
+        LINEAR_API_KEY: "linear-secret",
+        DOCS_GITHUB_OWNER: "acme-docs",
+        DOCS_GITHUB_REPO: "docs-site",
+        DOCS_GITHUB_HEAD_OWNER: "docs-owner",
+        DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+        DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+        DOCS_GITHUB_FEEDBACK_TOKEN: "docs-feedback-secret",
+        SYMPHONY_GITHUB_OWNER: "acme",
+        SYMPHONY_GITHUB_REPO: "symphony",
+        SYMPHONY_GITHUB_HEAD_OWNER: "sym-owner",
+        SYMPHONY_GITHUB_API_BASE_URL: "https://api.github.sym.test",
+        SYMPHONY_GITHUB_PUBLICATION_TOKEN: "symphony-publication-secret",
+        SYMPHONY_GITHUB_FEEDBACK_TOKEN: "symphony-feedback-secret",
+      };
+      const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+      expect(config.projectContexts.defaultContextId).toBe("docs");
+
+      const env = buildMcpSubprocessEnvironment({
+        config,
+        command,
+        parentEnv: { PATH: "/bin", ...sourceEnv, GITHUB_TOKEN: "decoy-parent-github-secret" },
+        projectContext: normalizeProjectContextResolution(undefined),
+      });
+
+      expect(env).toMatchObject({
+        DOCS_GITHUB_OWNER: "acme-docs",
+        DOCS_GITHUB_REPO: "docs-site",
+        DOCS_GITHUB_HEAD_OWNER: "docs-owner",
+        DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+        [envVar]: expectedSecret,
+      });
+      expect(env).not.toHaveProperty(excludedEnvVar);
+      expect(env).not.toHaveProperty("GITHUB_TOKEN");
+
+      const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+      expect(childConfig.credentialProfiles.resolveForRole(role, capability)).toMatchObject({
+        kind: "static_token",
+        source: "profile",
+        profileName,
+        value: expectedSecret,
+      });
+    },
+  );
 
   it.each([
     {
@@ -2263,6 +2404,38 @@ describe("MCP subprocess environment", () => {
     ).toThrow(/MISSING_GITHUB_PUBLICATION_TOKEN/);
   });
 });
+
+
+type ComparableProjectContext = {
+  workspace?: { source?: { repository?: string | null } };
+  publicMetadata?: { repository?: string | null } | null;
+  publicSummary?: { publicMetadata?: { repository?: string | null } | null } | null;
+};
+
+function comparableProjectContext<T extends ComparableProjectContext | undefined>(context: T): T {
+  if (!context) return context;
+  const repository = context.workspace?.source?.repository ?? null;
+  return {
+    ...context,
+    publicMetadata: context.publicMetadata
+      ? {
+          ...context.publicMetadata,
+          repository,
+        }
+      : context.publicMetadata,
+    publicSummary: context.publicSummary
+      ? {
+          ...context.publicSummary,
+          publicMetadata: context.publicSummary.publicMetadata
+            ? {
+                ...context.publicSummary.publicMetadata,
+                repository,
+              }
+            : context.publicSummary.publicMetadata,
+        }
+      : context.publicSummary,
+  };
+}
 
 function githubEnvKeys(env: Record<string, string>): string[] {
   return Object.keys(env)

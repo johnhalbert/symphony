@@ -69,7 +69,8 @@ export async function submitCompletionReportFromMcp(input: unknown, options: Com
     if (!activeRun || !lifecycle) {
       throw new SymphonyError("invalid_request", "Completion report MCP context does not match the active worker run");
     }
-    const tracker = options.tracker ?? createRuntimeTrackerClient(config);
+    const activeProjectContext = lifecycle.projectContext ?? activeRun.projectContext ?? loadedContext.projectContext;
+    const tracker = options.tracker ?? createRuntimeTrackerClient(config, undefined, activeProjectContext);
     const authoritativeIssue = await resolveCompletionReportMcpIssue({
       tracker,
       context: loadedContext,
@@ -91,7 +92,9 @@ export async function submitCompletionReportFromMcp(input: unknown, options: Com
     const pullRequestPublisher =
       options.pullRequestPublisher ??
       (config.github.publishPullRequests && !approvalRequiredForPublication
-        ? createGitHubPullRequestClientForCapability(config, "github.publication")
+        ? createGitHubPullRequestClientForCapability(config, "github.publication", undefined, {
+            projectContext: activeProjectContext,
+          })
         : undefined);
     const service = new CompletionReportService({
       config,

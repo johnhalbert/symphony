@@ -560,6 +560,313 @@ describe("MergePolicyService", () => {
     });
   });
 
+  it("resolves github.merge from the lifecycle project context for merge validation and approval carry-forward", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+      github: { owner: "acme", repo: "symphony", token: "legacy-github-token", api_base_url: "https://api.github.test" },
+      credentialProfiles: {
+        profiles: {
+          merge: { value: "$GLOBAL_GITHUB_MERGE_TOKEN", capabilities: ["github.merge"] },
+        },
+        roles: {
+          service: { "github.merge": "merge" },
+        },
+      },
+      projectContexts: [
+        {
+          id: "symphony",
+          tracker: { project_slug: "TEST" },
+          workspace: { source: { kind: "git", repository: "." } },
+          credential_profiles: {
+            profiles: {
+              merge: { value: "$GLOBAL_GITHUB_MERGE_TOKEN" },
+            },
+          },
+        },
+        {
+          id: "docs",
+          tracker: { project_slug: "DOCS" },
+          workspace: { source: { kind: "git", repository: "../docs-site" } },
+          credential_profiles: {
+            profiles: {
+              merge: { value: "$DOCS_GITHUB_MERGE_TOKEN" },
+            },
+          },
+        },
+      ],
+      env: {
+        GITHUB_TOKEN: "legacy-github-token",
+        GLOBAL_GITHUB_MERGE_TOKEN: "global-merge-secret",
+        DOCS_GITHUB_MERGE_TOKEN: "docs-merge-secret",
+      },
+    });
+    vi.stubEnv("GITHUB_TOKEN", "legacy-github-token");
+    vi.stubEnv("GLOBAL_GITHUB_MERGE_TOKEN", "global-merge-secret");
+    vi.stubEnv("DOCS_GITHUB_MERGE_TOKEN", "docs-merge-secret");
+    const currentIssue = issue({ state: "Approved with Conflicts", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await lifecycleStore.updateIssue(currentIssue, {
+      phase: "passed",
+      projectContext: docsProjectContext,
+      mergeConflict: mergeConflictRecord({ resolutionStatus: "resolved", resolvedHeadSha: "head-sha-2" }),
+    });
+    const calls: Array<{ pathname: string; authorization: string; method: string }> = [];
+    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
+      const url = new URL(String(input));
+      calls.push({
+        pathname: url.pathname,
+        authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+        method: init?.method ?? "GET",
+      });
+      if (url.pathname === "/repos/acme/symphony/pulls/42") {
+        return new Response(
+          JSON.stringify({
+            number: 42,
+            html_url: "https://github.com/acme/symphony/pull/42",
+            state: "open",
+            draft: false,
+            mergeable: true,
+            mergeable_state: "clean",
+            merged: false,
+            user: { login: "reviewer-1" },
+            base: { ref: "main", sha: "base-sha-1" },
+            head: { ref: "symphony/TEST-1", sha: "head-sha-2", repo: { pushed_at: "2026-01-01T00:00:01Z" } },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.pathname === "/repos/acme/symphony/compare/head-sha-1...head-sha-2") {
+        return new Response(JSON.stringify({ status: "ahead" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname === "/repos/acme/symphony/pulls/42/merge") {
+        return new Response(JSON.stringify({ merged: true, sha: "merge-sha-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname === "/user") {
+        return new Response(JSON.stringify({ login: "symphony-bot" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch ${url.pathname}`);
+    });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+
+    expect(result.status).toBe("merged");
+    expect(calls.map((call) => call.authorization)).toEqual([
+      "Bearer docs-merge-secret",
+      "Bearer docs-merge-secret",
+      "Bearer docs-merge-secret",
+      "Bearer docs-merge-secret",
+    ]);
+    expect(calls.map((call) => `${call.method} ${call.pathname}`)).toEqual([
+      "GET /repos/acme/symphony/pulls/42",
+      "GET /repos/acme/symphony/compare/head-sha-1...head-sha-2",
+      "PUT /repos/acme/symphony/pulls/42/merge",
+      "GET /user",
+    ]);
+  });
+
+  it("routes merge completion writebacks through the lifecycle project context", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      credentialProfiles: {
+        profiles: {
+          merge: { value: "$GLOBAL_GITHUB_MERGE_TOKEN", capabilities: ["github.merge"] },
+          writeback: { value: "$GLOBAL_LINEAR_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
+        },
+        roles: {
+          service: { "github.merge": "merge", "linear.writeback": "writeback" },
+        },
+      },
+      projectContexts: [
+        {
+          id: "symphony",
+          tracker: { project_slug: "TEST" },
+          workspace: { source: { kind: "git", repository: "." } },
+        },
+        {
+          id: "docs",
+          tracker: { project_slug: "DOCS" },
+          workspace: { source: { kind: "git", repository: "../docs-site" } },
+          credential_profiles: {
+            profiles: {
+              merge: { value: "$DOCS_GITHUB_MERGE_TOKEN" },
+              writeback: { value: "$DOCS_LINEAR_WRITEBACK_TOKEN" },
+            },
+            roles: {
+              service: { "github.merge": "merge", "linear.writeback": "writeback" },
+            },
+          },
+        },
+      ],
+      env: {
+        GLOBAL_GITHUB_MERGE_TOKEN: "global-merge-secret",
+        DOCS_GITHUB_MERGE_TOKEN: "docs-merge-secret",
+        GLOBAL_LINEAR_WRITEBACK_TOKEN: "global-writeback-secret",
+        DOCS_LINEAR_WRITEBACK_TOKEN: "docs-writeback-secret",
+      },
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await lifecycleStore.updateIssue(currentIssue, { projectContext: docsProjectContext });
+    const defaultWriter = new MemoryWriter(currentIssue);
+    const docsWriter = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        defaultWriter,
+        new StructuredLogger(() => undefined),
+        60_000,
+        undefined,
+        false,
+        undefined,
+        (projectContext) => (projectContext?.projectContextId === "docs" ? docsWriter : defaultWriter),
+      ),
+      client: new FakeMergeClient(),
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "merged" });
+    expect(docsWriter.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["Ready to Merge"],
+        toState: "Done",
+        reason: "Symphony reviewer-approved merge completed",
+      },
+    ]);
+    expect(defaultWriter.transitions).toEqual([]);
+  });
+
+  it("routes merge-gate repair writebacks through the lifecycle project context", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+      credentialProfiles: {
+        profiles: {
+          merge: { value: "$GLOBAL_GITHUB_MERGE_TOKEN", capabilities: ["github.merge"] },
+          writeback: { value: "$GLOBAL_LINEAR_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
+        },
+        roles: {
+          service: { "github.merge": "merge", "linear.writeback": "writeback" },
+        },
+      },
+      projectContexts: [
+        {
+          id: "symphony",
+          tracker: { project_slug: "TEST" },
+          workspace: { source: { kind: "git", repository: "." } },
+        },
+        {
+          id: "docs",
+          tracker: { project_slug: "DOCS" },
+          workspace: { source: { kind: "git", repository: "../docs-site" } },
+          credential_profiles: {
+            profiles: {
+              merge: { value: "$DOCS_GITHUB_MERGE_TOKEN" },
+              writeback: { value: "$DOCS_LINEAR_WRITEBACK_TOKEN" },
+            },
+            roles: {
+              service: { "github.merge": "merge", "linear.writeback": "writeback" },
+            },
+          },
+        },
+      ],
+      env: {
+        GLOBAL_GITHUB_MERGE_TOKEN: "global-merge-secret",
+        DOCS_GITHUB_MERGE_TOKEN: "docs-merge-secret",
+        GLOBAL_LINEAR_WRITEBACK_TOKEN: "global-writeback-secret",
+        DOCS_LINEAR_WRITEBACK_TOKEN: "docs-writeback-secret",
+      },
+    });
+    const currentIssue = issue({ state: "Approved with Conflicts", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await lifecycleStore.updateIssue(currentIssue, {
+      phase: "passed",
+      projectContext: docsProjectContext,
+      mergeConflict: mergeConflictRecord({ resolutionStatus: "resolved", resolvedHeadSha: "head-sha-2" }),
+    });
+    const defaultWriter = new MemoryWriter(currentIssue);
+    const docsWriter = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        defaultWriter,
+        new StructuredLogger(() => undefined),
+        60_000,
+        undefined,
+        false,
+        undefined,
+        (projectContext) => (projectContext?.projectContextId === "docs" ? docsWriter : defaultWriter),
+      ),
+      client: new FakeMergeClient({ headSha: "head-sha-2", mergeable: false, mergeableState: "dirty" }),
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "repair_dispatched" });
+    expect(docsWriter.comments).toHaveLength(1);
+    expect(docsWriter.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["Approved with Conflicts"],
+        toState: "In Progress",
+        reason: "Symphony merge gate required PR repair",
+      },
+    ]);
+    expect(defaultWriter.comments).toEqual([]);
+    expect(defaultWriter.transitions).toEqual([]);
+  });
+
   it("dispatches merge-gate repair instead of reopening legacy conflict metadata when a resolved conflict head is still dirty", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",
@@ -2536,6 +2843,7 @@ function mergeConfig(input: {
   conflictsState?: string;
   credentialProfiles?: Record<string, unknown>;
   github?: Record<string, unknown>;
+  projectContexts?: Array<Record<string, unknown>>;
   env?: NodeJS.ProcessEnv;
 }) {
   return parseServiceConfig(
@@ -2563,6 +2871,7 @@ function mergeConfig(input: {
       },
       github: input.github ?? { owner: "acme", repo: "symphony" },
       ...(input.credentialProfiles === undefined ? {} : { credential_profiles: input.credentialProfiles }),
+      ...(input.projectContexts === undefined ? {} : { project_contexts: input.projectContexts }),
     },
     path.join(root, "WORKFLOW.md"),
     { LINEAR_API_KEY: "linear-secret", GITHUB_TOKEN: "github-secret", ...input.env },

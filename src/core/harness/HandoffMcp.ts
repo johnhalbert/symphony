@@ -275,6 +275,7 @@ async function writeHandoffMcpContexts(
   });
   await writeReviewFeedbackMcpContext(reviewFeedbackContextFilePath(ctx), {
     issue: ctx.issue,
+    projectContext: ctx.projectContext,
     activeRunId: input.activeRunId,
     role: "reviewer",
     token: null,

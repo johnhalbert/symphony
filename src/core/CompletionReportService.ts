@@ -185,6 +185,7 @@ export class CompletionReportService {
     this.validateCaller(report, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
+    validateCompletionReportProjectContext(context, existingLifecycle);
     const existing = existingLifecycle?.completionReports.find((item) => item.idempotencyKey === report.idempotencyKey);
     if (existing && isFinalizedCompletionReport(existing)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
@@ -356,11 +357,9 @@ export class CompletionReportService {
     }
 
     const report = completionReportInputFromRecord(existing);
+    const issueTitle = lifecycle.summaryPointers.issueTitle ?? input.issue.title;
     const context: CompletionReportActiveContext = {
-      issue: {
-        ...input.issue,
-        title: lifecycle.summaryPointers.issueTitle ?? input.issue.title,
-      },
+      issue: { ...input.issue, title: issueTitle },
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -404,8 +403,9 @@ export class CompletionReportService {
     }
 
     const report = completionReportInputFromRecord(existing);
+    const issueTitle = lifecycle.summaryPointers.issueTitle ?? input.issue.title;
     const context: CompletionReportActiveContext = {
-      issue: input.issue,
+      issue: { ...input.issue, title: issueTitle },
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -777,12 +777,13 @@ export class CompletionReportService {
     if (!workspacePath) {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree workspace path");
     }
-    const branchName = resolveServiceOwnedCompletionReportBranchName({
-      workspaceGitBranchName: context.workspace?.gitBranchName ?? null,
-      lifecycleGitBranchName: existingLifecycle?.summaryPointers.gitBranchName ?? null,
-      lifecycleBranchName: existingLifecycle?.summaryPointers.branchName ?? null,
-      issueBranchName: context.issue.branchName,
-    });
+    const branchName =
+      resolveServiceOwnedCompletionReportBranchName({
+        workspaceGitBranchName: context.workspace?.gitBranchName ?? null,
+        lifecycleGitBranchName: existingLifecycle?.summaryPointers.gitBranchName ?? null,
+        lifecycleBranchName: existingLifecycle?.summaryPointers.branchName ?? null,
+        issueBranchName: context.issue.branchName,
+      }) || report.branchName || null;
     if (!branchName) {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree branch");
     }
@@ -1054,7 +1055,21 @@ function resolveCompletionReportProjectContext(
   existingLifecycle: ExistingIssueLifecycle = null,
 ): ProjectContextResolution {
   return normalizeProjectContextResolution(
-    context.projectContext ?? existingLifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+    existingLifecycle?.projectContext ?? context.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
+}
+
+function projectContextEquals(
+  left: ProjectContextResolution | undefined,
+  right: ProjectContextResolution | undefined,
+): boolean {
+  const normalizedLeft = normalizeProjectContextResolution(left);
+  const normalizedRight = normalizeProjectContextResolution(right);
+  return (
+    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
+    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
+    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
+    normalizedLeft.routingSource === normalizedRight.routingSource
   );
 }
 
@@ -1129,6 +1144,19 @@ function normalizeChecklist(items: CompletionReportInput["acceptanceChecklist"])
     satisfied: item.satisfied,
     evidence: item.evidence,
   }));
+}
+
+
+function validateCompletionReportProjectContext(
+  context: CompletionReportActiveContext,
+  existingLifecycle: ExistingIssueLifecycle,
+): void {
+  if (!context.projectContext || !existingLifecycle?.projectContext) return;
+  if (projectContextEquals(context.projectContext, existingLifecycle.projectContext)) return;
+  throw new SymphonyError(
+    "invalid_request",
+    "Completion report issue project context does not match the lifecycle record",
+  );
 }
 
 function normalizeInputPullRequest(

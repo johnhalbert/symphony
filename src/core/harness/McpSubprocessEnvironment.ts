@@ -15,7 +15,11 @@ import {
   type RawCredentialProfilesConfig,
 } from "../config/CredentialProfiles.js";
 import type { CredentialRole } from "../config/CredentialProfiles.js";
-import { normalizeProjectContextId, type ProjectContextResolution } from "../config/ProjectContexts.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  normalizeProjectContextId,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 
 export type McpSubprocessCommand =
   | "completion-report-mcp"
@@ -506,6 +510,12 @@ function resolveSelectedProjectContextOverride(
 
   const projectContextId = normalizeProjectContextId(projectContext.projectContextId);
   if (projectContextId === config.projectContexts.defaultContextId) return null;
+  if (
+    projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID &&
+    !config.projectContexts.byId.has(LEGACY_DEFAULT_PROJECT_CONTEXT_ID)
+  ) {
+    return null;
+  }
 
   const context = config.projectContexts.byId.get(projectContextId);
   if (!context) {
