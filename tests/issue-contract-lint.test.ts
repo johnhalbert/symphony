@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   analyzeIssueContractDescription,
@@ -210,4 +211,142 @@ describe("IssueContractLint", () => {
     expect(analysis.remainingBlocker).toBe("Manual operator-authored update required for the protected workflow file.");
     expect(hasMeaningfulRemainingBlocker(analysis.remainingBlocker)).toBe(true);
   });
+
+  it("keeps the ENG-371 public metadata child contract examples lint-clean with stable requirement ids", () => {
+    const examples = eng371ContractExamples();
+    const expectedExamples = [
+      {
+        title: "Example A — Redaction parity child issue",
+        requirementIds: ["REQ-ENG371-REDACTION-PARITY-001"],
+      },
+      {
+        title: "Example B — Repository ambiguity child issue",
+        requirementIds: ["REQ-ENG371-REPOSITORY-AMBIGUITY-001"],
+      },
+      {
+        title: "Example C — Merge-gate closure child issue",
+        requirementIds: ["REQ-ENG371-MERGE-GATE-CLOSURE-001"],
+      },
+      {
+        title: "Example D — Validation evidence follow-up (protected docs)",
+        requirementIds: ["REQ-ENG371-VALIDATION-EVIDENCE-001"],
+      },
+    ] as const;
+
+    expect(examples.map((example) => example.title)).toEqual(expectedExamples.map((example) => example.title));
+
+    const expectedRequirementIds = new Map<string, readonly string[]>(
+      expectedExamples.map((example) => [example.title, example.requirementIds]),
+    );
+    const protectedPaths = ["WORKFLOW.md", "docs/dogfood-runbook.md", "src/core/workflow/**", "hermes/src/**"];
+    for (const example of examples) {
+      const analysis = analyzeIssueContractDescription(example.description, protectedPaths);
+      expect(analysis.missingSections, example.title).toEqual([]);
+      expect(analysis.issueContractErrors, example.title).toEqual([]);
+      expect(extractIssueContractRequirementIds(example.description), example.title).toEqual(
+        expectedRequirementIds.get(example.title),
+      );
+    }
+  });
+
+  it("keeps the ENG-371 validation-evidence example manual-only for protected docs", () => {
+    const example = eng371ContractExamples().find(
+      (candidate) => candidate.title === "Example D — Validation evidence follow-up (protected docs)",
+    );
+    expect(example).toBeDefined();
+
+    const description = example?.description ?? "";
+    const analysis = analyzeIssueContractDescription(description, ["docs/dogfood-runbook.md"]);
+    expect(analysis.protectedSurfaceMatches).toEqual(["docs/dogfood-runbook.md"]);
+    expect(analysis.readyForDogfoodReady).toBe(false);
+    expect(analysis.remainingBlocker).toBe(
+      "Manual operator-authored update required for the protected workflow documentation in docs/dogfood-runbook.md.",
+    );
+    expect(hasMeaningfulRemainingBlocker(analysis.remainingBlocker)).toBe(true);
+    expect(description).toContain("git status --short -- hermes/upstream-src");
+    expect(description).toContain("reviewLoop.lastCompletionReport.runId");
+    expect(description).toContain("/api/v1/runs/<handoffWorkerRunId>/transcript?offset=<max(transcriptEventCount-15,0)>&limit=15");
+    expect(description).toContain("run.prompt");
+    expect(description).toContain("~/.hermes/logs/*.log");
+    expect(description).toContain("prompt, log, transcript, or documentation excerpt");
+  });
+
+  it("documents the ENG-371 promotion evidence packet and vendored-Hermes no-touch checks", () => {
+    const quickstart = eng371Quickstart();
+    const credentialUrlDetector = extractDocumentedPythonRawRegex(quickstart, "credential_url");
+    const openaiKeyDetector = extractDocumentedPythonRawRegex(quickstart, "openai_key");
+
+    expect(quickstart).toContain("REQ-ENG371-REDACTION-PARITY-001");
+    expect(quickstart).toContain("REQ-ENG371-REPOSITORY-AMBIGUITY-001");
+    expect(quickstart).toContain("REQ-ENG371-MERGE-GATE-CLOSURE-001");
+    expect(quickstart).toContain("REQ-ENG371-VALIDATION-EVIDENCE-001");
+    expect(quickstart).toContain("npm test -- tests/issue-contract-lint.test.ts");
+    expect(quickstart).toContain("git diff --name-only origin/main...HEAD -- hermes/upstream-src");
+    expect(quickstart).toContain("git status --short -- hermes/upstream-src");
+    expect(quickstart).toContain("/api/v1/issues/<issue-identifier>");
+    expect(quickstart).toContain("reviewLoop.lastCompletionReport.runId");
+    expect(quickstart).toContain("reviewLoop.lastCompletionReport.id");
+    expect(quickstart).toContain("reviewLoop.lastCompletionReport.acceptedAt");
+    expect(quickstart).toContain("/api/v1/runs/<handoffWorkerRunId>");
+    expect(quickstart).toContain("/api/v1/runs/<handoffWorkerRunId>/transcript?offset=<max(transcriptEventCount-15,0)>&limit=15");
+    expect(quickstart).toContain("RUN_ID='<handoffWorkerRunId>' python - <<'PY'");
+    expect(quickstart).toContain("run.prompt");
+    expect(quickstart).toContain("~/.hermes/logs/");
+    expect(quickstart).toContain("surfacesChecked");
+    expect(quickstart).toContain("findings");
+    expect(quickstart).toContain("prompt/log/transcript/doc sweep");
+    expect(quickstart).toContain("completed");
+    expect(quickstart).toContain("message_complete");
+    expect(quickstart).toContain("lastEvidenceCursor");
+    expect(quickstart).toContain("Do not cite `workspacePath` or `repoPath`");
+    expect(quickstart).toContain("Do not paste credential values");
+    expect(quickstart).toContain("credential-bearing repository URLs");
+    expect(quickstart).toContain("workflow, doctor, prompt, log, transcript, or documentation excerpt");
+    expect(quickstart).toContain("raw log lines");
+    expect(credentialUrlDetector.test("https://alice:token@example.com/repo.git")).toBe(true);
+    expect(credentialUrlDetector.test("https://user:pass@example.com/repo.git")).toBe(true);
+    expect(credentialUrlDetector.test("https://svc-user:token@example.com/repo.git")).toBe(true);
+    expect(credentialUrlDetector.test("https://github.com/org/repo.git")).toBe(false);
+    expect(openaiKeyDetector.test("sk-abcdefghijklmnopqrstuvwxyz1234")).toBe(true);
+    expect(openaiKeyDetector.test("sk-proj-abcdefghijklmnopqrstuvwxyz1234")).toBe(true);
+    expect(openaiKeyDetector.test("sk-svcacct-abcdefghijklmnopqrstuvwxyz1234")).toBe(true);
+    expect(openaiKeyDetector.test("https://example.com/sk-proj-not-a-key")).toBe(false);
+    expect(quickstart).not.toContain("tool_call_completed");
+    expect(quickstart).not.toContain("operator-only private logs");
+  });
 });
+
+interface Eng371ContractExample {
+  title: string;
+  description: string;
+}
+
+function eng371ContractExamples(): Eng371ContractExample[] {
+  const content = readFileSync(
+    new URL("../specs/005-eng-371-public-metadata-closure/contracts/public-metadata-redaction.md", import.meta.url),
+    "utf8",
+  );
+  const matches = Array.from(content.matchAll(/^## (.+?)\r?\n\r?\n````markdown\r?\n([\s\S]*?)\r?\n````/gm));
+  return matches.map((match) => ({ title: match[1] ?? "", description: (match[2] ?? "").trim() }));
+}
+
+function extractIssueContractRequirementIds(description: string): string[] {
+  const issueContractJson = description.match(/```json\r?\n([\s\S]*?)\r?\n```/);
+  expect(issueContractJson, "Issue Contract JSON block must exist").not.toBeNull();
+  const parsed = JSON.parse(issueContractJson?.[1] ?? "{}");
+  return Array.isArray(parsed.requirements)
+    ? parsed.requirements.map((requirement: { id?: unknown }) => String(requirement.id ?? "").trim())
+    : [];
+}
+
+function eng371Quickstart(): string {
+  return readFileSync(new URL("../specs/005-eng-371-public-metadata-closure/quickstart.md", import.meta.url), "utf8");
+}
+
+function extractDocumentedPythonRawRegex(document: string, detectorName: string): RegExp {
+  const escapedDetectorName = detectorName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = document.match(new RegExp(`'${escapedDetectorName}': re\\.compile\\(r'([^']+)'\\),`));
+
+  expect(match, `${detectorName} detector must be documented`).not.toBeNull();
+  return new RegExp(match?.[1] ?? "");
+}
