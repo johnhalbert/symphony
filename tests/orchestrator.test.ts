@@ -2771,7 +2771,7 @@ describe("Orchestrator", () => {
   it("does not stall-cancel lifecycle-only pending publication approval handoffs", async () => {
     const config = testConfig(root);
     config.reviewLoop.blockedStates = ["Blocked"];
-    (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = { stall_timeout_ms: 1 };
+    (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = { stall_timeout_ms: 25 };
     const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -2787,7 +2787,7 @@ describe("Orchestrator", () => {
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-    const harness = new BlockingHarness();
+    const harness = new HeartbeatUntilIdleHarness();
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2804,10 +2804,28 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
       await waitFor(() => orchestrator.snapshot().running[0]?.runId === runId, "worker run start");
       await waitForRunRecord(runStore, runId);
-      await lifecycleStore.ensureIssue(
-        candidate,
-        pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
-      );
+      await waitForAsync(async () => {
+        try {
+          return (await lifecycleStore.get(candidate.id)) !== null;
+        } catch (error) {
+          if (error instanceof SyntaxError) return false;
+          throw error;
+        }
+      }, "initial lifecycle record before pending approval patch", 5_000);
+      await waitForAsync(async () => {
+        try {
+          await lifecycleStore.ensureIssue(
+            candidate,
+            pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
+          );
+          return true;
+        } catch (error) {
+          if (error instanceof Error && /EPERM: operation not permitted, rename /.test(error.message)) {
+            return false;
+          }
+          throw error;
+        }
+      }, "pending publication approval lifecycle patch write", 5_000);
       await runStore.updateRun(runId, {
         metadata: {
           pendingApprovalRequestId: null,
@@ -2818,15 +2836,34 @@ describe("Orchestrator", () => {
       await waitForAsync(async () => {
         await orchestrator.refreshNow();
         const row = orchestrator.snapshot().running[0];
-        const idleAlert = row?.liveness.idleAlert;
-        return idleAlert?.reason === "suppressed" && idleAlert.active === false;
+        return (
+          row?.lifecycle?.phase === "blocked" &&
+          row.lifecycle?.blockedReason === PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON &&
+          row.lifecycle?.summaryPointers?.lastRunId === runId
+        );
       }, "pending publication approval lifecycle refresh");
+
+      harness.releaseToIdle();
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      await waitForAsync(async () => {
+        await orchestrator.refreshNow();
+        const row = orchestrator.snapshot().running[0];
+        const idleAlert = row?.liveness.idleAlert;
+        return (
+          idleAlert?.reason === "suppressed" &&
+          idleAlert.active === false &&
+          (idleAlert.secondsSinceLastActivity ?? 0) > 0.025
+        );
+      }, "pending publication approval idle alert suppression");
 
       expect(orchestrator.snapshot().counts.running).toBe(1);
       expect(orchestrator.snapshot().running[0]?.liveness.idleAlert).toMatchObject({
         active: false,
         reason: "suppressed",
+        thresholdMs: 25,
       });
+      expect(orchestrator.snapshot().running[0]?.liveness.idleAlert?.secondsSinceLastActivity ?? 0).toBeGreaterThan(0.025);
       const runningRun = await runStore.getRun(runId);
       expect(runningRun).toMatchObject({
         status: "running",
@@ -8490,6 +8527,33 @@ async function runAcceptedIssueBreakdownHandoffScenario(
   expect(harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")).toHaveLength(1);
 
   return { runStore, planRunId, stateDir: config.workspace.stateDir };
+}
+
+class HeartbeatUntilIdleHarness implements AgentHarness {
+  readonly id = "heartbeat-until-idle";
+  readonly stoppedRunIds: string[] = [];
+  private releasedToIdle = false;
+
+  releaseToIdle(): void {
+    this.releasedToIdle = true;
+  }
+
+  async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
+    yield { type: "session_started", sessionId: "session-123", runId: "run-123" };
+    while (!ctx.abortSignal.aborted && !this.releasedToIdle) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      if (ctx.abortSignal.aborted || this.releasedToIdle) break;
+      yield { type: "progress", message: "heartbeat", activitySource: "stream" };
+    }
+    if (!ctx.abortSignal.aborted) {
+      await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+    }
+    yield { type: "cancelled" };
+  }
+
+  async stop(runId: string): Promise<void> {
+    this.stoppedRunIds.push(runId);
+  }
 }
 
 class BlockingHarness implements AgentHarness {
