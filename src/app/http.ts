@@ -5746,8 +5746,8 @@ function resolveActivityIssueFilter(issue: string, runs: readonly RunRecord[], l
   return lookup.issueId ?? issue;
 }
 
-function activityRunMatchesIssue(run: RunRecord, issueId: string): boolean {
-  return run.issueId === issueId;
+function activityRunMatchesIssue(run: RunRecord, issueKey: string): boolean {
+  return run.issueId === issueKey || run.issueIdentifier === issueKey;
 }
 
 function writebackOperationMatchesIssue(
