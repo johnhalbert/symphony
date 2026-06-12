@@ -34,6 +34,7 @@ import type {
   WritebackProcessor,
   WritebackStatus,
 } from "./writeback/WritebackOutbox.js";
+import { writebackIdentityKey } from "./writeback/WritebackOutbox.js";
 
 export const PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON = "publication approval setup incomplete";
 export const PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON = "awaiting operator approval for PR publication";
@@ -559,7 +560,7 @@ export class CompletionReportService {
       issue: input.context.issue,
       projectContext: resolveCompletionReportProjectContext(input.context, lifecycle),
       pullRequest,
-      writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
+      writebackOperationKeys: operations.map((operation) => writebackIdentityKey(operation.idempotencyKey, operation.projectContext)),
       acceptedAt: input.existing?.acceptedAt ?? null,
     });
     const enqueued: WritebackOperation[] = [];
@@ -815,9 +816,9 @@ export class CompletionReportService {
         "Publication approval requires a writeback processor to apply pending Linear audit before waiting",
       );
     }
-    await processor.processDue({ idempotencyKeys: operations.map((operation) => operation.idempotencyKey) });
+    await this.processDueForOperations(operations);
     for (const operation of operations) {
-      const record = await this.options.writebackOutbox.get(operation.idempotencyKey);
+      const record = await this.options.writebackOutbox.get(operation.idempotencyKey, operation.projectContext);
       if (!record || !SETTLED_WRITEBACK_STATUSES.has(record.status)) {
         throw new SymphonyError("tracker_error", "Pending publication approval writeback did not complete", {
           idempotencyKey: operation.idempotencyKey,
@@ -908,11 +909,20 @@ export class CompletionReportService {
     return enqueued;
   }
 
-  private async processDueForOperations(operations: ReadonlyArray<Pick<WritebackOperation, "idempotencyKey">>): Promise<void> {
+  private async processDueForOperations(
+    operations: ReadonlyArray<Pick<WritebackOperation, "idempotencyKey" | "projectContext">>,
+  ): Promise<void> {
     if (operations.length === 0) return;
-    await this.options.writebackProcessor?.processDue({
-      idempotencyKeys: operations.map((operation) => operation.idempotencyKey),
-    });
+    const seen = new Set<string>();
+    for (const operation of operations) {
+      const scopedKey = writebackIdentityKey(operation.idempotencyKey, operation.projectContext);
+      if (seen.has(scopedKey)) continue;
+      seen.add(scopedKey);
+      await this.options.writebackProcessor?.processDue({
+        idempotencyKeys: [operation.idempotencyKey],
+        projectContext: operation.projectContext,
+      });
+    }
   }
 
   private async recordPublicationApprovalTerminalRun(approval: OperatorApprovalRecord): Promise<void> {
