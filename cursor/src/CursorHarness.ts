@@ -22,6 +22,7 @@ import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import { resolveCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
 import {
+  redactTextPreserveFormatting,
   sanitizeAgentEventForPublicOutput,
   sanitizedPreviewValue,
 } from "../../src/core/transcript/TranscriptProjection.js";
@@ -816,7 +817,7 @@ function cursorTranscriptEvent(message: unknown): { eventType: string; message?:
       return {
         eventType: "assistant",
         message: "Cursor assistant message",
-        payload: textPayload("assistant", message.text ?? message.message ?? message.content, 500),
+        payload: textPayload("assistant", cursorAssistantText(message), 500),
       };
     case "task":
       return {
@@ -859,8 +860,39 @@ function summaryPayload(kind: "thinking" | "task", value: unknown, maxLength: nu
 }
 
 function textPayload(kind: "assistant", value: unknown, maxLength: number): unknown {
-  const preview = sanitizedPreviewValue(value, maxLength);
-  return { kind, textPreview: preview.preview ?? "", truncated: preview.truncated };
+  const preview = redactTextPreserveFormatting(value, maxLength);
+  return { kind, textPreview: preview.text ?? "", truncated: preview.truncated, redacted: preview.redacted };
+}
+
+function cursorAssistantText(message: { [key: string]: unknown }): unknown {
+  const direct = firstString(message.text, message.content);
+  if (direct !== null) return direct;
+  const nested = message.message;
+  if (isRecord(nested)) {
+    const nestedText = firstString(nested.text, nested.message, nested.content);
+    if (nestedText !== null) return nestedText;
+    const nestedBlocks = textBlocks(nested.content);
+    if (nestedBlocks !== null) return nestedBlocks;
+  }
+  const blocks = textBlocks(message.content);
+  return blocks ?? nested ?? message.content;
+}
+
+function textBlocks(value: unknown): string | null {
+  if (!Array.isArray(value)) return null;
+  const text = value.flatMap((block) => (isRecord(block) && block.type === "text" && typeof block.text === "string" ? [block.text] : []));
+  return text.length > 0 ? text.join("") : null;
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string") return value;
+  }
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function toolCallPayload(message: { [key: string]: unknown }): unknown {

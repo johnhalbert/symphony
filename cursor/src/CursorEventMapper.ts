@@ -1,6 +1,6 @@
 import type { InteractionUpdate, SDKMessage } from "@cursor/sdk";
 import type { AgentEvent } from "../../src/core/harness/AgentHarness.js";
-import { sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
+import { redactTextPreserveFormatting, sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
 
 export function mapCursorMessage(message: SDKMessage): AgentEvent[] {
   switch (message.type) {
@@ -55,11 +55,15 @@ export function mapCursorDelta(update: InteractionUpdate): AgentEvent[] {
     ];
   }
   if (update.type === "text-delta" && update.text) {
-    return [{ type: "progress", message: sanitizedMessage(update.text), activitySource: "delta" }];
+    return [{ type: "progress", message: sanitizedFormattedMessage(update.text), activitySource: "delta" }];
   }
   return [];
 }
 
 function sanitizedMessage(value: string): string {
   return sanitizedPreviewValue(value).preview ?? "";
+}
+
+function sanitizedFormattedMessage(value: string): string {
+  return redactTextPreserveFormatting(value).text ?? "";
 }

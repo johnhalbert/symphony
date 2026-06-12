@@ -71,6 +71,9 @@ describe("Cursor event mapping", () => {
     expect(mapCursorDelta({ type: "text-delta", text: "chunk" })).toEqual([
       { type: "progress", message: "chunk", activitySource: "delta" },
     ]);
+    expect(mapCursorDelta({ type: "text-delta", text: "Hello\n\tSECRET_DELTA_TOKEN" })).toEqual([
+      { type: "progress", message: "Hello\n\t[redacted]", activitySource: "delta" },
+    ]);
   });
 
   it("maps turn-ended usage into token totals", () => {
@@ -607,6 +610,10 @@ describe("Cursor event mapping", () => {
         id: "sdk-run-sanitize",
         async *stream(): AsyncIterable<unknown> {
           yield { type: "user", message: { content: "SECRET_PROMPT access_token=user-access-token" } };
+          yield {
+            type: "assistant",
+            message: { content: [{ type: "text", text: "Line one\n  SECRET_ASSISTANT_INTERNAL" }] },
+          };
           yield { type: "thinking", text: "SECRET_THINKING refreshToken=thinking-refresh-token" };
           yield { type: "task", text: "SECRET_TASK github_token=task-github-token" };
           yield {
@@ -639,6 +646,7 @@ describe("Cursor event mapping", () => {
 
     const persisted = JSON.stringify(runStore.appendEvent.mock.calls);
     expect(persisted).not.toContain("SECRET_PROMPT");
+    expect(persisted).not.toContain("SECRET_ASSISTANT_INTERNAL");
     expect(persisted).not.toContain("SECRET_THINKING");
     expect(persisted).not.toContain("SECRET_TASK");
     expect(persisted).not.toContain("SECRET_ARGS");
@@ -652,6 +660,17 @@ describe("Cursor event mapping", () => {
     expect(persisted).not.toContain("result-private-key");
     expect(persisted).not.toContain("ghp_ABCDEFGH1");
     expect(persisted).not.toContain("sk-ABCDEFGH1");
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "assistant",
+        message: "Cursor assistant message",
+        payload: expect.objectContaining({
+          kind: "assistant",
+          textPreview: "Line one\n  [redacted]",
+          redacted: true,
+        }),
+      }),
+    );
     expect(runStore.appendEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         eventType: "thinking",

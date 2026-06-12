@@ -17,7 +17,7 @@ import {
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import type { AgentRunPhase, TokenCounts } from "../../src/core/types.js";
-import { redactTranscriptText, sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
+import { redactTextPreserveFormatting, redactTranscriptText, sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
 import { resolveRuntimeCredential } from "../../src/app/RuntimeDependencies.js";
 import { ScopedGatewayClient, type GatewayEvent, type HermesGatewayClient, type HermesGatewayEnvironment } from "./GatewayFacade.js";
 import {
@@ -1266,7 +1266,7 @@ function hermesTranscriptEvent(event: GatewayEvent, harnessId: string): { eventT
       return {
         eventType: "message_delta",
         message: "Hermes message delta",
-        payload: { harnessId, textPreview: preview(event.payload?.text, 500), redacted: true },
+        payload: formattedTextPayload({ harnessId, textPreview: event.payload?.text }, 500),
       };
     case "message.complete":
       return {
@@ -1322,10 +1322,9 @@ function hermesTranscriptEvent(event: GatewayEvent, harnessId: string): { eventT
 function messageCompletePayload(payload: unknown): Record<string, unknown> {
   const record = isRecord(payload) ? payload : {};
   return {
-    textPreview: preview(record.text, 500),
+    ...formattedTextPayload({ textPreview: record.text }, 500),
     status: preview(record.status, 80),
     usage: isRecord(record.usage) ? record.usage : null,
-    redacted: true,
   };
 }
 
@@ -1344,6 +1343,26 @@ function usageTokens(usage: unknown): Partial<TokenCounts> | null {
 
 function preview(value: unknown, maxLength: number): string {
   return sanitizedPreviewValue(value, maxLength).preview ?? "";
+}
+
+function formattedTextPayload(fields: Record<string, unknown>, maxLength: number): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  let redacted = false;
+  let truncated = false;
+  for (const [key, value] of Object.entries(fields)) {
+    if (key === "harnessId") {
+      output[key] = value;
+      continue;
+    }
+    const formatted = redactTextPreserveFormatting(value, maxLength);
+    output[key] = formatted.text ?? "";
+    redacted ||= formatted.redacted;
+    truncated ||= formatted.truncated;
+  }
+  output.redacted = true;
+  if (truncated) output.truncated = true;
+  if (redacted) output.textRedacted = true;
+  return output;
 }
 
 function transcriptToolDetailText(value: unknown): string {

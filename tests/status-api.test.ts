@@ -602,6 +602,10 @@ describe("StatusServer durable API", () => {
       expect(pageResponse.status).toBe(200);
       expect(pageHtml).toContain("/api/v1/runs/run-live/transcript");
       expect(pageHtml).toContain("/api/v1/runs/run-live/transcript/stream");
+      expect(pageHtml).toContain("tool-card");
+      expect(pageHtml).toContain("message-body");
+      expect(pageHtml).not.toContain("event-payload");
+      expect(pageHtml).not.toContain("JSON.stringify(event.payload");
 
       socket = new WebSocket(`${baseUrl.replace(/^http:/, "ws:")}/api/v1/runs/run-live/transcript/stream?afterSequence=0`);
       socket.on("message", (data) => {
@@ -613,8 +617,15 @@ describe("StatusServer durable API", () => {
         runId: "run-live",
         at: "2026-01-01T00:00:00.000Z",
         source: "harness",
-        eventType: "progress",
-        message: "streamed transcript event",
+        eventType: "assistant_message_delta",
+        message: "Hello\n  SECRET_DELTA_TOKEN",
+        payload: {
+          kind: "assistant_message_delta",
+          actor: "assistant",
+          channel: "chat",
+          delta: true,
+          textPreview: "Hello\n  SECRET_DELTA_TOKEN",
+        },
       });
 
       await waitForStatusApiAsync(
@@ -622,10 +633,19 @@ describe("StatusServer durable API", () => {
           messages.some(
             (message) =>
               message.type === "transcript.event" &&
-              (message.event as { message?: string } | undefined)?.message === "streamed transcript event",
+              (message.event as { message?: string } | undefined)?.message === "Hello\n  [redacted]" &&
+              ((message.event as { payload?: { textPreview?: string } } | undefined)?.payload?.textPreview ?? "") === "Hello\n  [redacted]",
           ),
         "websocket transcript event",
       );
+
+      const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/run-live/transcript?offset=0&limit=10`);
+      const transcriptBody = (await transcriptResponse.json()) as { events: Array<{ message?: string; payload?: { textPreview?: string } }> };
+      expect(transcriptResponse.status).toBe(200);
+      expect(transcriptBody.events.at(-1)).toMatchObject({
+        message: "Hello\n  [redacted]",
+        payload: { textPreview: "Hello\n  [redacted]" },
+      });
     } finally {
       socket?.close();
       await server.stop();

@@ -374,6 +374,57 @@ describe("HermesHarness", () => {
     expect(complete?.payload).toMatchObject({ resultPreview: longResult, redacted: false, unsafeToolDetails: true });
   });
 
+  it("persists Hermes message deltas with formatted redacted transcript text", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const appended: Array<Record<string, any>> = [];
+    const harness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`, {
+          eventsOnPrompt: [
+            {
+              type: "message.delta",
+              session_id: "gw-1",
+              payload: { text: "Hello\n  SECRET_DELTA_TOKEN" },
+            } as GatewayEvent,
+            {
+              type: "message.complete",
+              session_id: "gw-1",
+              payload: { text: "Hello\n  SECRET_DELTA_TOKEN done", session_key: "hermes-gw-1" },
+            } as GatewayEvent,
+          ],
+        });
+        clients.push(client);
+        return client;
+      },
+      runStore: {
+        appendEvent: async (input: Record<string, any>) => {
+          appended.push(input);
+          return { ...input, sequence: appended.length };
+        },
+      } as any,
+    });
+
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    const events = await collect(harness.run(context(config, { workspacePath, turnNumber: 1 }), "worker prompt"));
+
+    expect(events.map((event) => event.type)).toContain("completed");
+    expect(appended.find((event) => event.eventType === "message_delta")?.payload).toMatchObject({
+      textPreview: "Hello\n  [redacted]",
+      redacted: true,
+      textRedacted: true,
+    });
+    expect(appended.find((event) => event.eventType === "message_complete")?.payload).toMatchObject({
+      textPreview: "Hello\n  [redacted] done",
+      redacted: true,
+      textRedacted: true,
+    });
+  });
+
   it("retires a reusable worker lease when its gateway exits before completion", async () => {
     const clients: FakeGatewayClient[] = [];
     const leakedSecret = "very-secret-token-123";

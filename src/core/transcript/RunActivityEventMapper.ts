@@ -5,7 +5,7 @@ import {
   type RunActivityEvent,
 } from "../runActivity/RunActivityEvent.js";
 import type { TokenCounts } from "../types.js";
-import { sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "./TranscriptProjection.js";
+import { redactTextPreserveFormatting, sanitizePublicJson, sanitizedPreviewValue } from "./TranscriptProjection.js";
 
 export const RUN_ACTIVITY_AGENT_EVENT_SCHEMA_PREFIX = "symphony.run_activity.agent_event";
 
@@ -267,8 +267,8 @@ function previewText(value: unknown, maxLength: number): PreviewText {
 }
 
 function deltaPreviewText(value: unknown, maxLength: number): PreviewText {
-  const preview = sanitizedDeltaTextValue(value, maxLength);
-  return { preview: preview.preview ?? "", truncated: preview.truncated, redacted: preview.redacted };
+  const preview = redactTextPreserveFormatting(value, maxLength);
+  return { preview: preview.text ?? "", truncated: preview.truncated, redacted: preview.redacted };
 }
 
 function firstDeltaPreviewFromPayload(payload: Record<string, unknown>, maxLength: number): PreviewText | null {

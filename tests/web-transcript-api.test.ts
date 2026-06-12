@@ -673,7 +673,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
-  it("serves explicitly unsafe full Hermes tool details through the web transcript API", async () => {
+  it("serves explicitly unsafe Hermes tool details through the web transcript API as public-safe previews", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const longArgs = `{\n  "command": "echo SECRET_UNSAFE_ARGUMENT",\n  "filler": "${"a".repeat(700)}"\n}`;
@@ -715,17 +715,21 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(response.status).toBe(200);
       const body = transcriptMessages(await response.json());
       expectRunPrelude(body, { session: "unsafe-hermes-session", issue: "TEST-1" });
-      expect(body.slice(2)).toEqual([
-        {
-          kind: "tool_call",
-          ts: "2026-01-01T00:00:01.000Z",
-          call_id: "tool-unsafe",
-          name: "terminal",
-          status: "completed",
-          args: { preview: longArgs },
-          result: longResult,
-        },
-      ]);
+      expect(body.slice(2)).toHaveLength(1);
+      expect(body[2]).toMatchObject({
+        kind: "tool_call",
+        ts: "2026-01-01T00:00:01.000Z",
+        call_id: "tool-unsafe",
+        name: "terminal",
+        status: "completed",
+        args: { preview: expect.stringContaining("echo [redacted]") },
+        result: expect.stringContaining("[redacted]"),
+      });
+      expect((body[2] as { args?: { preview?: string }; result?: string; truncated?: boolean }).args?.preview).toContain("...[truncated]");
+      expect((body[2] as { result?: string; truncated?: boolean }).result).toContain("...[truncated]");
+      expect((body[2] as { truncated?: boolean }).truncated).toBe(true);
+      expect(JSON.stringify(body)).not.toContain("SECRET_UNSAFE_ARGUMENT");
+      expect(JSON.stringify(body)).not.toContain("SECRET_UNSAFE_RESULT");
     } finally {
       await server.stop();
     }

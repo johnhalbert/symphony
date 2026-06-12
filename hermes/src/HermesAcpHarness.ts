@@ -19,9 +19,9 @@ import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
 import type { AgentRunPhase, TokenCounts } from "../../src/core/types.js";
 import {
+  redactTextPreserveFormatting,
   redactTranscriptText,
   sanitizeAgentEventForPublicOutput,
-  sanitizedDeltaTextValue,
   sanitizedPreviewValue,
 } from "../../src/core/transcript/TranscriptProjection.js";
 import {
@@ -3242,7 +3242,7 @@ function preview(value: unknown, maxLength: number): string {
 }
 
 function previewDelta(value: unknown, maxLength: number): string {
-  return sanitizedDeltaTextValue(value, maxLength).preview ?? "";
+  return redactTextPreserveFormatting(value, maxLength).text ?? "";
 }
 
 function nonEmptyString(value: unknown): string | null {

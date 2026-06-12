@@ -1390,7 +1390,8 @@ export class StatusServer {
         const runId = decodeURIComponent(transcriptMatch[1] ?? "");
         const run = await this.options.runStore?.getRun(runId);
         if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
-        sendJson(response, 200, await this.options.runStore?.readTranscript(runId, parsePagination(url)));
+        const page = await this.options.runStore?.readTranscript(runId, parsePagination(url));
+        sendJson(response, 200, page ? publicTranscriptPage(page) : page);
         return;
       }
 
@@ -4227,6 +4228,13 @@ function sendJson(response: ServerResponse, status: number, body: unknown, heade
   response.end(`${JSON.stringify(body, null, 2)}\n`);
 }
 
+function publicTranscriptPage(page: TranscriptPage): TranscriptPage {
+  return {
+    ...page,
+    events: page.events.map(projectTranscriptEventForPublicRead),
+  };
+}
+
 function writeWebProjectionSseEvent(response: ServerResponse, event: string, body: unknown, id?: string): void {
   if (id) response.write(`id: ${id}\n`);
   response.write(`event: ${event}\n`);
@@ -6017,10 +6025,19 @@ function renderLiveTranscriptPage(run: RunRecord): string {
       .meta, .status { color: #57606a; font-size: 0.9rem; }
       .toolbar { align-items: center; display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.7rem; }
       .events { list-style: none; margin: 0; padding: 0; }
-      .event { background: #fff; border: 1px solid #d8dee4; border-left: 4px solid #6e7781; border-radius: 6px; margin: 0 0 0.65rem; padding: 0.65rem; }
-      .event-header { color: #57606a; display: flex; flex-wrap: wrap; gap: 0.45rem; font-size: 0.85rem; margin-bottom: 0.4rem; }
-      .event-message { white-space: pre-wrap; }
-      .event-payload { background: #f6f8fa; border-radius: 6px; margin: 0.5rem 0 0; max-height: 18rem; overflow: auto; padding: 0.55rem; white-space: pre-wrap; }
+      .message, .tool-card, .status-row { margin: 0 0 0.65rem; }
+      .message { background: #fff; border-left: 4px solid #2f6f9f; padding: 0.65rem 0.8rem; }
+      .message.user { border-left-color: #8a63d2; }
+      .message-meta, .tool-meta, .status-label { color: #57606a; font-size: 0.8rem; margin-bottom: 0.25rem; }
+      .message-body, .tool-section pre { white-space: pre-wrap; }
+      .tool-card { background: #fff; border: 1px solid #d8dee4; border-left: 4px solid #9a6700; border-radius: 6px; padding: 0.65rem; }
+      .tool-title { align-items: baseline; display: flex; flex-wrap: wrap; gap: 0.45rem; font-weight: 650; }
+      .tool-status { color: #57606a; font-size: 0.85rem; font-weight: 500; }
+      .tool-section { margin-top: 0.5rem; }
+      .tool-section-title { color: #57606a; font-size: 0.78rem; font-weight: 650; text-transform: uppercase; }
+      .tool-section pre { background: #f6f8fa; border-radius: 6px; margin: 0.2rem 0 0; max-height: 18rem; overflow: auto; padding: 0.55rem; }
+      .status-row { color: #57606a; font-size: 0.9rem; padding: 0.25rem 0.1rem; }
+      .status-label { display: inline; font-weight: 650; margin-right: 0.35rem; }
       .empty { color: #57606a; padding: 1rem 0; }
     </style>
   </head>
@@ -6043,7 +6060,7 @@ function renderLiveTranscriptPage(run: RunRecord): string {
     <script>
       (() => {
         const config = ${config};
-        const state = { lastSequence: 0, seen: new Set(), paused: false, queued: [], socket: null, reconnectTimer: null };
+        const state = { lastSequence: 0, seen: new Set(), paused: false, queued: [], socket: null, reconnectTimer: null, activeAssistant: null, tools: new Map() };
         const eventsEl = document.getElementById("events");
         const emptyEl = document.getElementById("empty");
         const statusEl = document.getElementById("stream-status");
@@ -6058,40 +6075,194 @@ function renderLiveTranscriptPage(run: RunRecord): string {
           if (!response.ok) throw new Error("HTTP " + response.status);
           return response.json();
         };
-        const truncate = (value, max) => value.length > max ? value.slice(0, max - 15) + "...[truncated]" : value;
-        const eventPayloadText = (event) => {
-          if (event.payload === undefined || event.payload === null) return "";
-          try { return truncate(JSON.stringify(event.payload, null, 2), 5000); } catch { return String(event.payload); }
+        const payloadRecord = (event) => event && event.payload && typeof event.payload === "object" && !Array.isArray(event.payload) ? event.payload : {};
+        const token = (value) => typeof value === "string" ? value.replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "").toLowerCase() : "";
+        const eventToken = (event) => token(event && event.eventType);
+        const payloadKind = (event) => {
+          const payload = payloadRecord(event);
+          return token(payload.kind || payload.type);
         };
-        const eventMessageText = (event) => event.message || event.eventType || "";
+        const firstText = (...values) => {
+          for (const value of values) {
+            if (typeof value === "string" && value.length > 0) return value;
+          }
+          return "";
+        };
+        const textFields = (payload, fields) => firstText(...fields.map((field) => payload[field]));
+        const metaText = (event, label) => "#" + event.sequence + " · " + event.at + " · " + label;
+        const isAssistantDelta = (event) => {
+          const kind = payloadKind(event);
+          const payload = payloadRecord(event);
+          const type = eventToken(event);
+          const actor = token(payload.actor);
+          const channel = token(payload.channel);
+          const activitySource = token(payload.activitySource || payload.activity_source);
+          const progressKind = token(payload.progressKind || payload.progress_kind);
+          const assistantChannel = channel === "chat" || channel === "message" || channel === "assistant";
+          return type === "message_delta" || type === "assistant_delta" || type === "assistant_message_delta" || type === "response_delta" ||
+            kind === "assistant_delta" || kind === "assistant_message_delta" || kind === "response_delta" ||
+            (kind === "progress" && actor === "assistant" && assistantChannel && payload.delta === true) ||
+            (kind === "progress" && (activitySource === "delta" || progressKind === "assistant_delta"));
+        };
+        const isAssistantComplete = (event) => {
+          const type = eventToken(event);
+          return type === "message_complete" || type === "assistant_complete" || type === "assistant_message_completed" || type === "response_complete";
+        };
+        const isAssistantEvent = (event) => {
+          const type = eventToken(event);
+          const kind = payloadKind(event);
+          return isAssistantDelta(event) || isAssistantComplete(event) || type === "assistant" || kind === "assistant";
+        };
+        const isUserEvent = (event) => {
+          const type = eventToken(event);
+          const kind = payloadKind(event);
+          return type === "user" || type === "user_message" || type === "user_message_submitted" || kind === "user" || kind === "user_message_submitted";
+        };
+        const isToolEvent = (event) => {
+          const type = eventToken(event);
+          const kind = payloadKind(event);
+          const payload = payloadRecord(event);
+          return type.includes("tool") || kind.includes("tool") || token(payload.activitySource || payload.activity_source) === "tool";
+        };
+        const transcriptText = (event) => {
+          const payload = payloadRecord(event);
+          const text = textFields(payload, ["textPreview", "messagePreview", "deltaPreview", "text", "message", "delta"]);
+          if (text) return text;
+          if (isAssistantDelta(event) && token(event.message) === "hermes_message_delta") return "";
+          return typeof event.message === "string" ? event.message : "";
+        };
         const scrollToBottom = () => {
           if (state.paused) return;
           window.requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: "auto" }));
         };
-        const renderEvent = (event) => {
+        const appendMessageBlock = (event, role, text) => {
           emptyEl.hidden = true;
           const item = document.createElement("li");
-          item.className = "event";
-          const header = document.createElement("div");
-          header.className = "event-header";
-          header.textContent = "#" + event.sequence + " · " + event.at + " · " + event.source + " · " + event.eventType;
-          item.appendChild(header);
-          const message = eventMessageText(event);
-          if (message) {
-            const messageEl = document.createElement("div");
-            messageEl.className = "event-message";
-            messageEl.textContent = message;
-            item.appendChild(messageEl);
-          }
-          const payload = eventPayloadText(event);
-          if (payload) {
-            const payloadEl = document.createElement("pre");
-            payloadEl.className = "event-payload";
-            payloadEl.textContent = payload;
-            item.appendChild(payloadEl);
-          }
+          item.className = "message " + role;
+          const meta = document.createElement("div");
+          meta.className = "message-meta";
+          meta.textContent = metaText(event, role);
+          const body = document.createElement("div");
+          body.className = "message-body";
+          body.textContent = text;
+          item.appendChild(meta);
+          item.appendChild(body);
           eventsEl.appendChild(item);
           scrollToBottom();
+          return { item, body, text };
+        };
+        const renderAssistant = (event) => {
+          const text = transcriptText(event);
+          if (!text) return;
+          if (isAssistantDelta(event)) {
+            if (!state.activeAssistant) state.activeAssistant = appendMessageBlock(event, "assistant", text);
+            else {
+              state.activeAssistant.text += text;
+              state.activeAssistant.body.textContent = state.activeAssistant.text;
+              scrollToBottom();
+            }
+            return;
+          }
+          if (isAssistantComplete(event) && state.activeAssistant) {
+            if (text.length >= state.activeAssistant.text.length) {
+              state.activeAssistant.text = text;
+              state.activeAssistant.body.textContent = text;
+              scrollToBottom();
+            }
+            return;
+          }
+          state.activeAssistant = appendMessageBlock(event, "assistant", text);
+        };
+        const toolKey = (event) => {
+          const payload = payloadRecord(event);
+          return firstText(payload.call_id, payload.callId, payload.toolCallId, payload.toolId, payload.tool_id, payload.id) || (event.runId + ":" + event.sequence);
+        };
+        const toolName = (event) => {
+          const payload = payloadRecord(event);
+          return firstText(payload.name, payload.tool, payload.toolName, payload.title) || event.eventType || "tool";
+        };
+        const toolStatus = (event) => {
+          const payload = payloadRecord(event);
+          return firstText(payload.status, payload.state) || (eventToken(event).includes("complete") ? "completed" : eventToken(event).includes("fail") ? "failed" : "running");
+        };
+        const toolSections = (event) => {
+          const payload = payloadRecord(event);
+          return [
+            ["input", textFields(payload, ["argsPreview", "argumentsPreview", "inputPreview"])],
+            ["result", textFields(payload, ["resultPreview"])],
+            ["output", textFields(payload, ["outputPreview", "messagePreview"])],
+            ["error", textFields(payload, ["errorPreview"])],
+            ["summary", textFields(payload, ["summary"])],
+          ].filter((section) => section[1]);
+        };
+        const renderTool = (event) => {
+          emptyEl.hidden = true;
+          state.activeAssistant = null;
+          const key = toolKey(event);
+          let tool = state.tools.get(key);
+          if (!tool) {
+            const item = document.createElement("li");
+            item.className = "tool-card";
+            const header = document.createElement("div");
+            header.className = "tool-title";
+            const title = document.createElement("span");
+            const status = document.createElement("span");
+            status.className = "tool-status";
+            const meta = document.createElement("div");
+            meta.className = "tool-meta";
+            const body = document.createElement("div");
+            item.appendChild(header);
+            header.appendChild(title);
+            header.appendChild(status);
+            item.appendChild(meta);
+            item.appendChild(body);
+            eventsEl.appendChild(item);
+            tool = { item, title, status, meta, body };
+            state.tools.set(key, tool);
+          }
+          tool.title.textContent = toolName(event);
+          tool.status.textContent = toolStatus(event);
+          tool.meta.textContent = metaText(event, "tool");
+          tool.body.replaceChildren();
+          for (const [label, value] of toolSections(event)) {
+            const section = document.createElement("div");
+            section.className = "tool-section";
+            const sectionTitle = document.createElement("div");
+            sectionTitle.className = "tool-section-title";
+            sectionTitle.textContent = label;
+            const pre = document.createElement("pre");
+            pre.textContent = value;
+            section.appendChild(sectionTitle);
+            section.appendChild(pre);
+            tool.body.appendChild(section);
+          }
+          scrollToBottom();
+        };
+        const renderStatus = (event) => {
+          const payload = payloadRecord(event);
+          const text = firstText(payload.messagePreview, payload.summary, payload.status, payload.reason, payload.errorPreview, payload.textPreview, event.message, event.eventType);
+          if (!text) return;
+          emptyEl.hidden = true;
+          state.activeAssistant = null;
+          const item = document.createElement("li");
+          item.className = "status-row";
+          const label = document.createElement("span");
+          label.className = "status-label";
+          label.textContent = event.eventType || "status";
+          const body = document.createElement("span");
+          body.textContent = text;
+          item.appendChild(label);
+          item.appendChild(body);
+          eventsEl.appendChild(item);
+          scrollToBottom();
+        };
+        const renderEvent = (event) => {
+          if (isToolEvent(event)) renderTool(event);
+          else if (isUserEvent(event)) {
+            state.activeAssistant = null;
+            appendMessageBlock(event, "user", transcriptText(event));
+          } else if (isAssistantEvent(event)) renderAssistant(event);
+          else renderStatus(event);
         };
         const appendEvent = (event) => {
           const sequence = Number(event && event.sequence);

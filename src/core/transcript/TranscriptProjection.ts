@@ -11,6 +11,9 @@ const REDACTED = "[redacted]";
 const REDACTED_COMMAND_PAYLOAD = "[redacted command payload]";
 const REDACTED_ENVIRONMENT_VALUES = "[redacted environment values]";
 const REDACTED_HELPER_PATH = "[redacted helper path]";
+const TRUNCATED_SUFFIX = "...[truncated]";
+const ANSI_ESCAPE_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][\s\S]*?(?:\x07|\x1B\\)|[PX^_][\s\S]*?(?:\x07|\x1B\\))/g;
+const UNSAFE_CONTROL_PATTERN = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g;
 const UNSAFE_TOOL_DETAIL_TEXT_FIELDS = [
   "argsPreview",
   "argumentsPreview",
@@ -107,9 +110,30 @@ const COMMAND_POLICY_DISPLAY_TEXT_KEYS = new Set([
   "text",
   "textpreview",
 ]);
+const FORMATTED_TRANSCRIPT_TEXT_FIELDS = [
+  "argsPreview",
+  "argumentsPreview",
+  "delta",
+  "deltaPreview",
+  "errorPreview",
+  "inputPreview",
+  "message",
+  "messagePreview",
+  "outputPreview",
+  "resultPreview",
+  "summary",
+  "text",
+  "textPreview",
+] as const;
 
 export interface RedactedPreview {
   preview: string | null;
+  truncated: boolean;
+  redacted: boolean;
+}
+
+export interface RedactedFormattedText {
+  text: string | null;
   truncated: boolean;
   redacted: boolean;
 }
@@ -120,19 +144,29 @@ export function sanitizedPreviewValue(value: unknown, maxLength = DEFAULT_PREVIE
   const redacted = redactTranscriptText(text);
   const oneLine = redacted.text.replace(/\s+/g, " ").trim();
   return {
-    preview: oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`,
+    preview: oneLine.length <= maxLength ? oneLine : truncateText(oneLine, maxLength),
     truncated: oneLine.length > maxLength,
     redacted: redacted.redacted,
   };
 }
 
-export function sanitizedDeltaTextValue(value: unknown, maxLength = DEFAULT_PREVIEW_LENGTH): RedactedPreview {
-  if (value === undefined || value === null) return { preview: null, truncated: false, redacted: false };
+export function redactTextPreserveFormatting(value: unknown, maxLength = DEFAULT_PREVIEW_LENGTH): RedactedFormattedText {
+  if (value === undefined || value === null) return { text: null, truncated: false, redacted: false };
   const text = typeof value === "string" ? value : safeJsonPreview(value);
-  const redacted = redactTranscriptText(text);
+  const safeText = stripUnsafeTranscriptFormatting(text);
+  const redacted = redactTranscriptText(safeText);
   return {
-    preview: redacted.text.length <= maxLength ? redacted.text : `${redacted.text.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`,
+    text: redacted.text.length <= maxLength ? redacted.text : truncateText(redacted.text, maxLength),
     truncated: redacted.text.length > maxLength,
+    redacted: safeText !== text || redacted.redacted,
+  };
+}
+
+export function sanitizedDeltaTextValue(value: unknown, maxLength = DEFAULT_PREVIEW_LENGTH): RedactedPreview {
+  const redacted = redactTextPreserveFormatting(value, maxLength);
+  return {
+    preview: redacted.text,
+    truncated: redacted.truncated,
     redacted: redacted.redacted,
   };
 }
@@ -350,16 +384,9 @@ function safeCommandPolicyMetadataLabel(value: unknown): string | null {
 function sanitizedEventPayloadForPublicRead(payload: unknown, assistantDelta: boolean, event: TranscriptEvent): unknown {
   if (isCommandPolicyTranscriptEvent(event) || isCommandPolicyPayload(payload)) return sanitizeCommandPolicyPayloadForPublicOutput(payload);
   if (isUnsafeToolDetailTranscriptPayload(event, payload)) return sanitizeUnsafeToolDetailPayloadForPublicRead(payload);
-  if (!assistantDelta) return sanitizePublicJson(payload);
   const sanitized = sanitizePublicJson(payload);
   if (!isRecord(payload) || !isRecord(sanitized)) return sanitized;
-  const output: Record<string, unknown> = { ...sanitized };
-  for (const key of ["textPreview", "deltaPreview", "messagePreview", "delta", "text", "message"]) {
-    const value = payload[key];
-    if (typeof value !== "string") continue;
-    output[key] = sanitizedDeltaTextValue(value).preview ?? "";
-  }
-  return output;
+  return applyFormattedTranscriptDisplayFields(sanitized, payload);
 }
 
 function isUnsafeToolDetailTranscriptPayload(event: TranscriptEvent, payload: unknown): payload is Record<string, unknown> {
@@ -375,13 +402,30 @@ function sanitizeUnsafeToolDetailPayloadForPublicRead(payload: Record<string, un
   const output: Record<string, unknown> = { ...sanitized, unsafeToolDetails: true, redacted: false };
   for (const key of UNSAFE_TOOL_DETAIL_TEXT_FIELDS) {
     const value = payload[key];
-    if (typeof value === "string") output[key] = normalizeUnsafeToolDetailText(value);
+    if (typeof value === "string") {
+      const formatted = redactTextPreserveFormatting(value);
+      output[key] = formatted.text ?? "";
+      if (formatted.redacted) output.redacted = true;
+      if (formatted.truncated) output.truncated = true;
+    }
   }
   return output;
 }
 
-function normalizeUnsafeToolDetailText(value: string): string {
-  return value.replace(/\r\n/g, "\n").trim();
+function applyFormattedTranscriptDisplayFields(
+  sanitizedPayload: Record<string, unknown>,
+  rawPayload: Record<string, unknown>,
+): Record<string, unknown> {
+  const output: Record<string, unknown> = { ...sanitizedPayload };
+  for (const key of FORMATTED_TRANSCRIPT_TEXT_FIELDS) {
+    const value = rawPayload[key];
+    if (typeof value !== "string") continue;
+    const formatted = redactTextPreserveFormatting(value);
+    output[key] = formatted.text ?? "";
+    if (formatted.redacted) output.redacted = true;
+    if (formatted.truncated) output.truncated = true;
+  }
+  return output;
 }
 
 function isTranscriptAssistantDeltaEvent(event: TranscriptEvent): boolean {
@@ -438,6 +482,14 @@ function safeJsonPreview(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function stripUnsafeTranscriptFormatting(value: string): string {
+  return value.replace(/\r\n?/g, "\n").replace(ANSI_ESCAPE_PATTERN, "").replace(UNSAFE_CONTROL_PATTERN, "");
+}
+
+function truncateText(value: string, maxLength: number): string {
+  return `${value.slice(0, Math.max(maxLength - 15, 0))}${TRUNCATED_SUFFIX}`;
 }
 
 function redactKeyValueAssignment(match: string, prefix: string, label: string, value: string): string {
