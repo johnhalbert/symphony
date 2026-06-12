@@ -7,7 +7,6 @@ import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptPro
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 import { isRunActivityCommandPolicyDecisionPayload } from "../runActivity/RunActivityEvent.js";
 import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
-import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "./ProjectionRevision.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
 export type PersistedRunRole = AgentRunRole | "planner";
@@ -241,6 +240,89 @@ export interface TranscriptPage {
   lastEventAt?: string | null;
 }
 
+export interface TranscriptSourceEvent {
+  type: "transcript.appended";
+  runId: string;
+  sessionId: string | null;
+  afterSequence: number;
+  event: TranscriptEvent;
+  emittedAt: string;
+}
+
+export type TranscriptSourceListener = (event: TranscriptSourceEvent) => void | Promise<void>;
+export type TranscriptSourceUnsubscribe = () => void;
+
+export interface TranscriptEventSink {
+  handleTranscriptEvent(event: TranscriptSourceEvent): void | Promise<void>;
+}
+
+export interface TranscriptSinkFailure {
+  runId: string;
+  sequence: number;
+  failedAt: string;
+  error: unknown;
+}
+
+export class TranscriptEventSource {
+  private readonly listeners: TranscriptSourceListener[] = [];
+
+  subscribe(listener: TranscriptSourceListener): TranscriptSourceUnsubscribe {
+    this.listeners.push(listener);
+    return () => {
+      const index = this.listeners.indexOf(listener);
+      if (index >= 0) this.listeners.splice(index, 1);
+    };
+  }
+
+  emit(event: TranscriptSourceEvent): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        const result = listener(event);
+        if (isPromiseLike(result)) {
+          void result.catch(() => undefined);
+        }
+      } catch {
+        // Listener failures are sink-owned. Source dispatch continues.
+      }
+    }
+  }
+}
+
+class FileTranscriptSink implements TranscriptEventSink {
+  private readonly pendingByRunId = new Map<string, Promise<void>>();
+  private readonly failures: TranscriptSinkFailure[] = [];
+
+  constructor(private readonly write: (event: TranscriptSourceEvent) => Promise<void>) {}
+
+  handleTranscriptEvent(event: TranscriptSourceEvent): void {
+    const previous = this.pendingByRunId.get(event.runId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(async () => {
+      try {
+        await this.write(event);
+      } catch (error) {
+        this.failures.push({
+          runId: event.runId,
+          sequence: event.event.sequence,
+          failedAt: new Date().toISOString(),
+          error,
+        });
+      }
+    });
+    this.pendingByRunId.set(event.runId, current);
+    void current.finally(() => {
+      if (this.pendingByRunId.get(event.runId) === current) this.pendingByRunId.delete(event.runId);
+    });
+  }
+
+  async waitForIdle(runId: string): Promise<void> {
+    await (this.pendingByRunId.get(runId) ?? Promise.resolve());
+  }
+
+  failuresSnapshot(): readonly TranscriptSinkFailure[] {
+    return [...this.failures];
+  }
+}
+
 function transcriptPage(input: {
   runId: string;
   offset: number;
@@ -321,16 +403,21 @@ export interface CiStatusTranscriptInput extends RunMetadata {
 
 export class FileRunTranscriptStore {
   private readonly runUpdateLocks = new Map<string, Promise<void>>();
-  private readonly projectionNotifier = new ProjectionRevisionNotifier();
+  private readonly transcriptEventCounts = new Map<string, number>();
+  private readonly transcriptSource = new TranscriptEventSource();
+  private readonly fileTranscriptSink: FileTranscriptSink;
 
-  constructor(private readonly stateDir: string) {}
-
-  projectionRevision(): number {
-    return this.projectionNotifier.currentRevision();
+  constructor(private readonly stateDir: string) {
+    this.fileTranscriptSink = new FileTranscriptSink((event) => this.writeTranscriptEvent(event));
+    this.transcriptSource.subscribe((event) => this.fileTranscriptSink.handleTranscriptEvent(event));
   }
 
-  onProjectionChanged(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe {
-    return this.projectionNotifier.subscribe(listener);
+  subscribeTranscriptEvents(listener: TranscriptSourceListener): TranscriptSourceUnsubscribe {
+    return this.transcriptSource.subscribe(listener);
+  }
+
+  transcriptSinkFailures(): readonly TranscriptSinkFailure[] {
+    return this.fileTranscriptSink.failuresSnapshot();
   }
 
   async upsertWorkspace(record: WorkspaceRecord): Promise<void> {
@@ -341,7 +428,6 @@ export class FileRunTranscriptStore {
       createdAt: existing?.createdAt ?? record.createdAt,
       updatedAt: record.updatedAt,
     });
-    this.notifyProjectionChanged("workspaces");
   }
 
   async getWorkspace(workspaceKey: string): Promise<WorkspaceRecord | null> {
@@ -352,7 +438,6 @@ export class FileRunTranscriptStore {
     const existing = await this.getWorkspace(workspaceKey);
     if (!existing) return;
     await fs.rm(this.workspacePath(workspaceKey), { force: true });
-    this.notifyProjectionChanged("workspaces");
   }
 
   async listWorkspaces(): Promise<WorkspaceRecord[]> {
@@ -422,7 +507,6 @@ export class FileRunTranscriptStore {
       transcriptEventCount: existing?.transcriptEventCount ?? 0,
     };
     await this.writeRun(record);
-    this.notifyProjectionChanged("runs");
     return record;
   }
 
@@ -442,7 +526,6 @@ export class FileRunTranscriptStore {
         updatedAt: new Date().toISOString(),
       };
       await this.writeRun(updated);
-      this.notifyProjectionChanged("runs");
       return updated;
     });
   }
@@ -475,27 +558,23 @@ export class FileRunTranscriptStore {
 
   async appendEvent(input: Omit<TranscriptEvent, "sequence"> & { sequence?: number }): Promise<TranscriptEvent> {
     return this.withRunUpdateLock(input.runId, async () => {
-      await fs.mkdir(this.runDir(input.runId), { recursive: true });
-      const count = await this.ensureTranscriptEventCountUnlocked(input.runId);
+      const count = await this.allocateTranscriptEventCount(input.runId);
       const sequence = input.sequence ?? count + 1;
       const event: TranscriptEvent = {
         ...input,
         sequence,
         payload: sanitizeJson(input.payload),
       };
-      await fs.appendFile(this.eventsPath(input.runId), `${JSON.stringify(event)}\n`, "utf8");
       const record = await this.getRun(input.runId);
-      const reduced = reduceRunActivityEvent(record, event, count + 1, { terminalEvents: true });
-      if (reduced) {
-        await this.writeRun(reduced);
-      }
-      this.notifyProjectionChanged("runs", {
+      this.transcriptSource.emit({
+        type: "transcript.appended",
         runId: event.runId,
-        sessionId: (reduced ?? record)?.sessionId ?? event.runId,
+        sessionId: record?.sessionId ?? event.runId,
         afterSequence: count,
-        eventCount: 1,
-        events: [projectTranscriptEventForPublicRead(event)],
+        event,
+        emittedAt: new Date().toISOString(),
       });
+      await this.fileTranscriptSink.waitForIdle(input.runId);
       return event;
     });
   }
@@ -518,7 +597,7 @@ export class FileRunTranscriptStore {
       }
       if (!reduced) return null;
       await this.writeRun(reduced);
-      this.notifyProjectionChanged("runs");
+      this.transcriptEventCounts.set(runId, count);
       return reduced;
     });
   }
@@ -568,8 +647,9 @@ export class FileRunTranscriptStore {
 
   async readTranscriptEventCount(runId: string): Promise<number> {
     const record = await this.getRun(runId);
-    if (typeof record?.transcriptEventCount === "number") return record.transcriptEventCount;
-    return countJsonlLines(this.eventsPath(runId));
+    const cached = this.transcriptEventCounts.get(runId) ?? 0;
+    if (typeof record?.transcriptEventCount === "number") return Math.max(record.transcriptEventCount, cached);
+    return Math.max(await countJsonlLines(this.eventsPath(runId)), cached);
   }
 
   async ensureTranscriptEventCount(runId: string): Promise<number> {
@@ -611,13 +691,27 @@ export class FileRunTranscriptStore {
     const count = await countJsonlLines(this.eventsPath(runId));
     if (record) {
       await this.writeRun({ ...record, transcriptEventCount: count });
-      this.notifyProjectionChanged("runs");
     }
+    this.transcriptEventCounts.set(runId, count);
     return count;
   }
 
-  private notifyProjectionChanged(source: "runs" | "workspaces", detail: Record<string, unknown> | null = null): void {
-    this.projectionNotifier.notify(source, detail);
+  private async allocateTranscriptEventCount(runId: string): Promise<number> {
+    const persisted = await this.ensureTranscriptEventCountUnlocked(runId);
+    const current = Math.max(persisted, this.transcriptEventCounts.get(runId) ?? 0);
+    this.transcriptEventCounts.set(runId, current + 1);
+    return current;
+  }
+
+  private async writeTranscriptEvent(sourceEvent: TranscriptSourceEvent): Promise<void> {
+    const event = sourceEvent.event;
+    await fs.mkdir(this.runDir(event.runId), { recursive: true });
+    await fs.appendFile(this.eventsPath(event.runId), `${JSON.stringify(event)}\n`, "utf8");
+    const record = await this.getRun(event.runId);
+    const reduced = reduceRunActivityEvent(record, event, sourceEvent.afterSequence + 1, { terminalEvents: true });
+    if (reduced) {
+      await this.writeRun(reduced);
+    }
   }
 
   private workspacesDir(): string {
@@ -1498,6 +1592,10 @@ async function readJsonlTailPage<T>(filePath: string, limit: number): Promise<T[
 
 function trimJsonlCarriageReturn(line: Buffer): Buffer {
   return line.at(-1) === 0x0d ? line.subarray(0, -1) : line;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> & { catch(onRejected: () => void): unknown } {
+  return typeof value === "object" && value !== null && typeof (value as { catch?: unknown }).catch === "function";
 }
 
 async function countJsonlLines(filePath: string): Promise<number> {

@@ -274,7 +274,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     });
     const durablePayload = [{ kind: "assistant", text: "stale durable transcript" }];
     const projectionReader = new StaticProjectionReader(durablePayload, [
-      { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+      { source: "runStore", revision: 0, observedAt: null },
     ]);
     const projectionWriter = new RecordingProjectionWriter();
     const server = createServer(config, runStore, { projectionReader, projectionWriter });
@@ -363,7 +363,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
         compatibility: { responseShape: "transcript_window", messagesField: "messages" },
       },
-      [{ source: "runStore", revision: runStore.projectionRevision(), observedAt: null }],
+      [{ source: "runStore", revision: 0, observedAt: null }],
     );
     const server = createServer(config, runStore, { projectionReader });
     const address = await server.start();

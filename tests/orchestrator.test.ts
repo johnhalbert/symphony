@@ -208,15 +208,17 @@ describe("Orchestrator", () => {
       messageId: "client-message-1",
       statusServer: { baseUrl: "http://127.0.0.1:7331", mutationToken: "secret" },
     });
-    const run = await runStore.getRun("operator-run-1");
-    expect(run).toMatchObject({
-      runId: "operator-run-1",
-      role: "planner",
-      runPhase: "issue_breakdown",
-      runKind: "planning",
-      status: "succeeded",
-      runtimeModel: "test-planner",
-      runtimeAgentLifecycle: "reuse_by_conversation",
+    await eventually(async () => {
+      const run = await runStore.getRun("operator-run-1");
+      expect(run).toMatchObject({
+        runId: "operator-run-1",
+        role: "planner",
+        runPhase: "issue_breakdown",
+        runKind: "planning",
+        status: "succeeded",
+        runtimeModel: "test-planner",
+        runtimeAgentLifecycle: "reuse_by_conversation",
+      });
     });
     const transcript = await runStore.readTranscript("operator-run-1");
     expect(transcript.events.map((event) => event.eventType)).toContain("completed");

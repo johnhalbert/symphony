@@ -2,6 +2,8 @@ import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Stats } from "node:fs";
+import type { Duplex } from "node:stream";
+import { WebSocket, WebSocketServer } from "ws";
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
 import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
@@ -61,6 +63,8 @@ import {
   type RunTranscriptStore,
   type TranscriptPage,
   type TranscriptEvent,
+  type TranscriptSourceEvent,
+  type TranscriptSourceUnsubscribe,
   type WorkspaceRecord,
 } from "../core/persistence/RunTranscriptStore.js";
 import type {
@@ -76,7 +80,12 @@ import {
   type WritebackOperation,
 } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
-import { sanitizedPreviewValue, sanitizeCommandPolicyReplayStateForPublicOutput, sanitizePublicJson } from "../core/transcript/TranscriptProjection.js";
+import {
+  projectTranscriptEventForPublicRead,
+  sanitizedPreviewValue,
+  sanitizeCommandPolicyReplayStateForPublicOutput,
+  sanitizePublicJson,
+} from "../core/transcript/TranscriptProjection.js";
 import {
   DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
   type OrchestratorConversationMessage,
@@ -166,6 +175,8 @@ import type {
 } from "../core/types.js";
 
 export const WEB_PROJECTION_CONTEXT_TTL_MS = 5_000;
+const TRANSCRIPT_STREAM_MAX_BUFFERED_BYTES = 1_000_000;
+const LIVE_TRANSCRIPT_TAIL_LIMIT = 500;
 
 export type StatusServerWebProjectionContext = WebProjectionContext<BuiltWebProjectionSourceIndex, Record<string, unknown>>;
 
@@ -248,6 +259,14 @@ interface WebProjectionEventClient {
   response: ServerResponse;
 }
 
+interface TranscriptStreamClient {
+  id: number;
+  runId: string;
+  sessionId: string | null;
+  afterSequence: number;
+  socket: WebSocket;
+}
+
 interface WebProjectionJsonResponse<TBody> {
   body: TBody;
   headers?: Record<string, string>;
@@ -315,10 +334,14 @@ export class StatusServer {
   private readonly webProjectionRevisionUnsubscribes: WebProjectionRevisionUnsubscribe[] = [];
   private readonly realtimeEvents = new RealtimeProjectionEventBus();
   private readonly webProjectionEventClients = new Map<number, WebProjectionEventClient>();
+  private readonly transcriptStreamClients = new Map<number, TranscriptStreamClient>();
   private readonly pendingWebOrchestratorChatMessagePosts = new Map<string, Promise<unknown>>();
+  private readonly transcriptWebSocketServer = new WebSocketServer({ noServer: true });
+  private transcriptStreamUnsubscribe: TranscriptSourceUnsubscribe | null = null;
   private lastPublishedTrackerSourceStatusKey: string | null = null;
   private trackerSourceStatusRevision = 0;
   private nextWebProjectionEventClientId = 1;
+  private nextTranscriptStreamClientId = 1;
   private webProjectionDirtyGeneration = 0;
 
   constructor(private readonly options: StatusServerOptions) {
@@ -342,6 +365,9 @@ export class StatusServer {
     this.server = http.createServer((request, response) => {
       void this.handle(request, response);
     });
+    this.server.on("upgrade", (request, socket, head) => {
+      void this.handleUpgrade(request, socket, head);
+    });
     await new Promise<void>((resolve) => {
       this.server?.listen(this.options.port, this.options.host, resolve);
     });
@@ -353,8 +379,11 @@ export class StatusServer {
 
   async stop(): Promise<void> {
     this.realtimeEvents.closeAllStreams();
+    this.closeTranscriptStreamClients();
+    this.unsubscribeTranscriptStream();
     if (!this.server) {
       this.unsubscribeWebProjectionRevisionListeners();
+      this.transcriptWebSocketServer.close();
       return;
     }
     const server = this.server;
@@ -366,6 +395,7 @@ export class StatusServer {
       });
     } finally {
       this.unsubscribeWebProjectionRevisionListeners();
+      this.transcriptWebSocketServer.close();
     }
   }
 
@@ -522,6 +552,106 @@ export class StatusServer {
     response.on("error", close);
   }
 
+  private async handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+    try {
+      const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+      const streamMatch = /^\/api\/v1\/runs\/([^/]+)\/transcript\/stream$/.exec(url.pathname);
+      if (request.method !== "GET" || !streamMatch) {
+        rejectUpgrade(socket, 404, "Not Found");
+        return;
+      }
+      const runId = decodeURIComponent(streamMatch[1] ?? "");
+      const run = await this.options.runStore?.getRun(runId);
+      if (!run) {
+        rejectUpgrade(socket, 404, "Run Not Found");
+        return;
+      }
+      this.transcriptWebSocketServer.handleUpgrade(request, socket, head, (socket) => {
+        this.acceptTranscriptStream(socket, run, url);
+      });
+    } catch {
+      rejectUpgrade(socket, 500, "Internal Server Error");
+    }
+  }
+
+  private acceptTranscriptStream(socket: WebSocket, run: RunRecord, url: URL): void {
+    this.ensureTranscriptStreamSubscription();
+    const clientId = this.nextTranscriptStreamClientId;
+    this.nextTranscriptStreamClientId += 1;
+    const client: TranscriptStreamClient = {
+      id: clientId,
+      runId: run.runId,
+      sessionId: run.sessionId,
+      afterSequence: parseNonNegativeInteger(url.searchParams.get("afterSequence")) ?? 0,
+      socket,
+    };
+    this.transcriptStreamClients.set(clientId, client);
+    socket.on("close", () => this.transcriptStreamClients.delete(clientId));
+    socket.on("error", () => this.transcriptStreamClients.delete(clientId));
+    this.sendTranscriptStreamPayload(client, {
+      type: "ready",
+      runId: run.runId,
+      sessionId: run.sessionId,
+      afterSequence: client.afterSequence,
+      connectedAt: new Date().toISOString(),
+    });
+  }
+
+  private ensureTranscriptStreamSubscription(): void {
+    if (this.transcriptStreamUnsubscribe || !this.options.runStore) return;
+    this.transcriptStreamUnsubscribe = this.options.runStore.subscribeTranscriptEvents((event) => {
+      this.broadcastTranscriptSourceEvent(event);
+    });
+  }
+
+  private unsubscribeTranscriptStream(): void {
+    try {
+      this.transcriptStreamUnsubscribe?.();
+    } finally {
+      this.transcriptStreamUnsubscribe = null;
+    }
+  }
+
+  private broadcastTranscriptSourceEvent(sourceEvent: TranscriptSourceEvent): void {
+    const publicEvent = projectTranscriptEventForPublicRead(sourceEvent.event);
+    for (const client of Array.from(this.transcriptStreamClients.values())) {
+      if (client.runId !== sourceEvent.runId) continue;
+      if (publicEvent.sequence <= client.afterSequence) continue;
+      const sent = this.sendTranscriptStreamPayload(client, {
+        type: "transcript.event",
+        runId: sourceEvent.runId,
+        sessionId: sourceEvent.sessionId,
+        event: publicEvent,
+      });
+      if (sent) client.afterSequence = Math.max(client.afterSequence, publicEvent.sequence);
+    }
+  }
+
+  private sendTranscriptStreamPayload(client: TranscriptStreamClient, payload: unknown): boolean {
+    if (client.socket.readyState !== WebSocket.OPEN) {
+      this.transcriptStreamClients.delete(client.id);
+      return false;
+    }
+    if (client.socket.bufferedAmount > TRANSCRIPT_STREAM_MAX_BUFFERED_BYTES) {
+      client.socket.close(1013, "transcript client is too slow");
+      this.transcriptStreamClients.delete(client.id);
+      return false;
+    }
+    client.socket.send(JSON.stringify(payload));
+    return true;
+  }
+
+  private closeTranscriptStreamClients(): void {
+    for (const client of Array.from(this.transcriptStreamClients.values())) {
+      try {
+        client.socket.close(1001, "status server stopping");
+      } catch {
+        // Shutdown should not fail because a websocket client disconnected first.
+      }
+      this.transcriptStreamClients.delete(client.id);
+    }
+  }
+
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
@@ -538,6 +668,14 @@ export class StatusServer {
             this.options.staleThresholdMs,
           ),
         );
+        return;
+      }
+      const liveTranscriptPageMatch = /^\/runs\/([^/]+)\/transcript$/.exec(url.pathname);
+      if (request.method === "GET" && liveTranscriptPageMatch) {
+        const runId = decodeURIComponent(liveTranscriptPageMatch[1] ?? "");
+        const run = await this.options.runStore?.getRun(runId);
+        if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
+        sendHtml(response, renderLiveTranscriptPage(run));
         return;
       }
       if (this.projectionStatusEnabled && request.method === "GET" && url.pathname === "/api/v1/web/events") {
@@ -5828,9 +5966,10 @@ function renderRunningRow(
   const activitySources = activitySummary(row);
   const blockedReason = lifecycleBlockedReason(row.lifecycle);
   const conflictSummary = mergeConflictDashboardSummary(row.lifecycle?.mergeConflict ?? null);
+  const transcriptLink = runId === "n/a" ? "" : ` · <a href="/runs/${encodeURIComponent(runId)}/transcript">Live transcript</a>`;
   return `<li class="run-row operator-${operator.status}">
     <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">${escapeHtml(operator.status)}</span> <span class="meta">${escapeHtml(row.role)} · ${escapeHtml(row.runKind)} · ${escapeHtml(row.state)}</span></div>
-    <div class="meta">run <code>${escapeHtml(runId)}</code> · agent <code>${escapeHtml(agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
+    <div class="meta">run <code>${escapeHtml(runId)}</code>${transcriptLink} · agent <code>${escapeHtml(agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code>${paused ? " · paused" : ""}</div>
     <div class="activity">last activity ${escapeHtml(row.liveness.lastActivityAt)} (${escapeHtml(idle)}, ${escapeHtml(threshold)}); SDK status <code>${escapeHtml(row.liveness.sdkRunStatus ?? "n/a")}</code>; event <code>${escapeHtml(row.lastEvent ?? "n/a")}</code>${row.lastEventAt ? ` at ${escapeHtml(row.lastEventAt)}` : ""}</div>
     ${activitySources ? `<div class="activity">${escapeHtml(activitySources)}</div>` : ""}
     ${row.lastMessage ? `<div>${escapeHtml(row.lastMessage)}</div>` : ""}
@@ -5847,11 +5986,187 @@ function renderRunningRow(
 function renderOrphanedRunRow(row: Awaited<ReturnType<typeof orphanedOperatorViews>>[number]): string {
   return `<li class="run-row operator-not_live">
     <div><strong>${escapeHtml(row.issueIdentifier)}</strong><span class="badge">not_live</span> <span class="meta">${escapeHtml(row.role)}</span></div>
-    <div class="meta">run <code>${escapeHtml(row.runId)}</code> · agent <code>${escapeHtml(row.agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code></div>
+    <div class="meta">run <code>${escapeHtml(row.runId)}</code> · <a href="/runs/${encodeURIComponent(row.runId)}/transcript">Transcript</a> · agent <code>${escapeHtml(row.agentId ?? "n/a")}</code> · session <code>${escapeHtml(row.sessionId ?? "n/a")}</code></div>
     <div class="activity">persisted running run is not present in the live orchestrator snapshot; SDK status <code>${escapeHtml(row.sdkRunStatus ?? "n/a")}</code>${row.lastActivityAt ? `; last activity ${escapeHtml(row.lastActivityAt)}` : ""}</div>
     <div><code>${escapeHtml(row.workspacePath ?? "")}</code></div>
     <div class="controls">controls: none</div>
   </li>`;
+}
+
+function renderLiveTranscriptPage(run: RunRecord): string {
+  const runId = encodeURIComponent(run.runId);
+  const config = jsonForInlineScript({
+    runId: run.runId,
+    runUrl: `/api/v1/runs/${runId}`,
+    transcriptUrl: `/api/v1/runs/${runId}/transcript`,
+    streamPath: `/api/v1/runs/${runId}/transcript/stream`,
+    tailLimit: LIVE_TRANSCRIPT_TAIL_LIMIT,
+  });
+  return `<!doctype html>
+<html>
+  <head>
+    <title>Symphony Transcript ${escapeHtml(run.issueIdentifier)} ${escapeHtml(run.runId)}</title>
+    <style>
+      body { font-family: system-ui, sans-serif; line-height: 1.4; margin: 0; color: #1f2328; background: #fafafa; }
+      header { position: sticky; top: 0; z-index: 2; background: #fff; border-bottom: 1px solid #d8dee4; padding: 0.85rem 1rem; }
+      main { padding: 1rem; }
+      h1 { font-size: 1.15rem; margin: 0 0 0.35rem; }
+      code { background: #f1f3f5; border-radius: 4px; padding: 0.1rem 0.25rem; }
+      button, a.button { border: 1px solid #8c959f; border-radius: 6px; background: #fff; color: #24292f; cursor: pointer; display: inline-block; font: inherit; padding: 0.35rem 0.6rem; text-decoration: none; }
+      button:hover, a.button:hover { background: #f6f8fa; }
+      .meta, .status { color: #57606a; font-size: 0.9rem; }
+      .toolbar { align-items: center; display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.7rem; }
+      .events { list-style: none; margin: 0; padding: 0; }
+      .event { background: #fff; border: 1px solid #d8dee4; border-left: 4px solid #6e7781; border-radius: 6px; margin: 0 0 0.65rem; padding: 0.65rem; }
+      .event-header { color: #57606a; display: flex; flex-wrap: wrap; gap: 0.45rem; font-size: 0.85rem; margin-bottom: 0.4rem; }
+      .event-message { white-space: pre-wrap; }
+      .event-payload { background: #f6f8fa; border-radius: 6px; margin: 0.5rem 0 0; max-height: 18rem; overflow: auto; padding: 0.55rem; white-space: pre-wrap; }
+      .empty { color: #57606a; padding: 1rem 0; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>${escapeHtml(run.issueIdentifier)} transcript</h1>
+      <div class="meta">run <code>${escapeHtml(run.runId)}</code> · status <code id="run-status">${escapeHtml(run.status)}</code> · sequence <code id="last-sequence">0</code></div>
+      <div class="meta">session <code>${escapeHtml(run.sessionId ?? "n/a")}</code></div>
+      <div class="toolbar">
+        <a class="button" href="/">Dashboard</a>
+        <button id="pause-button" type="button">Pause</button>
+        <button id="resume-button" type="button" disabled>Resume</button>
+        <span id="stream-status" class="status">connecting</span>
+      </div>
+    </header>
+    <main>
+      <div id="empty" class="empty">No transcript events loaded.</div>
+      <ol id="events" class="events"></ol>
+    </main>
+    <script>
+      (() => {
+        const config = ${config};
+        const state = { lastSequence: 0, seen: new Set(), paused: false, queued: [], socket: null, reconnectTimer: null };
+        const eventsEl = document.getElementById("events");
+        const emptyEl = document.getElementById("empty");
+        const statusEl = document.getElementById("stream-status");
+        const sequenceEl = document.getElementById("last-sequence");
+        const runStatusEl = document.getElementById("run-status");
+        const pauseButton = document.getElementById("pause-button");
+        const resumeButton = document.getElementById("resume-button");
+
+        const setStatus = (value) => { statusEl.textContent = value; };
+        const requestJson = async (url) => {
+          const response = await fetch(url, { cache: "no-store" });
+          if (!response.ok) throw new Error("HTTP " + response.status);
+          return response.json();
+        };
+        const truncate = (value, max) => value.length > max ? value.slice(0, max - 15) + "...[truncated]" : value;
+        const eventPayloadText = (event) => {
+          if (event.payload === undefined || event.payload === null) return "";
+          try { return truncate(JSON.stringify(event.payload, null, 2), 5000); } catch { return String(event.payload); }
+        };
+        const eventMessageText = (event) => event.message || event.eventType || "";
+        const scrollToBottom = () => {
+          if (state.paused) return;
+          window.requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: "auto" }));
+        };
+        const renderEvent = (event) => {
+          emptyEl.hidden = true;
+          const item = document.createElement("li");
+          item.className = "event";
+          const header = document.createElement("div");
+          header.className = "event-header";
+          header.textContent = "#" + event.sequence + " · " + event.at + " · " + event.source + " · " + event.eventType;
+          item.appendChild(header);
+          const message = eventMessageText(event);
+          if (message) {
+            const messageEl = document.createElement("div");
+            messageEl.className = "event-message";
+            messageEl.textContent = message;
+            item.appendChild(messageEl);
+          }
+          const payload = eventPayloadText(event);
+          if (payload) {
+            const payloadEl = document.createElement("pre");
+            payloadEl.className = "event-payload";
+            payloadEl.textContent = payload;
+            item.appendChild(payloadEl);
+          }
+          eventsEl.appendChild(item);
+          scrollToBottom();
+        };
+        const appendEvent = (event) => {
+          const sequence = Number(event && event.sequence);
+          if (!Number.isFinite(sequence) || state.seen.has(sequence)) return;
+          state.seen.add(sequence);
+          state.lastSequence = Math.max(state.lastSequence, sequence);
+          sequenceEl.textContent = String(state.lastSequence);
+          if (state.paused) state.queued.push(event);
+          else renderEvent(event);
+        };
+        const appendEvents = (events) => {
+          for (const event of Array.isArray(events) ? events : []) appendEvent(event);
+        };
+        const backfillFrom = async (afterSequence) => {
+          let offset = Math.max(0, Number(afterSequence) || 0);
+          for (let pageIndex = 0; pageIndex < 20; pageIndex += 1) {
+            const page = await requestJson(config.transcriptUrl + "?offset=" + offset + "&limit=1000");
+            appendEvents((page.events || []).filter((event) => Number(event.sequence) > afterSequence));
+            if (page.nextOffset === null || page.nextOffset === undefined) break;
+            offset = page.nextOffset;
+          }
+        };
+        const connect = () => {
+          const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+          const url = scheme + "//" + window.location.host + config.streamPath + "?afterSequence=" + encodeURIComponent(String(state.lastSequence));
+          const socket = new WebSocket(url);
+          state.socket = socket;
+          setStatus("connecting");
+          socket.onopen = () => setStatus("connected");
+          socket.onmessage = (message) => {
+            const payload = JSON.parse(message.data);
+            if (payload.type === "ready") setStatus("connected");
+            if (payload.type === "transcript.event") appendEvent(payload.event);
+          };
+          socket.onclose = () => {
+            if (state.socket !== socket) return;
+            setStatus("reconnecting");
+            clearTimeout(state.reconnectTimer);
+            state.reconnectTimer = setTimeout(async () => {
+              try { await backfillFrom(state.lastSequence); } catch { /* retry through websocket reconnect */ }
+              connect();
+            }, 1000);
+          };
+          socket.onerror = () => setStatus("connection error");
+        };
+        const bootstrap = async () => {
+          const run = await requestJson(config.runUrl);
+          runStatusEl.textContent = run.status || "unknown";
+          const total = Number(run.transcriptEventCount || 0);
+          const offset = Math.max(0, total - config.tailLimit);
+          const page = await requestJson(config.transcriptUrl + "?offset=" + offset + "&limit=" + config.tailLimit);
+          appendEvents(page.events || []);
+          connect();
+        };
+        pauseButton.addEventListener("click", () => {
+          state.paused = true;
+          pauseButton.disabled = true;
+          resumeButton.disabled = false;
+          setStatus("paused");
+        });
+        resumeButton.addEventListener("click", () => {
+          state.paused = false;
+          pauseButton.disabled = false;
+          resumeButton.disabled = true;
+          const queued = state.queued.splice(0);
+          for (const event of queued) renderEvent(event);
+          setStatus(state.socket && state.socket.readyState === WebSocket.OPEN ? "connected" : "reconnecting");
+        });
+        void bootstrap().catch((error) => {
+          setStatus("failed: " + error.message);
+        });
+      })();
+    </script>
+  </body>
+</html>`;
 }
 
 async function operatorSnapshotView(
@@ -7289,6 +7604,30 @@ async function pathExists(targetPath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function rejectUpgrade(socket: Duplex, status: number, message: string): void {
+  try {
+    const body = `${message}\n`;
+    socket.write(
+      `HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+    );
+  } finally {
+    socket.destroy();
+  }
+}
+
+function parseNonNegativeInteger(value: string | null): number | null {
+  if (value === null || value.trim().length === 0) return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function jsonForInlineScript(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 
 function escapeHtml(value: unknown): string {

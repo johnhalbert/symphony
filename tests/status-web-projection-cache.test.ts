@@ -340,7 +340,7 @@ describe("StatusServer web projection context cache", () => {
     expect(trackerCalls).toBe(3);
   });
 
-  it("registers durable-store listeners and dirties completed contexts for run, workspace, lifecycle, and writeback writes", async () => {
+  it("registers durable-store listeners and dirties completed contexts for lifecycle and writeback writes", async () => {
     await withTempStateDir(async (stateDir) => {
       const runStore = new FileRunTranscriptStore(stateDir);
       const lifecycleStore = new FileIssueLifecycleStore(stateDir);
@@ -371,25 +371,26 @@ describe("StatusServer web projection context cache", () => {
           expect(projectedBuild(current)).toBe(expectedBuild);
         };
 
-        await expectDirtyAfter(() => runStore.startRun(startRunInputFixture(stateDir, "run-1")).then(() => undefined), 2);
-        await expectDirtyAfter(() => runStore.upsertWorkspace(workspaceRecordFixture(stateDir, "workspace-1")), 3);
-        await expectDirtyAfter(() => runStore.deleteWorkspace("workspace-1"), 4);
+        await runStore.startRun(startRunInputFixture(stateDir, "run-1"));
+        await runStore.upsertWorkspace(workspaceRecordFixture(stateDir, "workspace-1"));
+        await runStore.deleteWorkspace("workspace-1");
+        await expect(acquire(false)).resolves.toBe(current);
         await expectDirtyAfter(
           () => lifecycleStore.ensureIssue({ id: "issue-lifecycle", identifier: "ENG-LIFE" }, { phase: "review" }).then(() => undefined),
-          5,
+          2,
         );
         const beforeWritebackEnqueue = current;
         let writeback = await writebackOutbox.enqueueOnce(writebackOperationFixture("writeback-1"));
         current = await acquire(false);
         expect(current).not.toBe(beforeWritebackEnqueue);
-        expect(projectedBuild(current)).toBe(6);
+        expect(projectedBuild(current)).toBe(3);
         const beforeWritebackStatus = current;
         writeback = await writebackOutbox.markSucceeded(writeback, { status: "applied", message: "applied" });
         current = await acquire(false);
         expect(current).not.toBe(beforeWritebackStatus);
         expect(writeback.status).toBe("succeeded");
-        expect(projectedBuild(current)).toBe(7);
-        expect(builds).toBe(7);
+        expect(projectedBuild(current)).toBe(4);
+        expect(builds).toBe(4);
       } finally {
         await server.stop();
       }
@@ -424,7 +425,7 @@ describe("StatusServer web projection context cache", () => {
 
   it("does not promote an in-flight build as completed when a store changes during the build", async () => {
     await withTempStateDir(async (stateDir) => {
-      const runStore = new FileRunTranscriptStore(stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(stateDir);
       const pendingBuilds: Array<{
         build: number;
         input: StatusServerWebProjectionContextBuildInput;
@@ -435,7 +436,7 @@ describe("StatusServer web projection context cache", () => {
       const server = createStatusServer({
         generatedAt: () => "2026-01-01T00:00:00.000Z",
         clock: () => new Date("2026-01-01T00:00:00.000Z"),
-        runStore,
+        lifecycleStore,
         builder: (input) => {
           builds += 1;
           if (deferNextBuild) {
@@ -457,7 +458,7 @@ describe("StatusServer web projection context cache", () => {
         await settleMicrotasks();
         const pending = pendingBuilds[0];
         if (!pending) throw new Error("expected a pending build");
-        await runStore.startRun(startRunInputFixture(stateDir, "run-during-build"));
+        await lifecycleStore.ensureIssue({ id: "issue-during-build", identifier: "ENG-BUILD" }, { phase: "review" });
         const staleBuild = contextFixture(pending.input, pending.build);
         pending.deferred.resolve(staleBuild);
 

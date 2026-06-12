@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { WebSocket } from "ws";
 import { StatusServer } from "../src/app/http.js";
 import { resolveStatusMutationToken } from "../src/app/RuntimeDependencies.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
@@ -551,6 +552,82 @@ describe("StatusServer durable API", () => {
         statusApiPointers: ["/api/v1/issues/TEST-1"],
       });
     } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves the old-dashboard live transcript page and streams transcript events over websocket", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "run-live",
+      sessionId: "session-live",
+      agentId: "agent-live",
+      role: "worker",
+      issueId: "issue-live",
+      issueIdentifier: "TEST-LIVE",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "watch live transcript",
+      workspaceKey: "TEST-LIVE",
+      workspacePath: path.join(config.workspace.root, "TEST-LIVE"),
+    });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger: new StructuredLogger(() => undefined),
+    });
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const messages: Array<Record<string, unknown>> = [];
+    let socket: WebSocket | null = null;
+    try {
+      const dashboardResponse = await fetch(`${baseUrl}/`);
+      const dashboardHtml = await dashboardResponse.text();
+      expect(dashboardHtml).toContain("/runs/run-live/transcript");
+
+      const pageResponse = await fetch(`${baseUrl}/runs/run-live/transcript`);
+      const pageHtml = await pageResponse.text();
+      expect(pageResponse.status).toBe(200);
+      expect(pageHtml).toContain("/api/v1/runs/run-live/transcript");
+      expect(pageHtml).toContain("/api/v1/runs/run-live/transcript/stream");
+
+      socket = new WebSocket(`${baseUrl.replace(/^http:/, "ws:")}/api/v1/runs/run-live/transcript/stream?afterSequence=0`);
+      socket.on("message", (data) => {
+        messages.push(JSON.parse(data.toString()) as Record<string, unknown>);
+      });
+      await waitForStatusApiAsync(async () => messages.some((message) => message.type === "ready"), "websocket ready");
+
+      await runStore.appendEvent({
+        runId: "run-live",
+        at: "2026-01-01T00:00:00.000Z",
+        source: "harness",
+        eventType: "progress",
+        message: "streamed transcript event",
+      });
+
+      await waitForStatusApiAsync(
+        async () =>
+          messages.some(
+            (message) =>
+              message.type === "transcript.event" &&
+              (message.event as { message?: string } | undefined)?.message === "streamed transcript event",
+          ),
+        "websocket transcript event",
+      );
+    } finally {
+      socket?.close();
       await server.stop();
     }
   });

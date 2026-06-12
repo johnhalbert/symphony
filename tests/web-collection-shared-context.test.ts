@@ -283,7 +283,7 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
     };
     const durableReader = new StaticProjectionRecordReader([
       projectionPayloadRecord(warmTranscriptSelector, coldBody, [
-        { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+        { source: "runStore", revision: 0, observedAt: null },
       ]),
     ]);
     const warmServer = createStatusServer({

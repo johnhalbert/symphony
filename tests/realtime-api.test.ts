@@ -274,9 +274,9 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
-  it("streams projection, source, run, and transcript updates, replays known Last-Event-ID, and cleans up disconnects", async () => {
-    const runStore = new FileRunTranscriptStore(root);
-    const server = createRealtimeServer({ runStore });
+  it("streams projection, source, run, and transcript updates from run activity, replays known Last-Event-ID, and cleans up disconnects", async () => {
+    const runActivitySourceStore = new InMemoryRunActivityAppendStore();
+    const server = createRealtimeServer({ runActivitySourceStore });
     const address = await server.start();
     const baseUrl = `http://${address.host}:${address.port}`;
     const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
@@ -286,31 +286,23 @@ describe("StatusServer realtime SSE API", () => {
       expect(client.response.headers.get("content-type")).toContain("text/event-stream");
       await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
 
-      await runStore.startRun({
-        runId: "run-realtime-1",
-        sessionId: "session-realtime-1",
-        agentId: "agent-1",
-        role: "worker",
-        issueId: "issue-1",
-        issueIdentifier: "TEST-1",
-        attempt: null,
-        turnNumber: 1,
-        prompt: "work",
-        workspaceKey: "TEST-1",
-        workspacePath: "/tmp/workspace",
-      });
+      await runActivitySourceStore.appendEvents([
+        runActivityInput({ id: "activity-realtime-replay-1", sequence: 1 }),
+        runActivityInput({ id: "activity-realtime-replay-2", sequence: 2 }),
+      ]);
 
-      const projection = await client.nextEventOfType("projection.updated");
-      const source = await client.nextEventOfType("source.status");
-      const run = await client.nextEventOfType("run.updated");
-      const transcript = await client.nextEventOfType("transcript.delta");
-
-      expect(projection.data).toMatchObject({ type: "projection.updated", revision: 1, source: { source: "runs", revision: 1 } });
-      expect(source.data).toMatchObject({ type: "source.status", revision: 2, source: { source: "runs", revision: 1 } });
-      expect(run.data).toMatchObject({ type: "run.updated", revision: 3, source: { source: "runs", revision: 1 } });
-      expect(transcript.data).toMatchObject({ type: "transcript.delta", revision: 4, source: { source: "runs", revision: 1 } });
-      expect((run.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/history");
-      expect((transcript.data as RealtimeProjectionEvent).recovery.endpoints).toContain(
+      const realtimeEvents = await readOrderedRealtimeEvents(client, "run_activity", 1, [
+        "projection.updated",
+        "source.status",
+        "run.updated",
+        "transcript.delta",
+      ]);
+      const projection = realtimeEvents[0]!;
+      const source = realtimeEvents[1]!;
+      const run = realtimeEvents[2]!;
+      const transcript = realtimeEvents[3]!;
+      expect(run.recovery.endpoints).toContain("/api/v1/web/history");
+      expect(transcript.recovery.endpoints).toContain(
         "/api/v1/web/sessions/{sessionId}/transcript",
       );
 
@@ -332,27 +324,18 @@ describe("StatusServer realtime SSE API", () => {
   });
 
   it("replays known events from lastEventId query cursors without missed-event recovery", async () => {
-    const runStore = new FileRunTranscriptStore(root);
-    const server = createRealtimeServer({ runStore });
+    const runActivitySourceStore = new InMemoryRunActivityAppendStore();
+    const server = createRealtimeServer({ runActivitySourceStore });
     const address = await server.start();
     const baseUrl = `http://${address.host}:${address.port}`;
     const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
 
     try {
       await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
-      await runStore.startRun({
-        runId: "run-realtime-query-cursor",
-        sessionId: "session-realtime-query-cursor",
-        agentId: "agent-1",
-        role: "worker",
-        issueId: "issue-1",
-        issueIdentifier: "TEST-1",
-        attempt: null,
-        turnNumber: 1,
-        prompt: "work",
-        workspaceKey: "TEST-1",
-        workspacePath: "/tmp/workspace",
-      });
+      await runActivitySourceStore.appendEvents([
+        runActivityInput({ id: "activity-realtime-query-cursor-1", sequence: 1 }),
+        runActivityInput({ id: "activity-realtime-query-cursor-2", sequence: 2 }),
+      ]);
 
       const liveEvents = [
         await client.nextEventOfType("projection.updated"),
@@ -379,8 +362,8 @@ describe("StatusServer realtime SSE API", () => {
           expect(data.id).toBe(replayed.id);
           expect(data.type).toBe(replayed.event);
           expect(typeof data.revision).toBe("number");
-          expect(data.source).toMatchObject({ source: "runs", revision: 1 });
-          expect(data.payload).toMatchObject({ source: "runs", sourceRevision: 1 });
+          expect(data.source).toMatchObject({ source: "run_activity", revision: 1 });
+          expect(data.payload).toMatchObject({ source: "run_activity", sourceRevision: 1 });
           expect(data.missedEvents).toBe(false);
         }
         await expect(queryReplayClient.nextEvent(150)).rejects.toThrow(/Timed out waiting for SSE event/);
@@ -908,19 +891,6 @@ describe("StatusServer realtime SSE API", () => {
           plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
         },
       });
-      await readOrderedRealtimeEvents(client, "runs", 2, [
-        "projection.updated",
-        "source.status",
-        "run.updated",
-        "transcript.delta",
-      ]);
-      const requestTranscriptEvents = await readOrderedRealtimeEvents(client, "runs", 3, [
-        "projection.updated",
-        "source.status",
-        "run.updated",
-        "transcript.delta",
-      ]);
-      expect(requestTranscriptEvents[3]?.recovery.endpoints).toContain("/api/v1/web/sessions/{sessionId}/transcript");
       await expect(runStore.readTranscript("run-approval-1", { offset: 0, limit: 10 })).resolves.toMatchObject({
         events: [expect.objectContaining({ eventType: "approval_request" })],
       });
@@ -963,27 +933,6 @@ describe("StatusServer realtime SSE API", () => {
       });
       await expect(rejected.json()).resolves.toMatchObject({ replayed: false, request: { status: "rejected" } });
       expect(rejected.status).toBe(200);
-      await readOrderedRealtimeEvents(client, "runs", 4, [
-        "projection.updated",
-        "source.status",
-        "run.updated",
-        "transcript.delta",
-      ]);
-      await readOrderedRealtimeEvents(client, "runs", 5, [
-        "projection.updated",
-        "source.status",
-        "run.updated",
-        "transcript.delta",
-      ]);
-      const terminalEvents = await readOrderedRealtimeEvents(client, "runs", 6, [
-        "projection.updated",
-        "source.status",
-        "run.updated",
-        "transcript.delta",
-      ]);
-      expect(terminalEvents[2]?.resources).toEqual(
-        expect.arrayContaining([{ kind: "history", href: "/api/v1/web/history", relation: "refetch" }]),
-      );
       await expect(runStore.getRun("run-approval-1")).resolves.toMatchObject({
         status: "cancelled",
         pendingApprovalRequestId: null,
@@ -1011,25 +960,16 @@ describe("StatusServer realtime SSE API", () => {
   });
 
   it("recovers unknown high Last-Event-ID values without replaying an exact current ID", async () => {
-    const runStore = new FileRunTranscriptStore(root);
-    const server = createRealtimeServer({ runStore });
+    const runActivitySourceStore = new InMemoryRunActivityAppendStore();
+    const server = createRealtimeServer({ runActivitySourceStore });
     const address = await server.start();
     const baseUrl = `http://${address.host}:${address.port}`;
 
     try {
-      await runStore.startRun({
-        runId: "run-realtime-current-id",
-        sessionId: "session-realtime-current-id",
-        agentId: "agent-1",
-        role: "worker",
-        issueId: "issue-1",
-        issueIdentifier: "TEST-1",
-        attempt: null,
-        turnNumber: 1,
-        prompt: "work",
-        workspaceKey: "TEST-1",
-        workspacePath: "/tmp/workspace",
-      });
+      await runActivitySourceStore.appendEvents([
+        runActivityInput({ id: "activity-realtime-current-id-1", sequence: 1 }),
+        runActivityInput({ id: "activity-realtime-current-id-2", sequence: 2 }),
+      ]);
 
       const currentClient = await openSseClient(`${baseUrl}/api/v1/realtime`, { "Last-Event-ID": "4" });
       try {
@@ -1090,11 +1030,11 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
-  it("publishes store-driven transcript deltas with canonical patch payloads for mirrored assistant streams", async () => {
+  it("does not publish run-store transcript appends on the projection realtime SSE stream", async () => {
     const runStore = new FileRunTranscriptStore(root);
     await runStore.startRun({
-      runId: "run-transcript-patch-1",
-      sessionId: "session-transcript-patch-1",
+      runId: "run-transcript-source-1",
+      sessionId: "session-transcript-source-1",
       agentId: "agent-1",
       role: "worker",
       issueId: "issue-1",
@@ -1113,89 +1053,16 @@ describe("StatusServer realtime SSE API", () => {
     try {
       await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
       await runStore.appendEvent({
-        runId: "run-transcript-patch-1",
+        runId: "run-transcript-source-1",
         at: "2026-01-01T00:00:01.000Z",
         source: "runtime",
         eventType: "message_delta",
         message: "Hermes message delta",
         payload: { harnessId: "hermes", textPreview: "Hel", redacted: true },
       });
-
-      const runtimeHel = await client.nextEventOfType("transcript.delta");
-      expect(runtimeHel.data).toMatchObject({
-        type: "transcript.delta",
-        scope: "session",
-        key: "session-transcript-patch-1",
-        source: { source: "runs", revision: 2 },
-        payload: {
-          source: "runs",
-          sourceRevision: 2,
-          runId: "run-transcript-patch-1",
-          sessionId: "session-transcript-patch-1",
-          afterSequence: 0,
-          eventCount: 1,
-          messages: [
-            {
-              sequence: 1,
-              operation: "append",
-              joinMode: "exact",
-              message: { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hel" },
-            },
-          ],
-        },
-      });
-      expect((runtimeHel.data as RealtimeProjectionEvent).recovery.endpoints).toContain("/api/v1/web/sessions/{sessionId}/transcript");
-
-      await runStore.appendEvent({
-        runId: "run-transcript-patch-1",
-        at: "2026-01-01T00:00:01.100Z",
-        source: "harness",
-        eventType: "progress",
-        message: "Hel",
-        payload: { kind: "assistant_delta", activitySource: "delta", progressKind: "assistant_delta", messagePreview: "Hel", redacted: false },
-      });
-      const harnessHel = await client.nextEventOfType("transcript.delta");
-      expect((harnessHel.data as RealtimeProjectionEvent).payload).toMatchObject({
-        afterSequence: 1,
-        eventCount: 1,
-        messages: [{ sequence: 2, message: null }],
-      });
-
-      await runStore.appendEvent({
-        runId: "run-transcript-patch-1",
-        at: "2026-01-01T00:00:02.000Z",
-        source: "runtime",
-        eventType: "message_delta",
-        message: "Hermes message delta",
-        payload: { harnessId: "hermes", textPreview: "lo", redacted: true },
-      });
-      const runtimeLo = await client.nextEventOfType("transcript.delta");
-      expect((runtimeLo.data as RealtimeProjectionEvent).payload).toMatchObject({
-        afterSequence: 2,
-        eventCount: 1,
-        messages: [
-          {
-            sequence: 3,
-            operation: "merge-assistant-delta",
-            joinMode: "exact",
-            message: { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "lo" },
-          },
-        ],
-      });
-
-      await runStore.appendEvent({
-        runId: "run-transcript-patch-1",
-        at: "2026-01-01T00:00:02.100Z",
-        source: "harness",
-        eventType: "progress",
-        message: "lo",
-        payload: { kind: "assistant_delta", activitySource: "delta", progressKind: "assistant_delta", messagePreview: "lo", redacted: false },
-      });
-      const harnessLo = await client.nextEventOfType("transcript.delta");
-      expect((harnessLo.data as RealtimeProjectionEvent).payload).toMatchObject({
-        afterSequence: 3,
-        eventCount: 1,
-        messages: [{ sequence: 4, message: null }],
+      await expect(client.nextEventOfType("transcript.delta", 150)).rejects.toThrow(/Timed out waiting for SSE event/);
+      await expect(runStore.readTranscript("run-transcript-source-1", { offset: 0, limit: 10 })).resolves.toMatchObject({
+        events: [expect.objectContaining({ eventType: "message_delta", message: "Hermes message delta" })],
       });
     } finally {
       await client.close();
