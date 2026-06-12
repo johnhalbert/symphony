@@ -1,0 +1,27 @@
+# Symphony Planner: SpecKit To Linear Decomposition
+
+You are a fresh-session Symphony planner. Do not reuse or assume the implementation worker's conversational framing. Use the evidence provided in this prompt and repository context.
+
+{% include "partials/issue_context.md.liquid" %}
+
+## Required Workflow
+
+Complete the full planning workflow in this single session:
+
+1. Run the SpecKit specify workflow for the parent issue scope.
+2. Run the SpecKit plan workflow.
+3. Run the SpecKit tasks workflow.
+4. Run SpecKit analyze.
+5. Fix critical/high analysis gaps in the planning artifacts within this same session, then rerun analyze.
+6. Convert the final tasks into proposed Linear child issues.
+7. Call `submit_issue_breakdown_plan` before ending the run.
+
+## Linear Child Issue Requirements
+
+- Each proposed child must be parented to this issue by Symphony service-owned writeback.
+- Each child must block the parent.
+- Child-to-child task dependencies must be represented in `dependencies`.
+- Each child description must include: `Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`.
+- Each `Issue Contract` must include fenced JSON with `schemaVersion`, `contractVersion`, and non-empty stable `requirements`.
+- Do not include `dogfood-ready`; operators add readiness labels after review.
+- Do not create Linear issues directly, transition Linear, comment on Linear, commit, or push.

@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { ServiceConfig } from "../src/core/config/Config.js";
-import type { PullRequestReviewEvidenceItem } from "../src/core/persistence/IssueLifecycleStore.js";
+import type { IssueTriageReportRecord, PullRequestReviewEvidenceItem } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import {
   planBlockedEscalationWritebacks,
   planCompletionReportAcceptedWritebacks,
+  planIssueTriageReportWritebacks,
   planMergeGateBlockedWritebacks,
   planMergeGateRepairWritebacks,
   planPullRequestHandoffWritebacks,
@@ -255,6 +256,24 @@ describe("TransitionPolicy review-loop planners", () => {
     });
   });
 
+  it("uses triage-pending blocked escalation action for triage-eligible ceilings", () => {
+    const config = reviewLoopConfig();
+    config.issueTriage.enabled = true;
+
+    const operations = planBlockedEscalationWritebacks(
+      {
+        issue: issue({ state: "In Review" }),
+        runId: "run-blocked-1",
+        reason: "max reviewer failures reached (3/3)",
+      },
+      config,
+    );
+
+    expect(commentBody(operations, 0)).toContain("Symphony will run issue triage");
+    expect(commentBody(operations, 0)).toContain("publish a follow-up recommendation");
+    expect(commentBody(operations, 0)).not.toContain("Inspect the latest worker output and reviewer feedback");
+  });
+
   it("plans blocked escalation transitions from PR handoff states", () => {
     const config = reviewLoopConfig();
     config.tracker.handoffStates = ["Human Review"];
@@ -297,6 +316,55 @@ describe("TransitionPolicy review-loop planners", () => {
       kind: "comment",
     });
     expect(commentBody(operations, 0)).toContain("left the issue state unchanged");
+  });
+
+  it("plans issue triage report comments", () => {
+    const config = reviewLoopConfig();
+    const report: IssueTriageReportRecord = {
+      id: "issue-triage-report:issue-1:triage-1",
+      idempotencyKey: "triage-1",
+      requestHash: "request-hash-1",
+      runId: "triage-run-1",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      triggerFingerprint: "trigger-fingerprint-1",
+      disposition: "decompose_issue",
+      confidence: "high",
+      summary: "Review failures exposed hidden sibling scope.",
+      evidence: ["review-verdict:issue-1:verdict-3 found sibling path"],
+      recommendedAction: "Use SpecKit to create blocking child issues for the hidden sibling scope.",
+      submittedAt: "2026-01-01T00:00:00.000Z",
+      writebackOperationKeys: [],
+    };
+
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: issue({ state: "Blocked" }),
+        report,
+        blockedReason: "max reviewer failures reached (3/3)",
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:issue-triage:triage-1",
+      kind: "comment",
+      issueId: "issue-1",
+      runId: "triage-run-1",
+      payload: {
+        dedupeKey: "issue-triage:triage-1",
+      },
+    });
+    expect(commentBody(operations, 0)).toContain("## Symphony Issue Triage");
+    expect(commentBody(operations, 0)).toContain("Status: triage complete, human action required");
+    expect(commentBody(operations, 0)).toContain("Blocked reason: max reviewer failures reached (3/3)");
+    expect(commentBody(operations, 0)).toContain("Disposition: decompose_issue");
+    expect(commentBody(operations, 0)).toContain("Confidence: high");
+    expect(commentBody(operations, 0)).toContain("Review failures exposed hidden sibling scope.");
+    expect(commentBody(operations, 0)).toContain("- review-verdict:issue-1:verdict-3 found sibling path");
+    expect(commentBody(operations, 0)).toContain("Recommended human action:");
+    expect(commentBody(operations, 0)).toContain(report.recommendedAction);
   });
 
   it("does not plan blocked escalation writebacks outside active or review states", () => {
@@ -444,6 +512,37 @@ describe("TransitionPolicy review-loop planners", () => {
         toState: "Blocked",
       },
     });
+  });
+
+  it("uses triage-pending merge gate blocked action when issue triage is enabled", () => {
+    const config = reviewLoopConfig();
+    config.issueTriage.enabled = true;
+
+    const operations = planMergeGateBlockedWritebacks(
+      {
+        issue: issue({ state: "Ready to Merge" }),
+        gateId: "merge-gate:issue-1:pr-42:head-sha-1",
+        blockerFingerprint: "head-sha-1:test:failure",
+        fromState: "Ready to Merge",
+        pullRequest: {
+          number: 42,
+          url: "https://github.com/acme/symphony/pull/42",
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
+        requiredChecks: ["test"],
+        failedChecks: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" }],
+        pendingChecks: [],
+        missingChecks: [],
+        reviewRound: 3,
+        maxReviewRounds: 3,
+      },
+      config,
+    );
+
+    expect(commentBody(operations, 0)).toContain("Symphony will run issue triage for this merge-gate ceiling");
+    expect(commentBody(operations, 0)).toContain("publish a follow-up recommendation");
+    expect(commentBody(operations, 0)).not.toContain("Inspect the failing required checks and decide whether to repair");
   });
 });
 

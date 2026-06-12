@@ -9,6 +9,7 @@ import {
 } from "../src/core/IssueTriageService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
 
 describe("IssueTriageService", () => {
@@ -25,15 +26,17 @@ describe("IssueTriageService", () => {
   it("accepts and replays a triage report for a max-failure blocked trigger", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
     const candidate = issue({ state: "Blocked" });
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
+    const writebackOutbox = new FileWritebackOutboxStore(root);
     const lifecycle = await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
       reviewRound: 3,
       blockedReason: "max reviewer failures reached (3/3)",
     });
-    const service = new IssueTriageService({ config, lifecycleStore, runStore });
+    const service = new IssueTriageService({ config, lifecycleStore, writebackOutbox, runStore });
     const input = {
       runId: "triage-run-1",
       issueId: candidate.id,
@@ -61,6 +64,21 @@ describe("IssueTriageService", () => {
 
     expect(accepted.replayed).toBe(false);
     expect(replayed.replayed).toBe(true);
+    expect(accepted.report.writebackOperationKeys).toEqual(["comment:issue-1:issue-triage:triage-1"]);
+    expect(replayed.report.writebackOperationKeys).toEqual(["comment:issue-1:issue-triage:triage-1"]);
+    const writebacks = await writebackOutbox.list();
+    expect(writebacks).toHaveLength(1);
+    expect(writebacks[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:issue-triage:triage-1",
+      kind: "comment",
+      issueId: "issue-1",
+      runId: "triage-run-1",
+    });
+    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("## Symphony Issue Triage");
+    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("Disposition: decompose_issue");
+    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("Confidence: high");
+    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("Recommended human action:");
+    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain(input.recommendedAction);
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       lastIssueTriageReportId: "issue-triage-report:issue-1:triage-1",
       issueTriageReports: [
@@ -68,6 +86,7 @@ describe("IssueTriageService", () => {
           disposition: "decompose_issue",
           confidence: "high",
           triggerFingerprint: input.triggerFingerprint,
+          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-1"],
         },
       ],
     });
@@ -77,14 +96,16 @@ describe("IssueTriageService", () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
     config.issueTriage.maxAttemptsPerTrigger = 1;
+    config.writeback.enabled = true;
     const candidate = issue({ state: "Blocked" });
     const lifecycleStore = new FileIssueLifecycleStore(root);
+    const writebackOutbox = new FileWritebackOutboxStore(root);
     const lifecycle = await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
       reviewRound: 3,
       blockedReason: "max reviewer failures reached (3/3)",
     });
-    const service = new IssueTriageService({ config, lifecycleStore });
+    const service = new IssueTriageService({ config, lifecycleStore, writebackOutbox });
     const triggerFingerprint = issueTriageTriggerFingerprint(lifecycle);
 
     await service.submitIssueTriageReport(reportInput("triage-run-1", "triage-1", triggerFingerprint), {

@@ -117,10 +117,11 @@ const rawConfigSchema = z
           .object({
             enabled: z.boolean().optional(),
             mode: z.enum(["child_issues"]).optional(),
+            auto_apply: z.boolean().optional(),
           })
           .passthrough()
           .optional(),
-        workspace_mode: z.enum(["none", "readonly_checkout"]).optional(),
+        workspace_mode: z.enum(["none", "readonly_checkout", "writable_checkout"]).optional(),
         max_planning_failures: z.number().int().positive().optional(),
         max_planning_dispatch_retries: z.number().int().positive().optional(),
         planning_retry_base_ms: z.number().int().positive().optional(),
@@ -197,7 +198,15 @@ const rawConfigSchema = z
         exclude_labels: stringArray.optional(),
         worker_exclude_labels: stringArray.optional(),
         reviewer_exclude_labels: stringArray.optional(),
+        planner_exclude_labels: stringArray.optional(),
         protected_paths: stringArray.optional(),
+      })
+      .passthrough()
+      .optional(),
+    prompts: z
+      .object({
+        templates_dir: z.string().optional(),
+        templates: z.record(z.string(), z.string()).optional(),
       })
       .passthrough()
       .optional(),
@@ -390,10 +399,16 @@ export interface AgentConfig {
   excludeLabels: string[];
   workerExcludeLabels: string[];
   reviewerExcludeLabels: string[];
+  plannerExcludeLabels: string[];
   protectedPaths: string[];
 }
 
 export type AgentHarnessKind = string;
+
+export interface PromptTemplatesConfig {
+  templatesDir: string | null;
+  templates: Record<string, string>;
+}
 
 export type CursorSettingSource =
   | "project"
@@ -583,8 +598,9 @@ export interface IssueBreakdownConfig {
   applyToLinear: {
     enabled: boolean;
     mode: "child_issues";
+    autoApply: boolean;
   };
-  workspaceMode: "none" | "readonly_checkout";
+  workspaceMode: "none" | "readonly_checkout" | "writable_checkout";
   maxPlanningFailures: number;
   maxPlanningDispatchRetries: number;
   planningRetryBaseMs: number;
@@ -617,6 +633,7 @@ export interface ServiceConfig {
   workspace: WorkspaceConfig;
   hooks: HookConfig;
   agent: AgentConfig;
+  prompts: PromptTemplatesConfig;
   cursor: CursorConfig;
   hermes: HermesConfig;
   hermesAcp: HermesAcpConfig;
@@ -737,13 +754,15 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     }
   }
   const issueBreakdownWorkspaceMode = raw.issue_breakdown?.workspace_mode ?? "none";
-  if (issueBreakdownWorkspaceMode === "readonly_checkout") {
+  if (issueBreakdownWorkspaceMode === "readonly_checkout" || issueBreakdownWorkspaceMode === "writable_checkout") {
     if (sourceKind !== "git_worktree") {
       throw new SymphonyError(
         "config_validation_error",
-        "issue_breakdown.workspace_mode readonly_checkout requires workspace.source.kind git_worktree",
+        `issue_breakdown.workspace_mode ${issueBreakdownWorkspaceMode} requires workspace.source.kind git_worktree`,
       );
     }
+  }
+  if (issueBreakdownWorkspaceMode === "readonly_checkout") {
     if (process.platform === "win32") {
       throw new SymphonyError(
         "config_validation_error",
@@ -764,6 +783,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     ...(sourceCachePath === undefined ? {} : { cachePath: sourceCachePath }),
     ...(raw.workspace?.source?.cleanup === undefined ? {} : { cleanup: raw.workspace.source.cleanup }),
   };
+  const promptTemplatesDir =
+    raw.prompts?.templates_dir === undefined ? null : resolvePathValue(raw.prompts.templates_dir, workflowDir, env);
+  const promptTemplates = normalizePromptTemplateMap(raw.prompts?.templates);
 
   const agentHarness = normalizeAgentHarness(raw.agent?.harness);
   const agentMaxTurns = raw.agent?.max_turns ?? 20;
@@ -943,7 +965,12 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       excludeLabels: normalizeLabels(raw.agent?.exclude_labels),
       workerExcludeLabels: normalizeLabels(raw.agent?.worker_exclude_labels),
       reviewerExcludeLabels: normalizeLabels(raw.agent?.reviewer_exclude_labels),
+      plannerExcludeLabels: normalizeLabels(raw.agent?.planner_exclude_labels),
       protectedPaths: raw.agent?.protected_paths ?? [],
+    },
+    prompts: {
+      templatesDir: promptTemplatesDir,
+      templates: promptTemplates,
     },
     cursor: {
       model: cursorModel,
@@ -1053,6 +1080,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       applyToLinear: {
         enabled: raw.issue_breakdown?.apply_to_linear?.enabled ?? false,
         mode: raw.issue_breakdown?.apply_to_linear?.mode ?? "child_issues",
+        autoApply: raw.issue_breakdown?.apply_to_linear?.auto_apply ?? raw.issue_breakdown?.apply_to_linear?.enabled ?? false,
       },
       workspaceMode: issueBreakdownWorkspaceMode,
       maxPlanningFailures: raw.issue_breakdown?.max_planning_failures ?? 3,
@@ -1201,6 +1229,16 @@ function normalizeStateLimitMap(input: Record<string, number> | undefined): Map<
 
 function normalizeLabels(input: string[] | undefined): string[] {
   return [...new Set((input ?? []).map((label) => label.trim().toLowerCase()).filter((label) => label.length > 0))];
+}
+
+function normalizePromptTemplateMap(input: Record<string, string> | undefined): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(input ?? {})) {
+    const normalizedKey = key.trim();
+    const normalizedValue = value.trim();
+    if (normalizedKey.length > 0 && normalizedValue.length > 0) result[normalizedKey] = normalizedValue;
+  }
+  return result;
 }
 
 function normalizePromptExtensions(input: string[] | undefined): string[] {

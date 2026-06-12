@@ -1595,6 +1595,8 @@ function projectIssueDescription(
   if (blockerText) description.push(blockerText);
   addUniqueText(description, reviewLoop?.blockedReason ?? null);
   addUniqueText(description, reviewLoop?.lastCompletionReport?.summary ?? null);
+  addUniqueText(description, reviewLoop?.lastIssueTriageReport?.summary ?? null);
+  addUniqueText(description, reviewLoop?.lastIssueTriageReport?.recommendedAction ?? null);
   for (const finding of reviewLoop?.lastReviewVerdict?.findings ?? []) {
     addUniqueText(description, finding);
   }

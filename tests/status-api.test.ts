@@ -384,7 +384,13 @@ describe("StatusServer durable API", () => {
           blockedReason: string | null;
           lastCompletionReport: { id: string; summary: string } | null;
           lastReviewVerdict: { id: string; verdict: string; findings: string[] } | null;
-          lastIssueTriageReport: { id: string; disposition: string; confidence: string; summary: string } | null;
+          lastIssueTriageReport: {
+            id: string;
+            disposition: string;
+            confidence: string;
+            summary: string;
+            recommendedAction: string;
+          } | null;
           mergeConflict: { resolutionStatus: string; fixTurnCount: number } | null;
         };
         metadata: {
@@ -476,6 +482,7 @@ describe("StatusServer durable API", () => {
           disposition: "decompose_issue",
           confidence: "high",
           summary: "Repeated failures exposed hidden sibling scope.",
+          recommendedAction: "Decompose the hidden sibling scope into blocking child issues.",
         },
         mergeConflict: {
           resolutionStatus: "still_conflicted",
@@ -1334,17 +1341,18 @@ describe("StatusServer durable API", () => {
       await waitForStatusApiAsync(
         async () =>
           ((await idFixture.runStore.latestRunForIssue(candidate.id, {
-            role: "worker",
+            role: "planner",
             runPhase: "issue_breakdown",
           }))?.runKind ?? null) === "planning",
         "durable planning run",
       );
       await expect(
-        idFixture.runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "issue_breakdown" }),
+        idFixture.runStore.latestRunForIssue(candidate.id, { role: "planner", runPhase: "issue_breakdown" }),
       ).resolves.toMatchObject({
         runPhase: "issue_breakdown",
         runKind: "planning",
       });
+      expect(idFixture.harness.runs[0]?.ctx.role).toBe("planner");
       expect(idFixture.harness.runs.map((run) => run.ctx.runPhase)).toEqual(["issue_breakdown"]);
     } finally {
       await idFixture.orchestrator.stop();
@@ -1367,7 +1375,7 @@ describe("StatusServer durable API", () => {
       expect(identifierFixture.tracker.lookupCalls).toEqual([["TEST-1"]]);
       await expect(
         identifierFixture.runStore.latestRunForIssue(candidate.id, {
-          role: "worker",
+          role: "planner",
           runPhase: "issue_breakdown",
         }),
       ).resolves.toBeNull();
@@ -3921,6 +3929,7 @@ describe("StatusServer durable API", () => {
       {
         phase: "merge_conflict_resolution",
         blockedReason: null,
+        lastIssueTriageReportId: "issue-triage-report:issue-4:triage-1",
         summaryPointers: {},
         mergeConflict: {
           id: "merge-conflict:issue-4:head-sha-1",
@@ -3952,6 +3961,24 @@ describe("StatusServer durable API", () => {
           blockedAt: "2026-01-01T00:01:00.000Z",
           blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
         },
+        issueTriageReports: [
+          {
+            id: "issue-triage-report:issue-4:triage-1",
+            idempotencyKey: "triage-1",
+            requestHash: "triage-hash-1",
+            runId: "triage-run-1",
+            issueId: "issue-4",
+            issueIdentifier: "TEST-4",
+            triggerFingerprint: "merge-conflict-trigger-1",
+            disposition: "merge_gate_repair",
+            confidence: "high",
+            summary: "Merge conflict repair attempts reached the configured ceiling.",
+            evidence: ["mergeConflict.fixTurnCount=3"],
+            recommendedAction: "Inspect the unresolved merge conflicts and decide whether to repair manually or close the PR.",
+            submittedAt: "2026-01-01T00:02:00.000Z",
+            writebackOperationKeys: ["comment:issue-4:issue-triage:triage-1"],
+          },
+        ],
       },
     );
     const server = new StatusServer({
@@ -3981,7 +4008,17 @@ describe("StatusServer durable API", () => {
         capabilities: { humanRequired: { active: boolean; reason: string | null }; continuationSummary: { available: boolean; path: string } };
       };
       const runsBody = (await runsResponse.json()) as {
-        issueBlocked: { status: string; reason: string };
+        issueBlocked: {
+          status: string;
+          reason: string;
+          blockedReason: string | null;
+          lastIssueTriageReport: {
+            disposition: string;
+            confidence: string;
+            summary: string;
+            recommendedAction: string;
+          } | null;
+        };
         enrichment: { timelineIncluded: boolean; level: string };
         runs: Array<{ runId: string; operatorLiveness: null | { status: string; timeline: Array<{ kind: string }> }; livenessSummary: { status: string | null } }>;
       };
@@ -3992,14 +4029,24 @@ describe("StatusServer durable API", () => {
       expect(issueResponse.status).toBe(200);
       expect(issueBody.operatorLiveness).toMatchObject({ status: "blocked_human_required" });
       expect(issueBody.capabilities).toMatchObject({
-        humanRequired: { active: true, reason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)" },
+        humanRequired: {
+          active: true,
+          reason: "Inspect the unresolved merge conflicts and decide whether to repair manually or close the PR.",
+        },
         continuationSummary: { available: true, path: "/api/v1/issues/TEST-4/continuation-summary" },
       });
       expect(runsResponse.status).toBe(200);
       expect(runDetailResponse.status).toBe(200);
       expect(runsBody.issueBlocked).toMatchObject({
         status: "blocked_human_required",
-        reason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+        reason: "Inspect the unresolved merge conflicts and decide whether to repair manually or close the PR.",
+        blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+        lastIssueTriageReport: {
+          disposition: "merge_gate_repair",
+          confidence: "high",
+          summary: "Merge conflict repair attempts reached the configured ceiling.",
+          recommendedAction: "Inspect the unresolved merge conflicts and decide whether to repair manually or close the PR.",
+        },
       });
       expect(runsBody.enrichment).toMatchObject({ timelineIncluded: true, level: "operator_liveness_with_timeline" });
       expect(runsBody.runs.find((run) => run.runId === "run-old")?.operatorLiveness).toBeNull();
@@ -4023,6 +4070,7 @@ describe("StatusServer durable API", () => {
       {
         phase: "blocked",
         blockedReason: "needs operator",
+        lastIssueTriageReportId: "issue-triage-report:issue-blocked:triage-1",
         summaryPointers: {},
         mergeConflict: {
           id: "merge-conflict:issue-blocked:head-sha-1",
@@ -4054,6 +4102,24 @@ describe("StatusServer durable API", () => {
           blockedAt: "2026-01-01T00:01:00.000Z",
           blockedReason: "needs operator",
         },
+        issueTriageReports: [
+          {
+            id: "issue-triage-report:issue-blocked:triage-1",
+            idempotencyKey: "triage-1",
+            requestHash: "triage-hash-blocked",
+            runId: "triage-run-blocked",
+            issueId: "issue-blocked",
+            issueIdentifier: "TEST-BLOCKED",
+            triggerFingerprint: "blocked-trigger-1",
+            disposition: "manual_decision",
+            confidence: "medium",
+            summary: "The block requires an operator decision.",
+            evidence: ["blockedReason=needs operator"],
+            recommendedAction: "Review the triage recommendation before moving this issue out of Blocked.",
+            submittedAt: "2026-01-01T00:02:00.000Z",
+            writebackOperationKeys: ["comment:issue-blocked:issue-triage:triage-1"],
+          },
+        ],
       },
     );
     await lifecycleStore.ensureIssue(
@@ -4193,6 +4259,14 @@ describe("StatusServer durable API", () => {
               lastConflictResolutionReportId: string | null;
               blockedReason: string | null;
             } | null;
+            reviewLoop: {
+              lastIssueTriageReport: {
+                disposition: string;
+                confidence: string;
+                summary: string;
+                recommendedAction: string;
+              } | null;
+            };
             humanRequired: { active: boolean; reason: string | null };
             continuationSummary: { available: boolean; path: string };
           }>;
@@ -4200,6 +4274,14 @@ describe("StatusServer durable API", () => {
             issueId: string;
             issueIdentifier: string;
             issueDetails: IssueDetailsEnvelope;
+            reviewLoop: {
+              lastIssueTriageReport: {
+                disposition: string;
+                confidence: string;
+                summary: string;
+                recommendedAction: string;
+              } | null;
+            };
             controls: { pause: boolean; resume: boolean; cancel: boolean; mutationsRequireToken: boolean };
             humanRequired: { active: boolean; reason: string | null };
             continuationSummary: { available: boolean; path: string };
@@ -4219,6 +4301,7 @@ describe("StatusServer durable API", () => {
       expect(html).toContain("TEST-PAUSED");
       expect(html).toContain("controls: resume");
       expect(html).toContain("continuation-summary POST /api/v1/issues/TEST-PAUSED/continuation-summary");
+      expect(html).toContain("Review the triage recommendation before moving this issue out of Blocked.");
       expect(html).toContain("Merge conflict:");
       expect(html).toContain("state=Approved with Conflicts");
       expect(html).toContain("attempts=3/3");
@@ -4263,7 +4346,18 @@ describe("StatusServer durable API", () => {
           lastConflictResolutionReportId: "merge-conflict-resolution:issue-blocked:blocked-1",
           blockedReason: "needs operator",
         },
-        humanRequired: { active: true, reason: "needs operator" },
+        reviewLoop: {
+          lastIssueTriageReport: {
+            disposition: "manual_decision",
+            confidence: "medium",
+            summary: "The block requires an operator decision.",
+            recommendedAction: "Review the triage recommendation before moving this issue out of Blocked.",
+          },
+        },
+        humanRequired: {
+          active: true,
+          reason: "Review the triage recommendation before moving this issue out of Blocked.",
+        },
         continuationSummary: { available: true, path: "/api/v1/issues/TEST-BLOCKED/continuation-summary" },
       });
     } finally {

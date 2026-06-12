@@ -3,6 +3,7 @@ import type {
   IssueCompletionReportRecord,
   IssueMergeGateMergeabilityState,
   IssueReviewVerdictRecord,
+  IssueTriageReportRecord,
   PullRequestReviewEvidenceItem,
 } from "../persistence/IssueLifecycleStore.js";
 import type { Issue, Workspace } from "../types.js";
@@ -40,6 +41,12 @@ export interface BlockedEscalationWritebackContext {
   lastCompletionReport?: IssueCompletionReportRecord | null;
   lastReviewVerdict?: IssueReviewVerdictRecord | null;
   requiredAction?: string;
+}
+
+export interface IssueTriageReportWritebackContext {
+  issue: Issue;
+  report: IssueTriageReportRecord;
+  blockedReason?: string | null;
 }
 
 export interface MergeCompletedWritebackContext {
@@ -537,6 +544,11 @@ export function planBlockedEscalationWritebacks(
 
   const blockedState = config.reviewLoop.blockedStates[0] ?? null;
   const eventKey = `${context.runId}:blocked-escalation`;
+  const requiredAction =
+    config.issueTriage.enabled && isIssueTriageEligibleBlockedReason(context.reason)
+      ? "Symphony will run issue triage for this max-failure block and publish a follow-up recommendation on the issue. Inspect the latest output only if the triage run does not complete or calls for immediate manual intervention."
+      : context.requiredAction ??
+        "Inspect the latest worker output and reviewer feedback, then move the issue out of the blocked state when it is safe for Symphony to continue.";
   const operations: NewWritebackOperation[] = [
     {
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
@@ -564,8 +576,7 @@ export function planBlockedEscalationWritebacks(
           ...formatReviewVerdictSummary(context.lastReviewVerdict ?? null),
           "",
           "Required human action:",
-          context.requiredAction ??
-            "Inspect the latest worker output and reviewer feedback, then move the issue out of the blocked state when it is safe for Symphony to continue.",
+          requiredAction,
           "",
           blockedState === null
             ? "No blocked state is configured, so Symphony left the issue state unchanged and automation should remain paused."
@@ -590,6 +601,44 @@ export function planBlockedEscalationWritebacks(
   }
 
   return operations;
+}
+
+export function planIssueTriageReportWritebacks(
+  context: IssueTriageReportWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  const eventKey = `issue-triage:${safeKeySegment(context.report.idempotencyKey)}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.report.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Issue Triage",
+          "",
+          "Status: triage complete, human action required",
+          "",
+          `Run: ${context.report.runId}`,
+          `Blocked reason: ${context.blockedReason ?? "n/a"}`,
+          `Disposition: ${context.report.disposition}`,
+          `Confidence: ${context.report.confidence}`,
+          "",
+          "Summary:",
+          context.report.summary,
+          "",
+          "Evidence:",
+          ...context.report.evidence.map((item) => `- ${item}`),
+          "",
+          "Recommended human action:",
+          context.report.recommendedAction,
+        ].join("\n"),
+      },
+    },
+  ];
 }
 
 export function planMergeCompletedWritebacks(
@@ -659,6 +708,11 @@ export function planMergeGateBlockedWritebacks(
   const blockedState = config.reviewLoop.blockedStates[0] ?? null;
   const eventKey = mergeGateWritebackEventKey(context, "blocked");
   const conflict = context.mergeability?.status === "conflicted";
+  const requiredAction = config.issueTriage.enabled
+    ? "Symphony will run issue triage for this merge-gate ceiling and publish a follow-up recommendation on the issue. Inspect the required checks or mergeability only if the triage run does not complete or calls for immediate manual intervention."
+    : conflict
+    ? "Inspect the merge conflicts and required checks, then decide whether to repair manually, reset approval, or override the merge gate."
+    : "Inspect the failing required checks and decide whether to repair, adjust CI configuration, or manually override the merge gate.";
   const operations: NewWritebackOperation[] = [
     mergeGateCommentOperation(
       context,
@@ -667,9 +721,7 @@ export function planMergeGateBlockedWritebacks(
       blockedState === null
         ? "No blocked state is configured, so Symphony recorded a lifecycle-level block without changing the tracker state."
         : `Transitioning to blocked state: ${blockedState}`,
-      conflict
-        ? "Inspect the merge conflicts and required checks, then decide whether to repair manually, reset approval, or override the merge gate."
-        : "Inspect the failing required checks and decide whether to repair, adjust CI configuration, or manually override the merge gate.",
+      requiredAction,
     ),
   ];
   if (blockedState !== null) {
@@ -1049,6 +1101,16 @@ function formatReviewEvidenceSummary(item: PullRequestReviewEvidenceItem): strin
 
 function safeKeySegment(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "report";
+}
+
+function isIssueTriageEligibleBlockedReason(reason: string | null | undefined): boolean {
+  const normalized = (reason ?? "").toLowerCase();
+  return (
+    normalized.includes("max reviewer failures") ||
+    normalized.includes("max review rounds") ||
+    normalized.includes("max merge gate failures") ||
+    normalized.includes("merge gate required checks failed")
+  );
 }
 
 function pullRequestIdempotencySegment(pullRequest: PullRequestHandoffWritebackDetails["pullRequest"]): string {

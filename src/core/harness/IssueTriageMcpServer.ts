@@ -5,6 +5,7 @@ import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { Issue, Workspace } from "../types.js";
+import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
 
@@ -45,6 +46,7 @@ export async function submitIssueTriageReportFromMcp(
     const service = new IssueTriageService({
       config,
       lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
       runStore: new FileRunTranscriptStore(config.workspace.stateDir),
     });
     const context: IssueTriageActiveContext = {

@@ -143,7 +143,7 @@ export function mapAgentCommandPolicyDecisionToAcpPermissionDecision(
 export const mapAgentCommandPolicyOutcomeToAcpPermissionDecision = mapAgentCommandPolicyDecisionToAcpPermissionDecision;
 
 function acpResolverRunPhase(input: HermesAcpPermissionResolverInput): string {
-  return input.ctx.runPhase ?? (input.ctx.role === "reviewer" ? "review" : "implementation");
+  return input.ctx.runPhase ?? (input.ctx.role === "reviewer" ? "review" : input.ctx.role === "triage" ? "issue_triage" : input.ctx.role === "planner" ? "issue_breakdown" : "implementation");
 }
 
 function fileEditPolicyDecisionForAcpPermission(input: HermesAcpPermissionResolverInput, policy: {

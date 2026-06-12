@@ -116,7 +116,7 @@ export class IssueBreakdownPlanApplyService {
       return { status: "pending", plan: pending, operations: processed };
     }
 
-    const finalOperations = planIssueBreakdownFinalizationWritebacks(issue, workingPlan);
+    const finalOperations = planIssueBreakdownFinalizationWritebacks(issue, workingPlan, this.options.config);
     workingPlan = await this.updatePlan(issue, workingPlan, {
       applicationOperationKeys: mergeOperationKeys(workingPlan.applicationOperationKeys, finalOperations),
     });
@@ -226,6 +226,7 @@ export function planIssueBreakdownApplicationWritebacks(
 export function planIssueBreakdownFinalizationWritebacks(
   issue: Issue,
   plan: IssueBreakdownPlanRecord,
+  config?: ServiceConfig,
 ): NewWritebackOperation[] {
   const operations: NewWritebackOperation[] = [];
   const refsByIndex = new Map(plan.createdIssueRefs.map((ref) => [ref.proposedIssueIndex, ref]));
@@ -283,6 +284,20 @@ export function planIssueBreakdownFinalizationWritebacks(
       body: renderParentComment(issue, plan),
     },
   });
+  const reviewState = config?.reviewLoop.reviewStates[0] ?? null;
+  if (config && reviewState) {
+    operations.push({
+      idempotencyKey: `transition:${issue.id}:issue-breakdown:${plan.id}:${reviewState}`,
+      kind: "transition",
+      issueId: issue.id,
+      runId: plan.runId,
+      payload: {
+        toState: reviewState,
+        fromStates: [...config.reviewLoop.blockedStates, ...config.tracker.activeStates],
+        reason: "Symphony issue breakdown created blocking child issues; parent is ready for gated review",
+      },
+    });
+  }
   return operations;
 }
 

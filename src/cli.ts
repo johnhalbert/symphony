@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path";
+import { promises as fs } from "node:fs";
 import { createRequire } from "node:module";
 import { Command } from "commander";
 import { StatusServer } from "./app/http.js";
@@ -217,6 +218,77 @@ program
     });
   });
 
+const promptCommand = program.command("prompt").description("Inspect Symphony prompts without dispatching an agent");
+
+promptCommand
+  .command("render")
+  .description("Render the prompt Symphony would give the next agent run for an issue")
+  .argument("<issue>", "issue id or identifier")
+  .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
+  .option("--state <state>", "simulate the issue in a specific tracker state")
+  .option("--role <role>", "force or constrain role: auto, worker, reviewer, triage, planner", "auto")
+  .option("--phase <phase>", "force or constrain phase: auto, implementation, review, issue_breakdown, issue_triage, merge_conflict_resolution", "auto")
+  .option("--force", "render the requested role/phase even if Symphony would not dispatch it")
+  .option("--json", "print JSON output including prompt metadata")
+  .option("--out <path>", "write the rendered prompt to a file instead of stdout")
+  .action(
+    async (
+      issue: string,
+      workflow: string,
+      options: { state?: string; role?: string; phase?: string; force?: boolean; json?: boolean; out?: string },
+    ) => {
+      const logger = new StructuredLogger();
+      const workflowPath = path.resolve(process.cwd(), workflow);
+      const loader = new WorkflowLoader(workflowPath);
+      const loaded = await loader.load();
+      const config = loaded.serviceConfig;
+      const tracker = createRuntimeTrackerClient(config);
+      const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const workspaceManager = new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+        planningWorkspaceMode: config.issueBreakdown.workspaceMode,
+      });
+      const harness = createAgentHarness(config, { runStore });
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager,
+        harness,
+        logger,
+        promptTemplate: loaded.definition.promptTemplate,
+        runStore,
+        lifecycleStore,
+        statusServerBaseUrl: () => null,
+        statusMutationToken: null,
+      });
+      try {
+        const result = await orchestrator.renderPromptPreview(issue, {
+          ...(options.state === undefined ? {} : { state: options.state }),
+          role: parsePromptRenderRole(options.role),
+          phase: parsePromptRenderPhase(options.phase),
+          force: options.force === true,
+        });
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else if (result.status === "rendered") {
+          if (options.out) {
+            await fs.writeFile(path.resolve(process.cwd(), options.out), result.prompt, "utf8");
+          } else {
+            console.log(result.prompt);
+          }
+        } else {
+          console.log(`No prompt would be dispatched for ${result.issue.identifier}: ${result.reason}`);
+        }
+      } finally {
+        await loader.close();
+        await harness.dispose?.();
+      }
+    },
+  );
+
 program
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
   .option("--port <port>", "enable local HTTP status server on this port")
@@ -360,6 +432,37 @@ function currentCliPath(): string {
 
 function localStatusHost(host: string): string {
   return host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
+}
+
+function parsePromptRenderRole(value: string | undefined): "auto" | "worker" | "reviewer" | "triage" | "planner" {
+  const normalized = (value ?? "auto").trim().toLowerCase();
+  if (
+    normalized === "auto" ||
+    normalized === "worker" ||
+    normalized === "reviewer" ||
+    normalized === "triage" ||
+    normalized === "planner"
+  ) {
+    return normalized;
+  }
+  throw new Error(`Invalid prompt render role: ${value}`);
+}
+
+function parsePromptRenderPhase(
+  value: string | undefined,
+): "auto" | "implementation" | "review" | "issue_breakdown" | "issue_triage" | "merge_conflict_resolution" {
+  const normalized = (value ?? "auto").trim().toLowerCase();
+  if (
+    normalized === "auto" ||
+    normalized === "implementation" ||
+    normalized === "review" ||
+    normalized === "issue_breakdown" ||
+    normalized === "issue_triage" ||
+    normalized === "merge_conflict_resolution"
+  ) {
+    return normalized;
+  }
+  throw new Error(`Invalid prompt render phase: ${value}`);
 }
 
 interface RuntimeProjectionPersistence {

@@ -72,6 +72,28 @@ handoff_repair:
     - issue_triage
     - merge_conflict_resolution
 
+issue_breakdown:
+  enabled: true
+  cursor_mode: plan
+  workspace_mode: writable_checkout
+  apply_to_linear:
+    enabled: true
+    mode: child_issues
+    auto_apply: true
+
+prompts:
+  templates_dir: ./prompts
+  templates:
+    worker.implementation.initial: worker/implementation/initial.md.liquid
+    worker.implementation.unsatisfied_requirements: worker/implementation/unsatisfied_requirements.md.liquid
+    worker.implementation.review_repair: worker/implementation/review_repair.md.liquid
+    worker.implementation.merge_gate_repair: worker/implementation/merge_gate_repair.md.liquid
+    worker.merge_conflict.resolve: worker/merge_conflict/resolve.md.liquid
+    reviewer.review.exhaustive: reviewer/review/exhaustive.md.liquid
+    triage.issue_blocked.classify: triage/issue_blocked/classify.md.liquid
+    planner.issue_breakdown.speckit_to_linear: planner/issue_breakdown/speckit_to_linear.md.liquid
+    handoff_repair.mcp_only: handoff_repair/mcp_only.md.liquid
+
 database:
   postgres:
     url: $SYMPHONY_POSTGRES_URL

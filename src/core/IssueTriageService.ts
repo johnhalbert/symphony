@@ -10,6 +10,8 @@ import type {
 } from "./persistence/IssueLifecycleStore.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
+import { planIssueTriageReportWritebacks } from "./writeback/TransitionPolicy.js";
+import type { FileWritebackOutboxStore } from "./writeback/WritebackOutbox.js";
 
 export const ISSUE_TRIAGE_DISPOSITIONS = [
   "decompose_issue",
@@ -49,6 +51,7 @@ export interface IssueTriageActiveContext {
 export interface IssueTriageServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
+  writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
   runStore?: Pick<RunTranscriptStore, "appendEvent">;
 }
 
@@ -115,7 +118,7 @@ export class IssueTriageService {
     }
 
     const submittedAt = new Date().toISOString();
-    const report: IssueTriageReportRecord = {
+    const reportBase: IssueTriageReportRecord = {
       id: issueTriageReportIdFor(context.issue.id, parsed.idempotencyKey),
       idempotencyKey: parsed.idempotencyKey,
       requestHash,
@@ -130,6 +133,23 @@ export class IssueTriageService {
       recommendedAction: parsed.recommendedAction,
       submittedAt,
       writebackOperationKeys: [],
+    };
+    const operations = planIssueTriageReportWritebacks(
+      {
+        issue: context.issue,
+        report: reportBase,
+        blockedReason: existingLifecycle.blockedReason,
+      },
+      this.options.config,
+    );
+    const writebackOperationKeys: string[] = [];
+    for (const operation of operations) {
+      const enqueued = await this.options.writebackOutbox.enqueueOnce(operation);
+      writebackOperationKeys.push(enqueued.idempotencyKey);
+    }
+    const report: IssueTriageReportRecord = {
+      ...reportBase,
+      writebackOperationKeys,
     };
 
     const lifecycle = await this.options.lifecycleStore.updateIssue(context.issue, {

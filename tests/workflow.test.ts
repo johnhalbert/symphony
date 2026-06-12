@@ -99,6 +99,7 @@ Work on {{ issue.identifier }}.`,
       applyToLinear: {
         enabled: false,
         mode: "child_issues",
+        autoApply: false,
       },
       workspaceMode: "none",
       maxPlanningFailures: 3,
@@ -601,6 +602,7 @@ Work on {{ issue.identifier }}.
       applyToLinear: {
         enabled: false,
         mode: "child_issues",
+        autoApply: false,
       },
       workspaceMode: "none",
       maxPlanningFailures: 3,

@@ -808,14 +808,16 @@ describe("Orchestrator", () => {
 
     expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
     expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs[0]?.ctx.role).toBe("planner");
     expect(harness.runs[0]?.prompt).toContain("Plan TEST-1");
     expect(harness.runs[0]?.prompt).toContain("submit_issue_breakdown_plan");
     expect(harness.runs[1]?.ctx.runPhase).toBe("implementation");
+    expect(harness.runs[1]?.ctx.role).toBe("worker");
     expect(harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")).toHaveLength(1);
     expect(harness.runs[1]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[1]?.prompt).toContain("Issue breakdown plan:");
     expect(harness.runs[1]?.prompt).toContain("Create implementation task");
-    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "issue_breakdown" })).resolves.toMatchObject({
+    await expect(runStore.latestRunForIssue(candidate.id, { role: "planner", runPhase: "issue_breakdown" })).resolves.toMatchObject({
       runPhase: "issue_breakdown",
       runKind: "planning",
     });
@@ -2385,6 +2387,7 @@ describe("Orchestrator", () => {
   it("dispatches classify-only issue triage for max-failure blocked issues", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
     config.reviewLoop.blockedStates = ["Blocked"];
     const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
     const tracker: TrackerClient = {
@@ -2401,12 +2404,13 @@ describe("Orchestrator", () => {
     const logger = new StructuredLogger(() => undefined);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
       reviewRound: 3,
       blockedReason: "max reviewer failures reached (3/3)",
     });
-    const harness = new IssueTriageAcceptingHarness(lifecycleStore);
+    const harness = new IssueTriageAcceptingHarness(lifecycleStore, outboxStore);
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
@@ -2436,14 +2440,108 @@ describe("Orchestrator", () => {
           runId: "triage-run-1",
           disposition: "decompose_issue",
           confidence: "high",
+          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-run-1"],
         },
       ],
     });
+    const writebacks = await outboxStore.list();
+    expect(writebacks).toHaveLength(1);
+    expect(writebacks[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:issue-triage:triage-run-1",
+      kind: "comment",
+      issueId: "issue-1",
+      runId: "triage-run-1",
+    });
+    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("## Symphony Issue Triage");
+    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("Recommended human action:");
     await expect(runStore.getRun("triage-run-1")).resolves.toMatchObject({
       role: "triage",
       runPhase: "issue_triage",
       runKind: "triage",
       status: "succeeded",
+    });
+  });
+
+  it("reconciles missing issue triage report writebacks without redispatching triage", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("Blocked") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter(() => undefined);
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const seeded = await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    await lifecycleStore.updateIssue(candidate, {
+      lastIssueTriageReportId: "issue-triage-report:issue-1:triage-1",
+      issueTriageReports: [
+        {
+          id: "issue-triage-report:issue-1:triage-1",
+          idempotencyKey: "triage-1",
+          requestHash: "triage-hash-1",
+          runId: "triage-run-1",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          triggerFingerprint: issueTriageTriggerFingerprint(seeded),
+          disposition: "decompose_issue",
+          confidence: "high",
+          summary: "Existing triage report was accepted before writebacks existed.",
+          evidence: ["blockedReason=max reviewer failures reached (3/3)"],
+          recommendedAction: "Publish the missing triage recommendation without rerunning the agent.",
+          submittedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    expect(writer.comments).toHaveLength(1);
+    expect(writer.comments[0]).toMatchObject({
+      issueId: candidate.id,
+      dedupeKey: "issue-triage:triage-1",
+    });
+    expect(writer.comments[0]?.body).toContain("## Symphony Issue Triage");
+    expect(writer.comments[0]?.body).toContain("Publish the missing triage recommendation without rerunning the agent.");
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      lastIssueTriageReportId: "issue-triage-report:issue-1:triage-1",
+      issueTriageReports: [
+        {
+          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-1"],
+        },
+      ],
     });
   });
 
@@ -7793,7 +7891,10 @@ class IssueTriageAcceptingHarness implements AgentHarness {
   readonly id = "issue-triage-accepting";
   readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
 
-  constructor(private readonly lifecycleStore: FileIssueLifecycleStore) {}
+  constructor(
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly writebackOutbox: FileWritebackOutboxStore,
+  ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.runs.push({ ctx, prompt });
@@ -7802,7 +7903,11 @@ class IssueTriageAcceptingHarness implements AgentHarness {
     if (ctx.runPhase === "issue_triage") {
       const lifecycle = await this.lifecycleStore.get(ctx.issue.id);
       if (!lifecycle) throw new Error("missing lifecycle for triage test");
-      await new IssueTriageService({ config: ctx.config, lifecycleStore: this.lifecycleStore }).submit_issue_triage_report(
+      await new IssueTriageService({
+        config: ctx.config,
+        lifecycleStore: this.lifecycleStore,
+        writebackOutbox: this.writebackOutbox,
+      }).submit_issue_triage_report(
         {
           runId,
           issueId: ctx.issue.id,

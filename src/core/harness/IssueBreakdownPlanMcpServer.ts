@@ -16,7 +16,7 @@ export const ISSUE_BREAKDOWN_PLAN_TOOL_NAME = "submit_issue_breakdown_plan";
 export interface IssueBreakdownPlanMcpContextFile {
   issue: Issue;
   activeRunId: string | null;
-  role: "worker";
+  role: "planner" | "worker";
   phase: "issue_breakdown";
   workspacePath: string | null;
   workspace: Workspace;
@@ -88,7 +88,7 @@ export async function runIssueBreakdownPlanMcpServer(options: {
 
 async function readIssueBreakdownPlanContext(filePath: string): Promise<IssueBreakdownPlanMcpContextFile> {
   const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as IssueBreakdownPlanMcpContextFile;
-  if (!parsed.issue || !parsed.workspace || parsed.role !== "worker" || parsed.phase !== "issue_breakdown") {
+  if (!parsed.issue || !parsed.workspace || (parsed.role !== "planner" && parsed.role !== "worker") || parsed.phase !== "issue_breakdown") {
     throw new SymphonyError("invalid_request", "Issue breakdown plan MCP context is invalid");
   }
   return parsed;

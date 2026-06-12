@@ -1438,7 +1438,7 @@ function formatHermesAcpLeaseReuseReason(reason: HermesAcpLeaseReuseDecisionReas
 }
 
 function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
-  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
+  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : ctx.role === "planner" ? "issue_breakdown" : "implementation");
 }
 
 function configuredHostHermesBinaryPath(ctx: AgentRunContext): string | null {
@@ -2954,7 +2954,7 @@ function fallbackPermissionPolicyDecision(
       redacted: true,
       surface: resolution.request.requestKind,
       role: ctx.role,
-      phase: ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation"),
+      phase: ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : ctx.role === "planner" ? "issue_breakdown" : "implementation"),
       commandClass,
       inlineEnvironmentKeys: [],
       unsafeConfigCategories: [],

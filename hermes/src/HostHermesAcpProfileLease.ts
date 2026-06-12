@@ -376,7 +376,11 @@ export function buildHostHermesAcpReusableLeaseKey(input: {
 export function resolveHostHermesAcpRunPhase(input: { role: string; phase?: string | null }): string {
   const configured = normalizeOptionalString(input.phase);
   if (configured) return configured;
-  return input.role.trim().toLowerCase() === "reviewer" ? "review" : "implementation";
+  const role = input.role.trim().toLowerCase();
+  if (role === "reviewer") return "review";
+  if (role === "triage") return "issue_triage";
+  if (role === "planner") return "issue_breakdown";
+  return "implementation";
 }
 
 export function buildHostHermesAcpProfileName(input: HostHermesAcpProfileNameInput): string {

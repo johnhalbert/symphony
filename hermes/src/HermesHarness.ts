@@ -704,7 +704,7 @@ function templateForRun(ctx: AgentRunContext): string {
 }
 
 function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
-  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : "implementation");
+  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : ctx.role === "planner" ? "issue_breakdown" : "implementation");
 }
 
 function agentCommandPolicyHookOptionsForRun(
@@ -726,6 +726,7 @@ function agentCommandPolicyHookOptionsForRun(
 function shouldInstallAgentCommandPolicyHook(ctx: AgentRunContext, phase: AgentRunPhase): boolean {
   if (ctx.role === "reviewer") return true;
   if (ctx.role === "triage") return true;
+  if (ctx.role === "planner") return true;
   return ctx.role === "worker" && phase !== "issue_breakdown";
 }
 

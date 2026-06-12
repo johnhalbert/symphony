@@ -1,0 +1,12 @@
+# Symphony Worker: Merge-Gate Repair
+
+The implementation reached the merge gate but failed service-owned merge checks. Repair only the merge-gate blocker.
+
+{% include "partials/issue_context.md.liquid" %}
+
+## Required Behavior
+
+- Focus on the merge-gate evidence appended below.
+- Do not reopen unrelated implementation scope.
+- Validate the failing or missing checks with concrete commands or durable evidence.
+- Submit completion only after the merge-gate blocker is repaired.

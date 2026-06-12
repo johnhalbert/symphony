@@ -5727,6 +5727,7 @@ function classifyBoardLane(
   if (isLifecycleBlocked(lifecycle)) return "progress";
   if (role === "reviewer") return "review";
   if (role === "worker") return "progress";
+  if (role === "planner") return "progress";
   if (lifecycle?.phase === "terminal") return "done";
   return "backlog";
 }
@@ -5972,7 +5973,7 @@ function renderRunningRow(
   const cancellation = cancellationSummary(row);
   const cancelFailed = cancelFailedSummary(liveCancelFailed(row));
   const activitySources = activitySummary(row);
-  const blockedReason = lifecycleBlockedReason(row.lifecycle);
+  const blockedReason = lifecycleHumanRequiredReason(row.lifecycle);
   const conflictSummary = mergeConflictDashboardSummary(row.lifecycle?.mergeConflict ?? null);
   const transcriptLink = runId === "n/a" ? "" : ` · <a href="/runs/${encodeURIComponent(runId)}/transcript">Live transcript</a>`;
   return `<li class="run-row operator-${operator.status}">
@@ -6387,6 +6388,7 @@ async function operatorSnapshotView(
           lifecycle: row.lifecycle,
         }),
         liveness: runningOperatorLiveness(row, paused, row.lifecycle, agentId),
+        reviewLoop: reviewLoopStatus({ live: row, latestRun, lifecycle: row.lifecycle }),
         mergeConflict,
         controls,
         ...affordances,
@@ -6481,7 +6483,10 @@ function runningOperatorLiveness(row: RunningRow, paused: boolean, lifecycle: Is
     lastActivityAt: row.liveness.lastActivityAt,
     lastTranscriptEventAt: row.lastEventAt,
     lastTranscriptEvent: publicDiagnosticText(row.lastEvent),
-    lastMessage: publicDiagnosticText(row.lastMessage),
+    lastMessage:
+      status === "blocked_human_required"
+        ? lifecycleHumanRequiredReason(lifecycle) ?? publicDiagnosticText(row.lastMessage)
+        : publicDiagnosticText(row.lastMessage),
     secondsSinceLastActivity: row.liveness.secondsSinceLastActivity,
     stallTimeoutMs: row.liveness.stallTimeoutMs,
     sdkRunStatus: row.liveness.sdkRunStatus ?? null,
@@ -6563,6 +6568,7 @@ async function pausedOperatorViews(
           summaryRun,
           lifecycle,
         }),
+        reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
         ...operatorAffordances({
           issueKey: issueIdentifier,
           lifecycle,
@@ -6860,7 +6866,7 @@ async function terminalOperatorLiveness(
     lastActivityAt: run?.updatedAt ?? lifecycle?.updatedAt ?? null,
     lastTranscriptEventAt: null,
     lastTranscriptEvent: null,
-    lastMessage: lifecycle?.blockedReason ?? publicDiagnosticText(run?.error),
+    lastMessage: lifecycleHumanRequiredReason(lifecycle) ?? publicDiagnosticText(run?.error),
     secondsSinceLastActivity: null,
     stallTimeoutMs: null,
     cancellation: null,
@@ -7000,7 +7006,9 @@ function blockedIssueView(lifecycle: IssueLifecycleRecord | null | undefined) {
   const blockedLifecycle = lifecycle;
   return {
     status: "blocked_human_required" as const,
-    reason: lifecycleBlockedReason(blockedLifecycle),
+    reason: lifecycleHumanRequiredReason(blockedLifecycle),
+    blockedReason: lifecycleBlockedReason(blockedLifecycle),
+    lastIssueTriageReport: latestIssueTriageReport(blockedLifecycle),
     issueId: blockedLifecycle.issueId,
     issueIdentifier: blockedLifecycle.issueIdentifier,
     continuationSummaryRecommended: true,
@@ -7124,7 +7132,7 @@ function terminalTimeline(
             at: lifecycle.updatedAt,
             kind: "lifecycle_blocked",
             label: "Human-required block recorded",
-            detail: lifecycleBlockedReason(lifecycle),
+            detail: lifecycleHumanRequiredReason(lifecycle),
             synthetic: true,
             source: "lifecycle_store",
           },
@@ -7161,6 +7169,10 @@ function isLifecycleBlocked(lifecycle: IssueLifecycleRecord | null | undefined):
 function lifecycleBlockedReason(lifecycle: IssueLifecycleRecord | null | undefined): string | null {
   if (lifecycle === null || lifecycle === undefined) return null;
   return lifecycle.blockedReason ?? lifecycle.mergeConflict?.blockedReason ?? null;
+}
+
+function lifecycleHumanRequiredReason(lifecycle: IssueLifecycleRecord | null | undefined): string | null {
+  return latestIssueTriageReport(lifecycle ?? null)?.recommendedAction ?? lifecycleBlockedReason(lifecycle);
 }
 
 function mergeConflictOperatorSummary(conflict: IssueMergeConflictMetadata | null) {
@@ -7543,7 +7555,7 @@ function operatorAffordances(input: {
   return {
     humanRequired: {
       active: blocked,
-      reason: lifecycleBlockedReason(input.lifecycle),
+      reason: lifecycleHumanRequiredReason(input.lifecycle),
       continuationSummaryRecommended: blocked,
     },
     continuationSummary: {

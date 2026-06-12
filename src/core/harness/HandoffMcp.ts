@@ -54,7 +54,7 @@ export function symphonyRoleMcpServers(
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
     };
   }
-  if (ctx.role === "worker" && currentRunPhase(ctx) === "issue_breakdown") {
+  if ((ctx.role === "planner" || ctx.role === "worker") && currentRunPhase(ctx) === "issue_breakdown") {
     return {
       symphony_planning: applyCwd(issueBreakdownPlanMcpServerConfig(ctx, issueBreakdownPlanContextFilePath(ctx), options)),
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
@@ -172,7 +172,7 @@ export function renderIssueBreakdownMcpHandoffPrompt(input: RuntimeHandoffPrompt
     "",
     "Symphony MCP issue-breakdown handoff:",
     `- Active issue: ${input.issue.identifier} (${input.issue.id})`,
-    "- Active role: worker",
+    `- Active role: ${input.role ?? "planner"}`,
     "- Active phase: issue_breakdown",
     "- Before ending the run, call the submit_issue_breakdown_plan MCP tool with summary, proposedIssues, and idempotencyKey.",
     "- Each proposed issue must include title, description, acceptanceCriteria, dependencies, and labels.",
@@ -201,7 +201,7 @@ export function renderIssueTriageMcpHandoffPrompt(input: RuntimeHandoffPromptInp
     "- Use disposition=\"decompose_issue\" only when the failures show hidden or under-specified scope that should be converted into smaller blocking child issues.",
     "- Use repair/refinement dispositions for non-decomposition failures such as validation gaps, merge-gate-only failures, infrastructure problems, PR retargeting, or orchestrator context defects.",
     "- Evidence must name concrete lifecycle records, review findings, merge-gate facts, commands, logs, or code paths that support the classification.",
-    "- Symphony persists the triage report locally for operator follow-up; it does not automatically modify the issue.",
+    "- After the MCP tool accepts the report, Symphony publishes a service-owned Linear triage comment with the recommendation. Do not write to Linear directly.",
   ].join("\n");
 }
 
@@ -274,11 +274,11 @@ async function writeHandoffMcpContexts(
     });
     return;
   }
-  if (ctx.role === "worker" && phase === "issue_breakdown") {
+  if ((ctx.role === "planner" || ctx.role === "worker") && phase === "issue_breakdown") {
     await writeIssueBreakdownPlanMcpContext(issueBreakdownPlanContextFilePath(ctx), {
       issue: ctx.issue,
       activeRunId: input.activeRunId,
-      role: "worker",
+      role: ctx.role === "planner" ? "planner" : "worker",
       workspacePath: ctx.workspace.path,
       workspace: ctx.workspace,
       phase: "issue_breakdown",
@@ -506,7 +506,7 @@ export function operatorChatContextFilePath(ctx: OperatorChatRunContext): string
 }
 
 export function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
-  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : "implementation");
+  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : ctx.role === "planner" ? "issue_breakdown" : "implementation");
 }
 
 function operatorChatRunContextFromAgentContext(ctx: AgentRunContext): OperatorChatRunContext {

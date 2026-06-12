@@ -205,7 +205,7 @@ export interface Workspace {
   baseRef?: string;
 }
 
-export type AgentRunRole = "worker" | "reviewer" | "triage";
+export type AgentRunRole = "worker" | "reviewer" | "triage" | "planner";
 export type AgentRunPhase = "issue_breakdown" | "implementation" | "merge_conflict_resolution" | "review" | "issue_triage";
 export type AgentRunKind = "planning" | "implementation" | "review" | "triage";
 

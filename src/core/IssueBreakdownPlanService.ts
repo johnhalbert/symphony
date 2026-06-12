@@ -44,7 +44,7 @@ type IssueBreakdownProposedIssue = IssueBreakdownPlanInput["proposedIssues"][num
 export interface IssueBreakdownPlanActiveContext {
   issue: Issue;
   activeRunId: string;
-  role: "worker";
+  role: "planner" | "worker";
   phase: "issue_breakdown";
 }
 
@@ -380,8 +380,8 @@ function describeProposedIssue(index: number, title: string): string {
 }
 
 function validateCaller(plan: IssueBreakdownPlanInput, context: IssueBreakdownPlanActiveContext): void {
-  if (context.role !== "worker" || context.phase !== "issue_breakdown") {
-    throw new SymphonyError("invalid_request", "Issue breakdown plans can only be submitted by issue breakdown worker runs");
+  if ((context.role !== "planner" && context.role !== "worker") || context.phase !== "issue_breakdown") {
+    throw new SymphonyError("invalid_request", "Issue breakdown plans can only be submitted by issue breakdown planner runs");
   }
   if (plan.runId !== context.activeRunId) {
     throw new SymphonyError("invalid_request", "Issue breakdown plan runId does not match the active run");

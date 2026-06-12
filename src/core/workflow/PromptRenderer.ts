@@ -7,6 +7,7 @@ export interface PromptRenderInput {
   issue: Issue;
   attempt: RunAttempt;
   role?: AgentRunRole;
+  [key: string]: unknown;
   completionReport?: unknown;
   acceptanceCriteria?: string[];
   workspaceEvidence?: string[];
@@ -20,10 +21,11 @@ export interface PromptRenderInput {
 export class PromptRenderer {
   private readonly engine: Liquid;
 
-  constructor() {
+  constructor(options: { root?: string | string[] | null } = {}) {
     this.engine = new Liquid({
       strictVariables: true,
       strictFilters: true,
+      ...(options.root ? { root: options.root } : {}),
     });
   }
 
@@ -34,6 +36,7 @@ export class PromptRenderer {
     try {
       const parsed = this.engine.parse(effectiveTemplate);
       const rendered = await this.engine.render(parsed, {
+        ...input,
         issue: input.issue,
         attempt: input.attempt,
         role: input.role ?? "worker",

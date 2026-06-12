@@ -6,6 +6,7 @@ import { Agent, type Run, type SDKAgent, type SettingSource } from "@cursor/sdk"
 import type { CursorSettingSource, ServiceConfig } from "../config/Config.js";
 import type { AgentRunContext } from "./AgentHarness.js";
 import { COMPLETION_REPORT_TOOL_NAME, writeCompletionReportMcpContext } from "./CompletionReportMcpServer.js";
+import { ISSUE_BREAKDOWN_PLAN_TOOL_NAME, writeIssueBreakdownPlanMcpContext } from "./IssueBreakdownPlanMcpServer.js";
 import { ISSUE_TRIAGE_TOOL_NAME, writeIssueTriageMcpContext } from "./IssueTriageMcpServer.js";
 import { writeMergeConflictResolutionMcpContext } from "./MergeConflictResolutionMcpServer.js";
 import {
@@ -21,6 +22,7 @@ import { StructuredLogger } from "../logging/StructuredLogger.js";
 import { resolveCursorRuntimeApiKey } from "../../app/RuntimeDependencies.js";
 import {
   completionReportContextFilePath,
+  issueBreakdownPlanContextFilePath,
   issueTriageContextFilePath,
   mergeConflictResolutionContextFilePath,
   reviewFeedbackContextFilePath,
@@ -69,7 +71,13 @@ export type McpToolExposureFailureCode =
 export interface McpToolExposureSpec {
   role: AgentRunRole;
   runPhase: AgentRunPhase;
-  serverKey: "symphony" | "symphony_conflicts" | "symphony_triage" | "symphony_review_verdict" | "symphony_review_feedback";
+  serverKey:
+    | "symphony"
+    | "symphony_conflicts"
+    | "symphony_planning"
+    | "symphony_triage"
+    | "symphony_review_verdict"
+    | "symphony_review_feedback";
   command: McpSubprocessCommand;
   expectedTool: string;
 }
@@ -228,6 +236,13 @@ export const MCP_TOOL_EXPOSURE_SPECS: readonly McpToolExposureSpec[] = [
     serverKey: "symphony_triage",
     command: "issue-triage-mcp",
     expectedTool: ISSUE_TRIAGE_TOOL_NAME,
+  },
+  {
+    role: "planner",
+    runPhase: "issue_breakdown",
+    serverKey: "symphony_planning",
+    command: "issue-breakdown-plan-mcp",
+    expectedTool: ISSUE_BREAKDOWN_PLAN_TOOL_NAME,
   },
 ] as const;
 
@@ -1147,6 +1162,17 @@ async function writeRoleContexts(ctx: AgentRunContext): Promise<void> {
     });
     return;
   }
+  if (ctx.role === "planner") {
+    await writeIssueBreakdownPlanMcpContext(issueBreakdownPlanContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: null,
+      role: "planner",
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "issue_breakdown",
+    });
+    return;
+  }
   if (ctx.role === "worker") {
     await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
       issue: ctx.issue,
@@ -1369,7 +1395,7 @@ function roleRunMatchesSpec(roleRun: SdkRoleRunResult, spec: McpToolExposureSpec
 }
 
 function defaultRunPhaseForRole(role: AgentRunRole): AgentRunPhase {
-  return role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : "implementation";
+  return role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : role === "planner" ? "issue_breakdown" : "implementation";
 }
 
 export function extractSdkSystemToolNames(tools: unknown): SdkSystemToolExtraction {

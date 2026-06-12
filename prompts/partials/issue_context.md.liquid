@@ -1,0 +1,15 @@
+## Issue
+
+- Identifier: {{ issue.identifier }}
+- Title: {{ issue.title }}
+- State: {{ issue.state }}
+- URL: {% if issue.url %}{{ issue.url }}{% else %}n/a{% endif %}
+- Labels: {% if issue.labels.size > 0 %}{{ issue.labels | join: ", " }}{% else %}none{% endif %}
+
+## Issue Description
+
+{% if issue.description %}
+{{ issue.description }}
+{% else %}
+No issue description was provided.
+{% endif %}

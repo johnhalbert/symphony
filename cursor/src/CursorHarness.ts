@@ -1081,7 +1081,7 @@ function operatorAgentKey(ctx: OperatorChatRunContext): string {
 }
 
 function cursorRunPhase(ctx: AgentRunContext): AgentRunPhase {
-  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
+  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : ctx.role === "planner" ? "issue_breakdown" : "implementation");
 }
 
 function currentSymphonyCliPath(): string {
