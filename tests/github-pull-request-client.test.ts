@@ -82,6 +82,40 @@ describe("GitHubPullRequestClient", () => {
     );
   });
 
+  it("closes an open pull request through the publication API", async () => {
+    const calls: Array<{ url: URL; init?: RequestInit }> = [];
+    const client = new GitHubPullRequestClient(config(), async (input, init) => {
+      calls.push({ url: new URL(String(input)), ...(init === undefined ? {} : { init }) });
+      return jsonResponse({
+        html_url: "https://github.com/octo-org/symphony/pull/42",
+        number: 42,
+        state: "closed",
+        merged: false,
+        merge_commit_sha: null,
+        merged_at: null,
+        merged_by: null,
+        mergeable: null,
+        mergeable_state: null,
+        base: { ref: "main", sha: "base-sha" },
+        head: {
+          ref: "symphony/TEST-1",
+          sha: "head-sha",
+          repo: { pushed_at: "2026-01-01T00:00:00Z" },
+        },
+      });
+    });
+
+    await expect(client.closePullRequest({ pullRequestNumber: 42 })).resolves.toBeUndefined();
+    expect(calls[0]?.url.pathname).toBe("/repos/octo-org/symphony/pulls/42");
+    expect(calls[0]?.init?.method).toBe("PATCH");
+    expect(calls[0]?.init?.headers).toMatchObject({
+      authorization: "Bearer github-secret",
+      accept: "application/vnd.github+json",
+      "content-type": "application/json",
+    });
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({ state: "closed" });
+  });
+
   it("ingests PR reviews, review comments, and PR issue comments as review evidence", async () => {
     const calls: string[] = [];
     const client = new GitHubPullRequestClient(config(), async (input, init) => {

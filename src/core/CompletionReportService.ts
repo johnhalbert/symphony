@@ -99,6 +99,7 @@ export interface CompletionReportServiceOptions {
 
 export interface CompletionReportPullRequestPublisher {
   publishPullRequest(input: CompletionReportPullRequestPublicationInput): Promise<CompletionReportPullRequestPublication>;
+  closePullRequest?(input: { pullRequestNumber: number }): Promise<void>;
   getRequiredCheckResults?(input: {
     headSha: string;
     requiredChecks: string[];
@@ -889,6 +890,9 @@ export class CompletionReportService {
     const latestLifecycle =
       (await this.options.lifecycleStore.get(context.issue.id)) ??
       (context.issue.identifier ? await this.options.lifecycleStore.get(context.issue.identifier) : null);
+    if (latestLifecycle?.phase === "terminal") {
+      return [];
+    }
     if (latestLifecycle?.phase === "blocked" && latestLifecycle.blockedReason === terminalReason) {
       return [];
     }
