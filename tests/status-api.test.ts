@@ -734,6 +734,170 @@ describe("StatusServer durable API", () => {
   });
 
 
+  it("preserves both exact-id siblings on symphony-only board cards when visible identifiers collide", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const docsRunning = liveRunningFixture(config, "ENG-123", "In Progress");
+    docsRunning.issueId = "issue-docs-board-live-1";
+    docsRunning.runId = "run-docs-board-live-1";
+    docsRunning.sessionId = "docs-board-live-session-1";
+    docsRunning.issueDetails = issueDetailsFixture({
+      id: docsRunning.issueId,
+      identifier: "ENG-123",
+      title: "Docs live duplicate",
+      state: "In Progress",
+    });
+
+    const symphonyRunning = liveRunningFixture(config, "ENG-123", "Blocked");
+    symphonyRunning.issueId = "issue-symphony-board-live-1";
+    symphonyRunning.runId = "run-symphony-board-live-1";
+    symphonyRunning.sessionId = "symphony-board-live-session-1";
+    symphonyRunning.issueDetails = issueDetailsFixture({
+      id: symphonyRunning.issueId,
+      identifier: "ENG-123",
+      title: "Symphony live duplicate",
+      state: "Blocked",
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([docsRunning, symphonyRunning]),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      tracker: new FakeTracker([]),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const boardResponse = await fetch(`${baseUrl}/api/v1/board`);
+      const ambiguousDetailResponse = await fetch(`${baseUrl}/api/v1/board/issues/${encodeURIComponent("ENG-123")}`);
+      const boardBody = (await boardResponse.json()) as {
+        issues: Array<{
+          issueId: string | null;
+          issueIdentifier: string | null;
+          origin: string;
+          capabilities: { detail: string | null };
+        }>;
+      };
+      const ambiguousDetailBody = (await ambiguousDetailResponse.json()) as { error: { code: string; message: string } };
+
+      expect(boardResponse.status).toBe(200);
+      const duplicateCards = boardBody.issues.filter((item) => item.issueIdentifier === "ENG-123");
+      expect(duplicateCards).toHaveLength(2);
+      expect(duplicateCards.map((item) => item.issueId).sort()).toEqual([
+        "issue-docs-board-live-1",
+        "issue-symphony-board-live-1",
+      ]);
+      expect(duplicateCards.every((item) => item.origin === "symphony")).toBe(true);
+      expect(duplicateCards.map((item) => item.capabilities.detail).sort()).toEqual([
+        "/api/v1/board/issues/issue-docs-board-live-1",
+        "/api/v1/board/issues/issue-symphony-board-live-1",
+      ]);
+
+      expect(ambiguousDetailResponse.status).toBe(409);
+      expect(ambiguousDetailBody.error).toMatchObject({
+        code: "conflict",
+        message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("preserves both exact-id siblings on tracker-backed board cards and rejects ambiguous board detail identifiers", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const docsIssue = trackerIssue({
+      id: "issue-docs-board-tracker-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-board-tracker-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-123",
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      tracker: new FakeTracker([docsIssue, symphonyIssue]),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const boardResponse = await fetch(`${baseUrl}/api/v1/board`);
+      const ambiguousDetailResponse = await fetch(`${baseUrl}/api/v1/board/issues/${encodeURIComponent(docsIssue.identifier)}`);
+      const docsDetailResponse = await fetch(`${baseUrl}/api/v1/board/issues/${encodeURIComponent(docsIssue.id)}`);
+      const boardBody = (await boardResponse.json()) as {
+        issues: Array<{
+          issueId: string | null;
+          issueIdentifier: string | null;
+          origin: string;
+          capabilities: { detail: string | null };
+        }>;
+      };
+      const ambiguousDetailBody = (await ambiguousDetailResponse.json()) as { error: { code: string; message: string } };
+      const docsDetailBody = (await docsDetailResponse.json()) as {
+        issue: string;
+        boardCard: { issueId: string | null; issueIdentifier: string | null; capabilities: { detail: string | null } } | null;
+        issueDetails: { issue: { id: string | null; identifier: string | null } };
+      };
+
+      expect(boardResponse.status).toBe(200);
+      const duplicateCards = boardBody.issues.filter((item) => item.issueIdentifier === docsIssue.identifier);
+      expect(duplicateCards).toHaveLength(2);
+      expect(duplicateCards.map((item) => item.issueId).sort()).toEqual([docsIssue.id, symphonyIssue.id].sort());
+      expect(duplicateCards.every((item) => item.origin === "tracker")).toBe(true);
+      expect(duplicateCards.map((item) => item.capabilities.detail).sort()).toEqual([
+        `/api/v1/board/issues/${docsIssue.id}`,
+        `/api/v1/board/issues/${symphonyIssue.id}`,
+      ].sort());
+
+      expect(ambiguousDetailResponse.status).toBe(409);
+      expect(ambiguousDetailBody.error).toMatchObject({
+        code: "conflict",
+        message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
+      });
+      expect(docsDetailResponse.status).toBe(200);
+      expect(docsDetailBody).toMatchObject({
+        issue: docsIssue.id,
+        boardCard: {
+          issueId: docsIssue.id,
+          issueIdentifier: docsIssue.identifier,
+          capabilities: { detail: `/api/v1/board/issues/${docsIssue.id}` },
+        },
+        issueDetails: { issue: { id: docsIssue.id, identifier: docsIssue.identifier } },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("uses exact issue ids for duplicate-identifier mutation routes and continuation-summary affordances", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
@@ -2115,7 +2279,7 @@ describe("StatusServer durable API", () => {
           },
         },
         links: {
-          issue: "/api/v1/board/issues/TEST-B",
+          issue: "/api/v1/board/issues/issue-b",
           run: "/api/v1/runs/run-b",
           transcript: null,
         },
@@ -2124,6 +2288,193 @@ describe("StatusServer durable API", () => {
       expect(writebackText).not.toContain("WRITEBACK_BODY_SECRET");
       expect(writebackText).not.toContain("/local/workspace/path");
       expect(clampedBody.limit).toBe(100);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rejects ambiguous duplicate-identifier activity filters and emits exact-id activity links", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-activity-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-activity-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-123",
+    });
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.startRun({
+      runId: "run-docs-activity-1",
+      sessionId: "docs-activity-session-1",
+      agentId: "docs-activity-agent-1",
+      role: "worker",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs activity work",
+      workspaceKey: "docs__ENG-123",
+      workspacePath: path.join(config.workspace.root, "docs__ENG-123"),
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+    });
+    await runStore.startRun({
+      runId: "run-symphony-activity-1",
+      sessionId: "symphony-activity-session-1",
+      agentId: "symphony-activity-agent-1",
+      role: "reviewer",
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: symphonyProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "symphony activity work",
+      workspaceKey: "symphony__ENG-123",
+      workspacePath: path.join(config.workspace.root, "symphony__ENG-123"),
+      ...(symphonyIssue.branchName ? { gitBranchName: symphonyIssue.branchName } : {}),
+      repoPath: "/repo/symphony",
+      baseRef: "origin/main",
+    });
+    await runStore.appendEvent({
+      runId: "run-docs-activity-1",
+      at: "2030-01-01T00:02:00.000Z",
+      source: "orchestrator",
+      eventType: "progress",
+      message: "docs-only progress",
+    });
+    await runStore.appendEvent({
+      runId: "run-symphony-activity-1",
+      at: "2030-01-01T00:03:00.000Z",
+      source: "orchestrator",
+      eventType: "progress",
+      message: "symphony-only progress",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, { phase: "implementation" });
+    await lifecycleStore.ensureIssue(symphonyIssue, { phase: "implementation" });
+    await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-docs-activity-1:report",
+      kind: "comment",
+      issueId: docsIssue.id,
+      runId: "run-docs-activity-1",
+      payload: {
+        body: "DOCS_WRITEBACK_BODY",
+        dedupeKey: "docs-report",
+      },
+    });
+    await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-symphony-activity-1:report",
+      kind: "comment",
+      issueId: symphonyIssue.id,
+      runId: "run-symphony-activity-1",
+      payload: {
+        body: "SYMPHONY_WRITEBACK_BODY",
+        dedupeKey: "symphony-report",
+      },
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      writebackOutbox,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const ambiguousResponse = await fetch(`${baseUrl}/api/v1/activity?issue=${encodeURIComponent(docsIssue.identifier)}&limit=100`);
+      const docsResponse = await fetch(`${baseUrl}/api/v1/activity?issue=${encodeURIComponent(docsIssue.id)}&limit=100`);
+      const ambiguousBody = (await ambiguousResponse.json()) as { error: { code: string; message: string } };
+      const docsBody = (await docsResponse.json()) as {
+        activity: Array<{
+          kind: string;
+          issue: { id: string; identifier: string };
+          run: { runId: string; role: string } | null;
+          transcript: { sequence: number; eventType: string; message: string | null } | null;
+          writeback: null | { operationKind: string; status: string };
+          links: { issue: string; run: string | null; transcript: string | null };
+        }>;
+        counts: {
+          distinctRunsConsidered: number;
+          writebackOperationsConsidered: number;
+        };
+      };
+
+      expect(ambiguousResponse.status).toBe(409);
+      expect(ambiguousBody.error).toMatchObject({
+        code: "conflict",
+        message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
+      });
+
+      expect(docsResponse.status).toBe(200);
+      expect(docsBody.counts).toMatchObject({
+        distinctRunsConsidered: 1,
+        writebackOperationsConsidered: 1,
+      });
+      expect(docsBody.activity).not.toHaveLength(0);
+      expect(docsBody.activity.every((item) => item.issue.id === docsIssue.id)).toBe(true);
+      expect(docsBody.activity.every((item) => item.links.issue === `/api/v1/board/issues/${docsIssue.id}`)).toBe(true);
+      expect(docsBody.activity.map((item) => item.run?.runId ?? null)).not.toContain("run-symphony-activity-1");
+
+      const transcriptItem = docsBody.activity.find((item) => item.kind === "transcript_event");
+      expect(transcriptItem).toMatchObject({
+        issue: { id: docsIssue.id, identifier: docsIssue.identifier },
+        run: { runId: "run-docs-activity-1", role: "worker" },
+        transcript: { eventType: "progress", message: "docs-only progress" },
+        links: {
+          issue: `/api/v1/board/issues/${docsIssue.id}`,
+          run: "/api/v1/runs/run-docs-activity-1",
+          transcript: expect.stringContaining("/api/v1/runs/run-docs-activity-1/transcript?offset="),
+        },
+      });
+
+      const writebackItem = docsBody.activity.find((item) => item.kind === "writeback_operation");
+      expect(writebackItem).toMatchObject({
+        issue: { id: docsIssue.id, identifier: docsIssue.identifier },
+        run: { runId: "run-docs-activity-1", role: "worker" },
+        writeback: { operationKind: "comment", status: "pending" },
+        links: {
+          issue: `/api/v1/board/issues/${docsIssue.id}`,
+          run: "/api/v1/runs/run-docs-activity-1",
+          transcript: null,
+        },
+      });
     } finally {
       await server.stop();
     }

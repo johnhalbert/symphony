@@ -1981,8 +1981,8 @@ export class StatusServer {
     try {
       const detail = await this.fetchBoardIssueDetail(issueId, forceRefresh);
       const issueActivityKey =
-        detail.issueDetails.issue.identifier ??
         detail.issueDetails.issue.id ??
+        detail.issueDetails.issue.identifier ??
         detail.boardCard?.issueIdentifier ??
         detail.boardCard?.issueId ??
         issueId;
@@ -2669,6 +2669,18 @@ export class StatusServer {
 
   private async fetchBoardIssueDetail(issueId: string, forceRefresh: boolean) {
     const { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
+    const lookup = resolveIssueLookupFromCandidates(
+      issueId,
+      dedupeIssueLookupCandidates([
+        ...(sourceIndex.trackerIssues.error ? [] : sourceIndex.trackerIssues.issues.map(issueLookupCandidateFromIssue)),
+        ...sourceIndex.runtime.snapshot.running.map(issueLookupCandidateFromRunningRow),
+        ...sourceIndex.lifecycles.records.map(issueLookupCandidateFromLifecycle),
+        ...sourceIndex.workspaces.workspaces.map(issueLookupCandidateFromWorkspace),
+        ...sourceIndex.runs.runs.map(issueLookupCandidateFromRun),
+      ].filter((candidate): candidate is IssueLookupCandidate => candidate !== null)),
+    );
+    if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+    const lookupIssueId = lookup.issueId ?? issueId;
     let board: IssueBoardResponse | null = null;
     let trackerFailure: SymphonyError | null = null;
     if (sourceIndex.trackerIssues.error) {
@@ -2685,9 +2697,9 @@ export class StatusServer {
       });
     }
 
-    const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), [issueId])) ?? null;
+    const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), [lookupIssueId])) ?? null;
     const detail = await buildBoardIssueDetail({
-      requestKey: issueId,
+      requestKey: lookupIssueId,
       card,
       sourceIndex,
       mutationsConfigured: Boolean(this.options.openWorkspaceToken),
@@ -5161,8 +5173,9 @@ async function buildActivityFeed(input: {
   const allRuns = input.runs ?? (input.runStore ? await input.runStore.listRuns() : []);
   const includeTranscriptEvents = input.includeTranscriptEvents ?? true;
   const lifecycleRecords = input.lifecycleRecords ?? (await input.lifecycleStore?.list()) ?? [];
-  const issueFilter = input.query.issue;
-  const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter)) : allRuns;
+  const requestedIssueFilter = input.query.issue;
+  const resolvedIssueFilter = requestedIssueFilter ? resolveActivityIssueFilter(requestedIssueFilter, allRuns, lifecycleRecords) : null;
+  const runs = resolvedIssueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, resolvedIssueFilter)) : allRuns;
   const activity: ActivityItem[] = [];
   let transcriptEventsConsidered = 0;
   let transcriptEventsTotal = 0;
@@ -5193,8 +5206,8 @@ async function buildActivityFeed(input: {
   }
 
   const writebackOperations = input.writebackOperations ?? (await input.writebackOutbox?.list()) ?? [];
-  const filteredWritebackOperations = issueFilter
-    ? writebackOperations.filter((operation) => writebackOperationMatchesIssue(operation, issueFilter, allRuns, lifecycleRecords))
+  const filteredWritebackOperations = resolvedIssueFilter
+    ? writebackOperations.filter((operation) => writebackOperationMatchesIssue(operation, resolvedIssueFilter, allRuns, lifecycleRecords))
     : writebackOperations;
   writebackOperationsConsidered = filteredWritebackOperations.length;
   activity.push(...filteredWritebackOperations.map((operation) => activityItemForWritebackOperation(operation, allRuns, lifecycleRecords)));
@@ -5280,6 +5293,7 @@ function activityItemForWritebackOperation(
   const run = operation.runId ? (runs.find((candidate) => candidate.runId === operation.runId) ?? null) : null;
   const lifecycle =
     lifecycles.find((candidate) => candidate.issueId === operation.issueId || candidate.issueIdentifier === operation.issueId) ?? null;
+  const issueId = run?.issueId ?? lifecycle?.issueId ?? operation.issueId;
   const issueIdentifier = run?.issueIdentifier ?? lifecycle?.issueIdentifier ?? operation.issueId;
   return {
     id: `writeback:${operation.idempotencyKey}`,
@@ -5287,7 +5301,7 @@ function activityItemForWritebackOperation(
     kind: "writeback_operation",
     source: "writeback",
     issue: {
-      id: operation.issueId,
+      id: issueId,
       identifier: issueIdentifier,
     },
     run: run ? activityRun(run) : null,
@@ -5317,7 +5331,7 @@ function activityItemForWritebackOperation(
           : null,
     },
     links: {
-      issue: `/api/v1/board/issues/${encodeURIComponent(issueIdentifier)}`,
+      issue: `/api/v1/board/issues/${encodeURIComponent(issueId)}`,
       run: operation.runId ? `/api/v1/runs/${encodeURIComponent(operation.runId)}` : null,
       transcript: null,
     },
@@ -5365,7 +5379,7 @@ function activityRun(run: RunRecord): ActivityItem["run"] {
 
 function activityLinks(run: RunRecord, event: TranscriptEvent | null): ActivityItem["links"] {
   return {
-    issue: `/api/v1/board/issues/${encodeURIComponent(run.issueIdentifier)}`,
+    issue: `/api/v1/board/issues/${encodeURIComponent(run.issueId)}`,
     run: `/api/v1/runs/${encodeURIComponent(run.runId)}`,
     transcript: event
       ? `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript?offset=${Math.max(event.sequence - 1, 0)}&limit=1`
@@ -5508,13 +5522,13 @@ async function buildSymphonyOnlyBoardCards(input: {
   };
 
   for (const live of snapshot.running) {
-    await maybeAdd(live.issueIdentifier, live);
+    await maybeAdd(live.issueId, live);
   }
   for (const pausedKey of snapshot.paused) {
     await maybeAdd(pausedKey);
   }
   for (const lifecycle of input.sourceIndex.lifecycles.records) {
-    if (isLifecycleBlocked(lifecycle)) await maybeAdd(lifecycle.issueIdentifier);
+    if (isLifecycleBlocked(lifecycle)) await maybeAdd(lifecycle.issueId);
   }
   return cards;
 }
@@ -5719,23 +5733,36 @@ function boardCardKeys(card: IssueBoardCard): string[] {
   return [card.key, card.issueId, card.issueIdentifier].filter((value): value is string => value !== null && value !== undefined);
 }
 
-function activityRunMatchesIssue(run: RunRecord, issue: string): boolean {
-  return run.issueId === issue || run.issueIdentifier === issue;
+function resolveActivityIssueFilter(issue: string, runs: readonly RunRecord[], lifecycles: readonly IssueLifecycleRecord[]): string {
+  const lookup = resolveIssueLookupFromCandidates(
+    issue,
+    dedupeIssueLookupCandidates(
+      [...runs.map(issueLookupCandidateFromRun), ...lifecycles.map(issueLookupCandidateFromLifecycle)].filter(
+        (candidate): candidate is IssueLookupCandidate => candidate !== null,
+      ),
+    ),
+  );
+  if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issue, lookup.ambiguousCandidates);
+  return lookup.issueId ?? issue;
+}
+
+function activityRunMatchesIssue(run: RunRecord, issueId: string): boolean {
+  return run.issueId === issueId;
 }
 
 function writebackOperationMatchesIssue(
   operation: WritebackOperation,
-  issue: string,
+  issueId: string,
   runs: readonly RunRecord[],
   lifecycles: readonly IssueLifecycleRecord[],
 ): boolean {
-  if (operation.issueId === issue) return true;
+  if (operation.issueId === issueId) return true;
   const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
-  if (run && activityRunMatchesIssue(run, issue)) return true;
+  if (run && activityRunMatchesIssue(run, issueId)) return true;
   return lifecycles.some(
     (lifecycle) =>
-      (lifecycle.issueId === operation.issueId || lifecycle.issueIdentifier === operation.issueId) &&
-      (lifecycle.issueId === issue || lifecycle.issueIdentifier === issue),
+      lifecycle.issueId === issueId &&
+      (lifecycle.issueId === operation.issueId || lifecycle.issueIdentifier === operation.issueId),
   );
 }
 
@@ -7097,6 +7124,7 @@ async function resolveIssueLookupKey(
     snapshot: RuntimeSnapshot;
     lifecycleStore: IssueLifecycleStore | undefined;
     runStore: RunTranscriptStore | undefined;
+    trackerIssues?: readonly Issue[];
   },
 ): Promise<{ issueId: string | null; ambiguousCandidates: IssueLookupCandidate[] }> {
   const [lifecycleRecords, workspaces, runs] = await Promise.all([
@@ -7104,12 +7132,24 @@ async function resolveIssueLookupKey(
     input.runStore?.listWorkspaces() ?? Promise.resolve([]),
     input.runStore?.listRuns() ?? Promise.resolve([]),
   ]);
-  const candidates = dedupeIssueLookupCandidates([
-    ...input.snapshot.running.map(issueLookupCandidateFromRunningRow),
-    ...lifecycleRecords.map(issueLookupCandidateFromLifecycle),
-    ...workspaces.map(issueLookupCandidateFromWorkspace),
-    ...runs.map(issueLookupCandidateFromRun),
-  ].filter((candidate): candidate is IssueLookupCandidate => candidate !== null));
+  return resolveIssueLookupFromCandidates(
+    issueKey,
+    dedupeIssueLookupCandidates(
+      [
+        ...(input.trackerIssues ?? []).map(issueLookupCandidateFromIssue),
+        ...input.snapshot.running.map(issueLookupCandidateFromRunningRow),
+        ...lifecycleRecords.map(issueLookupCandidateFromLifecycle),
+        ...workspaces.map(issueLookupCandidateFromWorkspace),
+        ...runs.map(issueLookupCandidateFromRun),
+      ].filter((candidate): candidate is IssueLookupCandidate => candidate !== null),
+    ),
+  );
+}
+
+function resolveIssueLookupFromCandidates(
+  issueKey: string,
+  candidates: readonly IssueLookupCandidate[],
+): { issueId: string | null; ambiguousCandidates: IssueLookupCandidate[] } {
   const exactIssueIdMatch = candidates.find((candidate) => candidate.issueId === issueKey);
   if (exactIssueIdMatch) return { issueId: exactIssueIdMatch.issueId, ambiguousCandidates: [] };
   const identifierMatches = candidates.filter((candidate) => candidate.issueIdentifier === issueKey);
@@ -7138,6 +7178,14 @@ function issueLookupCandidateFromRunningRow(row: RunningRow): IssueLookupCandida
     issueId: row.issueId,
     issueIdentifier: row.issueIdentifier,
     projectContext: projectContextResolutionFromIssue(row) ?? undefined,
+  });
+}
+
+function issueLookupCandidateFromIssue(issue: Issue): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    projectContext: projectContextResolutionFromIssue(issue) ?? undefined,
   });
 }
 
