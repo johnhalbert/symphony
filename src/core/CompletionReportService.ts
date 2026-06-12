@@ -781,12 +781,13 @@ export class CompletionReportService {
     if (!workspacePath) {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree workspace path");
     }
-    const branchName = resolveServiceOwnedCompletionReportBranchName({
-      workspaceGitBranchName: context.workspace?.gitBranchName ?? null,
-      lifecycleGitBranchName: existingLifecycle?.summaryPointers.gitBranchName ?? null,
-      lifecycleBranchName: existingLifecycle?.summaryPointers.branchName ?? null,
-      issueBranchName: context.issue.branchName,
-    });
+    const branchName =
+      resolveServiceOwnedCompletionReportBranchName({
+        workspaceGitBranchName: context.workspace?.gitBranchName ?? null,
+        lifecycleGitBranchName: existingLifecycle?.summaryPointers.gitBranchName ?? null,
+        lifecycleBranchName: existingLifecycle?.summaryPointers.branchName ?? null,
+        issueBranchName: context.issue.branchName,
+      }) ?? report.branchName ?? null;
     if (!branchName) {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree branch");
     }

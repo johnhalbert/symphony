@@ -6,6 +6,7 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import {
   createRuntimeTrackerClient,
+  createRuntimeWritebackClient,
   createRuntimeWritebackProcessor,
   resolveCursorRuntimeApiKey,
   resolveRuntimeCredential,
@@ -13,6 +14,12 @@ import {
 } from "../src/app/RuntimeDependencies.js";
 
 let root: string;
+const docsProjectContext = {
+  projectContextId: "docs",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
 
 describe("runtime dependency credential wiring", () => {
   beforeEach(async () => {
@@ -33,6 +40,38 @@ describe("runtime dependency credential wiring", () => {
     }).fetchCandidateIssues();
 
     expect(authorizations).toEqual(["linear-tracker-secret"]);
+  });
+
+  it("uses the selected project-context tracker profile and slug for scoped runtime tracker reads", async () => {
+    const config = scopedRuntimeConfig();
+    const seen: Array<{ authorization: string; projectSlug: string | null }> = [];
+
+    await createRuntimeTrackerClient(config, async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { variables?: { projectSlug?: string } };
+      seen.push({
+        authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+        projectSlug: body.variables?.projectSlug ?? null,
+      });
+      return jsonResponse({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
+    }, docsProjectContext).fetchCandidateIssues();
+
+    expect(seen).toEqual([{ authorization: "docs-tracker-secret", projectSlug: "DOCS" }]);
+  });
+
+  it("uses the selected project-context legacy tracker config and slug when no scoped tracker profile exists", async () => {
+    const config = scopedRuntimeConfig({ includeRootTrackerProfile: false, includeDocsTrackerProfile: false });
+    const seen: Array<{ authorization: string; projectSlug: string | null }> = [];
+
+    await createRuntimeTrackerClient(config, async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { variables?: { projectSlug?: string } };
+      seen.push({
+        authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+        projectSlug: body.variables?.projectSlug ?? null,
+      });
+      return jsonResponse({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
+    }, docsProjectContext).fetchCandidateIssues();
+
+    expect(seen).toEqual([{ authorization: "docs-legacy-linear-secret", projectSlug: "DOCS" }]);
   });
 
   it("uses the service linear.writeback profile for runtime writeback processing", async () => {
@@ -69,6 +108,22 @@ describe("runtime dependency credential wiring", () => {
     });
 
     expect(authorizations).toEqual(["linear-writeback-secret", "linear-writeback-secret"]);
+  });
+
+  it("uses the selected project-context writeback profile and slug for scoped runtime writeback clients", async () => {
+    const config = scopedRuntimeConfig();
+    const seen: Array<{ authorization: string; projectSlug: string | null }> = [];
+
+    await createRuntimeWritebackClient(config, async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { variables?: { projectSlug?: string } };
+      seen.push({
+        authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+        projectSlug: body.variables?.projectSlug ?? null,
+      });
+      return jsonResponse({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
+    }, docsProjectContext).fetchCandidateIssues();
+
+    expect(seen).toEqual([{ authorization: "docs-writeback-secret", projectSlug: "DOCS" }]);
   });
 
   it("uses the selected project-context linear.writeback profile for scoped writeback drains", async () => {
@@ -348,6 +403,88 @@ describe("runtime dependency credential wiring", () => {
     expect(() => resolveRuntimeCredential(wrongRole, "worker", "hermes")).toThrow(/runtime\.hermes is owned by worker/);
   });
 });
+
+function scopedRuntimeConfig(
+  options: {
+    includeRootTrackerProfile?: boolean;
+    includeDocsTrackerProfile?: boolean;
+    includeDocsWritebackProfile?: boolean;
+  } = {},
+) {
+  const includeRootTrackerProfile = options.includeRootTrackerProfile ?? true;
+  const includeDocsTrackerProfile = options.includeDocsTrackerProfile ?? true;
+  const includeDocsWritebackProfile = options.includeDocsWritebackProfile ?? true;
+
+  const docsProfiles: Record<string, unknown> = {};
+  const docsWorkerRoles: Record<string, string> = {};
+  const docsServiceRoles: Record<string, string> = {};
+  if (includeDocsTrackerProfile) {
+    docsProfiles["docs-tracker"] = { value: "$DOCS_TRACKER_TOKEN", capabilities: ["linear.tracker"] };
+    docsWorkerRoles["linear.tracker"] = "docs-tracker";
+  }
+  if (includeDocsWritebackProfile) {
+    docsProfiles["docs-writeback"] = { value: "$DOCS_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] };
+    docsServiceRoles["linear.writeback"] = "docs-writeback";
+  }
+
+  return parseServiceConfig(
+    {
+      tracker: { kind: "linear", api_key: "$LEGACY_LINEAR_TOKEN", project_slug: "SYM" },
+      workspace: {
+        root,
+        state_dir: path.join(root, "state"),
+        source: { kind: "copy", path: root },
+      },
+      writeback: { enabled: true, mode: "live" },
+      credential_profiles: {
+        profiles: {
+          ...(includeRootTrackerProfile
+            ? { "linear-tracker": { value: "$LINEAR_TRACKER_TOKEN", capabilities: ["linear.tracker"] } }
+            : {}),
+          "linear-writeback": { value: "$LINEAR_WRITEBACK_TOKEN", capabilities: ["linear.writeback"] },
+        },
+        roles: {
+          ...(includeRootTrackerProfile ? { worker: { "linear.tracker": "linear-tracker" } } : {}),
+          service: { "linear.writeback": "linear-writeback" },
+        },
+      },
+      project_contexts: [
+        {
+          id: "symphony",
+          label: "Symphony",
+          tracker: { project_slug: "SYM" },
+          workspace: { source: { kind: "copy", path: root } },
+        },
+        {
+          id: "docs",
+          label: "Documentation Site",
+          tracker: { api_key: "$DOCS_LEGACY_LINEAR_TOKEN", project_slug: "DOCS" },
+          workspace: { source: { kind: "copy", path: root } },
+          ...(Object.keys(docsProfiles).length === 0
+            ? {}
+            : {
+                credential_profiles: {
+                  profiles: docsProfiles,
+                  roles: {
+                    ...(Object.keys(docsWorkerRoles).length === 0 ? {} : { worker: docsWorkerRoles }),
+                    ...(Object.keys(docsServiceRoles).length === 0 ? {} : { service: docsServiceRoles }),
+                  },
+                },
+              }),
+        },
+      ],
+    },
+    path.join(root, "WORKFLOW.md"),
+    {
+      LEGACY_LINEAR_TOKEN: "legacy-linear-secret",
+      LINEAR_TRACKER_TOKEN: "linear-tracker-secret",
+      LINEAR_WRITEBACK_TOKEN: "linear-writeback-secret",
+      DOCS_LEGACY_LINEAR_TOKEN: "docs-legacy-linear-secret",
+      DOCS_TRACKER_TOKEN: "docs-tracker-secret",
+      DOCS_WRITEBACK_TOKEN: "docs-writeback-secret",
+    },
+  );
+}
 
 function runtimeConfig(
   overrides: {
