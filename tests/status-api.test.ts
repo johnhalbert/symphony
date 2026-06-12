@@ -525,9 +525,9 @@ describe("StatusServer durable API", () => {
       expect(pauseResponse.status).toBe(202);
       expect(continuationSummaryResponse.status).toBe(201);
       expect(continuationSummaryBody.summaryReference).toMatchObject({
-        id: "fake-summary:TEST-1",
+        id: "fake-summary:issue-1",
         transcriptPointers: ["/api/v1/runs/run-1/transcript"],
-        statusApiPointers: ["/api/v1/issues/TEST-1"],
+        statusApiPointers: ["/api/v1/issues/issue-1"],
       });
     } finally {
       await server.stop();
@@ -575,7 +575,7 @@ describe("StatusServer durable API", () => {
       projectContext: docsProjectContext,
       path: path.join(config.workspace.root, "docs__ENG-123"),
       sourceKind: "git_worktree",
-      gitBranchName: docsIssue.branchName ?? undefined,
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
@@ -586,7 +586,7 @@ describe("StatusServer durable API", () => {
       projectContext: symphonyProjectContext,
       path: path.join(config.workspace.root, "symphony__ENG-123"),
       sourceKind: "git_worktree",
-      gitBranchName: symphonyIssue.branchName ?? undefined,
+      ...(symphonyIssue.branchName ? { gitBranchName: symphonyIssue.branchName } : {}),
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:10:00.000Z",
     });
@@ -605,7 +605,7 @@ describe("StatusServer durable API", () => {
       prompt: "docs work",
       workspaceKey: "docs__ENG-123",
       workspacePath: path.join(config.workspace.root, "docs__ENG-123"),
-      gitBranchName: docsIssue.branchName ?? undefined,
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
       repoPath: "/repo/docs",
       baseRef: "origin/main",
     });
@@ -622,7 +622,7 @@ describe("StatusServer durable API", () => {
       prompt: "symphony work",
       workspaceKey: "symphony__ENG-123",
       workspacePath: path.join(config.workspace.root, "symphony__ENG-123"),
-      gitBranchName: symphonyIssue.branchName ?? undefined,
+      ...(symphonyIssue.branchName ? { gitBranchName: symphonyIssue.branchName } : {}),
       repoPath: "/repo/symphony",
       baseRef: "origin/main",
     });
@@ -733,6 +733,261 @@ describe("StatusServer durable API", () => {
     }
   });
 
+
+  it("uses exact issue ids for duplicate-identifier mutation routes and continuation-summary affordances", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-mutations-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-mutations-1",
+      identifier: "ENG-123",
+      state: "Blocked",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-123",
+    });
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "docs__ENG-123",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      path: path.join(config.workspace.root, "docs__ENG-123"),
+      sourceKind: "git_worktree",
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.upsertWorkspace({
+      workspaceKey: "symphony__ENG-123",
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: symphonyProjectContext,
+      path: path.join(config.workspace.root, "symphony__ENG-123"),
+      sourceKind: "git_worktree",
+      ...(symphonyIssue.branchName ? { gitBranchName: symphonyIssue.branchName } : {}),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:10:00.000Z",
+    });
+    await mkdir(path.join(config.workspace.root, "docs__ENG-123"), { recursive: true });
+    await mkdir(path.join(config.workspace.root, "symphony__ENG-123"), { recursive: true });
+    await runStore.startRun({
+      runId: "docs-mutation-run-1",
+      sessionId: "docs-mutation-session-1",
+      agentId: "docs-mutation-agent-1",
+      role: "worker",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs mutation work",
+      workspaceKey: "docs__ENG-123",
+      workspacePath: path.join(config.workspace.root, "docs__ENG-123"),
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+    });
+    await runStore.startRun({
+      runId: "symphony-mutation-run-1",
+      sessionId: "symphony-mutation-session-1",
+      agentId: "symphony-mutation-agent-1",
+      role: "worker",
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: symphonyProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "symphony mutation work",
+      workspaceKey: "symphony__ENG-123",
+      workspacePath: path.join(config.workspace.root, "symphony__ENG-123"),
+      ...(symphonyIssue.branchName ? { gitBranchName: symphonyIssue.branchName } : {}),
+      repoPath: "/repo/symphony",
+      baseRef: "origin/main",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, { phase: "implementation" });
+    await lifecycleStore.ensureIssue(symphonyIssue, { phase: "blocked", blockedReason: "awaiting operator input" });
+
+    const liveDocs = liveRunningFixture(config, docsIssue.identifier, docsIssue.state);
+    liveDocs.issueId = docsIssue.id;
+    liveDocs.issueIdentifier = docsIssue.identifier;
+    liveDocs.runId = "docs-mutation-run-1";
+    liveDocs.sessionId = "docs-mutation-session-1";
+    liveDocs.workspacePath = path.join(config.workspace.root, "docs__ENG-123");
+
+    const pauseCalls: string[] = [];
+    const resumeCalls: string[] = [];
+    const cancelCalls: string[] = [];
+    const continuationSummaryCalls: string[] = [];
+    const orchestrator = Object.assign(fakeOrchestrator([liveDocs], { paused: [symphonyIssue.id] }), {
+      pauseIssue(issueId: string) {
+        pauseCalls.push(issueId);
+      },
+      resumeIssue(issueId: string) {
+        resumeCalls.push(issueId);
+      },
+      async cancelIssue(issueId: string) {
+        cancelCalls.push(issueId);
+      },
+      async createContinuationSummary(issueId: string) {
+        continuationSummaryCalls.push(issueId);
+        return {
+          summaryReference: {
+            id: `fake-summary:${issueId}`,
+            kind: "continuation_history",
+            summary: "exact summary",
+            runIds: ["docs-mutation-run-1"],
+            transcriptEventCount: 1,
+            transcriptPointers: ["/api/v1/runs/docs-mutation-run-1/transcript"],
+            statusApiPointers: [`/api/v1/issues/${issueId}`],
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+          lifecycle: { summaryReferences: [] },
+        };
+      },
+    }) as Orchestrator;
+
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      tracker: new FakeTracker([docsIssue, symphonyIssue]),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
+      const boardDetailResponse = await fetch(`${baseUrl}/api/v1/board/issues/${encodeURIComponent(docsIssue.id)}`);
+      const ambiguousPauseResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousResumeResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/resume`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousCancelResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/cancel`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousSummaryResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/continuation-summary`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const pauseResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const resumeResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}/resume`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const cancelResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}/cancel`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const summaryResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}/continuation-summary`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+
+      const stateBody = (await stateResponse.json()) as {
+        operatorView: {
+          running: Array<{ continuationSummary: { available: boolean; path: string } }>;
+          paused: Array<{ issueId: string; continuationSummary: { available: boolean; path: string } }>;
+        };
+      };
+      const boardDetailBody = (await boardDetailResponse.json()) as {
+        issue: string;
+        boardCard: { capabilities: { detail: string } } | null;
+        capabilities: { continuationSummary: { available: boolean; path: string } };
+      };
+      const ambiguousPauseBody = (await ambiguousPauseResponse.json()) as { error: { code: string } };
+      const ambiguousResumeBody = (await ambiguousResumeResponse.json()) as { error: { code: string } };
+      const ambiguousCancelBody = (await ambiguousCancelResponse.json()) as { error: { code: string } };
+      const ambiguousSummaryBody = (await ambiguousSummaryResponse.json()) as { error: { code: string } };
+      const summaryBody = (await summaryResponse.json()) as {
+        issue: string;
+        summaryReference: { id: string; statusApiPointers: string[] };
+      };
+
+      expect(stateResponse.status).toBe(200);
+      expect(stateBody.operatorView.running[0]?.continuationSummary).toMatchObject({
+        available: true,
+        path: `/api/v1/issues/${docsIssue.id}/continuation-summary`,
+      });
+      expect(stateBody.operatorView.paused.find((item) => item.issueId === symphonyIssue.id)?.continuationSummary).toMatchObject({
+        available: true,
+        path: `/api/v1/issues/${symphonyIssue.id}/continuation-summary`,
+      });
+      expect(JSON.stringify(stateBody)).not.toContain(`/api/v1/issues/${docsIssue.identifier}/continuation-summary`);
+
+      expect(boardDetailResponse.status).toBe(200);
+      expect(boardDetailBody.issue).toBe(docsIssue.id);
+      expect(boardDetailBody.capabilities.continuationSummary).toMatchObject({
+        available: true,
+        path: `/api/v1/issues/${docsIssue.id}/continuation-summary`,
+      });
+      expect(boardDetailBody.boardCard?.capabilities.detail).toBe(`/api/v1/board/issues/${docsIssue.id}`);
+
+      for (const response of [ambiguousPauseResponse, ambiguousResumeResponse, ambiguousCancelResponse, ambiguousSummaryResponse]) {
+        expect(response.status).toBe(409);
+      }
+      expect(ambiguousPauseBody.error.code).toBe("conflict");
+      expect(ambiguousResumeBody.error.code).toBe("conflict");
+      expect(ambiguousCancelBody.error.code).toBe("conflict");
+      expect(ambiguousSummaryBody.error.code).toBe("conflict");
+      expect(pauseResponse.status).toBe(202);
+      expect(resumeResponse.status).toBe(202);
+      expect(cancelResponse.status).toBe(202);
+      expect(summaryResponse.status).toBe(201);
+      expect(pauseCalls).toEqual([docsIssue.id]);
+      expect(resumeCalls).toEqual([docsIssue.id]);
+      expect(cancelCalls).toEqual([docsIssue.id]);
+      expect(continuationSummaryCalls).toEqual([docsIssue.id]);
+      expect(summaryBody).toMatchObject({
+        issue: docsIssue.id,
+        summaryReference: {
+          id: `fake-summary:${docsIssue.id}`,
+          statusApiPointers: [`/api/v1/issues/${docsIssue.id}`],
+        },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
 
   it("surfaces legacy/default project context attribution across durable status records", async () => {
     const config = testConfig(path.join(root, "workspaces"));
@@ -4179,7 +4434,7 @@ describe("StatusServer durable API", () => {
       expect(issueBody.operatorLiveness).toMatchObject({ status: "blocked_human_required" });
       expect(issueBody.capabilities).toMatchObject({
         humanRequired: { active: true, reason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)" },
-        continuationSummary: { available: true, path: "/api/v1/issues/TEST-4/continuation-summary" },
+        continuationSummary: { available: true, path: "/api/v1/issues/issue-4/continuation-summary" },
       });
       expect(runsResponse.status).toBe(200);
       expect(runDetailResponse.status).toBe(200);
@@ -4404,7 +4659,7 @@ describe("StatusServer durable API", () => {
       expect(html).toContain("issue-paused");
       expect(html).toContain("TEST-PAUSED");
       expect(html).toContain("controls: resume");
-      expect(html).toContain("continuation-summary POST /api/v1/issues/TEST-PAUSED/continuation-summary");
+      expect(html).toContain("continuation-summary POST /api/v1/issues/issue-paused/continuation-summary");
       expect(html).toContain("Merge conflict:");
       expect(html).toContain("state=Approved with Conflicts");
       expect(html).toContain("attempts=3/3");
@@ -4423,7 +4678,7 @@ describe("StatusServer durable API", () => {
           blockers: { available: false, humanBlockedReason: "paused needs operator" },
         },
         humanRequired: { active: true, reason: "paused needs operator" },
-        continuationSummary: { available: true, path: "/api/v1/issues/TEST-PAUSED/continuation-summary" },
+        continuationSummary: { available: true, path: "/api/v1/issues/issue-paused/continuation-summary" },
       });
       const blocked = stateBody.operatorView.running.find((row) => row.issueIdentifier === "TEST-BLOCKED");
       const rawBlocked = stateBody.running.find((row) => row.issueIdentifier === "TEST-BLOCKED");
@@ -4450,7 +4705,7 @@ describe("StatusServer durable API", () => {
           blockedReason: "needs operator",
         },
         humanRequired: { active: true, reason: "needs operator" },
-        continuationSummary: { available: true, path: "/api/v1/issues/TEST-BLOCKED/continuation-summary" },
+        continuationSummary: { available: true, path: "/api/v1/issues/issue-blocked/continuation-summary" },
       });
     } finally {
       await server.stop();
@@ -4903,7 +5158,7 @@ function fakeOrchestrator(
           runIds: ["run-1"],
           transcriptEventCount: 1,
           transcriptPointers: ["/api/v1/runs/run-1/transcript"],
-          statusApiPointers: ["/api/v1/issues/TEST-1"],
+          statusApiPointers: [`/api/v1/issues/${issueId}`],
           createdAt: "2026-01-01T00:00:00Z",
         },
         lifecycle: {

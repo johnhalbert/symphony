@@ -408,7 +408,7 @@ export class WorkspaceManager {
         : defaultBranchNameForIssue(issue));
     const trimmed = String(branchName).trim();
     if (trimmed.length === 0) throw new SymphonyError("workspace_error", "Resolved git branch name is empty");
-    return trimmed;
+    return scopeBranchNameToProjectContext(trimmed, issue);
   }
 
   private async assertExistingWorktree(workspaceKey: string, workspacePath: string): Promise<void> {
@@ -431,7 +431,12 @@ export interface WorkspaceIssue {
   projectContext: ProjectContextResolution | null;
 }
 
-export type WorkspaceIssueInput = Pick<Issue, "id" | "identifier" | "branchName"> & Record<string, unknown>;
+export interface WorkspaceIssueInput {
+  id: string | null;
+  identifier: string;
+  branchName: string | null;
+  projectContext?: ProjectContextResolution | null;
+}
 
 function normalizeIssueInput(input: WorkspaceIssueInput): WorkspaceIssue {
   return {
@@ -461,6 +466,38 @@ function defaultBranchNameForIssue(issue: WorkspaceIssue): string {
     return `symphony/${projectContextId}/${issue.identifier}`;
   }
   return `symphony/${issue.identifier}`;
+}
+
+function scopeBranchNameToProjectContext(branchName: string, issue: WorkspaceIssue): string {
+  const projectContextId = issue.projectContext?.projectContextId;
+  if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return branchName;
+
+  const contextPart = sanitizeGitBranchPart(projectContextId);
+  const branchParts = branchName.split("/").filter((part) => part.length > 0);
+  const identifierParts = issue.identifier.split("/").filter((part) => part.length > 0);
+  const unscopedDefaultParts = ["symphony", ...identifierParts];
+  const matchesUnscopedDefault =
+    branchParts.length === unscopedDefaultParts.length && branchParts.every((part, index) => part === unscopedDefaultParts[index]);
+  const identifierIndex = findBranchPartSequence(branchParts, identifierParts);
+  if (identifierIndex >= 0) {
+    if (!matchesUnscopedDefault && identifierIndex > 0 && branchParts[identifierIndex - 1] === contextPart) return branchName;
+    return [...branchParts.slice(0, identifierIndex), contextPart, ...branchParts.slice(identifierIndex)].join("/");
+  }
+
+  return [...branchParts, contextPart].join("/");
+}
+
+function sanitizeGitBranchPart(value: string): string {
+  const sanitized = value.trim().replace(/[^A-Za-z0-9._-]/g, "_");
+  return sanitized.length > 0 ? sanitized : "context";
+}
+
+function findBranchPartSequence(parts: readonly string[], sequence: readonly string[]): number {
+  if (sequence.length === 0 || parts.length < sequence.length) return -1;
+  for (let start = 0; start <= parts.length - sequence.length; start += 1) {
+    if (sequence.every((part, index) => parts[start + index] === part)) return start;
+  }
+  return -1;
 }
 
 export function sanitizeWorkspaceKey(identifier: string): string {

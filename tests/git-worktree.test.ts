@@ -94,6 +94,84 @@ describe("git worktree workspace source", () => {
     });
   });
 
+  it("scopes identical upstream branch names by project context and cleans up only the targeted sibling", async () => {
+    const manager = newManager(root, repo);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-2",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-2",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/ENG-123",
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(symphonyWorkspace.workspaceKey).toBe("symphony__ENG-123");
+    expect(docsWorkspace.gitBranchName).toBe("symphony/docs/ENG-123");
+    expect(symphonyWorkspace.gitBranchName).toBe("symphony/symphony/ENG-123");
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
+    expect((await git(["branch", "--show-current"], symphonyWorkspace.path)).trim()).toBe("symphony/symphony/ENG-123");
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(symphonyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      gitBranchName: "symphony/symphony/ENG-123",
+      projectContext: { projectContextId: "symphony" },
+    });
+  });
+
+  it("scopes identifier-only fallback branches by project context and cleans up only the targeted sibling", async () => {
+    const manager = newManager(root, repo);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-3",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-3",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: null,
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(symphonyWorkspace.workspaceKey).toBe("symphony__ENG-123");
+    expect(docsWorkspace.gitBranchName).toBe("symphony/docs/ENG-123");
+    expect(symphonyWorkspace.gitBranchName).toBe("symphony/symphony/ENG-123");
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
+    expect((await git(["branch", "--show-current"], symphonyWorkspace.path)).trim()).toBe("symphony/symphony/ENG-123");
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(symphonyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      gitBranchName: "symphony/symphony/ENG-123",
+      projectContext: { projectContextId: "symphony" },
+    });
+  });
+
   it("refuses to remove dirty worktrees by default", async () => {
     const manager = newManager(root, repo);
     const dirtyIssue = issue({ identifier: "TEST-3", branchName: "symphony/TEST-3" });

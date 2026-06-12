@@ -1702,10 +1702,11 @@ export class Orchestrator {
 
   private async runWorker(entry: RunningEntry, attempt: number | null): Promise<void> {
     let workspace: Workspace | null = null;
+    let workspaceIssue = issueWithProjectContext(entry.issue, null);
     try {
       entry.lifecycle ??= await this.options.lifecycleStore?.get(entry.issue.id) ?? null;
-      const resolvedProjectContext =
-        entry.runPhase === "issue_breakdown" ? null : await this.resolveWorkerProjectContext(entry);
+      const resolvedProjectContext = await this.resolveWorkerProjectContext(entry);
+      workspaceIssue = issueWithProjectContext(entry.issue, resolvedProjectContext);
       if (
         entry.runPhase !== "issue_breakdown" &&
         entry.lifecycle !== null &&
@@ -1715,14 +1716,17 @@ export class Orchestrator {
       }
       workspace =
         entry.runPhase === "issue_breakdown"
-          ? await this.options.workspaceManager.createForPlanning(entry.issue)
-          : await this.options.workspaceManager.createForIssue(entry.issue);
+          ? await this.options.workspaceManager.createForPlanning(workspaceIssue)
+          : await this.options.workspaceManager.createForIssue(workspaceIssue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
       await this.updateLifecycle(
         entry,
         entry.runPhase === "issue_breakdown"
-          ? { phase: phaseForIssueState(entry.issue.state, this.config) }
+          ? {
+              phase: phaseForIssueState(entry.issue.state, this.config),
+              ...(resolvedProjectContext === null ? {} : { projectContext: resolvedProjectContext }),
+            }
           : {
               phase: phaseForIssueState(entry.issue.state, this.config),
               ...(resolvedProjectContext === null ? {} : { projectContext: resolvedProjectContext }),
@@ -1801,13 +1805,12 @@ export class Orchestrator {
         if (entry.runPhase !== "issue_breakdown") {
           await this.options.workspaceManager.afterRun(workspace.path);
         } else {
-          await this.options.workspaceManager.removeForPlanning(entry.issue);
+          await this.options.workspaceManager.removeForPlanning(workspaceIssue);
         }
-        if (entry.cleanupWorkspaceOnExit) await this.options.workspaceManager.removeForIssue(entry.issue);
+        if (entry.cleanupWorkspaceOnExit) await this.options.workspaceManager.removeForIssue(workspaceIssue);
       }
     }
   }
-
   private async runReviewer(entry: RunningEntry): Promise<void> {
     let workspace: Workspace | null = null;
     try {
@@ -1820,7 +1823,9 @@ export class Orchestrator {
         return;
       }
       entry.lifecycle = evidence.lifecycle;
-      workspace = await this.options.workspaceManager.createForIssue(entry.issue);
+      workspace = await this.options.workspaceManager.createForIssue(
+        issueWithProjectContext(entry.issue, this.resolvedProjectContext(entry) ?? null),
+      );
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
       await this.updateLifecycle(entry, {
@@ -4099,6 +4104,15 @@ function projectContextLookupOptions(projectContext: ProjectContextResolution | 
   | { projectContext: ProjectContextResolution }
   | {} {
   return projectContext ? { projectContext } : {};
+}
+
+function issueWithProjectContext(issue: Issue, projectContext: ProjectContextResolution | null | undefined) {
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    branchName: issue.branchName,
+    ...(projectContext ? { projectContext } : {}),
+  };
 }
 
 async function readContinuationTranscriptEvents(

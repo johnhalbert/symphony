@@ -1018,8 +1018,15 @@ export class StatusServer {
       if (request.method === "POST" && pauseMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(pauseMatch[1] ?? "");
-        this.options.orchestrator.pauseIssue(issueId);
-        sendJson(response, 202, { paused: true, issue: issueId });
+        const lookup = await resolveIssueLookupKey(issueId, {
+          snapshot: this.options.orchestrator.snapshot(),
+          lifecycleStore: this.options.lifecycleStore,
+          runStore: this.options.runStore,
+        });
+        if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+        const lookupIssueId = lookup.issueId ?? issueId;
+        this.options.orchestrator.pauseIssue(lookupIssueId);
+        sendJson(response, 202, { paused: true, issue: lookupIssueId });
         return;
       }
 
@@ -1027,8 +1034,15 @@ export class StatusServer {
       if (request.method === "POST" && resumeMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(resumeMatch[1] ?? "");
-        this.options.orchestrator.resumeIssue(issueId);
-        sendJson(response, 202, { paused: false, issue: issueId });
+        const lookup = await resolveIssueLookupKey(issueId, {
+          snapshot: this.options.orchestrator.snapshot(),
+          lifecycleStore: this.options.lifecycleStore,
+          runStore: this.options.runStore,
+        });
+        if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+        const lookupIssueId = lookup.issueId ?? issueId;
+        this.options.orchestrator.resumeIssue(lookupIssueId);
+        sendJson(response, 202, { paused: false, issue: lookupIssueId });
         return;
       }
 
@@ -1036,8 +1050,15 @@ export class StatusServer {
       if (request.method === "POST" && cancelMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(cancelMatch[1] ?? "");
-        await this.options.orchestrator.cancelIssue(issueId);
-        sendJson(response, 202, { cancelled: true, issue: issueId });
+        const lookup = await resolveIssueLookupKey(issueId, {
+          snapshot: this.options.orchestrator.snapshot(),
+          lifecycleStore: this.options.lifecycleStore,
+          runStore: this.options.runStore,
+        });
+        if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+        const lookupIssueId = lookup.issueId ?? issueId;
+        await this.options.orchestrator.cancelIssue(lookupIssueId);
+        sendJson(response, 202, { cancelled: true, issue: lookupIssueId });
         return;
       }
 
@@ -1086,9 +1107,9 @@ export class StatusServer {
           })),
         );
         sendJson(response, 200, {
-          issue: issueId,
+          issue: lookupIssueId,
           issueDetails: buildIssueDetailsEnvelope({
-            requestKey: issueId,
+            requestKey: lookupIssueId,
             generatedAt: snapshot.generatedAt,
             trackerStateLists: this.options.trackerStateLists,
             staleThresholdMs: this.options.staleThresholdMs,
@@ -1116,9 +1137,16 @@ export class StatusServer {
       if (request.method === "POST" && continuationSummaryMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(continuationSummaryMatch[1] ?? "");
-        const result = await this.options.orchestrator.createContinuationSummary(issueId);
+        const lookup = await resolveIssueLookupKey(issueId, {
+          snapshot: this.options.orchestrator.snapshot(),
+          lifecycleStore: this.options.lifecycleStore,
+          runStore: this.options.runStore,
+        });
+        if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+        const lookupIssueId = lookup.issueId ?? issueId;
+        const result = await this.options.orchestrator.createContinuationSummary(lookupIssueId);
         sendJson(response, 201, {
-          issue: issueId,
+          issue: lookupIssueId,
           summaryReference: result.summaryReference,
           lifecycle: result.lifecycle,
         });
@@ -1179,7 +1207,7 @@ export class StatusServer {
         });
         if (!live && !workspace && !latestRun && !lifecycle) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
-        const keys = issueKeys(issueId, { live, latestRun, lifecycle });
+        const keys = issueKeys(lookupIssueId, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
         const issueProjectContext = lifecycle?.projectContext ?? workspace?.projectContext ?? projectContextResolutionFromIssue(live) ?? latestRun?.projectContext;
@@ -1201,16 +1229,17 @@ export class StatusServer {
         });
         const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: Boolean(this.options.openWorkspaceToken) });
         const affordances = operatorAffordances({
-          issueKey: issueId,
+          issueKey: lookupIssueId,
           lifecycle,
           continuationSummaryAvailable: Boolean(this.options.lifecycleStore && this.options.runStore),
           mutationsRequireToken: controls.mutationsRequireToken,
         });
         sendJson(response, 200, {
-          issue: issueId,
+          issue: lookupIssueId,
           issueDetails: buildIssueDetailsEnvelope({
-            requestKey: issueId,
+            requestKey: lookupIssueId,
             generatedAt: snapshot.generatedAt,
+
             trackerStateLists: this.options.trackerStateLists,
             staleThresholdMs: this.options.staleThresholdMs,
             live,
@@ -4987,7 +5016,7 @@ async function buildBoardIssueDetail(input: {
   const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
   if (!input.card && !live && !workspace && !latestRun && !lifecycle) return null;
 
-  const issueKey = input.card?.issueIdentifier ?? input.card?.issueId ?? input.requestKey;
+  const issueKey = input.card?.issueId ?? input.card?.issueIdentifier ?? input.requestKey;
   const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore, input.sourceIndex.runs);
   const runs = runsByKeys(input.sourceIndex, keys);
   const enrichedRuns = await Promise.all(
@@ -5000,7 +5029,7 @@ async function buildBoardIssueDetail(input: {
   const issueDetails =
     input.card?.issueDetails ??
     buildIssueDetailsEnvelope({
-      requestKey: input.requestKey,
+      requestKey: issueKey,
       generatedAt: snapshot.generatedAt,
       trackerStateLists: input.trackerStateLists,
       staleThresholdMs: input.staleThresholdMs,
@@ -5031,7 +5060,7 @@ async function buildBoardIssueDetail(input: {
   const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
   const metadata = statusMetadata({ live, workspace, latestRun, lifecycle });
   return {
-    issue: input.requestKey,
+    issue: issueKey,
     boardCard: input.card ? acceptedBoardCard(input.card) : null,
     issueDetails,
     live: live ? liveIssueResponse(live, operatorLiveness) : null,
@@ -5505,7 +5534,7 @@ async function buildBoardCard(input: {
   runIndex?: BuiltWebProjectionSourceIndex["runs"];
   continuationSummaryAvailable: boolean;
 }): Promise<IssueBoardCard> {
-  const issueKey = input.issueDetails.issue.identifier ?? input.issueDetails.issue.id ?? input.key;
+  const issueKey = input.issueDetails.issue.id ?? input.issueDetails.issue.identifier ?? input.key;
   const lifecycle = sanitizeStatusLifecycle({
     live: input.live,
     workspace: input.workspace,
@@ -5855,7 +5884,7 @@ function renderRunningRow(
   const operator = runningOperatorLiveness(row, paused, row.lifecycle, agentId);
   const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
   const affordances = operatorAffordances({
-    issueKey: row.issueIdentifier,
+    issueKey: row.issueId,
     lifecycle: row.lifecycle,
     continuationSummaryAvailable,
     mutationsRequireToken: controls.mutationsRequireToken,
@@ -5918,7 +5947,7 @@ async function operatorSnapshotView(
       const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
       const mergeConflict = mergeConflictOperatorSummary(row.lifecycle?.mergeConflict ?? null);
       const affordances = operatorAffordances({
-        issueKey: row.issueIdentifier,
+        issueKey: row.issueId,
         lifecycle: row.lifecycle,
         continuationSummaryAvailable: Boolean(lifecycleStore && runStore),
         mutationsRequireToken: controls.mutationsRequireToken,
@@ -5934,7 +5963,7 @@ async function operatorSnapshotView(
         workspacePath: row.workspacePath,
         paused,
         issueDetails: buildIssueDetailsEnvelope({
-          requestKey: row.issueIdentifier,
+          requestKey: row.issueId,
           generatedAt: snapshot.generatedAt,
           trackerStateLists,
           staleThresholdMs,
@@ -6113,7 +6142,7 @@ async function pausedOperatorViews(
         paused: true,
         controls,
         issueDetails: buildIssueDetailsEnvelope({
-          requestKey: pausedKey,
+          requestKey: lifecycle?.issueId ?? workspace?.issueId ?? latestRun?.issueId ?? pausedKey,
           generatedAt,
           trackerStateLists,
           staleThresholdMs,
@@ -6124,7 +6153,7 @@ async function pausedOperatorViews(
           lifecycle,
         }),
         ...operatorAffordances({
-          issueKey: issueIdentifier,
+          issueKey: lifecycle?.issueId ?? workspace?.issueId ?? latestRun?.issueId ?? pausedKey,
           lifecycle,
           continuationSummaryAvailable: Boolean(lifecycleStore && runStore),
           mutationsRequireToken: controls.mutationsRequireToken,
@@ -7066,8 +7095,8 @@ async function resolveIssueLookupKey(
   issueKey: string,
   input: {
     snapshot: RuntimeSnapshot;
-    lifecycleStore?: IssueLifecycleStore;
-    runStore?: RunTranscriptStore;
+    lifecycleStore: IssueLifecycleStore | undefined;
+    runStore: RunTranscriptStore | undefined;
   },
 ): Promise<{ issueId: string | null; ambiguousCandidates: IssueLookupCandidate[] }> {
   const [lifecycleRecords, workspaces, runs] = await Promise.all([
