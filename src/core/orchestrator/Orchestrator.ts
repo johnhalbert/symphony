@@ -277,6 +277,7 @@ export interface RuntimeSnapshot {
     runPhase: AgentRunPhase;
     runKind: AgentRunKind;
     state: string;
+    projectContext?: ProjectContextResolution | undefined;
     workspacePath: string | null;
     sessionId: string | null;
     runId: string | null;
@@ -1077,29 +1078,33 @@ export class Orchestrator {
         manual: this.activeProviderGates.filter((gate) => gate.resumePolicy === "manual").length,
         autoResume: this.activeProviderGates.filter((gate) => gate.resumePolicy === "auto_at_window_close").length,
       },
-      running: [...this.running.entries()].map(([issueId, entry]) => ({
-        issueId,
-        issueIdentifier: entry.issue.identifier,
-        role: entry.role,
-        runPhase: entry.runPhase,
-        runKind: runKindForPhase(entry.runPhase),
-        state: entry.issue.state,
-        workspacePath: entry.workspacePath,
-        sessionId: entry.sessionId,
-        runId: entry.runId,
-        turnCount: entry.turnCount,
-        lastEvent: entry.lastEvent,
-        lastMessage: entry.lastMessage,
-        startedAt: entry.startedAt.toISOString(),
-        lastEventAt: entry.lastEventAt?.toISOString() ?? null,
-        liveness: this.livenessForEntry(entry, now),
-        cancellation: cancellationForEntry(entry),
-        activity: activityForEntry(entry),
-        tokens: entry.tokens,
-        lifecycle: entry.lifecycle,
-        metadata: metadataForRunningEntry(entry),
-        issueDetails: toIssueStatusView(entry.issue),
-      })),
+      running: [...this.running.entries()].map(([issueId, entry]) => {
+        const projectContext = this.resolvedProjectContext(entry);
+        return {
+          issueId,
+          issueIdentifier: entry.issue.identifier,
+          role: entry.role,
+          runPhase: entry.runPhase,
+          runKind: runKindForPhase(entry.runPhase),
+          state: entry.issue.state,
+          ...(projectContext === undefined ? {} : { projectContext }),
+          workspacePath: entry.workspacePath,
+          sessionId: entry.sessionId,
+          runId: entry.runId,
+          turnCount: entry.turnCount,
+          lastEvent: entry.lastEvent,
+          lastMessage: entry.lastMessage,
+          startedAt: entry.startedAt.toISOString(),
+          lastEventAt: entry.lastEventAt?.toISOString() ?? null,
+          liveness: this.livenessForEntry(entry, now),
+          cancellation: cancellationForEntry(entry),
+          activity: activityForEntry(entry),
+          tokens: entry.tokens,
+          lifecycle: entry.lifecycle,
+          metadata: metadataForRunningEntry(entry),
+          issueDetails: toIssueStatusView(entry.issue),
+        };
+      }),
       retrying: [...this.retryAttempts.values()].map((entry) => ({
         issueId: entry.issueId,
         issueIdentifier: entry.identifier,
