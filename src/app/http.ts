@@ -1133,8 +1133,29 @@ export class StatusServer {
       const continuationSummaryMatch = /^\/api\/v1\/issues\/([^/]+)\/continuation-summary$/.exec(url.pathname);
       if (request.method === "POST" && continuationSummaryMatch) {
         this.requireMutationToken(request);
-        const issueId = decodeURIComponent(continuationSummaryMatch[1] ?? "");
-        const result = await this.options.orchestrator.createContinuationSummary(issueId);
+        const issueId = decodeURIComponent(continuationSummaryMatch[1] ?? "").trim();
+        let continuationSummaryIssueId = issueId;
+        if (this.options.lifecycleStore || this.options.runStore) {
+          const resolvedIssue = await resolveIssueAliasData({
+            requestKey: issueId,
+            snapshot: this.options.orchestrator.snapshot(),
+            runStore: this.options.runStore,
+            lifecycleStore: this.options.lifecycleStore,
+            defaultProjectContextId: this.options.defaultProjectContextId,
+          });
+          if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+            throw statusAliasResolutionError("Issue", issueId, resolvedIssue.status);
+          }
+          if (resolvedIssue.status === "resolved") {
+            continuationSummaryIssueId =
+              resolvedIssue.lifecycle?.issueId ??
+              resolvedIssue.latestRun?.issueId ??
+              resolvedIssue.workspace?.issueId ??
+              resolvedIssue.live?.issueId ??
+              continuationSummaryIssueId;
+          }
+        }
+        const result = await this.options.orchestrator.createContinuationSummary(continuationSummaryIssueId);
         sendJson(response, 201, {
           issue: issueId,
           summaryReference: result.summaryReference,
@@ -1221,7 +1242,7 @@ export class StatusServer {
         });
         const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: Boolean(this.options.openWorkspaceToken) });
         const affordances = operatorAffordances({
-          issueKey: resolvedIssue.requestKey,
+          issueKey: issueId,
           lifecycle,
           continuationSummaryAvailable: Boolean(this.options.lifecycleStore && this.options.runStore),
           mutationsRequireToken: controls.mutationsRequireToken,

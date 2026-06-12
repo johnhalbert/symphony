@@ -531,7 +531,7 @@ describe("StatusServer durable API", () => {
       expect(pauseResponse.status).toBe(202);
       expect(continuationSummaryResponse.status).toBe(201);
       expect(continuationSummaryBody.summaryReference).toMatchObject({
-        id: "fake-summary:TEST-1",
+        id: "fake-summary:issue-1",
         transcriptPointers: ["/api/v1/runs/run-1/transcript"],
         statusApiPointers: ["/api/v1/issues/TEST-1"],
       });
@@ -1212,23 +1212,38 @@ describe("StatusServer durable API", () => {
         workspace: { workspaceKey: string; projectContext?: { projectContextId: string } } | null;
         latestRun: { projectContext?: { projectContextId: string } } | null;
         lifecycle: { projectContext?: { projectContextId: string } } | null;
+        capabilities: { continuationSummary: { path: string } };
       };
       const workspaceBody = (await workspaceResponse.json()) as {
         workspaceKey: string;
         projectContext?: { projectContextId: string };
       };
+      const continuationSummaryResponse = await fetch(`${baseUrl}${issueBody.capabilities.continuationSummary.path}`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const continuationSummaryBody = (await continuationSummaryResponse.json()) as {
+        issue: string;
+        summaryReference: { id: string };
+      };
 
       expect(issueResponse.status).toBe(200);
       expect(workspaceResponse.status).toBe(200);
+      expect(continuationSummaryResponse.status).toBe(201);
       expect(issueBody.workspace).toMatchObject({
         workspaceKey: "ENG-179",
         projectContext: { projectContextId: "docs" },
       });
       expect(issueBody.latestRun?.projectContext).toMatchObject({ projectContextId: "docs" });
       expect(issueBody.lifecycle?.projectContext).toMatchObject({ projectContextId: "docs" });
+      expect(issueBody.capabilities.continuationSummary.path).toBe("/api/v1/issues/docs%3AENG-179/continuation-summary");
       expect(workspaceBody).toMatchObject({
         workspaceKey: "ENG-179",
         projectContext: { projectContextId: "docs" },
+      });
+      expect(continuationSummaryBody).toMatchObject({
+        issue: "docs:ENG-179",
+        summaryReference: { id: "fake-summary:issue-docs-workspace-context-1" },
       });
     } finally {
       await server.stop();
@@ -1360,20 +1375,27 @@ describe("StatusServer durable API", () => {
       const runsResponse = await fetch(`${baseUrl}/api/v1/issues/AMBIGUOUS-ALIAS-1/runs`);
       const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/AMBIGUOUS-ALIAS-1`);
       const transcriptResponse = await fetch(`${baseUrl}/api/v1/runs/AMBIGUOUS-ALIAS-1/transcript?limit=10`);
+      const continuationSummaryResponse = await fetch(`${baseUrl}/api/v1/issues/AMBIGUOUS-ALIAS-1/continuation-summary`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
 
       const issueBody = (await issueResponse.json()) as { error: { message: string } };
       const runsBody = (await runsResponse.json()) as { error: { message: string } };
       const workspaceBody = (await workspaceResponse.json()) as { error: { message: string } };
       const transcriptBody = (await transcriptResponse.json()) as { error: { message: string } };
+      const continuationSummaryBody = (await continuationSummaryResponse.json()) as { error: { message: string } };
 
       expect(issueResponse.status).toBe(404);
       expect(runsResponse.status).toBe(404);
       expect(workspaceResponse.status).toBe(404);
       expect(transcriptResponse.status).toBe(404);
+      expect(continuationSummaryResponse.status).toBe(404);
       expect(issueBody.error.message).toContain("context-qualified alias");
       expect(runsBody.error.message).toContain("context-qualified alias");
       expect(workspaceBody.error.message).toContain("context-qualified alias");
       expect(transcriptBody.error.message).toContain("context-qualified alias");
+      expect(continuationSummaryBody.error.message).toContain("context-qualified alias");
     } finally {
       await server.stop();
     }
