@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   analyzeIssueContractDescription,
@@ -210,4 +211,84 @@ describe("IssueContractLint", () => {
     expect(analysis.remainingBlocker).toBe("Manual operator-authored update required for the protected workflow file.");
     expect(hasMeaningfulRemainingBlocker(analysis.remainingBlocker)).toBe(true);
   });
+
+  it("keeps the ENG-371 public metadata child contract examples lint-clean with stable requirement ids", () => {
+    const examples = eng371ContractExamples();
+
+    expect(examples.map((example) => example.title)).toEqual([
+      "Example A — Redaction parity child issue",
+      "Example B — Repository ambiguity child issue",
+      "Example C — Merge-gate closure child issue",
+      "Example D — Validation evidence follow-up (protected docs)",
+    ]);
+
+    const protectedPaths = ["WORKFLOW.md", "docs/dogfood-runbook.md", "src/core/workflow/**", "hermes/src/**"];
+    for (const example of examples) {
+      const analysis = analyzeIssueContractDescription(example.description, protectedPaths);
+      expect(analysis.missingSections, example.title).toEqual([]);
+      expect(analysis.issueContractErrors, example.title).toEqual([]);
+
+      const requirementIds = extractIssueContractRequirementIds(example.description);
+      expect(requirementIds.length, example.title).toBeGreaterThan(0);
+      expect(new Set(requirementIds).size, example.title).toBe(requirementIds.length);
+      for (const requirementId of requirementIds) {
+        expect(requirementId, example.title).toMatch(/^REQ-ENG371-[A-Z-]+-001$/);
+      }
+    }
+  });
+
+  it("keeps the ENG-371 validation-evidence example manual-only for protected docs", () => {
+    const example = eng371ContractExamples().find(
+      (candidate) => candidate.title === "Example D — Validation evidence follow-up (protected docs)",
+    );
+    expect(example).toBeDefined();
+
+    const analysis = analyzeIssueContractDescription(example?.description ?? "", ["docs/dogfood-runbook.md"]);
+    expect(analysis.protectedSurfaceMatches).toEqual(["docs/dogfood-runbook.md"]);
+    expect(analysis.readyForDogfoodReady).toBe(false);
+    expect(analysis.remainingBlocker).toBe(
+      "Manual operator-authored update required for the protected workflow documentation in docs/dogfood-runbook.md.",
+    );
+    expect(hasMeaningfulRemainingBlocker(analysis.remainingBlocker)).toBe(true);
+  });
+
+  it("documents the ENG-371 promotion evidence packet and vendored-Hermes no-touch checks", () => {
+    const quickstart = eng371Quickstart();
+
+    expect(quickstart).toContain("npm test -- tests/issue-contract-lint.test.ts");
+    expect(quickstart).toContain("git diff --name-only origin/main...HEAD -- hermes/upstream-src");
+    expect(quickstart).toContain("git status --short -- hermes/upstream-src");
+    expect(quickstart).toContain("/api/v1/issues/<issue-identifier>");
+    expect(quickstart).toContain("/api/v1/runs/<handoffWorkerRunId>");
+    expect(quickstart).toContain("/api/v1/runs/<handoffWorkerRunId>/transcript?offset=0&limit=200");
+    expect(quickstart).toContain("Do not paste credential values");
+    expect(quickstart).toContain("credential-bearing repository URLs");
+  });
 });
+
+interface Eng371ContractExample {
+  title: string;
+  description: string;
+}
+
+function eng371ContractExamples(): Eng371ContractExample[] {
+  const content = readFileSync(
+    new URL("../specs/005-eng-371-public-metadata-closure/contracts/public-metadata-redaction.md", import.meta.url),
+    "utf8",
+  );
+  const matches = Array.from(content.matchAll(/^## (.+?)\r?\n\r?\n````markdown\r?\n([\s\S]*?)\r?\n````/gm));
+  return matches.map((match) => ({ title: match[1] ?? "", description: (match[2] ?? "").trim() }));
+}
+
+function extractIssueContractRequirementIds(description: string): string[] {
+  const issueContractJson = description.match(/```json\r?\n([\s\S]*?)\r?\n```/);
+  expect(issueContractJson, "Issue Contract JSON block must exist").not.toBeNull();
+  const parsed = JSON.parse(issueContractJson?.[1] ?? "{}");
+  return Array.isArray(parsed.requirements)
+    ? parsed.requirements.map((requirement: { id?: unknown }) => String(requirement.id ?? "").trim())
+    : [];
+}
+
+function eng371Quickstart(): string {
+  return readFileSync(new URL("../specs/005-eng-371-public-metadata-closure/quickstart.md", import.meta.url), "utf8");
+}
