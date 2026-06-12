@@ -235,7 +235,9 @@ describe("IssueContractLint", () => {
 
     expect(examples.map((example) => example.title)).toEqual(expectedExamples.map((example) => example.title));
 
-    const expectedRequirementIds = new Map(expectedExamples.map((example) => [example.title, example.requirementIds]));
+    const expectedRequirementIds = new Map<string, readonly string[]>(
+      expectedExamples.map((example) => [example.title, example.requirementIds]),
+    );
     const protectedPaths = ["WORKFLOW.md", "docs/dogfood-runbook.md", "src/core/workflow/**", "hermes/src/**"];
     for (const example of examples) {
       const analysis = analyzeIssueContractDescription(example.description, protectedPaths);
