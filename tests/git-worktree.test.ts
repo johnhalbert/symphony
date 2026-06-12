@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -172,6 +172,38 @@ describe("git worktree workspace source", () => {
     });
   });
 
+  it("does not rescope branch templates that already embed project context", async () => {
+    const manager = newManager(
+      root,
+      repo,
+      "refuse_dirty",
+      "none",
+      "symphony/{{ issue.identifier }}-{{ issue.projectContextId }}",
+    );
+    const docsIssue = trackerIssue({
+      id: "issue-docs-template-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-template-1",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: null,
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    expect(docsWorkspace.gitBranchName).toBe("symphony/ENG-123-docs");
+    expect(symphonyWorkspace.gitBranchName).toBe("symphony/ENG-123-symphony");
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/ENG-123-docs");
+    expect((await git(["branch", "--show-current"], symphonyWorkspace.path)).trim()).toBe("symphony/ENG-123-symphony");
+  });
+
   it("backfills persisted project context when removing duplicate-identifier worktrees without incoming context", async () => {
     const manager = newManager(root, repo);
     const docsIssue = trackerIssue({
@@ -286,7 +318,8 @@ describe("git worktree workspace source", () => {
     expect(workspace.sourceKind).toBe("planning_readonly");
     expect(record?.sourceKind).toBe("planning_readonly");
     expect(record?.gitBranchName).toBeUndefined();
-    await expect(writeFile(path.join(workspace.path, "write.txt"), "blocked", "utf8")).rejects.toThrow();
+    expect((await stat(workspace.path)).mode & 0o222).toBe(0);
+    expect((await stat(path.join(workspace.path, "README.md"))).mode & 0o222).toBe(0);
 
     await manager.removeForPlanning(planningIssue);
 
@@ -301,6 +334,7 @@ function newManager(
   repository: string,
   cleanup: "refuse_dirty" | "force" = "refuse_dirty",
   planningWorkspaceMode: "none" | "readonly_checkout" = "none",
+  branchTemplate = "symphony/{{ issue.identifier }}",
 ): WorkspaceManager {
   const config = parseServiceConfig(
     {
@@ -311,7 +345,7 @@ function newManager(
           kind: "git_worktree",
           repository,
           base_ref: "main",
-          branch_template: "symphony/{{ issue.identifier }}",
+          branch_template: branchTemplate,
           cleanup,
         },
       },

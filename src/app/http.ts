@@ -2786,23 +2786,31 @@ export class StatusServer {
   private async resolveRouteIssueLookup(
     issueKey: string,
     snapshot: RuntimeSnapshot = this.options.orchestrator.snapshot(),
-  ): Promise<{ issueId: string | null; ambiguousCandidates: IssueLookupCandidate[] }> {
-    return resolveIssueLookupKey(issueKey, {
+  ): Promise<IssueLookupResult> {
+    const { trackerIssues, trackerFailure } = await this.loadTrackerIssuesForRouteLookup();
+    const lookup = await resolveIssueLookupKey(issueKey, {
       snapshot,
       lifecycleStore: this.options.lifecycleStore,
       runStore: this.options.runStore,
-      trackerIssues: await this.loadTrackerIssuesForRouteLookup(),
+      trackerIssues,
     });
+    if (trackerFailure && lookup.resolutionKind === "issue_identifier") {
+      throw trackerFailure;
+    }
+    return lookup;
   }
 
-  private async loadTrackerIssuesForRouteLookup(): Promise<readonly Issue[]> {
-    if (!this.options.tracker) return [];
+  private async loadTrackerIssuesForRouteLookup(): Promise<{
+    trackerIssues: readonly Issue[];
+    trackerFailure: SymphonyError | null;
+  }> {
+    if (!this.options.tracker) return { trackerIssues: [], trackerFailure: null };
     try {
       const projection = await this.fetchIssueBoardTrackerProjection(this.resolveWebProjectionIssueBoardColumns(), false);
-      return projection.trackerIssues;
+      return { trackerIssues: projection.trackerIssues, trackerFailure: null };
     } catch (error) {
       if (error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")) {
-        return [];
+        return { trackerIssues: [], trackerFailure: error };
       }
       throw error;
     }
@@ -5013,7 +5021,7 @@ async function buildBoardIssueDetail(input: {
   continuationSummaryAvailable: boolean;
 }) {
   const snapshot = input.sourceIndex.runtime.snapshot;
-  const keys = input.card ? boardCardKeys(input.card) : [input.requestKey];
+  const keys = input.card?.issueId ? [input.card.issueId] : input.card ? boardCardKeys(input.card) : [input.requestKey];
   const live = liveIssueByKeys(input.sourceIndex, keys);
   const workspace = workspaceByKeys(input.sourceIndex, keys);
   const latestRun = latestRunByKeys(input.sourceIndex, keys);
@@ -7111,6 +7119,12 @@ interface IssueLookupCandidate {
   projectContextId: string | null;
 }
 
+interface IssueLookupResult {
+  issueId: string | null;
+  ambiguousCandidates: IssueLookupCandidate[];
+  resolutionKind: "exact_issue_id" | "issue_identifier" | "unresolved";
+}
+
 async function resolveIssueLookupKey(
   issueKey: string,
   input: {
@@ -7119,7 +7133,7 @@ async function resolveIssueLookupKey(
     runStore: RunTranscriptStore | undefined;
     trackerIssues?: readonly Issue[];
   },
-): Promise<{ issueId: string | null; ambiguousCandidates: IssueLookupCandidate[] }> {
+): Promise<IssueLookupResult> {
   const [lifecycleRecords, workspaces, runs] = await Promise.all([
     input.lifecycleStore?.list() ?? Promise.resolve([]),
     input.runStore?.listWorkspaces() ?? Promise.resolve([]),
@@ -7142,16 +7156,19 @@ async function resolveIssueLookupKey(
 function resolveIssueLookupFromCandidates(
   issueKey: string,
   candidates: readonly IssueLookupCandidate[],
-): { issueId: string | null; ambiguousCandidates: IssueLookupCandidate[] } {
+): IssueLookupResult {
   const exactIssueIdMatch = candidates.find((candidate) => candidate.issueId === issueKey);
-  if (exactIssueIdMatch) return { issueId: exactIssueIdMatch.issueId, ambiguousCandidates: [] };
+  if (exactIssueIdMatch) {
+    return { issueId: exactIssueIdMatch.issueId, ambiguousCandidates: [], resolutionKind: "exact_issue_id" };
+  }
   const identifierMatches = candidates.filter((candidate) => candidate.issueIdentifier === issueKey);
   if (identifierMatches.length === 1) {
-    return { issueId: identifierMatches[0]?.issueId ?? null, ambiguousCandidates: [] };
+    return { issueId: identifierMatches[0]?.issueId ?? null, ambiguousCandidates: [], resolutionKind: "issue_identifier" };
   }
   return {
     issueId: null,
     ambiguousCandidates: identifierMatches.length > 1 ? identifierMatches : [],
+    resolutionKind: "unresolved",
   };
 }
 

@@ -407,6 +407,7 @@ export class WorkspaceManager {
   private async resolveBranchName(issue: WorkspaceIssue): Promise<string> {
     const source = this.options.workspace.source;
     const template = source.branchTemplate;
+    const renderedFromTemplate = !issue.branchName && Boolean(template);
     const branchName =
       issue.branchName ??
       (template
@@ -423,7 +424,7 @@ export class WorkspaceManager {
         : defaultBranchNameForIssue(issue));
     const trimmed = String(branchName).trim();
     if (trimmed.length === 0) throw new SymphonyError("workspace_error", "Resolved git branch name is empty");
-    return scopeBranchNameToProjectContext(trimmed, issue);
+    return scopeBranchNameToProjectContext(trimmed, issue, { renderedFromTemplate });
   }
 
   private async assertExistingWorktree(workspaceKey: string, workspacePath: string): Promise<void> {
@@ -483,7 +484,11 @@ function defaultBranchNameForIssue(issue: WorkspaceIssue): string {
   return `symphony/${issue.identifier}`;
 }
 
-function scopeBranchNameToProjectContext(branchName: string, issue: WorkspaceIssue): string {
+function scopeBranchNameToProjectContext(
+  branchName: string,
+  issue: WorkspaceIssue,
+  options: { renderedFromTemplate?: boolean } = {},
+): string {
   const projectContextId = issue.projectContext?.projectContextId;
   if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return branchName;
 
@@ -493,6 +498,9 @@ function scopeBranchNameToProjectContext(branchName: string, issue: WorkspaceIss
   const unscopedDefaultParts = ["symphony", ...identifierParts];
   const matchesUnscopedDefault =
     branchParts.length === unscopedDefaultParts.length && branchParts.every((part, index) => part === unscopedDefaultParts[index]);
+  if (options.renderedFromTemplate && !matchesUnscopedDefault && branchParts.some((part) => branchPartContainsContextToken(part, contextPart))) {
+    return branchName;
+  }
   const identifierIndex = findBranchPartSequence(branchParts, identifierParts);
   if (identifierIndex >= 0) {
     if (!matchesUnscopedDefault && identifierIndex > 0 && branchParts[identifierIndex - 1] === contextPart) return branchName;
@@ -513,6 +521,10 @@ function findBranchPartSequence(parts: readonly string[], sequence: readonly str
     if (sequence.every((part, index) => parts[start + index] === part)) return start;
   }
   return -1;
+}
+
+function branchPartContainsContextToken(part: string, contextPart: string): boolean {
+  return part.split(/[-_.]/).includes(contextPart);
 }
 
 export function sanitizeWorkspaceKey(identifier: string): string {
