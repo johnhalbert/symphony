@@ -35,6 +35,34 @@ export interface ProjectContextPublicMetadata {
   path: string | null;
 }
 
+export interface ProjectContextPublicWorkspaceSourceSummary {
+  kind: string | null;
+  pathConfigured: boolean;
+  repositoryConfigured: boolean;
+  refConfigured: boolean;
+  baseRefConfigured: boolean;
+  branchTemplateConfigured: boolean;
+  cachePathConfigured: boolean;
+  cleanup: string | null;
+}
+
+export interface ProjectContextPublicSummary {
+  id: ProjectContextId;
+  label: string;
+  enabled: boolean;
+  publicMetadata: ProjectContextPublicMetadata;
+  tracker: {
+    projectSlug: string | null;
+    apiKeyPresent: boolean;
+  };
+  workspace: {
+    source: ProjectContextPublicWorkspaceSourceSummary;
+  };
+  github: {
+    tokenPresent: boolean;
+  };
+}
+
 export interface ProjectContextConfig<
   TTracker = unknown,
   TWorkspace = unknown,
@@ -77,6 +105,7 @@ export interface NormalizedProjectContext<
   agent: TAgent;
   credentialProfiles?: TCredentialProfiles;
   publicMetadata: ProjectContextPublicMetadata;
+  publicSummary: ProjectContextPublicSummary;
 }
 
 export interface ProjectContextRegistry<TContext extends { id: ProjectContextId; enabled: boolean }> {
@@ -264,8 +293,70 @@ export function projectContextMetadataForPublicRead(input: {
     linearProjectSlug: normalizeOptionalNonEmptyString(input.tracker?.projectSlug),
     workspaceRoot: normalizeOptionalNonEmptyString(input.workspace?.root),
     workspaceSourceKind: normalizeOptionalNonEmptyString(input.workspace?.source?.kind),
-    repository: normalizeOptionalNonEmptyString(input.workspace?.source?.repository),
+    repository: publicRepositorySummary(input.workspace?.source?.repository),
     path: normalizeOptionalNonEmptyString(input.workspace?.source?.path),
+  };
+}
+
+export function projectContextSummaryForPublicRead(input: {
+  id: ProjectContextId;
+  label: string;
+  enabled: boolean;
+  tracker?: { projectSlug?: string | null; apiKey?: string | null } | null;
+  workspace?: {
+    root?: string | null;
+    source?: {
+      kind?: string | null;
+      repository?: string | null;
+      path?: string | null;
+      ref?: string | null;
+      baseRef?: string | null;
+      branchTemplate?: string | null;
+      cachePath?: string | null;
+      cleanup?: string | null;
+    } | null;
+  } | null;
+  github?: { token?: string | null } | null;
+}): ProjectContextPublicSummary {
+  const publicMetadata = projectContextMetadataForPublicRead({
+    id: input.id,
+    label: input.label,
+    enabled: input.enabled,
+    tracker: { projectSlug: input.tracker?.projectSlug ?? null },
+    workspace: {
+      root: input.workspace?.root ?? null,
+      source: {
+        kind: input.workspace?.source?.kind ?? null,
+        repository: input.workspace?.source?.repository ?? null,
+        path: input.workspace?.source?.path ?? null,
+      },
+    },
+  });
+
+  return {
+    id: input.id,
+    label: input.label,
+    enabled: input.enabled,
+    publicMetadata,
+    tracker: {
+      projectSlug: publicMetadata.linearProjectSlug,
+      apiKeyPresent: normalizeOptionalNonEmptyString(input.tracker?.apiKey) !== null,
+    },
+    workspace: {
+      source: {
+        kind: publicMetadata.workspaceSourceKind,
+        pathConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.path) !== null,
+        repositoryConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.repository) !== null,
+        refConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.ref) !== null,
+        baseRefConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.baseRef) !== null,
+        branchTemplateConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.branchTemplate) !== null,
+        cachePathConfigured: normalizeOptionalNonEmptyString(input.workspace?.source?.cachePath) !== null,
+        cleanup: normalizeOptionalNonEmptyString(input.workspace?.source?.cleanup),
+      },
+    },
+    github: {
+      tokenPresent: normalizeOptionalNonEmptyString(input.github?.token) !== null,
+    },
   };
 }
 
@@ -463,6 +554,115 @@ function normalizeOptionalNonEmptyString(value: string | null | undefined): stri
   if (value === null || value === undefined) return null;
   const normalized = value.trim();
   return normalized.length === 0 ? null : normalized;
+}
+
+function publicRepositorySummary(value: string | null | undefined): string | null {
+  const normalized = normalizeOptionalNonEmptyString(value);
+  if (normalized === null) return null;
+
+  if (looksLikeUrlRepositoryValue(normalized)) {
+    return sanitizedUrlRepositorySummary(normalized);
+  }
+
+  const sanitizedScp = sanitizedScpLikeRepositorySummary(normalized);
+  if (sanitizedScp !== null) return sanitizedScp;
+
+  const sanitizedAtSign = sanitizedAtSignRepositorySummary(normalized);
+  if (sanitizedAtSign !== null) return sanitizedAtSign;
+
+  const strippedSuffix = stripRepositoryQueryAndFragment(normalized);
+  if (strippedSuffix !== normalized) return publicRepositorySummary(strippedSuffix);
+
+  if (looksLikeLocalRepositoryPath(normalized)) return normalized;
+  return sanitizedHostIdentifierRepositorySummary(normalized);
+}
+
+function looksLikeUrlRepositoryValue(value: string): boolean {
+  return /^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(value);
+}
+
+function sanitizedUrlRepositorySummary(value: string): string | null {
+  if (!looksLikeUrlRepositoryValue(value)) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+
+  const pathname = parsed.pathname.length === 0 ? "/" : parsed.pathname;
+  if (parsed.host.length === 0) return `${parsed.protocol}//${pathname}`;
+  return `${parsed.protocol}//${parsed.host}${pathname}`;
+}
+
+function sanitizedScpLikeRepositorySummary(value: string): string | null {
+  const match = /^([^@\s/:]+)@([^:\s/]+):(.+)$/u.exec(value);
+  if (!match) return null;
+
+  const host = normalizeOptionalNonEmptyString(match[2]);
+  const repositoryPath = normalizeOptionalNonEmptyString(stripRepositoryQueryAndFragment(match[3] ?? ""));
+  if (host === null) return null;
+  if (repositoryPath === null) return host;
+  return `${host}:${repositoryPath}`;
+}
+
+function sanitizedAtSignRepositorySummary(value: string): string | null {
+  const slashMatch = /^([^@\s/]+)@([^/\s?#]+)\/(.+)$/u.exec(value);
+  if (slashMatch) {
+    const host = normalizeOptionalNonEmptyString(slashMatch[2]);
+    const repositoryPath = normalizeOptionalNonEmptyString(stripRepositoryQueryAndFragment(slashMatch[3] ?? ""));
+    if (host === null) return null;
+    if (repositoryPath === null) return host;
+    return `${host}/${repositoryPath}`;
+  }
+
+  const hostOnlyMatch = /^([^@\s]+)@([^/\s?#:]+(?:\.[^/\s?#:]+)*)$/u.exec(value);
+  if (!hostOnlyMatch) return null;
+  return normalizeOptionalNonEmptyString(hostOnlyMatch[2]);
+}
+
+function stripRepositoryQueryAndFragment(value: string): string {
+  return value.replace(/[?#].*$/u, "");
+}
+
+function looksLikeLocalRepositoryPath(value: string): boolean {
+  return (
+    value.startsWith(".") ||
+    value.startsWith("~") ||
+    value.startsWith("/") ||
+    value.startsWith("\\") ||
+    /^[A-Za-z]:[\\/]/u.test(value) ||
+    /[\\/]/u.test(value)
+  );
+}
+
+function sanitizedHostIdentifierRepositorySummary(value: string): string | null {
+  if (/[\s@/]/u.test(value)) return null;
+
+  const match = /^(?<host>\[[0-9A-Fa-f:.]+\]|localhost|(?:\d{1,3}\.){3}\d{1,3}|(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+)(?::(?<port>\d+))?$/u.exec(
+    value,
+  );
+  const host = normalizeOptionalNonEmptyString(match?.groups?.host);
+  const port = normalizeOptionalNonEmptyString(match?.groups?.port);
+  if (host === null || !isSafePublicRepositoryHost(host)) return null;
+  return port === null ? host : `${host}:${port}`;
+}
+
+function isSafePublicRepositoryHost(host: string): boolean {
+  if (host === "localhost") return true;
+  if (/^\[[0-9A-Fa-f:.]+\]$/u.test(host)) return true;
+  if (isValidIpv4Host(host)) return true;
+
+  const labels = host.split(".");
+  if (labels.length < 2) return false;
+  return labels.every((label) => /^[A-Za-z0-9-]+$/u.test(label) && !label.startsWith("-") && !label.endsWith("-"));
+}
+
+function isValidIpv4Host(host: string): boolean {
+  const octets = host.split(".");
+  if (octets.length !== 4) return false;
+  return octets.every((octet) => /^\d{1,3}$/u.test(octet) && Number(octet) >= 0 && Number(octet) <= 255);
 }
 
 function readIssueRoutingFields(issue: unknown): {

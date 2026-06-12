@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
 import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
   normalizeProjectContextResolution,
   projectContextResolutionFromIssue,
   type ProjectContextResolution,
@@ -25,6 +26,7 @@ export interface IssueLifecycleSummaryPointers {
   workspaceKey: string | null;
   workspacePath: string | null;
   branchName: string | null;
+  issueTitle?: string | null;
   gitBranchName: string | null;
   repoPath: string | null;
   baseRef: string | null;
@@ -886,6 +888,7 @@ function defaultSummaryPointers(): IssueLifecycleSummaryPointers {
     workspaceKey: null,
     workspacePath: null,
     branchName: null,
+    issueTitle: null,
     gitBranchName: null,
     repoPath: null,
     baseRef: null,
@@ -923,6 +926,53 @@ async function readLifecycleJsonIfExists(filePath: string): Promise<IssueLifecyc
   }
 }
 
+function inferLegacyLifecycleProjectContext(
+  value: Record<string, unknown>,
+  filePath: string,
+): ProjectContextResolution | undefined {
+  const handoffMemo = isRecord(value.handoff) && isRecord(value.handoff.memo) ? value.handoff.memo : null;
+  const handoffPointers = handoffMemo && isRecord(handoffMemo.pointers) ? handoffMemo.pointers : null;
+  const candidates = [
+    readStoredProjectContextCandidate(isRecord(value.summaryPointers) ? value.summaryPointers.projectContext : undefined),
+    ...collectStoredProjectContextCandidates(value.issueBreakdownPlans),
+    ...collectStoredProjectContextCandidates(value.completionReports),
+    ...collectStoredProjectContextCandidates(value.reviewVerdicts),
+    ...collectStoredProjectContextCandidates(value.reviewFeedback),
+    ...collectStoredProjectContextCandidates(value.mergeConflictResolutionReports),
+    readStoredProjectContextCandidate(handoffMemo?.projectContext),
+    readStoredProjectContextCandidate(handoffPointers?.projectContext),
+  ].filter((candidate): candidate is ProjectContextResolution => candidate !== null);
+  const explicitCandidates = candidates.filter((candidate) => candidate.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID);
+  if (explicitCandidates.length > 0) {
+    const firstExplicitCandidate = explicitCandidates[0]!;
+    if (explicitCandidates.some((candidate) => candidate.projectContextId !== firstExplicitCandidate.projectContextId)) {
+      throw corruptLifecycle(filePath, "projectContext metadata is ambiguous across legacy lifecycle subrecords");
+    }
+    return firstExplicitCandidate;
+  }
+  return candidates[0];
+}
+
+function collectStoredProjectContextCandidates(value: unknown): ProjectContextResolution[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (isRecord(item) ? readStoredProjectContextCandidate(item.projectContext) : null))
+    .filter((candidate): candidate is ProjectContextResolution => candidate !== null);
+}
+
+function readStoredProjectContextCandidate(value: unknown): ProjectContextResolution | null {
+  if (!isRecord(value)) return null;
+  if (
+    value.projectContextId === undefined &&
+    value.projectContextLabel === undefined &&
+    value.linearProjectSlug === undefined &&
+    value.routingSource === undefined
+  ) {
+    return null;
+  }
+  return normalizeProjectContextResolution(value as Partial<ProjectContextResolution>);
+}
+
 function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecycleRecord {
   if (!isRecord(value)) {
     throw corruptLifecycle(filePath, "record is not an object");
@@ -937,7 +987,10 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     throw corruptLifecycle(filePath, "phase is invalid");
   }
 
-  const projectContext = normalizeStoredProjectContext(value.projectContext);
+  const projectContext = normalizeStoredProjectContext(
+    value.projectContext,
+    inferLegacyLifecycleProjectContext(value, filePath),
+  );
   const normalized = {
     issueId: value.issueId,
     issueIdentifier: value.issueIdentifier,
@@ -1009,6 +1062,7 @@ function normalizeSummaryPointers(
     workspaceKey: nullableString(value.workspaceKey, filePath, "summaryPointers.workspaceKey"),
     workspacePath: nullableString(value.workspacePath, filePath, "summaryPointers.workspacePath"),
     branchName: nullableString(value.branchName, filePath, "summaryPointers.branchName"),
+    issueTitle: optionalNullableString(value.issueTitle, filePath, "summaryPointers.issueTitle"),
     gitBranchName: optionalNullableString(value.gitBranchName, filePath, "summaryPointers.gitBranchName"),
     repoPath: optionalNullableString(value.repoPath, filePath, "summaryPointers.repoPath"),
     baseRef: optionalNullableString(value.baseRef, filePath, "summaryPointers.baseRef"),

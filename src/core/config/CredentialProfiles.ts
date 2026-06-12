@@ -256,15 +256,23 @@ export function createCredentialProfileRegistry(input: {
   env: NodeJS.ProcessEnv;
   workflowDir: string;
   fallbacks: CredentialLegacyFallbacks;
+  errorTransformer?: (error: unknown) => Error;
 }): CredentialProfileRegistry {
-  const profiles = parseProfiles(input.raw?.profiles, input.workflowDir, input.env);
-  const roleAssignments = parseRoleAssignments(input.raw?.roles, profiles);
-  return new CredentialProfileRegistry({
-    profiles,
-    roleAssignments,
-    env: input.env,
-    fallbacks: input.fallbacks,
-  });
+  try {
+    const profiles = parseProfiles(input.raw?.profiles, input.workflowDir, input.env);
+    const roleAssignments = parseRoleAssignments(input.raw?.roles, profiles);
+    return new CredentialProfileRegistry({
+      profiles,
+      roleAssignments,
+      env: input.env,
+      fallbacks: input.fallbacks,
+    });
+  } catch (error) {
+    if (input.errorTransformer) {
+      throw input.errorTransformer(error);
+    }
+    throw error;
+  }
 }
 
 function parseProfiles(

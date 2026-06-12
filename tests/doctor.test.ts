@@ -409,6 +409,10 @@ github:
       id: string;
       label: string;
       enabled: boolean;
+      publicMetadata: {
+        linearProjectSlug: string | null;
+        repository: string | null;
+      };
       tracker: { projectSlug: string | null; apiKeyPresent: boolean };
       workspace: {
         source: {
@@ -425,8 +429,9 @@ github:
       github: { tokenPresent: boolean };
     }>;
 
+    expect(summary).toEqual(config.projectContexts.contexts.map((context) => context.publicSummary));
     expect(summary).toHaveLength(3);
-    expect(summary.map((context) => context.id)).toEqual(["symphony", "docs-site", "ops-portal"]);
+
     expect(summary[0]).toMatchObject({
       id: "symphony",
       label: "Symphony",
@@ -450,6 +455,10 @@ github:
       id: "docs-site",
       label: "Documentation Site",
       enabled: true,
+      publicMetadata: {
+        linearProjectSlug: "DOCS",
+        repository: "https://example.com/org/docs.git",
+      },
       tracker: { projectSlug: "DOCS", apiKeyPresent: true },
       workspace: {
         source: {
@@ -526,6 +535,7 @@ github:
     const prefix = `Configured project contexts (default: ${config.projectContexts.defaultContextId}): `;
     const summary = JSON.parse(check.message.slice(prefix.length)) as Array<{
       id: string;
+      publicMetadata: { linearProjectSlug: string | null; repository: string | null };
       tracker: { projectSlug: string | null; apiKeyPresent: boolean };
       workspace: {
         source: {
@@ -541,10 +551,12 @@ github:
       github: { tokenPresent: boolean };
     }>;
 
+    expect(summary).toEqual(config.projectContexts.contexts.map((context) => context.publicSummary));
     expect(summary).toHaveLength(2);
     expect(summary[1]).toMatchObject({
       id: "archive",
-      tracker: { projectSlug: "", apiKeyPresent: false },
+      publicMetadata: { linearProjectSlug: null, repository: null },
+      tracker: { projectSlug: null, apiKeyPresent: false },
       workspace: {
         source: {
           kind: "none",

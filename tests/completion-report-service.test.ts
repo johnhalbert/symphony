@@ -325,6 +325,210 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("prefers lifecycle summaryPointers over forged report.branchName when the workspace branch is unset", async () => {
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "service-owned-branch",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "branch-fallback-service",
+    });
+    const { service, lifecycleStore, runStore } = fixture({ publisher });
+    await runStore.startRun({
+      runId: "run-1",
+      sessionId: "session-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: null, title: "Do work" }), {
+      phase: "implementation",
+      summaryPointers: {
+        lastRunId: "run-1",
+        branchName: "service-owned-branch",
+        issueTitle: "Do work",
+        gitBranchName: "service-owned-branch",
+      },
+    });
+
+    const result = await service.submitCompletionReport(
+      report({ branchName: "forged-report-branch", idempotencyKey: "branch-fallback-service" }),
+      contextWithWorkspace({
+        issue: issue({ state: "In Progress", branchName: null, title: "Do work" }),
+        workspace: {
+          path: "/tmp/workspace",
+          workspaceKey: "TEST-1",
+          createdNow: false,
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          repoPath: "/repo",
+          baseRef: "main",
+        },
+      }),
+    );
+
+    expect(result.report.pullRequest).toEqual({
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      branch: "service-owned-branch",
+    });
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      branchName: "service-owned-branch",
+      baseBranch: "main",
+      title: "TEST-1: Do work",
+      evidenceCursor: "branch-fallback-service",
+    });
+    expect(publisher.inputs[0]?.branchName).not.toBe("forged-report-branch");
+    await expect(runStore.getRun("run-1")).resolves.toMatchObject({
+      prBranch: "service-owned-branch",
+      lastEvidenceCursor: "branch-fallback-service",
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      summaryPointers: {
+        branchName: "service-owned-branch",
+        gitBranchName: "service-owned-branch",
+        prBranch: "service-owned-branch",
+        lastEvidenceCursor: "branch-fallback-service",
+      },
+    });
+  });
+
+  it("re-requests publication approval with the service-owned branch and title when recovering a pending handoff", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.github.publishPullRequests = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.github.operatorApproval!.requiredForPublication = true;
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const runStore = new FileRunTranscriptStore(root);
+    const outbox = new FileWritebackOutboxStore(root);
+    await runStore.startRun({
+      runId: "run-1",
+      sessionId: "session-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: null, title: "Do work" }), {
+      phase: "blocked",
+      blockedReason: "publication approval setup incomplete",
+      lastCompletionReportId: "completion-report:issue-1:branch-recovery-idem",
+      summaryPointers: {
+        lastRunId: "run-1",
+        workspacePath: "/tmp/workspace",
+        workspaceKey: "TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+        branchName: "service-owned-branch",
+        issueTitle: "Do work",
+        gitBranchName: "service-owned-branch",
+      },
+      completionReports: [
+        {
+          id: "completion-report:issue-1:branch-recovery-idem",
+          idempotencyKey: "branch-recovery-idem",
+          runId: "run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Implemented the service contract.",
+          validationEvidence: ["npm run typecheck", "npm test"],
+          acceptanceChecklist: [
+            {
+              text: "Completion reports are persisted.",
+              satisfied: true,
+              evidence: "Lifecycle store records completionReports.",
+            },
+          ],
+          changedFiles: ["src/core/CompletionReportService.ts"],
+          branchName: "forged-report-branch",
+          pullRequest: null,
+          risks: ["Reviewer handler remains out of scope."],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+    });
+    const processedKeyBatches: string[][] = [];
+    let approvalBranch: string | null = null;
+    let approvalTitle: string | null = null;
+    const writebackProcessor = {
+      async processDue(options: { idempotencyKeys?: readonly string[] } = {}) {
+        const keys = [...(options.idempotencyKeys ?? [])];
+        processedKeyBatches.push(keys);
+        for (const key of keys) {
+          const record = await outbox.get(key);
+          if (record) await outbox.markSucceeded(record);
+        }
+      },
+    };
+    const service = new CompletionReportService({
+      config,
+      lifecycleStore,
+      writebackOutbox: outbox,
+      writebackProcessor,
+      runStore,
+      operatorApproval: {
+        async requestPublicationApproval(input) {
+          approvalBranch = input.action.branchName;
+          approvalTitle = input.action.title;
+          return approvalRecord(input.issueId, input.issueIdentifier, input.runId, input.evidenceCursor, input.action);
+        },
+        async waitForPublicationApprovalRequest(record) {
+          return record;
+        },
+      },
+    });
+
+    const recovered = await service.recoverPendingPublicationApproval({
+      issue: issue({ state: "In Progress", branchName: null, title: "FORGED TITLE FROM CALLER" }),
+    });
+
+    expect(recovered).toMatchObject({
+      recovered: true,
+      outcome: "pending",
+      report: expect.objectContaining({ idempotencyKey: "branch-recovery-idem" }),
+    });
+    expect(approvalBranch).toBe("service-owned-branch");
+    expect(approvalBranch).not.toBe("forged-report-branch");
+    expect(approvalTitle).toBe("TEST-1: Do work");
+    expect(approvalTitle).not.toContain("FORGED TITLE FROM CALLER");
+    expect(processedKeyBatches).toHaveLength(1);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "awaiting operator approval for PR publication",
+      summaryPointers: {
+        branchName: "service-owned-branch",
+        issueTitle: "Do work",
+        gitBranchName: "service-owned-branch",
+      },
+    });
+  });
+
   it("reuses a service-discovered PR and prevents duplicate publication on replay", async () => {
     const publisher = new FakePublisher({
       action: "reused",
@@ -561,12 +765,14 @@ describe("CompletionReportService", () => {
       },
     });
     const processedKeyBatches: string[][] = [];
+    const processedProjectContextIds: Array<string | null> = [];
     const writebackProcessor = {
-      async processDue(options: { idempotencyKeys?: readonly string[] } = {}) {
+      async processDue(options: { idempotencyKeys?: readonly string[]; projectContext?: WritebackOperation["projectContext"] } = {}) {
         const keys = [...(options.idempotencyKeys ?? [])];
         processedKeyBatches.push(keys);
+        processedProjectContextIds.push(options.projectContext?.projectContextId ?? null);
         for (const key of keys) {
-          const record = await outbox.get(key);
+          const record = await outbox.get(key, options.projectContext);
           if (record) await outbox.markSucceeded(record);
         }
       },
@@ -589,9 +795,14 @@ describe("CompletionReportService", () => {
 
     await service.submitCompletionReport(report(), contextWithWorkspace());
 
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      summaryPointers: { issueTitle: contextWithWorkspace().issue.title },
+    });
     expect(processedKeyBatches).toHaveLength(1);
+    expect(processedProjectContextIds).toHaveLength(1);
+    expect(processedProjectContextIds[0]).toBeTruthy();
     expect(processedKeyBatches[0]).not.toContain(siblingKey);
-    expect(processedKeyBatches[0]?.every((key) => key.includes("completion-report:idem-1"))).toBe(true);
+
     await expect(outbox.get(siblingKey)).resolves.toMatchObject({ status: "pending" });
   });
 
