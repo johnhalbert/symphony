@@ -1036,14 +1036,30 @@ export class Orchestrator {
       : normalizedProjectContextId;
   }
 
+  private issueHasProjectContextProof(issue: Issue): boolean {
+    return projectContextResolutionFromIssue(issue) !== null;
+  }
+
   private issueMatchesRequestedProjectContext(
     issue: Issue,
     requestedProjectContext?: ProjectContextResolution,
   ): boolean {
     if (!requestedProjectContext) return true;
     const issueProjectContext = projectContextResolutionFromIssue(issue);
-    if (!issueProjectContext) return true;
+    if (!issueProjectContext) return false;
     return this.comparableProjectContextId(issueProjectContext) === this.comparableProjectContextId(requestedProjectContext);
+  }
+
+  private canTrustRequestedProjectContextFromCandidateLookup(
+    tracker: TrackerClient,
+    requestedProjectContext?: ProjectContextResolution,
+  ): boolean {
+    if (!requestedProjectContext) return true;
+    const requestedProjectContextId = this.comparableProjectContextId(requestedProjectContext);
+    if (requestedProjectContextId === this.config.projectContexts.defaultContextId) {
+      return tracker === this.options.tracker;
+    }
+    return Boolean(this.options.trackerResolver && tracker !== this.options.tracker);
   }
 
   private async resolveTrackedIssue(
@@ -1055,12 +1071,20 @@ export class Orchestrator {
     const direct = (await tracker.fetchIssueStatesByIds([issueIdOrIdentifier]))[0] ?? null;
     if (direct && this.issueMatchesRequestedProjectContext(direct, projectContext)) return direct;
     if (options.allowCandidateIdentifierLookup !== true) return null;
+    const candidateLookupProvesRequestedContext = this.canTrustRequestedProjectContextFromCandidateLookup(
+      tracker,
+      projectContext,
+    );
     return (
-      (await tracker.fetchCandidateIssues()).find(
-        (candidate) =>
-          (candidate.id === issueIdOrIdentifier || candidate.identifier === issueIdOrIdentifier) &&
-          this.issueMatchesRequestedProjectContext(candidate, projectContext),
-      ) ?? null
+      (await tracker.fetchCandidateIssues()).find((candidate) => {
+        if (candidate.id !== issueIdOrIdentifier && candidate.identifier !== issueIdOrIdentifier) {
+          return false;
+        }
+        return (
+          this.issueMatchesRequestedProjectContext(candidate, projectContext) ||
+          (!this.issueHasProjectContextProof(candidate) && candidateLookupProvesRequestedContext)
+        );
+      }) ?? null
     );
   }
 
