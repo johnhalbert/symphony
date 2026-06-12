@@ -2,31 +2,39 @@ import type { Logger } from "../core/logging/StructuredLogger.js";
 import type { AgentRunRole, TrackerStateLists } from "../core/types.js";
 import type { ServiceConfig } from "../core/config/Config.js";
 import {
-  resolveProjectContextCredentialView,
-  type ProjectContextCredentialResolutionOptions,
-} from "../core/config/ProjectContextCredentialView.js";
-import type {
-  CredentialCapability,
-  CredentialProfileRegistry,
-  CredentialRole,
-  ResolvedCredential,
+  createCredentialProfileRegistry,
+  type CredentialCapability,
+  type CredentialRole,
+  type ResolvedCredential,
 } from "../core/config/CredentialProfiles.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  normalizeProjectContextId,
+  type ProjectContextResolution,
+} from "../core/config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import { FileIssueLifecycleStore, type IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
 import type { IssueBreakdownIssueLookupResult } from "../core/writeback/WritebackOutbox.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../core/writeback/WritebackOutbox.js";
 import { createLinearTrackerClientForCapability } from "../integrations/linear/LinearCredentialResolver.js";
+import {
+  resolveProjectContextCredentialView,
+  type ProjectContextCredentialResolutionOptions,
+} from "../core/config/ProjectContextCredentialView.js";
+import type { CredentialProfileRegistry } from "../core/config/CredentialProfiles.js";
 
 type FetchLike = typeof fetch;
-
-export interface RuntimeDependencyResolutionOptions extends ProjectContextCredentialResolutionOptions {}
 
 export function createRuntimeTrackerClient(
   config: ServiceConfig,
   fetchImpl?: FetchLike,
-  options: RuntimeDependencyResolutionOptions = {},
+  projectContext?: ProjectContextResolution,
 ) {
-  return createLinearTrackerClientForCapability(config, "linear.tracker", fetchImpl, options);
+  return createLinearTrackerClientForCapability(
+    resolveServiceConfigForProjectContext(config, projectContext),
+    "linear.tracker",
+    fetchImpl,
+  );
 }
 
 export function createRuntimeWritebackProcessor(
@@ -37,47 +45,34 @@ export function createRuntimeWritebackProcessor(
     outboxStore?: FileWritebackOutboxStore;
     lifecycleStore?: Pick<IssueLifecycleStore, "get">;
   } = {},
-  options: RuntimeDependencyResolutionOptions = {},
 ): WritebackProcessor | undefined {
   const getConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
   const config = getConfig();
   if (!config.writeback.enabled) return undefined;
-  const defaultWriter = createLinearTrackerClientForCapability(config, "linear.writeback", fetchImpl, options);
   return new WritebackProcessor(
     stores.outboxStore ?? new FileWritebackOutboxStore(config.workspace.stateDir),
-    (record) => {
-      const projectContext = record.projectContext ?? options.projectContext;
-      if (!projectContext || projectContext.projectContextId === config.projectContexts.defaultContextId) {
-        return defaultWriter;
-      }
-      return createLinearTrackerClientForCapability(getConfig(), "linear.writeback", fetchImpl, {
-        projectContext,
-        env: options.env,
-      });
-    },
+    createRuntimeWritebackClient(config, fetchImpl),
     logger,
     config.writeback.maxBackoffMs,
     stores.lifecycleStore ?? new FileIssueLifecycleStore(config.workspace.stateDir),
     config.writeback.mode === "dry_run",
     {
-      getConfig,
+      getConfig: (projectContext) => resolveServiceConfigForProjectContext(getConfig(), projectContext),
       resolveIssue: (issueId, projectContext) =>
-        resolveIssueForBreakdownFreshness(issueId, getConfig, fetchImpl, {
-          projectContext: projectContext ?? options.projectContext,
-          env: options.env,
-        }),
+        resolveIssueForBreakdownFreshness(issueId, getConfig, projectContext, fetchImpl),
     },
+    (projectContext) => createRuntimeWritebackClient(getConfig(), fetchImpl, projectContext),
   );
 }
 
 export async function resolveIssueForBreakdownFreshness(
   issueId: string,
   getConfig: () => ServiceConfig,
+  projectContext?: ProjectContextResolution,
   fetchImpl?: FetchLike,
-  options: RuntimeDependencyResolutionOptions = {},
 ): Promise<IssueBreakdownIssueLookupResult> {
   try {
-    const tracker = createRuntimeTrackerClient(getConfig(), fetchImpl, options);
+    const tracker = createRuntimeTrackerClient(getConfig(), fetchImpl, projectContext);
     const issue = (await tracker.fetchIssueStatesByIds([issueId]))[0];
     return issue ? { status: "ok", issue } : { status: "not_found" };
   } catch (error) {
@@ -85,13 +80,70 @@ export async function resolveIssueForBreakdownFreshness(
   }
 }
 
-export function resolveCursorRuntimeApiKey(
+export function resolveServiceConfigForProjectContext(
+  config: ServiceConfig,
+  projectContext?: ProjectContextResolution,
+): ServiceConfig {
+  if (!projectContext) return config;
+  const requestedProjectContextId = normalizeProjectContextId(projectContext.projectContextId);
+  const projectContextId =
+    requestedProjectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+      ? config.projectContexts.defaultContextId
+      : requestedProjectContextId;
+  if (projectContextId === config.projectContexts.defaultContextId) return config;
+
+  const context = config.projectContexts.byId.get(projectContextId);
+  if (!context) {
+    throw new SymphonyError("config_validation_error", `Resolved project context "${projectContextId}" is not configured`);
+  }
+
+  return {
+    ...config,
+    tracker: context.tracker,
+    workspace: context.workspace,
+    github: context.github,
+    reviewLoop: context.reviewLoop,
+    issueBreakdown: context.issueBreakdown,
+    agent: context.agent,
+    credentialProfiles: createCredentialProfileRegistry({
+      raw: context.credentialProfiles,
+      env: config.environment,
+      workflowDir: config.workflowDir,
+      fallbacks: {
+        githubToken: context.github.token,
+        linearApiKey: context.tracker.apiKey,
+        cursorRuntimeApiKey: null,
+        openWorkspaceToken: config.server.openWorkspaceToken,
+      },
+    }),
+  };
+}
+
+function createRuntimeWritebackClient(
+  config: ServiceConfig,
+  fetchImpl?: FetchLike,
+  projectContext?: ProjectContextResolution,
+) {
+  return createLinearTrackerClientForCapability(
+    resolveServiceConfigForProjectContext(config, projectContext),
+    "linear.writeback",
+    fetchImpl,
+  );
+}
+
+export function resolveCursorRuntimeApiKey(config: ServiceConfig, role: AgentRunRole): string | null {
+  return resolveRuntimeApiKey(config, role, "cursor");
+}
+
+export function resolveScopedCursorRuntimeApiKey(
   config: ServiceConfig,
   role: AgentRunRole,
   options: RuntimeDependencyResolutionOptions = {},
 ): string | null {
   return resolveRuntimeApiKey(config, role, "cursor", options);
 }
+
+export interface RuntimeDependencyResolutionOptions extends ProjectContextCredentialResolutionOptions {}
 
 export function resolveCursorRuntimeCredential(
   config: ServiceConfig,

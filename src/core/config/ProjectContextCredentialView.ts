@@ -30,6 +30,7 @@ export function resolveProjectContextCredentialView(input: {
   projectContext?: ProjectContextResolution | undefined;
   env?: NodeJS.ProcessEnv | undefined;
 }): ProjectContextCredentialView {
+  const resolvedEnv = input.env ?? input.config.environment ?? process.env;
   const selected = resolveConfiguredProjectContext(input.config, input.projectContext);
   if (!selected) {
     const defaultContext = input.config.projectContexts.defaultContext;
@@ -52,12 +53,12 @@ export function resolveProjectContextCredentialView(input: {
     github: selected.context.github,
     credentialProfiles: createCredentialProfileRegistry({
       raw: selected.context.credentialProfiles,
-      env: input.env ?? process.env,
+      env: resolvedEnv,
       workflowDir: input.config.workflowDir,
       fallbacks: {
         githubToken: selected.context.github.token,
         linearApiKey: selected.context.tracker.apiKey,
-        cursorRuntimeApiKey: (input.env ?? process.env).CURSOR_API_KEY ?? null,
+        cursorRuntimeApiKey: resolvedEnv.CURSOR_API_KEY ?? null,
         openWorkspaceToken: input.config.server.openWorkspaceToken,
       },
     }),

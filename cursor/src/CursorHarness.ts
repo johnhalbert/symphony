@@ -20,7 +20,7 @@ import {
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
-import { resolveCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
+import { resolveCursorRuntimeApiKey, resolveScopedCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
 import {
   sanitizeAgentEventForPublicOutput,
   sanitizedPreviewValue,
@@ -685,14 +685,14 @@ export class CursorHarness implements AgentHarness {
     const mcpServers = symphonyRoleMcpServers(ctx, { cliPath });
     const createOptions = cursorAgentCreateOptions(
       ctx,
-      resolveCursorRuntimeApiKey(ctx.config, ctx.role, { projectContext: ctx.projectContext }),
+      resolveScopedCursorRuntimeApiKey(ctx.config, ctx.role, { projectContext: ctx.projectContext }),
       {
         mcpServers,
       },
     );
     const resumeOptions = cursorAgentBaseOptions(
       ctx,
-      resolveCursorRuntimeApiKey(ctx.config, ctx.role, { projectContext: ctx.projectContext }),
+      resolveScopedCursorRuntimeApiKey(ctx.config, ctx.role, { projectContext: ctx.projectContext }),
       {
         mcpServers,
       },
@@ -932,7 +932,7 @@ function safeJsonPreview(value: unknown): string {
 
 export function cursorAgentCreateOptions(
   ctx: AgentRunContext,
-  apiKey: string | null | undefined = resolveCursorRuntimeApiKey(ctx.config, ctx.role, {
+  apiKey: string | null | undefined = resolveScopedCursorRuntimeApiKey(ctx.config, ctx.role, {
     projectContext: ctx.projectContext,
   }),
   options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},

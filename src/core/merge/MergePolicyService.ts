@@ -121,11 +121,6 @@ export class MergePolicyService {
       throw new SymphonyError("invalid_request", "Gated merge policy requires service-owned writeback");
     }
 
-    const serviceLinear = resolveLinearClientConfig(config, "linear.writeback").credential;
-    if (!serviceLinear) {
-      throw new SymphonyError("invalid_request", "Gated merge policy requires service linear.writeback credentials");
-    }
-
     const latestIssue = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? issue;
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
     if (!lifecycle) throw new SymphonyError("invalid_request", "Gated merge policy requires an issue lifecycle record");
@@ -138,7 +133,12 @@ export class MergePolicyService {
       if (recoverySourceState === null) {
         throw new SymphonyError("invalid_request", "Gated merge Done recovery requires issue in Done or a merge source state");
       }
-      await this.ensureDoneTransition(latestIssue, lifecycle.merge, recoverySourceState);
+      await this.ensureDoneTransition(
+        latestIssue,
+        lifecycle.merge,
+        recoverySourceState,
+        lifecycle.projectContext ?? projectContextResolutionFromIssue(latestIssue) ?? undefined,
+      );
       return { status: "already_merged", merge: lifecycle.merge };
     }
 
@@ -150,6 +150,14 @@ export class MergePolicyService {
     const report = latestCompletionReport(lifecycle);
     if (!report) throw new SymphonyError("invalid_request", "Gated merge requires a latest completion report");
     const projectContext = this.projectContextForIssue(latestIssue, lifecycle, report);
+    const serviceLinear = resolveLinearClientConfig(
+      config,
+      "linear.writeback",
+      projectContext === undefined ? {} : { projectContext },
+    ).credential;
+    if (!serviceLinear) {
+      throw new SymphonyError("invalid_request", "Gated merge policy requires service linear.writeback credentials");
+    }
     const serviceMergeConfig = resolveGitHubClientConfig(
       config,
       "github.merge",
@@ -174,7 +182,7 @@ export class MergePolicyService {
     const livePullRequest = await github.getPullRequest({ pullRequestNumber: requireNumber(pullRequest.number) });
     validateLivePullRequestMetadata(livePullRequest, pullRequest, headSha);
     if (livePullRequest.headSha !== headSha) {
-      return this.handleHeadSupersession(latestIssue, lifecycle, report, pullRequest, headSha, livePullRequest, sourceState);
+      return this.handleHeadSupersession(latestIssue, lifecycle, report, pullRequest, headSha, livePullRequest, sourceState, projectContext);
     }
     if (resolvedConflict) {
       await validateConflictApprovalCarryForward(github, resolvedConflict, approvedPullRequest, approvedHeadSha, headSha);
@@ -225,7 +233,7 @@ export class MergePolicyService {
           gate: { ...decision.gate, writebackOperationKeys: activeLifecycle.mergeGate?.writebackOperationKeys ?? existingGateVerdict.writebackOperationKeys },
         };
       }
-      return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, existingGateVerdict);
+      return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, projectContext, existingGateVerdict);
     }
     if (decision.kind === "pending") {
       const refreshedMergeGate = refreshActiveMergeGateObservation(activeLifecycle, decision.gate, existingGateVerdict?.writebackOperationKeys ?? []);
@@ -261,7 +269,7 @@ export class MergePolicyService {
     const workerRun = report && this.options.runStore ? await this.options.runStore.getRun(report.runId) : null;
     this.validateLifecycle(activeLifecycle, report, verdict, workerRun, latestIssue);
     if (decision.kind === "failure") {
-      return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, null);
+      return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, projectContext, null);
     }
     if (
       decision.kind === "passed" &&
@@ -291,7 +299,7 @@ export class MergePolicyService {
       if (mergeability?.status === "blocked") {
         throw new SymphonyError("invalid_request", mergeability.reason ?? "Pull request is not currently mergeable");
       }
-      const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState);
+      const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState, projectContext);
       mergeResult = await github.mergePullRequest({
         pullRequestNumber: requireNumber(pullRequest.number),
         expectedHeadSha: headSha,
@@ -304,10 +312,10 @@ export class MergePolicyService {
           : { mergeGate: activeLifecycle.mergeGate ?? null };
       const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge, ...mergeGatePatch });
       const storedMerge = updated.merge ?? merge;
-      await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
+      await this.ensureDoneTransition(latestIssue, storedMerge, sourceState, projectContext);
       return { status, merge: storedMerge };
     } else {
-      const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState);
+      const doneTransition = this.planDoneTransition(latestIssue, mergeId, sourceState, projectContext);
       const serviceLogin = await github.getAuthenticatedLogin();
       mergeResult = recoverAlreadyMergedPullRequest(livePullRequest, serviceLogin);
       status = "already_merged";
@@ -318,14 +326,19 @@ export class MergePolicyService {
           : { mergeGate: activeLifecycle.mergeGate ?? null };
       const updated = await this.options.lifecycleStore.updateIssue(latestIssue, { merge, ...mergeGatePatch });
       const storedMerge = updated.merge ?? merge;
-      await this.ensureDoneTransition(latestIssue, storedMerge, sourceState);
+      await this.ensureDoneTransition(latestIssue, storedMerge, sourceState, projectContext);
       return { status, merge: storedMerge };
     }
   }
 
-  private async ensureDoneTransition(issue: Issue, merge: IssueMergeMetadata, sourceState: string): Promise<void> {
+  private async ensureDoneTransition(
+    issue: Issue,
+    merge: IssueMergeMetadata,
+    sourceState: string,
+    projectContext?: ProjectContextResolution,
+  ): Promise<void> {
     if (statesEqual(issue.state, this.options.config.mergePolicy.doneState)) return;
-    const operation = this.planDoneTransition(issue, merge.id, sourceState);
+    const operation = this.planDoneTransition(issue, merge.id, sourceState, projectContext);
     if (operation.idempotencyKey !== merge.doneTransitionOperationKey) {
       throw new SymphonyError("invalid_request", "Gated merge Done writeback key does not match lifecycle merge metadata");
     }
@@ -348,10 +361,16 @@ export class MergePolicyService {
     }
   }
 
-  private planDoneTransition(issue: Issue, mergeId: string, sourceState: string): Parameters<WritebackProcessor["enqueueAndProcess"]>[0] {
+  private planDoneTransition(
+    issue: Issue,
+    mergeId: string,
+    sourceState: string,
+    projectContext?: ProjectContextResolution,
+  ): Parameters<WritebackProcessor["enqueueAndProcess"]>[0] {
     const operation = planMergeCompletedWritebacks(
       {
         issue,
+        projectContext,
         mergeId,
         fromState: sourceState,
         doneState: this.options.config.mergePolicy.doneState,
@@ -368,6 +387,7 @@ export class MergePolicyService {
     report: IssueCompletionReportRecord,
     gate: MergeGateStatus,
     sourceState: string,
+    projectContext: ProjectContextResolution | undefined,
     existingVerdict: IssueReviewVerdictRecord | null,
   ): Promise<MergePolicyResult> {
     const approvalVerdict = latestCurrentApprovalPassVerdict(lifecycle);
@@ -378,8 +398,8 @@ export class MergePolicyService {
     const reviewRound = newRepairCycle ? lifecycle.reviewRound + 1 : lifecycle.reviewRound;
     const blocked = reviewRound >= this.options.config.reviewLoop.maxReviewRounds;
     const operations = blocked
-      ? planMergeGateBlockedWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config)
-      : planMergeGateRepairWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config);
+      ? planMergeGateBlockedWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound, projectContext), this.options.config)
+      : planMergeGateRepairWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound, projectContext), this.options.config);
     if (operations.length === 0) {
       throw new SymphonyError("invalid_request", "Merge gate failure could not plan service-owned writeback");
     }
@@ -433,9 +453,16 @@ export class MergePolicyService {
     return blocked ? { status: "blocked", gate: resultGate } : { status: "repair_dispatched", gate: resultGate };
   }
 
-  private mergeGateWritebackContext(issue: Issue, gate: MergeGateStatus, sourceState: string, reviewRound: number) {
+  private mergeGateWritebackContext(
+    issue: Issue,
+    gate: MergeGateStatus,
+    sourceState: string,
+    reviewRound: number,
+    projectContext?: ProjectContextResolution,
+  ) {
     return {
       issue,
+      projectContext,
       gateId: gate.id,
       blockerFingerprint: gate.blockerFingerprint,
       fromState: sourceState,
@@ -460,6 +487,7 @@ export class MergePolicyService {
     previousHeadSha: string,
     livePullRequest: PullRequestDetails,
     sourceState: string,
+    projectContext?: ProjectContextResolution,
   ): Promise<MergePolicyResult> {
     const liveHeadSha = requireValue(livePullRequest.headSha, "Live PR head SHA is required for merge gate supersession");
     const gateId = mergeGateId(issue.id, pullRequest, previousHeadSha);
@@ -481,7 +509,7 @@ export class MergePolicyService {
     if (!supersededPatch) throw new SymphonyError("invalid_request", "Merge gate supersession could not build inactive gate state");
     const supersededGate = supersededPatch;
     const operations = planMergeGateHeadSupersessionWritebacks(
-      { issue, gateId, fromState: sourceState, pullRequest, liveHeadSha, reportId: report.id },
+      { issue, projectContext, gateId, fromState: sourceState, pullRequest, liveHeadSha, reportId: report.id },
       this.options.config,
     );
     await this.requireMergeGateWritebacksSucceeded(issue, operations, this.options.config.writeback.dispatchState);
