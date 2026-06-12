@@ -224,25 +224,27 @@ Document the redaction-promotion evidence packet so manual reviewers can verify 
 
 ## Acceptance Criteria
 
-- The evidence instructions identify the exact commands and public-safe fields reviewers should cite.
+- The evidence instructions identify the exact commands and public-safe fields reviewers should cite, including `reviewLoop.lastCompletionReport.runId` and a transcript tail window that reaches the accepted handoff on long runs while clamping to `0` on shorter runs.
 - The instructions tell reviewers to stop if credential values, private keys, or credential-bearing URLs appear.
 
 ## Contract Checklist
 
 - Happy path: the evidence packet points to the exact commands and public-safe fields.
 - Negative/error path: if redaction fails, promotion stops instead of recording unsafe evidence.
-- Adjacent sibling surface: protected docs stay aligned with the quickstart evidence packet.
+- Adjacent sibling surface: protected docs stay aligned with the quickstart evidence packet, including both vendored-Hermes no-touch commands.
 - Empty/missing/stale/fallback state: missing handoff metadata is called out explicitly.
 - Replay/restart/idempotency: rerunning the evidence commands produces the same safe field set.
 - Credential/security boundary: reviewers must never paste credential values into docs or comments.
-- Side-effect verification: reviewers confirm vendored-Hermes no-touch and public transcript fields directly.
+- Side-effect verification: reviewers confirm top-level issue handoff fields, run summary, transcript tail, and vendored-Hermes no-touch status directly.
 
 ## Validation Requirements
 
 - npm test -- tests/issue-contract-lint.test.ts
 - git diff --name-only origin/main...HEAD -- hermes/upstream-src
-- GET /api/v1/issues/<issue-identifier>
-- GET /api/v1/runs/<handoffWorkerRunId>/transcript?offset=0&limit=200
+- git status --short -- hermes/upstream-src
+- GET /api/v1/issues/<issue-identifier> and read `reviewLoop.lastCompletionReport.runId`
+- GET /api/v1/runs/<handoffWorkerRunId>
+- GET /api/v1/runs/<handoffWorkerRunId>/transcript?offset=<max(transcriptEventCount-15,0)>&limit=15
 
 ## Out Of Scope
 
