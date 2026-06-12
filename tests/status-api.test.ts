@@ -645,6 +645,127 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("strips unexpected project context repository/source fields across durable status routes", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const expectedProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "DOCS-CTX",
+      issueId: "issue-docs-ctx",
+      issueIdentifier: "DOCS-CTX",
+      projectContext: expectedProjectContext,
+      path: path.join(config.workspace.root, "DOCS-CTX"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/DOCS-CTX",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-docs-ctx",
+      sessionId: "session-docs-ctx",
+      agentId: "agent-docs-ctx",
+      role: "worker",
+      issueId: "issue-docs-ctx",
+      issueIdentifier: "DOCS-CTX",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "DOCS-CTX",
+      workspacePath: path.join(config.workspace.root, "DOCS-CTX"),
+      gitBranchName: "symphony/DOCS-CTX",
+      repoPath: "/repo",
+      baseRef: "origin/main",
+      projectContext: expectedProjectContext,
+    });
+    await lifecycleStore.ensureIssue(issue({ id: "issue-docs-ctx", identifier: "DOCS-CTX" }), {
+      phase: "implementation",
+      projectContext: expectedProjectContext,
+    } as IssueLifecyclePatch);
+
+    const injectedProjectContext = {
+      ...expectedProjectContext,
+      repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+      path: "packages/site",
+      token: "workspace-secret",
+      profile: { value: "profile-secret" },
+    };
+    const runPath = path.join(config.workspace.stateDir, "runs", "run-docs-ctx", "meta.json");
+    const rawRun = JSON.parse(await readFile(runPath, "utf8")) as Record<string, unknown>;
+    rawRun.projectContext = injectedProjectContext;
+    await writeFile(runPath, `${JSON.stringify(rawRun, null, 2)}\n`, "utf8");
+
+    const workspacePath = path.join(config.workspace.stateDir, "workspaces", "DOCS-CTX.json");
+    const rawWorkspace = JSON.parse(await readFile(workspacePath, "utf8")) as Record<string, unknown>;
+    rawWorkspace.projectContext = injectedProjectContext;
+    await writeFile(workspacePath, `${JSON.stringify(rawWorkspace, null, 2)}\n`, "utf8");
+
+    const lifecyclePath = path.join(config.workspace.stateDir, "issue-lifecycle", "issue-docs-ctx.json");
+    const rawLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as Record<string, unknown>;
+    rawLifecycle.projectContext = injectedProjectContext;
+    await writeFile(lifecyclePath, `${JSON.stringify(rawLifecycle, null, 2)}\n`, "utf8");
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/docs:DOCS-CTX`);
+      const runsResponse = await fetch(`${baseUrl}/api/v1/issues/docs:DOCS-CTX/runs`);
+      const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-docs-ctx`);
+      const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/docs:DOCS-CTX`);
+
+      const issueBody = (await issueResponse.json()) as {
+        workspace: { projectContext: typeof expectedProjectContext } | null;
+        latestRun: { projectContext: typeof expectedProjectContext } | null;
+        lifecycle: { projectContext: typeof expectedProjectContext } | null;
+      };
+      const runsBody = (await runsResponse.json()) as { runs: Array<{ projectContext: typeof expectedProjectContext }> };
+      const runBody = (await runResponse.json()) as { projectContext: typeof expectedProjectContext };
+      const workspaceBody = (await workspaceResponse.json()) as { projectContext: typeof expectedProjectContext };
+
+      expect(issueResponse.status).toBe(200);
+      expect(runsResponse.status).toBe(200);
+      expect(workspaceResponse.status).toBe(200);
+      expect(issueBody.workspace?.projectContext).toEqual(expectedProjectContext);
+      expect(issueBody.latestRun?.projectContext).toEqual(expectedProjectContext);
+      expect(issueBody.lifecycle?.projectContext).toEqual(expectedProjectContext);
+      expect(runsBody.runs).toHaveLength(1);
+      expect(runsBody.runs[0]?.projectContext).toEqual(expectedProjectContext);
+      expect(runBody.projectContext).toEqual(expectedProjectContext);
+      expect(workspaceBody.projectContext).toEqual(expectedProjectContext);
+
+      const serialized = JSON.stringify({ issueBody, runsBody, runBody, workspaceBody });
+      expect(serialized).not.toContain("repo-secret");
+      expect(serialized).not.toContain("x-access-token");
+      expect(serialized).not.toContain("workspace-secret");
+      expect(serialized).not.toContain("profile-secret");
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("resolves legacy unqualified status and transcript aliases through the configured default project context", async () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
@@ -943,6 +1064,172 @@ describe("StatusServer durable API", () => {
       expect(updatedRunsBody.error.message).toContain("default project context");
       expect(updatedWorkspaceBody.error.message).toContain("default project context");
       expect(updatedTranscriptBody.error.message).toContain("default project context");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("preserves exact workspace-key matches across sibling workspaces that share issue aliases", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "ENG-1",
+      issueId: "issue-eng-1",
+      issueIdentifier: "ENG-1",
+      path: path.join(config.workspace.root, "ENG-1"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/ENG-1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.upsertWorkspace({
+      workspaceKey: "ENG-1-planning",
+      issueId: "issue-eng-1",
+      issueIdentifier: "ENG-1",
+      path: path.join(config.workspace.root, "ENG-1-planning"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/ENG-1-planning",
+      createdAt: "2026-01-01T00:00:01.000Z",
+      updatedAt: "2026-01-01T00:00:01.000Z",
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/workspaces/ENG-1-planning`);
+      const body = (await response.json()) as {
+        workspaceKey: string;
+        issueId: string | null;
+        issueIdentifier: string;
+        path: string;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({
+        workspaceKey: "ENG-1-planning",
+        issueId: "issue-eng-1",
+        issueIdentifier: "ENG-1",
+        path: path.join(config.workspace.root, "ENG-1-planning"),
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("derives qualified workspace context from runs and lifecycles when the durable workspace record is legacy-default", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "workspaces"),
+            state_dir: path.join(root, ".symphony"),
+          },
+        },
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "ENG-179",
+      issueId: "issue-docs-workspace-context-1",
+      issueIdentifier: "ENG-179",
+      path: path.join(config.workspace.root, "docs", "ENG-179"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/docs/ENG-179",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-docs-workspace-context-1",
+      sessionId: "session-docs-workspace-context-1",
+      agentId: "agent-docs-workspace-context-1",
+      role: "worker",
+      issueId: "issue-docs-workspace-context-1",
+      issueIdentifier: "ENG-179",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      workspaceKey: "ENG-179",
+      workspacePath: path.join(config.workspace.root, "docs", "ENG-179"),
+      gitBranchName: "symphony/docs/ENG-179",
+      repoPath: "/repo-docs",
+      baseRef: "origin/main",
+      projectContext: docsProjectContext,
+    });
+    await lifecycleStore.ensureIssue(
+      issue({ id: "issue-docs-workspace-context-1", identifier: "ENG-179" }),
+      { phase: "implementation", projectContext: docsProjectContext },
+    );
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/docs:ENG-179`);
+      const workspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/docs:ENG-179`);
+
+      const issueBody = (await issueResponse.json()) as {
+        workspace: { workspaceKey: string; projectContext?: { projectContextId: string } } | null;
+        latestRun: { projectContext?: { projectContextId: string } } | null;
+        lifecycle: { projectContext?: { projectContextId: string } } | null;
+      };
+      const workspaceBody = (await workspaceResponse.json()) as {
+        workspaceKey: string;
+        projectContext?: { projectContextId: string };
+      };
+
+      expect(issueResponse.status).toBe(200);
+      expect(workspaceResponse.status).toBe(200);
+      expect(issueBody.workspace).toMatchObject({
+        workspaceKey: "ENG-179",
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(issueBody.latestRun?.projectContext).toMatchObject({ projectContextId: "docs" });
+      expect(issueBody.lifecycle?.projectContext).toMatchObject({ projectContextId: "docs" });
+      expect(workspaceBody).toMatchObject({
+        workspaceKey: "ENG-179",
+        projectContext: { projectContextId: "docs" },
+      });
     } finally {
       await server.stop();
     }

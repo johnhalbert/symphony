@@ -9,6 +9,7 @@ import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
   normalizeProjectContextId,
   projectContextResolutionFromIssue,
+  type ProjectContextResolution,
 } from "../core/config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
@@ -5892,6 +5893,53 @@ function aliasValuesIntersect(values: readonly string[], keys: ReadonlySet<strin
   return values.some((value) => keys.has(value));
 }
 
+interface WorkspaceContextSource {
+  issueId: string | null;
+  issueIdentifier: string;
+  workspaceKey?: string | null;
+  projectContext?: ProjectContextResolution | undefined;
+}
+
+function workspaceAliasMatchPriority(workspace: WorkspaceRecord, alias: string): number | null {
+  if (workspace.workspaceKey === alias) return 0;
+  if (workspace.issueIdentifier === alias) return 1;
+  if (workspace.issueId === alias) return 2;
+  return null;
+}
+
+function workspaceContextSourcePriority(workspace: WorkspaceRecord, source: WorkspaceContextSource): number | null {
+  if (source.workspaceKey && workspace.workspaceKey === source.workspaceKey) return 0;
+  if (workspace.issueId && source.issueId) return workspace.issueId === source.issueId ? 1 : null;
+  return workspace.issueIdentifier === source.issueIdentifier ? 2 : null;
+}
+
+function resolveWorkspaceProjectContext(
+  workspace: WorkspaceRecord,
+  sources: readonly WorkspaceContextSource[],
+): ProjectContextResolution | undefined {
+  const explicitProjectContext = projectContextResolutionFromIssue(workspace) ?? workspace.projectContext;
+  if (explicitProjectContext && explicitProjectContext.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+    return explicitProjectContext;
+  }
+
+  let bestMatch: { priority: number; legacyRank: number; projectContext: ProjectContextResolution } | null = null;
+  for (const source of sources) {
+    const priority = workspaceContextSourcePriority(workspace, source);
+    const projectContext = projectContextResolutionFromIssue(source) ?? source.projectContext;
+    if (priority === null || !projectContext) continue;
+    const legacyRank = projectContext.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID ? 1 : 0;
+    if (
+      !bestMatch ||
+      priority < bestMatch.priority ||
+      (priority === bestMatch.priority && legacyRank < bestMatch.legacyRank)
+    ) {
+      bestMatch = { priority, legacyRank, projectContext };
+    }
+  }
+
+  return bestMatch?.projectContext ?? explicitProjectContext ?? undefined;
+}
+
 async function resolveIssueAliasData(input: {
   requestKey: string;
   snapshot: RuntimeSnapshot;
@@ -5931,12 +5979,6 @@ async function resolveIssueAliasData(input: {
         projectContextGroupId(projectContextIdForAliasMatching(record), input.defaultProjectContextId) === resolvedGroupId &&
         aliasValuesIntersect(issueAliasValuesForLive(record), lookupKeys),
     ) ?? null;
-  const workspace =
-    workspaces.find(
-      (record) =>
-        projectContextGroupId(projectContextIdForAliasMatching(record), input.defaultProjectContextId) === resolvedGroupId &&
-        aliasValuesIntersect(issueAliasValuesForWorkspace(record), lookupKeys),
-    ) ?? null;
   const resolvedRuns = runs.filter(
     (record) =>
       projectContextGroupId(projectContextIdForAliasMatching(record), input.defaultProjectContextId) === resolvedGroupId &&
@@ -5948,6 +5990,36 @@ async function resolveIssueAliasData(input: {
         projectContextGroupId(projectContextIdForAliasMatching(record), input.defaultProjectContextId) === resolvedGroupId &&
         aliasValuesIntersect(issueAliasValuesForLifecycle(record), lookupKeys),
     ) ?? null;
+  const workspaceContextSources: WorkspaceContextSource[] = [
+    ...(live ? [live] : []),
+    ...resolvedRuns,
+    ...(lifecycle ? [lifecycle] : []),
+  ];
+  const workspaceCandidates = workspaces
+    .map((record) => ({ record, projectContext: resolveWorkspaceProjectContext(record, workspaceContextSources) }))
+    .filter(
+      ({ record, projectContext }) =>
+        projectContextGroupId(projectContext?.projectContextId ?? projectContextIdForAliasMatching(record), input.defaultProjectContextId) ===
+          resolvedGroupId && aliasValuesIntersect(issueAliasValuesForWorkspace(record), lookupKeys),
+    );
+  const prioritizedWorkspaceCandidate = workspaceCandidates.reduce<
+    | { record: WorkspaceRecord; projectContext: ProjectContextResolution | undefined; priority: number }
+    | null
+  >((best, candidate) => {
+    const priority = workspaceAliasMatchPriority(candidate.record, resolution.parsed.alias);
+    if (priority === null) return best;
+    if (!best || priority < best.priority) {
+      return { ...candidate, priority };
+    }
+    return best;
+  }, null);
+  const workspaceCandidate = prioritizedWorkspaceCandidate ?? workspaceCandidates[0] ?? null;
+  const workspace = workspaceCandidate
+    ? {
+        ...workspaceCandidate.record,
+        ...(workspaceCandidate.projectContext ? { projectContext: workspaceCandidate.projectContext } : {}),
+      }
+    : null;
   return {
     status: "resolved",
     requestKey: lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? resolvedRuns.at(-1)?.issueIdentifier ?? live?.issueIdentifier ?? input.requestKey,
