@@ -22,6 +22,7 @@ export interface Issue {
   assignedToWorker: boolean;
   labels: string[];
   blockedBy: IssueBlockerRef[];
+  hasChildren?: boolean;
   createdAt: string | null;
   updatedAt: string | null;
 }
@@ -39,6 +40,7 @@ export interface IssueStatusView {
   delegateId: string | null;
   labels: string[];
   blockedBy: IssueBlockerRef[];
+  hasChildren?: boolean;
   createdAt: string | null;
   updatedAt: string | null;
 }
@@ -203,9 +205,9 @@ export interface Workspace {
   baseRef?: string;
 }
 
-export type AgentRunRole = "worker" | "reviewer";
-export type AgentRunPhase = "issue_breakdown" | "implementation" | "merge_conflict_resolution" | "review";
-export type AgentRunKind = "planning" | "implementation" | "review";
+export type AgentRunRole = "worker" | "reviewer" | "triage";
+export type AgentRunPhase = "issue_breakdown" | "implementation" | "merge_conflict_resolution" | "review" | "issue_triage";
+export type AgentRunKind = "planning" | "implementation" | "review" | "triage";
 
 export function runKindForPhase(runPhase: AgentRunPhase): AgentRunKind {
   switch (runPhase) {
@@ -213,6 +215,8 @@ export function runKindForPhase(runPhase: AgentRunPhase): AgentRunKind {
       return "planning";
     case "review":
       return "review";
+    case "issue_triage":
+      return "triage";
     case "merge_conflict_resolution":
     case "implementation":
       return "implementation";

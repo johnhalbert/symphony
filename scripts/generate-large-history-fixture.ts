@@ -1031,6 +1031,7 @@ function buildLifecycleRecord(input: {
     planningDispatchRetryCount: input.issueIndex % 17 === 0 ? 1 : 0,
     lastPlanningFailureRunId: input.issueIndex % 13 === 0 ? input.runs[0]?.runId ?? null : null,
     lastPlanningFailureAt: input.issueIndex % 13 === 0 ? iso(input.issueStartMs + 5 * 60 * 1000) : null,
+    lastIssueTriageReportId: null,
     lastCompletionReportId: completionReports.at(-1)?.id ?? null,
     lastReviewVerdictId: reviewVerdicts.at(-1)?.id ?? null,
     blockedReason: phase === "blocked" ? (isPendingFixturePublicationApproval(input.issueIndex) ? PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON : "Synthetic large-history fixture blocker") : null,
@@ -1075,6 +1076,7 @@ function buildLifecycleRecord(input: {
     completionReports,
     reviewVerdicts,
     reviewFeedback: [],
+    issueTriageReports: [],
     reviewEvidence: {
       pullRequest: null,
       lastIngestedCursor: null,

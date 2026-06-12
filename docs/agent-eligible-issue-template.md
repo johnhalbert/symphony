@@ -56,7 +56,8 @@ Mark every surface that the issue is expected to touch. When a protected or high
 ## Contract Checklist
 
 Use this checklist as planning context for the JSON requirements and validation
-plan. It is not a substitute for the fenced JSON contract.
+plan. It is not a substitute for the fenced JSON contract. Each lane must name
+concrete coverage or a reasoned `N/A` that explains why the lane does not apply.
 
 - Happy path:
 - Negative/error path:
@@ -71,6 +72,8 @@ plan. It is not a substitute for the fenced JSON contract.
 - Name the smallest meaningful unit or integration tests.
 - Name broader validation when shared orchestration, workflow, tracker, harness, or persistence code is touched.
 - Include manual or API checks needed to verify side effects actually happened.
+- Avoid generic validation such as "run tests"; name the command, test file,
+  endpoint/API check, or manual verification path.
 
 ## Out Of Scope
 

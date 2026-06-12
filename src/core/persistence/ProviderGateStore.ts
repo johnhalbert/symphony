@@ -36,8 +36,8 @@ export class FileProviderGateStore implements ProviderGateStore {
       observedAt: normalized.observedAt ?? now,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
-      affectedRoles: ["worker", "reviewer"],
-      affectedRunPhases: ["issue_breakdown", "implementation", "merge_conflict_resolution", "review"],
+      affectedRoles: ["worker", "reviewer", "triage"],
+      affectedRunPhases: ["issue_breakdown", "implementation", "merge_conflict_resolution", "review", "issue_triage"],
       source: normalized.source ?? null,
       ...(normalized.raw === undefined ? {} : { raw: sanitizePublicJson(normalized.raw, 1_000) }),
     };

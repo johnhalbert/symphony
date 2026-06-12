@@ -1031,6 +1031,7 @@ function lifecycleWithReports(overrides: { lastCompletionReportId: string; compl
     planningDispatchRetryCount: 0,
     lastPlanningFailureRunId: null,
     lastPlanningFailureAt: null,
+    lastIssueTriageReportId: null,
     lastCompletionReportId: overrides.lastCompletionReportId,
     lastReviewVerdictId: null,
     blockedReason: null,
@@ -1040,6 +1041,7 @@ function lifecycleWithReports(overrides: { lastCompletionReportId: string; compl
     completionReports: overrides.completionReports,
     reviewVerdicts: [],
     reviewFeedback: [],
+    issueTriageReports: [],
     reviewEvidence: {
       pullRequest: null,
       lastIngestedCursor: null,

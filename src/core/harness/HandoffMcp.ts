@@ -2,6 +2,7 @@ import path from "node:path";
 import type { AgentHarness, AgentRunContext, OperatorChatRunContext } from "./AgentHarness.js";
 import { writeCompletionReportMcpContext } from "./CompletionReportMcpServer.js";
 import { writeIssueBreakdownPlanMcpContext } from "./IssueBreakdownPlanMcpServer.js";
+import { writeIssueTriageMcpContext } from "./IssueTriageMcpServer.js";
 import { writeMergeConflictResolutionMcpContext } from "./MergeConflictResolutionMcpServer.js";
 import {
   buildMcpSubprocessServerConfig,
@@ -56,6 +57,12 @@ export function symphonyRoleMcpServers(
   if (ctx.role === "worker" && currentRunPhase(ctx) === "issue_breakdown") {
     return {
       symphony_planning: applyCwd(issueBreakdownPlanMcpServerConfig(ctx, issueBreakdownPlanContextFilePath(ctx), options)),
+      ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
+    };
+  }
+  if (ctx.role === "triage" && currentRunPhase(ctx) === "issue_triage") {
+    return {
+      symphony_triage: applyCwd(issueTriageMcpServerConfig(ctx, issueTriageContextFilePath(ctx), options)),
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
     };
   }
@@ -179,6 +186,25 @@ export function renderIssueBreakdownMcpHandoffPrompt(input: RuntimeHandoffPrompt
   ].join("\n");
 }
 
+export function renderIssueTriageMcpHandoffPrompt(input: RuntimeHandoffPromptInput): string {
+  return [
+    "",
+    "Symphony MCP issue-triage handoff:",
+    `- Active issue: ${input.issue.identifier} (${input.issue.id})`,
+    "- Active role: triage",
+    "- Active phase: issue_triage",
+    `- Workspace path: ${input.workspacePath ?? "n/a"}`,
+    `- Repository path: ${input.repoPath ?? "n/a"}`,
+    `- Base ref: ${input.baseRef ?? "n/a"}`,
+    "- Before ending the run, call the submit_issue_triage_report MCP tool with disposition, confidence, summary, evidence, recommendedAction, and idempotencyKey.",
+    "- This is classify-only triage. Inspect the lifecycle evidence and repository context as needed, but do not edit files, create commits, push branches, transition Linear state, comment on Linear, or create subissues.",
+    "- Use disposition=\"decompose_issue\" only when the failures show hidden or under-specified scope that should be converted into smaller blocking child issues.",
+    "- Use repair/refinement dispositions for non-decomposition failures such as validation gaps, merge-gate-only failures, infrastructure problems, PR retargeting, or orchestrator context defects.",
+    "- Evidence must name concrete lifecycle records, review findings, merge-gate facts, commands, logs, or code paths that support the classification.",
+    "- Symphony persists the triage report locally for operator follow-up; it does not automatically modify the issue.",
+  ].join("\n");
+}
+
 export function renderMergeConflictResolutionMcpHandoffPrompt(input: RuntimeHandoffPromptInput): string {
   return [
     "",
@@ -259,6 +285,17 @@ async function writeHandoffMcpContexts(
     });
     return;
   }
+  if (ctx.role === "triage" && phase === "issue_triage") {
+    await writeIssueTriageMcpContext(issueTriageContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: input.activeRunId,
+      role: "triage",
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "issue_triage",
+    });
+    return;
+  }
   if (ctx.role !== "reviewer") return;
   await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
     issue: ctx.issue,
@@ -328,6 +365,20 @@ export function issueBreakdownPlanMcpServerConfig(
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
     command: "issue-breakdown-plan-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
+}
+
+export function issueTriageMcpServerConfig(
+  ctx: AgentRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "issue-triage-mcp",
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
@@ -414,6 +465,14 @@ export function issueBreakdownPlanContextFilePath(ctx: AgentRunContext): string 
   );
 }
 
+export function issueTriageContextFilePath(ctx: AgentRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "issue-triage-mcp",
+    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
+  );
+}
+
 export function reviewVerdictContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
@@ -447,7 +506,7 @@ export function operatorChatContextFilePath(ctx: OperatorChatRunContext): string
 }
 
 export function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
-  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
+  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : "implementation");
 }
 
 function operatorChatRunContextFromAgentContext(ctx: AgentRunContext): OperatorChatRunContext {

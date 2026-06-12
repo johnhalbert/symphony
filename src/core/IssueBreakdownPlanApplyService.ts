@@ -229,6 +229,26 @@ export function planIssueBreakdownFinalizationWritebacks(
 ): NewWritebackOperation[] {
   const operations: NewWritebackOperation[] = [];
   const refsByIndex = new Map(plan.createdIssueRefs.map((ref) => [ref.proposedIssueIndex, ref]));
+  for (const ref of plan.createdIssueRefs) {
+    operations.push({
+      idempotencyKey: `issue-relation:${issue.id}:${plan.id}:${ref.proposedIssueIndex}:parent`,
+      kind: "issue_relation",
+      issueId: issue.id,
+      runId: plan.runId,
+      payload: {
+        planId: plan.id,
+        sourceIssueId: ref.id,
+        sourceIssueIdentifier: ref.identifier,
+        targetIssueId: issue.id,
+        targetIssueIdentifier: issue.identifier,
+        type: "blocks",
+        dependency: `Blocks parent issue ${issue.identifier}`,
+        dedupeKey: `issue-breakdown-parent-relation:${plan.id}:${ref.proposedIssueIndex}`,
+        sourceProposedIssueIndex: ref.proposedIssueIndex,
+        targetProposedIssueIndex: -1,
+      },
+    });
+  }
   for (const relation of dependencyRelations(plan)) {
     const source = refsByIndex.get(relation.sourceProposedIssueIndex);
     const target = refsByIndex.get(relation.targetProposedIssueIndex);

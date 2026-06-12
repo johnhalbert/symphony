@@ -107,8 +107,9 @@ export class ReviewVerdictService {
       evidence: verdict.evidence,
     };
     const reviewRound = verdict.verdict === "fail" ? nextReviewRound(lifecycle) : lifecycle.reviewRound;
+    const maxReviewerFailures = this.options.config.reviewLoop.failureLimits.reviewerFailures;
     const ceilingReached =
-      verdict.verdict === "fail" && reviewRound >= this.options.config.reviewLoop.maxReviewRounds;
+      verdict.verdict === "fail" && reviewRound >= maxReviewerFailures;
     const provisionalVerdict: IssueReviewVerdictRecord = {
       id: verdictIdFor(context.issue.id, verdict.idempotencyKey),
       idempotencyKey: verdict.idempotencyKey,
@@ -129,11 +130,11 @@ export class ReviewVerdictService {
             {
               issue: context.issue,
               runId: verdict.runId,
-              reason: `max review rounds reached (${reviewRound}/${this.options.config.reviewLoop.maxReviewRounds})`,
+              reason: `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`,
               incompleteTurnCount: lifecycle.incompleteTurnCount,
               maxIncompleteTurns: this.options.config.reviewLoop.maxIncompleteTurns,
               reviewRound,
-              maxReviewRounds: this.options.config.reviewLoop.maxReviewRounds,
+              maxReviewRounds: maxReviewerFailures,
               lastCompletionReport: latestCompletionReport(lifecycle),
               lastReviewVerdict: provisionalVerdict,
               requiredAction:
@@ -162,7 +163,7 @@ export class ReviewVerdictService {
       ...(verdict.verdict === "fail" ? { reviewRound } : {}),
       incompleteTurnCount: verdict.verdict === "fail" ? 0 : lifecycle.incompleteTurnCount,
       blockedReason: ceilingReached
-        ? `max review rounds reached (${reviewRound}/${this.options.config.reviewLoop.maxReviewRounds})`
+        ? `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`
         : null,
       lastReviewVerdictId: storedVerdict.id,
       reviewVerdicts: [...lifecycle.reviewVerdicts, storedVerdict],
@@ -230,7 +231,7 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
     `Review run: ${verdict.runId}`,
     "",
     "Lifecycle counters:",
-    `- Review rounds: ${lifecycle.reviewRound}`,
+    `- Reviewer failures: ${lifecycle.reviewRound}`,
     `- Incomplete worker turns: ${lifecycle.incompleteTurnCount}`,
     `- Lifecycle phase: ${lifecycle.phase}`,
     "",

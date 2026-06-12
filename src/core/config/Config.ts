@@ -35,6 +35,13 @@ const rawConfigSchema = z
         reviewer_prompt_extensions: stringArray.optional(),
         worker_prompt_extensions: stringArray.optional(),
         max_review_rounds: z.number().int().positive().optional(),
+        failure_limits: z
+          .object({
+            reviewer_failures: z.number().int().positive().optional(),
+            merge_gate_failures: z.number().int().positive().optional(),
+          })
+          .passthrough()
+          .optional(),
         max_incomplete_turns: z.number().int().positive().optional(),
         continuation_history_threshold: z.number().int().nonnegative().optional(),
         transcript_history_limit: z.number().int().nonnegative().optional(),
@@ -121,6 +128,14 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    issue_triage: z
+      .object({
+        enabled: z.boolean().optional(),
+        mode: z.enum(["classify_only"]).optional(),
+        max_attempts_per_trigger: z.number().int().positive().optional(),
+      })
+      .passthrough()
+      .optional(),
     polling: z
       .object({
         interval_ms: z.number().int().positive().optional(),
@@ -168,6 +183,8 @@ const rawConfigSchema = z
         max_concurrent_agents_by_state: z.record(z.string(), z.number()).optional(),
         require_labels: stringArray.optional(),
         exclude_labels: stringArray.optional(),
+        worker_exclude_labels: stringArray.optional(),
+        reviewer_exclude_labels: stringArray.optional(),
         protected_paths: stringArray.optional(),
       })
       .passthrough()
@@ -358,6 +375,8 @@ export interface AgentConfig {
   maxConcurrentAgentsByState: Map<string, number>;
   requireLabels: string[];
   excludeLabels: string[];
+  workerExcludeLabels: string[];
+  reviewerExcludeLabels: string[];
   protectedPaths: string[];
 }
 
@@ -500,10 +519,16 @@ export interface ReviewLoopConfig {
   reviewerPromptExtensions: string[];
   workerPromptExtensions: string[];
   maxReviewRounds: number;
+  failureLimits: ReviewLoopFailureLimitsConfig;
   maxIncompleteTurns: number;
   continuationHistoryThreshold: number;
   transcriptHistoryLimit: number;
   prReviewEvidenceLimit: number;
+}
+
+export interface ReviewLoopFailureLimitsConfig {
+  reviewerFailures: number;
+  mergeGateFailures: number;
 }
 
 export interface MergePolicyConfig {
@@ -551,6 +576,12 @@ export interface IssueBreakdownConfig {
   planningRetryMaxMs: number;
 }
 
+export interface IssueTriageConfig {
+  enabled: boolean;
+  mode: "classify_only";
+  maxAttemptsPerTrigger: number;
+}
+
 export interface IssueBoardConfig {
   columns: IssueBoardColumnMapping;
 }
@@ -578,6 +609,7 @@ export interface ServiceConfig {
   continuationContext: ContinuationContextConfig;
   database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
+  issueTriage: IssueTriageConfig;
   raw: RawWorkflowConfig;
 }
 
@@ -877,6 +909,8 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       maxConcurrentAgentsByState: normalizeStateLimitMap(raw.agent?.max_concurrent_agents_by_state),
       requireLabels: normalizeLabels(raw.agent?.require_labels),
       excludeLabels: normalizeLabels(raw.agent?.exclude_labels),
+      workerExcludeLabels: normalizeLabels(raw.agent?.worker_exclude_labels),
+      reviewerExcludeLabels: normalizeLabels(raw.agent?.reviewer_exclude_labels),
       protectedPaths: raw.agent?.protected_paths ?? [],
     },
     cursor: {
@@ -960,6 +994,10 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       reviewerPromptExtensions: normalizePromptExtensions(raw.review_loop?.reviewer_prompt_extensions),
       workerPromptExtensions: normalizePromptExtensions(raw.review_loop?.worker_prompt_extensions),
       maxReviewRounds: raw.review_loop?.max_review_rounds ?? 3,
+      failureLimits: {
+        reviewerFailures: raw.review_loop?.failure_limits?.reviewer_failures ?? raw.review_loop?.max_review_rounds ?? 3,
+        mergeGateFailures: raw.review_loop?.failure_limits?.merge_gate_failures ?? raw.review_loop?.max_review_rounds ?? 3,
+      },
       maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
       continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
       transcriptHistoryLimit: raw.review_loop?.transcript_history_limit ?? raw.review_loop?.continuation_history_threshold ?? 5,
@@ -989,6 +1027,11 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
         raw.issue_breakdown?.max_planning_dispatch_retries ?? raw.issue_breakdown?.max_planning_failures ?? 3,
       planningRetryBaseMs: raw.issue_breakdown?.planning_retry_base_ms ?? 5_000,
       planningRetryMaxMs: raw.issue_breakdown?.planning_retry_max_ms ?? 60_000,
+    },
+    issueTriage: {
+      enabled: raw.issue_triage?.enabled ?? false,
+      mode: raw.issue_triage?.mode ?? "classify_only",
+      maxAttemptsPerTrigger: raw.issue_triage?.max_attempts_per_trigger ?? 1,
     },
     raw,
   };

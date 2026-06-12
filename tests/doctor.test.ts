@@ -131,6 +131,29 @@ describe("doctor review-loop checks", () => {
     });
   });
 
+  it("warns when an agent-eligible issue has an under-specified contract", () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.excludeLabels = ["dogfood-blocked"];
+
+    expect(
+      issueContractDoctorCheck(config, [
+        issue({
+          labels: ["dogfood-ready"],
+          description: agentEligibleIssueContract({
+            issueContractRequirements: [{ id: "REQ-001", requirement: "Complete the documented work." }],
+            contractChecklist: ["- Happy path: covered.", "- Negative/error path: covered."],
+            validationRequirements: ["- Run tests."],
+          }),
+        }),
+      ]),
+    ).toMatchObject({
+      id: "linear.issue_contract",
+      status: "warn",
+      message: expect.stringContaining("TEST-1 has an under-specified contract"),
+    });
+  });
+
   it("warns when an agent-eligible candidate issue declares protected workflow paths", () => {
     const config = testConfig("/tmp/symphony-doctor");
     config.agent.requireLabels = ["dogfood-ready"];
@@ -880,6 +903,30 @@ github:
     ]);
   });
 
+  it("includes issue triage MCP tool checks when triage is enabled", async () => {
+    const config = testConfig("/tmp/symphony-doctor");
+    config.issueTriage.enabled = true;
+    config.tracker.activeStates = ["Todo", "In Progress"];
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+
+    const checks = await reviewLoopDoctorChecks(config, {
+      workflowPath: "/tmp/symphony-doctor/WORKFLOW.md",
+      mcpToolLister: async ({ command }) => mcpToolsFor(command),
+      linearStateLister: async () => [linearTeam(["Todo", "In Progress", "In Review", "Blocked", "Ready to Merge", "Done"])],
+    });
+
+    expect(checks).toContainEqual({
+      id: "review_loop.mcp_tools",
+      status: "ok",
+      message:
+        "Configured MCP subprocess runner lists tools: submit_completion_report, submit_review_verdict, submit_pull_request_review_feedback, submit_issue_triage_report",
+    });
+  });
+
+
   it("allows PR handoff states to differ from reviewer-agent states", async () => {
     const config = testConfig("/tmp/symphony-doctor");
     config.tracker.activeStates = ["Todo", "In Progress"];
@@ -1340,6 +1387,7 @@ function mcpToolsFor(command: string): string[] {
   if (command === "completion-report-mcp") return ["submit_completion_report"];
   if (command === "review-verdict-mcp") return ["submit_review_verdict"];
   if (command === "review-feedback-mcp") return ["submit_pull_request_review_feedback"];
+  if (command === "issue-triage-mcp") return ["submit_issue_triage_report"];
   return [];
 }
 

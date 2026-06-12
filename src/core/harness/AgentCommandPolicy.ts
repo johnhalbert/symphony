@@ -33,7 +33,7 @@ const SENSITIVE_ASSIGNMENT_PATTERN =
   /(\b([A-Za-z_][A-Za-z0-9_]*)\b\s*=\s*)("(?:[^"\\]|\\.)*(?:"|$)|'(?:[^'\\]|\\.)*(?:'|$)|[^\s"',}]+)/g;
 const REDACTED_ASSIGNMENT_VALUE = "[redacted]";
 
-const RESTRICTED_ROLES = new Set(["worker", "reviewer", "merge-conflict-repair-worker", "merge_conflict_repair_worker"]);
+const RESTRICTED_ROLES = new Set(["worker", "reviewer", "triage", "merge-conflict-repair-worker", "merge_conflict_repair_worker"]);
 const LOCAL_INSPECTION_GIT_SUBCOMMANDS = new Set(["status", "diff", "log", "show", "branch", "blame"]);
 const LOCAL_GIT_INSPECTION_ALLOW_MESSAGE = "Allowed helper-free local Git inspection command.";
 const LOCAL_GIT_HELPER_DENY_MESSAGE =

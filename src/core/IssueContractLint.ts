@@ -3,8 +3,47 @@ import type { Issue } from "./types.js";
 
 const ISSUE_CONTRACT_HEADING = "Issue Contract";
 const TOUCHED_SURFACES_HEADING = "Touched Surfaces";
+const CONTRACT_CHECKLIST_HEADING = "Contract Checklist";
+const VALIDATION_REQUIREMENTS_HEADING = "Validation Requirements";
 const PROMOTION_READINESS_HEADING = "Promotion Readiness";
 const STABLE_REQUIREMENT_ID_PATTERN = /^[a-z][a-z0-9._:-]*$/i;
+const GENERIC_SINGLE_REQUIREMENTS = new Set([
+  "complete the documented work",
+  "do the work",
+  "implement this",
+  "implement the work",
+  "done",
+  "finish the task",
+  "complete this task",
+]);
+const PLACEHOLDER_CHECKLIST_VALUES = new Set([
+  "",
+  "covered",
+  "done",
+  "yes",
+  "ok",
+  "okay",
+  "handled",
+  "implemented",
+  "n/a",
+  "na",
+  "none",
+  "not applicable",
+  "todo",
+  "tbd",
+  "unknown",
+  "same as above",
+]);
+const GENERIC_VALIDATION_VALUES = new Set([
+  "add tests",
+  "run tests",
+  "run the tests",
+  "run relevant tests",
+  "run unit tests",
+  "run integration tests",
+  "run the narrow test",
+  "focused validation covers the acceptance criteria",
+]);
 const BLOCKER_PLACEHOLDER_VALUES = new Set([
   'if any protected path is listed above, keep this issue manual-only with "ready for `dogfood-ready`: no" and explain the operator blocker here',
   "n/a",
@@ -36,6 +75,7 @@ export const AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS = [
 export interface IssueContractAnalysis {
   missingSections: string[];
   issueContractErrors: string[];
+  underSpecifiedContractErrors: string[];
   protectedSurfaceMatches: string[];
   readyForDogfoodReady: boolean | null;
   remainingBlocker: string | null;
@@ -74,10 +114,17 @@ export function analyzeIssueContractDescription(
   const sections = markdownSections(content);
   const issueContract = sections.get(normalizeHeading(ISSUE_CONTRACT_HEADING));
   const touchedSurfaces = sections.get(normalizeHeading(TOUCHED_SURFACES_HEADING)) ?? "";
+  const contractChecklist = sections.get(normalizeHeading(CONTRACT_CHECKLIST_HEADING));
+  const validationRequirements = sections.get(normalizeHeading(VALIDATION_REQUIREMENTS_HEADING));
   const promotionReadiness = sections.get(normalizeHeading(PROMOTION_READINESS_HEADING)) ?? "";
   return {
     missingSections: missingRequiredIssueContractSections(content),
     issueContractErrors: validateIssueContractSection(issueContract),
+    underSpecifiedContractErrors: [
+      ...validateIssueContractSpecificity(issueContract),
+      ...validateContractChecklistSpecificity(contractChecklist),
+      ...validateValidationRequirementsSpecificity(validationRequirements),
+    ],
     protectedSurfaceMatches: findProtectedSurfaceMatches(touchedSurfaces, protectedPaths),
     readyForDogfoodReady: parseReadyForDogfoodReady(promotionReadiness),
     remainingBlocker: parseRemainingBlocker(promotionReadiness),
@@ -177,11 +224,69 @@ function validateIssueContractSection(section: string | undefined): string[] {
   return errors;
 }
 
+function validateIssueContractSpecificity(section: string | undefined): string[] {
+  if (section === undefined) return [];
+  const parsed = parseIssueContractJson(section);
+  if (!parsed || !isRecord(parsed)) return [];
+  const requirements = parsed.requirements;
+  if (!Array.isArray(requirements) || requirements.length !== 1) return [];
+  const requirement = requirements[0];
+  if (!isRecord(requirement)) return [];
+  const text = normalizeSpecificityText(typeof requirement.requirement === "string" ? requirement.requirement : "");
+  if (!GENERIC_SINGLE_REQUIREMENTS.has(text)) return [];
+  return ["Issue Contract single requirement is too generic; split the required behavior into concrete reviewable obligations"];
+}
+
+const REQUIRED_CONTRACT_CHECKLIST_LANES = [
+  "Happy path",
+  "Negative/error path",
+  "Adjacent sibling surface",
+  "Empty/missing/stale/fallback state",
+  "Replay/restart/idempotency",
+  "Credential/security boundary",
+  "Side-effect verification",
+] as const;
+
+function validateContractChecklistSpecificity(section: string | undefined): string[] {
+  if (section === undefined) return [];
+  const lanes = parseChecklistLanes(section);
+  const errors: string[] = [];
+  for (const lane of REQUIRED_CONTRACT_CHECKLIST_LANES) {
+    const value = lanes.get(normalizeChecklistLane(lane));
+    if (value === undefined) {
+      errors.push(`Contract Checklist must include "${lane}"`);
+      continue;
+    }
+    if (!isMeaningfulChecklistValue(value)) {
+      errors.push(`Contract Checklist "${lane}" must include concrete coverage or a reasoned N/A`);
+    }
+  }
+  return errors;
+}
+
+function validateValidationRequirementsSpecificity(section: string | undefined): string[] {
+  if (section === undefined) return [];
+  const text = stripMarkdownListMarkers(section)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join("\n");
+  if (text.length === 0) {
+    return ["Validation Requirements must name concrete tests, commands, files, API checks, or manual verification"];
+  }
+  const normalized = normalizeSpecificityText(text);
+  if (GENERIC_VALIDATION_VALUES.has(normalized)) {
+    return ["Validation Requirements are too generic; name concrete tests, commands, files, API checks, or manual verification"];
+  }
+  if (hasConcreteValidationSignal(text)) return [];
+  return ["Validation Requirements must name concrete tests, commands, files, API checks, or manual verification"];
+}
+
 export function requiresAgentEligibleIssueContract(issue: Issue, config: ServiceConfig): boolean {
   if (!issue.assignedToWorker) return false;
   if (!containsName(config.tracker.activeStates, issue.state)) return false;
   if (!containsAllLabels(issue.labels, config.agent.requireLabels)) return false;
   if (containsAnyLabel(issue.labels, config.agent.excludeLabels)) return false;
+  if (containsAnyLabel(issue.labels, config.agent.workerExcludeLabels)) return false;
   return true;
 }
 
@@ -189,6 +294,7 @@ function emptyIssueContractAnalysis(): IssueContractAnalysis {
   return {
     missingSections: [],
     issueContractErrors: [],
+    underSpecifiedContractErrors: [],
     protectedSurfaceMatches: [],
     readyForDogfoodReady: null,
     remainingBlocker: null,
@@ -299,6 +405,62 @@ function parseRemainingBlocker(section: string): string | null {
   }
 
   return null;
+}
+
+function parseIssueContractJson(section: string): unknown | null {
+  const fencedJson = extractFencedJsonBlock(section);
+  if (!fencedJson) return null;
+  try {
+    return JSON.parse(fencedJson);
+  } catch {
+    return null;
+  }
+}
+
+function parseChecklistLanes(section: string): Map<string, string> {
+  const lanes = new Map<string, string>();
+  for (const line of stripMarkdownListMarkers(section)) {
+    const match = line.match(/^([^:]+):\s*(.*)$/);
+    if (!match) continue;
+    const lane = normalizeChecklistLane(match[1] ?? "");
+    const value = (match[2] ?? "").trim();
+    if (!lane) continue;
+    lanes.set(lane, value);
+  }
+  return lanes;
+}
+
+function stripMarkdownListMarkers(section: string): string[] {
+  return section
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/^[-*]\s+(?:\[[ xX]\]\s*)?/, ""));
+}
+
+function normalizeChecklistLane(value: string): string {
+  return normalizeHeading(value.replace(/\//g, " "));
+}
+
+function isMeaningfulChecklistValue(value: string): boolean {
+  const normalized = normalizeSpecificityText(value);
+  if (PLACEHOLDER_CHECKLIST_VALUES.has(normalized)) return false;
+  if (normalized.length < 12) return false;
+  if (/^(?:n\/a|na|none|not applicable)\b/.test(normalized)) {
+    return normalized.split(" ").length >= 5 && /\b(because|due to|out of scope|does not|no)\b/.test(normalized);
+  }
+  return true;
+}
+
+function hasConcreteValidationSignal(value: string): boolean {
+  return (
+    /`[^`]+`/.test(value) ||
+    /\b(?:npm|pnpm|yarn|vitest|jest|tsx|tsc|pytest|cargo|go test|curl|gh)\b/i.test(value) ||
+    /\b[\w./\\-]+\.(?:test|spec)\.(?:ts|tsx|js|jsx|py|rs|go)\b/i.test(value) ||
+    /\b(?:src|tests|docs|migrations|packages|apps)[/\\][\w./\\-]+\b/i.test(value) ||
+    /\b(?:api|http|endpoint|request|response)\b.*\b(?:check|call|verify|assert|inspect|smoke)\b/i.test(value) ||
+    /\b(?:check|call|verify|assert|inspect|smoke)\b.*\b(?:api|http|endpoint|request|response)\b/i.test(value) ||
+    /\bmanual(?:ly)?\b.*\b(?:verify|check|inspect|confirm|smoke)\b/i.test(value) ||
+    /\b(?:verify|check|inspect|confirm|smoke)\b.*\bmanual(?:ly)?\b/i.test(value)
+  );
 }
 
 function findProtectedSurfaceMatches(text: string, protectedPaths: readonly string[]): string[] {
@@ -439,6 +601,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function normalizeBlockerText(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!,;:]+$/g, "");
+}
+
+function normalizeSpecificityText(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[`"'()]+/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[.!,;:]+$/g, "");
 }
 
 function normalizeHeading(value: string): string {

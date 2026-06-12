@@ -34,6 +34,7 @@ import {
   planIssueBreakdownFinalizationWritebacks,
 } from "../src/core/IssueBreakdownPlanApplyService.js";
 import { IssueBreakdownPlanService } from "../src/core/IssueBreakdownPlanService.js";
+import { IssueTriageService, issueTriageTriggerFingerprint } from "../src/core/IssueTriageService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
 import {
@@ -1820,6 +1821,74 @@ describe("Orchestrator", () => {
     expect(harness.runs).toHaveLength(0);
   });
 
+  it("skips worker dispatch for worker-scoped excluded labels", async () => {
+    const config = testConfig(root);
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.workerExcludeLabels = ["review_only"];
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready", "review_only"] });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+  });
+
+  it("skips worker dispatch for parent issues with children", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo", hasChildren: true });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+  });
+
   it("does not retry after a handoff state", async () => {
     const config = testConfig(root);
     config.tracker.handoffStates = ["Human Review"];
@@ -2236,7 +2305,7 @@ describe("Orchestrator", () => {
     }
   });
 
-  it("blocks a reviewer fail verdict at the max review round ceiling", async () => {
+  it("blocks a reviewer fail verdict at the max reviewer failure ceiling", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.mode = "live";
@@ -2244,6 +2313,7 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.blockedStates = ["Blocked"];
     config.reviewLoop.maxReviewRounds = 1;
+    config.reviewLoop.failureLimits.reviewerFailures = 1;
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
     const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
     let currentState = "In Review";
@@ -2294,7 +2364,7 @@ describe("Orchestrator", () => {
     expect(harness.runs).toEqual([{ role: "reviewer", runId: "review-run-1" }]);
     expect(currentState).toBe("Blocked");
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual(["review-run-1:blocked-escalation"]);
-    expect(writer.comments[0]?.body).toContain("max review rounds reached (1/1)");
+    expect(writer.comments[0]?.body).toContain("max reviewer failures reached (1/1)");
     expect(writer.comments[0]?.body).toContain("Review rounds: 1 / 1");
     expect(writer.comments[0]?.body).toContain("Last completion report:");
     expect(writer.comments[0]?.body).toContain("Last review verdict:");
@@ -2304,8 +2374,73 @@ describe("Orchestrator", () => {
       phase: "blocked",
       reviewRound: 1,
       incompleteTurnCount: 0,
-      blockedReason: "max review rounds reached (1/1)",
+      blockedReason: "max reviewer failures reached (1/1)",
       lastReviewVerdictId: "review-verdict:issue-1:review-verdict-fail-1",
+    });
+  });
+
+  it("dispatches classify-only issue triage for max-failure blocked issues", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("Blocked") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const harness = new IssueTriageAcceptingHarness(lifecycleStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "issue triage dispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "issue triage completion");
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx.role).toBe("triage");
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_triage");
+    expect(harness.runs[0]?.prompt).toContain("submit_issue_triage_report");
+    expect(harness.runs[0]?.prompt).toContain("Disposition choices:");
+    expect(harness.runs[0]?.prompt).toContain("Do not edit files");
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      lastIssueTriageReportId: "issue-triage-report:issue-1:triage-run-1",
+      issueTriageReports: [
+        {
+          runId: "triage-run-1",
+          disposition: "decompose_issue",
+          confidence: "high",
+        },
+      ],
+    });
+    await expect(runStore.getRun("triage-run-1")).resolves.toMatchObject({
+      role: "triage",
+      runPhase: "issue_triage",
+      runKind: "triage",
+      status: "succeeded",
     });
   });
 
@@ -4327,6 +4462,98 @@ describe("Orchestrator", () => {
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 0 });
   });
 
+  it("allows reviewer dispatch for worker-scoped excluded labels", async () => {
+    const config = testConfig(root);
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.workerExcludeLabels = ["review_only"];
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1", labels: ["dogfood-ready", "review_only"] });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("In Review") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "review_only reviewer dispatch");
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx.role).toBe("reviewer");
+  });
+
+  it("skips reviewer dispatch for reviewer-scoped excluded labels", async () => {
+    const config = testConfig(root);
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.reviewerExcludeLabels = ["no-agent-review"];
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1", labels: ["dogfood-ready", "no-agent-review"] });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("In Review") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+  });
+
   it("instructs default reviewer prompts to leave PR feedback before verdict submission", async () => {
     const config = testConfig(root);
     config.tracker.handoffStates = ["In Review"];
@@ -5332,7 +5559,7 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Reviewer findings to address");
     expect(harness.runs[0]?.prompt).toContain("Lifecycle counters:");
-    expect(harness.runs[0]?.prompt).toContain("Review rounds: 0");
+    expect(harness.runs[0]?.prompt).toContain("Reviewer failures: 0");
     expect(harness.runs[0]?.prompt).toContain("Latest workspace/git evidence:");
     expect(harness.runs[0]?.prompt).toContain("Branch: symphony/TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Pull request: #42 https://github.com/acme/symphony/pull/42");
@@ -7345,6 +7572,43 @@ class IssueBreakdownAcceptingHarness implements AgentHarness {
           activeRunId: runId,
           role: "worker",
           phase: "issue_breakdown",
+        },
+      );
+    }
+    yield { type: "completed" };
+  }
+}
+
+class IssueTriageAcceptingHarness implements AgentHarness {
+  readonly id = "issue-triage-accepting";
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  constructor(private readonly lifecycleStore: FileIssueLifecycleStore) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    const runId = `triage-run-${this.runs.length}`;
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    if (ctx.runPhase === "issue_triage") {
+      const lifecycle = await this.lifecycleStore.get(ctx.issue.id);
+      if (!lifecycle) throw new Error("missing lifecycle for triage test");
+      await new IssueTriageService({ config: ctx.config, lifecycleStore: this.lifecycleStore }).submit_issue_triage_report(
+        {
+          runId,
+          issueId: ctx.issue.id,
+          triggerFingerprint: issueTriageTriggerFingerprint(lifecycle),
+          disposition: "decompose_issue",
+          confidence: "high",
+          summary: "Repeated review failures exposed hidden child scope.",
+          evidence: ["blockedReason=max reviewer failures reached (3/3)"],
+          recommendedAction: "Decompose the hidden scope into blocking child issues.",
+          idempotencyKey: runId,
+        },
+        {
+          issue: ctx.issue,
+          activeRunId: runId,
+          role: "triage",
+          phase: "issue_triage",
         },
       );
     }

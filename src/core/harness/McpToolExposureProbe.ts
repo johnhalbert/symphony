@@ -6,6 +6,7 @@ import { Agent, type Run, type SDKAgent, type SettingSource } from "@cursor/sdk"
 import type { CursorSettingSource, ServiceConfig } from "../config/Config.js";
 import type { AgentRunContext } from "./AgentHarness.js";
 import { COMPLETION_REPORT_TOOL_NAME, writeCompletionReportMcpContext } from "./CompletionReportMcpServer.js";
+import { ISSUE_TRIAGE_TOOL_NAME, writeIssueTriageMcpContext } from "./IssueTriageMcpServer.js";
 import { writeMergeConflictResolutionMcpContext } from "./MergeConflictResolutionMcpServer.js";
 import {
   buildMcpSubprocessEnvironment,
@@ -20,6 +21,7 @@ import { StructuredLogger } from "../logging/StructuredLogger.js";
 import { resolveCursorRuntimeApiKey } from "../../app/RuntimeDependencies.js";
 import {
   completionReportContextFilePath,
+  issueTriageContextFilePath,
   mergeConflictResolutionContextFilePath,
   reviewFeedbackContextFilePath,
   reviewVerdictContextFilePath,
@@ -67,7 +69,7 @@ export type McpToolExposureFailureCode =
 export interface McpToolExposureSpec {
   role: AgentRunRole;
   runPhase: AgentRunPhase;
-  serverKey: "symphony" | "symphony_conflicts" | "symphony_review_verdict" | "symphony_review_feedback";
+  serverKey: "symphony" | "symphony_conflicts" | "symphony_triage" | "symphony_review_verdict" | "symphony_review_feedback";
   command: McpSubprocessCommand;
   expectedTool: string;
 }
@@ -219,6 +221,13 @@ export const MCP_TOOL_EXPOSURE_SPECS: readonly McpToolExposureSpec[] = [
     serverKey: "symphony_review_feedback",
     command: "review-feedback-mcp",
     expectedTool: REVIEW_FEEDBACK_TOOL_NAME,
+  },
+  {
+    role: "triage",
+    runPhase: "issue_triage",
+    serverKey: "symphony_triage",
+    command: "issue-triage-mcp",
+    expectedTool: ISSUE_TRIAGE_TOOL_NAME,
   },
 ] as const;
 
@@ -1152,6 +1161,17 @@ async function writeRoleContexts(ctx: AgentRunContext): Promise<void> {
     });
     return;
   }
+  if (ctx.role === "triage") {
+    await writeIssueTriageMcpContext(issueTriageContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: null,
+      role: "triage",
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "issue_triage",
+    });
+    return;
+  }
   await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
     issue: ctx.issue,
     activeRunId: null,
@@ -1175,7 +1195,14 @@ async function writeRoleContexts(ctx: AgentRunContext): Promise<void> {
 function probeAgentRunContext(config: ServiceConfig, role: AgentRunRole, cwd: string, runPhase: AgentRunPhase): AgentRunContext {
   const issue: Issue = {
     id: `mcp-exposure-probe-${role}-${runPhase}`,
-    identifier: role === "worker" ? (runPhase === "merge_conflict_resolution" ? "MCP-CONFLICT" : "MCP-WORKER") : "MCP-REVIEWER",
+    identifier:
+      role === "worker"
+        ? runPhase === "merge_conflict_resolution"
+          ? "MCP-CONFLICT"
+          : "MCP-WORKER"
+        : role === "triage"
+          ? "MCP-TRIAGE"
+          : "MCP-REVIEWER",
     title: "MCP exposure probe",
     description: null,
     priority: null,
@@ -1220,6 +1247,7 @@ function probeAgentRunContext(config: ServiceConfig, role: AgentRunRole, cwd: st
 
 function hermesTemplateForProbeTarget(config: ServiceConfig, role: AgentRunRole, runPhase: AgentRunPhase): string {
   if (role === "reviewer") return config.hermes.roleTemplates.reviewer;
+  if (role === "triage") return config.hermes.roleTemplates.planner;
   if (runPhase === "issue_breakdown") return config.hermes.roleTemplates.planner;
   if (runPhase === "merge_conflict_resolution") return config.hermes.roleTemplates.mergeConflictResolution;
   return config.hermes.roleTemplates.worker;
@@ -1341,7 +1369,7 @@ function roleRunMatchesSpec(roleRun: SdkRoleRunResult, spec: McpToolExposureSpec
 }
 
 function defaultRunPhaseForRole(role: AgentRunRole): AgentRunPhase {
-  return role === "reviewer" ? "review" : "implementation";
+  return role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : "implementation";
 }
 
 export function extractSdkSystemToolNames(tools: unknown): SdkSystemToolExtraction {
@@ -1738,6 +1766,8 @@ function mcpSdkServerNameForCommand(command: McpSubprocessCommand): string {
       return "symphony-merge-conflict-resolution";
     case "issue-breakdown-plan-mcp":
       return "symphony-issue-breakdown-plan";
+    case "issue-triage-mcp":
+      return "symphony-issue-triage";
     case "operator-chat-mcp":
       return "symphony-operator-chat";
     case "review-verdict-mcp":

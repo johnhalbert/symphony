@@ -76,6 +76,11 @@ describe("IssueBreakdownPlanApplyService", () => {
       payload: { title: "Build child", parentIssueId: candidate.id, planId: expect.any(String) },
     });
     expect(writeback.operations[1]).toMatchObject({
+      kind: "issue_relation",
+      issueId: candidate.id,
+      payload: { sourceIssueId: "child-1", targetIssueId: candidate.id, type: "blocks" },
+    });
+    expect(writeback.operations.find((operation) => operation.kind === "comment")).toMatchObject({
       kind: "comment",
       issueId: candidate.id,
       payload: { body: expect.stringContaining("TEST-2"), issueBreakdownPlanId: expect.any(String) },
@@ -493,7 +498,9 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(result.status).toBe("applied");
     expect(writer.issueCreates).toHaveLength(1);
     expect(writer.issueCreates[0]?.title).toBe("Build dependent child");
-    expect(writer.issueRelations).toHaveLength(1);
+    expect(writer.issueRelations).toHaveLength(3);
+    expect(writer.issueRelations.filter((relation) => relation.targetIssueId === candidate.id)).toHaveLength(2);
+    expect(writer.issueRelations.some((relation) => relation.targetIssueId !== candidate.id)).toBe(true);
     expect(writer.comments).toHaveLength(1);
     expect(records.filter((record) => record.kind === "issue_create")).toHaveLength(2);
     await expect(store.get(firstChild.idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
@@ -553,7 +560,9 @@ describe("IssueBreakdownPlanApplyService", () => {
 
     expect(result.status).toBe("applied");
     expect(writer.issueCreates).toHaveLength(0);
-    expect(writer.issueRelations).toHaveLength(1);
+    expect(writer.issueRelations).toHaveLength(3);
+    expect(writer.issueRelations.filter((relation) => relation.targetIssueId === candidate.id)).toHaveLength(2);
+    expect(writer.issueRelations.some((relation) => relation.targetIssueId !== candidate.id)).toBe(true);
     expect(writer.comments).toHaveLength(1);
     for (const operation of finalOperations) {
       await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });

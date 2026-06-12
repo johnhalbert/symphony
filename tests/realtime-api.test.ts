@@ -736,7 +736,7 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
-  it("publishes tracker source freshness changes from reference-data, issues, and dashboard refresh paths", async () => {
+  it("publishes tracker source status only when tracker source content changes", async () => {
     let currentIssue = testIssue();
     const tracker = mutableTracker(() => [currentIssue]);
     const server = createRealtimeServer({ tracker });
@@ -780,23 +780,24 @@ describe("StatusServer realtime SSE API", () => {
           "/api/v1/web/dashboard?refresh=1",
         ]),
       );
+      expect(trackerSourceStatusRevision(server)).toBe(1);
 
-      const issuesResponse = await fetch(`${baseUrl}/api/v1/web/issues`);
-      expect(issuesResponse.status).toBe(200);
-      const cached = await client.nextEventOfType("source.status");
-      expect(cached.data).toMatchObject({
-        type: "source.status",
-        source: { source: "trackerIssues", revision: 2 },
-        detail: { status: "ok", cached: true, error: null, issueCount: 1 },
-      });
+      const sameContentRefreshResponse = await fetch(`${baseUrl}/api/v1/web/dashboard?refresh=1`);
+      expect(sameContentRefreshResponse.status).toBe(200);
+      expect(trackerSourceStatusRevision(server)).toBe(1);
+
+      const cachedIssuesResponse = await fetch(`${baseUrl}/api/v1/web/issues`);
+      expect(cachedIssuesResponse.status).toBe(200);
+      expect(trackerSourceStatusRevision(server)).toBe(1);
 
       currentIssue = testIssue({ updatedAt: "2026-01-01T00:00:01.000Z" });
       const dashboardResponse = await fetch(`${baseUrl}/api/v1/web/dashboard?refresh=1`);
       expect(dashboardResponse.status).toBe(200);
+      expect(trackerSourceStatusRevision(server)).toBe(2);
       const refreshed = await client.nextEventOfType("source.status");
       expect(refreshed.data).toMatchObject({
         type: "source.status",
-        source: { source: "trackerIssues", revision: 3 },
+        source: { source: "trackerIssues", revision: 2 },
         detail: { status: "ok", cached: false, error: null, issueCount: 1 },
       });
       expect((refreshed.data as RealtimeProjectionEvent).resources).toEqual(
@@ -2259,6 +2260,10 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, descriptio
 function requireEvent(event: RealtimeProjectionEvent | undefined): RealtimeProjectionEvent {
   if (!event) throw new Error("Expected realtime event to be present");
   return event;
+}
+
+function trackerSourceStatusRevision(server: StatusServer): number {
+  return (server as unknown as { trackerSourceStatusRevision: number }).trackerSourceStatusRevision;
 }
 
 function requireDataLine(serialized: string): string {

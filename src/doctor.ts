@@ -20,6 +20,7 @@ import {
 } from "./core/IssueContractLint.js";
 import { resolveCursorRuntimeApiKey, resolveRuntimeApiKey } from "./app/RuntimeDependencies.js";
 import { COMPLETION_REPORT_TOOL_NAME } from "./core/harness/CompletionReportMcpServer.js";
+import { ISSUE_TRIAGE_TOOL_NAME } from "./core/harness/IssueTriageMcpServer.js";
 import {
   runHermesGatewayMcpToolExposureProbe,
   runSubprocessMcpToolExposureProbe,
@@ -84,7 +85,11 @@ export interface RuntimeHarnessDependencyDoctorCheckOptions {
   hostHermesCommandRunner?: HostHermesCommandRunner | undefined;
 }
 
-export type McpToolServerCommand = "completion-report-mcp" | "review-verdict-mcp" | "review-feedback-mcp";
+export type McpToolServerCommand =
+  | "completion-report-mcp"
+  | "issue-triage-mcp"
+  | "review-verdict-mcp"
+  | "review-feedback-mcp";
 
 export type McpToolLister = (input: {
   command: McpToolServerCommand;
@@ -167,6 +172,9 @@ export function issueContractDoctorCheck(config: ServiceConfig, issues: readonly
     }
     if (result.issueContractErrors.length > 0) {
       reasons.push(`has an invalid Issue Contract (${result.issueContractErrors.join("; ")})`);
+    }
+    if (result.underSpecifiedContractErrors.length > 0) {
+      reasons.push(`has an under-specified contract (${result.underSpecifiedContractErrors.join("; ")})`);
     }
     if (result.protectedSurfaceMatches.length > 0) {
       reasons.push(
@@ -933,7 +941,10 @@ async function mcpToolAvailabilityCheck(
         message: "Configured MCP subprocess runner could not list review-loop MCP tools: missing explicit cliPath",
       };
     }
-    const stage = await runSubprocessMcpToolExposureProbe(config, { cliPath: options.cliPath });
+    const stage = await runSubprocessMcpToolExposureProbe(config, {
+      cliPath: options.cliPath,
+      roles: config.issueTriage.enabled ? ["worker", "reviewer", "triage"] : ["worker", "reviewer"],
+    });
     if (stage.status === "failure") {
       return {
         id: "review_loop.mcp_tools",
@@ -952,6 +963,7 @@ async function mcpToolAvailabilityCheck(
     { command: "completion-report-mcp" as const, tool: COMPLETION_REPORT_TOOL_NAME },
     { command: "review-verdict-mcp" as const, tool: REVIEW_VERDICT_TOOL_NAME },
     { command: "review-feedback-mcp" as const, tool: REVIEW_FEEDBACK_TOOL_NAME },
+    ...(config.issueTriage.enabled ? [{ command: "issue-triage-mcp" as const, tool: ISSUE_TRIAGE_TOOL_NAME }] : []),
   ];
   try {
     const missing: string[] = [];

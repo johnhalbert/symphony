@@ -495,6 +495,51 @@ describe("IssueBreakdownPlanService", () => {
     await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
   });
 
+  it("rejects proposed issues with under-specified contracts", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue();
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    await expect(
+      service.submit_issue_breakdown_plan(
+        {
+          runId: "run-plan-under-specified-contract",
+          issueId: candidate.id,
+          summary: "Contracts must be concrete before child issues are created.",
+          proposedIssues: [
+            {
+              title: "Task",
+              description: agentEligibleIssueContract({
+                issueContractRequirements: [{ id: "REQ-001", requirement: "Complete the documented work." }],
+                contractChecklist: ["- Happy path: covered.", "- Negative/error path: covered."],
+                validationRequirements: ["- Run tests."],
+              }),
+              acceptanceCriteria: ["Done"],
+              dependencies: [],
+              labels: [],
+            },
+          ],
+          idempotencyKey: "plan-under-specified-contract",
+        },
+        {
+          issue: candidate,
+          activeRunId: "run-plan-under-specified-contract",
+          role: "worker",
+          phase: "issue_breakdown",
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("has an under-specified contract"),
+      details: {
+        underSpecifiedContractErrors: expect.arrayContaining([expect.stringContaining("single requirement is too generic")]),
+      },
+    });
+
+    await expect(lifecycleStore.get(candidate.id)).resolves.toBeNull();
+  });
+
   it("rejects configured worker dispatch labels before persistence", async () => {
     const config = testConfig(root);
     config.agent.requireLabels = ["agent-ready"];

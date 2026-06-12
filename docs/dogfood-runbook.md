@@ -41,6 +41,7 @@ Confirm:
 - Terminal states: `Done`, `Closed`, `Cancelled`, `Canceled`, `Duplicate`
 - Required dispatch label: `dogfood-ready`
 - Deny labels: `dogfood-blocked`, `safety-blocked`
+- Worker-only deny label: `review_only`
 
 Confirm there are zero issues in `Todo` or `In Progress` before connectivity smoke.
 

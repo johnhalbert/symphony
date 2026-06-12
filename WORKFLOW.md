@@ -23,6 +23,9 @@ review_loop:
     - Blocked
   review_pass_state: Ready to Merge
   max_review_rounds: 3
+  failure_limits:
+    reviewer_failures: 3
+    merge_gate_failures: 3
   max_incomplete_turns: 3
   continuation_history_threshold: 5
   reviewer_prompt_extensions:
@@ -53,6 +56,11 @@ merge_policy:
 continuation_context:
   search_enabled: false
   summarization_enabled: false
+
+issue_triage:
+  enabled: true
+  mode: classify_only
+  max_attempts_per_trigger: 1
 
 database:
   postgres:
@@ -85,6 +93,8 @@ agent:
   exclude_labels:
     - dogfood-blocked
     - safety-blocked
+  worker_exclude_labels:
+    - review_only
   protected_paths:
     - WORKFLOW.md
     - docs/dogfood-runbook.md

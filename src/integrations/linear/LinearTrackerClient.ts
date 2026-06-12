@@ -65,6 +65,9 @@ interface LinearIssueNode {
   labels?: {
     nodes?: Array<{ name?: unknown }>;
   } | null;
+  children?: {
+    nodes?: Array<{ id?: unknown }>;
+  } | null;
   inverseRelations?: {
     nodes?: LinearRelationNode[];
   } | null;
@@ -153,6 +156,7 @@ const ISSUE_FIELDS = `
   assignee { id }
   delegate { id }
   labels { nodes { name } }
+  children(first: 1) { nodes { id } }
   inverseRelations { nodes { type issue { id identifier state { name } } } }
 `;
 
@@ -211,6 +215,7 @@ const ISSUE_STATES_QUERY = `
         assignee { id }
         delegate { id }
         labels { nodes { name } }
+        children(first: 1) { nodes { id } }
         inverseRelations { nodes { type issue { id identifier state { name } } } }
       }
     }
@@ -730,6 +735,7 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
     assignedToWorker: assignedToWorker(assigneeId, delegateId, assigneeFilter),
     labels: normalizeLabels(node.labels?.nodes),
     blockedBy: normalizeBlockers(node.inverseRelations?.nodes),
+    hasChildren: (node.children?.nodes ?? []).length > 0,
     createdAt: asNullableString(node.createdAt),
     updatedAt: asNullableString(node.updatedAt),
   };

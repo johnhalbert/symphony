@@ -205,6 +205,38 @@ export interface IssueReviewFeedbackRecord {
   submittedAt: string;
 }
 
+export type IssueTriageDisposition =
+  | "decompose_issue"
+  | "implementation_repair"
+  | "validation_repair"
+  | "compatibility_matrix_repair"
+  | "retarget_or_split_pr"
+  | "close_or_retarget_issue"
+  | "merge_gate_repair"
+  | "process_gate_repair"
+  | "infra_repair"
+  | "orchestrator_context_repair"
+  | "manual_decision";
+
+export type IssueTriageConfidence = "high" | "medium" | "low";
+
+export interface IssueTriageReportRecord {
+  id: string;
+  idempotencyKey: string;
+  requestHash: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  triggerFingerprint: string;
+  disposition: IssueTriageDisposition;
+  confidence: IssueTriageConfidence;
+  summary: string;
+  evidence: string[];
+  recommendedAction: string;
+  submittedAt: string;
+  writebackOperationKeys: string[];
+}
+
 export interface IssueMergeMetadata {
   id: string;
   pullRequest: CompletionReportPullRequestRef;
@@ -391,6 +423,7 @@ export interface IssueLifecycleRecord {
   planningDispatchRetryCount: number;
   lastPlanningFailureRunId: string | null;
   lastPlanningFailureAt: string | null;
+  lastIssueTriageReportId: string | null;
   lastCompletionReportId: string | null;
   lastReviewVerdictId: string | null;
   blockedReason: string | null;
@@ -400,6 +433,7 @@ export interface IssueLifecycleRecord {
   completionReports: IssueCompletionReportRecord[];
   reviewVerdicts: IssueReviewVerdictRecord[];
   reviewFeedback: IssueReviewFeedbackRecord[];
+  issueTriageReports: IssueTriageReportRecord[];
   reviewEvidence: PullRequestReviewEvidenceState;
   mergeGate?: IssueMergeGateState | null;
   merge: IssueMergeMetadata | null;
@@ -419,6 +453,7 @@ export interface IssueLifecyclePatch {
   planningDispatchRetryCount?: number;
   lastPlanningFailureRunId?: string | null;
   lastPlanningFailureAt?: string | null;
+  lastIssueTriageReportId?: string | null;
   lastCompletionReportId?: string | null;
   lastReviewVerdictId?: string | null;
   blockedReason?: string | null;
@@ -428,6 +463,7 @@ export interface IssueLifecyclePatch {
   completionReports?: IssueCompletionReportRecord[];
   reviewVerdicts?: IssueReviewVerdictRecord[];
   reviewFeedback?: IssueReviewFeedbackRecord[];
+  issueTriageReports?: IssueTriageReportRecord[];
   reviewEvidence?: PullRequestReviewEvidenceState;
   mergeGate?: IssueMergeGateState | null;
   merge?: IssueMergeMetadata | null;
@@ -473,6 +509,11 @@ export class FileIssueLifecycleStore {
         existing?.lastPlanningFailureRunId ?? null,
       ),
       lastPlanningFailureAt: patchValue(patch, "lastPlanningFailureAt", existing?.lastPlanningFailureAt ?? null),
+      lastIssueTriageReportId: patchValue(
+        patch,
+        "lastIssueTriageReportId",
+        existing?.lastIssueTriageReportId ?? null,
+      ),
       lastCompletionReportId: patchValue(patch, "lastCompletionReportId", existing?.lastCompletionReportId ?? null),
       lastReviewVerdictId: patchValue(patch, "lastReviewVerdictId", existing?.lastReviewVerdictId ?? null),
       blockedReason: patchValue(patch, "blockedReason", existing?.blockedReason ?? null),
@@ -486,6 +527,7 @@ export class FileIssueLifecycleStore {
       completionReports: patch.completionReports ?? existing?.completionReports ?? [],
       reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
       reviewFeedback: patch.reviewFeedback ?? existing?.reviewFeedback ?? [],
+      issueTriageReports: patch.issueTriageReports ?? existing?.issueTriageReports ?? [],
       reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
       mergeGate: patchValue(patch, "mergeGate", existing?.mergeGate ?? null),
       merge: patchValue(patch, "merge", existing?.merge ?? null),
@@ -941,6 +983,10 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
       value.lastPlanningFailureAt === undefined
         ? null
         : nullableString(value.lastPlanningFailureAt, filePath, "lastPlanningFailureAt"),
+    lastIssueTriageReportId:
+      value.lastIssueTriageReportId === undefined
+        ? null
+        : nullableString(value.lastIssueTriageReportId, filePath, "lastIssueTriageReportId"),
     lastCompletionReportId: nullableString(value.lastCompletionReportId, filePath, "lastCompletionReportId"),
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
@@ -950,6 +996,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     completionReports: normalizeCompletionReports(value.completionReports, filePath),
     reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
     reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
+    issueTriageReports: normalizeIssueTriageReports(value.issueTriageReports, filePath),
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
     mergeGate: normalizeMergeGateState(value.mergeGate, filePath),
     merge: normalizeMergeMetadata(value.merge, filePath),
@@ -1191,6 +1238,12 @@ function normalizeReviewFeedback(value: unknown, filePath: string): IssueReviewF
   return value.map((item, index) => normalizeReviewFeedbackRecord(item, filePath, index));
 }
 
+function normalizeIssueTriageReports(value: unknown, filePath: string): IssueTriageReportRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "issueTriageReports is invalid");
+  return value.map((item, index) => normalizeIssueTriageReport(item, filePath, index));
+}
+
 function normalizeMergeConflictResolutionReports(
   value: unknown,
   filePath: string,
@@ -1416,6 +1469,57 @@ function normalizeReviewFeedbackRecord(value: unknown, filePath: string, index: 
     commentUrls: requiredStringArray(value.commentUrls, filePath, `reviewFeedback[${index}].commentUrls`),
     submittedAt: requiredString(value.submittedAt, filePath, `reviewFeedback[${index}].submittedAt`),
   };
+}
+
+function normalizeIssueTriageReport(value: unknown, filePath: string, index: number): IssueTriageReportRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `issueTriageReports[${index}] is invalid`);
+  return {
+    id: requiredString(value.id, filePath, `issueTriageReports[${index}].id`),
+    idempotencyKey: requiredString(value.idempotencyKey, filePath, `issueTriageReports[${index}].idempotencyKey`),
+    requestHash: requiredString(value.requestHash, filePath, `issueTriageReports[${index}].requestHash`),
+    runId: requiredString(value.runId, filePath, `issueTriageReports[${index}].runId`),
+    issueId: requiredString(value.issueId, filePath, `issueTriageReports[${index}].issueId`),
+    issueIdentifier: requiredString(value.issueIdentifier, filePath, `issueTriageReports[${index}].issueIdentifier`),
+    triggerFingerprint: requiredString(value.triggerFingerprint, filePath, `issueTriageReports[${index}].triggerFingerprint`),
+    disposition: normalizeIssueTriageDisposition(value.disposition, filePath, `issueTriageReports[${index}].disposition`),
+    confidence: normalizeIssueTriageConfidence(value.confidence, filePath, `issueTriageReports[${index}].confidence`),
+    summary: requiredString(value.summary, filePath, `issueTriageReports[${index}].summary`),
+    evidence: requiredStringArray(value.evidence, filePath, `issueTriageReports[${index}].evidence`),
+    recommendedAction: requiredString(value.recommendedAction, filePath, `issueTriageReports[${index}].recommendedAction`),
+    submittedAt: requiredString(value.submittedAt, filePath, `issueTriageReports[${index}].submittedAt`),
+    writebackOperationKeys:
+      value.writebackOperationKeys === undefined
+        ? []
+        : requiredStringArray(value.writebackOperationKeys, filePath, `issueTriageReports[${index}].writebackOperationKeys`),
+  };
+}
+
+function normalizeIssueTriageDisposition(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssueTriageDisposition {
+  if (
+    value === "decompose_issue" ||
+    value === "implementation_repair" ||
+    value === "validation_repair" ||
+    value === "compatibility_matrix_repair" ||
+    value === "retarget_or_split_pr" ||
+    value === "close_or_retarget_issue" ||
+    value === "merge_gate_repair" ||
+    value === "process_gate_repair" ||
+    value === "infra_repair" ||
+    value === "orchestrator_context_repair" ||
+    value === "manual_decision"
+  ) {
+    return value;
+  }
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function normalizeIssueTriageConfidence(value: unknown, filePath: string, field: string): IssueTriageConfidence {
+  if (value === "high" || value === "medium" || value === "low") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
 }
 
 function normalizeMergeGateState(value: unknown, filePath: string): IssueMergeGateState | null {

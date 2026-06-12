@@ -32,6 +32,7 @@ import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
 import { runIssueBreakdownPlanMcpServer } from "./core/harness/IssueBreakdownPlanMcpServer.js";
+import { runIssueTriageMcpServer } from "./core/harness/IssueTriageMcpServer.js";
 import { runMergeConflictResolutionMcpServer } from "./core/harness/MergeConflictResolutionMcpServer.js";
 import { runOperatorChatMcpServer } from "./core/harness/OperatorChatMcpServer.js";
 import { runReviewFeedbackMcpServer } from "./core/harness/ReviewFeedbackMcpServer.js";
@@ -133,6 +134,18 @@ program
   .requiredOption("--context-file <path>", "path to the active planning worker context file")
   .action(async (options: { workflow: string; contextFile: string }) => {
     await runIssueBreakdownPlanMcpServer({
+      workflowPath: path.resolve(process.cwd(), options.workflow),
+      contextFile: path.resolve(process.cwd(), options.contextFile),
+    });
+  });
+
+program
+  .command("issue-triage-mcp")
+  .description("Run the internal Symphony issue-triage MCP server")
+  .requiredOption("--workflow <path>", "path to WORKFLOW.md")
+  .requiredOption("--context-file <path>", "path to the active triage context file")
+  .action(async (options: { workflow: string; contextFile: string }) => {
+    await runIssueTriageMcpServer({
       workflowPath: path.resolve(process.cwd(), options.workflow),
       contextFile: path.resolve(process.cwd(), options.contextFile),
     });

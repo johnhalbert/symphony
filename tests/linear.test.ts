@@ -24,9 +24,22 @@ describe("LinearTrackerClient", () => {
 
     expect(normalized?.labels).toEqual(["bug"]);
     expect(normalized?.blockedBy[0]?.identifier).toBe("T-0");
+    expect(normalized?.hasChildren).toBe(false);
     expect(normalized?.assigneeId).toBe("user-1");
     expect(normalized?.delegateId).toBe("delegate-1");
     expect(normalized?.assignedToWorker).toBe(true);
+  });
+
+  it("normalizes whether an issue has children", () => {
+    const normalized = normalizeIssue({
+      id: "id",
+      identifier: "T-1",
+      title: "Title",
+      state: { name: "Todo" },
+      children: { nodes: [{ id: "child-1" }] },
+    });
+
+    expect(normalized?.hasChildren).toBe(true);
   });
 
   it("routes to worker when an assignee route matches the assignee", () => {

@@ -640,13 +640,14 @@ function templateForRun(ctx: AgentRunContext): string {
   if (ctx.operatorChat) return ctx.config.hermes.roleTemplates.planner;
   const phase = currentRunPhase(ctx);
   if (ctx.role === "reviewer") return ctx.config.hermes.roleTemplates.reviewer;
+  if (ctx.role === "triage") return ctx.config.hermes.roleTemplates.planner;
   if (phase === "issue_breakdown") return ctx.config.hermes.roleTemplates.planner;
   if (phase === "merge_conflict_resolution") return ctx.config.hermes.roleTemplates.mergeConflictResolution;
   return ctx.config.hermes.roleTemplates.worker;
 }
 
 function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
-  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
+  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : "implementation");
 }
 
 function agentCommandPolicyHookOptionsForRun(
@@ -667,6 +668,7 @@ function agentCommandPolicyHookOptionsForRun(
 
 function shouldInstallAgentCommandPolicyHook(ctx: AgentRunContext, phase: AgentRunPhase): boolean {
   if (ctx.role === "reviewer") return true;
+  if (ctx.role === "triage") return true;
   return ctx.role === "worker" && phase !== "issue_breakdown";
 }
 

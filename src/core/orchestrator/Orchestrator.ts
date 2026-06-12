@@ -14,6 +14,7 @@ import {
   harnessSupportsMcpHandoff,
   renderCompletionMcpHandoffPrompt,
   renderIssueBreakdownMcpHandoffPrompt,
+  renderIssueTriageMcpHandoffPrompt,
   renderMergeConflictResolutionMcpHandoffPrompt,
   renderOperatorChatMcpPrompt,
   renderReviewMcpHandoffPrompt,
@@ -45,6 +46,11 @@ import {
   renderIssueBreakdownPlanSummary,
 } from "../IssueBreakdownPlanService.js";
 import { IssueBreakdownPlanApplyService } from "../IssueBreakdownPlanApplyService.js";
+import {
+  ISSUE_TRIAGE_DISPOSITIONS,
+  issueTriageTriggerFingerprint,
+  shouldIssueTriageRun,
+} from "../IssueTriageService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import {
   DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE,
@@ -194,6 +200,7 @@ export interface RunningEntry {
   completionReportAccepted: boolean;
   mergeConflictResolutionAccepted: boolean;
   issueBreakdownPlanAccepted: boolean;
+  issueTriageReportAccepted: boolean;
   pullRequestHandoffAccepted: boolean;
   reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
@@ -233,7 +240,12 @@ export interface RetryEntry {
 
 type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
 type TerminalUpdateResult = { updated: true; record: RunRecord | null } | { updated: false; record: RunRecord | null };
-type AcceptedHandoffKind = "completion_report" | "pull_request_handoff" | "issue_breakdown_plan" | "merge_conflict_resolution";
+type AcceptedHandoffKind =
+  | "completion_report"
+  | "pull_request_handoff"
+  | "issue_breakdown_plan"
+  | "issue_triage_report"
+  | "merge_conflict_resolution";
 
 interface OperatorChatQueueEntry {
   conversationId: string;
@@ -249,6 +261,7 @@ interface OperatorChatQueueEntry {
 
 const PLANNING_NO_PLAN_ERROR = "Planning run completed without submit_issue_breakdown_plan";
 const PLANNING_FAILURE_DIAGNOSTIC_CODE = "planning_run_failed";
+const TRIAGE_NO_REPORT_ERROR = "Issue triage run completed without submit_issue_triage_report";
 
 export interface RuntimeSnapshot {
   generatedAt: string;
@@ -1157,6 +1170,7 @@ export class Orchestrator {
         if (this.availableSlots() <= 0) break;
         await this.tryDispatchReviewerIssue(issue);
       }
+      await this.reconcileIssueTriageIssues();
       await this.reconcileMergePolicyIssues();
     } catch (error) {
       this.options.logger.warn("orchestrator tick failed", { error: errorMessage(error) });
@@ -1295,6 +1309,8 @@ export class Orchestrator {
         await this.terminateRunningIssue(issueId, false, "blocked state");
       } else if (entry.role === "reviewer" && !isStateIn(latest.state, this.config.reviewLoop.reviewStates)) {
         await this.terminateRunningIssue(issueId, false, "non-review state");
+      } else if (entry.role === "triage" && !isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
+        await this.terminateRunningIssue(issueId, false, "non-blocked state");
       }
     }
   }
@@ -1352,7 +1368,8 @@ export class Orchestrator {
     if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
     if (!this.isWorkerStateActiveForRunPhase(issue, runPhase)) return false;
-    if (!this.passesLabelGuardrails(issue)) return false;
+    if (issue.hasChildren) return false;
+    if (!this.passesLabelGuardrails(issue, "worker")) return false;
     if (issue.state.toLowerCase() === "todo") {
       if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
     }
@@ -1372,20 +1389,35 @@ export class Orchestrator {
     if (!isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
     if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
-    if (!this.passesLabelGuardrails(issue)) return false;
+    if (!this.passesLabelGuardrails(issue, "reviewer")) return false;
     if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
+    return this.hasStateSlot(issue.state);
+  }
+
+  private shouldDispatchIssueTriage(issue: Issue, allowExistingClaim = false): boolean {
+    if (!this.config.issueTriage.enabled || !this.options.lifecycleStore) return false;
+    if (this.running.has(issue.id)) return false;
+    if (this.pausedIssues.has(issue.id)) return false;
+    if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
+    if (!isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
+    if (!this.passesLabelGuardrails(issue, "triage")) return false;
     return this.hasStateSlot(issue.state);
   }
 
   private async lifecycleAllowsDispatch(
     issue: Issue,
     role: AgentRunRole,
-    runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
+    runPhase: AgentRunPhase = role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : "implementation",
   ): Promise<boolean> {
     const store = this.options.lifecycleStore;
     if (!store) return true;
     const lifecycle = await store.get(issue.id);
     if (!lifecycle) return true;
+
+    if (role === "triage") {
+      return runPhase === "issue_triage" && shouldIssueTriageRun(lifecycle, this.config);
+    }
 
     const phase = phaseForIssueState(issue.state, this.config);
     const conflict = lifecycle.mergeConflict;
@@ -1455,12 +1487,12 @@ export class Orchestrator {
       );
       return false;
     }
-    if (role === "reviewer" && lifecycle.reviewRound >= this.config.reviewLoop.maxReviewRounds) {
+    if (role === "reviewer" && lifecycle.reviewRound >= this.config.reviewLoop.failureLimits.reviewerFailures) {
       await this.escalateLifecycleBlocked(
         issue,
         lifecycle,
         lifecycle.summaryPointers.lastRunId ?? issue.id,
-        `max review rounds reached (${lifecycle.reviewRound}/${this.config.reviewLoop.maxReviewRounds})`,
+        `max reviewer failures reached (${lifecycle.reviewRound}/${this.config.reviewLoop.failureLimits.reviewerFailures})`,
       );
       return false;
     }
@@ -1468,10 +1500,12 @@ export class Orchestrator {
     return true;
   }
 
-  private passesLabelGuardrails(issue: Issue): boolean {
+  private passesLabelGuardrails(issue: Issue, role: AgentRunRole | "merge_policy"): boolean {
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
     if (this.config.agent.requireLabels.some((label) => !labels.has(label))) return false;
     if (this.config.agent.excludeLabels.some((label) => labels.has(label))) return false;
+    if (role === "worker" && this.config.agent.workerExcludeLabels.some((label) => labels.has(label))) return false;
+    if (role === "reviewer" && this.config.agent.reviewerExcludeLabels.some((label) => labels.has(label))) return false;
     return true;
   }
 
@@ -1566,6 +1600,52 @@ export class Orchestrator {
     return true;
   }
 
+  private async reconcileIssueTriageIssues(): Promise<void> {
+    if (!this.config.issueTriage.enabled || !this.options.lifecycleStore || this.config.reviewLoop.blockedStates.length === 0) {
+      return;
+    }
+    let candidates: Issue[];
+    try {
+      candidates = await this.options.tracker.fetchIssuesByStates(this.config.reviewLoop.blockedStates);
+    } catch (error) {
+      this.options.logger.warn("issue triage candidate fetch failed", { error: errorMessage(error) });
+      return;
+    }
+    for (const issue of sortIssuesForDispatch(candidates)) {
+      if (this.availableSlots() <= 0) break;
+      await this.tryDispatchIssueTriage(issue);
+    }
+  }
+
+  private async tryDispatchIssueTriage(issue: Issue, allowExistingClaim = false): Promise<boolean> {
+    if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
+    if (!this.shouldDispatchIssueTriage(issue, allowExistingClaim)) return false;
+    if (!(await this.lifecycleAllowsDispatch(issue, "triage", "issue_triage"))) return false;
+
+    let refreshed: Issue[];
+    try {
+      refreshed = await this.options.tracker.fetchIssueStatesByIds([issue.id]);
+    } catch (error) {
+      this.options.logger.warn("pre-triage issue refresh failed", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        error: errorMessage(error),
+      });
+      return false;
+    }
+
+    const latest = refreshed[0];
+    if (!latest) return false;
+    if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
+    if (!this.shouldDispatchIssueTriage(latest, allowExistingClaim)) return false;
+    if (!(await this.lifecycleAllowsDispatch(latest, "triage", "issue_triage"))) return false;
+
+    this.dispatchIssue(latest, null, "triage", null, "issue_triage");
+    return true;
+  }
+
   private async resolveWorkerDispatchDecision(issue: Issue): Promise<WorkerDispatchDecision> {
     if (this.isMergeConflictState(issue.state)) return { action: "dispatch", runPhase: "merge_conflict_resolution" };
     if (!this.config.issueBreakdown.enabled) return { action: "dispatch", runPhase: "implementation" };
@@ -1606,7 +1686,7 @@ export class Orchestrator {
     attempt: number | null,
     role: AgentRunRole,
     reviewEvidence: ReviewerDispatchEvidence | null,
-    runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
+    runPhase: AgentRunPhase = role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : "implementation",
   ): void {
     const abortController = new AbortController();
     const retryAttempt = attempt ?? 0;
@@ -1643,6 +1723,7 @@ export class Orchestrator {
       completionReportAccepted: false,
       mergeConflictResolutionAccepted: false,
       issueBreakdownPlanAccepted: false,
+      issueTriageReportAccepted: false,
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence,
@@ -1661,7 +1742,8 @@ export class Orchestrator {
     this.running.set(issue.id, entry);
     this.claimed.add(issue.id);
     this.clearRetry(issue.id);
-    const run = role === "reviewer" ? this.runReviewer(entry) : this.runWorker(entry, attempt);
+    const run =
+      role === "reviewer" ? this.runReviewer(entry) : role === "triage" ? this.runIssueTriage(entry) : this.runWorker(entry, attempt);
     const worker = this.monitorRunExit(entry, run);
     entry.worker = worker;
     this.activeWorkers.add(worker);
@@ -1860,6 +1942,51 @@ export class Orchestrator {
     }
   }
 
+  private async runIssueTriage(entry: RunningEntry): Promise<void> {
+    let workspace: Workspace | null = null;
+    try {
+      const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
+      if (!shouldIssueTriageRun(lifecycle, this.config)) {
+        this.options.logger.warn("issue triage dispatch skipped because lifecycle is not triage-eligible", {
+          issue_id: entry.issue.id,
+          issue_identifier: entry.issue.identifier,
+        });
+        return;
+      }
+      entry.lifecycle = lifecycle;
+      workspace = await this.options.workspaceManager.createForIssue(entry.issue);
+      entry.workspacePath = workspace.path;
+      entry.workspace = workspace;
+      await this.updateLifecycle(entry, {
+        summaryPointers: {
+          workspaceKey: workspace.workspaceKey,
+          workspacePath: workspace.path,
+          branchName: workspace.gitBranchName ?? entry.issue.branchName ?? lifecycle.summaryPointers.branchName,
+          gitBranchName: workspace.gitBranchName ?? entry.issue.branchName ?? lifecycle.summaryPointers.gitBranchName,
+          repoPath: workspace.repoPath ?? lifecycle.summaryPointers.repoPath,
+          baseRef: workspace.baseRef ?? lifecycle.summaryPointers.baseRef,
+        },
+      });
+      await this.options.workspaceManager.beforeRun(workspace.path);
+      await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, null, 1));
+      await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
+      this.requireMcpHandoff("issue_triage");
+
+      entry.turnCount = 1;
+      const prompt = await this.renderIssueTriagePrompt(entry);
+      await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
+        workspace,
+        prompt,
+        attempt: null,
+        turnNumber: 1,
+      });
+    } finally {
+      if (workspace) {
+        await this.options.workspaceManager.afterRun(workspace.path);
+      }
+    }
+  }
+
   private async consumeHarnessEvents(
     entry: RunningEntry,
     events: AsyncIterable<AgentEvent>,
@@ -1968,6 +2095,26 @@ export class Orchestrator {
       if (!terminalHarnessEvent) await this.persistHarnessEvent(entry, rawEvent);
 
       if (event.type === "completed") {
+        if (entry.runPhase === "issue_triage") {
+          const accepted = await this.reconcileIssueTriageHandoff(entry);
+          if (accepted) {
+            const terminal = await this.terminalizeAcceptedHandoff(entry, "issue_triage_report");
+            await this.persistHarnessEvent(entry, event);
+            if (!terminal.updated) return;
+            continue;
+          }
+          const completedAt = new Date().toISOString();
+          const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
+            status: "failed",
+            completedAt,
+            error: TRIAGE_NO_REPORT_ERROR,
+            tokens: entry.activeRunTokens,
+            metadata: terminalRunMetadata(entry, "failed"),
+          });
+          await this.persistHarnessEvent(entry, event);
+          if (!terminal.updated) return;
+          continue;
+        }
         if (entry.runPhase === "issue_breakdown") {
           const accepted = await this.reconcileIssueBreakdownPlanHandoff(entry);
           if (accepted) {
@@ -2146,6 +2293,11 @@ export class Orchestrator {
   }
 
   private async acceptedTerminalHandoffKind(entry: RunningEntry): Promise<AcceptedHandoffKind | null> {
+    if (entry.role === "triage") {
+      return entry.issueTriageReportAccepted || (await this.reconcileIssueTriageHandoff(entry))
+        ? "issue_triage_report"
+        : null;
+    }
     if (entry.role !== "worker") return null;
     if (entry.runPhase === "issue_breakdown") {
       return entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry))
@@ -2202,6 +2354,23 @@ export class Orchestrator {
     this.endedRuntimeSeconds += (Date.now() - entry.startedAt.getTime()) / 1000;
 
     if (entry.providerLimitSignal) {
+      this.claimed.delete(issueId);
+      return;
+    }
+
+    if (entry.runPhase === "issue_triage") {
+      const accepted = entry.issueTriageReportAccepted || (await this.reconcileIssueTriageHandoff(entry));
+      if (accepted && entry.runId) {
+        await this.terminalizeAcceptedHandoff(entry, "issue_triage_report");
+      } else if (entry.runId) {
+        await this.updateRunTerminalStateIfRunning(entry.runId, {
+          status: entry.suppressRetryOnExit ? "cancelled" : "failed",
+          completedAt: new Date().toISOString(),
+          error: entry.suppressRetryOnExit ? error : error ?? TRIAGE_NO_REPORT_ERROR,
+          tokens: entry.activeRunTokens,
+          metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
+        });
+      }
       this.claimed.delete(issueId);
       return;
     }
@@ -2898,7 +3067,7 @@ export class Orchestrator {
           incompleteTurnCount: blockedLifecycle.incompleteTurnCount,
           maxIncompleteTurns: this.config.reviewLoop.maxIncompleteTurns,
           reviewRound: blockedLifecycle.reviewRound,
-          maxReviewRounds: this.config.reviewLoop.maxReviewRounds,
+          maxReviewRounds: this.config.reviewLoop.failureLimits.reviewerFailures,
           lastCompletionReport: latestCompletionReport(blockedLifecycle),
           lastReviewVerdict: latestReviewVerdict(blockedLifecycle),
           requiredAction:
@@ -2982,6 +3151,18 @@ export class Orchestrator {
     return true;
   }
 
+  private async reconcileIssueTriageHandoff(entry: RunningEntry): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!store || !runId) return entry.issueTriageReportAccepted;
+    const lifecycle = await store.get(entry.issue.id);
+    const report = lifecycle?.issueTriageReports.find((item) => item.runId === runId) ?? null;
+    if (!lifecycle || !report) return entry.issueTriageReportAccepted;
+    entry.lifecycle = lifecycle;
+    entry.issueTriageReportAccepted = true;
+    return true;
+  }
+
   private async reconcileReviewVerdictHandoff(entry: RunningEntry): Promise<boolean> {
     const store = this.options.lifecycleStore;
     const runId = entry.activeRunId ?? entry.runId;
@@ -3025,7 +3206,7 @@ export class Orchestrator {
     }
     for (const issue of sortIssuesForDispatch(candidates)) {
       if (this.running.has(issue.id) || this.pausedIssues.has(issue.id)) continue;
-      if (!this.passesLabelGuardrails(issue)) continue;
+      if (!this.passesLabelGuardrails(issue, "merge_policy")) continue;
       await this.tryReconcileMergePolicy(issue);
     }
   }
@@ -3235,6 +3416,97 @@ export class Orchestrator {
     return [basePrompt, this.issueBreakdownMcpPrompt(entry)].join("\n");
   }
 
+  private async renderIssueTriagePrompt(entry: RunningEntry): Promise<string> {
+    const lifecycle = (await this.options.lifecycleStore?.get(entry.issue.id)) ?? entry.lifecycle;
+    if (!lifecycle) throw new SymphonyError("invalid_request", "Issue triage prompt requires lifecycle evidence");
+    const workspace = entry.workspace;
+    const report = latestCompletionReport(lifecycle);
+    const verdict = latestReviewVerdict(lifecycle);
+    const gate = lifecycle.mergeGate ?? null;
+    const triggerFingerprint = issueTriageTriggerFingerprint(lifecycle);
+    return [
+      `Triage why ${entry.issue.identifier} hit Symphony's max-failure blocked path.`,
+      "",
+      "You are a scoped, read-only Symphony issue triage agent. Classify the failure mode and recommend the next operator/system action.",
+      "Do not edit files, create commits, push branches, transition Linear state, comment on Linear, create subissues, or submit worker/reviewer handoffs.",
+      "",
+      "Issue:",
+      `- Identifier: ${entry.issue.identifier}`,
+      `- Title: ${entry.issue.title}`,
+      `- State: ${entry.issue.state}`,
+      `- URL: ${entry.issue.url ?? "n/a"}`,
+      `- Labels: ${formatList(entry.issue.labels)}`,
+      `- Has children: ${entry.issue.hasChildren === true ? "yes" : "no"}`,
+      `- Open blockers: ${formatList(entry.issue.blockedBy.filter((blocker) => blocker.state === null || !isStateIn(blocker.state, this.config.tracker.terminalStates)).map((blocker) => blocker.identifier ?? blocker.id ?? "unknown"))}`,
+      "",
+      "Blocked trigger:",
+      `- Trigger fingerprint: ${triggerFingerprint}`,
+      `- Lifecycle phase: ${lifecycle.phase}`,
+      `- Blocked reason: ${lifecycle.blockedReason ?? "n/a"}`,
+      `- Reviewer failures: ${lifecycle.reviewRound} / ${this.config.reviewLoop.failureLimits.reviewerFailures}`,
+      `- Merge-gate failures: ${gate?.reviewRound ?? 0} / ${this.config.reviewLoop.failureLimits.mergeGateFailures}`,
+      `- Incomplete worker turns: ${lifecycle.incompleteTurnCount} / ${this.config.reviewLoop.maxIncompleteTurns}`,
+      "",
+      "Latest workspace/git evidence:",
+      `- Workspace path: ${workspace?.path ?? lifecycle.summaryPointers.workspacePath ?? entry.workspacePath ?? "n/a"}`,
+      `- Branch: ${workspace?.gitBranchName ?? lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName ?? entry.issue.branchName ?? "n/a"}`,
+      `- Repository path: ${workspace?.repoPath ?? lifecycle.summaryPointers.repoPath ?? "n/a"}`,
+      `- Base ref: ${workspace?.baseRef ?? lifecycle.summaryPointers.baseRef ?? "n/a"}`,
+      `- Pull request: ${formatPullRequest(lifecycle.summaryPointers.prNumber, lifecycle.summaryPointers.prUrl)}`,
+      `- PR head SHA: ${lifecycle.summaryPointers.prHeadSha ?? "n/a"}`,
+      `- CI status: ${lifecycle.summaryPointers.ciStatus ?? "n/a"}`,
+      "",
+      "Latest completion report:",
+      ...(report
+        ? [
+            `- Report: ${report.id}; run: ${report.runId}`,
+            `- Summary: ${report.summary}`,
+            `- Changed files: ${formatList(report.changedFiles)}`,
+            `- Validation: ${formatList(report.validationEvidence)}`,
+            `- Risks: ${formatList(report.risks)}`,
+          ]
+        : ["- None"]),
+      "",
+      "Latest review verdict:",
+      ...(verdict
+        ? [
+            `- Verdict: ${verdict.verdict}; record: ${verdict.id}; run: ${verdict.runId}`,
+            `- Findings: ${formatList(verdict.findings)}`,
+            `- Evidence: ${formatList(verdict.evidence)}`,
+            "Acceptance results:",
+            ...verdict.acceptanceResults.map(
+              (item) => `- ${item.satisfied ? "[x]" : "[ ]"} ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`,
+            ),
+          ]
+        : ["- None"]),
+      "",
+      "Merge gate:",
+      ...(gate
+        ? [
+            `- Gate: ${gate.id}; status: ${gate.status}`,
+            `- PR: ${formatPullRequest(gate.pullRequest.number, gate.pullRequest.url)}`,
+            `- Head SHA: ${gate.headSha}`,
+            `- Blocker fingerprint: ${gate.blockerFingerprint ?? "n/a"}`,
+            `- Required checks: ${formatList(gate.requiredChecks)}`,
+            `- Actionable checks: ${formatList(gate.checks.filter((check) => check.outcome === "failing" || check.outcome === "missing_actionable").map((check) => `${check.name}=${check.outcome}`))}`,
+            `- Observing checks: ${formatList(gate.checks.filter((check) => check.outcome === "pending" || check.outcome === "missing_observed" || check.outcome === "unknown").map((check) => `${check.name}=${check.outcome}`))}`,
+            `- Mergeability: ${gate.mergeability?.status ?? "n/a"} (${gate.mergeability?.reason ?? gate.mergeability?.mergeableState ?? "n/a"})`,
+          ]
+        : ["- None"]),
+      "",
+      "Disposition choices:",
+      ...ISSUE_TRIAGE_DISPOSITIONS.map((disposition) => `- ${disposition}`),
+      "",
+      "Classification guidance:",
+      "- Use decompose_issue when the evidence shows hidden or under-specified scope that should become smaller blocking child issues.",
+      "- Use implementation_repair or validation_repair when the issue scope is adequate but worker behavior or proof was incomplete.",
+      "- Use merge_gate_repair for CI/mergeability-only repair loops, process_gate_repair for workflow/policy gaps, infra_repair for runtime/tool failures, and orchestrator_context_repair for missing or misleading Symphony context.",
+      "- Use manual_decision when the evidence requires a product/owner decision before automation should continue.",
+      "",
+      this.issueTriageMcpPrompt(entry),
+    ].join("\n");
+  }
+
   private async renderMergeConflictResolutionPrompt(entry: RunningEntry): Promise<string> {
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
     const conflict = lifecycle?.mergeConflict ?? null;
@@ -3268,6 +3540,19 @@ export class Orchestrator {
   private issueBreakdownMcpPrompt(entry: RunningEntry): string {
     this.requireMcpHandoff("issue_breakdown");
     return renderIssueBreakdownMcpHandoffPrompt({ issue: entry.issue });
+  }
+
+  private issueTriageMcpPrompt(entry: RunningEntry): string {
+    this.requireMcpHandoff("issue_triage");
+    const workspace = entry.workspace;
+    return renderIssueTriageMcpHandoffPrompt({
+      issue: entry.issue,
+      role: entry.role,
+      workspacePath: workspace?.path ?? entry.workspacePath,
+      branchName: workspace?.gitBranchName ?? entry.issue.branchName ?? null,
+      repoPath: workspace?.repoPath ?? null,
+      baseRef: workspace?.baseRef ?? null,
+    });
   }
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
@@ -3323,7 +3608,7 @@ export class Orchestrator {
       "",
       "Lifecycle counters:",
       `- Phase: ${lifecycle?.phase ?? phaseForIssueState(entry.issue.state, this.config)}`,
-      `- Review rounds: ${lifecycle?.reviewRound ?? 0} / ${this.config.reviewLoop.maxReviewRounds}`,
+      `- Reviewer failures: ${lifecycle?.reviewRound ?? 0} / ${this.config.reviewLoop.failureLimits.reviewerFailures}`,
       `- Incomplete worker turns: ${lifecycle?.incompleteTurnCount ?? 0} / ${this.config.reviewLoop.maxIncompleteTurns}`,
       `- Last completion report: ${lifecycle?.lastCompletionReportId ?? "n/a"}`,
       `- Last review verdict: ${lifecycle?.lastReviewVerdictId ?? "n/a"}`,
@@ -4131,6 +4416,8 @@ function formatAcceptedHandoffKind(kind: AcceptedHandoffKind): string {
       return "pull request";
     case "issue_breakdown_plan":
       return "issue breakdown plan";
+    case "issue_triage_report":
+      return "issue triage report";
     case "merge_conflict_resolution":
       return "merge conflict resolution";
   }

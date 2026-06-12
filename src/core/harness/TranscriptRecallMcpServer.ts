@@ -4,7 +4,7 @@ import { SymphonyError } from "../errors.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import { DEFAULT_RECALL_BUDGET, TranscriptRecallService } from "../recall/TranscriptRecallService.js";
 import type { TranscriptRecallSearchResult } from "../recall/TranscriptRecallService.js";
-import type { AgentRunPhase, Issue } from "../types.js";
+import type { AgentRunPhase, AgentRunRole, Issue } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
 
@@ -13,7 +13,7 @@ export const TRANSCRIPT_RECALL_TOOL_NAME = "search_transcript_context";
 export interface TranscriptRecallMcpContextFile {
   issue: Issue;
   activeRunId: string | null;
-  role: "worker" | "reviewer";
+  role: AgentRunRole;
   phase: AgentRunPhase;
 }
 

@@ -210,4 +210,58 @@ describe("IssueContractLint", () => {
     expect(analysis.remainingBlocker).toBe("Manual operator-authored update required for the protected workflow file.");
     expect(hasMeaningfulRemainingBlocker(analysis.remainingBlocker)).toBe(true);
   });
+
+  it("accepts concrete checklist lanes with reasoned N/A entries", () => {
+    const analysis = analyzeIssueContractDescription(agentEligibleIssueContract(), []);
+
+    expect(analysis.underSpecifiedContractErrors).toEqual([]);
+  });
+
+  it("reports a generic single-requirement Issue Contract", () => {
+    const analysis = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        issueContractRequirements: [{ id: "REQ-001", requirement: "Complete the documented work." }],
+      }),
+      [],
+    );
+
+    expect(analysis.underSpecifiedContractErrors).toEqual(
+      expect.arrayContaining([expect.stringContaining("single requirement is too generic")]),
+    );
+  });
+
+  it("reports placeholder or missing Contract Checklist lanes", () => {
+    const analysis = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        contractChecklist: [
+          "- Happy path: covered.",
+          "- Negative/error path: covered.",
+          "- Empty/missing/stale/fallback state: N/A",
+        ],
+      }),
+      [],
+    );
+
+    expect(analysis.underSpecifiedContractErrors).toEqual(
+      expect.arrayContaining([
+        'Contract Checklist "Happy path" must include concrete coverage or a reasoned N/A',
+        'Contract Checklist "Negative/error path" must include concrete coverage or a reasoned N/A',
+        'Contract Checklist must include "Adjacent sibling surface"',
+        'Contract Checklist "Empty/missing/stale/fallback state" must include concrete coverage or a reasoned N/A',
+      ]),
+    );
+  });
+
+  it("reports generic Validation Requirements", () => {
+    const analysis = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        validationRequirements: ["- Run tests."],
+      }),
+      [],
+    );
+
+    expect(analysis.underSpecifiedContractErrors).toEqual(
+      expect.arrayContaining([expect.stringContaining("Validation Requirements are too generic")]),
+    );
+  });
 });

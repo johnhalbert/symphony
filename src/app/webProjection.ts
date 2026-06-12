@@ -297,6 +297,14 @@ interface IssueBoardCardReviewLoopInput {
     submittedAt?: string | null;
     id?: string | null;
   } | null;
+  lastIssueTriageReport?: {
+    disposition?: string | null;
+    confidence?: string | null;
+    summary?: string | null;
+    recommendedAction?: string | null;
+    submittedAt?: string | null;
+    id?: string | null;
+  } | null;
 }
 
 export interface IssueBoardCardProjectionInput {

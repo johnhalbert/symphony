@@ -91,6 +91,7 @@ describe("StatusServer durable API", () => {
         incompleteTurnCount: 0,
         lastCompletionReportId: "completion-report:issue-1:report-1",
         lastReviewVerdictId: "review-verdict:issue-1:verdict-1",
+        lastIssueTriageReportId: "issue-triage-report:issue-1:triage-1",
         blockedReason: null,
         summaryPointers: {
           workspaceKey: "TEST-1",
@@ -224,6 +225,24 @@ describe("StatusServer durable API", () => {
             evidence: ["https://github.com/acme/repo/pull/7#discussion_r1"],
             reviewer: "reviewer-1",
             submittedAt: "2026-01-01T00:00:04.000Z",
+            writebackOperationKeys: [],
+          },
+        ],
+        issueTriageReports: [
+          {
+            id: "issue-triage-report:issue-1:triage-1",
+            idempotencyKey: "triage-1",
+            requestHash: "triage-hash",
+            runId: "triage-run-1",
+            issueId: "issue-1",
+            issueIdentifier: "TEST-1",
+            triggerFingerprint: "blocked-trigger-1",
+            disposition: "decompose_issue",
+            confidence: "high",
+            summary: "Repeated failures exposed hidden sibling scope.",
+            evidence: ["review findings kept expanding sibling API scope"],
+            recommendedAction: "Decompose the hidden sibling scope into blocking child issues.",
+            submittedAt: "2026-01-01T00:00:06.000Z",
             writebackOperationKeys: [],
           },
         ],
@@ -364,6 +383,7 @@ describe("StatusServer durable API", () => {
           blockedReason: string | null;
           lastCompletionReport: { id: string; summary: string } | null;
           lastReviewVerdict: { id: string; verdict: string; findings: string[] } | null;
+          lastIssueTriageReport: { id: string; disposition: string; confidence: string; summary: string } | null;
           mergeConflict: { resolutionStatus: string; fixTurnCount: number } | null;
         };
         metadata: {
@@ -449,6 +469,12 @@ describe("StatusServer durable API", () => {
           id: "review-verdict:issue-1:verdict-1",
           verdict: "fail",
           findings: ["Add reviewer pass evidence."],
+        },
+        lastIssueTriageReport: {
+          id: "issue-triage-report:issue-1:triage-1",
+          disposition: "decompose_issue",
+          confidence: "high",
+          summary: "Repeated failures exposed hidden sibling scope.",
         },
         mergeConflict: {
           resolutionStatus: "still_conflicted",

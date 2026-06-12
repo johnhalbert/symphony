@@ -8,9 +8,7 @@ import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
   projectActivityModels,
-  formatAgentUsageLabel,
   projectProviderGates,
-  projectRunningAgents,
   projectSessionModel,
   projectTranscriptMessages,
   projectWebDashboard,
@@ -44,6 +42,7 @@ import type {
   IssueMergeConflictMetadata,
   IssueMergeGateMergeabilityState,
   IssueReviewVerdictRecord,
+  IssueTriageReportRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
 import { latestCurrentApprovalPassVerdict } from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
@@ -99,7 +98,7 @@ import {
   type OrchestratorChatCommandResultStatus,
 } from "../core/orchestrator/OrchestratorChatCommand.js";
 
-import { applyWebHistoryRuntimeLiveness, projectWebHistory } from "./WebHistoryProjection.js";
+import { projectWebHistory } from "./WebHistoryProjection.js";
 import {
   emptyWebTranscriptProjectionPayload,
   isWebTranscriptProjectionPayload,
@@ -1428,15 +1427,19 @@ export class StatusServer {
         query: { issue: null, offset: 0, limit: 20 },
         includeTranscriptEvents: false,
       });
-      const dashboard = projectWebDashboard({
-        runtime: snapshot,
-        board,
-        activity,
-        runs: sourceIndex?.runs.runs ?? activitySources.runs,
-        lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
-        source: dashboardSourceInputFromSourceIndex(sourceIndex, { activityCount: activity.activity.length }),
-        config: this.options.dashboard ?? null,
-      });
+      const dashboard = dashboardWithRuntimeProviderGates(
+        projectWebDashboard({
+          generatedAt: snapshot.generatedAt,
+          runtime: dashboardRuntimeSnapshot(snapshot),
+          board,
+          activity,
+          runs: sourceIndex?.runs.runs ?? activitySources.runs,
+          lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
+          source: dashboardSourceInputFromSourceIndex(sourceIndex, { activityCount: activity.activity.length }),
+          config: this.options.dashboard ?? null,
+        }),
+        snapshot,
+      );
       await this.recordProjectionRebuildEntry(
         this.webDashboardProjectionWriteInput(dashboard, {
           sourceIndex,
@@ -1469,14 +1472,18 @@ export class StatusServer {
         includeTranscriptEvents: false,
       });
       const dashboardActivity = previewActivityFeed(historyActivity, 20);
-      const dashboard = projectWebDashboard({
-        runtime: snapshot,
-        board,
-        activity: dashboardActivity,
-        runs: sourceIndex?.runs.runs ?? activitySources.runs,
-        lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
-        config: this.options.dashboard ?? null,
-      });
+      const dashboard = dashboardWithRuntimeProviderGates(
+        projectWebDashboard({
+          generatedAt: snapshot.generatedAt,
+          runtime: dashboardRuntimeSnapshot(snapshot),
+          board,
+          activity: dashboardActivity,
+          runs: sourceIndex?.runs.runs ?? activitySources.runs,
+          lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
+          config: this.options.dashboard ?? null,
+        }),
+        snapshot,
+      );
       const issues = projectWebIssueBoard(board);
       const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot });
       const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
@@ -1979,18 +1986,7 @@ export class StatusServer {
   private async fetchWebDashboard(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebDashboard>>> {
     const durableDashboard = await this.webProjectionRepositories.dashboard.readCurrent({ forceRefresh });
     if (durableDashboard.status === "hit" && durableDashboard.record) {
-      const dashboard = durableDashboard.record.payload;
-      const snapshot = this.options.orchestrator.snapshot();
-      const runningAgents = projectRunningAgents(snapshot, snapshot.generatedAt);
-      return webProjectionJsonResponse(
-        {
-          ...dashboard,
-          agentUsageLabel: formatAgentUsageLabel(runningAgents.length, dashboard.concurrencyCap),
-          providerGates: projectProviderGates(snapshot),
-          runningAgents,
-        },
-        durableDashboard,
-      );
+      return webProjectionJsonResponse(durableDashboard.record.payload, durableDashboard);
     }
 
     if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
@@ -2022,15 +2018,19 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: 20 },
       includeTranscriptEvents: false,
     });
-    const dashboard = projectWebDashboard({
-      runtime: snapshot,
-      board,
-      activity,
-      runs: sourceIndex?.runs.runs ?? activitySources.runs,
-      lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
-      source: dashboardSourceInputFromSourceIndex(sourceIndex, { activityCount: activity.activity.length }),
-      config: this.options.dashboard ?? null,
-    });
+    const dashboard = dashboardWithRuntimeProviderGates(
+      projectWebDashboard({
+        generatedAt: snapshot.generatedAt,
+        runtime: dashboardRuntimeSnapshot(snapshot),
+        board,
+        activity,
+        runs: sourceIndex?.runs.runs ?? activitySources.runs,
+        lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
+        source: dashboardSourceInputFromSourceIndex(sourceIndex, { activityCount: activity.activity.length }),
+        config: this.options.dashboard ?? null,
+      }),
+      snapshot,
+    );
     await this.persistWebDashboardProjection(dashboard, {
       sourceIndex,
       activityCount: activity.activity.length,
@@ -2305,22 +2305,7 @@ export class StatusServer {
   private async fetchWebSidebar(forceRefresh: boolean): Promise<WebProjectionJsonResponse<ReturnType<typeof projectWebSidebar>>> {
     const durableSidebar = await this.webProjectionRepositories.sidebar.readCurrent({ forceRefresh });
     if (durableSidebar.status === "hit" && durableSidebar.record) {
-      const sidebar = durableSidebar.record.payload;
-      const snapshot = this.options.orchestrator.snapshot();
-      const runningAgents = projectRunningAgents(snapshot, snapshot.generatedAt);
-      const normalizedHistory = applyWebHistoryRuntimeLiveness(
-        { sessions: sidebar.sessions, transcriptBySession: {}, timeline: [], defaultSessionId: "" },
-        snapshot,
-      );
-      return webProjectionJsonResponse(
-        {
-          ...sidebar,
-          providerGates: projectProviderGates(snapshot),
-          runningAgents,
-          sessions: normalizedHistory.sessions,
-        },
-        durableSidebar,
-      );
+      return webProjectionJsonResponse(durableSidebar.record.payload, durableSidebar);
     }
 
     if (this.shouldReturnDurableProjectionFallback(forceRefresh)) {
@@ -2353,14 +2338,18 @@ export class StatusServer {
       includeTranscriptEvents: false,
     });
     const dashboardActivity = previewActivityFeed(historyActivity, 20);
-    const dashboard = projectWebDashboard({
-      runtime: snapshot,
-      board,
-      activity: dashboardActivity,
-      runs: sourceIndex?.runs.runs ?? activitySources.runs,
-      lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
-      config: this.options.dashboard ?? null,
-    });
+    const dashboard = dashboardWithRuntimeProviderGates(
+      projectWebDashboard({
+        generatedAt: snapshot.generatedAt,
+        runtime: dashboardRuntimeSnapshot(snapshot),
+        board,
+        activity: dashboardActivity,
+        runs: sourceIndex?.runs.runs ?? activitySources.runs,
+        lifecycleRecords: sourceIndex?.lifecycles.records ?? activitySources.lifecycleRecords,
+        config: this.options.dashboard ?? null,
+      }),
+      snapshot,
+    );
     const issues = projectWebIssueBoard(board);
     const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot });
     const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
@@ -2377,10 +2366,7 @@ export class StatusServer {
     const limits = parseWebHistoryLimits(url);
     const durableHistory = await this.webProjectionRepositories.history.readGlobalCollection(limits, { forceRefresh });
     if (durableHistory.status === "hit" && durableHistory.record) {
-      return webProjectionJsonResponse(
-        applyWebHistoryRuntimeLiveness(durableHistory.record.payload, this.options.orchestrator.snapshot()),
-        durableHistory,
-      );
+      return webProjectionJsonResponse(durableHistory.record.payload, durableHistory);
     }
 
     const projection = await this.fetchOptionalWebProjectionSourceIndex(forceRefresh);
@@ -3127,6 +3113,17 @@ function statusServerProjectionSourceRevisions(
     statusServerStoreProjectionSourceRevision("lifecycleStore", options.lifecycleStore),
     statusServerStoreProjectionSourceRevision("writebackOutbox", options.writebackOutbox),
   ].filter((revision): revision is ProjectionSourceRevision => revision !== null);
+}
+
+function dashboardRuntimeSnapshot(snapshot: ReturnType<Orchestrator["snapshot"]>): ReturnType<Orchestrator["snapshot"]> | null {
+  return snapshot.running.length > 0 ? snapshot : null;
+}
+
+function dashboardWithRuntimeProviderGates<T extends { providerGates: ReturnType<typeof projectProviderGates> }>(
+  dashboard: T,
+  snapshot: ReturnType<Orchestrator["snapshot"]>,
+): T {
+  return { ...dashboard, providerGates: projectProviderGates(snapshot) };
 }
 
 function dashboardSourceInputFromSourceIndex(
@@ -7229,6 +7226,7 @@ function reviewLoopStatus(input: {
     incompleteTurnCount: lifecycle?.incompleteTurnCount ?? null,
     lastCompletionReport: latestCompletionReport(lifecycle),
     lastReviewVerdict: latestReviewVerdict(lifecycle),
+    lastIssueTriageReport: latestIssueTriageReport(lifecycle),
     mergeConflict: lifecycle?.mergeConflict ?? null,
     blockedReason: lifecycleBlockedReason(lifecycle),
   };
@@ -7260,6 +7258,15 @@ function latestReviewVerdict(lifecycle: IssueLifecycleRecord | null): IssueRevie
     if (currentPass?.id === verdict.id) return verdict;
   }
   return null;
+}
+
+function latestIssueTriageReport(lifecycle: IssueLifecycleRecord | null): IssueTriageReportRecord | null {
+  if (!lifecycle) return null;
+  if (lifecycle.lastIssueTriageReportId) {
+    const exact = lifecycle.issueTriageReports.find((report) => report.id === lifecycle.lastIssueTriageReportId);
+    if (exact) return exact;
+  }
+  return lifecycle.issueTriageReports[lifecycle.issueTriageReports.length - 1] ?? null;
 }
 
 function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {

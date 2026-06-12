@@ -512,6 +512,8 @@ Work on {{ issue.identifier }}.
         agent: {
           require_labels: ["Dogfood-Ready"],
           exclude_labels: ["Safety-Blocked"],
+          worker_exclude_labels: ["Review_Only"],
+          reviewer_exclude_labels: ["No-Agent-Review"],
           protected_paths: ["src/core/orchestrator/**"],
         },
         writeback: {
@@ -528,6 +530,10 @@ Work on {{ issue.identifier }}.
           reviewer_prompt_extensions: [" Check database transactions. ", " ", "Check API boundaries."],
           worker_prompt_extensions: [" Fix shared invariants. ", "\t", "Validate replay."],
           max_review_rounds: 4,
+          failure_limits: {
+            reviewer_failures: 5,
+            merge_gate_failures: 2,
+          },
           max_incomplete_turns: 2,
           continuation_history_threshold: 7,
         },
@@ -557,6 +563,8 @@ Work on {{ issue.identifier }}.
     expect(config.tracker.handoffStates).toEqual(["In Review"]);
     expect(config.agent.requireLabels).toEqual(["dogfood-ready"]);
     expect(config.agent.excludeLabels).toEqual(["safety-blocked"]);
+    expect(config.agent.workerExcludeLabels).toEqual(["review_only"]);
+    expect(config.agent.reviewerExcludeLabels).toEqual(["no-agent-review"]);
     expect(config.agent.protectedPaths).toEqual(["src/core/orchestrator/**"]);
     expect(config.writeback).toMatchObject({
       enabled: true,
@@ -572,6 +580,10 @@ Work on {{ issue.identifier }}.
       reviewerPromptExtensions: ["Check database transactions.", "Check API boundaries."],
       workerPromptExtensions: ["Fix shared invariants.", "Validate replay."],
       maxReviewRounds: 4,
+      failureLimits: {
+        reviewerFailures: 5,
+        mergeGateFailures: 2,
+      },
       maxIncompleteTurns: 2,
       continuationHistoryThreshold: 7,
       transcriptHistoryLimit: 7,
@@ -595,6 +607,11 @@ Work on {{ issue.identifier }}.
       maxPlanningDispatchRetries: 3,
       planningRetryBaseMs: 5_000,
       planningRetryMaxMs: 60_000,
+    });
+    expect(config.issueTriage).toEqual({
+      enabled: false,
+      mode: "classify_only",
+      maxAttemptsPerTrigger: 1,
     });
     expect(config.mergePolicy).toEqual({
       mode: "gated",
@@ -1382,10 +1399,11 @@ Work on {{ issue.identifier }}.
       mode: "managed_root",
       providers: ["openai-codex"],
     });
-    expect(rawHermes?.worker_session_lifecycle).toBe("fresh_per_run");
+    expect(rawHermes?.worker_session_lifecycle).toBe("reuse_by_issue");
     expect(config.hermes.workerSessionLifecycle).toBe(rawHermes?.worker_session_lifecycle);
-    expect(rawHermes?.keep_profiles).toBe("failed");
+    expect(rawHermes?.keep_profiles).toBe("always");
     expect(config.hermes.keepProfiles).toBe(rawHermes?.keep_profiles);
+    expect(config.agent.workerExcludeLabels).toEqual(["review_only"]);
     expect(config.agent.protectedPaths).toContain("hermes/src/**");
     const expectedReasoningEffortByTemplate = new Map([
       ["worker", "xhigh"],

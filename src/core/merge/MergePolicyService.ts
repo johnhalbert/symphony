@@ -367,8 +367,10 @@ export class MergePolicyService {
       existingVerdict === null ||
       lifecycle.phase === "passed" ||
       (approvalVerdict !== null && lifecycle.lastReviewVerdictId === approvalVerdict.id);
-    const reviewRound = newRepairCycle ? lifecycle.reviewRound + 1 : lifecycle.reviewRound;
-    const blocked = reviewRound >= this.options.config.reviewLoop.maxReviewRounds;
+    const previousMergeGateRound = lifecycle.mergeGate?.id === gate.id ? lifecycle.mergeGate.reviewRound : 0;
+    const reviewRound = newRepairCycle ? previousMergeGateRound + 1 : previousMergeGateRound;
+    const maxMergeGateFailures = this.options.config.reviewLoop.failureLimits.mergeGateFailures;
+    const blocked = reviewRound >= maxMergeGateFailures;
     const operations = blocked
       ? planMergeGateBlockedWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config)
       : planMergeGateRepairWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config);
@@ -403,10 +405,9 @@ export class MergePolicyService {
 
     await this.options.lifecycleStore.updateIssue(issue, {
       phase: blocked ? "blocked" : "implementation",
-      reviewRound,
       incompleteTurnCount: 0,
       blockedReason: blocked
-        ? `merge gate required checks failed or mergeability blockers persisted and max review rounds reached (${reviewRound}/${this.options.config.reviewLoop.maxReviewRounds})`
+        ? `max merge gate failures reached (${reviewRound}/${maxMergeGateFailures})`
         : null,
       lastReviewVerdictId: storedVerdict.id,
       reviewVerdicts: upsertMergeGateVerdict(lifecycle.reviewVerdicts, storedVerdict),
@@ -440,7 +441,7 @@ export class MergePolicyService {
       unknownChecks: gate.unknownChecks,
       mergeability: gate.mergeability,
       reviewRound,
-      maxReviewRounds: this.options.config.reviewLoop.maxReviewRounds,
+      maxReviewRounds: this.options.config.reviewLoop.failureLimits.mergeGateFailures,
     };
   }
 
@@ -1035,9 +1036,10 @@ function mergeGateStateFromStatus(
   lifecycle: IssueLifecycleRecord,
   gateRunId: string | null,
   gateReportId: string | null,
-  reviewRound = lifecycle.reviewRound,
+  reviewRound?: number,
 ): IssueMergeGateState {
   const previous = lifecycle.mergeGate?.id === gate.id ? lifecycle.mergeGate : null;
+  const effectiveReviewRound = reviewRound ?? previous?.reviewRound ?? 0;
   return {
     id: gate.id,
     status,
@@ -1054,7 +1056,7 @@ function mergeGateStateFromStatus(
       actionableSince: check.actionableSince,
     })),
     mergeability: gate.mergeability,
-    reviewRound,
+    reviewRound: effectiveReviewRound,
     gateRunId: previous?.gateRunId ?? gateRunId,
     gateReportId: previous?.gateReportId ?? gateReportId,
     repairRunId: status === "repair_dispatched" ? null : previous?.repairRunId ?? null,

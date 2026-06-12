@@ -328,6 +328,13 @@ function validateProposedIssues(proposedIssues: readonly IssueBreakdownProposedI
         { proposedIssueIndex: index, issueContractErrors: analysis.issueContractErrors },
       );
     }
+    if (analysis.underSpecifiedContractErrors.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `${descriptor} has an under-specified contract: ${analysis.underSpecifiedContractErrors.join("; ")}`,
+        { proposedIssueIndex: index, underSpecifiedContractErrors: analysis.underSpecifiedContractErrors },
+      );
+    }
     if (analysis.readyForDogfoodReady === null) {
       throw new SymphonyError(
         "invalid_request",
