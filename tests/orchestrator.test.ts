@@ -2469,6 +2469,257 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("manual agent run re-triggers triage after the automatic attempt limit", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("Blocked") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const seeded = await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    await lifecycleStore.updateIssue(candidate, {
+      lastIssueTriageReportId: "issue-triage-report:issue-1:existing-triage",
+      issueTriageReports: [
+        {
+          id: "issue-triage-report:issue-1:existing-triage",
+          idempotencyKey: "existing-triage",
+          requestHash: "existing-hash",
+          runId: "existing-triage-run",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          triggerFingerprint: issueTriageTriggerFingerprint(seeded),
+          disposition: "implementation_repair",
+          confidence: "medium",
+          summary: "Existing automatic triage report.",
+          evidence: ["blockedReason=max reviewer failures reached (3/3)"],
+          recommendedAction: "Run another explicit triage pass.",
+          blockers: [
+            {
+              kind: "implementation_unsatisfied_requirements",
+              status: "active",
+              nextActor: "worker",
+              confidence: "medium",
+              summary: "Existing automatic triage report.",
+              evidence: ["blockedReason=max reviewer failures reached (3/3)"],
+              recommendedAction: "Run another explicit triage pass.",
+            },
+          ],
+          submittedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+    });
+    const harness = new IssueTriageAcceptingHarness(lifecycleStore, outboxStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    const result = await orchestrator.runManualAgent(candidate.id, { stage: "triage" });
+    await orchestrator.stop();
+
+    expect(result).toMatchObject({ status: "completed", role: "triage", runPhase: "issue_triage", finalStatus: "succeeded" });
+    expect(harness.runs[0]?.ctx.manualDispatch).toBe(true);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      issueTriageReports: [
+        { runId: "existing-triage-run" },
+        { runId: "triage-run-1" },
+      ],
+    });
+    await expect(runStore.getRun("triage-run-1")).resolves.toMatchObject({
+      manualDispatch: true,
+      manualDispatchStage: "triage",
+    });
+  });
+
+  it("manual triage still rejects non-triage blocked lifecycle reasons", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      blockedReason: "needs operator",
+    });
+    const harness = new IssueTriageAcceptingHarness(lifecycleStore, new FileWritebackOutboxStore(config.workspace.stateDir));
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    const result = await orchestrator.runManualAgent(candidate.id, { stage: "triage" });
+    await orchestrator.stop();
+
+    expect(result).toMatchObject({ status: "not_dispatched", reason: "lifecycle_gate_blocked" });
+    expect(harness.runs).toHaveLength(0);
+  });
+
+  it("manual worker dispatch force bypasses worker exclude labels only", async () => {
+    const config = testConfig(root);
+    config.agent.workerExcludeLabels = ["review_only"];
+    const candidate = issue({ state: "Todo", labels: ["review_only"], branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    const blocked = await orchestrator.runManualAgent(candidate.id, { stage: "worker" });
+    const forced = await orchestrator.runManualAgent(candidate.id, { stage: "worker", forceLabels: true });
+    await orchestrator.stop();
+
+    expect(blocked).toMatchObject({ status: "not_dispatched", reason: "worker_excluded_label:review_only" });
+    expect(forced).toMatchObject({ status: "completed", role: "worker", runPhase: "implementation" });
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx).toMatchObject({ role: "worker", runPhase: "implementation", manualDispatch: true });
+  });
+
+  it("manual worker dispatch does not auto-route planning-labeled issues to planner", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["needs_breakdown"];
+    const candidate = issue({ state: "Todo", labels: ["needs_breakdown"], branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    const result = await orchestrator.runManualAgent(candidate.id, { stage: "worker" });
+    await orchestrator.stop();
+
+    expect(result).toMatchObject({ status: "completed", role: "worker", runPhase: "implementation" });
+    expect(harness.runs[0]?.ctx).toMatchObject({ role: "worker", runPhase: "implementation" });
+  });
+
+  it("manual reviewer dispatch fails clearly when review evidence is unavailable", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [candidate];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    const result = await orchestrator.runManualAgent(candidate.id, { stage: "reviewer" });
+    await orchestrator.stop();
+
+    expect(result).toMatchObject({ status: "not_dispatched", reason: "review_evidence_unavailable" });
+    expect(harness.runs).toHaveLength(0);
+  });
+
   it("flushes issue triage report writebacks when the triage handoff is accepted", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
@@ -7884,6 +8135,55 @@ class NonMcpHarness implements AgentHarness {
   }
 }
 
+class ManualDispatchRecordingHarness implements AgentHarness {
+  readonly id = "manual-dispatch-recording";
+  readonly capabilities = { continuation: true, mcpHandoff: true, ephemeralSystemPrompt: true };
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  constructor(
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly outboxStore: FileWritebackOutboxStore,
+    private readonly runStore: FileRunTranscriptStore,
+  ) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    const runId = `manual-run-${this.runs.length}`;
+    yield { type: "session_started", sessionId: `${runId}-session`, runId };
+    if (ctx.role === "worker" && ctx.runPhase === "implementation") {
+      await new CompletionReportService({
+        config: ctx.config,
+        lifecycleStore: this.lifecycleStore,
+        writebackOutbox: this.outboxStore,
+        runStore: this.runStore,
+      }).submitCompletionReport(
+        {
+          runId,
+          issueId: ctx.issue.id,
+          summary: "Manual worker dispatch completed.",
+          validationEvidence: ["manual dispatch test"],
+          acceptanceChecklist: [{ text: "Manual dispatch started the requested worker stage.", satisfied: true, evidence: "test" }],
+          changedFiles: [],
+          branchName: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
+          pullRequest: null,
+          risks: [],
+          idempotencyKey: runId,
+        },
+        {
+          issue: ctx.issue,
+          activeRunId: runId,
+          role: "worker",
+          sessionId: `${runId}-session`,
+          workspacePath: ctx.workspace.path,
+          workspace: ctx.workspace,
+          phase: "implementation",
+        },
+      );
+    }
+    yield { type: "completed" };
+  }
+}
+
 class ProviderLimitThenCompleteHarness implements AgentHarness {
   readonly capabilities = { continuation: true, mcpHandoff: true };
   readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
@@ -8011,6 +8311,7 @@ class IssueTriageAcceptingHarness implements AgentHarness {
           activeRunId: runId,
           role: "triage",
           phase: "issue_triage",
+          ...(ctx.manualDispatch === true ? { manualDispatch: true } : {}),
         },
       );
     }

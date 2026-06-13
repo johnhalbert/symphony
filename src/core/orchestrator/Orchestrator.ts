@@ -59,6 +59,7 @@ import {
   issueTriageTriggerFingerprint,
   latestIssueTriageReport,
   latestIssueTriageReportForFingerprint,
+  shouldIssueTriageManualRun,
   shouldIssueTriageRun,
   sortIssueTriageBlockers,
 } from "../IssueTriageService.js";
@@ -189,6 +190,35 @@ export interface PromptPreviewOptions {
   force?: boolean;
 }
 
+export type ManualAgentRunStage = "worker" | "reviewer" | "triage" | "planner" | "merge_conflict";
+
+export interface ManualAgentRunOptions {
+  stage: ManualAgentRunStage;
+  forceLabels?: boolean;
+}
+
+export type ManualAgentRunResult =
+  | {
+      status: "completed";
+      issue: Issue;
+      role: AgentRunRole;
+      runPhase: AgentRunPhase;
+      runKind: AgentRunKind;
+      runId: string | null;
+      sessionId: string | null;
+      finalStatus: "succeeded" | "failed" | "cancelled" | "unknown";
+      error: string | null;
+      lifecycle: IssueLifecycleRecord | null;
+    }
+  | {
+      status: "not_dispatched";
+      issue: Issue | null;
+      role: AgentRunRole;
+      runPhase: AgentRunPhase;
+      runKind: AgentRunKind;
+      reason: string;
+    };
+
 export type PromptPreviewResult =
   | {
       status: "rendered";
@@ -256,6 +286,10 @@ export interface RunningEntry {
   pullRequestHandoffAccepted: boolean;
   reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
+  manualDispatch: {
+    stage: ManualAgentRunStage;
+    forceLabels: boolean;
+  } | null;
   handoffRepair: {
     sourceRunId: string;
     kind: AgentHandoffRepairKind;
@@ -285,6 +319,10 @@ interface ReviewerDispatchEvidence {
 type WorkerDispatchDecision =
   | { action: "dispatch"; runPhase: AgentRunPhase }
   | { action: "skip"; reason: string };
+
+interface DispatchGateOptions {
+  ignoreExcludeLabels?: boolean;
+}
 
 export interface RetryEntry {
   issueId: string;
@@ -1124,6 +1162,161 @@ export class Orchestrator {
     };
   }
 
+  async runManualAgent(issueIdOrIdentifier: string, options: ManualAgentRunOptions): Promise<ManualAgentRunResult> {
+    const target = manualAgentRunTarget(options.stage);
+    const issue = await this.fetchSingleIssue(issueIdOrIdentifier);
+    if (!issue) return manualAgentNotDispatched(null, target, "issue_not_found");
+
+    const gateOptions: DispatchGateOptions = { ignoreExcludeLabels: options.forceLabels === true };
+    let dispatchIssue = issue;
+    let reviewEvidence: ReviewerDispatchEvidence | null = null;
+
+    const preflightReason = await this.manualDispatchBlockReason(dispatchIssue, target, gateOptions);
+    if (preflightReason !== null) return manualAgentNotDispatched(dispatchIssue, target, preflightReason);
+
+    if (target.role === "reviewer") {
+      reviewEvidence = await this.loadReviewerDispatchEvidence(dispatchIssue);
+      if (!reviewEvidence) return manualAgentNotDispatched(dispatchIssue, target, "review_evidence_unavailable");
+    }
+
+    if (target.role === "worker" && target.runPhase === "implementation") {
+      const dispatchWriteback = planDispatchWriteback(dispatchIssue, this.config);
+      if (!(await this.applyWriteback(dispatchWriteback, "manual dispatch"))) {
+        return manualAgentNotDispatched(dispatchIssue, target, "dispatch_writeback_failed");
+      }
+      if (dispatchWriteback) {
+        const refreshed = await this.fetchSingleIssue(dispatchIssue.id);
+        if (!refreshed) return manualAgentNotDispatched(dispatchIssue, target, "issue_not_found_after_dispatch_writeback");
+        dispatchIssue = refreshed;
+        const postWritebackReason = await this.manualDispatchBlockReason(dispatchIssue, target, gateOptions);
+        if (postWritebackReason !== null) return manualAgentNotDispatched(dispatchIssue, target, postWritebackReason);
+      }
+    }
+
+    const entry = this.dispatchIssue(
+      dispatchIssue,
+      null,
+      target.role,
+      reviewEvidence,
+      target.runPhase,
+      { stage: options.stage, forceLabels: options.forceLabels === true },
+    );
+    await entry.worker;
+    const runId = entry.activeRunId ?? entry.runId;
+    const run = runId && this.options.runStore ? await this.options.runStore.getRun(runId) : null;
+    const lifecycle = (await this.options.lifecycleStore?.get(dispatchIssue.id)) ?? entry.lifecycle ?? null;
+    return {
+      status: "completed",
+      issue: dispatchIssue,
+      role: target.role,
+      runPhase: target.runPhase,
+      runKind: runKindForPhase(target.runPhase),
+      runId,
+      sessionId: entry.sessionId,
+      finalStatus: terminalManualRunStatus(run?.status),
+      error: run?.error ?? null,
+      lifecycle,
+    };
+  }
+
+  private async fetchSingleIssue(issueIdOrIdentifier: string): Promise<Issue | null> {
+    const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
+    return refreshed[0] ?? null;
+  }
+
+  private async manualDispatchBlockReason(
+    issue: Issue,
+    target: { role: AgentRunRole; runPhase: AgentRunPhase },
+    options: DispatchGateOptions,
+  ): Promise<string | null> {
+    if (this.availableSlots() <= 0) return "no_agent_slots_available";
+    if (await this.activeProviderDispatchGate()) return "provider_dispatch_gate_active";
+    const roleReason = this.manualRoleGateBlockReason(issue, target, options);
+    if (roleReason !== null) return roleReason;
+    const lifecycleAllowed = await this.lifecycleAllowsDispatch(issue, target.role, target.runPhase, {
+      ...options,
+      manualDispatch: target.role === "triage" && target.runPhase === "issue_triage",
+    });
+    if (!lifecycleAllowed) return "lifecycle_gate_blocked";
+    return null;
+  }
+
+  private manualRoleGateBlockReason(
+    issue: Issue,
+    target: { role: AgentRunRole; runPhase: AgentRunPhase },
+    options: DispatchGateOptions,
+  ): string | null {
+    if (this.running.has(issue.id)) return "issue_already_running";
+    if (this.pausedIssues.has(issue.id)) return "issue_paused";
+    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return "issue_in_terminal_state";
+    const labelReason = this.labelGuardrailBlockReason(issue, target.role, options);
+    if (labelReason !== null) return labelReason;
+
+    if (target.role === "worker") {
+      if (!issue.assignedToWorker) return "worker_not_assigned";
+      if (target.runPhase === "merge_conflict_resolution") {
+        if (!this.isMergeConflictState(issue.state)) return "issue_not_in_merge_conflict_state";
+      } else {
+        if (!isStateIn(issue.state, this.config.tracker.activeStates)) return "issue_not_in_worker_active_state";
+        if (isStateIn(issue.state, this.config.tracker.handoffStates)) return "issue_in_handoff_state";
+        if (isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return "issue_in_review_state";
+        if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return "issue_in_blocked_state";
+      }
+      if (issue.hasChildren) return "issue_has_children";
+      if (issue.state.toLowerCase() === "todo" && hasOpenBlocker(issue, this.config.tracker.terminalStates)) return "issue_has_open_blocker";
+      if (!this.hasStateSlot(issue.state)) return "state_slot_unavailable";
+      return null;
+    }
+
+    if (target.role === "reviewer") {
+      if (!isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return "issue_not_in_review_state";
+      if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return "issue_in_blocked_state";
+      if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return "issue_has_open_blocker";
+      if (!this.hasStateSlot(issue.state)) return "state_slot_unavailable";
+      return null;
+    }
+
+    if (target.role === "triage") {
+      if (!this.config.issueTriage.enabled || !this.options.lifecycleStore) return "issue_triage_not_configured";
+      if (!isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return "issue_not_in_blocked_state";
+      if (!this.hasStateSlot(issue.state)) return "state_slot_unavailable";
+      return null;
+    }
+
+    if (!this.config.issueBreakdown.enabled || !this.options.lifecycleStore) return "issue_breakdown_not_configured";
+    if (!issue.assignedToWorker) return "planner_not_assigned";
+    if (this.isMergeConflictState(issue.state)) return "issue_in_merge_conflict_state";
+    if (!isStateIn(issue.state, this.config.tracker.activeStates) && !isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
+      return "issue_not_in_planner_state";
+    }
+    if (issue.hasChildren) return "issue_has_children";
+    if (issue.state.toLowerCase() === "todo" && hasOpenBlocker(issue, this.config.tracker.terminalStates)) return "issue_has_open_blocker";
+    if (!this.hasStateSlot(issue.state)) return "state_slot_unavailable";
+    return null;
+  }
+
+  private labelGuardrailBlockReason(issue: Issue, role: AgentRunRole | "merge_policy", options: DispatchGateOptions): string | null {
+    const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
+    const missingRequired = this.config.agent.requireLabels.find((label) => !labels.has(label));
+    if (missingRequired) return `missing_required_label:${missingRequired}`;
+    if (options.ignoreExcludeLabels === true) return null;
+    const globalExcluded = this.config.agent.excludeLabels.find((label) => labels.has(label));
+    if (globalExcluded) return `excluded_label:${globalExcluded}`;
+    if (role === "worker") {
+      const excluded = this.config.agent.workerExcludeLabels.find((label) => labels.has(label));
+      if (excluded) return `worker_excluded_label:${excluded}`;
+    }
+    if (role === "reviewer") {
+      const excluded = this.config.agent.reviewerExcludeLabels.find((label) => labels.has(label));
+      if (excluded) return `reviewer_excluded_label:${excluded}`;
+    }
+    if (role === "planner") {
+      const excluded = this.config.agent.plannerExcludeLabels.find((label) => labels.has(label));
+      if (excluded) return `planner_excluded_label:${excluded}`;
+    }
+    return null;
+  }
+
   private async selectPromptPreviewRun(
     issue: Issue,
     lifecycle: IssueLifecycleRecord | null,
@@ -1223,6 +1416,7 @@ export class Orchestrator {
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence: null,
+      manualDispatch: null,
       handoffRepair: null,
       hermesResume: null,
       cancellationRequestedAt: null,
@@ -1635,6 +1829,7 @@ export class Orchestrator {
     issue: Issue,
     allowExistingClaim = false,
     runPhase: AgentRunPhase = "implementation",
+    options: DispatchGateOptions = {},
   ): boolean {
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
@@ -1646,7 +1841,7 @@ export class Orchestrator {
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
     if (!this.isWorkerStateActiveForRunPhase(issue, runPhase)) return false;
     if (issue.hasChildren) return false;
-    if (!this.passesLabelGuardrails(issue, "worker")) return false;
+    if (!this.passesLabelGuardrails(issue, "worker", options)) return false;
     if (issue.state.toLowerCase() === "todo") {
       if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
     }
@@ -1659,30 +1854,30 @@ export class Orchestrator {
     return isStateIn(issue.state, this.config.tracker.activeStates);
   }
 
-  private shouldDispatchReviewer(issue: Issue, allowExistingClaim = false): boolean {
+  private shouldDispatchReviewer(issue: Issue, allowExistingClaim = false, options: DispatchGateOptions = {}): boolean {
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
     if (!isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
     if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
-    if (!this.passesLabelGuardrails(issue, "reviewer")) return false;
+    if (!this.passesLabelGuardrails(issue, "reviewer", options)) return false;
     if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
     return this.hasStateSlot(issue.state);
   }
 
-  private shouldDispatchIssueTriage(issue: Issue, allowExistingClaim = false): boolean {
+  private shouldDispatchIssueTriage(issue: Issue, allowExistingClaim = false, options: DispatchGateOptions = {}): boolean {
     if (!this.config.issueTriage.enabled || !this.options.lifecycleStore) return false;
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
     if (!isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
-    if (!this.passesLabelGuardrails(issue, "triage")) return false;
+    if (!this.passesLabelGuardrails(issue, "triage", options)) return false;
     return this.hasStateSlot(issue.state);
   }
 
-  private shouldDispatchPlanner(issue: Issue, allowExistingClaim = false): boolean {
+  private shouldDispatchPlanner(issue: Issue, allowExistingClaim = false, options: DispatchGateOptions = {}): boolean {
     if (!this.config.issueBreakdown.enabled || !this.options.lifecycleStore) return false;
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
@@ -1694,7 +1889,7 @@ export class Orchestrator {
       return false;
     }
     if (issue.hasChildren) return false;
-    if (!this.passesLabelGuardrails(issue, "planner")) return false;
+    if (!this.passesLabelGuardrails(issue, "planner", options)) return false;
     if (issue.state.toLowerCase() === "todo" && hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
     return this.hasStateSlot(issue.state);
   }
@@ -1703,6 +1898,7 @@ export class Orchestrator {
     issue: Issue,
     role: AgentRunRole,
     runPhase: AgentRunPhase = role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : role === "planner" ? "issue_breakdown" : "implementation",
+    options: DispatchGateOptions & { manualDispatch?: boolean } = {},
   ): Promise<boolean> {
     const store = this.options.lifecycleStore;
     if (!store) return true;
@@ -1710,7 +1906,9 @@ export class Orchestrator {
     if (!lifecycle) return true;
 
     if (role === "triage") {
-      return runPhase === "issue_triage" && shouldIssueTriageRun(lifecycle, this.config);
+      return runPhase === "issue_triage" && (options.manualDispatch === true
+        ? shouldIssueTriageManualRun(lifecycle, this.config)
+        : shouldIssueTriageRun(lifecycle, this.config));
     }
 
     const phase = phaseForIssueState(issue.state, this.config);
@@ -1807,9 +2005,10 @@ export class Orchestrator {
     return true;
   }
 
-  private passesLabelGuardrails(issue: Issue, role: AgentRunRole | "merge_policy"): boolean {
+  private passesLabelGuardrails(issue: Issue, role: AgentRunRole | "merge_policy", options: DispatchGateOptions = {}): boolean {
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
     if (this.config.agent.requireLabels.some((label) => !labels.has(label))) return false;
+    if (options.ignoreExcludeLabels === true) return true;
     if (this.config.agent.excludeLabels.some((label) => labels.has(label))) return false;
     if (role === "worker" && this.config.agent.workerExcludeLabels.some((label) => labels.has(label))) return false;
     if (role === "reviewer" && this.config.agent.reviewerExcludeLabels.some((label) => labels.has(label))) return false;
@@ -2074,7 +2273,8 @@ export class Orchestrator {
     role: AgentRunRole,
     reviewEvidence: ReviewerDispatchEvidence | null,
     runPhase: AgentRunPhase = role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : role === "planner" ? "issue_breakdown" : "implementation",
-  ): void {
+    manualDispatch: RunningEntry["manualDispatch"] = null,
+  ): RunningEntry {
     const abortController = new AbortController();
     const retryAttempt = attempt ?? 0;
     const entry: RunningEntry = {
@@ -2114,6 +2314,7 @@ export class Orchestrator {
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence,
+      manualDispatch,
       handoffRepair: null,
       hermesResume: null,
       cancellationRequestedAt: null,
@@ -2140,6 +2341,7 @@ export class Orchestrator {
       () => this.activeWorkers.delete(worker),
       () => this.activeWorkers.delete(worker),
     );
+    return entry;
   }
 
   private async monitorRunExit(entry: RunningEntry, run: Promise<void>): Promise<void> {
@@ -2357,14 +2559,20 @@ export class Orchestrator {
   private async runIssueTriage(entry: RunningEntry): Promise<void> {
     let workspace: Workspace | null = null;
     try {
-      const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
-      if (!shouldIssueTriageRun(lifecycle, this.config)) {
+      const lifecycle = (await this.options.lifecycleStore?.get(entry.issue.id)) ?? null;
+      const triageEligible = entry.manualDispatch === null
+        ? shouldIssueTriageRun(lifecycle, this.config)
+        : shouldIssueTriageManualRun(lifecycle, this.config);
+      if (!triageEligible) {
         this.options.logger.warn("issue triage dispatch skipped because lifecycle is not triage-eligible", {
           issue_id: entry.issue.id,
           issue_identifier: entry.issue.identifier,
+          manual_dispatch: entry.manualDispatch !== null,
         });
         return;
       }
+      if (!lifecycle) return;
+      const eligibleLifecycle = lifecycle;
       entry.lifecycle = lifecycle;
       workspace = await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
@@ -2373,10 +2581,10 @@ export class Orchestrator {
         summaryPointers: {
           workspaceKey: workspace.workspaceKey,
           workspacePath: workspace.path,
-          branchName: workspace.gitBranchName ?? entry.issue.branchName ?? lifecycle.summaryPointers.branchName,
-          gitBranchName: workspace.gitBranchName ?? entry.issue.branchName ?? lifecycle.summaryPointers.gitBranchName,
-          repoPath: workspace.repoPath ?? lifecycle.summaryPointers.repoPath,
-          baseRef: workspace.baseRef ?? lifecycle.summaryPointers.baseRef,
+          branchName: workspace.gitBranchName ?? entry.issue.branchName ?? eligibleLifecycle.summaryPointers.branchName,
+          gitBranchName: workspace.gitBranchName ?? entry.issue.branchName ?? eligibleLifecycle.summaryPointers.gitBranchName,
+          repoPath: workspace.repoPath ?? eligibleLifecycle.summaryPointers.repoPath,
+          baseRef: workspace.baseRef ?? eligibleLifecycle.summaryPointers.baseRef,
         },
       });
       await this.options.workspaceManager.beforeRun(workspace.path);
@@ -2468,6 +2676,7 @@ export class Orchestrator {
           ...(context.workspace.gitBranchName === undefined ? {} : { gitBranchName: context.workspace.gitBranchName }),
           ...(context.workspace.repoPath === undefined ? {} : { repoPath: context.workspace.repoPath }),
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),
+          ...(entry.manualDispatch === null ? {} : { metadata: manualDispatchRunMetadata(entry) }),
         });
         if (entry.runPhase !== "issue_breakdown") {
           await this.discoverPullRequestForEntry(entry, context.workspace);
@@ -3316,6 +3525,7 @@ export class Orchestrator {
       turnNumber,
       ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: this.config.issueBreakdown.cursorMode } : {}),
       ...(entry.handoffRepair === null ? {} : { handoffRepair: entry.handoffRepair }),
+      ...(entry.manualDispatch === null ? {} : { manualDispatch: true }),
       ...(entry.hermesResume === null ? {} : { hermesResume: entry.hermesResume }),
       ...(promptBundle === undefined ? {} : { ephemeralSystemPrompt: promptBundle.ephemeralSystemPrompt }),
       abortSignal: entry.abortController.signal,
@@ -5726,6 +5936,42 @@ function requiredHandoffForRun(entry: RunningEntry): string {
   }
 }
 
+function manualAgentRunTarget(stage: ManualAgentRunStage): { role: AgentRunRole; runPhase: AgentRunPhase } {
+  switch (stage) {
+    case "worker":
+      return { role: "worker", runPhase: "implementation" };
+    case "reviewer":
+      return { role: "reviewer", runPhase: "review" };
+    case "triage":
+      return { role: "triage", runPhase: "issue_triage" };
+    case "planner":
+      return { role: "planner", runPhase: "issue_breakdown" };
+    case "merge_conflict":
+      return { role: "worker", runPhase: "merge_conflict_resolution" };
+  }
+}
+
+function manualAgentNotDispatched(
+  issue: Issue | null,
+  target: { role: AgentRunRole; runPhase: AgentRunPhase },
+  reason: string,
+): ManualAgentRunResult {
+  return {
+    status: "not_dispatched",
+    issue,
+    role: target.role,
+    runPhase: target.runPhase,
+    runKind: runKindForPhase(target.runPhase),
+    reason,
+  };
+}
+
+function terminalManualRunStatus(
+  status: "running" | "succeeded" | "failed" | "cancelled" | undefined,
+): "succeeded" | "failed" | "cancelled" | "unknown" {
+  return status === "succeeded" || status === "failed" || status === "cancelled" ? status : "unknown";
+}
+
 function formatPinnedIssueContract(contract: ReturnType<typeof summarizeIssueContractForPrompt>): string {
   const sections: string[] = [];
   if (contract.issueContractJson) {
@@ -5907,6 +6153,16 @@ function terminalRunMetadata(entry: RunningEntry, terminalStatus: "succeeded" | 
     failureDiagnosticAt: terminalStatus === "failed" ? entry.failureDiagnosticAt?.toISOString() ?? null : null,
     failureDiagnosticPayload: terminalStatus === "failed" ? entry.failureDiagnosticPayload : null,
     providerLimit: entry.providerLimitSignal,
+    ...manualDispatchRunMetadata(entry),
+  };
+}
+
+function manualDispatchRunMetadata(entry: RunningEntry): Pick<RunMetadata, "manualDispatch" | "manualDispatchStage" | "manualDispatchForceLabels"> {
+  if (entry.manualDispatch === null) return {};
+  return {
+    manualDispatch: true,
+    manualDispatchStage: entry.manualDispatch.stage,
+    manualDispatchForceLabels: entry.manualDispatch.forceLabels,
   };
 }
 

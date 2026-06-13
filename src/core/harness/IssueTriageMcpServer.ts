@@ -25,6 +25,7 @@ export interface IssueTriageMcpContextFile {
   phase: "issue_triage";
   workspacePath: string | null;
   workspace: Workspace;
+  manualDispatch?: boolean;
 }
 
 export async function writeIssueTriageMcpContext(filePath: string, context: IssueTriageMcpContextFile): Promise<void> {
@@ -61,6 +62,7 @@ export async function submitIssueTriageReportFromMcp(
       activeRunId: loadedContext.activeRunId,
       role: loadedContext.role,
       phase: loadedContext.phase,
+      ...(loadedContext.manualDispatch === true ? { manualDispatch: true } : {}),
     };
     const result = await service.submit_issue_triage_report(issueTriageReportInputFromMcp(input, context, lifecycle), context);
     return {

@@ -146,6 +146,9 @@ export interface RunMetadata {
   handoffRepairSourceRunId?: string | null;
   handoffRepairKind?: string | null;
   handoffRepairAttempt?: number | null;
+  manualDispatch?: boolean;
+  manualDispatchStage?: string | null;
+  manualDispatchForceLabels?: boolean;
 }
 
 export interface RunRecord {
@@ -234,6 +237,9 @@ export interface RunRecord {
   handoffRepairSourceRunId?: string | null;
   handoffRepairKind?: string | null;
   handoffRepairAttempt?: number | null;
+  manualDispatch?: boolean;
+  manualDispatchStage?: string | null;
+  manualDispatchForceLabels?: boolean;
 }
 
 export interface TranscriptEvent {
@@ -410,6 +416,7 @@ export interface StartRunInput {
   gitBranchName?: string;
   repoPath?: string;
   baseRef?: string;
+  metadata?: RunMetadata;
 }
 
 export interface UpdateRunInput {
@@ -541,6 +548,7 @@ export class FileRunTranscriptStore {
       ...(input.gitBranchName === undefined ? {} : { gitBranchName: input.gitBranchName }),
       ...(input.repoPath === undefined ? {} : { repoPath: input.repoPath }),
       ...(input.baseRef === undefined ? {} : { baseRef: input.baseRef }),
+      ...metadataPatch(input.metadata),
       status: existing?.status ?? "running",
       startedAt: existing?.startedAt ?? now,
       updatedAt: now,
@@ -930,6 +938,9 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.handoffRepairSourceRunId === undefined ? {} : { handoffRepairSourceRunId: metadata.handoffRepairSourceRunId }),
     ...(metadata.handoffRepairKind === undefined ? {} : { handoffRepairKind: metadata.handoffRepairKind }),
     ...(metadata.handoffRepairAttempt === undefined ? {} : { handoffRepairAttempt: metadata.handoffRepairAttempt }),
+    ...(metadata.manualDispatch === undefined ? {} : { manualDispatch: metadata.manualDispatch }),
+    ...(metadata.manualDispatchStage === undefined ? {} : { manualDispatchStage: metadata.manualDispatchStage }),
+    ...(metadata.manualDispatchForceLabels === undefined ? {} : { manualDispatchForceLabels: metadata.manualDispatchForceLabels }),
   };
 }
 

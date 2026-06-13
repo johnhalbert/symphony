@@ -163,6 +163,43 @@ describe("IssueTriageService", () => {
     });
   });
 
+  it("allows manual triage reports after the configured trigger attempt limit", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.issueTriage.maxAttemptsPerTrigger = 1;
+    config.writeback.enabled = true;
+    const candidate = issue({ state: "Blocked" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const writebackOutbox = new FileWritebackOutboxStore(root);
+    const lifecycle = await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const service = new IssueTriageService({ config, lifecycleStore, writebackOutbox });
+    const triggerFingerprint = issueTriageTriggerFingerprint(lifecycle);
+
+    await service.submitIssueTriageReport(reportInput("triage-run-1", "triage-1", triggerFingerprint), {
+      issue: candidate,
+      activeRunId: "triage-run-1",
+      role: "triage",
+      phase: "issue_triage",
+    });
+    const manual = await service.submitIssueTriageReport(reportInput("triage-run-2", "triage-2", triggerFingerprint), {
+      issue: candidate,
+      activeRunId: "triage-run-2",
+      role: "triage",
+      phase: "issue_triage",
+      manualDispatch: true,
+    });
+
+    expect(manual.replayed).toBe(false);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      issueTriageReports: [{ runId: "triage-run-1" }, { runId: "triage-run-2" }],
+    });
+    await expect(writebackOutbox.list()).resolves.toHaveLength(2);
+  });
+
   it("replays legacy-hashed triage reports without duplicating writebacks", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;

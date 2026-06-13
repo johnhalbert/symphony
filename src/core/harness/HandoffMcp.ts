@@ -294,6 +294,7 @@ async function writeHandoffMcpContexts(
       workspacePath: ctx.workspace.path,
       workspace: ctx.workspace,
       phase: "issue_triage",
+      ...(ctx.manualDispatch === true ? { manualDispatch: true } : {}),
     });
     return;
   }

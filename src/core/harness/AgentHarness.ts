@@ -61,6 +61,7 @@ export interface AgentRunContext {
     kind: AgentHandoffRepairKind;
     attempt: number;
   } | null;
+  manualDispatch?: boolean;
   hermesResume?: AgentHermesResumeContext | null;
   ephemeralSystemPrompt?: string | null;
   abortSignal: AbortSignal;

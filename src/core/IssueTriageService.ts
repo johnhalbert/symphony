@@ -130,6 +130,7 @@ export interface IssueTriageActiveContext {
   activeRunId: string;
   role: "triage";
   phase: "issue_triage";
+  manualDispatch?: boolean;
 }
 
 export interface IssueTriageServiceOptions {
@@ -192,14 +193,17 @@ export class IssueTriageService {
         requestHash,
       });
     }
-    if (!shouldIssueTriageRun(existingLifecycle, this.options.config)) {
+    const triageEligible = context.manualDispatch === true
+      ? shouldIssueTriageManualRun(existingLifecycle, this.options.config)
+      : shouldIssueTriageRun(existingLifecycle, this.options.config);
+    if (!triageEligible) {
       throw new SymphonyError("invalid_request", "Issue triage is not currently eligible for this issue");
     }
 
     const attemptsForTrigger = existingLifecycle.issueTriageReports.filter(
       (report) => report.triggerFingerprint === parsed.triggerFingerprint,
     ).length;
-    if (attemptsForTrigger >= this.options.config.issueTriage.maxAttemptsPerTrigger) {
+    if (context.manualDispatch !== true && attemptsForTrigger >= this.options.config.issueTriage.maxAttemptsPerTrigger) {
       throw new SymphonyError("conflict", "Issue triage report already exists for this blocked trigger", {
         triggerFingerprint: parsed.triggerFingerprint,
         attemptsForTrigger,
@@ -283,6 +287,14 @@ export function shouldIssueTriageRun(
   const fingerprint = issueTriageTriggerFingerprint(lifecycle);
   const attemptsForTrigger = lifecycle.issueTriageReports.filter((report) => report.triggerFingerprint === fingerprint).length;
   return attemptsForTrigger < config.issueTriage.maxAttemptsPerTrigger;
+}
+
+export function shouldIssueTriageManualRun(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  config: ServiceConfig,
+): lifecycle is IssueLifecycleRecord {
+  if (!config.issueTriage.enabled || !lifecycle || lifecycle.phase !== "blocked") return false;
+  return isIssueTriageBlockedReason(lifecycle.blockedReason);
 }
 
 export function isIssueTriageBlockedReason(reason: string | null | undefined): boolean {

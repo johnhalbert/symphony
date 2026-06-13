@@ -7,7 +7,12 @@ import { StatusServer } from "./app/http.js";
 import { parseDatabaseConfig, type DatabaseConfig, type ServiceConfig } from "./core/config/Config.js";
 import { createAgentHarness } from "./core/harness/HarnessFactory.js";
 import { StructuredLogger } from "./core/logging/StructuredLogger.js";
-import { Orchestrator, type PromptPreviewResult } from "./core/orchestrator/Orchestrator.js";
+import {
+  Orchestrator,
+  type ManualAgentRunResult,
+  type ManualAgentRunStage,
+  type PromptPreviewResult,
+} from "./core/orchestrator/Orchestrator.js";
 import { FileIssueLifecycleStore } from "./core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureDiagnosticsStore.js";
 import { FileOrchestratorConversationStore } from "./core/persistence/OrchestratorConversationStore.js";
@@ -216,6 +221,72 @@ program
       runId: options.runId ?? process.env.SYMPHONY_RUN_ID,
       journalPath: options.decisionJournal,
     });
+  });
+
+const agentCommand = program.command("agent").description("Run or inspect Symphony agents");
+
+agentCommand
+  .command("run")
+  .description("Dispatch one Symphony agent stage for a specific issue and wait for completion")
+  .argument("<issue>", "issue id or identifier")
+  .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
+  .requiredOption("--stage <stage>", "agent stage: worker, reviewer, review, triage, planner, breakdown, merge-conflict")
+  .option("--force", "bypass configured label exclude guardrails only")
+  .option("--json", "print JSON result")
+  .action(async (issue: string, workflow: string, options: { stage: string; force?: boolean; json?: boolean }) => {
+    const logger = new StructuredLogger();
+    const workflowPath = path.resolve(process.cwd(), workflow);
+    const loader = new WorkflowLoader(workflowPath);
+    const loaded = await loader.load();
+    const config = loaded.serviceConfig;
+    const configRef = { value: config };
+    const tracker = createRuntimeTrackerClient(config);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const writeback = createRuntimeWritebackProcessor(() => configRef.value, logger);
+    const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
+    const operatorApproval = new OperatorApprovalService({ config, store: operatorApprovalStore, runStore });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+      planningWorkspaceMode: config.issueBreakdown.workspaceMode,
+    });
+    const harness = createAgentHarness(config, { runStore });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: loaded.definition.promptTemplate,
+      runStore,
+      lifecycleStore,
+      statusServerBaseUrl: () => null,
+      statusMutationToken: null,
+      ...(writeback === undefined ? {} : { writeback }),
+      operatorApproval,
+    });
+    try {
+      const result = await orchestrator.runManualAgent(issue, {
+        stage: parseManualAgentRunStage(options.stage),
+        forceLabels: options.force === true,
+      });
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatManualAgentRunResult(result));
+      }
+      if (result.status === "not_dispatched") {
+        process.exitCode = 2;
+      } else if (result.finalStatus !== "succeeded") {
+        process.exitCode = 1;
+      }
+    } finally {
+      await orchestrator.stop();
+      await loader.close();
+      await harness.dispose?.();
+    }
   });
 
 const promptCommand = program.command("prompt").description("Inspect Symphony prompts without dispatching an agent");
@@ -466,6 +537,27 @@ function parsePromptRenderPhase(
   throw new Error(`Invalid prompt render phase: ${value}`);
 }
 
+function parseManualAgentRunStage(value: string | undefined): ManualAgentRunStage {
+  const normalized = (value ?? "").trim().toLowerCase().replace(/_/g, "-");
+  switch (normalized) {
+    case "worker":
+      return "worker";
+    case "review":
+    case "reviewer":
+      return "reviewer";
+    case "triage":
+      return "triage";
+    case "breakdown":
+    case "planner":
+      return "planner";
+    case "merge-conflict":
+    case "merge-conflict-resolution":
+      return "merge_conflict";
+    default:
+      throw new Error(`Invalid agent run stage: ${value}`);
+  }
+}
+
 function formatRenderedPromptPreview(result: Extract<PromptPreviewResult, { status: "rendered" }>): string {
   return [
     "===== EPHEMERAL SYSTEM PROMPT =====",
@@ -473,6 +565,26 @@ function formatRenderedPromptPreview(result: Extract<PromptPreviewResult, { stat
     "",
     "===== USER PROMPT =====",
     result.userPrompt,
+  ].join("\n");
+}
+
+function formatManualAgentRunResult(result: ManualAgentRunResult): string {
+  if (result.status === "not_dispatched") {
+    return [
+      `No manual agent run dispatched${result.issue ? ` for ${result.issue.identifier}` : ""}.`,
+      `Role: ${result.role}`,
+      `Phase: ${result.runPhase}`,
+      `Reason: ${result.reason}`,
+    ].join("\n");
+  }
+  return [
+    `Manual agent run completed for ${result.issue.identifier}.`,
+    `Role: ${result.role}`,
+    `Phase: ${result.runPhase}`,
+    `Run: ${result.runId ?? "n/a"}`,
+    `Session: ${result.sessionId ?? "n/a"}`,
+    `Status: ${result.finalStatus}`,
+    ...(result.error === null ? [] : [`Error: ${result.error}`]),
   ].join("\n");
 }
 
