@@ -4,6 +4,7 @@ import type { ServiceConfig } from "../config/Config.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
   LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+  normalizeProjectContextResolution,
   normalizeProjectContextId,
   projectContextResolutionFromIssue,
   resolveProjectContextForIssue,
@@ -240,6 +241,7 @@ export interface RetryEntry {
   timer: NodeJS.Timeout;
   error: string | null;
   runPhase: AgentRunPhase;
+  projectContext: ProjectContextResolution | undefined;
 }
 
 type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
@@ -1010,6 +1012,92 @@ export class Orchestrator {
     return this.options.trackerResolver?.(projectContext) ?? this.options.tracker;
   }
 
+  private pollingProjectContexts(): Array<ProjectContextResolution | undefined> {
+    if (!this.options.trackerResolver) return [undefined];
+    return this.config.projectContexts.enabledContexts.map((context) =>
+      normalizeProjectContextResolution({
+        projectContextId: context.id,
+        projectContextLabel: context.label,
+        linearProjectSlug: context.tracker.projectSlug ?? null,
+        routingSource: context.source === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE ? context.source : "candidate_poll",
+      }),
+    );
+  }
+
+  private issueWithRequestedProjectContext(issue: Issue, requestedProjectContext?: ProjectContextResolution): Issue {
+    const projectContext = this.requestedProjectContextForIssue(issue, requestedProjectContext);
+    if (!projectContext || this.issueHasProjectContextProof(issue)) return issue;
+    return { ...issue, projectContext } as Issue;
+  }
+
+  private async fetchCandidateIssuesForProjectContext(projectContext?: ProjectContextResolution): Promise<Issue[]> {
+    const tracker = this.trackerClientForProjectContext(projectContext);
+    return (await tracker.fetchCandidateIssues()).map((issue) => this.issueWithRequestedProjectContext(issue, projectContext));
+  }
+
+  private async fetchIssuesByStatesForProjectContext(
+    states: readonly string[],
+    projectContext?: ProjectContextResolution,
+  ): Promise<Issue[]> {
+    const tracker = this.trackerClientForProjectContext(projectContext);
+    return (await tracker.fetchIssuesByStates([...states])).map((issue) => this.issueWithRequestedProjectContext(issue, projectContext));
+  }
+
+  private async fetchIssueStatesByIdsForProjectContext(
+    issueIds: readonly string[],
+    projectContext?: ProjectContextResolution,
+  ): Promise<Issue[]> {
+    const tracker = this.trackerClientForProjectContext(projectContext);
+    return (await tracker.fetchIssueStatesByIds([...issueIds])).map((issue) => this.issueWithRequestedProjectContext(issue, projectContext));
+  }
+
+  private async fetchPollingIssues(read: (projectContext?: ProjectContextResolution) => Promise<Issue[]>): Promise<Issue[]> {
+    const projectContexts = this.pollingProjectContexts();
+    if (projectContexts.length === 1) {
+      return read(projectContexts[0]);
+    }
+
+    const issues = new Map<string, Issue>();
+    for (const projectContext of projectContexts) {
+      for (const issue of await read(projectContext)) {
+        issues.set(issue.id, issue);
+      }
+    }
+    return [...issues.values()];
+  }
+
+  private async fetchIssueStatesByIdsGroupedByProjectContext(
+    requests: Array<{ issueId: string; projectContext: ProjectContextResolution | undefined }>,
+  ): Promise<Map<string, Issue>> {
+    if (!this.options.trackerResolver) {
+      return new Map(
+        (await this.fetchIssueStatesByIdsForProjectContext(
+          requests.map((request) => request.issueId),
+          undefined,
+        )).map((issue) => [issue.id, issue]),
+      );
+    }
+
+    const groupedRequests = new Map<string, { issueIds: string[]; projectContext: ProjectContextResolution | undefined }>();
+    for (const request of requests) {
+      const key = this.comparableProjectContextId(request.projectContext) ?? "__default__";
+      const group = groupedRequests.get(key);
+      if (group) {
+        group.issueIds.push(request.issueId);
+        continue;
+      }
+      groupedRequests.set(key, { issueIds: [request.issueId], projectContext: request.projectContext });
+    }
+
+    const issues = new Map<string, Issue>();
+    for (const { issueIds, projectContext } of groupedRequests.values()) {
+      for (const issue of await this.fetchIssueStatesByIdsForProjectContext(issueIds, projectContext)) {
+        issues.set(issue.id, issue);
+      }
+    }
+    return issues;
+  }
+
   private configForProjectContext(projectContext?: ProjectContextResolution): ServiceConfig {
     try {
       return resolveServiceConfigForProjectContext(this.config, projectContext);
@@ -1260,12 +1348,16 @@ export class Orchestrator {
         return;
       }
       await this.recoverPendingPublicationApprovalHandoffs();
-      const workerCandidates = await this.options.tracker.fetchCandidateIssues();
+      const workerCandidates = await this.fetchPollingIssues((projectContext) =>
+        this.fetchCandidateIssuesForProjectContext(projectContext),
+      );
       for (const issue of sortIssuesForDispatch(workerCandidates)) {
         if (this.availableSlots() <= 0) break;
         await this.tryDispatchWorkerIssue(issue, null);
       }
-      const reviewerCandidates = await this.options.tracker.fetchIssuesByStates(this.config.reviewLoop.reviewStates);
+      const reviewerCandidates = await this.fetchPollingIssues((projectContext) =>
+        this.fetchIssuesByStatesForProjectContext(this.config.reviewLoop.reviewStates, projectContext),
+      );
       for (const issue of sortIssuesForDispatch(reviewerCandidates)) {
         if (this.availableSlots() <= 0) break;
         await this.tryDispatchReviewerIssue(issue);
@@ -1381,17 +1473,21 @@ export class Orchestrator {
   private async reconcileRunningIssues(): Promise<void> {
     const runningIds = [...this.running.keys()];
     if (runningIds.length === 0) return;
-    let refreshed: Issue[];
+    let refreshedById: Map<string, Issue>;
     try {
-      refreshed = await this.options.tracker.fetchIssueStatesByIds(runningIds);
+      refreshedById = await this.fetchIssueStatesByIdsGroupedByProjectContext(
+        [...this.running.entries()].map(([issueId, entry]) => ({
+          issueId,
+          projectContext: this.resolvedProjectContext(entry) ?? undefined,
+        })),
+      );
     } catch (error) {
       this.options.logger.warn("running issue refresh failed", { error: errorMessage(error) });
       return;
     }
 
-    const byId = new Map(refreshed.map((issue) => [issue.id, issue]));
     for (const [issueId, entry] of this.running) {
-      const latest = byId.get(issueId);
+      const latest = refreshedById.get(issueId);
       if (!latest) continue;
       entry.issue = latest;
       const preservePendingApprovalWorker =
@@ -1603,9 +1699,10 @@ export class Orchestrator {
     const initialRunPhase = this.isMergeConflictState(issue.state) ? "merge_conflict_resolution" : "implementation";
     if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase)) return false;
 
+    const requestedProjectContext = this.requestedProjectContextForIssue(issue);
     let refreshed: Issue[];
     try {
-      refreshed = await this.options.tracker.fetchIssueStatesByIds([issue.id]);
+      refreshed = await this.fetchIssueStatesByIdsForProjectContext([issue.id], requestedProjectContext);
     } catch (error) {
       this.options.logger.warn("pre-dispatch issue refresh failed", {
         issue_id: issue.id,
@@ -1621,6 +1718,7 @@ export class Orchestrator {
     if (await this.activeProviderDispatchGate()) return false;
     const latestRunPhase = this.isMergeConflictState(latest.state) ? "merge_conflict_resolution" : "implementation";
     if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase)) return false;
+    const latestProjectContext = this.requestedProjectContextForIssue(latest, requestedProjectContext);
 
     const decision = await this.resolveWorkerDispatchDecision(latest);
     if (decision.action === "skip") {
@@ -1635,7 +1733,9 @@ export class Orchestrator {
     if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase))) return false;
     const dispatchWriteback = runPhase === "implementation" ? planDispatchWriteback(latest, this.config) : null;
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
-    const afterWriteback = dispatchWriteback ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] : latest;
+    const afterWriteback = dispatchWriteback
+      ? (await this.fetchIssueStatesByIdsForProjectContext([issue.id], latestProjectContext))[0]
+      : latest;
     if (!afterWriteback) return false;
     if (dispatchWriteback) {
       const postWritebackDecision = await this.resolveWorkerDispatchDecision(afterWriteback);
@@ -1662,9 +1762,10 @@ export class Orchestrator {
     if (!this.shouldDispatchReviewer(issue, allowExistingClaim)) return false;
     if (!(await this.lifecycleAllowsDispatch(issue, "reviewer"))) return false;
 
+    const requestedProjectContext = this.requestedProjectContextForIssue(issue);
     let refreshed: Issue[];
     try {
-      refreshed = await this.options.tracker.fetchIssueStatesByIds([issue.id]);
+      refreshed = await this.fetchIssueStatesByIdsForProjectContext([issue.id], requestedProjectContext);
     } catch (error) {
       this.options.logger.warn("pre-review issue refresh failed", {
         issue_id: issue.id,
@@ -1906,7 +2007,10 @@ export class Orchestrator {
         if (entry.completionReportAccepted || entry.mergeConflictResolutionAccepted) break;
         if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) break;
 
-        const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
+        const refreshed = await this.fetchIssueStatesByIdsForProjectContext(
+          [entry.issue.id],
+          this.resolvedProjectContext(entry) ?? undefined,
+        );
         const latest = refreshed[0];
         if (latest) {
           entry.issue = latest;
@@ -2426,7 +2530,15 @@ export class Orchestrator {
       }
       if (entry.runPhase === "merge_conflict_resolution") {
         if (await this.shouldScheduleContinuation(entry)) {
-          this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
+          this.scheduleRetry(
+            issueId,
+            entry.issue.identifier,
+            1,
+            1_000,
+            null,
+            entry.runPhase,
+            this.resolvedProjectContext(entry) ?? undefined,
+          );
         } else {
           this.claimed.delete(issueId);
         }
@@ -2450,7 +2562,15 @@ export class Orchestrator {
         return;
       }
       if (await this.shouldScheduleContinuation(entry)) {
-        this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
+        this.scheduleRetry(
+          issueId,
+          entry.issue.identifier,
+          1,
+          1_000,
+          null,
+          entry.runPhase,
+          this.resolvedProjectContext(entry) ?? undefined,
+        );
       } else {
         this.claimed.delete(issueId);
       }
@@ -2557,7 +2677,15 @@ export class Orchestrator {
       }
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
-      this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error, entry.runPhase);
+      this.scheduleRetry(
+        issueId,
+        entry.issue.identifier,
+        nextAttempt,
+        delayMs,
+        error,
+        entry.runPhase,
+        this.resolvedProjectContext(entry) ?? undefined,
+      );
     }
   }
 
@@ -2613,7 +2741,15 @@ export class Orchestrator {
     }
 
     const delayMs = planningRetryDelayMs(nextCount, this.config);
-    this.scheduleRetry(issueId, entry.issue.identifier, nextCount, delayMs, error, "issue_breakdown");
+    this.scheduleRetry(
+      issueId,
+      entry.issue.identifier,
+      nextCount,
+      delayMs,
+      error,
+      "issue_breakdown",
+      this.resolvedProjectContext(entry) ?? undefined,
+    );
   }
 
   private async consecutiveSdkErrorFailures(issue: Issue): Promise<number> {
@@ -2675,7 +2811,10 @@ export class Orchestrator {
   private async shouldScheduleContinuation(entry: RunningEntry): Promise<boolean> {
     let refreshed: Issue[];
     try {
-      refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
+      refreshed = await this.fetchIssueStatesByIdsForProjectContext(
+        [entry.issue.id],
+        this.resolvedProjectContext(entry) ?? undefined,
+      );
     } catch (error) {
       this.options.logger.warn("post-run issue refresh failed", {
         issue_id: entry.issue.id,
@@ -2697,6 +2836,7 @@ export class Orchestrator {
     delayMs: number,
     error: string | null,
     runPhase: AgentRunPhase = "implementation",
+    projectContext: ProjectContextResolution | undefined = undefined,
   ): void {
     this.clearRetry(issueId);
     if (this.stopped) {
@@ -2707,7 +2847,7 @@ export class Orchestrator {
     const timer = setTimeout(() => {
       void this.onRetryTimer(issueId);
     }, delayMs);
-    this.retryAttempts.set(issueId, { issueId, identifier, attempt, dueAtMs, timer, error, runPhase });
+    this.retryAttempts.set(issueId, { issueId, identifier, attempt, dueAtMs, timer, error, runPhase, projectContext });
   }
 
   private async onRetryTimer(issueId: string): Promise<void> {
@@ -2725,22 +2865,24 @@ export class Orchestrator {
           Math.max(delayMs, this.config.polling.intervalMs),
           retry.error ?? providerGateDispatchBlockedMessage(providerGate),
           retry.runPhase,
+          retry.projectContext,
         );
         return;
       }
       const candidates =
         retry.runPhase === "merge_conflict_resolution"
-          ? await this.options.tracker.fetchIssueStatesByIds([issueId])
-          : await this.options.tracker.fetchCandidateIssues();
+          ? await this.fetchIssueStatesByIdsForProjectContext([issueId], retry.projectContext)
+          : await this.fetchCandidateIssuesForProjectContext(retry.projectContext);
       const issue = candidates.find((candidate) => candidate.id === issueId);
       if (!issue) {
         this.claimed.delete(issueId);
         return;
       }
+      const retryProjectContext = this.requestedProjectContextForIssue(issue, retry.projectContext);
       if (retry.runPhase === "issue_breakdown") {
         const remainingMs = await this.planningBackoffRemainingForIssue(issue);
         if (remainingMs > 0) {
-          this.scheduleRetry(issueId, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+          this.scheduleRetry(issueId, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase, retryProjectContext);
           return;
         }
       }
@@ -2748,7 +2890,15 @@ export class Orchestrator {
         if (retry.runPhase === "issue_breakdown") {
           await this.recordPlanningDispatchRetry(issue, retry, "no available orchestrator slots");
         } else {
-          this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, "no available orchestrator slots", retry.runPhase);
+          this.scheduleRetry(
+            issueId,
+            retry.identifier,
+            retry.attempt + 1,
+            1_000,
+            "no available orchestrator slots",
+            retry.runPhase,
+            retryProjectContext,
+          );
         }
         return;
       }
@@ -2765,7 +2915,15 @@ export class Orchestrator {
         this.claimed.delete(issueId);
         return;
       }
-      this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, errorMessage(error), retry.runPhase);
+      this.scheduleRetry(
+        issueId,
+        retry.identifier,
+        retry.attempt + 1,
+        1_000,
+        errorMessage(error),
+        retry.runPhase,
+        retry.projectContext,
+      );
     }
   }
 
@@ -2785,7 +2943,7 @@ export class Orchestrator {
     if (current) {
       const remainingMs = planningBackoffRemainingMs(current, this.config);
       if (remainingMs > 0) {
-        this.scheduleRetry(issue.id, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+        this.scheduleRetry(issue.id, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase, retry.projectContext);
         return;
       }
     }
@@ -2804,7 +2962,7 @@ export class Orchestrator {
       return;
     }
     const delayMs = planningRetryDelayMs(Math.max(lifecycle.planningFailureCount, 1), this.config);
-    this.scheduleRetry(issue.id, retry.identifier, retry.attempt + 1, delayMs, error, retry.runPhase);
+    this.scheduleRetry(issue.id, retry.identifier, retry.attempt + 1, delayMs, error, retry.runPhase, retry.projectContext);
   }
 
   private clearRetry(issueId: string): void {
@@ -3055,7 +3213,10 @@ export class Orchestrator {
 
   private async refreshEntryIssue(entry: RunningEntry, reason: string): Promise<boolean> {
     try {
-      const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
+      const refreshed = await this.fetchIssueStatesByIdsForProjectContext(
+        [entry.issue.id],
+        this.resolvedProjectContext(entry) ?? undefined,
+      );
       const latest = refreshed[0];
       if (!latest) return false;
       entry.issue = latest;
