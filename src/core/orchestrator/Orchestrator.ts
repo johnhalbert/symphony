@@ -1146,7 +1146,7 @@ export class Orchestrator {
     return this.comparableProjectContextId(issueProjectContext) === this.comparableProjectContextId(requestedProjectContext);
   }
 
-  private canTrustRequestedProjectContextFromCandidateLookup(
+  private canTrustRequestedProjectContextFromTrackerLookup(
     tracker: TrackerClient,
     requestedProjectContext?: ProjectContextResolution,
   ): boolean {
@@ -1164,24 +1164,30 @@ export class Orchestrator {
     options: { allowCandidateIdentifierLookup?: boolean } = {},
   ): Promise<Issue | null> {
     const tracker = this.trackerClientForProjectContext(projectContext);
-    const direct = (await tracker.fetchIssueStatesByIds([issueIdOrIdentifier]))[0] ?? null;
-    if (direct && this.issueMatchesRequestedProjectContext(direct, projectContext)) return direct;
-    if (options.allowCandidateIdentifierLookup !== true) return null;
-    const candidateLookupProvesRequestedContext = this.canTrustRequestedProjectContextFromCandidateLookup(
+    const trackerLookupProvesRequestedContext = this.canTrustRequestedProjectContextFromTrackerLookup(
       tracker,
       projectContext,
     );
-    return (
-      (await tracker.fetchCandidateIssues()).find((candidate) => {
-        if (candidate.id !== issueIdOrIdentifier && candidate.identifier !== issueIdOrIdentifier) {
-          return false;
-        }
-        return (
-          this.issueMatchesRequestedProjectContext(candidate, projectContext) ||
-          (!this.issueHasProjectContextProof(candidate) && candidateLookupProvesRequestedContext)
-        );
-      }) ?? null
-    );
+    const direct = (await tracker.fetchIssueStatesByIds([issueIdOrIdentifier]))[0] ?? null;
+    if (direct) {
+      if (
+        this.issueMatchesRequestedProjectContext(direct, projectContext) ||
+        (!this.issueHasProjectContextProof(direct) && trackerLookupProvesRequestedContext)
+      ) {
+        return this.issueWithRequestedProjectContext(direct, projectContext);
+      }
+    }
+    if (options.allowCandidateIdentifierLookup !== true) return null;
+    const candidate = (await tracker.fetchCandidateIssues()).find((candidateIssue) => {
+      if (candidateIssue.id !== issueIdOrIdentifier && candidateIssue.identifier !== issueIdOrIdentifier) {
+        return false;
+      }
+      return (
+        this.issueMatchesRequestedProjectContext(candidateIssue, projectContext) ||
+        (!this.issueHasProjectContextProof(candidateIssue) && trackerLookupProvesRequestedContext)
+      );
+    });
+    return candidate ? this.issueWithRequestedProjectContext(candidate, projectContext) : null;
   }
 
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {

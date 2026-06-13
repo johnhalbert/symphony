@@ -2473,7 +2473,7 @@ describe("StatusServer durable API", () => {
     }
   });
 
-  it("routes planning-run identifier lookups through the resolved issue project context", async () => {
+  it("routes planning-run identifier lookups through the resolved issue project context when scoped candidate lookups return runtime-shaped issues", async () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
         topLevel: {
@@ -2486,29 +2486,41 @@ describe("StatusServer durable API", () => {
       path.join(root, "planning-context-WORKFLOW.md"),
       { LINEAR_API_KEY: "linear-secret" },
     );
+    config.tracker.activeStates = ["Root Todo"];
     config.issueBreakdown.enabled = true;
-    config.issueBreakdown.planningLabels = ["planning"];
+    config.issueBreakdown.planningLabels = ["root-planning"];
     config.issueBreakdown.promptTemplate = "Default planning prompt for {{ issue.identifier }}";
     config.issueBreakdown.cursorMode = "agent";
     const docsContext = config.projectContexts.byId.get("docs");
     expect(docsContext).toBeDefined();
     if (!docsContext) throw new Error("Expected docs project context in planning route fixture");
+    docsContext.tracker.activeStates = ["Docs Todo"];
     docsContext.issueBreakdown.enabled = true;
     docsContext.issueBreakdown.planningLabels = ["docs-planning"];
     docsContext.issueBreakdown.promptTemplate = "Docs planning prompt for {{ issue.identifier }}";
     docsContext.issueBreakdown.cursorMode = "plan";
-    const docsCandidate = trackerIssue({
+    const docsRuntimeIssue = issue({
       id: "issue-docs-planning-1",
       identifier: "ENG-179",
-      state: "Todo",
-      labels: ["planning"],
-      projectContextId: "docs",
-      projectContextLabel: "Documentation Site",
-      linearProjectSlug: "DOCS",
-      routingSource: "candidate_poll",
+      state: "Docs Todo",
+      labels: ["docs-planning"],
     });
     const symphonyTracker = trackerClientFixture({ candidates: [], issues: [] });
-    const docsTracker = trackerClientFixture({ candidates: [docsCandidate], issues: [docsCandidate] });
+    const docsRequestedIds: string[][] = [];
+    let docsCandidateFetchCount = 0;
+    const docsTracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        docsCandidateFetchCount += 1;
+        return [structuredClone(docsRuntimeIssue)];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds: string[]) {
+        docsRequestedIds.push([...issueIds]);
+        return [];
+      },
+    };
     const logger = new StructuredLogger(() => undefined);
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
@@ -2558,37 +2570,181 @@ describe("StatusServer durable API", () => {
       expect(body).toMatchObject({
         queued: true,
         issue: "ENG-179",
-        issueId: "issue-docs-planning-1",
+        issueId: docsRuntimeIssue.id,
         runPhase: "issue_breakdown",
         runKind: "planning",
         reason: "explicit_request",
       });
       expect(symphonyTracker.requestedIds).toEqual([]);
       expect(symphonyTracker.candidateFetchCount).toBe(0);
-      expect(docsTracker.requestedIds[0]).toEqual(["ENG-179"]);
-      expect(docsTracker.candidateFetchCount).toBe(1);
+      expect(docsRequestedIds[0]).toEqual(["ENG-179"]);
+      expect(docsCandidateFetchCount).toBe(1);
       await waitForStatusApiAsync(
         async () =>
-          ((await runStore.latestRunForIssue(docsCandidate.id, {
+          ((await runStore.latestRunForIssue(docsRuntimeIssue.id, {
             role: "worker",
             runPhase: "issue_breakdown",
           }))?.runKind ?? null) === "planning",
         "context-routed durable planning run",
       );
       await expect(
-        runStore.latestRunForIssue(docsCandidate.id, {
+        runStore.latestRunForIssue(docsRuntimeIssue.id, {
           role: "worker",
           runPhase: "issue_breakdown",
         }),
       ).resolves.toMatchObject({
-        issueId: docsCandidate.id,
-        issueIdentifier: docsCandidate.identifier,
+        issueId: docsRuntimeIssue.id,
+        issueIdentifier: docsRuntimeIssue.identifier,
         runPhase: "issue_breakdown",
         runKind: "planning",
         projectContext: expect.objectContaining({ projectContextId: "docs" }),
       });
-      expect(harness.runs[0]?.ctx.issue.id).toBe(docsCandidate.id);
+      expect(harness.runs[0]?.ctx.issue.id).toBe(docsRuntimeIssue.id);
+      expect(harness.runs[0]?.ctx.issue).toMatchObject({ projectContext: { projectContextId: "docs" } });
       expect(harness.runs[0]?.ctx.projectContext).toMatchObject({ projectContextId: "docs" });
+      expect(harness.runs[0]?.ctx.config.tracker.activeStates).toEqual(["Docs Todo"]);
+      expect(harness.runs[0]?.ctx.config.issueBreakdown.planningLabels).toEqual(["docs-planning"]);
+      expect(harness.runs[0]?.ctx.runModeOverride).toBe("plan");
+      expect(harness.runs[0]?.prompt).toContain("Docs planning prompt for ENG-179");
+    } finally {
+      await orchestrator.stop();
+      await server.stop();
+    }
+  });
+
+  it("routes context-qualified planning-run direct lookups through the resolved issue project context when scoped tracker issues omit project-context proof", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "planning-direct-context-workspaces"),
+            state_dir: path.join(root, "planning-direct-context-state"),
+          },
+        },
+      }),
+      path.join(root, "planning-direct-context-WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    config.tracker.activeStates = ["Root Todo"];
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["root-planning"];
+    config.issueBreakdown.promptTemplate = "Default planning prompt for {{ issue.identifier }}";
+    config.issueBreakdown.cursorMode = "agent";
+    const docsContext = config.projectContexts.byId.get("docs");
+    expect(docsContext).toBeDefined();
+    if (!docsContext) throw new Error("Expected docs project context in planning direct route fixture");
+    docsContext.tracker.activeStates = ["Docs Todo"];
+    docsContext.issueBreakdown.enabled = true;
+    docsContext.issueBreakdown.planningLabels = ["docs-planning"];
+    docsContext.issueBreakdown.promptTemplate = "Docs planning prompt for {{ issue.identifier }}";
+    docsContext.issueBreakdown.cursorMode = "plan";
+    const docsRuntimeIssue = issue({
+      id: "linear-docs-179",
+      identifier: "ENG-179",
+      state: "Docs Todo",
+      labels: ["docs-planning"],
+    });
+    const symphonyTracker = trackerClientFixture({ candidates: [], issues: [] });
+    const docsRequestedIds: string[][] = [];
+    let docsCandidateFetchCount = 0;
+    const docsTracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        docsCandidateFetchCount += 1;
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds: string[]) {
+        docsRequestedIds.push([...issueIds]);
+        return issueIds.includes(docsRuntimeIssue.id) ? [structuredClone(docsRuntimeIssue)] : [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new PlanningRunRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: symphonyTracker,
+      trackerResolver: (projectContext) => (projectContext?.projectContextId === "docs" ? docsTracker : symphonyTracker),
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(
+        `http://${address.host}:${address.port}/api/v1/issues/docs:${docsRuntimeIssue.id}/planning-run`,
+        {
+          method: "POST",
+          headers: { "x-symphony-token": "secret" },
+        },
+      );
+      const body = (await response.json()) as {
+        queued: boolean;
+        issue: string;
+        issueId: string;
+        runPhase: string;
+        runKind: string;
+        reason: string;
+      };
+
+      expect(response.status).toBe(202);
+      expect(body).toMatchObject({
+        queued: true,
+        issue: "ENG-179",
+        issueId: docsRuntimeIssue.id,
+        runPhase: "issue_breakdown",
+        runKind: "planning",
+        reason: "explicit_request",
+      });
+      expect(symphonyTracker.requestedIds).toEqual([]);
+      expect(symphonyTracker.candidateFetchCount).toBe(0);
+      expect(docsRequestedIds[0]).toEqual([docsRuntimeIssue.id]);
+      expect(docsCandidateFetchCount).toBe(0);
+      await waitForStatusApiAsync(
+        async () =>
+          ((await runStore.latestRunForIssue(docsRuntimeIssue.id, {
+            role: "worker",
+            runPhase: "issue_breakdown",
+          }))?.runKind ?? null) === "planning",
+        "context-routed direct planning run",
+      );
+      await expect(
+        runStore.latestRunForIssue(docsRuntimeIssue.id, {
+          role: "worker",
+          runPhase: "issue_breakdown",
+        }),
+      ).resolves.toMatchObject({
+        issueId: docsRuntimeIssue.id,
+        issueIdentifier: docsRuntimeIssue.identifier,
+        runPhase: "issue_breakdown",
+        runKind: "planning",
+        projectContext: expect.objectContaining({ projectContextId: "docs" }),
+      });
+      expect(harness.runs[0]?.ctx.issue.id).toBe(docsRuntimeIssue.id);
+      expect(harness.runs[0]?.ctx.issue).toMatchObject({ projectContext: { projectContextId: "docs" } });
+      expect(harness.runs[0]?.ctx.projectContext).toMatchObject({ projectContextId: "docs" });
+      expect(harness.runs[0]?.ctx.config.tracker.activeStates).toEqual(["Docs Todo"]);
       expect(harness.runs[0]?.ctx.config.issueBreakdown.planningLabels).toEqual(["docs-planning"]);
       expect(harness.runs[0]?.ctx.runModeOverride).toBe("plan");
       expect(harness.runs[0]?.prompt).toContain("Docs planning prompt for ENG-179");
