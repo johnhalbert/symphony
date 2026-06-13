@@ -1233,6 +1233,122 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("preserves the context-qualified alias for open-workspace filesystem fallback when no durable match exists", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "workspaces"),
+            state_dir: path.join(root, ".symphony"),
+          },
+        },
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger: new StructuredLogger(() => undefined),
+    });
+    const defaultPath = workspaceManager.getPathForIssue("ENG-179");
+    const docsPath = workspaceManager.getPathForIssue("docs:ENG-179");
+    await mkdir(defaultPath, { recursive: true });
+    await mkdir(docsPath, { recursive: true });
+    const openedPaths: string[] = [];
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager,
+      workspaceOpener: {
+        async open(workspacePath: string) {
+          openedPaths.push(workspacePath);
+        },
+      },
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:ENG-179/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const body = (await response.json()) as { workspace_path: string };
+
+      expect(response.status).toBe(202);
+      expect(body.workspace_path).toBe(docsPath);
+      expect(openedPaths).toEqual([docsPath]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("fails closed for context-qualified open-workspace filesystem fallback when only the default workspace exists", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "workspaces"),
+            state_dir: path.join(root, ".symphony"),
+          },
+        },
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger: new StructuredLogger(() => undefined),
+    });
+    const defaultPath = workspaceManager.getPathForIssue("ENG-179");
+    const docsPath = workspaceManager.getPathForIssue("docs:ENG-179");
+    await mkdir(defaultPath, { recursive: true });
+    const openedPaths: string[] = [];
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager,
+      workspaceOpener: {
+        async open(workspacePath: string) {
+          openedPaths.push(workspacePath);
+        },
+      },
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:ENG-179/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(404);
+      expect(body.error.code).toBe("not_found");
+      expect(body.error.message).toBe(`Workspace not found: ${docsPath}`);
+      expect(openedPaths).toEqual([]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("derives qualified workspace context from runs and lifecycles when the durable workspace record is legacy-default", async () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({

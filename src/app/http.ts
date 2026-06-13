@@ -1399,13 +1399,17 @@ export class StatusServer {
           throw statusAliasResolutionError("Issue", issueId, resolvedTarget.status);
         }
         const { target } = resolvedTarget;
-        const workspaceLookupKey = (target.workspace?.workspaceKey ?? target.requestAlias) || target.lookupKey;
-        const details = this.options.orchestrator.getIssueDetails(target.lookupKey) ?? this.options.orchestrator.getIssueDetails(workspaceLookupKey);
+        const workspaceLookupKey = (target.workspace?.workspaceKey ?? issueId) || target.lookupKey;
+        const details =
+          this.options.orchestrator.getIssueDetails(target.lookupKey) ??
+          this.options.orchestrator.getIssueDetails(workspaceLookupKey);
         const workspace =
           target.workspace ??
           (await this.options.runStore?.findWorkspace(target.lookupKey)) ??
           (workspaceLookupKey === target.lookupKey ? null : await this.options.runStore?.findWorkspace(workspaceLookupKey));
-        const workspacePath = details?.workspacePath ?? workspace?.path ?? this.options.workspaceManager.getPathForIssue(workspaceLookupKey);
+        const workspacePath =
+          details?.workspacePath ?? workspace?.path ?? this.options.workspaceManager.getPathForIssue(workspaceLookupKey);
+
         if (!(await pathExists(workspacePath))) {
           throw new SymphonyError("not_found", `Workspace not found: ${workspacePath}`);
         }
