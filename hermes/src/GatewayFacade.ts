@@ -25,6 +25,7 @@ export interface HermesGatewayEnvironment {
   python?: string | null;
   model?: string | null;
   provider?: string | null;
+  ephemeralSystemPrompt?: string | null;
   startupTimeoutMs?: number | null;
   requestTimeoutMs?: number | null;
   extraEnv?: Record<string, string | null | undefined>;
@@ -105,6 +106,7 @@ export function withHermesGatewayEnvironment<T>(env: HermesGatewayEnvironment, o
     HERMES_TUI_GATEWAY_URL: null,
     HERMES_TUI_SIDECAR_URL: null,
     ...(env.extraEnv ?? {}),
+    HERMES_EPHEMERAL_SYSTEM_PROMPT: env.ephemeralSystemPrompt,
   };
   const previous = new Map<string, string | undefined>();
   for (const key of Object.keys(patch)) {

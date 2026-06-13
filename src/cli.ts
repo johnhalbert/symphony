@@ -7,7 +7,7 @@ import { StatusServer } from "./app/http.js";
 import { parseDatabaseConfig, type DatabaseConfig, type ServiceConfig } from "./core/config/Config.js";
 import { createAgentHarness } from "./core/harness/HarnessFactory.js";
 import { StructuredLogger } from "./core/logging/StructuredLogger.js";
-import { Orchestrator } from "./core/orchestrator/Orchestrator.js";
+import { Orchestrator, type PromptPreviewResult } from "./core/orchestrator/Orchestrator.js";
 import { FileIssueLifecycleStore } from "./core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureDiagnosticsStore.js";
 import { FileOrchestratorConversationStore } from "./core/persistence/OrchestratorConversationStore.js";
@@ -274,10 +274,11 @@ promptCommand
         if (options.json) {
           console.log(JSON.stringify(result, null, 2));
         } else if (result.status === "rendered") {
+          const rendered = formatRenderedPromptPreview(result);
           if (options.out) {
-            await fs.writeFile(path.resolve(process.cwd(), options.out), result.prompt, "utf8");
+            await fs.writeFile(path.resolve(process.cwd(), options.out), rendered, "utf8");
           } else {
-            console.log(result.prompt);
+            console.log(rendered);
           }
         } else {
           console.log(`No prompt would be dispatched for ${result.issue.identifier}: ${result.reason}`);
@@ -463,6 +464,16 @@ function parsePromptRenderPhase(
     return normalized;
   }
   throw new Error(`Invalid prompt render phase: ${value}`);
+}
+
+function formatRenderedPromptPreview(result: Extract<PromptPreviewResult, { status: "rendered" }>): string {
+  return [
+    "===== EPHEMERAL SYSTEM PROMPT =====",
+    result.ephemeralSystemPrompt,
+    "",
+    "===== USER PROMPT =====",
+    result.userPrompt,
+  ].join("\n");
 }
 
 interface RuntimeProjectionPersistence {

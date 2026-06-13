@@ -86,6 +86,12 @@ export interface IssueContractLintResult extends IssueContractAnalysis {
   applicable: boolean;
 }
 
+export interface IssueContractPromptSummary extends IssueContractAnalysis {
+  issueContractJson: string | null;
+  contractChecklist: string | null;
+  validationRequirements: string | null;
+}
+
 export function lintAgentEligibleIssueContract(issue: Issue, config: ServiceConfig): IssueContractLintResult {
   const applicable = requiresAgentEligibleIssueContract(issue, config);
   const analysis = applicable
@@ -128,6 +134,23 @@ export function analyzeIssueContractDescription(
     protectedSurfaceMatches: findProtectedSurfaceMatches(touchedSurfaces, protectedPaths),
     readyForDogfoodReady: parseReadyForDogfoodReady(promotionReadiness),
     remainingBlocker: parseRemainingBlocker(promotionReadiness),
+  };
+}
+
+export function summarizeIssueContractForPrompt(
+  description: string | null | undefined,
+  protectedPaths: readonly string[] = [],
+): IssueContractPromptSummary {
+  const content = description ?? "";
+  const sections = markdownSections(content);
+  const issueContract = sections.get(normalizeHeading(ISSUE_CONTRACT_HEADING));
+  const contractChecklist = sections.get(normalizeHeading(CONTRACT_CHECKLIST_HEADING)) ?? null;
+  const validationRequirements = sections.get(normalizeHeading(VALIDATION_REQUIREMENTS_HEADING)) ?? null;
+  return {
+    ...analyzeIssueContractDescription(description, protectedPaths),
+    issueContractJson: issueContract === undefined ? null : extractFencedJsonBlock(issueContract),
+    contractChecklist,
+    validationRequirements,
   };
 }
 

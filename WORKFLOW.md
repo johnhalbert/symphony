@@ -85,14 +85,24 @@ prompts:
   templates_dir: ./prompts
   templates:
     worker.implementation.initial: worker/implementation/initial.md.liquid
+    worker.implementation.initial.system: worker/implementation/initial.system.md.liquid
     worker.implementation.unsatisfied_requirements: worker/implementation/unsatisfied_requirements.md.liquid
+    worker.implementation.unsatisfied_requirements.system: worker/implementation/unsatisfied_requirements.system.md.liquid
     worker.implementation.review_repair: worker/implementation/review_repair.md.liquid
+    worker.implementation.review_repair.system: worker/implementation/review_repair.system.md.liquid
     worker.implementation.merge_gate_repair: worker/implementation/merge_gate_repair.md.liquid
+    worker.implementation.merge_gate_repair.system: worker/implementation/merge_gate_repair.system.md.liquid
+    worker.implementation.continuation.system: worker/implementation/continuation.system.md.liquid
     worker.merge_conflict.resolve: worker/merge_conflict/resolve.md.liquid
+    worker.merge_conflict.resolve.system: worker/merge_conflict/resolve.system.md.liquid
     reviewer.review.exhaustive: reviewer/review/exhaustive.md.liquid
+    reviewer.review.exhaustive.system: reviewer/review/exhaustive.system.md.liquid
     triage.issue_blocked.classify: triage/issue_blocked/classify.md.liquid
+    triage.issue_blocked.classify.system: triage/issue_blocked/classify.system.md.liquid
     planner.issue_breakdown.speckit_to_linear: planner/issue_breakdown/speckit_to_linear.md.liquid
+    planner.issue_breakdown.speckit_to_linear.system: planner/issue_breakdown/speckit_to_linear.system.md.liquid
     handoff_repair.mcp_only: handoff_repair/mcp_only.md.liquid
+    handoff_repair.mcp_only.system: handoff_repair/mcp_only.system.md.liquid
 
 database:
   postgres:

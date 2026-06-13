@@ -9,6 +9,7 @@ import type {
   AgentHandoffRepairKind,
   AgentHarness,
   AgentHermesResumeContext,
+  AgentPromptBundle,
   AgentRunSdkStatus,
   OperatorChatRunContext,
 } from "../harness/AgentHarness.js";
@@ -52,10 +53,12 @@ import { IssueBreakdownPlanApplyService } from "../IssueBreakdownPlanApplyServic
 import {
   ISSUE_TRIAGE_DISPOSITIONS,
   issueTriageTriggerFingerprint,
+  latestIssueTriageReport,
   latestIssueTriageReportForFingerprint,
   shouldIssueTriageRun,
 } from "../IssueTriageService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
+import { summarizeIssueContractForPrompt } from "../IssueContractLint.js";
 import {
   DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE,
   DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE,
@@ -186,7 +189,10 @@ export type PromptPreviewResult =
       role: AgentRunRole;
       runPhase: AgentRunPhase;
       runKind: AgentRunKind;
+      promptBundle: AgentPromptBundle;
       prompt: string;
+      userPrompt: string;
+      ephemeralSystemPrompt: string;
       metadata: PromptPreviewMetadata;
     }
   | {
@@ -202,6 +208,7 @@ export interface PromptPreviewMetadata {
   selectedPhase: AgentRunPhase | null;
   selectedRunKind: AgentRunKind | null;
   dispatchDecision: "would_dispatch" | "forced" | "no_prompt";
+  promptBundle?: AgentPromptBundle["metadata"];
   warnings: string[];
 }
 
@@ -422,6 +429,33 @@ export interface IssueRunMetadata {
 }
 
 const PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER = "[[SYMPHONY_PROJECT_REVIEWER_PROMPT_EXTENSIONS]]";
+const EPHEMERAL_SYSTEM_PROMPT_MAX_CHARS = 12_000;
+const PROMPT_SUMMARY_BLOCK_MAX_CHARS = 1_600;
+
+const DEFAULT_EPHEMERAL_SYSTEM_PROMPT_TEMPLATE = `
+# Symphony Current Run Directive
+
+## Role / Phase
+{{ rolePhase }}
+
+## Current Objective
+{{ currentObjective }}
+
+## Pinned Issue Contract
+{{ pinnedIssueContract }}
+
+## Active Findings Or Triage Recommendation
+{{ activeDirective }}
+
+## Success Conditions
+{{ successConditions }}
+
+## Scope Guards
+{{ scopeGuards }}
+
+## Required Handoff
+{{ requiredHandoff }}
+`.trim();
 
 const DEFAULT_REVIEWER_PROMPT_TEMPLATE = `
 You are a reviewer agent for {{ issue.identifier }}.
@@ -1064,16 +1098,20 @@ export class Orchestrator {
     }
     const workspace = this.previewWorkspaceFor(issue, selection.runPhase);
     const entry = this.promptPreviewEntry(issue, lifecycle, selection.role, selection.runPhase, workspace);
-    const prompt = await this.renderPromptForPreview(entry, workspace);
+    const promptBundle = await this.renderPromptBundleForPreview(entry, workspace);
     return {
       status: "rendered",
       issue,
       role: selection.role,
       runPhase: selection.runPhase,
       runKind: runKindForPhase(selection.runPhase),
-      prompt,
+      promptBundle,
+      prompt: promptBundle.userPrompt,
+      userPrompt: promptBundle.userPrompt,
+      ephemeralSystemPrompt: promptBundle.ephemeralSystemPrompt,
       metadata: {
         ...metadataBase,
+        promptBundle: promptBundle.metadata,
         dispatchDecision: options.force ? "forced" : "would_dispatch",
       },
     };
@@ -1208,15 +1246,15 @@ export class Orchestrator {
     };
   }
 
-  private async renderPromptForPreview(entry: RunningEntry, workspace: Workspace): Promise<string> {
-    if (entry.role === "planner") return this.renderIssueBreakdownPrompt(entry, null);
-    if (entry.role === "triage") return this.renderIssueTriagePrompt(entry);
+  private async renderPromptBundleForPreview(entry: RunningEntry, workspace: Workspace): Promise<AgentPromptBundle> {
+    if (entry.role === "planner") return this.renderIssueBreakdownPromptBundle(entry, null);
+    if (entry.role === "triage") return this.renderIssueTriagePromptBundle(entry);
     if (entry.role === "reviewer") {
       const evidence = entry.reviewEvidence ?? (await this.loadReviewerDispatchEvidence(entry.issue));
       if (!evidence) throw new SymphonyError("invalid_request", "Reviewer prompt preview requires completion report evidence");
-      return this.renderReviewerPrompt(entry, evidence, workspace);
+      return this.renderReviewerPromptBundle(entry, evidence, workspace);
     }
-    return this.renderWorkerPrompt(entry, null);
+    return this.renderWorkerPromptBundle(entry, null, 1);
   }
 
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
@@ -2154,11 +2192,13 @@ export class Orchestrator {
 
       if (entry.runPhase === "issue_breakdown") {
         entry.turnCount = 1;
-        const prompt = await this.renderIssueBreakdownPrompt(entry, attempt);
-        const context = this.buildRunContext(entry, workspace, attempt, 1);
-        await this.consumeHarnessEvents(entry, this.options.harness.run(context, prompt), {
+        const promptBundle = await this.renderIssueBreakdownPromptBundle(entry, attempt);
+        this.assertPromptBundleSupported(promptBundle);
+        const context = this.buildRunContext(entry, workspace, attempt, 1, promptBundle);
+        await this.consumeHarnessEvents(entry, this.options.harness.run(context, promptBundle.userPrompt), {
           workspace,
-          prompt,
+          prompt: promptBundle.userPrompt,
+          promptBundle,
           attempt,
           turnNumber: 1,
         });
@@ -2179,14 +2219,16 @@ export class Orchestrator {
           );
         }
         entry.turnCount = turnNumber;
-        const prompt =
+        const promptBundle =
           turnNumber === 1
-            ? await this.renderWorkerPrompt(entry, attempt)
-            : await this.renderWorkerContinuationPrompt(entry);
-        const context = this.buildRunContext(entry, workspace, attempt, turnNumber);
-        await this.consumeHarnessEvents(entry, this.options.harness.run(context, prompt), {
+            ? await this.renderWorkerPromptBundle(entry, attempt, turnNumber)
+            : await this.renderWorkerContinuationPromptBundle(entry, attempt, turnNumber);
+        this.assertPromptBundleSupported(promptBundle);
+        const context = this.buildRunContext(entry, workspace, attempt, turnNumber, promptBundle);
+        await this.consumeHarnessEvents(entry, this.options.harness.run(context, promptBundle.userPrompt), {
           workspace,
-          prompt,
+          prompt: promptBundle.userPrompt,
+          promptBundle,
           attempt,
           turnNumber,
         });
@@ -2285,10 +2327,12 @@ export class Orchestrator {
       this.requireMcpHandoff("review");
 
       entry.turnCount = 1;
-      const prompt = await this.renderReviewerPrompt(entry, evidence, workspace);
-      await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
+      const promptBundle = await this.renderReviewerPromptBundle(entry, evidence, workspace);
+      this.assertPromptBundleSupported(promptBundle);
+      await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1, promptBundle), promptBundle.userPrompt), {
         workspace,
-        prompt,
+        prompt: promptBundle.userPrompt,
+        promptBundle,
         attempt: null,
         turnNumber: 1,
       });
@@ -2331,10 +2375,12 @@ export class Orchestrator {
       this.requireMcpHandoff("issue_triage");
 
       entry.turnCount = 1;
-      const prompt = await this.renderIssueTriagePrompt(entry);
-      await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
+      const promptBundle = await this.renderIssueTriagePromptBundle(entry);
+      this.assertPromptBundleSupported(promptBundle);
+      await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1, promptBundle), promptBundle.userPrompt), {
         workspace,
-        prompt,
+        prompt: promptBundle.userPrompt,
+        promptBundle,
         attempt: null,
         turnNumber: 1,
       });
@@ -2349,7 +2395,7 @@ export class Orchestrator {
   private async consumeHarnessEvents(
     entry: RunningEntry,
     events: AsyncIterable<AgentEvent>,
-    context: { workspace: Workspace; prompt: string; attempt: number | null; turnNumber: number },
+    context: { workspace: Workspace; prompt: string; promptBundle?: AgentPromptBundle; attempt: number | null; turnNumber: number },
   ): Promise<void> {
     for await (const rawEvent of events) {
       const event = sanitizeAgentEventForPublicOutput(rawEvent);
@@ -2392,6 +2438,13 @@ export class Orchestrator {
           attempt: context.attempt,
           turnNumber: context.turnNumber,
           prompt: context.prompt,
+          ...(context.promptBundle === undefined
+            ? {}
+            : {
+                ephemeralSystemPrompt: context.promptBundle.ephemeralSystemPrompt,
+                promptTemplateKeys: context.promptBundle.metadata.templateKeys,
+                promptBundleWarnings: context.promptBundle.metadata.warnings,
+              }),
           harnessId: this.options.harness.id,
           ...runtimeMetadata,
           cursorModel: this.config.cursor.model,
@@ -3241,6 +3294,7 @@ export class Orchestrator {
     workspace: Workspace,
     attempt: number | null,
     turnNumber: number,
+    promptBundle?: AgentPromptBundle,
   ) {
     return {
       issue: entry.issue,
@@ -3253,9 +3307,19 @@ export class Orchestrator {
       ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: this.config.issueBreakdown.cursorMode } : {}),
       ...(entry.handoffRepair === null ? {} : { handoffRepair: entry.handoffRepair }),
       ...(entry.hermesResume === null ? {} : { hermesResume: entry.hermesResume }),
+      ...(promptBundle === undefined ? {} : { ephemeralSystemPrompt: promptBundle.ephemeralSystemPrompt }),
       abortSignal: entry.abortController.signal,
       logger: this.options.logger,
     };
+  }
+
+  private assertPromptBundleSupported(bundle: AgentPromptBundle): void {
+    if (bundle.ephemeralSystemPrompt.trim().length === 0) return;
+    if (harnessSupportsEphemeralSystemPrompt(this.options.harness)) return;
+    throw new SymphonyError(
+      "config_validation_error",
+      `Runtime harness ${this.options.harness.id} does not support Symphony ephemeral system prompts required for ${bundle.metadata.templateKeys.join(", ")}`,
+    );
   }
 
   private async runHandoffRepairIfNeeded(
@@ -3278,7 +3342,8 @@ export class Orchestrator {
     entry.handoffRepair = { sourceRunId, kind, attempt: repairAttempt };
     entry.hermesResume = resume;
     entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-    const prompt = await this.renderHandoffRepairPrompt(entry, kind, sourceRunId, repairAttempt);
+    const promptBundle = await this.renderHandoffRepairPromptBundle(entry, kind, sourceRunId, repairAttempt);
+    this.assertPromptBundleSupported(promptBundle);
     await this.options.runStore?.appendEvent({
       runId: sourceRunId,
       at: new Date().toISOString(),
@@ -3298,11 +3363,12 @@ export class Orchestrator {
       kind,
       repair_attempt: repairAttempt,
     });
-    await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, turnNumber));
-    await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, turnNumber));
-    await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, attempt, turnNumber), prompt), {
+    await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, turnNumber, promptBundle));
+    await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, turnNumber, promptBundle));
+    await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, attempt, turnNumber, promptBundle), promptBundle.userPrompt), {
       workspace,
-      prompt,
+      prompt: promptBundle.userPrompt,
+      promptBundle,
       attempt,
       turnNumber,
     });
@@ -3437,6 +3503,33 @@ export class Orchestrator {
       handoffKind: kind,
     });
     return [basePrompt, "", this.repairMcpPrompt(entry, kind)].join("\n");
+  }
+
+  private async renderHandoffRepairPromptBundle(
+    entry: RunningEntry,
+    kind: RepairableHandoffKind,
+    sourceRunId: string,
+    repairAttempt: number,
+  ): Promise<AgentPromptBundle> {
+    const userPrompt = await this.renderHandoffRepairPrompt(entry, kind, sourceRunId, repairAttempt);
+    return this.renderPromptBundle(
+      entry,
+      userPrompt,
+      "handoff_repair.mcp_only",
+      {
+        issue: entry.issue,
+        attempt: null,
+        role: entry.role,
+        lifecycle: entry.lifecycle,
+        sourceRunId,
+        repairAttempt,
+        maxAttempts: this.config.handoffRepair.maxAttempts,
+        missingHandoff: formatRepairableHandoffKind(kind),
+        requiredTool: repairToolName(kind),
+        handoffKind: kind,
+      },
+      { attempt: null, turnNumber: repairAttempt + 1 },
+    );
   }
 
   private repairMcpPrompt(entry: RunningEntry, kind: RepairableHandoffKind): string {
@@ -4023,6 +4116,77 @@ export class Orchestrator {
     return fs.readFile(templatePath, "utf8");
   }
 
+  private async renderPromptBundle(
+    entry: RunningEntry,
+    userPrompt: string,
+    userTemplateKey: string,
+    input: Parameters<PromptRenderer["render"]>[1],
+    options: { attempt: number | null; turnNumber: number; reviewerEvidence?: ReviewerDispatchEvidence | null } = {
+      attempt: null,
+      turnNumber: 1,
+    },
+  ): Promise<AgentPromptBundle> {
+    const systemTemplateKey = `${userTemplateKey}.system`;
+    const system = await this.renderEphemeralSystemPrompt(entry, systemTemplateKey, {
+      ...input,
+      attempt: options.attempt,
+      role: entry.role,
+      lifecycle: entry.lifecycle,
+      ...this.ephemeralSystemPromptInput(entry, options),
+    });
+    return {
+      userPrompt,
+      ephemeralSystemPrompt: system.prompt,
+      metadata: {
+        templateKeys: [userTemplateKey, systemTemplateKey],
+        warnings: system.warnings,
+        userPromptCharCount: userPrompt.length,
+        ephemeralSystemPromptCharCount: system.prompt.length,
+      },
+    };
+  }
+
+  private async renderEphemeralSystemPrompt(
+    entry: RunningEntry,
+    templateKey: string,
+    input: Parameters<PromptRenderer["render"]>[1],
+  ): Promise<{ prompt: string; warnings: string[] }> {
+    const rendered = (
+      await this.renderConfiguredPromptTemplate(templateKey, DEFAULT_EPHEMERAL_SYSTEM_PROMPT_TEMPLATE, input)
+    ).trim();
+    const warnings = Array.isArray(input.warnings) ? input.warnings.filter((item): item is string => typeof item === "string") : [];
+    if (rendered.length > EPHEMERAL_SYSTEM_PROMPT_MAX_CHARS) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `Ephemeral system prompt for ${entry.issue.identifier} is ${rendered.length} chars, exceeding ${EPHEMERAL_SYSTEM_PROMPT_MAX_CHARS}. Shorten the Issue Contract or prompt template before dispatch.`,
+      );
+    }
+    return { prompt: rendered, warnings };
+  }
+
+  private ephemeralSystemPromptInput(
+    entry: RunningEntry,
+    options: { attempt: number | null; turnNumber: number; reviewerEvidence?: ReviewerDispatchEvidence | null },
+  ): Record<string, unknown> {
+    const lifecycle = entry.lifecycle === null ? null : currentPromptLifecycle(entry.lifecycle);
+    const contract = summarizeIssueContractForPrompt(entry.issue.description, this.config.agent.protectedPaths);
+    const warnings = [
+      ...contract.missingSections.map((section) => `Missing issue authoring section: ${section}`),
+      ...contract.issueContractErrors,
+      ...contract.underSpecifiedContractErrors,
+    ];
+    return {
+      rolePhase: formatRolePhaseDirective(entry, options),
+      currentObjective: currentObjectiveDirective(entry, lifecycle, options),
+      pinnedIssueContract: formatPinnedIssueContract(contract),
+      activeDirective: activeDirectiveForRun(entry, lifecycle, options),
+      successConditions: successConditionsForRun(entry, lifecycle, options),
+      scopeGuards: scopeGuardsForRun(entry, options),
+      requiredHandoff: requiredHandoffForRun(entry),
+      warnings,
+    };
+  }
+
   private formatRenderedReviewerPrompt(
     prompt: string,
     mcpHandoff: Parameters<typeof renderReviewMcpHandoffPrompt>[0],
@@ -4056,9 +4220,51 @@ export class Orchestrator {
       reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
       workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
     });
-    return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.workerMcpPrompt(entry), mergeGate, reviewVerdict, reviewEvidence]
-      .filter((item): item is string => item !== null)
-      .join("\n");
+    return formatUserPromptPacket("Symphony Worker Evidence Packet", [
+      ["Primary Assignment", basePrompt],
+      ["Issue Breakdown Plan", issueBreakdownPlan],
+      ["Review Loop Hardening", reviewHardening],
+      ["Compact Handoff", handoff],
+      ["MCP Handoff Instructions", this.workerMcpPrompt(entry)],
+      ["Merge Gate Evidence", mergeGate],
+      ["Reviewer Verdict Evidence", reviewVerdict],
+      ["Pull Request Review Evidence", reviewEvidence],
+    ]);
+  }
+
+  private async renderWorkerPromptBundle(
+    entry: RunningEntry,
+    attempt: number | null,
+    turnNumber: number,
+  ): Promise<AgentPromptBundle> {
+    if (entry.runPhase === "merge_conflict_resolution") {
+      const userPrompt = await this.renderMergeConflictResolutionPrompt(entry);
+      return this.renderPromptBundle(
+        entry,
+        userPrompt,
+        "worker.merge_conflict.resolve",
+        { issue: entry.issue, attempt, role: entry.role, lifecycle: entry.lifecycle, workspace: entry.workspace },
+        { attempt, turnNumber },
+      );
+    }
+    const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
+    const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
+    const userTemplateKey = workerImplementationTemplateKey(entry, mergeGateResult, reviewVerdict);
+    const userPrompt = await this.renderWorkerPrompt(entry, attempt);
+    return this.renderPromptBundle(
+      entry,
+      userPrompt,
+      userTemplateKey,
+      {
+        issue: entry.issue,
+        attempt,
+        role: entry.role,
+        lifecycle: entry.lifecycle,
+        reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
+        workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+      },
+      { attempt, turnNumber },
+    );
   }
 
   private async renderIssueBreakdownPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
@@ -4070,6 +4276,26 @@ export class Orchestrator {
       applyToLinear: this.config.issueBreakdown.applyToLinear,
     });
     return [basePrompt, this.issueBreakdownMcpPrompt(entry)].join("\n");
+  }
+
+  private async renderIssueBreakdownPromptBundle(
+    entry: RunningEntry,
+    attempt: number | null,
+  ): Promise<AgentPromptBundle> {
+    const userPrompt = await this.renderIssueBreakdownPrompt(entry, attempt);
+    return this.renderPromptBundle(
+      entry,
+      userPrompt,
+      "planner.issue_breakdown.speckit_to_linear",
+      {
+        issue: entry.issue,
+        attempt,
+        role: entry.role,
+        lifecycle: entry.lifecycle,
+        applyToLinear: this.config.issueBreakdown.applyToLinear,
+      },
+      { attempt, turnNumber: 1 },
+    );
   }
 
   private async renderReviewerPrompt(
@@ -4097,6 +4323,33 @@ export class Orchestrator {
       repoPath: workspace.repoPath ?? null,
       baseRef: workspace.baseRef ?? null,
     });
+  }
+
+  private async renderReviewerPromptBundle(
+    entry: RunningEntry,
+    evidence: ReviewerDispatchEvidence,
+    workspace: Workspace,
+  ): Promise<AgentPromptBundle> {
+    const userPrompt = await this.renderReviewerPrompt(entry, evidence, workspace);
+    return this.renderPromptBundle(
+      entry,
+      userPrompt,
+      "reviewer.review.exhaustive",
+      {
+        issue: entry.issue,
+        attempt: null,
+        role: "reviewer",
+        lifecycle: entry.lifecycle,
+        completionReport: evidence.completionReport,
+        acceptanceCriteria: acceptanceCriteriaForReport(evidence.completionReport),
+        workspaceEvidence: workspaceEvidenceForReview(entry.issue, workspace, evidence),
+        validationEvidence: evidence.completionReport.validationEvidence,
+        runDigest: evidence.runDigest,
+        reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
+        workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+      },
+      { attempt: null, turnNumber: 1, reviewerEvidence: evidence },
+    );
   }
 
   private async renderIssueTriagePrompt(entry: RunningEntry): Promise<string> {
@@ -4204,6 +4457,17 @@ export class Orchestrator {
     ].join("\n");
   }
 
+  private async renderIssueTriagePromptBundle(entry: RunningEntry): Promise<AgentPromptBundle> {
+    const userPrompt = await this.renderIssueTriagePrompt(entry);
+    return this.renderPromptBundle(
+      entry,
+      userPrompt,
+      "triage.issue_blocked.classify",
+      { issue: entry.issue, attempt: null, role: entry.role, lifecycle: entry.lifecycle },
+      { attempt: null, turnNumber: 1 },
+    );
+  }
+
   private async renderMergeConflictResolutionPrompt(entry: RunningEntry): Promise<string> {
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
     const conflict = lifecycle?.mergeConflict ?? null;
@@ -4284,17 +4548,30 @@ export class Orchestrator {
     const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
     const mergeGate = mergeGateResult?.text ?? null;
     const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
-    return [
-      continuationBrief,
-      reviewHardening,
-      handoff,
-      mergeGate,
-      reviewVerdict,
-      reviewEvidence,
-      this.workerMcpPrompt(entry),
-    ]
-      .filter((item): item is string => item !== null)
-      .join("\n");
+    return formatUserPromptPacket("Symphony Worker Continuation Evidence Packet", [
+      ["Continuation Brief", continuationBrief],
+      ["Review Loop Hardening", reviewHardening],
+      ["Compact Handoff", handoff],
+      ["Merge Gate Evidence", mergeGate],
+      ["Reviewer Verdict Evidence", reviewVerdict],
+      ["Pull Request Review Evidence", reviewEvidence],
+      ["MCP Handoff Instructions", this.workerMcpPrompt(entry)],
+    ]);
+  }
+
+  private async renderWorkerContinuationPromptBundle(
+    entry: RunningEntry,
+    attempt: number | null,
+    turnNumber: number,
+  ): Promise<AgentPromptBundle> {
+    const userPrompt = await this.renderWorkerContinuationPrompt(entry);
+    return this.renderPromptBundle(
+      entry,
+      userPrompt,
+      "worker.implementation.continuation",
+      { issue: entry.issue, attempt, role: entry.role, lifecycle: entry.lifecycle },
+      { attempt, turnNumber },
+    );
   }
 
   private workerReviewHardeningPrompt(): string {
@@ -5123,6 +5400,20 @@ function formatList(values: string[]): string {
   return values.length === 0 ? "n/a" : values.join("; ");
 }
 
+function formatUserPromptPacket(title: string, sections: Array<[string, string | null]>): string {
+  const renderedSections = sections
+    .filter((section): section is [string, string] => section[1] !== null && section[1].trim().length > 0)
+    .map(([heading, body]) => [`## ${heading}`, body.trim()].join("\n\n"));
+  return [
+    `# ${title}`,
+    "",
+    "## How To Read This Prompt",
+    "Use the pinned ephemeral system prompt as the current directive. Use this user prompt as the evidence packet and detailed handoff instructions.",
+    "",
+    ...renderedSections,
+  ].join("\n");
+}
+
 function formatPullRequest(number: number | null, url: string | null): string {
   const parts = [number === null ? null : `#${number}`, url].filter((value): value is string => value !== null);
   return parts.length === 0 ? "n/a" : parts.join(" ");
@@ -5130,6 +5421,261 @@ function formatPullRequest(number: number | null, url: string | null): string {
 
 function oneLine(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function formatRolePhaseDirective(
+  entry: RunningEntry,
+  options: { attempt: number | null; turnNumber: number },
+): string {
+  return [
+    `- Issue: ${entry.issue.identifier} - ${entry.issue.title}`,
+    `- Role: ${entry.role}`,
+    `- Phase: ${entry.runPhase}`,
+    `- Run kind: ${runKindForPhase(entry.runPhase)}`,
+    `- Turn: ${options.turnNumber}`,
+    `- Attempt: ${options.attempt ?? "n/a"}`,
+    `- State at dispatch: ${entry.issue.state}`,
+  ].join("\n");
+}
+
+function currentObjectiveDirective(
+  entry: RunningEntry,
+  lifecycle: IssueLifecycleRecord | null,
+  options: { turnNumber: number },
+): string {
+  if (entry.handoffRepair) {
+    return `Resume the existing Hermes session only to call the missing ${formatRepairableHandoffKind(entry.handoffRepair.kind)} MCP handoff. Do not perform new implementation, review, planning, git, GitHub, or Linear work.`;
+  }
+  if (entry.runPhase === "issue_breakdown") {
+    return "Create a SpecKit-backed decomposition plan and submit proposed blocking Linear child issues for the parent issue.";
+  }
+  if (entry.runPhase === "issue_triage") {
+    return "Classify why this blocked issue exhausted its failure budget and submit a read-only issue triage report with the recommended human/system action.";
+  }
+  if (entry.runPhase === "review") {
+    return "Perform an exhaustive independent review against the issue contract and current implementation evidence.";
+  }
+  if (entry.runPhase === "merge_conflict_resolution") {
+    return "Resolve only the lifecycle-bound pull request merge conflict and submit the merge-conflict resolution handoff.";
+  }
+  if (options.turnNumber > 1) {
+    return "Continue the incomplete implementation turn, satisfy the unmet requirements, and submit the required completion handoff.";
+  }
+  const triage = latestIssueTriageReport(lifecycle);
+  if (triage && triage.disposition !== "decompose_issue") {
+    return `Run a focused ${triage.disposition} implementation turn using the latest issue triage recommendation.`;
+  }
+  if (lifecycle?.mergeGate?.status === "repair_dispatched" || lifecycle?.mergeGate?.status === "blocked") {
+    return "Repair only the active Symphony merge-gate blocker on the lifecycle-bound pull request.";
+  }
+  if (lifecycle?.handoff.lastReviewerOutput?.verdict === "fail") {
+    return "Repair the latest reviewer-requested changes while preserving correct completed work.";
+  }
+  if ((lifecycle?.incompleteTurnCount ?? 0) > 0) {
+    return "Complete the previously unsatisfied issue requirements without broadening scope.";
+  }
+  return "Implement the issue contract exactly and submit a completion report with concrete validation evidence.";
+}
+
+function activeDirectiveForRun(
+  entry: RunningEntry,
+  lifecycle: IssueLifecycleRecord | null,
+  options: { reviewerEvidence?: ReviewerDispatchEvidence | null },
+): string {
+  if (entry.handoffRepair) {
+    return [
+      `- Source run: ${entry.handoffRepair.sourceRunId}`,
+      `- Missing handoff: ${formatRepairableHandoffKind(entry.handoffRepair.kind)}`,
+      `- Required tool: ${repairToolName(entry.handoffRepair.kind)}`,
+      "- Use only findings already present in the resumed session.",
+    ].join("\n");
+  }
+  if (entry.runPhase === "review" && options.reviewerEvidence) {
+    return [
+      `- Completion report: ${options.reviewerEvidence.completionReport.id}`,
+      `- Worker run: ${options.reviewerEvidence.completionReport.runId}`,
+      `- Summary: ${options.reviewerEvidence.completionReport.summary}`,
+      `- Changed files: ${formatList(options.reviewerEvidence.completionReport.changedFiles)}`,
+      `- Validation evidence: ${formatList(options.reviewerEvidence.completionReport.validationEvidence)}`,
+    ].join("\n");
+  }
+  const triage = latestIssueTriageReport(lifecycle);
+  const verdict = lifecycle ? latestReviewVerdict(lifecycle) : null;
+  const gate = lifecycle?.mergeGate ?? null;
+  const sections: string[] = [];
+  if (triage) {
+    sections.push(
+      [
+        "Latest issue triage:",
+        `- Disposition: ${triage.disposition}`,
+        `- Confidence: ${triage.confidence}`,
+        `- Summary: ${triage.summary}`,
+        `- Recommended human action: ${triage.recommendedAction}`,
+      ].join("\n"),
+    );
+  }
+  if (verdict?.verdict === "fail") {
+    sections.push(
+      [
+        "Latest review failure:",
+        `- Review run: ${verdict.runId}`,
+        "Findings:",
+        ...verdict.findings.map((finding) => `- ${finding}`),
+        "Unsatisfied acceptance results:",
+        ...formatDirectiveAcceptanceGaps(verdict.acceptanceResults),
+      ].join("\n"),
+    );
+  }
+  if (gate && (gate.status === "repair_dispatched" || gate.status === "blocked")) {
+    const actionable = gate.checks.filter((check) => check.outcome === "failing" || check.outcome === "missing_actionable");
+    sections.push(
+      [
+        "Active merge gate:",
+        `- Gate: ${gate.id}; status: ${gate.status}`,
+        `- PR: ${formatPullRequest(gate.pullRequest.number, gate.pullRequest.url)}`,
+        `- Head SHA: ${gate.headSha}`,
+        `- Actionable checks: ${formatList(actionable.map((check) => `${check.name}=${check.outcome}`))}`,
+      ].join("\n"),
+    );
+  }
+  if (sections.length > 0) return sections.join("\n\n");
+  return "- No prior review, triage, or merge-gate repair signal is active for this run.";
+}
+
+function successConditionsForRun(
+  entry: RunningEntry,
+  lifecycle: IssueLifecycleRecord | null,
+  _options: { turnNumber: number },
+): string {
+  if (entry.handoffRepair) {
+    return `- Call ${repairToolName(entry.handoffRepair.kind)} once with the best valid payload supported by the prior session findings.\n- Stop after the required MCP call.`;
+  }
+  if (entry.runPhase === "review") {
+    return [
+      "- Check every Issue Contract requirement and relevant adjacent scenario.",
+      "- Leave required PR review feedback when applicable.",
+      "- Call submit_review_verdict before ending the run.",
+    ].join("\n");
+  }
+  if (entry.runPhase === "issue_triage") {
+    return [
+      "- Choose the most specific disposition supported by evidence.",
+      "- Include confidence, summary, evidence, and recommendedAction.",
+      "- Call submit_issue_triage_report before ending the run.",
+    ].join("\n");
+  }
+  if (entry.runPhase === "issue_breakdown") {
+    return [
+      "- Complete specify, plan, tasks, analyze, fix, and task-to-Linear issue planning in one planner session.",
+      "- Proposed child issues must satisfy Symphony issue-contract lint.",
+      "- Call submit_issue_breakdown_plan before ending the run.",
+    ].join("\n");
+  }
+  if (entry.runPhase === "merge_conflict_resolution") {
+    return [
+      "- Resolve only merge conflicts on the lifecycle-bound PR.",
+      "- Validate the conflict resolution evidence.",
+      "- Call submit_merge_conflict_resolution before ending the run.",
+    ].join("\n");
+  }
+  const triage = latestIssueTriageReport(lifecycle);
+  return [
+    triage && triage.disposition !== "decompose_issue"
+      ? `- Complete the focused repair requested by triage: ${triage.recommendedAction}`
+      : "- Satisfy every Issue Contract requirement.",
+    "- Preserve correct completed work unless current evidence proves it conflicts with the contract.",
+    "- Validate with concrete commands, tests, API checks, or reasoned manual evidence.",
+    "- Call submit_completion_report before ending the run.",
+  ].join("\n");
+}
+
+function scopeGuardsForRun(entry: RunningEntry, _options: { turnNumber: number }): string {
+  const common = [
+    "- The current run directive is authoritative over stale session assumptions.",
+    "- Do not commit, push, transition Linear, comment on Linear, or create/update GitHub PRs directly unless a Symphony MCP tool explicitly performs that service-owned action.",
+  ];
+  if (entry.runPhase === "review" || entry.runPhase === "issue_triage") {
+    return [
+      "- This run is read-only except for the required Symphony MCP handoff and allowed review feedback.",
+      "- Do not edit files or alter repository, Linear, or GitHub state directly.",
+      ...common,
+    ].join("\n");
+  }
+  if (entry.handoffRepair) {
+    return [
+      "- Do not perform new investigation or code edits.",
+      "- Do not reopen implementation, review, planning, git, GitHub, or Linear work.",
+      ...common,
+    ].join("\n");
+  }
+  return [
+    "- Keep the change scoped to the current issue contract and active repair evidence.",
+    "- Do not broaden scope from stale conversation history.",
+    ...common,
+  ].join("\n");
+}
+
+function requiredHandoffForRun(entry: RunningEntry): string {
+  if (entry.handoffRepair) return `Call ${repairToolName(entry.handoffRepair.kind)} and then stop.`;
+  switch (entry.runPhase) {
+    case "review":
+      return "Call submit_review_verdict before ending the run.";
+    case "issue_triage":
+      return "Call submit_issue_triage_report before ending the run.";
+    case "issue_breakdown":
+      return "Call submit_issue_breakdown_plan before ending the run.";
+    case "merge_conflict_resolution":
+      return "Call submit_merge_conflict_resolution before ending the run.";
+    case "implementation":
+      return "Call submit_completion_report before ending the run.";
+  }
+}
+
+function formatPinnedIssueContract(contract: ReturnType<typeof summarizeIssueContractForPrompt>): string {
+  const sections: string[] = [];
+  if (contract.issueContractJson) {
+    sections.push(["Fenced JSON Issue Contract:", "```json", contract.issueContractJson, "```"].join("\n"));
+  } else {
+    sections.push("Fenced JSON Issue Contract: missing or invalid in the issue description.");
+  }
+  sections.push(
+    [
+      "Contract Checklist:",
+      clipPromptBlock(contract.contractChecklist ?? "No Contract Checklist section was found."),
+    ].join("\n"),
+  );
+  sections.push(
+    [
+      "Validation Requirements:",
+      clipPromptBlock(contract.validationRequirements ?? "No Validation Requirements section was found."),
+    ].join("\n"),
+  );
+  const warnings = [
+    ...contract.missingSections.map((section) => `Missing section: ${section}`),
+    ...contract.issueContractErrors,
+    ...contract.underSpecifiedContractErrors,
+  ];
+  if (warnings.length > 0) {
+    sections.push(["Contract authoring warnings:", ...warnings.map((warning) => `- ${warning}`)].join("\n"));
+  }
+  return sections.join("\n\n");
+}
+
+function formatDirectiveAcceptanceGaps(results: IssueReviewVerdictRecord["acceptanceResults"]): string[] {
+  const gaps = results.filter((item) => !item.satisfied);
+  if (gaps.length === 0) return ["- None"];
+  return gaps.map((item) => `- ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`);
+}
+
+function clipPromptBlock(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= PROMPT_SUMMARY_BLOCK_MAX_CHARS) return trimmed;
+  return `${trimmed.slice(0, PROMPT_SUMMARY_BLOCK_MAX_CHARS - 32).trimEnd()}\n...[truncated for prompt directive]`;
+}
+
+function harnessSupportsEphemeralSystemPrompt(harness: AgentHarness): boolean {
+  if (harness.capabilities?.ephemeralSystemPrompt !== undefined) return harness.capabilities.ephemeralSystemPrompt;
+  return true;
 }
 
 function metadataForRunningEntry(entry: RunningEntry): IssueRunMetadata {

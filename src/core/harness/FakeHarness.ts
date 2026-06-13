@@ -7,7 +7,7 @@ export interface FakeHarnessOptions {
 
 export class FakeHarness implements AgentHarness {
   readonly id = "fake";
-  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly capabilities = { continuation: true, mcpHandoff: true, ephemeralSystemPrompt: true };
   readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
   reloadCount = 0;
 

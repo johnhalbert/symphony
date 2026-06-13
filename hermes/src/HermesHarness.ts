@@ -76,6 +76,7 @@ export class HermesHarness implements AgentHarness {
   readonly capabilities = {
     continuation: true,
     mcpHandoff: true,
+    ephemeralSystemPrompt: true,
     runStatus: false,
     liveDiagnostics: true,
   };
@@ -360,6 +361,7 @@ export class HermesHarness implements AgentHarness {
       python: ctx.config.hermes.python,
       model: ctx.config.hermes.model,
       provider: ctx.config.hermes.provider,
+      ephemeralSystemPrompt: ctx.ephemeralSystemPrompt ?? null,
       startupTimeoutMs: ctx.config.hermes.startupTimeoutMs,
       requestTimeoutMs: ctx.config.hermes.requestTimeoutMs,
       extraEnv,

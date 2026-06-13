@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -160,6 +161,11 @@ export interface RunRecord {
   turnNumber: number;
   prompt: string;
   promptCharCount?: number;
+  ephemeralSystemPrompt?: string | null;
+  ephemeralSystemPromptCharCount?: number;
+  ephemeralSystemPromptHash?: string | null;
+  promptTemplateKeys?: string[];
+  promptBundleWarnings?: string[];
   harnessId?: string;
   runtimeModel?: string | null;
   runtimeModelParams?: PersistedRuntimeModelParam[];
@@ -383,6 +389,9 @@ export interface StartRunInput {
   attempt: number | null;
   turnNumber: number;
   prompt: string;
+  ephemeralSystemPrompt?: string | null;
+  promptTemplateKeys?: string[];
+  promptBundleWarnings?: string[];
   harnessId?: string;
   runtimeModel?: string | null;
   runtimeModelParams?: PersistedRuntimeModelParam[];
@@ -504,6 +513,16 @@ export class FileRunTranscriptStore {
       turnNumber: input.turnNumber,
       prompt: promptPreview(input.prompt),
       promptCharCount: input.prompt.length,
+      ...(input.ephemeralSystemPrompt === undefined
+        ? {}
+        : {
+            ephemeralSystemPrompt: input.ephemeralSystemPrompt === null ? null : promptPreview(input.ephemeralSystemPrompt),
+            ephemeralSystemPromptCharCount: input.ephemeralSystemPrompt?.length ?? 0,
+            ephemeralSystemPromptHash:
+              input.ephemeralSystemPrompt === null ? null : promptTextHash(input.ephemeralSystemPrompt),
+          }),
+      ...(input.promptTemplateKeys === undefined ? {} : { promptTemplateKeys: [...input.promptTemplateKeys] }),
+      ...(input.promptBundleWarnings === undefined ? {} : { promptBundleWarnings: [...input.promptBundleWarnings] }),
       ...(input.harnessId === undefined ? {} : { harnessId: input.harnessId }),
       ...(input.runtimeModel === undefined ? {} : { runtimeModel: input.runtimeModel }),
       ...(input.runtimeModelParams === undefined ? {} : { runtimeModelParams: input.runtimeModelParams }),
@@ -804,6 +823,10 @@ function promptPreview(prompt: string): string {
   return oneLine.length <= 240 ? oneLine : `${oneLine.slice(0, 225)}...[truncated]`;
 }
 
+function promptTextHash(prompt: string): string {
+  return createHash("sha256").update(prompt).digest("hex");
+}
+
 function normalizeRunRecord(record: RunRecord): RunRecord {
   const runPhase = record.runPhase ?? defaultRunPhase(record.role);
   const harnessId =
@@ -843,6 +866,13 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
         ? { runtimeAgentLifecycle: record.cursorWorkerAgentLifecycle }
         : {}),
     ...(record.commandPolicy === undefined ? {} : { commandPolicy: commandPolicyReplayStateFromExisting(record.commandPolicy) }),
+    ...(record.ephemeralSystemPrompt === undefined ? {} : { ephemeralSystemPrompt: record.ephemeralSystemPrompt }),
+    ...(record.ephemeralSystemPromptCharCount === undefined
+      ? {}
+      : { ephemeralSystemPromptCharCount: record.ephemeralSystemPromptCharCount }),
+    ...(record.ephemeralSystemPromptHash === undefined ? {} : { ephemeralSystemPromptHash: record.ephemeralSystemPromptHash }),
+    ...(record.promptTemplateKeys === undefined ? {} : { promptTemplateKeys: [...record.promptTemplateKeys] }),
+    ...(record.promptBundleWarnings === undefined ? {} : { promptBundleWarnings: [...record.promptBundleWarnings] }),
   };
 }
 

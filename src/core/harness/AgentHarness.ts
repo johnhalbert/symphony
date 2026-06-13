@@ -13,6 +13,19 @@ export type AgentHandoffRepairKind =
   | "merge_conflict_resolution";
 export type AgentHermesResumeReason = "handoff_repair" | "merge_conflict_original_worker";
 
+export interface AgentPromptBundleMetadata {
+  templateKeys: string[];
+  warnings: string[];
+  userPromptCharCount: number;
+  ephemeralSystemPromptCharCount: number;
+}
+
+export interface AgentPromptBundle {
+  userPrompt: string;
+  ephemeralSystemPrompt: string;
+  metadata: AgentPromptBundleMetadata;
+}
+
 export interface AgentHermesResumeContext {
   sourceRunId: string;
   reason: AgentHermesResumeReason;
@@ -24,6 +37,7 @@ export interface AgentHermesResumeContext {
 export interface AgentHarnessCapabilities {
   readonly mcpHandoff?: boolean;
   readonly continuation?: boolean;
+  readonly ephemeralSystemPrompt?: boolean;
   readonly runStatus?: boolean;
   readonly liveDiagnostics?: boolean;
 }
@@ -48,6 +62,7 @@ export interface AgentRunContext {
     attempt: number;
   } | null;
   hermesResume?: AgentHermesResumeContext | null;
+  ephemeralSystemPrompt?: string | null;
   abortSignal: AbortSignal;
   logger: Logger;
 }
