@@ -1400,13 +1400,33 @@ export class StatusServer {
         }
         const { target } = resolvedTarget;
         const workspaceLookupKey = (target.workspace?.workspaceKey ?? issueId) || target.lookupKey;
+        const scopedIssueLookupKeys = Array.from(
+          new Set(
+            [target.live?.issueId, target.latestRun?.issueId, target.lifecycle?.issueId, target.workspace?.issueId, issueId].filter(
+              (key): key is string => typeof key === "string" && key.length > 0,
+            ),
+          ),
+        );
         const details =
-          this.options.orchestrator.getIssueDetails(target.lookupKey) ??
-          this.options.orchestrator.getIssueDetails(workspaceLookupKey);
-        const workspace =
-          target.workspace ??
-          (await this.options.runStore?.findWorkspace(target.lookupKey)) ??
-          (workspaceLookupKey === target.lookupKey ? null : await this.options.runStore?.findWorkspace(workspaceLookupKey));
+          target.live ??
+          scopedIssueLookupKeys
+            .map((key) => this.options.orchestrator.getIssueDetails(key))
+            .find((candidate) => candidate !== null) ??
+          null;
+        const scopedWorkspaceLookupKeys = Array.from(
+          new Set(
+            [target.workspace?.workspaceKey, target.workspace?.issueId, target.live?.issueId, target.latestRun?.issueId, target.lifecycle?.issueId, issueId].filter(
+              (key): key is string => typeof key === "string" && key.length > 0,
+            ),
+          ),
+        );
+        let workspace = target.workspace;
+        if (!workspace && this.options.runStore) {
+          for (const key of scopedWorkspaceLookupKeys) {
+            workspace = await this.options.runStore.findWorkspace(key);
+            if (workspace) break;
+          }
+        }
         const workspacePath =
           details?.workspacePath ?? workspace?.path ?? this.options.workspaceManager.getPathForIssue(workspaceLookupKey);
 
