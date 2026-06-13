@@ -77,6 +77,59 @@ describe("ReviewVerdictService", () => {
     });
   });
 
+  it("stores structured gate and discovery findings while deriving legacy findings from gate summaries", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+      reviewRound: 0,
+    });
+
+    await service.submitReviewVerdict(
+      failVerdict({
+        idempotencyKey: "verdict-structured-1",
+        findings: ["Legacy summary that should not drive storage."],
+        gateFindings: [
+          gateFinding({
+            summary: "Preserve explicit project context when resolving workspace fallbacks.",
+            requirementIds: ["REQ-1"],
+            contractAnchor: "Issue Contract > Requirements > REQ-1",
+          }),
+        ],
+        discoveryFindings: [
+          discoveryFinding({
+            summary: "The sibling docs workspace fallback matrix may need its own follow-up.",
+            relationship: "adjacent_sibling",
+            suggestedDisposition: "followup_issue",
+          }),
+        ],
+      }),
+      context(),
+    );
+
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      reviewVerdicts: [
+        {
+          idempotencyKey: "verdict-structured-1",
+          findings: ["Preserve explicit project context when resolving workspace fallbacks."],
+          gateFindings: [
+            {
+              summary: "Preserve explicit project context when resolving workspace fallbacks.",
+              requirementIds: ["REQ-1"],
+              contractAnchor: "Issue Contract > Requirements > REQ-1",
+            },
+          ],
+          discoveryFindings: [
+            {
+              summary: "The sibling docs workspace fallback matrix may need its own follow-up.",
+              relationship: "adjacent_sibling",
+              suggestedDisposition: "followup_issue",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
   it("increments review rounds on each accepted fail verdict", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
@@ -152,6 +205,49 @@ describe("ReviewVerdictService", () => {
     expect((await outbox.list()).find((operation) => operation.kind === "transition")).toMatchObject({
       idempotencyKey: "transition:issue-1:review-run-1:review-verdict-pass:Ready to Merge",
       payload: { toState: "Ready to Merge" },
+    });
+  });
+
+  it("accepts a pass verdict with non-gating discovery findings", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+      reviewRound: 1,
+      summaryPointers: { prUrl: "https://github.com/acme/symphony/pull/42", prNumber: 42, prHeadSha: "head-sha-1" },
+      reviewFeedback: [approvalFeedback()],
+    });
+
+    await service.submitReviewVerdict(
+      passVerdict({
+        idempotencyKey: "verdict-pass-with-discovery",
+        discoveryFindings: [
+          discoveryFinding({
+            summary: "A broader stale-cache matrix would be useful hardening outside this contract.",
+            relationship: "future_hardening",
+            suggestedDisposition: "followup_issue",
+          }),
+        ],
+      }),
+      context(),
+    );
+
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "passed",
+      reviewVerdicts: [
+        {
+          idempotencyKey: "verdict-pass-with-discovery",
+          verdict: "pass",
+          findings: [],
+          gateFindings: [],
+          discoveryFindings: [
+            {
+              summary: "A broader stale-cache matrix would be useful hardening outside this contract.",
+              relationship: "future_hardening",
+              suggestedDisposition: "followup_issue",
+            },
+          ],
+        },
+      ],
     });
   });
 
@@ -234,6 +330,18 @@ describe("ReviewVerdictService", () => {
     );
     await expect(service.submitReviewVerdict(failVerdict({ findings: [] }), context())).rejects.toMatchObject({
       code: "invalid_request",
+    });
+    await expect(
+      service.submitReviewVerdict(failVerdict({ findings: [], gateFindings: [], discoveryFindings: [discoveryFinding()] }), context()),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Fail review verdicts require at least one gate finding or legacy finding",
+    });
+    await expect(
+      service.submitReviewVerdict(passVerdict({ gateFindings: [gateFinding()] }), context()),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Pass review verdicts cannot include gate findings",
     });
   });
 
@@ -572,6 +680,7 @@ function failVerdict(overrides: Partial<ReviewVerdictInput> = {}): ReviewVerdict
       },
     ],
     findings: ["Add a regression test for duplicate verdict handling."],
+    discoveryFindings: [],
     evidence: ["https://github.com/acme/symphony/pull/42#discussion_r1"],
     idempotencyKey: "verdict-1",
     ...overrides,
@@ -591,8 +700,42 @@ function passVerdict(overrides: Partial<ReviewVerdictInput> = {}): ReviewVerdict
       },
     ],
     findings: [],
+    discoveryFindings: [],
     evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-1"],
     idempotencyKey: "verdict-pass-1",
+    ...overrides,
+  };
+}
+
+function gateFinding(
+  overrides: Partial<NonNullable<ReviewVerdictInput["gateFindings"]>[number]> = {},
+): NonNullable<ReviewVerdictInput["gateFindings"]>[number] {
+  return {
+    summary: "Add a regression test for duplicate verdict handling.",
+    requirementIds: ["REQ-1"],
+    contractAnchor: "Issue Contract > Requirements > REQ-1",
+    scenario: "Duplicate review verdict submission",
+    scenarioEntitlement: "explicit_requirement",
+    observedFailure: "The PR has no duplicate verdict regression coverage.",
+    currentIssueOwnership: "The issue contract names idempotent duplicate handling as required behavior.",
+    boundedRepair: "Add focused duplicate verdict regression coverage.",
+    evidence: ["https://github.com/acme/symphony/pull/42#discussion_r1"],
+    ...overrides,
+  };
+}
+
+function discoveryFinding(
+  overrides: Partial<NonNullable<ReviewVerdictInput["discoveryFindings"]>[number]> = {},
+): NonNullable<ReviewVerdictInput["discoveryFindings"]>[number] {
+  return {
+    summary: "Sibling workflow coverage may need separate hardening.",
+    importance: "medium",
+    relationship: "adjacent_sibling",
+    discoveryReason: "Review found a nearby scenario that is related but not explicitly owned by this issue contract.",
+    suggestedDisposition: "operator_decision",
+    scenarioAxes: ["sibling workflow", "fallback state"],
+    evidence: ["https://github.com/acme/symphony/pull/42#discussion_r2"],
+    ownerIssueIdentifier: null,
     ...overrides,
   };
 }

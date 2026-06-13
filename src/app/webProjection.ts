@@ -293,6 +293,14 @@ interface IssueBoardCardReviewLoopInput {
   lastReviewVerdict?: {
     verdict?: string | null;
     findings?: string[] | null;
+    gateFindings?: Array<{ summary?: string | null; scenario?: string | null; contractAnchor?: string | null }> | null;
+    discoveryFindings?: Array<{
+      summary?: string | null;
+      relationship?: string | null;
+      suggestedDisposition?: string | null;
+      discoveryReason?: string | null;
+      scenarioAxes?: string[] | null;
+    }> | null;
     evidence?: string[] | null;
     submittedAt?: string | null;
     id?: string | null;
@@ -1611,6 +1619,18 @@ function projectIssueDescription(
   }
   for (const finding of reviewLoop?.lastReviewVerdict?.findings ?? []) {
     addUniqueText(description, finding);
+  }
+  for (const finding of reviewLoop?.lastReviewVerdict?.gateFindings ?? []) {
+    addUniqueText(description, finding.summary ?? null);
+    addUniqueText(description, finding.scenario ?? null);
+    addUniqueText(description, finding.contractAnchor ?? null);
+  }
+  for (const finding of reviewLoop?.lastReviewVerdict?.discoveryFindings ?? []) {
+    addUniqueText(description, finding.summary ?? null);
+    addUniqueText(description, finding.relationship ?? null);
+    addUniqueText(description, finding.suggestedDisposition ?? null);
+    addUniqueText(description, finding.discoveryReason ?? null);
+    for (const axis of finding.scenarioAxes ?? []) addUniqueText(description, axis);
   }
   if (details.latestRun.error) addUniqueText(description, details.latestRun.error);
   return description;

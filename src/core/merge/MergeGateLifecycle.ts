@@ -226,6 +226,8 @@ function scrubMergeGateVerdicts(verdicts: IssueReviewVerdictRecord[], gateId: st
           ...verdict,
           acceptanceResults: [],
           findings: [],
+          gateFindings: [],
+          discoveryFindings: [],
           evidence: [],
         }
       : verdict,

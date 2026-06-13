@@ -170,6 +170,49 @@ export interface ReviewVerdictAcceptanceResult {
   evidence: string | null;
 }
 
+export type ReviewGateScenarioEntitlement =
+  | "explicit_requirement"
+  | "named_acceptance_criterion"
+  | "named_validation_requirement"
+  | "necessary_core_behavior";
+
+export interface ReviewGateFindingRecord {
+  summary: string;
+  requirementIds: string[];
+  contractAnchor: string;
+  scenario: string;
+  scenarioEntitlement: ReviewGateScenarioEntitlement;
+  observedFailure: string;
+  currentIssueOwnership: string;
+  boundedRepair: string;
+  evidence: string[];
+}
+
+export type ReviewDiscoveryImportance = "critical" | "high" | "medium" | "low";
+export type ReviewDiscoveryRelationship =
+  | "implied_core"
+  | "adjacent_sibling"
+  | "hidden_matrix_axis"
+  | "sibling_issue_scope"
+  | "future_hardening"
+  | "out_of_scope";
+export type ReviewDiscoverySuggestedDisposition =
+  | "planner_decomposition"
+  | "followup_issue"
+  | "operator_decision"
+  | "ignore";
+
+export interface ReviewDiscoveryFindingRecord {
+  summary: string;
+  importance: ReviewDiscoveryImportance;
+  relationship: ReviewDiscoveryRelationship;
+  discoveryReason: string;
+  suggestedDisposition: ReviewDiscoverySuggestedDisposition;
+  scenarioAxes: string[];
+  evidence: string[];
+  ownerIssueIdentifier: string | null;
+}
+
 export interface IssueReviewVerdictRecord {
   id: string;
   idempotencyKey: string;
@@ -179,6 +222,8 @@ export interface IssueReviewVerdictRecord {
   verdict: IssueReviewVerdict;
   acceptanceResults: ReviewVerdictAcceptanceResult[];
   findings: string[];
+  gateFindings: ReviewGateFindingRecord[];
+  discoveryFindings: ReviewDiscoveryFindingRecord[];
   evidence: string[];
   reviewer: string | null;
   submittedAt: string;
@@ -406,6 +451,8 @@ export interface IssueReviewerOutputContract {
   runId: string;
   verdict: IssueReviewVerdict;
   findings: string[];
+  gateFindings: ReviewGateFindingRecord[];
+  discoveryFindings: ReviewDiscoveryFindingRecord[];
   acceptanceResults: ReviewVerdictAcceptanceResult[];
   evidence: string[];
   submittedAt: string;
@@ -922,6 +969,8 @@ function reviewerOutputFromVerdict(verdict: IssueReviewVerdictRecord | null): Is
     runId: verdict.runId,
     verdict: verdict.verdict,
     findings: verdict.findings.map((item) => clip(item)).slice(0, 10),
+    gateFindings: verdict.gateFindings.slice(0, 10),
+    discoveryFindings: verdict.discoveryFindings.slice(0, 10),
     acceptanceResults: verdict.acceptanceResults.slice(0, 20),
     evidence: verdict.evidence.map((item) => clip(item)).slice(0, 10),
     submittedAt: verdict.submittedAt,
@@ -1374,14 +1423,22 @@ function normalizeReviewerOutputContract(value: unknown, filePath: string): Issu
   if (verdict !== "pass" && verdict !== "fail") {
     throw corruptLifecycle(filePath, "handoff.lastReviewerOutput.verdict is invalid");
   }
+  const findings = requiredStringArray(value.findings, filePath, "handoff.lastReviewerOutput.findings");
+  const evidence = requiredStringArray(value.evidence, filePath, "handoff.lastReviewerOutput.evidence");
   return {
     version: 1,
     verdictId: requiredString(value.verdictId, filePath, "handoff.lastReviewerOutput.verdictId"),
     runId: requiredString(value.runId, filePath, "handoff.lastReviewerOutput.runId"),
     verdict,
-    findings: requiredStringArray(value.findings, filePath, "handoff.lastReviewerOutput.findings"),
+    findings,
+    gateFindings:
+      value.gateFindings === undefined
+        ? legacyGateFindingsFromFindings(findings, evidence)
+        : normalizeReviewGateFindings(value.gateFindings, filePath, 0),
+    discoveryFindings:
+      value.discoveryFindings === undefined ? [] : normalizeReviewDiscoveryFindings(value.discoveryFindings, filePath, 0),
     acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, 0),
-    evidence: requiredStringArray(value.evidence, filePath, "handoff.lastReviewerOutput.evidence"),
+    evidence,
     submittedAt: requiredString(value.submittedAt, filePath, "handoff.lastReviewerOutput.submittedAt"),
   };
 }
@@ -1459,6 +1516,16 @@ function normalizeReviewVerdict(value: unknown, filePath: string, index: number)
   if (value.verdict !== "pass" && value.verdict !== "fail") {
     throw corruptLifecycle(filePath, `reviewVerdicts[${index}].verdict is invalid`);
   }
+  const findings = requiredStringArray(value.findings, filePath, `reviewVerdicts[${index}].findings`);
+  const evidence = requiredStringArray(value.evidence, filePath, `reviewVerdicts[${index}].evidence`);
+  const gateFindings =
+    value.gateFindings === undefined
+      ? legacyGateFindingsFromFindings(findings, evidence)
+      : normalizeReviewGateFindings(value.gateFindings, filePath, index);
+  const discoveryFindings =
+    value.discoveryFindings === undefined
+      ? []
+      : normalizeReviewDiscoveryFindings(value.discoveryFindings, filePath, index);
   return {
     id: requiredString(value.id, filePath, `reviewVerdicts[${index}].id`),
     idempotencyKey: requiredString(value.idempotencyKey, filePath, `reviewVerdicts[${index}].idempotencyKey`),
@@ -1467,8 +1534,10 @@ function normalizeReviewVerdict(value: unknown, filePath: string, index: number)
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `reviewVerdicts[${index}].issueIdentifier`),
     verdict: value.verdict,
     acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, index),
-    findings: requiredStringArray(value.findings, filePath, `reviewVerdicts[${index}].findings`),
-    evidence: requiredStringArray(value.evidence, filePath, `reviewVerdicts[${index}].evidence`),
+    findings,
+    gateFindings,
+    discoveryFindings,
+    evidence,
     reviewer: nullableString(value.reviewer, filePath, `reviewVerdicts[${index}].reviewer`),
     submittedAt: requiredString(value.submittedAt, filePath, `reviewVerdicts[${index}].submittedAt`),
     writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, `reviewVerdicts[${index}].writebackOperationKeys`),
@@ -2069,6 +2138,180 @@ function normalizeReviewVerdictAcceptanceResults(
       ),
     };
   });
+}
+
+function normalizeReviewGateFindings(value: unknown, filePath: string, verdictIndex: number): ReviewGateFindingRecord[] {
+  if (!Array.isArray(value)) {
+    throw corruptLifecycle(filePath, `reviewVerdicts[${verdictIndex}].gateFindings is invalid`);
+  }
+  return value.map((item, itemIndex) => {
+    if (!isRecord(item)) {
+      throw corruptLifecycle(filePath, `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}] is invalid`);
+    }
+    const scenarioEntitlement = requiredString(
+      item.scenarioEntitlement,
+      filePath,
+      `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}].scenarioEntitlement`,
+    );
+    if (!isReviewGateScenarioEntitlement(scenarioEntitlement)) {
+      throw corruptLifecycle(
+        filePath,
+        `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}].scenarioEntitlement is invalid`,
+      );
+    }
+    return {
+      summary: requiredString(item.summary, filePath, `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}].summary`),
+      requirementIds: requiredStringArray(
+        item.requirementIds,
+        filePath,
+        `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}].requirementIds`,
+      ),
+      contractAnchor: requiredString(
+        item.contractAnchor,
+        filePath,
+        `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}].contractAnchor`,
+      ),
+      scenario: requiredString(item.scenario, filePath, `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}].scenario`),
+      scenarioEntitlement,
+      observedFailure: requiredString(
+        item.observedFailure,
+        filePath,
+        `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}].observedFailure`,
+      ),
+      currentIssueOwnership: requiredString(
+        item.currentIssueOwnership,
+        filePath,
+        `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}].currentIssueOwnership`,
+      ),
+      boundedRepair: requiredString(
+        item.boundedRepair,
+        filePath,
+        `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}].boundedRepair`,
+      ),
+      evidence: requiredStringArray(item.evidence, filePath, `reviewVerdicts[${verdictIndex}].gateFindings[${itemIndex}].evidence`),
+    };
+  });
+}
+
+function normalizeReviewDiscoveryFindings(
+  value: unknown,
+  filePath: string,
+  verdictIndex: number,
+): ReviewDiscoveryFindingRecord[] {
+  if (!Array.isArray(value)) {
+    throw corruptLifecycle(filePath, `reviewVerdicts[${verdictIndex}].discoveryFindings is invalid`);
+  }
+  return value.map((item, itemIndex) => {
+    if (!isRecord(item)) {
+      throw corruptLifecycle(filePath, `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}] is invalid`);
+    }
+    const importance = requiredString(
+      item.importance,
+      filePath,
+      `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].importance`,
+    );
+    if (!isReviewDiscoveryImportance(importance)) {
+      throw corruptLifecycle(
+        filePath,
+        `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].importance is invalid`,
+      );
+    }
+    const relationship = requiredString(
+      item.relationship,
+      filePath,
+      `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].relationship`,
+    );
+    if (!isReviewDiscoveryRelationship(relationship)) {
+      throw corruptLifecycle(
+        filePath,
+        `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].relationship is invalid`,
+      );
+    }
+    const suggestedDisposition = requiredString(
+      item.suggestedDisposition,
+      filePath,
+      `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].suggestedDisposition`,
+    );
+    if (!isReviewDiscoverySuggestedDisposition(suggestedDisposition)) {
+      throw corruptLifecycle(
+        filePath,
+        `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].suggestedDisposition is invalid`,
+      );
+    }
+    return {
+      summary: requiredString(item.summary, filePath, `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].summary`),
+      importance,
+      relationship,
+      discoveryReason: requiredString(
+        item.discoveryReason,
+        filePath,
+        `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].discoveryReason`,
+      ),
+      suggestedDisposition,
+      scenarioAxes: requiredStringArray(
+        item.scenarioAxes,
+        filePath,
+        `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].scenarioAxes`,
+      ),
+      evidence: requiredStringArray(
+        item.evidence,
+        filePath,
+        `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].evidence`,
+      ),
+      ownerIssueIdentifier: optionalNullableString(
+        item.ownerIssueIdentifier,
+        filePath,
+        `reviewVerdicts[${verdictIndex}].discoveryFindings[${itemIndex}].ownerIssueIdentifier`,
+      ),
+    };
+  });
+}
+
+function legacyGateFindingsFromFindings(findings: readonly string[], evidence: readonly string[]): ReviewGateFindingRecord[] {
+  return findings.map((finding) => ({
+    summary: finding,
+    requirementIds: [],
+    contractAnchor: "Legacy unstructured reviewer finding.",
+    scenario: "Legacy unstructured reviewer finding.",
+    scenarioEntitlement: "necessary_core_behavior",
+    observedFailure: finding,
+    currentIssueOwnership: "Legacy review verdict accepted before structured gate entitlement was recorded.",
+    boundedRepair: finding,
+    evidence: evidence.length === 0 ? ["Legacy review verdict did not include per-finding evidence."] : [...evidence],
+  }));
+}
+
+function isReviewGateScenarioEntitlement(value: string): value is ReviewGateScenarioEntitlement {
+  return (
+    value === "explicit_requirement" ||
+    value === "named_acceptance_criterion" ||
+    value === "named_validation_requirement" ||
+    value === "necessary_core_behavior"
+  );
+}
+
+function isReviewDiscoveryImportance(value: string): value is ReviewDiscoveryImportance {
+  return value === "critical" || value === "high" || value === "medium" || value === "low";
+}
+
+function isReviewDiscoveryRelationship(value: string): value is ReviewDiscoveryRelationship {
+  return (
+    value === "implied_core" ||
+    value === "adjacent_sibling" ||
+    value === "hidden_matrix_axis" ||
+    value === "sibling_issue_scope" ||
+    value === "future_hardening" ||
+    value === "out_of_scope"
+  );
+}
+
+function isReviewDiscoverySuggestedDisposition(value: string): value is ReviewDiscoverySuggestedDisposition {
+  return (
+    value === "planner_decomposition" ||
+    value === "followup_issue" ||
+    value === "operator_decision" ||
+    value === "ignore"
+  );
 }
 
 function normalizePullRequest(value: unknown, filePath: string, reportIndex: number): CompletionReportPullRequestRef | null {

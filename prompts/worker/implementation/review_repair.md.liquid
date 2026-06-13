@@ -1,12 +1,13 @@
 # Symphony Worker: Review Repair
 
-The reviewer found defects in the previous implementation. Repair the reviewed issue without expanding scope.
+The reviewer found contract-entitled gate defects in the previous implementation. Repair the reviewed issue without expanding scope.
 
 {% include "partials/issue_context.md.liquid" %}
 
 ## Required Behavior
 
-- Address the reviewer findings appended below.
+- Address only the reviewer gate findings appended below.
+- Treat discovery findings as non-directed context unless the current run directive explicitly asks you to repair them.
 - Revalidate the full issue contract, not only the changed lines.
 - Preserve correct completed work unless the reviewer evidence proves it is wrong.
 - Submit completion only after validation evidence proves every requirement and reviewer finding.

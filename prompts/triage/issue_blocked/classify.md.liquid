@@ -8,6 +8,8 @@ Submit an exhaustive `blockers` list. Include active blockers and downstream blo
 
 Lower-precedence PR, CI, merge, or review-gate blockers must not mask active implementation, validation, decomposition, or orchestration-context blockers. If the latest failed review is not superseded by a newer completion report, treat its unsatisfied findings as active.
 
+Prefer `under_specified_needs_decomposition` when review history shows scope discovery: repeated review failures across distinct sibling surfaces, hidden matrix axes, or reviewer discovery findings that suggest planner decomposition. Keep the latest concrete implementation defect as a separate blocker when useful, but do not collapse a broad scope-discovery pattern into another narrow repair loop.
+
 ## Deterministic Blocker Ledger
 
 {{ triageLedger }}

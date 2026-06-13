@@ -219,6 +219,8 @@ describe("FileIssueLifecycleStore", () => {
           verdict: "fail",
           acceptanceResults: [{ text: "Add doctor coverage", satisfied: false, evidence: "missing test" }],
           findings: ["Add doctor coverage for unsafe setting sources."],
+          gateFindings: [],
+          discoveryFindings: [],
           evidence: ["tests/doctor.test.ts"],
           reviewer: "agent:run",
           submittedAt: "2026-01-01T00:01:00.000Z",

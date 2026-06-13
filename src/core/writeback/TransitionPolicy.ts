@@ -5,6 +5,8 @@ import type {
   IssueReviewVerdictRecord,
   IssueTriageReportRecord,
   PullRequestReviewEvidenceItem,
+  ReviewDiscoveryFindingRecord,
+  ReviewGateFindingRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import type { Issue, Workspace } from "../types.js";
 import type { NewWritebackOperation } from "./WritebackOutbox.js";
@@ -27,6 +29,8 @@ export interface ReviewVerdictWritebackDetails {
   idempotencyKey: string;
   acceptanceResults: Array<{ text: string; satisfied: boolean; evidence: string | null }>;
   findings: string[];
+  gateFindings?: ReviewGateFindingRecord[];
+  discoveryFindings?: ReviewDiscoveryFindingRecord[];
   evidence: string[];
 }
 
@@ -431,7 +435,8 @@ export function planReviewFailWritebacks(
   if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
 
   const details = reviewVerdictDetailsFromInput(requestedRevisions);
-  const revisions = details.findings.map((revision) => revision.trim()).filter((revision) => revision.length > 0);
+  const gateFindings = reviewGateFindingsForDetails(details);
+  const revisions = gateFindings.map((finding) => finding.summary.trim()).filter((revision) => revision.length > 0);
   const eventKey = `${context.runId}:review-verdict-fail`;
   return [
     {
@@ -448,7 +453,7 @@ export function planReviewFailWritebacks(
           "Symphony review failed.",
           `Next state: ${config.writeback.dispatchState}`,
           "",
-          "Revision request:",
+          "Gate findings requiring worker repair:",
           "",
           ...(revisions.length === 0
             ? ["- Reviewer did not provide concrete requested revisions."]
@@ -964,7 +969,12 @@ function formatReviewVerdictSummary(verdict: IssueReviewVerdictRecord | null): s
     `- Verdict: ${verdict.verdict}`,
     `- Verdict record: ${verdict.id}`,
     `- Run: ${verdict.runId}`,
-    ...listOrFallback(verdict.findings, "No findings supplied.").map((item) => `- Finding ${item.slice(2)}`),
+    ...listOrFallback(verdict.gateFindings.map((finding) => finding.summary), "No gate findings supplied.").map(
+      (item) => `- Gate finding ${item.slice(2)}`,
+    ),
+    ...listOrFallback(verdict.discoveryFindings.map((finding) => finding.summary), "No discovery findings supplied.").map(
+      (item) => `- Discovery finding ${item.slice(2)}`,
+    ),
   ];
 }
 
@@ -974,14 +984,76 @@ function reviewVerdictDetailsFromInput(input: string[] | ReviewVerdictWritebackD
       idempotencyKey: "n/a",
       acceptanceResults: [],
       findings: input,
+      gateFindings: input.map((finding) => ({
+        summary: finding,
+        requirementIds: [],
+        contractAnchor: "Legacy unstructured reviewer finding.",
+        scenario: "Legacy unstructured reviewer finding.",
+        scenarioEntitlement: "necessary_core_behavior",
+        observedFailure: finding,
+        currentIssueOwnership: "Legacy review verdict accepted before structured gate entitlement was recorded.",
+        boundedRepair: finding,
+        evidence: ["Legacy review verdict did not include per-finding evidence."],
+      })),
+      discoveryFindings: [],
       evidence: [],
     };
   }
   return input;
 }
 
+function reviewGateFindingsForDetails(details: ReviewVerdictWritebackDetails): ReviewGateFindingRecord[] {
+  if (details.gateFindings !== undefined) return details.gateFindings;
+  return details.findings.map((finding) => ({
+    summary: finding,
+    requirementIds: [],
+    contractAnchor: "Legacy unstructured reviewer finding.",
+    scenario: "Legacy unstructured reviewer finding.",
+    scenarioEntitlement: "necessary_core_behavior",
+    observedFailure: finding,
+    currentIssueOwnership: "Legacy review verdict accepted before structured gate entitlement was recorded.",
+    boundedRepair: finding,
+    evidence: details.evidence.length === 0 ? ["Legacy review verdict did not include per-finding evidence."] : details.evidence,
+  }));
+}
+
+function formatGateFindingsForComment(findings: ReviewGateFindingRecord[]): string[] {
+  if (findings.length === 0) return ["- No gate findings supplied."];
+  return findings.flatMap((finding, index) => [
+    `- ${index + 1}. ${finding.summary}`,
+    `  - Requirement IDs: ${finding.requirementIds.length === 0 ? "n/a" : finding.requirementIds.join(", ")}`,
+    `  - Contract anchor: ${finding.contractAnchor}`,
+    `  - Scenario: ${finding.scenario}`,
+    `  - Entitlement: ${finding.scenarioEntitlement}`,
+    `  - Observed failure: ${finding.observedFailure}`,
+    `  - Current-issue ownership: ${finding.currentIssueOwnership}`,
+    `  - Bounded repair: ${finding.boundedRepair}`,
+    `  - Evidence: ${finding.evidence.join(" | ")}`,
+  ]);
+}
+
+function formatDiscoveryFindingsForComment(findings: ReviewDiscoveryFindingRecord[]): string[] {
+  if (findings.length === 0) return ["- None supplied."];
+  return findings.flatMap((finding, index) => [
+    `- ${index + 1}. ${finding.summary}`,
+    `  - Importance: ${finding.importance}`,
+    `  - Relationship: ${finding.relationship}`,
+    `  - Suggested disposition: ${finding.suggestedDisposition}`,
+    `  - Scenario axes: ${finding.scenarioAxes.length === 0 ? "n/a" : finding.scenarioAxes.join(", ")}`,
+    `  - Discovery reason: ${finding.discoveryReason}`,
+    `  - Owner issue: ${finding.ownerIssueIdentifier ?? "n/a"}`,
+    `  - Evidence: ${finding.evidence.join(" | ")}`,
+  ]);
+}
+
 function formatReviewVerdictDetails(details: ReviewVerdictWritebackDetails): string[] {
   return [
+    "",
+    "Gate findings:",
+    ...formatGateFindingsForComment(reviewGateFindingsForDetails(details)),
+    "",
+    "Discovery findings (not worker-gating):",
+    ...formatDiscoveryFindingsForComment(details.discoveryFindings ?? []),
     "",
     "Acceptance results:",
     ...(details.acceptanceResults.length === 0

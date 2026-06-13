@@ -136,7 +136,7 @@ describe("Orchestrator", () => {
 
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Review-cycle hardening:");
-    expect(harness.runs[0]?.prompt).toContain("address the underlying invariant");
+    expect(harness.runs[0]?.prompt).toContain("underlying contract invariant");
     expect(harness.runs[0]?.prompt).toContain("derive a conservative checklist");
     expect(harness.runs[0]?.prompt).toContain("issue-authoring gap");
     expect(harness.runs[0]?.prompt).not.toContain("Compact Symphony handoff packet:");
@@ -3004,6 +3004,7 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
       await waitFor(() => typeof orchestrator.snapshot().running[0]?.runId === "string", "worker run start");
       const runId = orchestrator.snapshot().running[0]?.runId ?? "";
+      await waitForRunRecord(runStore, runId);
       await lifecycleStore.ensureIssue(
         candidate,
         pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
@@ -4744,7 +4745,7 @@ describe("Orchestrator", () => {
       { role: "worker", runId: "smoke-worker-run-2" },
       { role: "reviewer", runId: "smoke-review-run-2" },
     ]);
-    expect(harness.runs[2]?.prompt).toContain("Reviewer findings to address");
+    expect(harness.runs[2]?.prompt).toContain("Reviewer gate findings to address");
     expect(harness.runs[2]?.prompt).toContain("Add the manufactured smoke revision.");
     expect(harness.runs[2]?.prompt).not.toContain("RAW_TRANSCRIPT_SECRET");
     expect(harness.runs[2]?.prompt.length).toBeLessThan(12_000);
@@ -5052,9 +5053,9 @@ describe("Orchestrator", () => {
     expect(prompt).toContain("Symphony service-owned review feedback workflow");
     expect(prompt).toContain("Do not run gh pr review");
     expect(prompt).toContain("direct GitHub API/curl writes");
-    expect(prompt).toContain("Before any fail verdict, perform a bounded sibling-risk sweep");
-    expect(prompt).toContain("Include every known blocking gap");
-    expect(prompt).toContain("required behavior, concrete evidence, expected validation");
+    expect(prompt).toContain("Before any fail verdict, classify every concern as either a gate finding or a discovery finding");
+    expect(prompt).toContain("Gate findings must be contract-entitled");
+    expect(prompt).toContain("Discovery findings are valuable backlog/decomposition evidence");
     expect(prompt).toContain("General software review matrix:");
     expect(prompt).toContain("Persistence/durability");
     expect(prompt).toContain("Project-specific reviewer extensions:");
@@ -5878,7 +5879,7 @@ describe("Orchestrator", () => {
     expect(pullRequestReviewClient.calls).toEqual([42]);
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Review-cycle hardening:");
-    expect(harness.runs[0]?.prompt).toContain("address the underlying invariant");
+    expect(harness.runs[0]?.prompt).toContain("underlying contract invariant");
     expect(harness.runs[0]?.prompt).toContain("General software change matrix:");
     expect(harness.runs[0]?.prompt).toContain("Project-specific worker extensions:");
     expect(harness.runs[0]?.prompt).toContain("Check project-specific publication replay.");
@@ -5996,7 +5997,7 @@ describe("Orchestrator", () => {
     expect(pullRequestReviewClient.calls).toEqual([42]);
     expect(prompt).toContain("Work on TEST-1");
     expect(prompt).not.toContain("PR review feedback to address before submitting another completion report:");
-    expect(prompt).not.toContain("Reviewer findings to address before submitting another completion report:");
+    expect(prompt).not.toContain("Reviewer gate findings to address before submitting another completion report:");
     expect(prompt).not.toContain("Reviewer verdict: fail / requested changes");
     expect(prompt).not.toContain("linear-linkback");
     expect(prompt).not.toContain("Linear linkback");
@@ -6163,7 +6164,7 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
-    expect(harness.runs[0]?.prompt).toContain("Reviewer findings to address");
+    expect(harness.runs[0]?.prompt).toContain("Reviewer gate findings to address");
     expect(harness.runs[0]?.prompt).toContain("Lifecycle counters:");
     expect(harness.runs[0]?.prompt).toContain("Reviewer failures: 0");
     expect(harness.runs[0]?.prompt).toContain("Latest workspace/git evidence:");
@@ -6209,6 +6210,8 @@ describe("Orchestrator", () => {
           verdict: "fail",
           acceptanceResults: [{ text: "Required checks pass", satisfied: false, evidence: "test failed" }],
           findings: ["Required check failed: test: failure"],
+          gateFindings: [],
+          discoveryFindings: [],
           evidence: ["Failing check: test: failure"],
           reviewer: "symphony-merge-gate",
           submittedAt: "2026-01-01T00:00:01.000Z",
@@ -6262,7 +6265,7 @@ describe("Orchestrator", () => {
 
     expect(harness.runs[0]?.prompt).toContain("## Symphony Merge Gate Repair");
     expect(harness.runs[0]?.prompt).toContain("test: failing / failure (https://ci.test/test)");
-    expect(harness.runs[0]?.prompt).not.toContain("Reviewer findings to address");
+    expect(harness.runs[0]?.prompt).not.toContain("Reviewer gate findings to address");
   });
 
   it("shows head-advanced guidance without old-head repair context after the current PR head advances", async () => {
@@ -6305,6 +6308,8 @@ describe("Orchestrator", () => {
           verdict: "fail",
           acceptanceResults: [{ text: "Required checks pass", satisfied: false, evidence: "test failed" }],
           findings: ["Required check failed: test: failure"],
+          gateFindings: [],
+          discoveryFindings: [],
           evidence: ["Failing check: test: failure"],
           reviewer: "symphony-merge-gate",
           submittedAt: "2026-01-01T00:00:01.000Z",
@@ -6319,6 +6324,8 @@ describe("Orchestrator", () => {
           verdict: "fail",
           acceptanceResults: [{ text: "Current head review finding is addressed", satisfied: false, evidence: "Missing regression test." }],
           findings: ["Add regression coverage for the current PR head."],
+          gateFindings: [],
+          discoveryFindings: [],
           evidence: ["https://github.com/acme/symphony/pull/42#discussion_current"],
           reviewer: "reviewer-1",
           submittedAt: "2026-01-01T00:00:02.000Z",
@@ -6382,7 +6389,7 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("## Symphony Merge Gate Head Advanced");
     expect(harness.runs[0]?.prompt).toContain("Current PR head SHA: head-sha-2");
     expect(harness.runs[0]?.prompt).toContain("normal review approval");
-    expect(harness.runs[0]?.prompt).toContain("Reviewer findings to address");
+    expect(harness.runs[0]?.prompt).toContain("Reviewer gate findings to address");
     expect(harness.runs[0]?.prompt).toContain("Add regression coverage for the current PR head.");
     expect(harness.runs[0]?.prompt).not.toContain("## Symphony Merge Gate Repair");
     expect(harness.runs[0]?.prompt).not.toContain("test: failing / failure (https://ci.test/test)");
@@ -7048,7 +7055,7 @@ describe("Orchestrator", () => {
     expect(harness.runs).toHaveLength(2);
     expect(harness.runs[1]?.prompt).toContain("Structured continuation brief:");
     expect(harness.runs[1]?.prompt).toContain("Review-cycle hardening:");
-    expect(harness.runs[1]?.prompt).toContain("address the underlying invariant");
+    expect(harness.runs[1]?.prompt).toContain("underlying contract invariant");
     expect(harness.runs[1]?.prompt).toContain("Check continuation-specific project invariants.");
     expect(harness.runs[1]?.prompt).toContain("Mode: summary");
     expect(harness.runs[1]?.prompt).toContain("Transcript/status pointers:");
@@ -7263,6 +7270,8 @@ function reviewVerdictRecord(candidate = issue()): IssueReviewVerdictRecord {
       },
     ],
     findings: ["Add regression coverage for duplicate verdict submissions."],
+    gateFindings: [],
+    discoveryFindings: [],
     evidence: ["https://github.com/acme/symphony/pull/42#discussion_r1"],
     reviewer: "reviewer-a",
     submittedAt: "2026-01-01T00:00:02Z",

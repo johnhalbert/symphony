@@ -105,7 +105,7 @@ import {
   type IssueTriageBlockerKind,
   type IssueTriageBlockerRecord,
 } from "../persistence/IssueLifecycleStore.js";
-import { MergePolicyService, type MergePolicyGitHubClient } from "../merge/MergePolicyService.js";
+import { isMergeGateVerdict, MergePolicyService, type MergePolicyGitHubClient } from "../merge/MergePolicyService.js";
 import { sanitizeStaleMergeGateLifecycle, staleMergeGateLifecyclePatch } from "../merge/MergeGateLifecycle.js";
 import {
   formatWorkerReviewEvidencePrompt,
@@ -509,7 +509,7 @@ Inspect only. Do not modify files, create commits, push branches, comment on Lin
 
 Use the linked GitHub pull request as the primary detailed review surface. Call the submit_pull_request_review_feedback MCP tool before any verdict submission to leave concrete feedback directly on the lifecycle-bound PR by submitting a GitHub PR review and/or posting PR review comments. A pass verdict requires a prior whole-PR review with kind "review" and event "APPROVE" in this reviewer run. Requested changes should use kind "review" with event "REQUEST_CHANGES" when PR feedback is submitted, and must point to the relevant files, lines, or threads on GitHub.
 
-After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence. Then call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" for requested changes and "pass" only when all acceptance criteria are satisfied. The MCP servers supply the active run, issue, and lifecycle-bound PR context; include runId, issueId, PR number, repository, token, or commit identity only if a tool explicitly asks for it.
+After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence. Then call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" only for contract-entitled gate findings and "pass" when all written acceptance criteria are satisfied, even if non-gating discovery findings remain. The MCP servers supply the active run, issue, and lifecycle-bound PR context; include runId, issueId, PR number, repository, token, or commit identity only if a tool explicitly asks for it.
 
 ${DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE}
 
@@ -519,7 +519,9 @@ ${PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER}
 
 Tool payload guidance:
 - acceptanceResults: one entry per acceptance criterion with satisfied true/false and concrete evidence.
-- findings: required for fail verdicts, empty for pass verdicts.
+- gateFindings: blocking contract defects only. A fail verdict requires at least one gate finding, and every gate finding must include requirementIds, contractAnchor, scenario, scenarioEntitlement, observedFailure, currentIssueOwnership, boundedRepair, and evidence.
+- discoveryFindings: non-gating discovered scope, adjacent sibling scenarios, hidden matrix axes, sibling issue scope, future hardening, or out-of-scope concerns. A pass verdict may include discovery findings.
+- findings: legacy compact summaries equal to gateFindings[].summary; empty for pass verdicts.
 - evidence: PR review/comment URLs or other durable review evidence.
 - idempotencyKey: a stable unique key for this reviewer verdict.
 
@@ -1796,9 +1798,11 @@ export class Orchestrator {
   private async hasPendingPublicationApprovalHandoff(entry: RunningEntry): Promise<boolean> {
     const store = this.options.lifecycleStore;
     const runId = entry.activeRunId ?? entry.runId;
-    if (!store || !runId) return false;
+    if (!store) return false;
     const lifecycle = await store.get(entry.issue.id);
-    const handoff = pendingPublicationHandoffForRun(lifecycle, { runId });
+    const handoff = runId
+      ? pendingPublicationHandoffForRun(lifecycle, { runId }) ?? pendingPublicationHandoffForRun(lifecycle)
+      : pendingPublicationHandoffForRun(lifecycle);
     if (!handoff) return false;
     entry.lifecycle = lifecycle;
     return true;
@@ -4695,6 +4699,7 @@ export class Orchestrator {
       "Blocker guidance:",
       "- Submit an exhaustive blockers array; do not choose a single most-specific disposition.",
       "- Use under_specified_needs_decomposition when hidden or under-specified scope should become smaller blocking child issues.",
+      "- Prefer under_specified_needs_decomposition when review history shows repeated sibling-scenario or hidden-matrix discovery under the same broad requirement.",
       "- Use implementation_unsatisfied_requirements when the latest review failure is active or worker behavior did not satisfy the issue contract.",
       "- Use pr_review_gate only for review approval gates; mark it downstream when a higher-precedence active blocker still needs work.",
       "- Lower-precedence PR, CI, merge, or review-gate blockers must not mask active implementation, validation, decomposition, or orchestration-context blockers.",
@@ -5765,8 +5770,10 @@ function activeDirectiveForRun(
       [
         "Latest review failure:",
         `- Review run: ${verdict.runId}`,
-        "Findings:",
-        ...verdict.findings.map((finding) => `- ${finding}`),
+        "Gate findings:",
+        ...formatDirectiveGateFindings(verdict),
+        "Discovery findings (not worker-gating):",
+        ...formatDirectiveDiscoveryFindings(verdict),
         "Unsatisfied acceptance results:",
         ...formatDirectiveAcceptanceGaps(verdict.acceptanceResults),
       ].join("\n"),
@@ -5814,6 +5821,7 @@ function issueTriageLedgerLines(
   } else {
     lines.push("- Merge gate signal: none recorded in lifecycle.");
   }
+  lines.push(...reviewScopeDiscoveryLedgerLines(lifecycle));
   lines.push("- Precedence rule: lower-precedence PR, CI, merge, or review-gate signals do not clear higher-precedence active blockers.");
   return lines;
 }
@@ -6006,6 +6014,65 @@ function formatDirectiveAcceptanceGaps(results: IssueReviewVerdictRecord["accept
   const gaps = results.filter((item) => !item.satisfied);
   if (gaps.length === 0) return ["- None"];
   return gaps.map((item) => `- ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`);
+}
+
+function formatDirectiveGateFindings(verdict: IssueReviewVerdictRecord): string[] {
+  const findings =
+    verdict.gateFindings.length === 0
+      ? verdict.findings.map((finding) => ({
+          summary: finding,
+          requirementIds: [] as string[],
+          scenario: "legacy unstructured finding",
+          scenarioEntitlement: "necessary_core_behavior",
+        }))
+      : verdict.gateFindings;
+  if (findings.length === 0) return ["- None"];
+  return findings.map(
+    (finding) =>
+      `- ${finding.summary} (requirements: ${finding.requirementIds.length === 0 ? "n/a" : finding.requirementIds.join(", ")}; scenario: ${finding.scenario}; entitlement: ${finding.scenarioEntitlement})`,
+  );
+}
+
+function formatDirectiveDiscoveryFindings(verdict: IssueReviewVerdictRecord): string[] {
+  if (verdict.discoveryFindings.length === 0) return ["- None"];
+  return verdict.discoveryFindings.map(
+    (finding) =>
+      `- ${finding.summary} (${finding.importance}, ${finding.relationship}, ${finding.suggestedDisposition}; axes: ${finding.scenarioAxes.length === 0 ? "n/a" : finding.scenarioAxes.join(", ")})`,
+  );
+}
+
+function reviewScopeDiscoveryLedgerLines(lifecycle: IssueLifecycleRecord): string[] {
+  const failedVerdicts = lifecycle.reviewVerdicts.filter((verdict) => !isMergeGateVerdict(verdict) && verdict.verdict === "fail");
+  const discoveryFindings = failedVerdicts.flatMap((verdict) => verdict.discoveryFindings);
+  const gateFindings = failedVerdicts.flatMap((verdict) => verdict.gateFindings);
+  const requirementIds = sortedUnique(gateFindings.flatMap((finding) => finding.requirementIds));
+  const gateScenarios = sortedUnique(gateFindings.map((finding) => finding.scenario));
+  const discoveryAxes = sortedUnique(discoveryFindings.flatMap((finding) => finding.scenarioAxes));
+  const decompositionDiscoveries = discoveryFindings.filter((finding) => finding.suggestedDisposition === "planner_decomposition");
+  const hiddenMatrixDiscoveries = discoveryFindings.filter((finding) => finding.relationship === "hidden_matrix_axis");
+  const lines = [
+    `- Review history: ${failedVerdicts.length} failed reviewer verdict(s), ${gateFindings.length} gate finding(s), ${discoveryFindings.length} discovery finding(s).`,
+  ];
+  if (requirementIds.length > 0) lines.push(`- Gate requirement IDs seen across review history: ${formatList(requirementIds)}`);
+  if (gateScenarios.length > 0) lines.push(`- Distinct gate scenarios seen across review history: ${formatList(gateScenarios.slice(0, 12))}`);
+  if (discoveryAxes.length > 0) lines.push(`- Distinct discovery scenario axes: ${formatList(discoveryAxes.slice(0, 12))}`);
+  if (decompositionDiscoveries.length > 0 || hiddenMatrixDiscoveries.length > 0) {
+    lines.push(
+      `- Scope-discovery signal: ${decompositionDiscoveries.length} planner-decomposition discover${decompositionDiscoveries.length === 1 ? "y" : "ies"} and ${hiddenMatrixDiscoveries.length} hidden-matrix discover${hiddenMatrixDiscoveries.length === 1 ? "y" : "ies"} recorded by reviewers.`,
+    );
+  }
+  if (failedVerdicts.length >= 2 && (gateScenarios.length >= 2 || discoveryAxes.length >= 2)) {
+    lines.push(
+      "- Deterministic scope-discovery pattern: repeated review failures cover distinct sibling scenarios or axes. Prefer under_specified_needs_decomposition when the issue contract did not explicitly enumerate this matrix.",
+    );
+  }
+  return lines;
+}
+
+function sortedUnique(values: readonly string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))].sort((left, right) =>
+    left.localeCompare(right),
+  );
 }
 
 function clipPromptBlock(value: string): string {

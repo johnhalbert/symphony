@@ -117,6 +117,8 @@ describe("CompletionReportService", () => {
           verdict: "pass",
           acceptanceResults: [{ text: "Head A reviewed", satisfied: true, evidence: "approved" }],
           findings: [],
+          gateFindings: [],
+          discoveryFindings: [],
           evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-1"],
           reviewer: "reviewer-1",
           submittedAt: "2026-01-01T00:00:01.000Z",

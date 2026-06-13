@@ -7,6 +7,8 @@ import type {
   IssueLifecycleRecord,
   IssueMergeGateState,
   IssueLifecycleStore,
+  ReviewDiscoveryFindingRecord,
+  ReviewGateFindingRecord,
   IssueReviewVerdictRecord,
   ReviewVerdictAcceptanceResult,
 } from "./persistence/IssueLifecycleStore.js";
@@ -28,6 +30,46 @@ const PASS_REQUIRES_APPROVE_MESSAGE =
 const FAIL_AFTER_APPROVE_MESSAGE =
   "Fail review verdict cannot follow APPROVE review feedback in the same reviewer run; submit a pass verdict or start a fresh review run.";
 
+const REVIEW_GATE_SCENARIO_ENTITLEMENTS = [
+  "explicit_requirement",
+  "named_acceptance_criterion",
+  "named_validation_requirement",
+  "necessary_core_behavior",
+] as const;
+const REVIEW_DISCOVERY_IMPORTANCE = ["critical", "high", "medium", "low"] as const;
+const REVIEW_DISCOVERY_RELATIONSHIPS = [
+  "implied_core",
+  "adjacent_sibling",
+  "hidden_matrix_axis",
+  "sibling_issue_scope",
+  "future_hardening",
+  "out_of_scope",
+] as const;
+const REVIEW_DISCOVERY_DISPOSITIONS = ["planner_decomposition", "followup_issue", "operator_decision", "ignore"] as const;
+
+const reviewGateFindingSchema = z.object({
+  summary: z.string().trim().min(1),
+  requirementIds: z.array(z.string().trim().min(1)).default([]),
+  contractAnchor: z.string().trim().min(1),
+  scenario: z.string().trim().min(1),
+  scenarioEntitlement: z.enum(REVIEW_GATE_SCENARIO_ENTITLEMENTS),
+  observedFailure: z.string().trim().min(1),
+  currentIssueOwnership: z.string().trim().min(1),
+  boundedRepair: z.string().trim().min(1),
+  evidence: z.array(z.string().trim().min(1)).min(1),
+});
+
+const reviewDiscoveryFindingSchema = z.object({
+  summary: z.string().trim().min(1),
+  importance: z.enum(REVIEW_DISCOVERY_IMPORTANCE),
+  relationship: z.enum(REVIEW_DISCOVERY_RELATIONSHIPS),
+  discoveryReason: z.string().trim().min(1),
+  suggestedDisposition: z.enum(REVIEW_DISCOVERY_DISPOSITIONS),
+  scenarioAxes: z.array(z.string().trim().min(1)).default([]),
+  evidence: z.array(z.string().trim().min(1)).min(1),
+  ownerIssueIdentifier: z.string().trim().min(1).nullable().optional(),
+});
+
 const reviewVerdictSchema = z.object({
   runId: z.string().trim().min(1),
   issueId: z.string().trim().min(1),
@@ -41,7 +83,9 @@ const reviewVerdictSchema = z.object({
       }),
     )
     .min(1),
-  findings: z.array(z.string().trim().min(1)),
+  findings: z.array(z.string().trim().min(1)).optional().default([]),
+  gateFindings: z.array(reviewGateFindingSchema).optional(),
+  discoveryFindings: z.array(reviewDiscoveryFindingSchema).optional().default([]),
   evidence: z.array(z.string().trim().min(1)).min(1),
   idempotencyKey: z.string().trim().min(1),
 });
@@ -97,13 +141,18 @@ export class ReviewVerdictService {
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
     this.validateIssueIsAcceptingVerdicts(context, lifecyclePhase);
     this.validateVerdictPayload(verdict);
+    const gateFindings = normalizeReviewGateFindings(verdict);
+    const discoveryFindings = normalizeReviewDiscoveryFindings(verdict.discoveryFindings);
+    const storedFindings = gateFindings.map((finding) => finding.summary);
 
     const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, { phase: lifecyclePhase });
     this.validateReviewFeedbackAlignment(verdict, lifecycle);
     const writebackDetails = {
       idempotencyKey: verdict.idempotencyKey,
       acceptanceResults: normalizeAcceptanceResults(verdict.acceptanceResults),
-      findings: verdict.findings,
+      findings: storedFindings,
+      gateFindings,
+      discoveryFindings,
       evidence: verdict.evidence,
     };
     const reviewRound = verdict.verdict === "fail" ? nextReviewRound(lifecycle) : lifecycle.reviewRound;
@@ -118,7 +167,9 @@ export class ReviewVerdictService {
       issueIdentifier: context.issue.identifier,
       verdict: verdict.verdict,
       acceptanceResults: normalizeAcceptanceResults(verdict.acceptanceResults),
-      findings: verdict.findings,
+      findings: storedFindings,
+      gateFindings,
+      discoveryFindings,
       evidence: verdict.evidence,
       reviewer: context.reviewer ?? null,
       submittedAt: new Date().toISOString(),
@@ -198,8 +249,12 @@ export class ReviewVerdictService {
   }
 
   private validateVerdictPayload(verdict: ReviewVerdictInput): void {
-    if (verdict.verdict === "fail" && verdict.findings.length === 0) {
-      throw new SymphonyError("invalid_request", "Fail review verdicts require at least one finding");
+    const gateFindings = normalizeReviewGateFindings(verdict);
+    if (verdict.verdict === "fail" && gateFindings.length === 0) {
+      throw new SymphonyError("invalid_request", "Fail review verdicts require at least one gate finding or legacy finding");
+    }
+    if (verdict.verdict === "pass" && gateFindings.length > 0) {
+      throw new SymphonyError("invalid_request", "Pass review verdicts cannot include gate findings");
     }
   }
 
@@ -226,7 +281,7 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
   const latestReport = latestCompletionReport(lifecycle);
   return [
     "",
-    "Reviewer findings to address before submitting another completion report:",
+    "Reviewer gate findings to address before submitting another completion report:",
     "Reviewer verdict: fail / requested changes",
     `Review run: ${verdict.runId}`,
     "",
@@ -250,8 +305,11 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
       (item) => `- ${item.satisfied ? "[x]" : "[ ]"} ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`,
     ),
     "",
-    "Findings:",
-    ...verdict.findings.map((finding) => `- ${finding}`),
+    "Gate findings:",
+    ...formatGateFindingsForWorker(verdict),
+    "",
+    "Discovery findings (non-directed context; do not repair unless a current directive explicitly asks for them):",
+    ...formatDiscoveryFindingsForWorker(verdict.discoveryFindings),
     "",
     "Evidence:",
     ...verdict.evidence.map((item) => `- ${item}`),
@@ -325,6 +383,46 @@ function parseReviewVerdict(input: unknown): ReviewVerdictInput {
     throw new SymphonyError("invalid_request", "Review verdict is invalid", parsed.error.flatten());
   }
   return parsed.data;
+}
+
+function normalizeReviewGateFindings(verdict: ReviewVerdictInput): ReviewGateFindingRecord[] {
+  if (verdict.gateFindings !== undefined) {
+    return verdict.gateFindings.map((finding) => ({
+      summary: finding.summary,
+      requirementIds: [...finding.requirementIds],
+      contractAnchor: finding.contractAnchor,
+      scenario: finding.scenario,
+      scenarioEntitlement: finding.scenarioEntitlement,
+      observedFailure: finding.observedFailure,
+      currentIssueOwnership: finding.currentIssueOwnership,
+      boundedRepair: finding.boundedRepair,
+      evidence: [...finding.evidence],
+    }));
+  }
+  return verdict.findings.map((finding) => ({
+    summary: finding,
+    requirementIds: [],
+    contractAnchor: "Legacy unstructured reviewer finding.",
+    scenario: "Legacy unstructured reviewer finding.",
+    scenarioEntitlement: "necessary_core_behavior",
+    observedFailure: finding,
+    currentIssueOwnership: "Legacy review verdict accepted before structured gate entitlement was recorded.",
+    boundedRepair: finding,
+    evidence: verdict.evidence.length === 0 ? ["Legacy review verdict did not include per-finding evidence."] : [...verdict.evidence],
+  }));
+}
+
+function normalizeReviewDiscoveryFindings(findings: ReviewVerdictInput["discoveryFindings"]): ReviewDiscoveryFindingRecord[] {
+  return findings.map((finding) => ({
+    summary: finding.summary,
+    importance: finding.importance,
+    relationship: finding.relationship,
+    discoveryReason: finding.discoveryReason,
+    suggestedDisposition: finding.suggestedDisposition,
+    scenarioAxes: [...finding.scenarioAxes],
+    evidence: [...finding.evidence],
+    ownerIssueIdentifier: finding.ownerIssueIdentifier ?? null,
+  }));
 }
 
 function normalizeAcceptanceResults(items: ReviewVerdictInput["acceptanceResults"]): ReviewVerdictAcceptanceResult[] {
@@ -498,6 +596,52 @@ function formatAcceptanceGaps(results: ReviewVerdictAcceptanceResult[]): string[
   const gaps = results.filter((item) => !item.satisfied);
   if (gaps.length === 0) return ["- No explicit acceptance criteria gaps were recorded."];
   return gaps.map((item) => `- ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`);
+}
+
+function formatGateFindingsForWorker(verdict: IssueReviewVerdictRecord): string[] {
+  const findings =
+    verdict.gateFindings.length > 0
+      ? verdict.gateFindings
+      : legacyGateFindingsFromFindings(verdict.findings, verdict.evidence);
+  if (findings.length === 0) return ["- No structured gate findings were recorded."];
+  return findings.flatMap((finding, index) => [
+    `- ${index + 1}. ${finding.summary}`,
+    `  Requirement IDs: ${finding.requirementIds.length === 0 ? "n/a" : finding.requirementIds.join(", ")}`,
+    `  Contract anchor: ${finding.contractAnchor}`,
+    `  Scenario: ${finding.scenario}`,
+    `  Entitlement: ${finding.scenarioEntitlement}`,
+    `  Observed failure: ${finding.observedFailure}`,
+    `  Current-issue ownership: ${finding.currentIssueOwnership}`,
+    `  Bounded repair: ${finding.boundedRepair}`,
+    `  Evidence: ${finding.evidence.join(" | ")}`,
+  ]);
+}
+
+function legacyGateFindingsFromFindings(findings: readonly string[], evidence: readonly string[]): ReviewGateFindingRecord[] {
+  return findings.map((finding) => ({
+    summary: finding,
+    requirementIds: [],
+    contractAnchor: "Legacy unstructured reviewer finding.",
+    scenario: "Legacy unstructured reviewer finding.",
+    scenarioEntitlement: "necessary_core_behavior",
+    observedFailure: finding,
+    currentIssueOwnership: "Legacy review verdict accepted before structured gate entitlement was recorded.",
+    boundedRepair: finding,
+    evidence: evidence.length === 0 ? ["Legacy review verdict did not include per-finding evidence."] : [...evidence],
+  }));
+}
+
+function formatDiscoveryFindingsForWorker(findings: ReviewDiscoveryFindingRecord[]): string[] {
+  if (findings.length === 0) return ["- None recorded."];
+  return findings.flatMap((finding, index) => [
+    `- ${index + 1}. ${finding.summary}`,
+    `  Importance: ${finding.importance}`,
+    `  Relationship: ${finding.relationship}`,
+    `  Suggested disposition: ${finding.suggestedDisposition}`,
+    `  Scenario axes: ${finding.scenarioAxes.length === 0 ? "n/a" : finding.scenarioAxes.join(", ")}`,
+    `  Discovery reason: ${finding.discoveryReason}`,
+    `  Owner issue: ${finding.ownerIssueIdentifier ?? "n/a"}`,
+  ]);
 }
 
 function sameStateIn(state: string, states: string[]): boolean {

@@ -140,7 +140,8 @@ describe("TransitionPolicy review-loop planners", () => {
       },
     });
     expect(commentBody(operations, 0)).toContain("## Symphony Review Verdict: Fail");
-    expect(commentBody(operations, 0)).toContain("Revision request:");
+    expect(commentBody(operations, 0)).toContain("Gate findings requiring worker repair:");
+    expect(commentBody(operations, 0)).toContain("Discovery findings (not worker-gating):");
     expect(commentBody(operations, 0)).toContain("- Add tests for the blocked fallback.");
     expect(commentBody(operations, 0)).toContain("- Clarify idempotency keys.");
     expect(commentBody(operations, 0)).toContain("PR review evidence:");

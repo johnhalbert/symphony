@@ -105,11 +105,12 @@ function reviewVerdictInputSchema(): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["verdict", "acceptanceResults", "findings", "evidence", "idempotencyKey"],
+    required: ["verdict", "acceptanceResults", "findings", "gateFindings", "discoveryFindings", "evidence", "idempotencyKey"],
     properties: {
       verdict: {
         enum: ["pass", "fail"],
-        description: "Use fail for requested changes and pass only when all acceptance criteria are satisfied.",
+        description:
+          "Use fail only when at least one contract-entitled gate finding remains; pass is allowed with discovery findings when no gate findings remain.",
       },
       acceptanceResults: {
         type: "array",
@@ -131,8 +132,73 @@ function reviewVerdictInputSchema(): Record<string, unknown> {
       },
       findings: {
         type: "array",
-        description: "Concrete requested changes for fail verdicts; use an empty array for pass verdicts.",
+        description:
+          "Legacy compact gate-finding summaries. For structured submissions, this should equal gateFindings[].summary; use an empty array for pass verdicts.",
         items: { type: "string", minLength: 1 },
+      },
+      gateFindings: {
+        type: "array",
+        description:
+          "Blocking contract defects that are allowed to gate the worker. A fail verdict requires at least one item; a pass verdict requires none.",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: [
+            "summary",
+            "requirementIds",
+            "contractAnchor",
+            "scenario",
+            "scenarioEntitlement",
+            "observedFailure",
+            "currentIssueOwnership",
+            "boundedRepair",
+            "evidence",
+          ],
+          properties: {
+            summary: { type: "string", minLength: 1 },
+            requirementIds: { type: "array", items: { type: "string", minLength: 1 } },
+            contractAnchor: { type: "string", minLength: 1 },
+            scenario: { type: "string", minLength: 1 },
+            scenarioEntitlement: {
+              enum: ["explicit_requirement", "named_acceptance_criterion", "named_validation_requirement", "necessary_core_behavior"],
+            },
+            observedFailure: { type: "string", minLength: 1 },
+            currentIssueOwnership: { type: "string", minLength: 1 },
+            boundedRepair: { type: "string", minLength: 1 },
+            evidence: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+          },
+        },
+      },
+      discoveryFindings: {
+        type: "array",
+        description:
+          "Non-gating discovered scope, adjacent scenarios, hidden matrix axes, sibling issue scope, or future hardening. These do not by themselves make the verdict fail.",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: [
+            "summary",
+            "importance",
+            "relationship",
+            "discoveryReason",
+            "suggestedDisposition",
+            "scenarioAxes",
+            "evidence",
+            "ownerIssueIdentifier",
+          ],
+          properties: {
+            summary: { type: "string", minLength: 1 },
+            importance: { enum: ["critical", "high", "medium", "low"] },
+            relationship: {
+              enum: ["implied_core", "adjacent_sibling", "hidden_matrix_axis", "sibling_issue_scope", "future_hardening", "out_of_scope"],
+            },
+            discoveryReason: { type: "string", minLength: 1 },
+            suggestedDisposition: { enum: ["planner_decomposition", "followup_issue", "operator_decision", "ignore"] },
+            scenarioAxes: { type: "array", items: { type: "string", minLength: 1 } },
+            evidence: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+            ownerIssueIdentifier: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
+          },
+        },
       },
       evidence: {
         type: "array",
