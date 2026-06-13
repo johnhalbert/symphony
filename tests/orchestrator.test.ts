@@ -146,6 +146,13 @@ function addDocsPollingProjectContext(config: ReturnType<typeof testConfig>): vo
   (config.projectContexts.byId as unknown as Map<string, typeof docsContext>).set(docsContext.id, docsContext);
 }
 
+function requireDocsPollingContext(config: ReturnType<typeof testConfig>) {
+  const docsContext = config.projectContexts.byId.get(docsProjectContext.projectContextId);
+  expect(docsContext).toBeDefined();
+  if (!docsContext) throw new Error("Expected docs project context in orchestrator test fixture");
+  return docsContext;
+}
+
 describe("Orchestrator", () => {
   let root: string;
 
@@ -964,6 +971,190 @@ const docsProjectContext = {
     expect(harness.runs.filter((run) => run.ctx.runPhase === "implementation")).toHaveLength(0);
     expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("not_requested");
     expect(lifecycle?.issueBreakdownPlans[0]?.createdIssueRefs).toEqual([]);
+  }, 10_000);
+
+  it("uses resolved project-context issue breakdown planning config during automatic polling", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = false;
+    config.issueBreakdown.promptTemplate = "Default planning prompt for {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.issueBreakdown.enabled = true;
+    docsContext.issueBreakdown.planningLabels = ["docs-planning"];
+    docsContext.issueBreakdown.promptTemplate = "Docs planning prompt for {{ issue.identifier }}";
+    docsContext.issueBreakdown.cursorMode = "plan";
+    const candidate = trackerIssue({
+      id: "issue-docs-plan-routing-1",
+      identifier: "DOCS-PLAN-1",
+      state: "Todo",
+      labels: ["docs-planning"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    const defaultTracker = trackerClientFixture();
+    const docsTracker = trackerClientFixture({
+      candidates: [candidate],
+      issues: [candidate],
+    });
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    expect(defaultTracker.candidateFetchCount).toBe(1);
+    expect(docsTracker.candidateFetchCount).toBe(1);
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(docsTracker.requestedIds.length).toBeGreaterThanOrEqual(1);
+    expect(docsTracker.requestedIds.every((issueIds) => issueIds.length === 1 && issueIds[0] === candidate.id)).toBe(true);
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(docsProjectContext);
+    expect(harness.runs[0]?.ctx.config.issueBreakdown.enabled).toBe(true);
+    expect(harness.runs[0]?.ctx.config.issueBreakdown.planningLabels).toEqual(["docs-planning"]);
+    expect(harness.runs[0]?.ctx.runModeOverride).toBe("plan");
+    expect(harness.runs[0]?.prompt).toContain("Docs planning prompt for DOCS-PLAN-1");
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+    });
+  }, 10_000);
+
+  it("uses resolved project-context fresh-plan and apply-to-linear config during automatic polling", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.promptTemplate = "Default planning prompt for {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.issueBreakdown.enabled = true;
+    docsContext.issueBreakdown.applyToLinear.enabled = false;
+    docsContext.issueBreakdown.planningLabels = ["docs-planning"];
+    docsContext.issueBreakdown.promptTemplate = "Docs planning prompt for {{ issue.identifier }}";
+    docsContext.issueBreakdown.cursorMode = "plan";
+    const candidate = trackerIssue({
+      id: "issue-docs-plan-routing-2",
+      identifier: "DOCS-PLAN-2",
+      state: "Todo",
+      labels: ["docs-planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    let currentState = "Todo";
+    let updatedAt = "2026-01-02T00:00:00Z";
+    const defaultTracker = trackerClientFixture();
+    const docsTrackerStats = {
+      candidateFetchCount: 0,
+      requestedIds: [] as string[][],
+    };
+    const docsTracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        docsTrackerStats.candidateFetchCount += 1;
+        return [{ ...candidate, state: currentState, updatedAt }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        docsTrackerStats.requestedIds.push([...issueIds]);
+        return issueIds.includes(candidate.id) ? [{ ...candidate, state: currentState, updatedAt }] : [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+      updatedAt = "2026-01-02T00:01:00Z";
+    });
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await waitForAsync(
+      async () => ((await lifecycleStore.get(candidate.id))?.issueBreakdownPlans.length ?? 0) === 1,
+      "persisted docs issue breakdown plan",
+    );
+    await settleOrchestratorExit();
+    await waitForAsync(async () => {
+      await orchestrator.refreshNow();
+      return harness.runs.length === 2;
+    }, "docs implementation dispatch after accepted plan", 5_000);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(docsTrackerStats.candidateFetchCount).toBeGreaterThanOrEqual(2);
+    expect(docsTrackerStats.requestedIds.length).toBeGreaterThanOrEqual(2);
+    expect(docsTrackerStats.requestedIds.every((issueIds) => issueIds.length === 1 && issueIds[0] === candidate.id)).toBe(true);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.issueCreates).toEqual([]);
+    expect(harness.runs.map((run) => run.ctx.runPhase)).toEqual(["issue_breakdown", "implementation"]);
+    expect(harness.runs[0]?.ctx.config.issueBreakdown.planningLabels).toEqual(["docs-planning"]);
+    expect(harness.runs[0]?.prompt).toContain("Docs planning prompt for DOCS-PLAN-2");
+    expect(harness.runs[1]?.ctx.projectContext).toMatchObject(docsProjectContext);
+    expect(harness.runs[1]?.ctx.config.issueBreakdown.applyToLinear.enabled).toBe(false);
+    expect(harness.runs[1]?.prompt).toContain("Issue breakdown plan:");
+    expect(harness.runs[1]?.prompt).toContain("Create implementation task");
+    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "issue_breakdown" })).resolves.toMatchObject({
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+      projectContext: docsProjectContext,
+    });
+    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "implementation" })).resolves.toMatchObject({
+      runPhase: "implementation",
+      runKind: "implementation",
+      projectContext: docsProjectContext,
+    });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+      issueBreakdownPlans: [
+        expect.objectContaining({
+          applicationStatus: "not_requested",
+        }),
+      ],
+    });
   }, 10_000);
 
   it("startup processDue skips superseded issue breakdown children, relations, and comments", async () => {

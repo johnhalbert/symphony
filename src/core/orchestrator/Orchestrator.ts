@@ -1791,13 +1791,14 @@ export class Orchestrator {
 
   private async resolveWorkerDispatchDecision(issue: Issue): Promise<WorkerDispatchDecision> {
     if (this.isMergeConflictState(issue.state)) return { action: "dispatch", runPhase: "merge_conflict_resolution" };
-    if (!this.config.issueBreakdown.enabled) return { action: "dispatch", runPhase: "implementation" };
-    if (!this.passesIssueBreakdownRouting(issue)) return { action: "dispatch", runPhase: "implementation" };
+    const config = this.configForProjectContext(this.requestedProjectContextForIssue(issue));
+    if (!config.issueBreakdown.enabled) return { action: "dispatch", runPhase: "implementation" };
+    if (!this.passesIssueBreakdownRouting(issue, config)) return { action: "dispatch", runPhase: "implementation" };
     if (!this.options.lifecycleStore) return { action: "skip", reason: "planning_required_no_lifecycle_store" };
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
-    const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, this.config);
+    const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, config);
     if (plan === null) return { action: "dispatch", runPhase: "issue_breakdown" };
-    if (this.config.issueBreakdown.applyToLinear.enabled) {
+    if (config.issueBreakdown.applyToLinear.enabled) {
       return {
         action: "skip",
         reason:
@@ -1814,10 +1815,10 @@ export class Orchestrator {
     };
   }
 
-  private passesIssueBreakdownRouting(issue: Issue): boolean {
-    if (this.config.issueBreakdown.planningLabels.length === 0) return false;
+  private passesIssueBreakdownRouting(issue: Issue, config: ServiceConfig): boolean {
+    if (config.issueBreakdown.planningLabels.length === 0) return false;
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
-    return this.config.issueBreakdown.planningLabels.some((label) => labels.has(label));
+    return config.issueBreakdown.planningLabels.some((label) => labels.has(label));
   }
 
   private isMergeConflictState(_state: string): boolean {
@@ -3807,15 +3808,16 @@ export class Orchestrator {
   }
 
   private async loadIssueBreakdownPlanPrompt(entry: RunningEntry): Promise<string | null> {
-    if (!this.config.issueBreakdown.enabled) return null;
+    const config = this.configForProjectContext(this.resolvedProjectContext(entry));
+    if (!config.issueBreakdown.enabled) return null;
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
-    const plan = latestFreshIssueBreakdownPlan(lifecycle, entry.issue, this.config);
+    const plan = latestFreshIssueBreakdownPlan(lifecycle, entry.issue, config);
     if (plan === null) return null;
     return [
       "",
       "Issue breakdown plan:",
       `- Source: ${plan.id}; accepted at ${plan.acceptedAt}`,
-      `- Runtime mode: ${plan.cursorMode ?? this.config.issueBreakdown.cursorMode}`,
+      `- Runtime mode: ${plan.cursorMode ?? config.issueBreakdown.cursorMode}`,
       `- Transcript pointers: ${formatList(plan.transcriptPointers)}`,
       `- Status pointers: ${formatList(plan.statusApiPointers)}`,
       "",
