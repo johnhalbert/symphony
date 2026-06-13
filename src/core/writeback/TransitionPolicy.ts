@@ -150,13 +150,18 @@ export interface PublicationApprovalActionDetails {
   title: string;
 }
 
-export function planDispatchWriteback(issue: Issue, config: ServiceConfig): NewWritebackOperation | null {
+export function planDispatchWriteback(
+  issue: Issue,
+  config: ServiceConfig,
+  projectContext?: ProjectContextResolution,
+): NewWritebackOperation | null {
   if (!config.writeback.enabled || !sameName(issue.state, "Todo")) return null;
   const dispatchStateVersion = safeKeySegment(issue.updatedAt ?? issue.createdAt ?? issue.state);
   return {
     idempotencyKey: `transition:${issue.id}:dispatch:${dispatchStateVersion}:${config.writeback.dispatchState}`,
     kind: "transition",
     issueId: issue.id,
+    projectContext,
     payload: {
       fromStates: ["Todo"],
       toState: config.writeback.dispatchState,

@@ -5068,7 +5068,7 @@ const docsProjectContext = {
     });
   }, 15_000);
 
-  it("dispatches reviewer runs from configured review states with reviewer evidence", async () => {
+  it("dispatches reviewer runs from resolved project-context review states with reviewer evidence", async () => {
     const config = testConfig(root);
     config.tracker.handoffStates = ["In Review"];
     config.reviewLoop.reviewStates = ["In Review"];
@@ -5076,10 +5076,12 @@ const docsProjectContext = {
       "Review {{ issue.identifier }} as {{ role }}: {{ completionReport.summary }}\n{% for item in workspaceEvidence %}{{ item }}\n{% endfor %}{% for item in runDigest %}{{ item }}\n{% endfor %}";
     config.reviewLoop.reviewerPromptExtensions = ["Custom project reviewer extension."];
     addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.reviewLoop.reviewStates = ["Docs Review"];
     const candidate = trackerIssue({
       id: "issue-review-docs-1",
       identifier: "TEST-1",
-      state: "In Review",
+      state: "Docs Review",
       branchName: "symphony/docs/TEST-1",
       projectContextId: docsProjectContext.projectContextId,
       projectContextLabel: docsProjectContext.projectContextLabel,
@@ -5149,12 +5151,14 @@ const docsProjectContext = {
     await waitFor(() => harness.runs.length === 1, "reviewer dispatch");
     await orchestrator.stop();
 
+    expect(defaultTracker.requestedStates).toEqual([["In Review"]]);
     expect(defaultTracker.requestedIds).toEqual([]);
-    expect(docsTracker.requestedStates).toEqual([["In Review"]]);
+    expect(docsTracker.requestedStates).toEqual([["Docs Review"]]);
     expect(docsTracker.requestedIds).toEqual([[candidate.id]]);
     expect(harness.runs).toHaveLength(1);
     expect(harness.runs[0]?.ctx.role).toBe("reviewer");
     expect(harness.runs[0]?.ctx.projectContext).toMatchObject(docsProjectContext);
+    expect(harness.runs[0]?.ctx.config.reviewLoop.reviewStates).toEqual(["Docs Review"]);
     expect(harness.runs[0]?.prompt).toContain("Review TEST-1 as reviewer");
     expect(harness.runs[0]?.prompt).toContain("Implemented the requested change.");
     expect(harness.runs[0]?.prompt).toContain("Pull request: https://github.com/acme/symphony/pull/42");

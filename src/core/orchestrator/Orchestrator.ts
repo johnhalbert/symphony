@@ -1116,6 +1116,14 @@ export class Orchestrator {
     return requestedProjectContext ?? projectContextResolutionFromIssue(issue) ?? undefined;
   }
 
+  private serviceConfigForIssue(issue: Issue, requestedProjectContext?: ProjectContextResolution): ServiceConfig {
+    return this.configForProjectContext(this.requestedProjectContextForIssue(issue, requestedProjectContext));
+  }
+
+  private serviceConfigForEntry(entry: RunningEntry): ServiceConfig {
+    return this.configForProjectContext(this.resolvedProjectContext(entry) ?? undefined);
+  }
+
   private comparableProjectContextId(projectContext?: ProjectContextResolution | null): string | null {
     if (!projectContext) return null;
     const normalizedProjectContextId = normalizeProjectContextId(projectContext.projectContextId);
@@ -1356,7 +1364,10 @@ export class Orchestrator {
         await this.tryDispatchWorkerIssue(issue, null);
       }
       const reviewerCandidates = await this.fetchPollingIssues((projectContext) =>
-        this.fetchIssuesByStatesForProjectContext(this.config.reviewLoop.reviewStates, projectContext),
+        this.fetchIssuesByStatesForProjectContext(
+          this.configForProjectContext(projectContext).reviewLoop.reviewStates,
+          projectContext,
+        ),
       );
       for (const issue of sortIssuesForDispatch(reviewerCandidates)) {
         if (this.availableSlots() <= 0) break;
@@ -1490,21 +1501,22 @@ export class Orchestrator {
       const latest = refreshedById.get(issueId);
       if (!latest) continue;
       entry.issue = latest;
+      const config = this.serviceConfigForEntry(entry);
       const preservePendingApprovalWorker =
         entry.role === "worker" && (await this.hasPendingPublicationApprovalHandoff(entry));
-      if (isStateIn(latest.state, this.config.tracker.terminalStates)) {
+      if (isStateIn(latest.state, config.tracker.terminalStates)) {
         await this.terminateRunningIssue(issueId, true, "terminal state");
       } else if (preservePendingApprovalWorker) {
         entry.lastMessage = "Awaiting operator approval for push/PR";
-      } else if (entry.role === "worker" && isStateIn(latest.state, this.config.tracker.handoffStates)) {
+      } else if (entry.role === "worker" && isStateIn(latest.state, config.tracker.handoffStates)) {
         await this.terminateRunningIssue(issueId, false, "handoff state");
       } else if (entry.role === "worker" && !latest.assignedToWorker) {
         await this.terminateRunningIssue(issueId, false, "worker route changed");
-      } else if (entry.role === "worker" && !this.isWorkerStateActiveForRunPhase(latest, entry.runPhase)) {
+      } else if (entry.role === "worker" && !this.isWorkerStateActiveForRunPhase(latest, entry.runPhase, config)) {
         await this.terminateRunningIssue(issueId, false, "non-active state");
-      } else if (entry.role === "reviewer" && isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
+      } else if (entry.role === "reviewer" && isStateIn(latest.state, config.reviewLoop.blockedStates)) {
         await this.terminateRunningIssue(issueId, false, "blocked state");
-      } else if (entry.role === "reviewer" && !isStateIn(latest.state, this.config.reviewLoop.reviewStates)) {
+      } else if (entry.role === "reviewer" && !isStateIn(latest.state, config.reviewLoop.reviewStates)) {
         await this.terminateRunningIssue(issueId, false, "non-review state");
       }
     }
@@ -1554,37 +1566,43 @@ export class Orchestrator {
     allowExistingClaim = false,
     runPhase: AgentRunPhase = "implementation",
   ): boolean {
+    const config = this.serviceConfigForIssue(issue);
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
     if (!issue.assignedToWorker) return false;
-    if (isStateIn(issue.state, this.config.tracker.handoffStates)) return false;
-    if (isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
-    if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
-    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
-    if (!this.isWorkerStateActiveForRunPhase(issue, runPhase)) return false;
-    if (!this.passesLabelGuardrails(issue)) return false;
+    if (isStateIn(issue.state, config.tracker.handoffStates)) return false;
+    if (isStateIn(issue.state, config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(issue.state, config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(issue.state, config.tracker.terminalStates)) return false;
+    if (!this.isWorkerStateActiveForRunPhase(issue, runPhase, config)) return false;
+    if (!this.passesLabelGuardrails(issue, config)) return false;
     if (issue.state.toLowerCase() === "todo") {
-      if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
+      if (hasOpenBlocker(issue, config.tracker.terminalStates)) return false;
     }
     return this.hasStateSlot(issue.state);
   }
 
-  private isWorkerStateActiveForRunPhase(issue: Issue, runPhase: AgentRunPhase): boolean {
+  private isWorkerStateActiveForRunPhase(
+    issue: Issue,
+    runPhase: AgentRunPhase,
+    config: ServiceConfig = this.serviceConfigForIssue(issue),
+  ): boolean {
     if (runPhase === "merge_conflict_resolution") return this.isMergeConflictState(issue.state);
     if (this.isMergeConflictState(issue.state)) return false;
-    return isStateIn(issue.state, this.config.tracker.activeStates);
+    return isStateIn(issue.state, config.tracker.activeStates);
   }
 
   private shouldDispatchReviewer(issue: Issue, allowExistingClaim = false): boolean {
+    const config = this.serviceConfigForIssue(issue);
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
-    if (!isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
-    if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
-    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
-    if (!this.passesLabelGuardrails(issue)) return false;
-    if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
+    if (!isStateIn(issue.state, config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(issue.state, config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(issue.state, config.tracker.terminalStates)) return false;
+    if (!this.passesLabelGuardrails(issue, config)) return false;
+    if (hasOpenBlocker(issue, config.tracker.terminalStates)) return false;
     return this.hasStateSlot(issue.state);
   }
 
@@ -1599,12 +1617,15 @@ export class Orchestrator {
     const lifecycle = await store.get(issue.id);
     if (!lifecycle) return true;
 
-    const phase = phaseForIssueState(issue.state, this.config);
+    const config = this.configForProjectContext(
+      projectContext ?? lifecycle.projectContext ?? projectContextResolutionFromIssue(issue) ?? undefined,
+    );
+    const phase = phaseForIssueState(issue.state, config);
     const conflict = lifecycle.mergeConflict;
     if (
       conflict &&
-      this.config.mergePolicy.conflictsState !== null &&
-      isStateIn(issue.state, [this.config.mergePolicy.conflictsState]) &&
+      config.mergePolicy.conflictsState !== null &&
+      isStateIn(issue.state, [config.mergePolicy.conflictsState]) &&
       (conflict.status === "blocked" || conflict.resolutionStatus === "blocked")
     ) {
       const blockedReason =
@@ -1623,7 +1644,7 @@ export class Orchestrator {
       if (isPendingPublicationApprovalReason(lifecycle.blockedReason)) {
         return false;
       }
-      if (this.config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
+      if (config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, config.reviewLoop.blockedStates)) {
         return false;
       }
       await store.updateIssue(issue, {
@@ -1636,9 +1657,7 @@ export class Orchestrator {
     }
 
     if (role === "worker" && runPhase === "issue_breakdown") {
-      const issueBreakdownConfig = this.configForProjectContext(
-        projectContext ?? lifecycle.projectContext ?? projectContextResolutionFromIssue(issue) ?? undefined,
-      );
+      const issueBreakdownConfig = config;
       if (lifecycle.planningFailureCount >= issueBreakdownConfig.issueBreakdown.maxPlanningFailures) {
         await this.escalateLifecycleBlocked(
           issue,
@@ -1663,22 +1682,22 @@ export class Orchestrator {
     if (
       role === "worker" &&
       runPhase === "implementation" &&
-      lifecycle.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns
+      lifecycle.incompleteTurnCount >= config.reviewLoop.maxIncompleteTurns
     ) {
       await this.escalateLifecycleBlocked(
         issue,
         lifecycle,
         lifecycle.summaryPointers.lastRunId ?? issue.id,
-        `max incomplete turns reached (${lifecycle.incompleteTurnCount}/${this.config.reviewLoop.maxIncompleteTurns})`,
+        `max incomplete turns reached (${lifecycle.incompleteTurnCount}/${config.reviewLoop.maxIncompleteTurns})`,
       );
       return false;
     }
-    if (role === "reviewer" && lifecycle.reviewRound >= this.config.reviewLoop.maxReviewRounds) {
+    if (role === "reviewer" && lifecycle.reviewRound >= config.reviewLoop.maxReviewRounds) {
       await this.escalateLifecycleBlocked(
         issue,
         lifecycle,
         lifecycle.summaryPointers.lastRunId ?? issue.id,
-        `max review rounds reached (${lifecycle.reviewRound}/${this.config.reviewLoop.maxReviewRounds})`,
+        `max review rounds reached (${lifecycle.reviewRound}/${config.reviewLoop.maxReviewRounds})`,
       );
       return false;
     }
@@ -1686,10 +1705,10 @@ export class Orchestrator {
     return true;
   }
 
-  private passesLabelGuardrails(issue: Issue): boolean {
+  private passesLabelGuardrails(issue: Issue, config: ServiceConfig = this.serviceConfigForIssue(issue)): boolean {
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
-    if (this.config.agent.requireLabels.some((label) => !labels.has(label))) return false;
-    if (this.config.agent.excludeLabels.some((label) => labels.has(label))) return false;
+    if (config.agent.requireLabels.some((label) => !labels.has(label))) return false;
+    if (config.agent.excludeLabels.some((label) => labels.has(label))) return false;
     return true;
   }
 
@@ -1730,13 +1749,17 @@ export class Orchestrator {
       return false;
     }
     let runPhase = decision.runPhase;
-    if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase))) return false;
-    const dispatchWriteback = runPhase === "implementation" ? planDispatchWriteback(latest, this.config) : null;
+    if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase, latestProjectContext))) return false;
+    const dispatchWriteback =
+      runPhase === "implementation"
+        ? planDispatchWriteback(latest, this.serviceConfigForIssue(latest, latestProjectContext), latestProjectContext)
+        : null;
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
     const afterWriteback = dispatchWriteback
       ? (await this.fetchIssueStatesByIdsForProjectContext([issue.id], latestProjectContext))[0]
       : latest;
     if (!afterWriteback) return false;
+    const afterWritebackProjectContext = this.requestedProjectContextForIssue(afterWriteback, latestProjectContext);
     if (dispatchWriteback) {
       const postWritebackDecision = await this.resolveWorkerDispatchDecision(afterWriteback);
       if (postWritebackDecision.action === "skip") {
@@ -1750,19 +1773,19 @@ export class Orchestrator {
       runPhase = postWritebackDecision.runPhase;
     }
     if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim, runPhase)) return false;
-    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase))) return false;
+    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase, afterWritebackProjectContext))) return false;
 
-    this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase);
+    this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase, afterWritebackProjectContext ?? null);
     return true;
   }
 
   private async tryDispatchReviewerIssue(issue: Issue, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
-    if (!this.shouldDispatchReviewer(issue, allowExistingClaim)) return false;
-    if (!(await this.lifecycleAllowsDispatch(issue, "reviewer"))) return false;
-
     const requestedProjectContext = this.requestedProjectContextForIssue(issue);
+    if (!this.shouldDispatchReviewer(issue, allowExistingClaim)) return false;
+    if (!(await this.lifecycleAllowsDispatch(issue, "reviewer", "review", requestedProjectContext))) return false;
+
     let refreshed: Issue[];
     try {
       refreshed = await this.fetchIssueStatesByIdsForProjectContext([issue.id], requestedProjectContext);
@@ -1779,13 +1802,14 @@ export class Orchestrator {
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
+    const latestProjectContext = this.requestedProjectContextForIssue(latest, requestedProjectContext);
     if (!this.shouldDispatchReviewer(latest, allowExistingClaim)) return false;
-    if (!(await this.lifecycleAllowsDispatch(latest, "reviewer"))) return false;
+    if (!(await this.lifecycleAllowsDispatch(latest, "reviewer", "review", latestProjectContext))) return false;
 
     const reviewEvidence = await this.loadReviewerDispatchEvidence(latest);
     if (!reviewEvidence) return false;
 
-    this.dispatchIssue(latest, null, "reviewer", reviewEvidence);
+    this.dispatchIssue(latest, null, "reviewer", reviewEvidence, "review", latestProjectContext ?? null);
     return true;
   }
 
