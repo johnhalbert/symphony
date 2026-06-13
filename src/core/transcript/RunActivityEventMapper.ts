@@ -13,6 +13,7 @@ type RunActivityEventPatch = Pick<TranscriptEvent, "eventType"> &
   Partial<Pick<TranscriptEvent, "message" | "payload" | "payloadSchema" | "payloadTruncated" | "payloadByteLength">>;
 
 const RAW_PROTOCOL_KEYS = new Set(["raw", "rawpayload", "protocolpayload", "jsonrpc", "rpcerror"]);
+const TRANSCRIPT_MESSAGE_PREVIEW_LENGTH = 10_000;
 const ASSISTANT_DELTA_TEXT_KEYS = ["textPreview", "deltaPreview", "messagePreview", "delta", "text", "message"] as const;
 
 interface PreviewText {
@@ -96,7 +97,7 @@ export function mapAgentEventToRunActivityEvent(event: AgentEvent): RunActivityE
       return activity("run_diagnostic", message.preview, payload);
     }
     case "completed": {
-      const message = event.message === undefined ? undefined : previewText(event.message, 500);
+      const message = event.message === undefined ? undefined : previewText(event.message, TRANSCRIPT_MESSAGE_PREVIEW_LENGTH);
       return activity("completed", message?.preview ?? "Run completed", {
         kind: "terminal",
         status: "succeeded",

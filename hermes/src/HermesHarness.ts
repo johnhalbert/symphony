@@ -1323,7 +1323,7 @@ function hermesTranscriptEvent(event: GatewayEvent, harnessId: string): { eventT
 function messageCompletePayload(payload: unknown): Record<string, unknown> {
   const record = isRecord(payload) ? payload : {};
   return {
-    ...formattedTextPayload({ textPreview: record.text }, 500),
+    ...formattedTextPayload({ textPreview: record.text }, 10_000),
     status: preview(record.status, 80),
     usage: isRecord(record.usage) ? record.usage : null,
   };

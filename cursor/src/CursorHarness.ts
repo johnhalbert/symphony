@@ -817,7 +817,7 @@ function cursorTranscriptEvent(message: unknown): { eventType: string; message?:
       return {
         eventType: "assistant",
         message: "Cursor assistant message",
-        payload: textPayload("assistant", cursorAssistantText(message), 500),
+        payload: textPayload("assistant", cursorAssistantText(message), 10_000),
       };
     case "task":
       return {

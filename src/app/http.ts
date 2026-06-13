@@ -6061,7 +6061,7 @@ function renderLiveTranscriptPage(run: RunRecord): string {
     <script>
       (() => {
         const config = ${config};
-        const state = { lastSequence: 0, seen: new Set(), paused: false, queued: [], socket: null, reconnectTimer: null, activeAssistant: null, tools: new Map() };
+        const state = { lastSequence: 0, seen: new Set(), paused: false, queued: [], socket: null, reconnectTimer: null, activeAssistant: null, lastAssistant: null, tools: new Map(), deltaMirror: { runtime: new Map(), harness: new Map() } };
         const eventsEl = document.getElementById("events");
         const emptyEl = document.getElementById("empty");
         const statusEl = document.getElementById("stream-status");
@@ -6091,6 +6091,43 @@ function renderLiveTranscriptPage(run: RunRecord): string {
         };
         const textFields = (payload, fields) => firstText(...fields.map((field) => payload[field]));
         const metaText = (event, label) => "#" + event.sequence + " · " + event.at + " · " + label;
+        const lastToken = (value) => {
+          const match = value.match(/\\S+$/);
+          return match ? match[0] : "";
+        };
+        const hasOpenInlineCode = (value) => ((value.match(/\`/g) || []).length % 2) === 1;
+        const hasOpenDoubleQuote = (value) => ((value.match(/"/g) || []).length % 2) === 1;
+        const commonShortWord = new Set(["a","am","an","and","are","as","at","be","but","by","can","do","for","get","git","go","had","has","he","her","his","i","if","in","is","it","me","my","no","not","of","on","or","our","out","pr","run","so","the","to","up","us","use","was","we","you"]);
+        const knownWordpiecePrefix = new Set(["lat","orches","rer"]);
+        const shouldJoinWordpiece = (previous, next) => /^[a-z]{2,8}$/.test(previous) && /^[a-z]{2,8}$/.test(next) && !commonShortWord.has(previous) && !commonShortWord.has(next) && knownWordpiecePrefix.has(previous);
+        const shouldJoinTokenWithoutSpace = (existing, next) => {
+          const previous = lastToken(existing);
+          if (!previous) return false;
+          if (/^[,.;:!?)}\\]]/.test(next)) return true;
+          if (/^[’'][\\p{L}]/u.test(next)) return true;
+          if (next.startsWith("\`") && hasOpenInlineCode(existing)) return true;
+          if (next.startsWith('"') && hasOpenDoubleQuote(existing)) return true;
+          if (/[({\\[]$/.test(previous)) return true;
+          if (previous.endsWith("\`") && hasOpenInlineCode(existing)) return true;
+          if (previous.endsWith('"') && hasOpenDoubleQuote(existing)) return true;
+          if (hasOpenInlineCode(existing) && /^[\\p{L}\\p{N}_-]/u.test(next) && /[\`./\\\\-]$/.test(previous)) return true;
+          if (next === "-") return true;
+          if (/^-[\\p{L}\\p{N}_]/u.test(next)) return true;
+          if (/^[A-Z]{1,4}$/.test(previous) && /^[A-Z]$/.test(next)) return true;
+          if (shouldJoinWordpiece(previous, next)) return true;
+          if (previous === "--" || previous.endsWith("-")) return true;
+          if (/^[/\\\\]/.test(next) && /[\\p{L}\\p{N}._-]$/u.test(previous)) return true;
+          if (/^\\.[\\p{L}\\p{N}_-]/u.test(next) && /[\\p{L}\\p{N}_-]$/u.test(previous)) return true;
+          if (/[/\\\\][\\p{L}\\p{N}._-]*$/u.test(previous) && /^[\\p{L}\\p{N}._-]+$/u.test(next)) return true;
+          return false;
+        };
+        const combineAssistantDeltaText = (existing, next, mode) => {
+          if (!existing) return next;
+          if (!next) return existing;
+          if (mode === "exact" || (mode === "token" && shouldJoinTokenWithoutSpace(existing, next))) return existing + next;
+          if (/\\s$/.test(existing) || /^\\s/.test(next)) return existing + next;
+          return existing + " " + next;
+        };
         const isAssistantDelta = (event) => {
           const kind = payloadKind(event);
           const payload = payloadRecord(event);
@@ -6107,7 +6144,7 @@ function renderLiveTranscriptPage(run: RunRecord): string {
         };
         const isAssistantComplete = (event) => {
           const type = eventToken(event);
-          return type === "message_complete" || type === "assistant_complete" || type === "assistant_message_completed" || type === "response_complete";
+          return type === "message_complete" || type === "assistant_complete" || type === "assistant_message_completed" || type === "response_complete" || type === "completed" || type === "run_succeeded";
         };
         const isAssistantEvent = (event) => {
           const type = eventToken(event);
@@ -6132,6 +6169,33 @@ function renderLiveTranscriptPage(run: RunRecord): string {
           if (isAssistantDelta(event) && token(event.message) === "hermes_message_delta") return "";
           return typeof event.message === "string" ? event.message : "";
         };
+        const assistantDeltaMirrorSource = (event) => {
+          const type = eventToken(event);
+          const payload = payloadRecord(event);
+          const kind = payloadKind(event);
+          if (token(event.source) === "runtime" && type === "message_delta") return "runtime";
+          if (token(event.source) === "harness" && (type === "assistant_message_delta" || (type === "progress" && token(payload.activitySource || payload.activity_source) === "delta") || kind === "assistant_delta" || kind === "assistant_message_delta")) return "harness";
+          return "";
+        };
+        const assistantDeltaMirrorKey = (text) => text.length + ":" + text;
+        const shouldSkipMirroredDelta = (event, text) => {
+          const source = assistantDeltaMirrorSource(event);
+          if (!source || !text) return false;
+          const key = assistantDeltaMirrorKey(text);
+          const opposite = source === "runtime" ? "harness" : "runtime";
+          const sourceCount = state.deltaMirror[source].get(key) || 0;
+          const oppositeCount = state.deltaMirror[opposite].get(key) || 0;
+          state.deltaMirror[source].set(key, sourceCount + 1);
+          return oppositeCount > sourceCount;
+        };
+        const assistantDeltaJoinMode = (event) => {
+          const type = eventToken(event);
+          const payload = payloadRecord(event);
+          const kind = payloadKind(event);
+          if (type === "progress" && token(payload.activitySource || payload.activity_source) === "delta") return kind === "assistant_delta" || token(payload.progressKind || payload.progress_kind) === "assistant_delta" ? "token" : "exact";
+          if (type === "message_delta" && token(event.source) !== "runtime") return "token";
+          return "exact";
+        };
         const scrollToBottom = () => {
           if (state.paused) return;
           window.requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: "auto" }));
@@ -6150,26 +6214,28 @@ function renderLiveTranscriptPage(run: RunRecord): string {
           item.appendChild(body);
           eventsEl.appendChild(item);
           scrollToBottom();
-          return { item, body, text };
+          const block = { item, body, text };
+          if (role === "assistant") state.lastAssistant = block;
+          return block;
         };
         const renderAssistant = (event) => {
           const text = transcriptText(event);
           if (!text) return;
           if (isAssistantDelta(event)) {
+            if (shouldSkipMirroredDelta(event, text)) return;
             if (!state.activeAssistant) state.activeAssistant = appendMessageBlock(event, "assistant", text);
             else {
-              state.activeAssistant.text += text;
+              state.activeAssistant.text = combineAssistantDeltaText(state.activeAssistant.text, text, assistantDeltaJoinMode(event));
               state.activeAssistant.body.textContent = state.activeAssistant.text;
               scrollToBottom();
             }
             return;
           }
-          if (isAssistantComplete(event) && state.activeAssistant) {
-            if (text.length >= state.activeAssistant.text.length) {
-              state.activeAssistant.text = text;
-              state.activeAssistant.body.textContent = text;
-              scrollToBottom();
-            }
+          if (isAssistantComplete(event) && state.lastAssistant) {
+            state.lastAssistant.text = text;
+            state.lastAssistant.body.textContent = text;
+            state.activeAssistant = null;
+            scrollToBottom();
             return;
           }
           state.activeAssistant = appendMessageBlock(event, "assistant", text);

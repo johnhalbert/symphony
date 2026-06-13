@@ -6,6 +6,8 @@ import type {
 } from "../persistence/RunTranscriptStore.js";
 
 const DEFAULT_PREVIEW_LENGTH = 500;
+const TRANSCRIPT_DISPLAY_TEXT_LENGTH = 10_000;
+const TRANSCRIPT_TOOL_TEXT_LENGTH = 5_000;
 const MAX_JSON_DEPTH = 8;
 const REDACTED = "[redacted]";
 const REDACTED_COMMAND_PAYLOAD = "[redacted command payload]";
@@ -125,6 +127,7 @@ const FORMATTED_TRANSCRIPT_TEXT_FIELDS = [
   "text",
   "textPreview",
 ] as const;
+const TRANSCRIPT_TOOL_DISPLAY_TEXT_FIELDS = new Set<string>(UNSAFE_TOOL_DETAIL_TEXT_FIELDS);
 
 export interface RedactedPreview {
   preview: string | null;
@@ -359,6 +362,9 @@ function sanitizedEventMessageForPublicRead(
   event: TranscriptEvent,
 ): string {
   if (commandPolicyEvent) return commandPolicyFallbackTextForPublicRead(event);
+  if (assistantDelta || isTranscriptAssistantCompleteEvent(event)) {
+    return redactTextPreserveFormatting(message, TRANSCRIPT_DISPLAY_TEXT_LENGTH).text ?? "";
+  }
   const preview = assistantDelta ? sanitizedDeltaTextValue(message) : sanitizedPreviewValue(message);
   return preview.preview ?? "";
 }
@@ -386,7 +392,7 @@ function sanitizedEventPayloadForPublicRead(payload: unknown, assistantDelta: bo
   if (isUnsafeToolDetailTranscriptPayload(event, payload)) return sanitizeUnsafeToolDetailPayloadForPublicRead(payload);
   const sanitized = sanitizePublicJson(payload);
   if (!isRecord(payload) || !isRecord(sanitized)) return sanitized;
-  return applyFormattedTranscriptDisplayFields(sanitized, payload);
+  return applyFormattedTranscriptDisplayFields(sanitized, payload, event);
 }
 
 function isUnsafeToolDetailTranscriptPayload(event: TranscriptEvent, payload: unknown): payload is Record<string, unknown> {
@@ -403,7 +409,7 @@ function sanitizeUnsafeToolDetailPayloadForPublicRead(payload: Record<string, un
   for (const key of UNSAFE_TOOL_DETAIL_TEXT_FIELDS) {
     const value = payload[key];
     if (typeof value === "string") {
-      const formatted = redactTextPreserveFormatting(value);
+      const formatted = redactTextPreserveFormatting(value, TRANSCRIPT_TOOL_TEXT_LENGTH);
       output[key] = formatted.text ?? "";
       if (formatted.redacted) output.redacted = true;
       if (formatted.truncated) output.truncated = true;
@@ -415,17 +421,23 @@ function sanitizeUnsafeToolDetailPayloadForPublicRead(payload: Record<string, un
 function applyFormattedTranscriptDisplayFields(
   sanitizedPayload: Record<string, unknown>,
   rawPayload: Record<string, unknown>,
+  event: TranscriptEvent,
 ): Record<string, unknown> {
   const output: Record<string, unknown> = { ...sanitizedPayload };
   for (const key of FORMATTED_TRANSCRIPT_TEXT_FIELDS) {
     const value = rawPayload[key];
     if (typeof value !== "string") continue;
-    const formatted = redactTextPreserveFormatting(value);
+    const formatted = redactTextPreserveFormatting(value, formattedTranscriptDisplayFieldLength(key, event));
     output[key] = formatted.text ?? "";
     if (formatted.redacted) output.redacted = true;
     if (formatted.truncated) output.truncated = true;
   }
   return output;
+}
+
+function formattedTranscriptDisplayFieldLength(key: string, event: TranscriptEvent): number {
+  if (TRANSCRIPT_TOOL_DISPLAY_TEXT_FIELDS.has(key) || isToolTranscriptEvent(event)) return TRANSCRIPT_TOOL_TEXT_LENGTH;
+  return TRANSCRIPT_DISPLAY_TEXT_LENGTH;
 }
 
 function isTranscriptAssistantDeltaEvent(event: TranscriptEvent): boolean {
@@ -482,6 +494,26 @@ function safeJsonPreview(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function isTranscriptAssistantCompleteEvent(event: TranscriptEvent): boolean {
+  const eventType = normalizePublicToken(event.eventType);
+  return (
+    eventType === "message_complete" ||
+    eventType === "assistant_complete" ||
+    eventType === "assistant_message_completed" ||
+    eventType === "response_complete" ||
+    eventType === "completed" ||
+    eventType === "run_succeeded"
+  );
+}
+
+function isToolTranscriptEvent(event: TranscriptEvent): boolean {
+  const eventType = normalizePublicToken(event.eventType);
+  const payload = isRecord(event.payload) ? event.payload : {};
+  const payloadKind = normalizePublicToken(payload.kind) ?? normalizePublicToken(payload.type);
+  const activitySource = normalizePublicToken(payload.activitySource) ?? normalizePublicToken(payload.activity_source);
+  return eventType?.includes("tool") === true || payloadKind?.includes("tool") === true || activitySource === "tool";
 }
 
 function stripUnsafeTranscriptFormatting(value: string): string {

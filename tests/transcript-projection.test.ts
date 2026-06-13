@@ -40,4 +40,30 @@ describe("transcript public formatting redaction", () => {
       redacted: true,
     });
   });
+
+  it("keeps long assistant completion display text readable for transcript pages", () => {
+    const longText = `Pass.\n\n${"final answer ".repeat(80)}SECRET_FINAL_TOKEN`;
+    const event: TranscriptEvent = {
+      runId: "run-1",
+      sequence: 2,
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "run_succeeded",
+      message: longText,
+      payload: {
+        kind: "run_succeeded",
+        textPreview: longText,
+      },
+    };
+
+    const publicEvent = projectTranscriptEventForPublicRead(event);
+
+    expect(publicEvent.message).toContain("final answer final answer");
+    expect(publicEvent.message).not.toContain("...[truncated]");
+    expect(publicEvent.message).not.toContain("SECRET_FINAL_TOKEN");
+    expect(publicEvent.payload).toMatchObject({
+      textPreview: expect.stringContaining("Pass.\n\nfinal answer"),
+      redacted: true,
+    });
+  });
 });

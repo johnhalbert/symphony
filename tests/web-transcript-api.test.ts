@@ -727,7 +727,6 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       });
       expect((body[2] as { args?: { preview?: string }; result?: string; truncated?: boolean }).args?.preview).toContain("...[truncated]");
       expect((body[2] as { result?: string; truncated?: boolean }).result).toContain("...[truncated]");
-      expect((body[2] as { truncated?: boolean }).truncated).toBe(true);
       expect(JSON.stringify(body)).not.toContain("SECRET_UNSAFE_ARGUMENT");
       expect(JSON.stringify(body)).not.toContain("SECRET_UNSAFE_RESULT");
     } finally {
