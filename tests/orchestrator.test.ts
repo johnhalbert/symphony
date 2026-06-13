@@ -2462,6 +2462,68 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("flushes issue triage report writebacks when the triage handoff is accepted", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("Blocked") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter(() => undefined);
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const harness = new IssueTriageAcceptingHarness(lifecycleStore, outboxStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "issue triage dispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "issue triage completion");
+    await orchestrator.stop();
+
+    expect(writer.comments).toHaveLength(1);
+    expect(writer.comments[0]).toMatchObject({
+      issueId: candidate.id,
+      dedupeKey: "issue-triage:triage-run-1",
+    });
+    expect(writer.comments[0]?.body).toContain("## Symphony Issue Triage");
+    expect(writer.comments[0]?.body).toContain("Decompose the hidden scope into blocking child issues.");
+    await expect(outboxStore.list()).resolves.toEqual([
+      expect.objectContaining({
+        idempotencyKey: "comment:issue-1:issue-triage:triage-run-1",
+        status: "succeeded",
+      }),
+    ]);
+  });
+
   it("reconciles missing issue triage report writebacks without redispatching triage", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;

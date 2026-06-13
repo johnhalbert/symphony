@@ -3882,6 +3882,19 @@ export class Orchestrator {
     if (!lifecycle || !report) return entry.issueTriageReportAccepted;
     entry.lifecycle = lifecycle;
     entry.issueTriageReportAccepted = true;
+
+    if (this.options.writeback) {
+      await this.options.writeback.processDue();
+    } else if (this.config.writeback.enabled) {
+      this.options.logger.warn("issue triage report accepted but writeback processor is not configured", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        run_id: runId,
+        report_id: report.id,
+        disposition: report.disposition,
+      });
+    }
+
     return true;
   }
 
