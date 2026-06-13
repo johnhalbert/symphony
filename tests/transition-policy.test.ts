@@ -333,6 +333,17 @@ describe("TransitionPolicy review-loop planners", () => {
       summary: "Review failures exposed hidden sibling scope.",
       evidence: ["review-verdict:issue-1:verdict-3 found sibling path"],
       recommendedAction: "Use SpecKit to create blocking child issues for the hidden sibling scope.",
+      blockers: [
+        {
+          kind: "under_specified_needs_decomposition",
+          status: "active",
+          nextActor: "planner",
+          confidence: "high",
+          summary: "Review failures exposed hidden sibling scope.",
+          evidence: ["review-verdict:issue-1:verdict-3 found sibling path"],
+          recommendedAction: "Use SpecKit to create blocking child issues for the hidden sibling scope.",
+        },
+      ],
       submittedAt: "2026-01-01T00:00:00.000Z",
       writebackOperationKeys: [],
     };
@@ -359,7 +370,7 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(commentBody(operations, 0)).toContain("## Symphony Issue Triage");
     expect(commentBody(operations, 0)).toContain("Status: triage complete, human action required");
     expect(commentBody(operations, 0)).toContain("Blocked reason: max reviewer failures reached (3/3)");
-    expect(commentBody(operations, 0)).toContain("Disposition: decompose_issue");
+    expect(commentBody(operations, 0)).toContain("### 1. under_specified_needs_decomposition");
     expect(commentBody(operations, 0)).toContain("Confidence: high");
     expect(commentBody(operations, 0)).toContain("Review failures exposed hidden sibling scope.");
     expect(commentBody(operations, 0)).toContain("- review-verdict:issue-1:verdict-3 found sibling path");

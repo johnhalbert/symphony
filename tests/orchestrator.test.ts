@@ -2431,7 +2431,7 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.ctx.role).toBe("triage");
     expect(harness.runs[0]?.ctx.runPhase).toBe("issue_triage");
     expect(harness.runs[0]?.prompt).toContain("submit_issue_triage_report");
-    expect(harness.runs[0]?.prompt).toContain("Disposition choices:");
+    expect(harness.runs[0]?.prompt).toContain("Blocker kinds:");
     expect(harness.runs[0]?.prompt).toContain("Do not edit files");
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       lastIssueTriageReportId: "issue-triage-report:issue-1:triage-run-1",
@@ -2440,6 +2440,13 @@ describe("Orchestrator", () => {
           runId: "triage-run-1",
           disposition: "decompose_issue",
           confidence: "high",
+          blockers: [
+            {
+              kind: "under_specified_needs_decomposition",
+              status: "active",
+              nextActor: "planner",
+            },
+          ],
           writebackOperationKeys: ["comment:issue-1:issue-triage:triage-run-1"],
         },
       ],
@@ -2568,6 +2575,17 @@ describe("Orchestrator", () => {
           summary: "Existing triage report was accepted before writebacks existed.",
           evidence: ["blockedReason=max reviewer failures reached (3/3)"],
           recommendedAction: "Publish the missing triage recommendation without rerunning the agent.",
+          blockers: [
+            {
+              kind: "under_specified_needs_decomposition",
+              status: "active",
+              nextActor: "planner",
+              confidence: "high",
+              summary: "Existing triage report was accepted before writebacks existed.",
+              evidence: ["blockedReason=max reviewer failures reached (3/3)"],
+              recommendedAction: "Publish the missing triage recommendation without rerunning the agent.",
+            },
+          ],
           submittedAt: "2026-01-01T00:00:00.000Z",
           writebackOperationKeys: [],
         },
@@ -7974,11 +7992,18 @@ class IssueTriageAcceptingHarness implements AgentHarness {
           runId,
           issueId: ctx.issue.id,
           triggerFingerprint: issueTriageTriggerFingerprint(lifecycle),
-          disposition: "decompose_issue",
-          confidence: "high",
           summary: "Repeated review failures exposed hidden child scope.",
-          evidence: ["blockedReason=max reviewer failures reached (3/3)"],
-          recommendedAction: "Decompose the hidden scope into blocking child issues.",
+          blockers: [
+            {
+              kind: "under_specified_needs_decomposition",
+              status: "active",
+              nextActor: "planner",
+              confidence: "high",
+              summary: "Repeated review failures exposed hidden child scope.",
+              evidence: ["blockedReason=max reviewer failures reached (3/3)"],
+              recommendedAction: "Decompose the hidden scope into blocking child issues.",
+            },
+          ],
           idempotencyKey: runId,
         },
         {

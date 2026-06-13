@@ -624,14 +624,12 @@ export function planIssueTriageReportWritebacks(
           "",
           `Run: ${context.report.runId}`,
           `Blocked reason: ${context.blockedReason ?? "n/a"}`,
-          `Disposition: ${context.report.disposition}`,
-          `Confidence: ${context.report.confidence}`,
           "",
           "Summary:",
           context.report.summary,
           "",
-          "Evidence:",
-          ...context.report.evidence.map((item) => `- ${item}`),
+          "Blockers, ordered by Symphony precedence:",
+          ...formatIssueTriageBlockerWritebackLines(context.report),
           "",
           "Recommended human action:",
           context.report.recommendedAction,
@@ -639,6 +637,26 @@ export function planIssueTriageReportWritebacks(
       },
     },
   ];
+}
+
+function formatIssueTriageBlockerWritebackLines(report: IssueTriageReportRecord): string[] {
+  return report.blockers.flatMap((blocker, index) => [
+    "",
+    `### ${index + 1}. ${blocker.kind}`,
+    "",
+    `Status: ${blocker.status}`,
+    `Next actor: ${blocker.nextActor}`,
+    `Confidence: ${blocker.confidence}`,
+    "",
+    "Summary:",
+    blocker.summary,
+    "",
+    "Evidence:",
+    ...blocker.evidence.map((item) => `- ${item}`),
+    "",
+    "Recommended action:",
+    blocker.recommendedAction,
+  ]);
 }
 
 export function planMergeCompletedWritebacks(

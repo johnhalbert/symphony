@@ -51,11 +51,16 @@ import {
 } from "../IssueBreakdownPlanService.js";
 import { IssueBreakdownPlanApplyService } from "../IssueBreakdownPlanApplyService.js";
 import {
-  ISSUE_TRIAGE_DISPOSITIONS,
+  activeIssueTriageBlockers,
+  activeWorkerOwnedIssueTriageBlockers,
+  ISSUE_TRIAGE_BLOCKER_KINDS,
+  ISSUE_TRIAGE_BLOCKER_NEXT_ACTORS,
+  ISSUE_TRIAGE_BLOCKER_STATUSES,
   issueTriageTriggerFingerprint,
   latestIssueTriageReport,
   latestIssueTriageReportForFingerprint,
   shouldIssueTriageRun,
+  sortIssueTriageBlockers,
 } from "../IssueTriageService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import { summarizeIssueContractForPrompt } from "../IssueContractLint.js";
@@ -96,6 +101,8 @@ import {
   type IssueLifecycleStore,
   type IssueMergeConflictMetadata,
   type IssueReviewVerdictRecord,
+  type IssueTriageBlockerKind,
+  type IssueTriageBlockerRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import { MergePolicyService, type MergePolicyGitHubClient } from "../merge/MergePolicyService.js";
 import { sanitizeStaleMergeGateLifecycle, staleMergeGateLifecyclePatch } from "../merge/MergeGateLifecycle.js";
@@ -1142,7 +1149,7 @@ export class Orchestrator {
     }
     if (forcedRole === "triage" || (!forcedRole && isStateIn(issue.state, this.config.reviewLoop.blockedStates))) {
       const report = lifecycle ? latestIssueTriageReportForFingerprint(lifecycle, issueTriageTriggerFingerprint(lifecycle)) : null;
-      if (!forcedRole && report?.disposition === "decompose_issue" && this.shouldDispatchPlanner(issue, true)) {
+      if (!forcedRole && reportHasActiveTriageBlocker(report, "under_specified_needs_decomposition") && this.shouldDispatchPlanner(issue, true)) {
         return { status: "rendered", role: "planner", runPhase: "issue_breakdown" };
       }
       return this.shouldDispatchIssueTriage(issue, true)
@@ -1731,7 +1738,10 @@ export class Orchestrator {
       runPhase === "issue_breakdown" &&
       blockedByLifecycle &&
       isStateIn(issue.state, this.config.reviewLoop.blockedStates) &&
-      latestIssueTriageReportForFingerprint(lifecycle, issueTriageTriggerFingerprint(lifecycle))?.disposition === "decompose_issue";
+      reportHasActiveTriageBlocker(
+        latestIssueTriageReportForFingerprint(lifecycle, issueTriageTriggerFingerprint(lifecycle)),
+        "under_specified_needs_decomposition",
+      );
     if (blockedByLifecycle) {
       if (plannerAllowedFromBlocked) {
         // Continue below into the planning failure/backoff gates.
@@ -3891,7 +3901,7 @@ export class Orchestrator {
         issue_identifier: entry.issue.identifier,
         run_id: runId,
         report_id: report.id,
-        disposition: report.disposition,
+        blockers: report.blockers.map((blocker) => ({ kind: blocker.kind, status: blocker.status, nextActor: blocker.nextActor })),
       });
     }
 
@@ -4383,14 +4393,17 @@ export class Orchestrator {
         verdict,
         gate,
         triggerFingerprint,
-        dispositions: ISSUE_TRIAGE_DISPOSITIONS,
+        blockerKinds: ISSUE_TRIAGE_BLOCKER_KINDS,
+        blockerStatuses: ISSUE_TRIAGE_BLOCKER_STATUSES,
+        blockerNextActors: ISSUE_TRIAGE_BLOCKER_NEXT_ACTORS,
+        triageLedger: issueTriageLedgerLines(lifecycle, report, verdict, gate).join("\n"),
       });
       return [basePrompt, this.issueTriageMcpPrompt(entry)].join("\n");
     }
     return [
       `Triage why ${entry.issue.identifier} hit Symphony's max-failure blocked path.`,
       "",
-      "You are a scoped, read-only Symphony issue triage agent. Classify the failure mode and recommend the next operator/system action.",
+      "You are a scoped, read-only Symphony issue triage agent. Identify every blocker and recommend the next operator/system action.",
       "Do not edit files, create commits, push branches, transition Linear state, comment on Linear, create subissues, or submit worker/reviewer handoffs.",
       "",
       "Issue:",
@@ -4409,6 +4422,9 @@ export class Orchestrator {
       `- Reviewer failures: ${lifecycle.reviewRound} / ${this.config.reviewLoop.failureLimits.reviewerFailures}`,
       `- Merge-gate failures: ${gate?.reviewRound ?? 0} / ${this.config.reviewLoop.failureLimits.mergeGateFailures}`,
       `- Incomplete worker turns: ${lifecycle.incompleteTurnCount} / ${this.config.reviewLoop.maxIncompleteTurns}`,
+      "",
+      "Deterministic blocker ledger:",
+      ...issueTriageLedgerLines(lifecycle, report, verdict, gate),
       "",
       "Latest workspace/git evidence:",
       `- Workspace path: ${workspace?.path ?? lifecycle.summaryPointers.workspacePath ?? entry.workspacePath ?? "n/a"}`,
@@ -4457,13 +4473,21 @@ export class Orchestrator {
           ]
         : ["- None"]),
       "",
-      "Disposition choices:",
-      ...ISSUE_TRIAGE_DISPOSITIONS.map((disposition) => `- ${disposition}`),
+      "Blocker kinds:",
+      ...ISSUE_TRIAGE_BLOCKER_KINDS.map((kind) => `- ${kind}`),
       "",
-      "Classification guidance:",
-      "- Use decompose_issue when the evidence shows hidden or under-specified scope that should become smaller blocking child issues.",
-      "- Use implementation_repair or validation_repair when the issue scope is adequate but worker behavior or proof was incomplete.",
-      "- Use merge_gate_repair for CI/mergeability-only repair loops, process_gate_repair for workflow/policy gaps, infra_repair for runtime/tool failures, and orchestrator_context_repair for missing or misleading Symphony context.",
+      "Blocker statuses:",
+      ...ISSUE_TRIAGE_BLOCKER_STATUSES.map((status) => `- ${status}`),
+      "",
+      "Next actors:",
+      ...ISSUE_TRIAGE_BLOCKER_NEXT_ACTORS.map((actor) => `- ${actor}`),
+      "",
+      "Blocker guidance:",
+      "- Submit an exhaustive blockers array; do not choose a single most-specific disposition.",
+      "- Use under_specified_needs_decomposition when hidden or under-specified scope should become smaller blocking child issues.",
+      "- Use implementation_unsatisfied_requirements when the latest review failure is active or worker behavior did not satisfy the issue contract.",
+      "- Use pr_review_gate only for review approval gates; mark it downstream when a higher-precedence active blocker still needs work.",
+      "- Lower-precedence PR, CI, merge, or review-gate blockers must not mask active implementation, validation, decomposition, or orchestration-context blockers.",
       "- Use manual_decision when the evidence requires a product/owner decision before automation should continue.",
       "",
       this.issueTriageMcpPrompt(entry),
@@ -5463,7 +5487,7 @@ function currentObjectiveDirective(
     return "Create a SpecKit-backed decomposition plan and submit proposed blocking Linear child issues for the parent issue.";
   }
   if (entry.runPhase === "issue_triage") {
-    return "Classify why this blocked issue exhausted its failure budget and submit a read-only issue triage report with the recommended human/system action.";
+    return "Identify every blocker behind this max-failure block and submit a read-only issue triage blocker report.";
   }
   if (entry.runPhase === "review") {
     return "Perform an exhaustive independent review against the issue contract and current implementation evidence.";
@@ -5475,8 +5499,9 @@ function currentObjectiveDirective(
     return "Continue the incomplete implementation turn, satisfy the unmet requirements, and submit the required completion handoff.";
   }
   const triage = latestIssueTriageReport(lifecycle);
-  if (triage && triage.disposition !== "decompose_issue") {
-    return `Run a focused ${triage.disposition} implementation turn using the latest issue triage recommendation.`;
+  const workerBlockers = activeWorkerOwnedIssueTriageBlockers(triage);
+  if (workerBlockers.length > 0) {
+    return `Run a focused implementation turn for the active triage blockers: ${workerBlockers.map((blocker) => blocker.kind).join(", ")}.`;
   }
   if (lifecycle?.mergeGate?.status === "repair_dispatched" || lifecycle?.mergeGate?.status === "blocked") {
     return "Repair only the active Symphony merge-gate blocker on the lifecycle-bound pull request.";
@@ -5520,10 +5545,8 @@ function activeDirectiveForRun(
     sections.push(
       [
         "Latest issue triage:",
-        `- Disposition: ${triage.disposition}`,
-        `- Confidence: ${triage.confidence}`,
         `- Summary: ${triage.summary}`,
-        `- Recommended human action: ${triage.recommendedAction}`,
+        ...formatTriageBlockersForDirective(triage.blockers),
       ].join("\n"),
     );
   }
@@ -5555,6 +5578,63 @@ function activeDirectiveForRun(
   return "- No prior review, triage, or merge-gate repair signal is active for this run.";
 }
 
+function issueTriageLedgerLines(
+  lifecycle: IssueLifecycleRecord,
+  report: IssueCompletionReportRecord | null,
+  verdict: IssueReviewVerdictRecord | null,
+  gate: IssueLifecycleRecord["mergeGate"],
+): string[] {
+  const lines = [
+    `- Lifecycle phase: ${lifecycle.phase}`,
+    `- Blocked reason: ${lifecycle.blockedReason ?? "n/a"}`,
+    `- Latest completion report: ${report?.id ?? "none"}${report ? ` acceptedAt=${report.acceptedAt}` : ""}`,
+    `- Latest review verdict: ${verdict?.id ?? "none"}${verdict ? ` verdict=${verdict.verdict} submittedAt=${verdict.submittedAt}` : ""}`,
+  ];
+  if (isUnsupersededReviewFailure(report, verdict)) {
+    lines.push(
+      "- Deterministic blocker: latest review failure is active and unsuperseded by worker completion; report implementation_unsatisfied_requirements unless stronger evidence proves decomposition or orchestration-context failure.",
+    );
+  } else if (verdict?.verdict === "fail") {
+    lines.push("- Deterministic blocker: latest review failure appears superseded by a newer completion report; verify before marking it downstream or resolved.");
+  }
+  if (gate) {
+    lines.push(
+      `- Merge gate signal: status=${gate.status}; headSha=${gate.headSha}; blockerFingerprint=${gate.blockerFingerprint ?? "n/a"}`,
+    );
+  } else {
+    lines.push("- Merge gate signal: none recorded in lifecycle.");
+  }
+  lines.push("- Precedence rule: lower-precedence PR, CI, merge, or review-gate signals do not clear higher-precedence active blockers.");
+  return lines;
+}
+
+function isUnsupersededReviewFailure(
+  report: IssueCompletionReportRecord | null,
+  verdict: IssueReviewVerdictRecord | null,
+): boolean {
+  if (!verdict || verdict.verdict !== "fail") return false;
+  if (!report) return true;
+  return Date.parse(verdict.submittedAt) >= Date.parse(report.acceptedAt);
+}
+
+function reportHasActiveTriageBlocker(
+  report: IssueLifecycleRecord["issueTriageReports"][number] | null | undefined,
+  kind: IssueTriageBlockerKind,
+): boolean {
+  return activeIssueTriageBlockers(report).some((blocker) => blocker.kind === kind);
+}
+
+function formatTriageBlockersForDirective(blockers: readonly IssueTriageBlockerRecord[]): string[] {
+  if (blockers.length === 0) return ["- Blockers: none reported."];
+  return [
+    "Blockers, ordered by Symphony precedence:",
+    ...sortIssueTriageBlockers(blockers).map(
+      (blocker, index) =>
+        `- ${index + 1}. ${blocker.kind} (${blocker.status}, ${blocker.nextActor}, ${blocker.confidence}): ${blocker.summary}; action: ${blocker.recommendedAction}`,
+    ),
+  ];
+}
+
 function successConditionsForRun(
   entry: RunningEntry,
   lifecycle: IssueLifecycleRecord | null,
@@ -5572,8 +5652,9 @@ function successConditionsForRun(
   }
   if (entry.runPhase === "issue_triage") {
     return [
-      "- Choose the most specific disposition supported by evidence.",
-      "- Include confidence, summary, evidence, and recommendedAction.",
+      "- Submit an exhaustive blockers list; do not collapse the situation into one disposition.",
+      "- Include status, nextActor, confidence, summary, evidence, and recommendedAction for every blocker.",
+      "- Lower-precedence PR, CI, merge, or review-gate blockers must not mask active implementation, validation, decomposition, or orchestration-context blockers.",
       "- Call submit_issue_triage_report before ending the run.",
     ].join("\n");
   }
@@ -5592,9 +5673,10 @@ function successConditionsForRun(
     ].join("\n");
   }
   const triage = latestIssueTriageReport(lifecycle);
+  const workerBlockers = activeWorkerOwnedIssueTriageBlockers(triage);
   return [
-    triage && triage.disposition !== "decompose_issue"
-      ? `- Complete the focused repair requested by triage: ${triage.recommendedAction}`
+    workerBlockers.length > 0
+      ? `- Complete every active worker-owned triage blocker: ${workerBlockers.map((blocker) => `${blocker.kind}: ${blocker.recommendedAction}`).join(" | ")}`
       : "- Satisfy every Issue Contract requirement.",
     "- Preserve correct completed work unless current evidence proves it conflicts with the contract.",
     "- Validate with concrete commands, tests, API checks, or reasoned manual evidence.",

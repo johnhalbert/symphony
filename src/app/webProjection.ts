@@ -302,6 +302,14 @@ interface IssueBoardCardReviewLoopInput {
     confidence?: string | null;
     summary?: string | null;
     recommendedAction?: string | null;
+    blockers?: Array<{
+      kind?: string | null;
+      status?: string | null;
+      nextActor?: string | null;
+      confidence?: string | null;
+      summary?: string | null;
+      recommendedAction?: string | null;
+    }> | null;
     submittedAt?: string | null;
     id?: string | null;
   } | null;
@@ -1597,6 +1605,10 @@ function projectIssueDescription(
   addUniqueText(description, reviewLoop?.lastCompletionReport?.summary ?? null);
   addUniqueText(description, reviewLoop?.lastIssueTriageReport?.summary ?? null);
   addUniqueText(description, reviewLoop?.lastIssueTriageReport?.recommendedAction ?? null);
+  for (const blocker of reviewLoop?.lastIssueTriageReport?.blockers ?? []) {
+    addUniqueText(description, blocker.summary ?? null);
+    addUniqueText(description, blocker.recommendedAction ?? null);
+  }
   for (const finding of reviewLoop?.lastReviewVerdict?.findings ?? []) {
     addUniqueText(description, finding);
   }

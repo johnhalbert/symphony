@@ -1,7 +1,31 @@
-# Symphony Triage: Blocked Issue Classification
+# Symphony Triage: Blocked Issue Blocker Ledger
 
-Classify why this issue reached a max-failure blocked state. This is read-only triage.
+Identify every blocker that explains why this issue reached a max-failure blocked state. This is read-only triage.
 
 {% include "partials/issue_context.md.liquid" %}
 
-Use `decompose_issue` only when the evidence proves hidden or under-specified scope should become smaller blocking child issues. Otherwise choose the most specific repair/refinement disposition and recommend the next human or system action.
+Submit an exhaustive `blockers` list. Include active blockers and downstream blockers. Do not choose a single "most specific" disposition.
+
+Lower-precedence PR, CI, merge, or review-gate blockers must not mask active implementation, validation, decomposition, or orchestration-context blockers. If the latest failed review is not superseded by a newer completion report, treat its unsatisfied findings as active.
+
+## Deterministic Blocker Ledger
+
+{{ triageLedger }}
+
+## Blocker Kinds
+
+{% for kind in blockerKinds -%}
+- {{ kind }}
+{% endfor %}
+
+## Blocker Statuses
+
+{% for status in blockerStatuses -%}
+- {{ status }}
+{% endfor %}
+
+## Next Actors
+
+{% for actor in blockerNextActors -%}
+- {{ actor }}
+{% endfor %}

@@ -56,6 +56,10 @@ import {
   isPendingPublicationApprovalLifecycle,
   pendingPublicationReport,
 } from "../core/CompletionReportService.js";
+import {
+  activeIssueTriageBlockers,
+  highestPrecedenceIssueTriageBlocker,
+} from "../core/IssueTriageService.js";
 import { sanitizeInactiveMergeGateLifecycle, sanitizeStaleMergeGateLifecycle } from "../core/merge/MergeGateLifecycle.js";
 import {
   compareRunChronology,
@@ -7238,7 +7242,9 @@ function lifecycleBlockedReason(lifecycle: IssueLifecycleRecord | null | undefin
 }
 
 function lifecycleHumanRequiredReason(lifecycle: IssueLifecycleRecord | null | undefined): string | null {
-  return latestIssueTriageReport(lifecycle ?? null)?.recommendedAction ?? lifecycleBlockedReason(lifecycle);
+  const report = latestIssueTriageReport(lifecycle ?? null);
+  const primaryActiveBlocker = highestPrecedenceIssueTriageBlocker({ blockers: activeIssueTriageBlockers(report) });
+  return primaryActiveBlocker?.recommendedAction ?? report?.recommendedAction ?? lifecycleBlockedReason(lifecycle);
 }
 
 function mergeConflictOperatorSummary(conflict: IssueMergeConflictMetadata | null) {

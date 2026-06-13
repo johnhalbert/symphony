@@ -3,6 +3,11 @@ import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError } from "./errors.js";
 import type {
+  IssueTriageBlockerKind,
+  IssueTriageBlockerNextActor,
+  IssueTriageBlockerRecord,
+  IssueTriageBlockerStatus,
+  IssueTriageConfidence,
   IssueLifecycleRecord,
   IssueLifecycleStore,
   IssueTriageDisposition,
@@ -27,19 +32,98 @@ export const ISSUE_TRIAGE_DISPOSITIONS = [
   "manual_decision",
 ] as const satisfies readonly IssueTriageDisposition[];
 
-const issueTriageReportSchema = z.object({
-  runId: z.string().trim().min(1),
-  issueId: z.string().trim().min(1),
-  triggerFingerprint: z.string().trim().min(1),
-  disposition: z.enum(ISSUE_TRIAGE_DISPOSITIONS),
+export const ISSUE_TRIAGE_BLOCKER_KINDS = [
+  "under_specified_needs_decomposition",
+  "implementation_unsatisfied_requirements",
+  "validation_or_test_failure",
+  "compatibility_matrix_gap",
+  "orchestrator_context_or_prompt_gap",
+  "infra_or_tooling_failure",
+  "pr_target_or_scope_mismatch",
+  "merge_conflict",
+  "merge_gate_check_failure",
+  "pr_review_gate",
+  "manual_decision",
+] as const satisfies readonly IssueTriageBlockerKind[];
+
+export const ISSUE_TRIAGE_BLOCKER_STATUSES = ["active", "downstream"] as const satisfies readonly IssueTriageBlockerStatus[];
+export const ISSUE_TRIAGE_BLOCKER_NEXT_ACTORS = [
+  "planner",
+  "worker",
+  "reviewer",
+  "merge_conflict_worker",
+  "operator",
+  "orchestrator",
+  "infra",
+] as const satisfies readonly IssueTriageBlockerNextActor[];
+
+const ISSUE_TRIAGE_BLOCKER_PRECEDENCE: Record<IssueTriageBlockerKind, number> = {
+  under_specified_needs_decomposition: 10,
+  implementation_unsatisfied_requirements: 20,
+  validation_or_test_failure: 30,
+  compatibility_matrix_gap: 40,
+  orchestrator_context_or_prompt_gap: 50,
+  infra_or_tooling_failure: 60,
+  pr_target_or_scope_mismatch: 70,
+  merge_conflict: 80,
+  merge_gate_check_failure: 90,
+  pr_review_gate: 100,
+  manual_decision: 110,
+};
+
+const issueTriageBlockerSchema = z.object({
+  kind: z.enum(ISSUE_TRIAGE_BLOCKER_KINDS),
+  status: z.enum(ISSUE_TRIAGE_BLOCKER_STATUSES),
+  nextActor: z.enum(ISSUE_TRIAGE_BLOCKER_NEXT_ACTORS),
   confidence: z.enum(["high", "medium", "low"]),
   summary: z.string().trim().min(1),
   evidence: z.array(z.string().trim().min(1)).min(1),
   recommendedAction: z.string().trim().min(1),
-  idempotencyKey: z.string().trim().min(1),
 });
 
-export type IssueTriageReportInput = z.infer<typeof issueTriageReportSchema>;
+const issueTriageReportSchema = z
+  .object({
+    runId: z.string().trim().min(1),
+    issueId: z.string().trim().min(1),
+    triggerFingerprint: z.string().trim().min(1),
+    summary: z.string().trim().min(1),
+    blockers: z.array(issueTriageBlockerSchema).min(1).optional(),
+    disposition: z.enum(ISSUE_TRIAGE_DISPOSITIONS).optional(),
+    confidence: z.enum(["high", "medium", "low"]).optional(),
+    evidence: z.array(z.string().trim().min(1)).min(1).optional(),
+    recommendedAction: z.string().trim().min(1).optional(),
+    idempotencyKey: z.string().trim().min(1),
+  })
+  .superRefine((value, context) => {
+    if (value.blockers !== undefined) return;
+    if (value.disposition === undefined) {
+      context.addIssue({ code: "custom", path: ["disposition"], message: "Legacy triage reports require disposition" });
+    }
+    if (value.confidence === undefined) {
+      context.addIssue({ code: "custom", path: ["confidence"], message: "Legacy triage reports require confidence" });
+    }
+    if (value.evidence === undefined) {
+      context.addIssue({ code: "custom", path: ["evidence"], message: "Legacy triage reports require evidence" });
+    }
+    if (value.recommendedAction === undefined) {
+      context.addIssue({ code: "custom", path: ["recommendedAction"], message: "Legacy triage reports require recommendedAction" });
+    }
+  });
+
+type RawIssueTriageReportInput = z.infer<typeof issueTriageReportSchema>;
+
+export interface IssueTriageReportInput {
+  runId: string;
+  issueId: string;
+  triggerFingerprint: string;
+  summary: string;
+  blockers: IssueTriageBlockerRecord[];
+  disposition: IssueTriageDisposition;
+  confidence: IssueTriageConfidence;
+  evidence: string[];
+  recommendedAction: string;
+  idempotencyKey: string;
+}
 
 export interface IssueTriageActiveContext {
   issue: Issue;
@@ -85,11 +169,17 @@ export class IssueTriageService {
     }
 
     const requestHash = issueTriageReportRequestHash(parsed);
+    const legacyRequestHash = legacyIssueTriageReportRequestHash(parsed);
     const existingScoped = existingLifecycle.issueTriageReports.find(
       (report) => report.runId === context.activeRunId && report.idempotencyKey === parsed.idempotencyKey,
     );
     if (existingScoped) {
-      assertIssueTriageReplayAllowed(existingScoped, { idempotencyKey: parsed.idempotencyKey, activeRunId: context.activeRunId, requestHash });
+      assertIssueTriageReplayAllowed(existingScoped, {
+        idempotencyKey: parsed.idempotencyKey,
+        activeRunId: context.activeRunId,
+        requestHash,
+        legacyRequestHash,
+      });
       return { accepted: true, replayed: true, report: existingScoped };
     }
     const existingCrossRun = existingLifecycle.issueTriageReports.find(
@@ -131,6 +221,7 @@ export class IssueTriageService {
       summary: parsed.summary,
       evidence: parsed.evidence,
       recommendedAction: parsed.recommendedAction,
+      blockers: parsed.blockers,
       submittedAt,
       writebackOperationKeys: [],
     };
@@ -166,6 +257,7 @@ export class IssueTriageService {
         reportId: report.id,
         disposition: report.disposition,
         confidence: report.confidence,
+        blockers: report.blockers.map((blocker) => ({ kind: blocker.kind, status: blocker.status, nextActor: blocker.nextActor })),
         triggerFingerprint: report.triggerFingerprint,
         lifecycleUpdatedAt: lifecycle.updatedAt,
       },
@@ -179,7 +271,7 @@ export function parseIssueTriageReport(input: unknown): IssueTriageReportInput {
   if (!parsed.success) {
     throw new SymphonyError("invalid_request", "Issue triage report is invalid", parsed.error.flatten());
   }
-  return parsed.data;
+  return canonicalIssueTriageReportInput(parsed.data);
 }
 
 export function shouldIssueTriageRun(
@@ -260,6 +352,19 @@ export function issueTriageReportRequestHash(input: IssueTriageReportInput): str
       stableJson({
         issueId: input.issueId,
         triggerFingerprint: input.triggerFingerprint,
+        summary: normalizeString(input.summary),
+        blockers: input.blockers,
+      }),
+    )
+    .digest("hex");
+}
+
+export function legacyIssueTriageReportRequestHash(input: IssueTriageReportInput): string {
+  return createHash("sha256")
+    .update(
+      stableJson({
+        issueId: input.issueId,
+        triggerFingerprint: input.triggerFingerprint,
         disposition: input.disposition,
         confidence: input.confidence,
         summary: normalizeString(input.summary),
@@ -274,15 +379,175 @@ export function renderIssueTriageReportSummary(report: IssueTriageReportRecord):
   return [
     report.summary,
     "",
-    `Disposition: ${report.disposition}`,
-    `Confidence: ${report.confidence}`,
-    "",
-    "Evidence:",
-    ...report.evidence.map((item) => `- ${item}`),
-    "",
-    "Recommended next action:",
-    report.recommendedAction,
+    "Blockers:",
+    ...report.blockers.flatMap((blocker, index) => [
+      `${index + 1}. ${blocker.kind} (${blocker.status}, ${blocker.nextActor}, ${blocker.confidence})`,
+      `   Summary: ${blocker.summary}`,
+      `   Recommended next action: ${blocker.recommendedAction}`,
+      "   Evidence:",
+      ...blocker.evidence.map((item) => `   - ${item}`),
+    ]),
   ].join("\n");
+}
+
+export function sortIssueTriageBlockers(blockers: readonly IssueTriageBlockerRecord[]): IssueTriageBlockerRecord[] {
+  return [...blockers].sort(compareIssueTriageBlockers);
+}
+
+export function highestPrecedenceIssueTriageBlocker(
+  report: { blockers?: readonly IssueTriageBlockerRecord[] } | null | undefined,
+): IssueTriageBlockerRecord | null {
+  return sortIssueTriageBlockers(report?.blockers ?? [])[0] ?? null;
+}
+
+export function activeIssueTriageBlockers(
+  report: { blockers?: readonly IssueTriageBlockerRecord[] } | null | undefined,
+): IssueTriageBlockerRecord[] {
+  return sortIssueTriageBlockers((report?.blockers ?? []).filter((blocker) => blocker.status === "active"));
+}
+
+export function activeWorkerOwnedIssueTriageBlockers(
+  report: { blockers?: readonly IssueTriageBlockerRecord[] } | null | undefined,
+): IssueTriageBlockerRecord[] {
+  return activeIssueTriageBlockers(report).filter((blocker) => blocker.nextActor === "worker");
+}
+
+export function issueTriageBlockerPrecedence(kind: IssueTriageBlockerKind): number {
+  return ISSUE_TRIAGE_BLOCKER_PRECEDENCE[kind];
+}
+
+function canonicalIssueTriageReportInput(input: RawIssueTriageReportInput): IssueTriageReportInput {
+  const blockers = sortIssueTriageBlockers(
+    (input.blockers ?? [
+      {
+        kind: legacyIssueTriageBlockerKind(input.disposition as IssueTriageDisposition),
+        status: "active" as const,
+        nextActor: legacyIssueTriageNextActor(input.disposition as IssueTriageDisposition),
+        confidence: input.confidence as IssueTriageConfidence,
+        summary: input.summary,
+        evidence: input.evidence as string[],
+        recommendedAction: input.recommendedAction as string,
+      },
+    ]).map(canonicalIssueTriageBlocker),
+  );
+  const primary = primaryIssueTriageBlockerForLegacyFields(blockers);
+  if (!primary) {
+    throw new SymphonyError("invalid_request", "Issue triage report requires at least one blocker");
+  }
+  return {
+    runId: normalizeString(input.runId),
+    issueId: normalizeString(input.issueId),
+    triggerFingerprint: normalizeString(input.triggerFingerprint),
+    summary: normalizeString(input.summary),
+    blockers,
+    disposition: legacyDispositionForIssueTriageBlocker(primary.kind),
+    confidence: primary.confidence,
+    evidence: primary.evidence,
+    recommendedAction: primary.recommendedAction,
+    idempotencyKey: normalizeString(input.idempotencyKey),
+  };
+}
+
+function canonicalIssueTriageBlocker(blocker: IssueTriageBlockerRecord): IssueTriageBlockerRecord {
+  return {
+    kind: blocker.kind,
+    status: blocker.status,
+    nextActor: blocker.nextActor,
+    confidence: blocker.confidence,
+    summary: normalizeString(blocker.summary),
+    evidence: normalizeStringList(blocker.evidence),
+    recommendedAction: normalizeString(blocker.recommendedAction),
+  };
+}
+
+function primaryIssueTriageBlockerForLegacyFields(blockers: readonly IssueTriageBlockerRecord[]): IssueTriageBlockerRecord | null {
+  const active = highestPrecedenceIssueTriageBlocker({ blockers: blockers.filter((blocker) => blocker.status === "active") });
+  return active ?? highestPrecedenceIssueTriageBlocker({ blockers });
+}
+
+function compareIssueTriageBlockers(left: IssueTriageBlockerRecord, right: IssueTriageBlockerRecord): number {
+  const precedence = ISSUE_TRIAGE_BLOCKER_PRECEDENCE[left.kind] - ISSUE_TRIAGE_BLOCKER_PRECEDENCE[right.kind];
+  if (precedence !== 0) return precedence;
+  const status = issueTriageBlockerStatusRank(left.status) - issueTriageBlockerStatusRank(right.status);
+  if (status !== 0) return status;
+  const actor = left.nextActor.localeCompare(right.nextActor);
+  if (actor !== 0) return actor;
+  return left.summary.localeCompare(right.summary);
+}
+
+function issueTriageBlockerStatusRank(status: IssueTriageBlockerStatus): number {
+  return status === "active" ? 0 : 1;
+}
+
+function legacyIssueTriageBlockerKind(disposition: IssueTriageDisposition): IssueTriageBlockerKind {
+  switch (disposition) {
+    case "decompose_issue":
+      return "under_specified_needs_decomposition";
+    case "implementation_repair":
+      return "implementation_unsatisfied_requirements";
+    case "validation_repair":
+      return "validation_or_test_failure";
+    case "compatibility_matrix_repair":
+      return "compatibility_matrix_gap";
+    case "retarget_or_split_pr":
+    case "close_or_retarget_issue":
+      return "pr_target_or_scope_mismatch";
+    case "merge_gate_repair":
+      return "merge_gate_check_failure";
+    case "process_gate_repair":
+    case "orchestrator_context_repair":
+      return "orchestrator_context_or_prompt_gap";
+    case "infra_repair":
+      return "infra_or_tooling_failure";
+    case "manual_decision":
+      return "manual_decision";
+  }
+}
+
+function legacyIssueTriageNextActor(disposition: IssueTriageDisposition): IssueTriageBlockerNextActor {
+  switch (disposition) {
+    case "decompose_issue":
+      return "planner";
+    case "implementation_repair":
+    case "validation_repair":
+    case "compatibility_matrix_repair":
+    case "merge_gate_repair":
+      return "worker";
+    case "process_gate_repair":
+    case "orchestrator_context_repair":
+      return "orchestrator";
+    case "infra_repair":
+      return "infra";
+    case "retarget_or_split_pr":
+    case "close_or_retarget_issue":
+    case "manual_decision":
+      return "operator";
+  }
+}
+
+function legacyDispositionForIssueTriageBlocker(kind: IssueTriageBlockerKind): IssueTriageDisposition {
+  switch (kind) {
+    case "under_specified_needs_decomposition":
+      return "decompose_issue";
+    case "implementation_unsatisfied_requirements":
+      return "implementation_repair";
+    case "validation_or_test_failure":
+      return "validation_repair";
+    case "compatibility_matrix_gap":
+      return "compatibility_matrix_repair";
+    case "pr_target_or_scope_mismatch":
+      return "retarget_or_split_pr";
+    case "merge_conflict":
+    case "merge_gate_check_failure":
+    case "pr_review_gate":
+      return "merge_gate_repair";
+    case "orchestrator_context_or_prompt_gap":
+      return "orchestrator_context_repair";
+    case "infra_or_tooling_failure":
+      return "infra_repair";
+    case "manual_decision":
+      return "manual_decision";
+  }
 }
 
 function validateCaller(report: IssueTriageReportInput, context: IssueTriageActiveContext): void {
@@ -299,9 +564,9 @@ function validateCaller(report: IssueTriageReportInput, context: IssueTriageActi
 
 function assertIssueTriageReplayAllowed(
   existing: IssueTriageReportRecord,
-  expected: { idempotencyKey: string; activeRunId: string; requestHash: string },
+  expected: { idempotencyKey: string; activeRunId: string; requestHash: string; legacyRequestHash: string },
 ): void {
-  if (existing.requestHash !== expected.requestHash) {
+  if (existing.requestHash !== expected.requestHash && existing.requestHash !== expected.legacyRequestHash) {
     throw issueTriageIdempotencyConflict("payload_mismatch", existing, expected);
   }
 }
@@ -309,13 +574,14 @@ function assertIssueTriageReplayAllowed(
 function issueTriageIdempotencyConflict(
   reason: "payload_mismatch" | "cross_run_key_reuse",
   existing: IssueTriageReportRecord,
-  expected: { idempotencyKey: string; activeRunId: string; requestHash: string },
+  expected: { idempotencyKey: string; activeRunId: string; requestHash: string; legacyRequestHash?: string },
 ): SymphonyError {
   return new SymphonyError("conflict", "Issue triage report idempotency key was reused with a different run or payload", {
     reason,
     idempotencyKey: expected.idempotencyKey,
     activeRunId: expected.activeRunId,
     requestHash: expected.requestHash,
+    legacyRequestHash: expected.legacyRequestHash,
     existingRunId: existing.runId,
     existingRequestHash: existing.requestHash,
     existingReportId: existing.id,

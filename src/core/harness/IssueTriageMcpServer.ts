@@ -1,6 +1,13 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { ISSUE_TRIAGE_DISPOSITIONS, IssueTriageService, issueTriageTriggerFingerprint, type IssueTriageActiveContext } from "../IssueTriageService.js";
+import {
+  ISSUE_TRIAGE_BLOCKER_KINDS,
+  ISSUE_TRIAGE_BLOCKER_NEXT_ACTORS,
+  ISSUE_TRIAGE_BLOCKER_STATUSES,
+  IssueTriageService,
+  issueTriageTriggerFingerprint,
+  type IssueTriageActiveContext,
+} from "../IssueTriageService.js";
 import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
@@ -62,6 +69,12 @@ export async function submitIssueTriageReportFromMcp(
       reportId: result.report.id,
       disposition: result.report.disposition,
       confidence: result.report.confidence,
+      blockers: result.report.blockers.map((blocker) => ({
+        kind: blocker.kind,
+        status: blocker.status,
+        nextActor: blocker.nextActor,
+        confidence: blocker.confidence,
+      })),
     };
   } finally {
     await loader.close();
@@ -81,7 +94,7 @@ export async function runIssueTriageMcpServer(options: {
     output: options.output,
     tool: {
       name: ISSUE_TRIAGE_TOOL_NAME,
-      description: "Submit a classify-only Symphony issue triage report for a max-failure blocked issue.",
+      description: "Submit a read-only Symphony issue triage blocker report for a max-failure blocked issue.",
       inputSchema: issueTriageReportInputSchema(),
       handler: (input) => submitIssueTriageReportFromMcp(input, options),
     },
@@ -100,33 +113,60 @@ function issueTriageReportInputSchema(): Record<string, unknown> {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["disposition", "confidence", "summary", "evidence", "recommendedAction", "idempotencyKey"],
+    required: ["summary", "blockers", "idempotencyKey"],
     properties: {
-      disposition: {
-        type: "string",
-        enum: [...ISSUE_TRIAGE_DISPOSITIONS],
-        description: "Classification for the max-failure blocked issue.",
-      },
-      confidence: {
-        type: "string",
-        enum: ["high", "medium", "low"],
-        description: "Confidence in the selected disposition.",
-      },
       summary: {
         type: "string",
         minLength: 1,
         description: "Concise explanation of why the issue hit the max-failure path.",
       },
-      evidence: {
+      blockers: {
         type: "array",
         minItems: 1,
-        items: { type: "string", minLength: 1 },
-        description: "Specific evidence from lifecycle records, review findings, merge gate data, logs, or code inspection.",
-      },
-      recommendedAction: {
-        type: "string",
-        minLength: 1,
-        description: "Concrete next operator/system action. For decompose_issue, name the hidden scope that should become subissues.",
+        description: "Exhaustive blocker list. Include active blockers and downstream blockers that will remain after higher-precedence blockers are fixed.",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["kind", "status", "nextActor", "confidence", "summary", "evidence", "recommendedAction"],
+          properties: {
+            kind: {
+              type: "string",
+              enum: [...ISSUE_TRIAGE_BLOCKER_KINDS],
+              description: "Blocker category. Report every supported blocker kind that is active or downstream.",
+            },
+            status: {
+              type: "string",
+              enum: [...ISSUE_TRIAGE_BLOCKER_STATUSES],
+              description: "Use active for blockers that currently prevent progress; downstream for blockers that remain after higher-precedence active blockers are fixed.",
+            },
+            nextActor: {
+              type: "string",
+              enum: [...ISSUE_TRIAGE_BLOCKER_NEXT_ACTORS],
+              description: "Actor that should handle this blocker.",
+            },
+            confidence: {
+              type: "string",
+              enum: ["high", "medium", "low"],
+              description: "Confidence in this blocker classification.",
+            },
+            summary: {
+              type: "string",
+              minLength: 1,
+              description: "Concise blocker-specific explanation.",
+            },
+            evidence: {
+              type: "array",
+              minItems: 1,
+              items: { type: "string", minLength: 1 },
+              description: "Specific evidence from lifecycle records, review findings, merge gate data, logs, or code inspection.",
+            },
+            recommendedAction: {
+              type: "string",
+              minLength: 1,
+              description: "Concrete next action for this blocker.",
+            },
+          },
+        },
       },
       idempotencyKey: {
         type: "string",

@@ -219,6 +219,37 @@ export type IssueTriageDisposition =
   | "manual_decision";
 
 export type IssueTriageConfidence = "high" | "medium" | "low";
+export type IssueTriageBlockerKind =
+  | "under_specified_needs_decomposition"
+  | "implementation_unsatisfied_requirements"
+  | "validation_or_test_failure"
+  | "compatibility_matrix_gap"
+  | "orchestrator_context_or_prompt_gap"
+  | "infra_or_tooling_failure"
+  | "pr_target_or_scope_mismatch"
+  | "merge_conflict"
+  | "merge_gate_check_failure"
+  | "pr_review_gate"
+  | "manual_decision";
+export type IssueTriageBlockerStatus = "active" | "downstream";
+export type IssueTriageBlockerNextActor =
+  | "planner"
+  | "worker"
+  | "reviewer"
+  | "merge_conflict_worker"
+  | "operator"
+  | "orchestrator"
+  | "infra";
+
+export interface IssueTriageBlockerRecord {
+  kind: IssueTriageBlockerKind;
+  status: IssueTriageBlockerStatus;
+  nextActor: IssueTriageBlockerNextActor;
+  confidence: IssueTriageConfidence;
+  summary: string;
+  evidence: string[];
+  recommendedAction: string;
+}
 
 export interface IssueTriageReportRecord {
   id: string;
@@ -233,6 +264,7 @@ export interface IssueTriageReportRecord {
   summary: string;
   evidence: string[];
   recommendedAction: string;
+  blockers: IssueTriageBlockerRecord[];
   submittedAt: string;
   writebackOperationKeys: string[];
 }
@@ -1473,6 +1505,34 @@ function normalizeReviewFeedbackRecord(value: unknown, filePath: string, index: 
 
 function normalizeIssueTriageReport(value: unknown, filePath: string, index: number): IssueTriageReportRecord {
   if (!isRecord(value)) throw corruptLifecycle(filePath, `issueTriageReports[${index}] is invalid`);
+  const summary = requiredString(value.summary, filePath, `issueTriageReports[${index}].summary`);
+  const normalizedBlockers =
+    value.blockers === undefined ? null : normalizeIssueTriageBlockers(value.blockers, filePath, index);
+  const primaryBlocker = normalizedBlockers === null ? null : primaryIssueTriageBlockerForLegacyFields(normalizedBlockers);
+  const disposition =
+    value.disposition === undefined
+      ? primaryBlocker === null
+        ? normalizeIssueTriageDisposition(value.disposition, filePath, `issueTriageReports[${index}].disposition`)
+        : legacyDispositionForIssueTriageBlocker(primaryBlocker.kind)
+      : normalizeIssueTriageDisposition(value.disposition, filePath, `issueTriageReports[${index}].disposition`);
+  const confidence =
+    value.confidence === undefined
+      ? primaryBlocker === null
+        ? normalizeIssueTriageConfidence(value.confidence, filePath, `issueTriageReports[${index}].confidence`)
+        : primaryBlocker.confidence
+      : normalizeIssueTriageConfidence(value.confidence, filePath, `issueTriageReports[${index}].confidence`);
+  const evidence =
+    value.evidence === undefined
+      ? primaryBlocker === null
+        ? requiredStringArray(value.evidence, filePath, `issueTriageReports[${index}].evidence`)
+        : primaryBlocker.evidence
+      : requiredStringArray(value.evidence, filePath, `issueTriageReports[${index}].evidence`);
+  const recommendedAction =
+    value.recommendedAction === undefined
+      ? primaryBlocker === null
+        ? requiredString(value.recommendedAction, filePath, `issueTriageReports[${index}].recommendedAction`)
+        : primaryBlocker.recommendedAction
+      : requiredString(value.recommendedAction, filePath, `issueTriageReports[${index}].recommendedAction`);
   return {
     id: requiredString(value.id, filePath, `issueTriageReports[${index}].id`),
     idempotencyKey: requiredString(value.idempotencyKey, filePath, `issueTriageReports[${index}].idempotencyKey`),
@@ -1481,11 +1541,25 @@ function normalizeIssueTriageReport(value: unknown, filePath: string, index: num
     issueId: requiredString(value.issueId, filePath, `issueTriageReports[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `issueTriageReports[${index}].issueIdentifier`),
     triggerFingerprint: requiredString(value.triggerFingerprint, filePath, `issueTriageReports[${index}].triggerFingerprint`),
-    disposition: normalizeIssueTriageDisposition(value.disposition, filePath, `issueTriageReports[${index}].disposition`),
-    confidence: normalizeIssueTriageConfidence(value.confidence, filePath, `issueTriageReports[${index}].confidence`),
-    summary: requiredString(value.summary, filePath, `issueTriageReports[${index}].summary`),
-    evidence: requiredStringArray(value.evidence, filePath, `issueTriageReports[${index}].evidence`),
-    recommendedAction: requiredString(value.recommendedAction, filePath, `issueTriageReports[${index}].recommendedAction`),
+    disposition,
+    confidence,
+    summary,
+    evidence,
+    recommendedAction,
+    blockers:
+      normalizedBlockers === null
+        ? [
+            {
+              kind: legacyIssueTriageBlockerKind(disposition),
+              status: "active",
+              nextActor: legacyIssueTriageNextActor(disposition),
+              confidence,
+              summary,
+              evidence,
+              recommendedAction,
+            },
+          ]
+        : normalizedBlockers,
     submittedAt: requiredString(value.submittedAt, filePath, `issueTriageReports[${index}].submittedAt`),
     writebackOperationKeys:
       value.writebackOperationKeys === undefined
@@ -1520,6 +1594,195 @@ function normalizeIssueTriageDisposition(
 function normalizeIssueTriageConfidence(value: unknown, filePath: string, field: string): IssueTriageConfidence {
   if (value === "high" || value === "medium" || value === "low") return value;
   throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function normalizeIssueTriageBlockers(value: unknown, filePath: string, reportIndex: number): IssueTriageBlockerRecord[] {
+  if (!Array.isArray(value) || value.length === 0) throw corruptLifecycle(filePath, `issueTriageReports[${reportIndex}].blockers is invalid`);
+  return value
+    .map((item, index) => normalizeIssueTriageBlocker(item, filePath, reportIndex, index))
+    .sort(compareIssueTriageBlockers);
+}
+
+function normalizeIssueTriageBlocker(
+  value: unknown,
+  filePath: string,
+  reportIndex: number,
+  blockerIndex: number,
+): IssueTriageBlockerRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `issueTriageReports[${reportIndex}].blockers[${blockerIndex}] is invalid`);
+  return {
+    kind: normalizeIssueTriageBlockerKind(value.kind, filePath, `issueTriageReports[${reportIndex}].blockers[${blockerIndex}].kind`),
+    status: normalizeIssueTriageBlockerStatus(value.status, filePath, `issueTriageReports[${reportIndex}].blockers[${blockerIndex}].status`),
+    nextActor: normalizeIssueTriageBlockerNextActor(
+      value.nextActor,
+      filePath,
+      `issueTriageReports[${reportIndex}].blockers[${blockerIndex}].nextActor`,
+    ),
+    confidence: normalizeIssueTriageConfidence(value.confidence, filePath, `issueTriageReports[${reportIndex}].blockers[${blockerIndex}].confidence`),
+    summary: requiredString(value.summary, filePath, `issueTriageReports[${reportIndex}].blockers[${blockerIndex}].summary`),
+    evidence: requiredStringArray(value.evidence, filePath, `issueTriageReports[${reportIndex}].blockers[${blockerIndex}].evidence`),
+    recommendedAction: requiredString(
+      value.recommendedAction,
+      filePath,
+      `issueTriageReports[${reportIndex}].blockers[${blockerIndex}].recommendedAction`,
+    ),
+  };
+}
+
+function normalizeIssueTriageBlockerKind(value: unknown, filePath: string, field: string): IssueTriageBlockerKind {
+  if (
+    value === "under_specified_needs_decomposition" ||
+    value === "implementation_unsatisfied_requirements" ||
+    value === "validation_or_test_failure" ||
+    value === "compatibility_matrix_gap" ||
+    value === "orchestrator_context_or_prompt_gap" ||
+    value === "infra_or_tooling_failure" ||
+    value === "pr_target_or_scope_mismatch" ||
+    value === "merge_conflict" ||
+    value === "merge_gate_check_failure" ||
+    value === "pr_review_gate" ||
+    value === "manual_decision"
+  ) {
+    return value;
+  }
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function normalizeIssueTriageBlockerStatus(value: unknown, filePath: string, field: string): IssueTriageBlockerStatus {
+  if (value === "active" || value === "downstream") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function normalizeIssueTriageBlockerNextActor(value: unknown, filePath: string, field: string): IssueTriageBlockerNextActor {
+  if (
+    value === "planner" ||
+    value === "worker" ||
+    value === "reviewer" ||
+    value === "merge_conflict_worker" ||
+    value === "operator" ||
+    value === "orchestrator" ||
+    value === "infra"
+  ) {
+    return value;
+  }
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function legacyIssueTriageBlockerKind(disposition: IssueTriageDisposition): IssueTriageBlockerKind {
+  switch (disposition) {
+    case "decompose_issue":
+      return "under_specified_needs_decomposition";
+    case "implementation_repair":
+      return "implementation_unsatisfied_requirements";
+    case "validation_repair":
+      return "validation_or_test_failure";
+    case "compatibility_matrix_repair":
+      return "compatibility_matrix_gap";
+    case "retarget_or_split_pr":
+    case "close_or_retarget_issue":
+      return "pr_target_or_scope_mismatch";
+    case "merge_gate_repair":
+      return "merge_gate_check_failure";
+    case "process_gate_repair":
+    case "orchestrator_context_repair":
+      return "orchestrator_context_or_prompt_gap";
+    case "infra_repair":
+      return "infra_or_tooling_failure";
+    case "manual_decision":
+      return "manual_decision";
+  }
+}
+
+function legacyIssueTriageNextActor(disposition: IssueTriageDisposition): IssueTriageBlockerNextActor {
+  switch (disposition) {
+    case "decompose_issue":
+      return "planner";
+    case "implementation_repair":
+    case "validation_repair":
+    case "compatibility_matrix_repair":
+    case "merge_gate_repair":
+      return "worker";
+    case "process_gate_repair":
+    case "orchestrator_context_repair":
+      return "orchestrator";
+    case "infra_repair":
+      return "infra";
+    case "retarget_or_split_pr":
+    case "close_or_retarget_issue":
+    case "manual_decision":
+      return "operator";
+  }
+}
+
+function legacyDispositionForIssueTriageBlocker(kind: IssueTriageBlockerKind): IssueTriageDisposition {
+  switch (kind) {
+    case "under_specified_needs_decomposition":
+      return "decompose_issue";
+    case "implementation_unsatisfied_requirements":
+      return "implementation_repair";
+    case "validation_or_test_failure":
+      return "validation_repair";
+    case "compatibility_matrix_gap":
+      return "compatibility_matrix_repair";
+    case "pr_target_or_scope_mismatch":
+      return "retarget_or_split_pr";
+    case "merge_conflict":
+    case "merge_gate_check_failure":
+    case "pr_review_gate":
+      return "merge_gate_repair";
+    case "orchestrator_context_or_prompt_gap":
+      return "orchestrator_context_repair";
+    case "infra_or_tooling_failure":
+      return "infra_repair";
+    case "manual_decision":
+      return "manual_decision";
+  }
+}
+
+function compareIssueTriageBlockers(left: IssueTriageBlockerRecord, right: IssueTriageBlockerRecord): number {
+  const precedence = issueTriageBlockerPrecedence(left.kind) - issueTriageBlockerPrecedence(right.kind);
+  if (precedence !== 0) return precedence;
+  const status = issueTriageBlockerStatusRank(left.status) - issueTriageBlockerStatusRank(right.status);
+  if (status !== 0) return status;
+  const actor = left.nextActor.localeCompare(right.nextActor);
+  if (actor !== 0) return actor;
+  return left.summary.localeCompare(right.summary);
+}
+
+function issueTriageBlockerPrecedence(kind: IssueTriageBlockerKind): number {
+  switch (kind) {
+    case "under_specified_needs_decomposition":
+      return 10;
+    case "implementation_unsatisfied_requirements":
+      return 20;
+    case "validation_or_test_failure":
+      return 30;
+    case "compatibility_matrix_gap":
+      return 40;
+    case "orchestrator_context_or_prompt_gap":
+      return 50;
+    case "infra_or_tooling_failure":
+      return 60;
+    case "pr_target_or_scope_mismatch":
+      return 70;
+    case "merge_conflict":
+      return 80;
+    case "merge_gate_check_failure":
+      return 90;
+    case "pr_review_gate":
+      return 100;
+    case "manual_decision":
+      return 110;
+  }
+}
+
+function issueTriageBlockerStatusRank(status: IssueTriageBlockerStatus): number {
+  return status === "active" ? 0 : 1;
+}
+
+function primaryIssueTriageBlockerForLegacyFields(blockers: readonly IssueTriageBlockerRecord[]): IssueTriageBlockerRecord | null {
+  const active = blockers.filter((blocker) => blocker.status === "active");
+  return active[0] ?? blockers[0] ?? null;
 }
 
 function normalizeMergeGateState(value: unknown, filePath: string): IssueMergeGateState | null {

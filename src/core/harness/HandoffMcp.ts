@@ -196,11 +196,12 @@ export function renderIssueTriageMcpHandoffPrompt(input: RuntimeHandoffPromptInp
     `- Workspace path: ${input.workspacePath ?? "n/a"}`,
     `- Repository path: ${input.repoPath ?? "n/a"}`,
     `- Base ref: ${input.baseRef ?? "n/a"}`,
-    "- Before ending the run, call the submit_issue_triage_report MCP tool with disposition, confidence, summary, evidence, recommendedAction, and idempotencyKey.",
+    "- Before ending the run, call the submit_issue_triage_report MCP tool with summary, blockers, and idempotencyKey.",
     "- This is classify-only triage. Inspect the lifecycle evidence and repository context as needed, but do not edit files, create commits, push branches, transition Linear state, comment on Linear, or create subissues.",
-    "- Use disposition=\"decompose_issue\" only when the failures show hidden or under-specified scope that should be converted into smaller blocking child issues.",
-    "- Use repair/refinement dispositions for non-decomposition failures such as validation gaps, merge-gate-only failures, infrastructure problems, PR retargeting, or orchestrator context defects.",
-    "- Evidence must name concrete lifecycle records, review findings, merge-gate facts, commands, logs, or code paths that support the classification.",
+    "- Report an exhaustive blocker list. Include active blockers and downstream blockers that will remain after higher-precedence blockers are fixed.",
+    "- Do not collapse blockers into one category. Lower-precedence PR, CI, merge, or review-gate blockers must not mask active implementation, validation, decomposition, or orchestration-context blockers.",
+    "- Each blocker must include kind, status, nextActor, confidence, summary, evidence, and recommendedAction.",
+    "- Evidence must name concrete lifecycle records, review findings, merge-gate facts, commands, logs, or code paths that support each blocker.",
     "- After the MCP tool accepts the report, Symphony publishes a service-owned Linear triage comment with the recommendation. Do not write to Linear directly.",
   ].join("\n");
 }
