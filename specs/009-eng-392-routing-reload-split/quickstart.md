@@ -125,3 +125,122 @@ Keep these adjacent PR #286 paths excluded unless a later child contract names t
 - Keep follow-up notes limited to public URLs and repo-relative paths.
 - Do not paste secrets, credentials, raw environment values, or local absolute filesystem paths.
 - When citing the blocked-state validation history, prefer the exact command strings already quoted in the review comments.
+
+## Local validation quickstart
+
+Run these commands from the repository root in PowerShell. They stay inside the checkout and avoid live Linear or GitHub writeback by default.
+
+### PowerShell setup
+
+```powershell
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$Quickstart = '.\specs\009-eng-392-routing-reload-split\quickstart.md'
+$ChildContracts = '.\specs\009-eng-392-routing-reload-split\contracts\child-issue-contracts.md'
+$SurfaceGate = '.\specs\009-eng-392-routing-reload-split\contracts\publication-surface-gate.md'
+$ValidationGuide = '.\specs\009-eng-392-routing-reload-split\contracts\validation-evidence.md'
+
+Test-Path $Quickstart
+Test-Path $ChildContracts
+Test-Path $SurfaceGate
+Test-Path $ValidationGuide
+```
+
+All four `Test-Path` checks should print `True` before you rely on the rest of this packet.
+
+### 1. Issue-contract lint
+
+```powershell
+npm test -- tests/issue-contract-lint.test.ts
+```
+
+Expected evidence to record:
+
+- exit code `0`
+- a passing `tests/issue-contract-lint.test.ts` run
+- the child examples in `$ChildContracts` still satisfy the required headings, fenced JSON `Issue Contract` blocks, and stable requirement IDs
+
+### 2. Orchestrator validation sweeps
+
+Run the focused local test sweeps that back the runtime-routing, reload-preservation, approval-writeback, and focused-proof child families:
+
+```powershell
+npm test -- tests/orchestrator.test.ts tests/status-api.test.ts tests/cursor-workspace-opener.test.ts
+npm test -- tests/orchestrator.test.ts tests/status-api.test.ts
+npm test -- tests/orchestrator.test.ts tests/completion-report-service.test.ts tests/operator-approval-service.test.ts tests/approval-status-api.test.ts tests/status-api.test.ts
+npm test -- tests/orchestrator.test.ts
+```
+
+Expected evidence to record:
+
+- all four commands exit `0`
+- the passing output covers `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, `REQ-392-APPROVAL-WRITEBACK`, and `REQ-392-TEST-PROOF`
+- review notes cite the matching suites directly instead of inferring success from coupled runtime edits alone
+
+### 3. Diff-surface checks
+
+```powershell
+git diff --name-only origin/main...HEAD
+git status --short -- 'tmp-debug-*'
+git diff --name-only origin/main...HEAD -- 'hermes/upstream-src'
+git status --short -- 'hermes/upstream-src'
+```
+
+Expected evidence to record:
+
+- `git diff --name-only origin/main...HEAD` lists only repo-relative surfaces authorized by the active child contract
+- `git status --short -- 'tmp-debug-*'` returns no debug-capture paths
+- both `hermes/upstream-src` checks return no paths, proving vendored Hermes source stayed untouched
+- reviewers can map any remaining spec-doc changes back to `$Quickstart`, `$ChildContracts`, or another explicitly authorized surface
+
+### 4. Redaction check
+
+Use a bounded repo-local scan against the candidate evidence docs you plan to cite. Keep the validation guide itself out of the scan because it intentionally contains example sensitive-pattern classes.
+
+```powershell
+$DocsToScan = @(
+  $ChildContracts,
+  $SurfaceGate,
+  '.\specs\009-eng-392-routing-reload-split\review-notes.md'
+) | Where-Object { Test-Path $_ }
+
+$Patterns = [ordered]@{
+  github_token   = 'gh[pousr]_[A-Za-z0-9]{20,}'
+  github_pat     = 'github_pat_[A-Za-z0-9_]{20,}'
+  openai_key     = 'sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}'
+  private_key    = '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+  credential_url = 'https?://[^\s:@/]+:[^\s@/]+@'
+  local_path     = '(?:[A-Za-z]:[\\/]+Users[\\/]+|/Users/|/home/)'
+}
+
+$Findings = foreach ($Pattern in $Patterns.GetEnumerator()) {
+  foreach ($Hit in Select-String -Path $DocsToScan -Pattern $Pattern.Value -AllMatches) {
+    [pscustomobject]@{
+      pattern = $Pattern.Key
+      path = (Resolve-Path -LiteralPath $Hit.Path -Relative)
+      line = $Hit.LineNumber
+    }
+  }
+}
+
+[pscustomobject]@{
+  surfacesChecked = $DocsToScan
+  findings = @($Findings)
+} | ConvertTo-Json -Depth 4
+```
+
+Expected evidence to record:
+
+- `findings` is `[]`
+- `surfacesChecked` lists only repo-local spec docs you actually plan to cite
+- any finding blocks promotion until the doc or evidence packet is sanitized to remove the secret class or local absolute path
+
+### 5. Review pass criteria
+
+Before promoting a child issue or reviewer packet, confirm all of the following:
+
+- the lint and orchestrator commands above match the child-family validation requirements in `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`
+- the diff checks stay aligned with `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md`
+- the evidence and redaction expectations stay aligned with `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`
+- all cited proof stays repo-relative and public-safe, with no live publication or writeback side effects
