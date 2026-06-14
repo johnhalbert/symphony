@@ -111,6 +111,25 @@ Rules:
 - Do not replace focused proof with a vague claim such as "tests passed" or "docs updated".
 - If `failing-before` is `not_applicable`, `passing-after` may also be `not_applicable`, but the reason must stay explicit.
 
+#### Close/replace planning disposition
+
+When an operator chooses the **close or replace** path instead of a resumed implementation candidate, record the proof bundle as a no-implementation disposition rather than pretending a code change was validated.
+
+Required current-base proof in `base-behavior`:
+
+- cite the current blocked candidate, diff reference, or review artifact that proved the original scope mismatch or protected-surface dependency
+- name the coupled runtime, publication, or other protected surface families that explain why that candidate will not resume
+- explain why this blocked baseline is the correct starting point for the close/replace decision
+
+Required no-implementation proof in `passing-after`:
+
+- record that the disposition is **close or replace** and that no implementation resumed from the blocked candidate
+- cite the superseding issue, branch, PR, or explicit closure record that replaces the blocked candidate
+- record what remains excluded after the decision, including runtime, publication, and debug-capture surfaces that still are not authorized
+- confirm renewed worker or reviewer dispatch stays blocked until the superseding replacement is stable
+
+Current ENG-392 planning baseline: this close/replace variant is **not currently selected**. `specs/009-eng-392-routing-reload-split/quickstart.md` records **split/retarget** as the selected decomposition decision, so any close/replace-specific evidence entry should currently use `status: not_applicable` and explicitly name `split/retarget` as the selected alternative until a later planning decision replaces it.
+
 ### `surface-comparison`
 
 Use this category to keep the evidence packet honest about scope.
