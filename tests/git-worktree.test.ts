@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
-import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import { StructuredLogger, type Logger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { issue, trackerIssue } from "./helpers.js";
 
@@ -46,8 +46,37 @@ describe("git worktree workspace source", () => {
     expect(workspace.workspaceKey).toBe("TEST-2");
   });
 
+  it("scopes fallback branches when tracker branch metadata is missing for duplicate-context siblings", async () => {
+    const manager = newManager(root, repo);
+    const { branchName: _docsBranchName, ...docsIssue } = trackerIssue({
+      id: "issue-docs-missing-branch-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+    const { branchName: _symphonyBranchName, ...symphonyIssue } = trackerIssue({
+      id: "issue-symphony-missing-branch-1",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: null,
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(symphonyWorkspace.workspaceKey).toBe("symphony__ENG-123");
+    expect(docsWorkspace.gitBranchName).toBe("symphony/docs/ENG-123");
+    expect(symphonyWorkspace.gitBranchName).toBe("symphony/symphony/ENG-123");
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
+    expect((await git(["branch", "--show-current"], symphonyWorkspace.path)).trim()).toBe("symphony/symphony/ENG-123");
+  });
+
   it("creates duplicate-identifier context worktrees without collision and cleans up only the targeted sibling", async () => {
     const manager = newManager(root, repo);
+
     const docsIssue = trackerIssue({
       id: "issue-docs-1",
       identifier: "ENG-123",
@@ -202,6 +231,86 @@ describe("git worktree workspace source", () => {
     expect(symphonyWorkspace.gitBranchName).toBe("symphony/ENG-123-symphony");
     expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/ENG-123-docs");
     expect((await git(["branch", "--show-current"], symphonyWorkspace.path)).trim()).toBe("symphony/ENG-123-symphony");
+  });
+
+  it("evaluates branch-template safety independently for sibling issue contexts after priming the cache", async () => {
+    const loggerCapture = createLoggerCapture();
+    const manager = newManager(root, repo, "refuse_dirty", "none", "release/docs-ready/{{ issue.identifier }}", loggerCapture.logger);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-template-cache-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-template-cache-1",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: null,
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    expect(docsWorkspace.gitBranchName).toBe("release/docs-ready/ENG-123");
+    expect(symphonyWorkspace.gitBranchName).toBe("release/docs-ready/symphony/ENG-123");
+    expect(branchPreparationLog(loggerCapture.records, docsWorkspace.path)).toMatchObject({
+      level: "debug",
+      message: "git worktree branch prepared",
+      fields: {
+        workspace_path: docsWorkspace.path,
+        branch_name: "release/docs-ready/ENG-123",
+        branch_candidate_name: "release/docs-ready/ENG-123",
+        branch_source: "branch_template",
+        branch_collision_reason: "template_already_contextualized",
+        tracker_branch_name: null,
+        branch_template: "release/docs-ready/{{ issue.identifier }}",
+      },
+    });
+    expect(branchPreparationLog(loggerCapture.records, symphonyWorkspace.path)).toMatchObject({
+      level: "debug",
+      message: "git worktree branch prepared",
+      fields: {
+        workspace_path: symphonyWorkspace.path,
+        branch_name: "release/docs-ready/symphony/ENG-123",
+        branch_candidate_name: "release/docs-ready/ENG-123",
+        branch_source: "branch_template",
+        branch_collision_reason: "scoped_before_identifier",
+        tracker_branch_name: null,
+        branch_template: "release/docs-ready/{{ issue.identifier }}",
+      },
+    });
+  });
+
+  it("passes the selected safe branch and branch-source evidence into git worktree creation", async () => {
+    const loggerCapture = createLoggerCapture();
+    const manager = newManager(root, repo, "refuse_dirty", "none", "symphony/{{ issue.identifier }}", loggerCapture.logger);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-branch-evidence-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/ENG-123",
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+
+    expect(docsWorkspace.gitBranchName).toBe("symphony/docs/ENG-123");
+    expect(branchPreparationLog(loggerCapture.records, docsWorkspace.path)).toMatchObject({
+      level: "debug",
+      message: "git worktree branch prepared",
+      fields: {
+        workspace_path: docsWorkspace.path,
+        branch_name: "symphony/docs/ENG-123",
+        branch_candidate_name: "symphony/ENG-123",
+        branch_source: "tracker_metadata",
+        branch_collision_reason: "scoped_before_identifier",
+        tracker_branch_name: "symphony/ENG-123",
+        branch_template: null,
+      },
+    });
   });
 
   it("backfills persisted project context when removing duplicate-identifier worktrees without incoming context", async () => {
@@ -375,6 +484,7 @@ function newManager(
   cleanup: "refuse_dirty" | "force" = "refuse_dirty",
   planningWorkspaceMode: "none" | "readonly_checkout" = "none",
   branchTemplate = "symphony/{{ issue.identifier }}",
+  logger: Logger = new StructuredLogger(() => undefined),
 ): WorkspaceManager {
   const config = parseServiceConfig(
     {
@@ -397,9 +507,40 @@ function newManager(
   return new WorkspaceManager({
     workspace: config.workspace,
     hooks: config.hooks,
-    logger: new StructuredLogger(() => undefined),
+    logger,
     planningWorkspaceMode,
   });
+}
+
+interface CapturedLogRecord {
+  level: string;
+  message: string;
+  fields: Record<string, unknown>;
+}
+
+function createLoggerCapture(): { logger: Logger; records: CapturedLogRecord[] } {
+  const records: CapturedLogRecord[] = [];
+  const logger: Logger = {
+    debug(message, fields = {}) {
+      records.push({ level: "debug", message, fields });
+    },
+    info(message, fields = {}) {
+      records.push({ level: "info", message, fields });
+    },
+    warn(message, fields = {}) {
+      records.push({ level: "warn", message, fields });
+    },
+    error(message, fields = {}) {
+      records.push({ level: "error", message, fields });
+    },
+  };
+  return { logger, records };
+}
+
+function branchPreparationLog(records: CapturedLogRecord[], workspacePath: string): CapturedLogRecord | undefined {
+  return records.find(
+    (record) => record.message === "git worktree branch prepared" && record.fields.workspace_path === workspacePath,
+  );
 }
 
 async function initRepo(repository: string): Promise<void> {

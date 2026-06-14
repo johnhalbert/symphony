@@ -11,7 +11,13 @@ import {
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue, Workspace } from "../types.js";
 import type { Logger } from "../logging/StructuredLogger.js";
-import { createGitPlanningCheckout, createGitWorktree, removeGitWorktree } from "./GitWorktreeManager.js";
+import {
+  createGitPlanningCheckout,
+  createGitWorktree,
+  removeGitWorktree,
+  type GitBranchCollisionReason,
+  type ResolvedGitBranchSelection,
+} from "./GitWorktreeManager.js";
 import { FileRunTranscriptStore, type WorkspaceRecord } from "../persistence/RunTranscriptStore.js";
 
 export interface WorkspaceManagerOptions {
@@ -37,6 +43,7 @@ export interface WorkspaceMetadata {
 
 export class WorkspaceManager {
   private readonly branchRenderer = new Liquid({ strictVariables: true });
+  private readonly branchTemplateSafetyCache = new Map<string, ScopedBranchNameDecision>();
   private readonly store: FileRunTranscriptStore;
 
   constructor(private readonly options: WorkspaceManagerOptions) {
@@ -55,12 +62,12 @@ export class WorkspaceManager {
     await assertWorkspaceParentInsideRoot(workspacePath, this.options.workspace.root);
     const createdNow = !(await pathExists(workspacePath));
     if (createdNow && this.options.workspace.source.kind === "git_worktree") {
-      const branchName = await this.resolveBranchName(issue);
+      const branch = await this.resolveBranchSelection(issue);
       const result = await createGitWorktree({
         source: this.options.workspace.source,
         stateDir: this.options.workspace.stateDir,
         workspacePath,
-        branchName,
+        branch,
         timeoutMs: this.options.hooks.timeoutMs,
         logger: this.options.logger,
       });
@@ -420,13 +427,18 @@ export class WorkspaceManager {
     await this.store.upsertWorkspace(metadata);
   }
 
-  private async resolveBranchName(issue: WorkspaceIssue): Promise<string> {
+  private async resolveBranchSelection(issue: WorkspaceIssue): Promise<ResolvedGitBranchSelection> {
     const source = this.options.workspace.source;
-    const template = source.branchTemplate;
-    const renderedFromTemplate = !issue.branchName && Boolean(template);
-    const branchName =
-      issue.branchName ??
-      (template
+    const template = source.branchTemplate ?? null;
+    const trackerBranchName = issue.branchName ?? null;
+    const branchSource: ResolvedGitBranchSelection["source"] = trackerBranchName !== null
+      ? "tracker_metadata"
+      : template
+        ? "branch_template"
+        : "default_fallback";
+    const candidateBranchName = trackerBranchName !== null
+      ? trackerBranchName
+      : template
         ? await this.branchRenderer.parseAndRender(template, {
             issue: {
               id: issue.id,
@@ -437,10 +449,48 @@ export class WorkspaceManager {
               projectContextLabel: issue.projectContext?.projectContextLabel ?? null,
             },
           })
-        : defaultBranchNameForIssue(issue));
-    const trimmed = String(branchName).trim();
-    if (trimmed.length === 0) throw new SymphonyError("workspace_error", "Resolved git branch name is empty");
-    return scopeBranchNameToProjectContext(trimmed, issue, { renderedFromTemplate });
+        : defaultBranchNameForIssue(issue);
+    const trimmedCandidateBranchName = String(candidateBranchName).trim();
+    if (trimmedCandidateBranchName.length === 0) {
+      throw new SymphonyError("workspace_error", "Resolved git branch name is empty");
+    }
+
+    const scopedBranch =
+      branchSource === "branch_template"
+        ? this.resolveBranchTemplateSafetyDecision(issue, template, trackerBranchName, trimmedCandidateBranchName)
+        : scopeBranchNameToProjectContext(trimmedCandidateBranchName, issue);
+
+    return {
+      branchName: scopedBranch.branchName,
+      candidateBranchName: trimmedCandidateBranchName,
+      source: branchSource,
+      collisionReason: scopedBranch.collisionReason,
+      trackerBranchName,
+      branchTemplate: branchSource === "branch_template" ? template : null,
+    };
+  }
+
+  private resolveBranchTemplateSafetyDecision(
+    issue: WorkspaceIssue,
+    template: string | null,
+    trackerBranchName: string | null,
+    candidateBranchName: string,
+  ): ScopedBranchNameDecision {
+    const cacheKey = JSON.stringify({
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      projectContextId: issue.projectContext?.projectContextId ?? null,
+      projectContextLabel: issue.projectContext?.projectContextLabel ?? null,
+      repository: this.options.workspace.source.kind === "git_worktree" ? this.options.workspace.source.repository ?? null : null,
+      template,
+      trackerBranchName,
+      candidateBranchName,
+    });
+    const cached = this.branchTemplateSafetyCache.get(cacheKey);
+    if (cached) return cached;
+    const decision = scopeBranchNameToProjectContext(candidateBranchName, issue, { renderedFromTemplate: true });
+    this.branchTemplateSafetyCache.set(cacheKey, decision);
+    return decision;
   }
 
   private async assertExistingWorktree(workspaceKey: string, workspacePath: string): Promise<void> {
@@ -466,7 +516,7 @@ export interface WorkspaceIssue {
 export interface WorkspaceIssueInput {
   id: string | null;
   identifier: string;
-  branchName: string | null;
+  branchName?: string | null;
   projectContext?: ProjectContextResolution | null;
 }
 
@@ -474,9 +524,14 @@ function normalizeIssueInput(input: WorkspaceIssueInput): WorkspaceIssue {
   return {
     id: input.id,
     identifier: input.identifier,
-    branchName: input.branchName,
+    branchName: input.branchName ?? null,
     projectContext: projectContextResolutionFromIssue(input),
   };
+}
+
+interface ScopedBranchNameDecision {
+  branchName: string;
+  collisionReason: GitBranchCollisionReason | null;
 }
 
 function workspaceKeyForIssue(issue: WorkspaceIssue): string {
@@ -517,9 +572,11 @@ function scopeBranchNameToProjectContext(
   branchName: string,
   issue: WorkspaceIssue,
   options: { renderedFromTemplate?: boolean } = {},
-): string {
+): ScopedBranchNameDecision {
   const projectContextId = issue.projectContext?.projectContextId;
-  if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return branchName;
+  if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+    return { branchName, collisionReason: null };
+  }
 
   const contextPart = sanitizeGitBranchPart(projectContextId);
   const branchParts = branchName.split("/").filter((part) => part.length > 0);
@@ -528,15 +585,23 @@ function scopeBranchNameToProjectContext(
   const matchesUnscopedDefault =
     branchParts.length === unscopedDefaultParts.length && branchParts.every((part, index) => part === unscopedDefaultParts[index]);
   if (options.renderedFromTemplate && !matchesUnscopedDefault && branchParts.some((part) => branchPartContainsContextToken(part, contextPart))) {
-    return branchName;
+    return { branchName, collisionReason: "template_already_contextualized" };
   }
   const identifierIndex = findBranchPartSequence(branchParts, identifierParts);
   if (identifierIndex >= 0) {
-    if (!matchesUnscopedDefault && identifierIndex > 0 && branchParts[identifierIndex - 1] === contextPart) return branchName;
-    return [...branchParts.slice(0, identifierIndex), contextPart, ...branchParts.slice(identifierIndex)].join("/");
+    if (!matchesUnscopedDefault && identifierIndex > 0 && branchParts[identifierIndex - 1] === contextPart) {
+      return { branchName, collisionReason: "already_contextualized_before_identifier" };
+    }
+    return {
+      branchName: [...branchParts.slice(0, identifierIndex), contextPart, ...branchParts.slice(identifierIndex)].join("/"),
+      collisionReason: "scoped_before_identifier",
+    };
   }
 
-  return [...branchParts, contextPart].join("/");
+  return {
+    branchName: [...branchParts, contextPart].join("/"),
+    collisionReason: "appended_context_suffix",
+  };
 }
 
 function sanitizeGitBranchPart(value: string): string {
