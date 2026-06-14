@@ -111,6 +111,7 @@ Current responsibilities:
 5. **The current apply path creates children, then relations, then a parent comment.** These services do not perform a separate child-issue update pass; they stage `issue_create`, `issue_relation`, and parent `comment` writebacks.
 6. **Apply depends on freshness and writeback availability.** A plan only applies when it is the latest fresh plan, `applyToLinear` is enabled, and writeback is both enabled and available.
 7. **Idempotency is already scoped for decomposition retries.** Same-run plan replays require an identical payload, cross-run idempotency-key reuse is rejected, and each child create operation gets its own payload-hashed dedupe key.
+8. **Vendored Hermes upstream source stays out of scope.** The tracked ENG-392 planning artifacts in `specs/009-eng-392-routing-reload-split/` do not authorize edits under `hermes/upstream-src/**`; any follow-on child task that appears to require vendored Hermes changes should stay blocked until a separate protected-surface contract explicitly authorizes that work.
 
 ## Scenario matrix used for this inventory
 
@@ -137,4 +138,18 @@ The current Symphony decomposition path already has three distinct seams:
 2. **Plan application / child writeback orchestration** in `IssueBreakdownPlanApplyService`.
 3. **Contract and protected-surface preflight** in `IssueContractLint`.
 
-For ENG-392 child issue creation, the critical constraints are: keep child contracts fully formed up front, avoid auto-ready labels, keep protected-path children manual-only, and ensure dependency titles are unique and resolvable before any writeback apply is attempted.
+For ENG-392 child issue creation, the critical constraints are: keep child contracts fully formed up front, avoid auto-ready labels, keep protected-path children manual-only, ensure dependency titles are unique and resolvable before any writeback apply is attempted, and keep vendored Hermes upstream source out of scope unless a later protected-surface contract explicitly expands authorization.
+
+## T005 verification note: vendored Hermes source remains out of scope
+
+- Checked the tracked planning artifacts under `specs/009-eng-392-routing-reload-split/` and confirmed only `research.md` and `quickstart.md` are present in `HEAD`; `tasks.md` is not a tracked file in the current decomposition snapshot.
+- Reviewed the current 009 planning notes for authorized work surfaces. The recorded decomposition constraints and protected publication surface inventory cover Symphony-owned planning, runtime, test, and writeback paths only; neither artifact names `hermes/upstream-src/**` as an edit target or prerequisite.
+- Result: the current ENG-392 decomposition does not authorize changes under `hermes/upstream-src/**`. If a future child issue appears to require vendored Hermes edits, treat that as a new protected-surface planning gap that needs explicit contract authorization instead of folding it into the current scope.
+
+### T005 verification matrix
+
+| Scenario | Expected handling |
+| --- | --- |
+| Tracked ENG-392 planning artifacts stay limited to Symphony-owned repo surfaces | Current decomposition remains in scope without vendored Hermes edits. |
+| A future child plan or task explicitly names `hermes/upstream-src/**` | Treat it as out of scope for the current decomposition and require a separate protected-surface contract before implementation. |
+| The implementation branch diff touches `hermes/upstream-src/**` | Treat it as a validation failure for this task because vendored upstream source must remain unchanged. |
