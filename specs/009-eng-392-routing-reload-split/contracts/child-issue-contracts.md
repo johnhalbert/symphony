@@ -72,21 +72,34 @@ Record the ENG-392 decomposition decision before any child implementation work s
 
 ## Acceptance Criteria
 
-- The issue names the chosen decomposition path and the child titles that depend on it.
-- The issue keeps excluded runtime, test, publication, and debug-capture surfaces explicit until a later child contract names them directly.
+- The issue names the chosen decomposition path and the child titles or superseding replacement that depend on it.
+- The issue limits operator outcomes to split/retarget, widened child-contract authorization, or close/replace with durable proof.
+- The issue states the evidence required before renewed worker or reviewer dispatch can resume.
+- The issue keeps excluded runtime, test, publication, and debug-capture surfaces explicit until a later child contract names them directly or replacement evidence retires them.
+
+### Operator decision checklist
+
+1. Restate the blocking evidence that forced decomposition, including the current candidate or diff reference plus the coupled protected surfaces.
+2. Choose exactly one allowed outcome and cite proof:
+   - **Split or retarget**: identify the scoped child title(s), requirement ID(s), and diff or surface-map proof showing the renewed candidate stays within those authorized surfaces.
+   - **Widen child contract(s)**: name the widened child contract(s), newly authorized surface families or paths, and validation proof showing the broader scope is intentional and fully owned.
+   - **Close or replace**: record why the blocked candidate will not resume, plus the superseding issue, branch, PR, or explicit closure record that replaces it.
+3. Record what remains excluded after the choice, including runtime, publication, and debug-capture surfaces not yet authorized.
+4. Confirm renewed worker or reviewer dispatch stays blocked until the cited proof is present and the dependency order or superseding replacement is stable.
 
 ## Contract Checklist
 
-- Happy path: the decision freezes one decomposition path and lists the child titles it unblocks.
-- Negative/error path: ambiguous or contradictory scope language is removed instead of leaving multiple incompatible repair paths open.
-- Adjacent sibling surface: the decision keeps the tests-only proof slice and the protected runtime/publication slices distinct.
-- Empty/missing/stale/fallback state: the issue says what remains excluded when no later child contract has been created yet.
-- Replay/restart/idempotency: repeated plan review points back to the same stable child titles and requirement IDs.
+- Happy path: the decision freezes exactly one allowed outcome and lists the child titles, requirement IDs, or replacement reference it unblocks.
+- Negative/error path: ambiguous or contradictory scope language is removed instead of leaving multiple incompatible repair paths open or allowing renewed dispatch without proof.
+- Adjacent sibling surface: the decision keeps the tests-only proof slice and the protected runtime/publication slices distinct, even when a widened contract or replacement path is chosen.
+- Empty/missing/stale/fallback state: the issue says what remains excluded and that the blocked non-dispatch state persists when no later child contract or replacement proof exists yet.
+- Replay/restart/idempotency: repeated plan review points back to the same stable child titles, requirement IDs, or superseding replacement record.
 - Credential/security boundary: no secret values, local absolute paths, or credential-bearing URLs appear in the planning notes.
-- Side-effect verification: review the contract-family table itself instead of inferring scope from a nearby PR diff.
+- Side-effect verification: review the recorded proof bundle before renewed dispatch instead of inferring scope from a nearby PR diff.
 
 ## Validation Requirements
 
+- Review `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` and confirm the operator decision checklist lists all three allowed outcomes and the proof each one requires before redispatch.
 - Review `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` and confirm every later family depends on this title directly or transitively, or stays intentionally independent.
 - Review `specs/009-eng-392-routing-reload-split/quickstart.md` and confirm excluded surfaces remain explicitly excluded until a later child contract authorizes them.
 
