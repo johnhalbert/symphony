@@ -1153,7 +1153,7 @@ export class Orchestrator {
     if (!requestedProjectContext) return true;
     const requestedProjectContextId = this.comparableProjectContextId(requestedProjectContext);
     if (requestedProjectContextId === this.config.projectContexts.defaultContextId) {
-      return tracker === this.options.tracker;
+      return tracker === this.options.tracker || Boolean(this.options.trackerResolver);
     }
     return Boolean(this.options.trackerResolver && tracker !== this.options.tracker);
   }

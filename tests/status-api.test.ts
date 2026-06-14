@@ -2754,6 +2754,236 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("routes explicit default-context planning-run identifier lookups through the resolver-selected default tracker when runtime-shaped issues omit project-context proof", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "planning-default-context-workspaces"),
+            state_dir: path.join(root, "planning-default-context-state"),
+          },
+        },
+      }),
+      path.join(root, "planning-default-context-WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    config.tracker.activeStates = ["Root Todo"];
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["root-planning"];
+    config.issueBreakdown.promptTemplate = "Default planning prompt for {{ issue.identifier }}";
+    config.issueBreakdown.cursorMode = "agent";
+    const defaultContextId = config.projectContexts.defaultContextId;
+    const defaultRuntimeIssue = issue({
+      id: "issue-root-planning-1",
+      identifier: "ENG-179",
+      state: "Root Todo",
+      labels: ["root-planning"],
+    });
+    const baseTracker = trackerClientFixture({ candidates: [], issues: [] });
+    const defaultRequestedIds: string[][] = [];
+    let defaultCandidateFetchCount = 0;
+    const defaultTracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        defaultCandidateFetchCount += 1;
+        return [structuredClone(defaultRuntimeIssue)];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds: string[]) {
+        defaultRequestedIds.push([...issueIds]);
+        return [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new PlanningRunRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: baseTracker,
+      trackerResolver: (projectContext) =>
+        projectContext?.projectContextId === defaultContextId ? defaultTracker : baseTracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(
+        `http://${address.host}:${address.port}/api/v1/issues/${defaultContextId}:ENG-179/planning-run`,
+        {
+          method: "POST",
+          headers: { "x-symphony-token": "secret" },
+        },
+      );
+      const body = (await response.json()) as {
+        queued: boolean;
+        issue: string;
+        issueId: string;
+        runPhase: string;
+        runKind: string;
+        reason: string;
+      };
+
+      expect(response.status).toBe(202);
+      expect(body).toMatchObject({
+        queued: true,
+        issue: "ENG-179",
+        issueId: defaultRuntimeIssue.id,
+        runPhase: "issue_breakdown",
+        runKind: "planning",
+        reason: "explicit_request",
+      });
+      expect(baseTracker.requestedIds).toEqual([]);
+      expect(baseTracker.candidateFetchCount).toBe(0);
+      expect(defaultRequestedIds[0]).toEqual(["ENG-179"]);
+      expect(defaultCandidateFetchCount).toBe(1);
+      await waitForStatusApiAsync(
+        async () =>
+          ((await runStore.latestRunForIssue(defaultRuntimeIssue.id, {
+            role: "worker",
+            runPhase: "issue_breakdown",
+          }))?.runKind ?? null) === "planning",
+        "default-context planning run",
+      );
+      await expect(
+        runStore.latestRunForIssue(defaultRuntimeIssue.id, {
+          role: "worker",
+          runPhase: "issue_breakdown",
+        }),
+      ).resolves.toMatchObject({
+        issueId: defaultRuntimeIssue.id,
+        issueIdentifier: defaultRuntimeIssue.identifier,
+        runPhase: "issue_breakdown",
+        runKind: "planning",
+        projectContext: expect.objectContaining({ projectContextId: defaultContextId }),
+      });
+      expect(harness.runs[0]?.ctx.issue.id).toBe(defaultRuntimeIssue.id);
+      expect(harness.runs[0]?.ctx.issue).toMatchObject({ projectContext: { projectContextId: defaultContextId } });
+      expect(harness.runs[0]?.ctx.projectContext).toMatchObject({ projectContextId: defaultContextId });
+      expect(harness.runs[0]?.ctx.config.tracker.activeStates).toEqual(["Root Todo"]);
+      expect(harness.runs[0]?.ctx.config.issueBreakdown.planningLabels).toEqual(["root-planning"]);
+      expect(harness.runs[0]?.ctx.runModeOverride).toBe("agent");
+      expect(harness.runs[0]?.prompt).toContain("Default planning prompt for ENG-179");
+    } finally {
+      await orchestrator.stop();
+      await server.stop();
+    }
+  });
+
+  it("rejects explicit default-context planning-run apply requests after resolving runtime-shaped issues through the resolver-selected default tracker", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "planning-default-context-apply-workspaces"),
+            state_dir: path.join(root, "planning-default-context-apply-state"),
+          },
+        },
+      }),
+      path.join(root, "planning-default-context-apply-WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = false;
+    const defaultContextId = config.projectContexts.defaultContextId;
+    const defaultRuntimeIssue = issue({
+      id: "issue-root-apply-1",
+      identifier: "ENG-179",
+      state: "Todo",
+      labels: ["planning"],
+    });
+    const baseTracker = trackerClientFixture({ candidates: [], issues: [] });
+    const defaultRequestedIds: string[][] = [];
+    let defaultCandidateFetchCount = 0;
+    const defaultTracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        defaultCandidateFetchCount += 1;
+        return [structuredClone(defaultRuntimeIssue)];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds: string[]) {
+        defaultRequestedIds.push([...issueIds]);
+        return [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new PlanningRunRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: baseTracker,
+      trackerResolver: (projectContext) =>
+        projectContext?.projectContextId === defaultContextId ? defaultTracker : baseTracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(
+        `http://${address.host}:${address.port}/api/v1/issues/${defaultContextId}:ENG-179/planning-run/apply`,
+        {
+          method: "POST",
+          headers: { "x-symphony-token": "secret" },
+        },
+      );
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(401);
+      expect(body.error.code).toBe("invalid_request");
+      expect(body.error.message).toBe("Issue breakdown Linear application is disabled");
+      expect(baseTracker.requestedIds).toEqual([]);
+      expect(baseTracker.candidateFetchCount).toBe(0);
+      expect(defaultRequestedIds[0]).toEqual(["ENG-179"]);
+      expect(defaultCandidateFetchCount).toBe(1);
+      expect(harness.runs).toHaveLength(0);
+    } finally {
+      await orchestrator.stop();
+      await server.stop();
+    }
+  });
+
   it("fails closed for context-qualified planning-run internal-id requests when the direct tracker hit lacks project-context proof", async () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
