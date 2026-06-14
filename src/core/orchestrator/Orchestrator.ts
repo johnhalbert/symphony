@@ -1163,31 +1163,38 @@ export class Orchestrator {
     projectContext: ProjectContextResolution | undefined,
     options: { allowCandidateIdentifierLookup?: boolean } = {},
   ): Promise<Issue | null> {
-    const tracker = this.trackerClientForProjectContext(projectContext);
-    const trackerLookupProvesRequestedContext = this.canTrustRequestedProjectContextFromTrackerLookup(
-      tracker,
-      projectContext,
-    );
-    const direct = (await tracker.fetchIssueStatesByIds([issueIdOrIdentifier]))[0] ?? null;
-    if (direct) {
-      if (
-        this.issueMatchesRequestedProjectContext(direct, projectContext) ||
-        (!this.issueHasProjectContextProof(direct) && trackerLookupProvesRequestedContext)
-      ) {
-        return this.issueWithRequestedProjectContext(direct, projectContext);
-      }
-    }
-    if (options.allowCandidateIdentifierLookup !== true) return null;
-    const candidate = (await tracker.fetchCandidateIssues()).find((candidateIssue) => {
-      if (candidateIssue.id !== issueIdOrIdentifier && candidateIssue.identifier !== issueIdOrIdentifier) {
-        return false;
-      }
-      return (
-        this.issueMatchesRequestedProjectContext(candidateIssue, projectContext) ||
-        (!this.issueHasProjectContextProof(candidateIssue) && trackerLookupProvesRequestedContext)
+    try {
+      const tracker = this.trackerClientForProjectContext(projectContext);
+      const trackerLookupProvesRequestedContext = this.canTrustRequestedProjectContextFromTrackerLookup(
+        tracker,
+        projectContext,
       );
-    });
-    return candidate ? this.issueWithRequestedProjectContext(candidate, projectContext) : null;
+      const direct = (await tracker.fetchIssueStatesByIds([issueIdOrIdentifier]))[0] ?? null;
+      if (direct) {
+        if (
+          this.issueMatchesRequestedProjectContext(direct, projectContext) ||
+          (!this.issueHasProjectContextProof(direct) && trackerLookupProvesRequestedContext)
+        ) {
+          return this.issueWithRequestedProjectContext(direct, projectContext);
+        }
+      }
+      if (options.allowCandidateIdentifierLookup !== true) return null;
+      const candidate = (await tracker.fetchCandidateIssues()).find((candidateIssue) => {
+        if (candidateIssue.id !== issueIdOrIdentifier && candidateIssue.identifier !== issueIdOrIdentifier) {
+          return false;
+        }
+        return (
+          this.issueMatchesRequestedProjectContext(candidateIssue, projectContext) ||
+          (!this.issueHasProjectContextProof(candidateIssue) && trackerLookupProvesRequestedContext)
+        );
+      });
+      return candidate ? this.issueWithRequestedProjectContext(candidate, projectContext) : null;
+    } catch (error) {
+      if (error instanceof SymphonyError && error.code === "config_validation_error") {
+        return null;
+      }
+      throw error;
+    }
   }
 
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {

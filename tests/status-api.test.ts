@@ -20,6 +20,7 @@ import { FileRunTranscriptStore, type RunRecord } from "../src/core/persistence/
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import { SymphonyError } from "../src/core/errors.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
@@ -2978,6 +2979,167 @@ describe("StatusServer durable API", () => {
       expect(defaultRequestedIds[0]).toEqual(["ENG-179"]);
       expect(defaultCandidateFetchCount).toBe(1);
       expect(harness.runs).toHaveLength(0);
+    } finally {
+      await orchestrator.stop();
+      await server.stop();
+    }
+  });
+
+  it("fails closed for context-qualified planning-run requests when resolved-context tracker credentials are unavailable", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "planning-context-credential-unavailable-workspaces"),
+            state_dir: path.join(root, "planning-context-credential-unavailable-state"),
+          },
+        },
+      }),
+      path.join(root, "planning-context-credential-unavailable-WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    const rawCredentialMessage =
+      "Linear credential capability linear.tracker is owned by worker, but is assigned only to service. Configure credential_profiles.roles.worker.linear.tracker or remove the non-owning assignment to use legacy tracker api key/LINEAR_API_KEY.";
+    const resolverProjectContextIds: Array<string | null> = [];
+    const baseTracker = trackerClientFixture({ candidates: [], issues: [] });
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new PlanningRunRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: baseTracker,
+      trackerResolver: (projectContext) => {
+        resolverProjectContextIds.push(projectContext?.projectContextId ?? null);
+        if (projectContext?.projectContextId === "docs") {
+          throw new SymphonyError("config_validation_error", rawCredentialMessage);
+        }
+        return baseTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:ENG-179/planning-run`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(404);
+      expect(body.error.code).toBe("not_found");
+      expect(body.error.message).toContain("Issue not found");
+      expect(body.error.message).not.toContain("Linear credential capability linear.tracker is owned by worker");
+      expect(body.error.message).not.toContain("credential_profiles.roles.worker.linear.tracker");
+      expect(body.error.message).not.toContain("LINEAR_API_KEY");
+      expect(resolverProjectContextIds).toEqual(["docs"]);
+      expect(baseTracker.requestedIds).toEqual([]);
+      expect(baseTracker.candidateFetchCount).toBe(0);
+      expect(harness.runs).toHaveLength(0);
+      expect(orchestrator.snapshot().counts.running).toBe(0);
+    } finally {
+      await orchestrator.stop();
+      await server.stop();
+    }
+  });
+
+  it("fails closed for context-qualified planning-run apply requests when resolved-context tracker credentials are unavailable", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "planning-context-apply-credential-unavailable-workspaces"),
+            state_dir: path.join(root, "planning-context-apply-credential-unavailable-state"),
+          },
+        },
+      }),
+      path.join(root, "planning-context-apply-credential-unavailable-WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    const rawCredentialMessage =
+      "Linear credential capability linear.tracker is owned by worker, but is assigned only to service. Configure credential_profiles.roles.worker.linear.tracker or remove the non-owning assignment to use legacy tracker api key/LINEAR_API_KEY.";
+    const resolverProjectContextIds: Array<string | null> = [];
+    const baseTracker = trackerClientFixture({ candidates: [], issues: [] });
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new PlanningRunRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: baseTracker,
+      trackerResolver: (projectContext) => {
+        resolverProjectContextIds.push(projectContext?.projectContextId ?? null);
+        if (projectContext?.projectContextId === "docs") {
+          throw new SymphonyError("config_validation_error", rawCredentialMessage);
+        }
+        return baseTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager,
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:ENG-179/planning-run/apply`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+        body: JSON.stringify({ dryRun: true }),
+      });
+      const body = (await response.json()) as { error: { code: string; message: string } };
+
+      expect(response.status).toBe(404);
+      expect(body.error.code).toBe("not_found");
+      expect(body.error.message).toContain("Issue not found");
+      expect(body.error.message).not.toContain("Linear credential capability linear.tracker is owned by worker");
+      expect(body.error.message).not.toContain("credential_profiles.roles.worker.linear.tracker");
+      expect(body.error.message).not.toContain("LINEAR_API_KEY");
+      expect(resolverProjectContextIds).toEqual(["docs"]);
+      expect(baseTracker.requestedIds).toEqual([]);
+      expect(baseTracker.candidateFetchCount).toBe(0);
+      expect(harness.runs).toHaveLength(0);
+      expect(orchestrator.snapshot().counts.running).toBe(0);
     } finally {
       await orchestrator.stop();
       await server.stop();
