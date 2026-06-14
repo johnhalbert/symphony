@@ -394,6 +394,28 @@ describe("IssueContractLint", () => {
     }
   });
 
+  it("keeps the ENG-392 child contract family examples lintable and mapped to stable requirement ids", () => {
+    const examples = eng392ContractExamples();
+    const expectedRequirementIds = new Map<string, string[]>([
+      ["Family A — `REQ-392-DECISION`", ["REQ-392-DECISION"]],
+      ["Family B — `REQ-392-RUNTIME-ROUTING`", ["REQ-392-RUNTIME-ROUTING"]],
+      ["Family C — `REQ-392-RELOAD-PRESERVATION`", ["REQ-392-RELOAD-PRESERVATION"]],
+      ["Family D — `REQ-392-APPROVAL-WRITEBACK`", ["REQ-392-APPROVAL-WRITEBACK"]],
+      ["Family E — `REQ-392-TEST-PROOF`", ["REQ-392-TEST-PROOF"]],
+      ["Family F — `REQ-392-PUBLICATION-HYGIENE`", ["REQ-392-PUBLICATION-HYGIENE"]],
+    ]);
+
+    expect(examples.map((example) => example.title)).toEqual([...expectedRequirementIds.keys()]);
+    for (const example of examples) {
+      const analysis = analyzeIssueContractDescription(example.description, []);
+      expect(analysis.missingSections, example.title).toEqual([]);
+      expect(analysis.issueContractErrors, example.title).toEqual([]);
+      expect(extractIssueContractRequirementIds(example.description), example.title).toEqual(
+        expectedRequirementIds.get(example.title),
+      );
+    }
+  });
+
   it("documents the ENG-372 routing validation matrix and redacted evidence quickstart", () => {
     const quickstart = eng372Quickstart();
 
@@ -415,14 +437,26 @@ describe("IssueContractLint", () => {
     expect(quickstart).not.toContain("LINEAR_API_KEY=");
     expect(quickstart).not.toContain("credential_profiles.roles.worker.linear.tracker");
   });
+
+  it("validates the original mirrored ENG-392 issue body and records its section findings", () => {
+    const description = eng392OriginalMirroredIssueBody();
+    const analysis = analyzeIssueContractDescription(description, []);
+
+    expect(analysis.missingSections).toEqual(["Contract Checklist", "Out Of Scope"]);
+    expect(analysis.issueContractErrors).toEqual([]);
+    expect(extractIssueContractRequirementIds(description)).toEqual(["REQ-T037"]);
+    expect(description).toContain("tests/orchestrator.test.ts");
+    expect(description).toContain("## Validation Requirements");
+    expect(description).toContain("## Promotion Readiness");
+  });
 });
 
-interface Eng371ContractExample {
+interface IssueContractExample {
   title: string;
   description: string;
 }
 
-function eng371ContractExamples(): Eng371ContractExample[] {
+function eng371ContractExamples(): IssueContractExample[] {
   const content = readFileSync(
     new URL("../specs/005-eng-371-public-metadata-closure/contracts/public-metadata-redaction.md", import.meta.url),
     "utf8",
@@ -444,7 +478,7 @@ function eng371Quickstart(): string {
   return readFileSync(new URL("../specs/005-eng-371-public-metadata-closure/quickstart.md", import.meta.url), "utf8");
 }
 
-function eng372ContractExamples(): Eng371ContractExample[] {
+function eng372ContractExamples(): IssueContractExample[] {
   const content = readFileSync(
     new URL("../specs/006-eng-372-context-credential-routing/contracts/live-tracker-routing.md", import.meta.url),
     "utf8",
@@ -455,6 +489,61 @@ function eng372ContractExamples(): Eng371ContractExample[] {
 
 function eng372Quickstart(): string {
   return readFileSync(new URL("../specs/006-eng-372-context-credential-routing/quickstart.md", import.meta.url), "utf8");
+}
+
+function eng392ContractExamples(): IssueContractExample[] {
+  const content = readFileSync(
+    new URL("../specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md", import.meta.url),
+    "utf8",
+  );
+  const matches = Array.from(content.matchAll(/^## (Family .+?)\r?\n[\s\S]*?````markdown\r?\n([\s\S]*?)\r?\n````/gm));
+  return matches.map((match) => ({ title: match[1] ?? "", description: (match[2] ?? "").trim() }));
+}
+
+function eng392OriginalMirroredIssueBody(): string {
+  return [
+    "<!-- linear-linkback -->",
+    "<details>",
+    "<summary><a href=\"https://linear.app/john-halbert/issue/ENG-392/t037-add-orchestrator-routing-and-config-reload-preservation-tests\">ENG-392 T037 Add orchestrator routing and config-reload preservation tests</a></summary>",
+    "<p>",
+    "",
+    "Source: `specs/003-multi-project-config/tasks.md`, commit `0f4db1e`.",
+    "",
+    "Phase: US2 Tests",
+    "",
+    "## Problem / Goal",
+    "",
+    "Add orchestrator dispatch and config-reload preservation tests for two Linear projects routing to distinct workspaces, state buckets, and persisted in-progress run contexts in `tests/orchestrator.test.ts`.",
+    "",
+    "## Issue Contract",
+    "",
+    "```json",
+    '{"schemaVersion":1,"contractVersion":"2026-06-07.1","requirements":[{"id":"REQ-T037","requirement":"Add orchestrator tests proving two Linear projects route to distinct workspaces/state buckets and in-progress contexts survive config reload.","proofHint":"Show active runs keep their persisted projectContextId after reload or definition changes."}]}',
+    "```",
+    "",
+    "## Touched Surfaces",
+    "",
+    "* Expected repo paths: `tests/orchestrator.test.ts`.",
+    "* Surface category: testing, orchestration, persistence/replay.",
+    "",
+    "## Acceptance Criteria",
+    "",
+    "* Orchestrator dispatch and reload preservation are tested before implementation.",
+    "",
+    "## Validation Requirements",
+    "",
+    "* Run focused orchestrator tests.",
+    "",
+    "## Promotion Readiness",
+    "",
+    "* Ready for `dogfood-ready`: no",
+    "* Remaining blocker: Operator review required before promotion.",
+    "</p>",
+    "</details>",
+    "<!-- linear-review-link -->",
+    "<p><a href=\"https://linear.app/john-halbert/review/eng-392-t037-add-orchestrator-routing-and-config-reload-preservation-68cc104e4ffe\">Review in Linear</a></p>",
+    "",
+  ].join("\n");
 }
 
 function extractDocumentedPythonRawRegex(document: string, detectorName: string): RegExp {
