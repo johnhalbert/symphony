@@ -25,6 +25,41 @@ This quickstart records the source links and concise blocked-state notes needed 
 - PR overview: [#286 ENG-392: T037 Add orchestrator routing and config-reload preservation tests](https://github.com/johnhalbert/symphony/pull/286)
 - Files changed: [PR #286 /files](https://github.com/johnhalbert/symphony/pull/286/files)
 - Commits: [PR #286 /commits](https://github.com/johnhalbert/symphony/pull/286/commits)
+- Merge-base used for the reproducible local diff summary: `3839c28462010e2a14520f2853aa83e15873fc6f` from `git merge-base origin/main origin/sinfonista/eng-392-t037-add-orchestrator-routing-and-config-reload-preservation`
+- `git diff --name-status 3839c28462010e2a14520f2853aa83e15873fc6f..origin/sinfonista/eng-392-t037-add-orchestrator-routing-and-config-reload-preservation` captured the widened surface:
+
+  ```text
+  M	cursor/src/CursorWorkspaceOpener.ts
+  A	src/app/ProjectContextRuntime.ts
+  M	src/cli.ts
+  M	src/core/CompletionReportService.ts
+  M	src/core/approval/OperatorApprovalService.ts
+  M	src/core/orchestrator/Orchestrator.ts
+  M	src/core/workspace/WorkspaceManager.ts
+  M	src/core/writeback/WritebackOutbox.ts
+  M	tests/cursor-workspace-opener.test.ts
+  M	tests/orchestrator.test.ts
+  M	tests/status-api.test.ts
+  ```
+
+- `git diff --stat 3839c28462010e2a14520f2853aa83e15873fc6f..origin/sinfonista/eng-392-t037-add-orchestrator-routing-and-config-reload-preservation` shows how far the branch exceeded the original tests-only contract:
+
+  ```text
+   cursor/src/CursorWorkspaceOpener.ts          |   35 +-
+   src/app/ProjectContextRuntime.ts             |  967 ++++++++++++++++++
+   src/cli.ts                                   |   23 +-
+   src/core/CompletionReportService.ts          |    4 +
+   src/core/approval/OperatorApprovalService.ts |   16 +-
+   src/core/orchestrator/Orchestrator.ts        |  686 +++++++++----
+   src/core/workspace/WorkspaceManager.ts       |    8 +
+   src/core/writeback/WritebackOutbox.ts        |   12 +
+   tests/cursor-workspace-opener.test.ts        |   17 +
+   tests/orchestrator.test.ts                   | 1406 +++++++++++++++++++++++++-
+   tests/status-api.test.ts                     |  159 ++-
+   11 files changed, 3084 insertions(+), 249 deletions(-)
+  ```
+
+- Contract-to-surface mismatch summary: `REQ-T037` named `tests/orchestrator.test.ts` as the review surface, but the merge-base diff shows 10 additional out-of-contract paths: `cursor/src/CursorWorkspaceOpener.ts`, `src/app/ProjectContextRuntime.ts`, `src/cli.ts`, `src/core/CompletionReportService.ts`, `src/core/approval/OperatorApprovalService.ts`, `src/core/orchestrator/Orchestrator.ts`, `src/core/workspace/WorkspaceManager.ts`, `src/core/writeback/WritebackOutbox.ts`, `tests/cursor-workspace-opener.test.ts`, and `tests/status-api.test.ts`. The biggest expansions were the new `src/app/ProjectContextRuntime.ts` surface and the large `src/core/orchestrator/Orchestrator.ts` runtime edit, which confirms the proof depended on coupled runtime changes rather than a test-only publication.
 
 ## Contract and blocked-state summary
 
@@ -37,7 +72,7 @@ This quickstart records the source links and concise blocked-state notes needed 
 | Source | Evidence note |
 | --- | --- |
 | `REQ-T037` in the mirrored linkback comment | Contract scope is tests-only and points at `tests/orchestrator.test.ts` as the expected review surface. |
-| PR #286 changed surface | The published branch touched `tests/orchestrator.test.ts` plus 10 additional runtime/CLI/workspace/writeback/status paths: `cursor/src/CursorWorkspaceOpener.ts`, `src/app/ProjectContextRuntime.ts`, `src/cli.ts`, `src/core/CompletionReportService.ts`, `src/core/approval/OperatorApprovalService.ts`, `src/core/orchestrator/Orchestrator.ts`, `src/core/workspace/WorkspaceManager.ts`, `src/core/writeback/WritebackOutbox.ts`, `tests/cursor-workspace-opener.test.ts`, and `tests/status-api.test.ts`. |
+| PR #286 changed surface | The merge-base diff evidence above (`git diff --name-status` / `git diff --stat` against `3839c28462010e2a14520f2853aa83e15873fc6f..origin/sinfonista/eng-392-t037-add-orchestrator-routing-and-config-reload-preservation`) shows the published branch touched `tests/orchestrator.test.ts` plus 10 additional runtime/CLI/workspace/writeback/status paths: `cursor/src/CursorWorkspaceOpener.ts`, `src/app/ProjectContextRuntime.ts`, `src/cli.ts`, `src/core/CompletionReportService.ts`, `src/core/approval/OperatorApprovalService.ts`, `src/core/orchestrator/Orchestrator.ts`, `src/core/workspace/WorkspaceManager.ts`, `src/core/writeback/WritebackOutbox.ts`, `tests/cursor-workspace-opener.test.ts`, and `tests/status-api.test.ts`. |
 | Review `4480831534` | Reviewer reported affected-suite flakiness, called out the tests-only contract vs. broad runtime publication mismatch, and flagged orphaned `tmp-debug-docs-reviewer-redispatch-state/` captures as non-fixture debug state. |
 | Review `4483292693` | Final blocked-state summary: the focused five-test sweep and full `tests/orchestrator.test.ts` run were green on the branch tip, but restoring the non-contract paths to the merge-base made the routing/reload tests stop passing. That proves the published test-only proof still depends on coupled runtime changes. |
 
