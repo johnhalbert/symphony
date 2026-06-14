@@ -75,6 +75,20 @@ Allowed proof shapes:
 - review comment or blocker link when the failure was already captured externally and rerunning it is out of scope
 - doc line range showing a missing or contradictory requirement when the task fixes planning authoring rather than runtime behavior
 
+Use the narrowest proof shape that matches the actual before-state:
+
+| Before-state variant | Record under `surface` / `proof` | Why this is the right shape |
+| --- | --- | --- |
+| In-scope tests or runtime checks already fail without changing authorized surfaces | Cite the failing command or test family plus the failing assertion, summary line, or non-zero exit status. | This is a true pre-change failure inside the contracted validation surface. |
+| The branch-tip tests pass, but only while out-of-contract runtime paths remain present | Record a **bounded contradiction proof** instead of pretending there was no failure. Pair the passing focused test family with one contradiction artifact showing the same behavior stops passing once the non-contract runtime paths are removed, restored to merge-base, or otherwise isolated. Name the blocked runtime prerequisite or surface family the contradiction exposes. | This distinguishes a tests-only proof gap from a genuine runtime prerequisite gap: the focused tests are green, but the candidate still depends on unauthorized runtime behavior. |
+| Planning-only authoring gap with no runnable failure in scope | Cite the contradictory or missing requirement line range. | This keeps planning repairs bounded without inventing runtime failures. |
+
+For bounded contradiction proofs, the cited artifact must stay public-safe and should include all of the following:
+
+- the exact focused test, command, or review proof that passed on the candidate branch tip
+- the restore, diff, review, or equivalent contradiction artifact proving the result stops holding once the non-contract runtime paths are removed or isolated
+- the repo-relative runtime prerequisite, surface family, or protected path family that explains the dependency
+
 When it is not applicable, record `status: not_applicable` and explain why. Typical examples:
 
 - docs-only planning tasks with no runnable before-state check in scope
@@ -222,8 +236,8 @@ Use the following shape when recording future evidence:
 
 ### failing-before
 - status: `<recorded | not_applicable>`
-- surface: `<focused command | test | review artifact>`
-- proof: `<failing assertion | blocker summary | missing requirement lines>`
+- surface: `<focused failing command/test | bounded contradiction pair | review artifact>`
+- proof: `<failing assertion | blocker summary | contradiction artifact + runtime prerequisite/surface family | missing requirement lines>`
 - why_it_matters: `<why the pre-change gap blocked acceptance>`
 - redactions: `<none | note>`
 
