@@ -1,6 +1,6 @@
 import type { RuntimeSnapshot } from "../core/orchestrator/Orchestrator.js";
 import type { Issue, IssueBoardColumnId, IssueBoardColumnMapping, TrackerStateLists } from "../core/types.js";
-import { errorMessage } from "../core/errors.js";
+import { errorMessage, SymphonyError } from "../core/errors.js";
 import type { IssueLifecycleRecord, IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
 import { compareRunChronology, type RunRecord, type RunTranscriptStore, type WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
@@ -557,10 +557,7 @@ async function buildTrackerIssueSourceIndex(input: {
       });
       return trackerIssueSourceIndexFromProjection(projection, "ok", null);
     } catch (error) {
-      return trackerIssueSourceIndexFromFailure(input.fetchedStates, {
-        code: "tracker_error",
-        message: `Issue board tracker fetch failed: ${errorMessage(error)}`,
-      });
+      return trackerIssueSourceIndexFromFailure(input.fetchedStates, trackerIssueSourceFailureFromError(error));
     }
   }
 
@@ -584,11 +581,21 @@ async function buildTrackerIssueSourceIndex(input: {
       null,
     );
   } catch (error) {
-    return trackerIssueSourceIndexFromFailure(input.fetchedStates, {
-      code: "tracker_error",
-      message: `Issue board tracker fetch failed: ${errorMessage(error)}`,
-    });
+    return trackerIssueSourceIndexFromFailure(input.fetchedStates, trackerIssueSourceFailureFromError(error));
   }
+}
+
+function trackerIssueSourceFailureFromError(error: unknown): WebProjectionTrackerFailure {
+  if (error instanceof SymphonyError && error.code === "tracker_unavailable") {
+    return { code: "tracker_unavailable", message: error.message };
+  }
+  if (error instanceof SymphonyError && error.code === "tracker_error") {
+    return { code: "tracker_error", message: error.message };
+  }
+  return {
+    code: "tracker_error",
+    message: `Issue board tracker fetch failed: ${errorMessage(error)}`,
+  };
 }
 
 function trackerIssueSourceIndexFromProjection(

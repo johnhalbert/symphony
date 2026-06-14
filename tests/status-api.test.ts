@@ -1134,6 +1134,452 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("rechecks warm route-lookup tracker caches before selecting duplicate identifier siblings", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-route-cache-duplicate-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-route-cache-duplicate-1",
+      identifier: "ENG-123",
+      state: "Blocked",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-123",
+    });
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "docs__ENG-123",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      path: path.join(config.workspace.root, "docs__ENG-123"),
+      sourceKind: "git_worktree",
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await mkdir(path.join(config.workspace.root, "docs__ENG-123"), { recursive: true });
+    await runStore.startRun({
+      runId: "docs-route-cache-duplicate-run-1",
+      sessionId: "docs-route-cache-duplicate-session-1",
+      agentId: "docs-route-cache-duplicate-agent-1",
+      role: "worker",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs route cache duplicate work",
+      workspaceKey: "docs__ENG-123",
+      workspacePath: path.join(config.workspace.root, "docs__ENG-123"),
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, { phase: "implementation" });
+
+    const openedWorkspaces: string[] = [];
+    const pauseCalls: string[] = [];
+    const resumeCalls: string[] = [];
+    const cancelCalls: string[] = [];
+    const continuationSummaryCalls: string[] = [];
+    const orchestrator = Object.assign(fakeOrchestrator(), {
+      pauseIssue(issueId: string) {
+        pauseCalls.push(issueId);
+      },
+      resumeIssue(issueId: string) {
+        resumeCalls.push(issueId);
+      },
+      async cancelIssue(issueId: string) {
+        cancelCalls.push(issueId);
+      },
+      async createContinuationSummary(issueId: string) {
+        continuationSummaryCalls.push(issueId);
+        return {
+          summaryReference: {
+            id: `route-cache-duplicate-summary:${issueId}`,
+            kind: "continuation_history",
+            summary: "route cache duplicate",
+            runIds: ["docs-route-cache-duplicate-run-1"],
+            transcriptEventCount: 1,
+            transcriptPointers: ["/api/v1/runs/docs-route-cache-duplicate-run-1/transcript"],
+            statusApiPointers: [`/api/v1/issues/${issueId}`],
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+          lifecycle: { summaryReferences: [] },
+        };
+      },
+    }) as Orchestrator;
+    const tracker = new FakeTracker([docsIssue]);
+
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: {
+        async open(workspacePath: string): Promise<void> {
+          openedWorkspaces.push(workspacePath);
+        },
+      },
+      tracker,
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const primedIssueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}`);
+      const primedIssueBody = (await primedIssueResponse.json()) as {
+        workspace: { workspaceKey: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+        latestRun: { runId: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+      };
+
+      expect(primedIssueResponse.status).toBe(200);
+      expect(primedIssueBody.workspace).toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(primedIssueBody.latestRun).toMatchObject({
+        runId: "docs-route-cache-duplicate-run-1",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(tracker.fetchCount).toBe(1);
+
+      tracker.setIssues([docsIssue, symphonyIssue]);
+
+      const exactIssueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}`);
+      const exactWorkspaceKeyResponse = await fetch(`${baseUrl}/api/v1/workspaces/${encodeURIComponent("docs__ENG-123")}`);
+      const ambiguousIssueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}`);
+      const ambiguousRunsResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/runs`);
+      const ambiguousWorkspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/${encodeURIComponent(docsIssue.identifier)}`);
+      const ambiguousOpenResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousPauseResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousResumeResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/resume`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousCancelResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/cancel`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousContinuationResponse = await fetch(
+        `${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/continuation-summary`,
+        {
+          method: "POST",
+          headers: { "x-symphony-token": "secret" },
+        },
+      );
+
+      const exactIssueBody = (await exactIssueResponse.json()) as {
+        workspace: { workspaceKey: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+        latestRun: { runId: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+      };
+      const exactWorkspaceKeyBody = (await exactWorkspaceKeyResponse.json()) as {
+        workspaceKey: string;
+        issueId: string;
+        projectContext?: { projectContextId?: string };
+      };
+      const conflictBodies = await Promise.all(
+        [
+          ambiguousIssueResponse,
+          ambiguousRunsResponse,
+          ambiguousWorkspaceResponse,
+          ambiguousOpenResponse,
+          ambiguousPauseResponse,
+          ambiguousResumeResponse,
+          ambiguousCancelResponse,
+          ambiguousContinuationResponse,
+        ].map(async (response) => ({
+          status: response.status,
+          body: (await response.json()) as { error: { code: string; message: string } },
+        })),
+      );
+
+      expect(exactIssueResponse.status).toBe(200);
+      expect(exactIssueBody.workspace).toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(exactIssueBody.latestRun).toMatchObject({
+        runId: "docs-route-cache-duplicate-run-1",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(exactWorkspaceKeyResponse.status).toBe(200);
+      expect(exactWorkspaceKeyBody).toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      for (const { status, body } of conflictBodies) {
+        expect(status).toBe(409);
+        expect(body.error).toMatchObject({
+          code: "conflict",
+          message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
+        });
+      }
+      expect(openedWorkspaces).toEqual([]);
+      expect(pauseCalls).toEqual([]);
+      expect(resumeCalls).toEqual([]);
+      expect(cancelCalls).toEqual([]);
+      expect(continuationSummaryCalls).toEqual([]);
+      expect(tracker.fetchCount).toBeGreaterThan(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rechecks warm route-lookup tracker caches before failing closed on tracker outages", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-route-cache-outage-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "docs__ENG-123",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      path: path.join(config.workspace.root, "docs__ENG-123"),
+      sourceKind: "git_worktree",
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await mkdir(path.join(config.workspace.root, "docs__ENG-123"), { recursive: true });
+    await runStore.startRun({
+      runId: "docs-route-cache-outage-run-1",
+      sessionId: "docs-route-cache-outage-session-1",
+      agentId: "docs-route-cache-outage-agent-1",
+      role: "worker",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs route cache outage work",
+      workspaceKey: "docs__ENG-123",
+      workspacePath: path.join(config.workspace.root, "docs__ENG-123"),
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, { phase: "implementation" });
+
+    const openedWorkspaces: string[] = [];
+    const pauseCalls: string[] = [];
+    const resumeCalls: string[] = [];
+    const cancelCalls: string[] = [];
+    const continuationSummaryCalls: string[] = [];
+    const orchestrator = Object.assign(fakeOrchestrator(), {
+      pauseIssue(issueId: string) {
+        pauseCalls.push(issueId);
+      },
+      resumeIssue(issueId: string) {
+        resumeCalls.push(issueId);
+      },
+      async cancelIssue(issueId: string) {
+        cancelCalls.push(issueId);
+      },
+      async createContinuationSummary(issueId: string) {
+        continuationSummaryCalls.push(issueId);
+        return {
+          summaryReference: {
+            id: `route-cache-outage-summary:${issueId}`,
+            kind: "continuation_history",
+            summary: "route cache outage",
+            runIds: ["docs-route-cache-outage-run-1"],
+            transcriptEventCount: 1,
+            transcriptPointers: ["/api/v1/runs/docs-route-cache-outage-run-1/transcript"],
+            statusApiPointers: [`/api/v1/issues/${issueId}`],
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+          lifecycle: { summaryReferences: [] },
+        };
+      },
+    }) as Orchestrator;
+    const tracker = new FakeTracker([docsIssue]);
+
+    const server = new StatusServer({
+      orchestrator,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: {
+        async open(workspacePath: string): Promise<void> {
+          openedWorkspaces.push(workspacePath);
+        },
+      },
+      tracker,
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const primedIssueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}`);
+      const primedIssueBody = (await primedIssueResponse.json()) as {
+        workspace: { workspaceKey: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+        latestRun: { runId: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+      };
+
+      expect(primedIssueResponse.status).toBe(200);
+      expect(primedIssueBody.workspace).toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(primedIssueBody.latestRun).toMatchObject({
+        runId: "docs-route-cache-outage-run-1",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(tracker.fetchCount).toBe(1);
+
+      tracker.setFetchIssuesByStatesError(new SymphonyError("tracker_unavailable", "Tracker route lookup unavailable"));
+
+      const exactIssueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}`);
+      const exactWorkspaceKeyResponse = await fetch(`${baseUrl}/api/v1/workspaces/${encodeURIComponent("docs__ENG-123")}`);
+      const ambiguousIssueResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}`);
+      const ambiguousRunsResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/runs`);
+      const ambiguousWorkspaceResponse = await fetch(`${baseUrl}/api/v1/workspaces/${encodeURIComponent(docsIssue.identifier)}`);
+      const ambiguousOpenResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousPauseResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/pause`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousResumeResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/resume`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousCancelResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/cancel`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const ambiguousContinuationResponse = await fetch(
+        `${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.identifier)}/continuation-summary`,
+        {
+          method: "POST",
+          headers: { "x-symphony-token": "secret" },
+        },
+      );
+
+      const exactIssueBody = (await exactIssueResponse.json()) as {
+        workspace: { workspaceKey: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+        latestRun: { runId: string; issueId: string; projectContext?: { projectContextId?: string } } | null;
+      };
+      const exactWorkspaceKeyBody = (await exactWorkspaceKeyResponse.json()) as {
+        workspaceKey: string;
+        issueId: string;
+        projectContext?: { projectContextId?: string };
+      };
+      const outageBodies = await Promise.all(
+        [
+          ambiguousIssueResponse,
+          ambiguousRunsResponse,
+          ambiguousWorkspaceResponse,
+          ambiguousOpenResponse,
+          ambiguousPauseResponse,
+          ambiguousResumeResponse,
+          ambiguousCancelResponse,
+          ambiguousContinuationResponse,
+        ].map(async (response) => ({
+          status: response.status,
+          body: (await response.json()) as { error: { code: string; message: string } },
+        })),
+      );
+
+      expect(exactIssueResponse.status).toBe(200);
+      expect(exactIssueBody.workspace).toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(exactIssueBody.latestRun).toMatchObject({
+        runId: "docs-route-cache-outage-run-1",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      expect(exactWorkspaceKeyResponse.status).toBe(200);
+      expect(exactWorkspaceKeyBody).toMatchObject({
+        workspaceKey: "docs__ENG-123",
+        issueId: docsIssue.id,
+        projectContext: { projectContextId: "docs" },
+      });
+      for (const { status, body } of outageBodies) {
+        expect(status).toBe(503);
+        expect(body.error).toMatchObject({
+          code: "tracker_unavailable",
+          message: "Tracker route lookup unavailable",
+        });
+      }
+      expect(openedWorkspaces).toEqual([]);
+      expect(pauseCalls).toEqual([]);
+      expect(resumeCalls).toEqual([]);
+      expect(cancelCalls).toEqual([]);
+      expect(continuationSummaryCalls).toEqual([]);
+      expect(tracker.fetchCount).toBeGreaterThan(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("preserves both exact-id siblings on symphony-only board cards when visible identifiers collide", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const docsRunning = liveRunningFixture(config, "ENG-123", "In Progress");
@@ -1293,6 +1739,142 @@ describe("StatusServer durable API", () => {
         },
         issueDetails: { issue: { id: docsIssue.id, identifier: docsIssue.identifier } },
       });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rechecks warm board-detail tracker caches before selecting duplicate identifier siblings", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const docsIssue = trackerIssue({
+      id: "issue-docs-board-cache-duplicate-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-board-cache-duplicate-1",
+      identifier: "ENG-123",
+      state: "Blocked",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-123",
+    });
+    const tracker = new FakeTracker([docsIssue]);
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      tracker,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const primedBoardResponse = await fetch(`${baseUrl}/api/v1/board`);
+      const primedBoardBody = (await primedBoardResponse.json()) as {
+        issues: Array<{ issueId: string | null; issueIdentifier: string | null; capabilities: { detail: string | null } }>;
+      };
+
+      expect(primedBoardResponse.status).toBe(200);
+      expect(primedBoardBody.issues.filter((item) => item.issueIdentifier === docsIssue.identifier)).toHaveLength(1);
+      expect(tracker.fetchCount).toBe(1);
+
+      tracker.setIssues([docsIssue, symphonyIssue]);
+
+      const ambiguousDetailResponse = await fetch(`${baseUrl}/api/v1/board/issues/${encodeURIComponent(docsIssue.identifier)}`);
+      const docsDetailResponse = await fetch(`${baseUrl}/api/v1/board/issues/${encodeURIComponent(docsIssue.id)}`);
+      const ambiguousDetailBody = (await ambiguousDetailResponse.json()) as { error: { code: string; message: string } };
+      const docsDetailBody = (await docsDetailResponse.json()) as {
+        issue: string;
+        boardCard: { issueId: string | null; issueIdentifier: string | null; capabilities: { detail: string | null } } | null;
+        issueDetails: { issue: { id: string | null; identifier: string | null } };
+      };
+
+      expect(ambiguousDetailResponse.status).toBe(409);
+      expect(ambiguousDetailBody.error).toMatchObject({
+        code: "conflict",
+        message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
+      });
+      expect(docsDetailResponse.status).toBe(200);
+      expect(docsDetailBody).toMatchObject({
+        issue: docsIssue.id,
+        boardCard: {
+          issueId: docsIssue.id,
+          issueIdentifier: docsIssue.identifier,
+          capabilities: { detail: `/api/v1/board/issues/${docsIssue.id}` },
+        },
+        issueDetails: { issue: { id: docsIssue.id, identifier: docsIssue.identifier } },
+      });
+      expect(tracker.fetchCount).toBeGreaterThan(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rechecks warm board-detail tracker caches before failing closed on tracker outages", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const docsIssue = trackerIssue({
+      id: "issue-docs-board-cache-outage-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const tracker = new FakeTracker([docsIssue]);
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      tracker,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const primedBoardResponse = await fetch(`${baseUrl}/api/v1/board`);
+      const primedBoardBody = (await primedBoardResponse.json()) as {
+        issues: Array<{ issueId: string | null; issueIdentifier: string | null; capabilities: { detail: string | null } }>;
+      };
+
+      expect(primedBoardResponse.status).toBe(200);
+      expect(primedBoardBody.issues.filter((item) => item.issueIdentifier === docsIssue.identifier)).toHaveLength(1);
+      expect(tracker.fetchCount).toBe(1);
+
+      tracker.setFetchIssuesByStatesError(new SymphonyError("tracker_unavailable", "Tracker route lookup unavailable"));
+
+      const ambiguousDetailResponse = await fetch(`${baseUrl}/api/v1/board/issues/${encodeURIComponent(docsIssue.identifier)}`);
+      const ambiguousDetailBody = (await ambiguousDetailResponse.json()) as { error: { code: string; message: string } };
+
+      expect(ambiguousDetailResponse.status).toBe(503);
+      expect(ambiguousDetailBody.error).toMatchObject({
+        code: "tracker_unavailable",
+        message: "Tracker route lookup unavailable",
+      });
+      expect(tracker.fetchCount).toBeGreaterThan(1);
     } finally {
       await server.stop();
     }
@@ -4398,17 +4980,18 @@ describe("StatusServer durable API", () => {
       expect(runStore.latestRunForIssueCount).toBe(0);
       expect(lifecycleStore.getCount).toBe(0);
 
+      const fetchCountBeforeCachedResponse = tracker.fetchCount;
       const cachedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
       const cachedBody = (await cachedResponse.json()) as { tracker: { cached: boolean } };
       expect(cachedResponse.status).toBe(200);
       expect(cachedBody.tracker.cached).toBe(true);
-      expect(tracker.fetchCount).toBe(1);
+      expect(tracker.fetchCount).toBe(fetchCountBeforeCachedResponse);
 
       const refreshResponse = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board?refresh=1`);
       const refreshBody = (await refreshResponse.json()) as { tracker: { cached: boolean } };
       expect(refreshResponse.status).toBe(200);
       expect(refreshBody.tracker.cached).toBe(false);
-      expect(tracker.fetchCount).toBe(2);
+      expect(tracker.fetchCount).toBe(fetchCountBeforeCachedResponse + 1);
     } finally {
       await server.stop();
     }
@@ -5633,8 +6216,17 @@ function testTrackerStateLists(): TrackerStateLists {
 class FakeTracker implements TrackerClient {
   requestedStates: string[] = [];
   fetchCount = 0;
+  private fetchIssuesByStatesError: Error | null = null;
 
-  constructor(private readonly issues: Issue[]) {}
+  constructor(private issues: Issue[]) {}
+
+  setIssues(issues: Issue[]): void {
+    this.issues = [...issues];
+  }
+
+  setFetchIssuesByStatesError(error: Error | null): void {
+    this.fetchIssuesByStatesError = error;
+  }
 
   async fetchCandidateIssues(): Promise<Issue[]> {
     return [];
@@ -5643,6 +6235,7 @@ class FakeTracker implements TrackerClient {
   async fetchIssuesByStates(stateNames: string[]): Promise<Issue[]> {
     this.fetchCount += 1;
     this.requestedStates = stateNames;
+    if (this.fetchIssuesByStatesError) throw this.fetchIssuesByStatesError;
     return this.issues.filter((item) =>
       stateNames.some((state) => state.toLowerCase() === item.state.toLowerCase()),
     );

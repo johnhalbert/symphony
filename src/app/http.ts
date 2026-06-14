@@ -2635,9 +2635,8 @@ export class StatusServer {
     });
   }
 
-  private async fetchBoardIssueDetail(issueId: string, forceRefresh: boolean) {
-    const { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
-    const lookup = resolveIssueLookupFromCandidates(
+  private resolveBoardIssueLookup(issueId: string, sourceIndex: BuiltWebProjectionSourceIndex): IssueLookupResult {
+    return resolveIssueLookupFromCandidates(
       issueId,
       dedupeIssueLookupCandidates([
         ...(sourceIndex.trackerIssues.error ? [] : sourceIndex.trackerIssues.issues.map(issueLookupCandidateFromIssue)),
@@ -2647,7 +2646,20 @@ export class StatusServer {
         ...sourceIndex.runs.runs.map(issueLookupCandidateFromRun),
       ].filter((candidate): candidate is IssueLookupCandidate => candidate !== null)),
     );
+  }
+
+  private async fetchBoardIssueDetail(issueId: string, forceRefresh: boolean) {
+    let { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
+    let lookup = this.resolveBoardIssueLookup(issueId, sourceIndex);
+    const refreshedIdentifierLookup = lookup.resolutionKind === "issue_identifier" && this.options.tracker && sourceIndex.trackerIssues.cached;
+    if (refreshedIdentifierLookup) {
+      ({ sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(true));
+      lookup = this.resolveBoardIssueLookup(issueId, sourceIndex);
+    }
     if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+    if (this.options.tracker && sourceIndex.trackerIssues.error && (lookup.resolutionKind === "issue_identifier" || refreshedIdentifierLookup)) {
+      throw trackerFailureFromSourceIndex(sourceIndex);
+    }
     const lookupIssueId = lookup.issueId ?? issueId;
     let board: IssueBoardResponse | null = null;
     let trackerFailure: SymphonyError | null = null;
@@ -2787,30 +2799,46 @@ export class StatusServer {
     issueKey: string,
     snapshot: RuntimeSnapshot = this.options.orchestrator.snapshot(),
   ): Promise<IssueLookupResult> {
-    const { trackerIssues, trackerFailure } = await this.loadTrackerIssuesForRouteLookup();
-    const lookup = await resolveIssueLookupKey(issueKey, {
-      snapshot,
-      lifecycleStore: this.options.lifecycleStore,
-      runStore: this.options.runStore,
-      trackerIssues,
-    });
-    if (trackerFailure && lookup.resolutionKind === "issue_identifier") {
-      throw trackerFailure;
+    const resolveLookup = async (trackerIssues: readonly Issue[]): Promise<IssueLookupResult> =>
+      resolveIssueLookupKey(issueKey, {
+        snapshot,
+        lifecycleStore: this.options.lifecycleStore,
+        runStore: this.options.runStore,
+        trackerIssues,
+      });
+
+    const initialTrackerLookup = await this.loadTrackerIssuesForRouteLookup();
+    let lookup = await resolveLookup(initialTrackerLookup.trackerIssues);
+    if (lookup.resolutionKind === "issue_identifier") {
+      if (initialTrackerLookup.trackerFailure) {
+        throw initialTrackerLookup.trackerFailure;
+      }
+      if (initialTrackerLookup.trackerCached) {
+        const refreshedTrackerLookup = await this.loadTrackerIssuesForRouteLookup(true);
+        lookup = await resolveLookup(refreshedTrackerLookup.trackerIssues);
+        if (refreshedTrackerLookup.trackerFailure) {
+          throw refreshedTrackerLookup.trackerFailure;
+        }
+      }
     }
     return lookup;
   }
 
-  private async loadTrackerIssuesForRouteLookup(): Promise<{
+  private async loadTrackerIssuesForRouteLookup(forceRefresh = false): Promise<{
     trackerIssues: readonly Issue[];
     trackerFailure: SymphonyError | null;
+    trackerCached: boolean;
   }> {
-    if (!this.options.tracker) return { trackerIssues: [], trackerFailure: null };
+    if (!this.options.tracker) return { trackerIssues: [], trackerFailure: null, trackerCached: false };
     try {
-      const projection = await this.fetchIssueBoardTrackerProjection(this.resolveWebProjectionIssueBoardColumns(), false);
-      return { trackerIssues: projection.trackerIssues, trackerFailure: null };
+      const projection = await this.fetchIssueBoardTrackerProjection(
+        this.resolveWebProjectionIssueBoardColumns(),
+        forceRefresh,
+      );
+      return { trackerIssues: projection.trackerIssues, trackerFailure: null, trackerCached: projection.cached };
     } catch (error) {
       if (error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")) {
-        return { trackerIssues: [], trackerFailure: error };
+        return { trackerIssues: [], trackerFailure: error, trackerCached: false };
       }
       throw error;
     }

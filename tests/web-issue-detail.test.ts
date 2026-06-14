@@ -622,7 +622,7 @@ describe("GET /api/v1/web/issues/:issueId", () => {
       expect(serializedTranscript).not.toContain("sk-ABCDEFGH1");
       expect(JSON.stringify(body).toLowerCase()).not.toContain("mock");
       expect(JSON.stringify(explicitBody).toLowerCase()).not.toContain("mock");
-      expect(tracker.fetchCount).toBe(1);
+      expect(tracker.fetchCount).toBe(2);
     } finally {
       await server.stop();
     }
