@@ -9,10 +9,16 @@ import { createAgentHarness } from "./core/harness/HarnessFactory.js";
 import { StructuredLogger } from "./core/logging/StructuredLogger.js";
 import {
   Orchestrator,
+  type ManualAgentEligibilityResult,
   type ManualAgentRunResult,
   type ManualAgentRunStage,
   type PromptPreviewResult,
 } from "./core/orchestrator/Orchestrator.js";
+import {
+  DEFAULT_ISSUE_INSPECTION_STAGES,
+  IssueInspectionService,
+  type IssueInspectionResult,
+} from "./core/IssueInspectionService.js";
 import { FileIssueLifecycleStore } from "./core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureDiagnosticsStore.js";
 import { FileOrchestratorConversationStore } from "./core/persistence/OrchestratorConversationStore.js";
@@ -366,6 +372,82 @@ promptCommand
     },
   );
 
+const issueCommand = program.command("issue").description("Inspect Symphony issue metadata");
+
+issueCommand
+  .command("inspect")
+  .description("Inspect tracker, lifecycle, run, writeback, approval, and dispatch metadata for an issue")
+  .argument("<issue>", "issue id or identifier")
+  .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
+  .option("--stage <stage>", "limit eligibility to one stage: worker, reviewer, review, triage, planner, breakdown, merge-conflict")
+  .option("--json", "print JSON result")
+  .option("--raw", "include raw lifecycle, run, writeback, and approval records; implies --json")
+  .option("--runs-limit <count>", "number of recent runs to include", "10")
+  .action(
+    async (
+      issue: string,
+      workflow: string,
+      options: { stage?: string; json?: boolean; raw?: boolean; runsLimit?: string },
+    ) => {
+      const logger = new StructuredLogger();
+      const workflowPath = path.resolve(process.cwd(), workflow);
+      const loader = new WorkflowLoader(workflowPath);
+      const loaded = await loader.load();
+      const config = loaded.serviceConfig;
+      const tracker = createRuntimeTrackerClient(config);
+      const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+      const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
+      const workspaceManager = new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+        planningWorkspaceMode: config.issueBreakdown.workspaceMode,
+      });
+      const harness = createAgentHarness(config, { runStore });
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager,
+        harness,
+        logger,
+        promptTemplate: loaded.definition.promptTemplate,
+        runStore,
+        lifecycleStore,
+        statusServerBaseUrl: () => null,
+        statusMutationToken: null,
+      });
+      try {
+        const stage = options.stage === undefined ? null : parseManualAgentRunStage(options.stage);
+        const inspector = new IssueInspectionService({
+          config,
+          tracker,
+          lifecycleStore,
+          runStore,
+          writebackOutbox,
+          approvalStore: operatorApprovalStore,
+          orchestrator,
+        });
+        const result = await inspector.inspect(issue, {
+          stages: stage === null ? DEFAULT_ISSUE_INSPECTION_STAGES : [stage],
+          includeRaw: options.raw === true,
+          runsLimit: parsePositiveIntegerOption(options.runsLimit, "--runs-limit"),
+        });
+        if (options.json || options.raw) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(formatIssueInspectionResult(result));
+        }
+        if (!result.found) process.exitCode = 2;
+      } finally {
+        await orchestrator.stop();
+        await loader.close();
+        await harness.dispose?.();
+      }
+    },
+  );
+
 program
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
   .option("--port <port>", "enable local HTTP status server on this port")
@@ -563,6 +645,14 @@ function parseManualAgentRunStage(value: string | undefined): ManualAgentRunStag
   }
 }
 
+function parsePositiveIntegerOption(value: string | undefined, label: string): number {
+  const parsed = Number(value ?? "10");
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return parsed;
+}
+
 function formatRenderedPromptPreview(result: Extract<PromptPreviewResult, { status: "rendered" }>): string {
   return [
     "===== EPHEMERAL SYSTEM PROMPT =====",
@@ -571,6 +661,58 @@ function formatRenderedPromptPreview(result: Extract<PromptPreviewResult, { stat
     "===== USER PROMPT =====",
     result.userPrompt,
   ].join("\n");
+}
+
+function formatIssueInspectionResult(result: IssueInspectionResult): string {
+  const trackerIssue = result.tracker.issue;
+  const lifecycle = result.lifecycle.summary;
+  const lines = [
+    `Issue ${trackerIssue?.identifier ?? lifecycle?.issueIdentifier ?? result.issue}`,
+    "",
+    "Tracker",
+    `  Status: ${result.tracker.status}${result.tracker.error ? ` (${result.tracker.error})` : ""}`,
+    `  State: ${trackerIssue?.state ?? "n/a"}`,
+    `  Title: ${trackerIssue?.title ?? "n/a"}`,
+    `  Labels: ${formatCliList(trackerIssue?.labels ?? [])}`,
+    `  Assigned to worker: ${formatCliBoolean(trackerIssue?.assignedToWorker)}`,
+    `  Has children: ${formatCliBoolean(trackerIssue?.hasChildren)}`,
+    `  Open blockers: ${trackerIssue ? trackerIssue.blockedBy.filter((blocker) => blocker.state === null || !stateInCliList(blocker.state, result.config.terminalStates)).length : "n/a"}`,
+    "",
+    "Lifecycle",
+    `  Present: ${formatCliBoolean(result.lifecycle.found)}`,
+    `  Phase: ${lifecycle?.phase ?? "n/a"}`,
+    `  Blocked reason: ${lifecycle?.blockedReason ?? "n/a"}`,
+    `  Review round: ${lifecycle?.reviewRound ?? "n/a"}`,
+    `  Incomplete turns: ${lifecycle?.incompleteTurnCount ?? "n/a"}`,
+    `  Planning failures: ${lifecycle?.planningFailureCount ?? "n/a"}`,
+    `  Last run pointer: ${lifecycle?.summaryPointers.lastRunId ?? "n/a"}`,
+    `  PR: ${formatCliPullRequest(lifecycle?.summaryPointers.prNumber ?? null, lifecycle?.summaryPointers.prUrl ?? null)}`,
+    "",
+    "Latest Signals",
+    `  Completion: ${formatCompletionSignal(result)}`,
+    `  Review: ${formatReviewSignal(result)}`,
+    `  Triage: ${formatTriageSignal(result)}`,
+    `  Run: ${formatRunSignal(result)}`,
+    `  Pending approval: ${result.latest.pendingApproval ? `${result.latest.pendingApproval.requestId} (${result.latest.pendingApproval.status})` : "none"}`,
+    "",
+    "Workspace",
+    `  Key: ${result.workspace?.workspaceKey ?? lifecycle?.summaryPointers.workspaceKey ?? "n/a"}`,
+    `  Path: ${result.workspace?.path ?? lifecycle?.summaryPointers.workspacePath ?? "n/a"}`,
+    `  Branch: ${result.workspace?.gitBranchName ?? lifecycle?.summaryPointers.gitBranchName ?? lifecycle?.summaryPointers.branchName ?? "n/a"}`,
+    "",
+    "Runs",
+    `  Total: ${result.runs.count}`,
+    ...formatRecentRuns(result),
+    "",
+    "Writebacks",
+    `  Related: ${result.writebacks.count}`,
+    `  Pending: ${result.writebacks.pendingCount}`,
+    ...formatPendingWritebacks(result),
+    "",
+    "Eligibility",
+    ...formatEligibility(result.eligibility),
+  ];
+  return lines.join("\n");
 }
 
 function formatManualAgentRunResult(result: ManualAgentRunResult): string {
@@ -591,6 +733,87 @@ function formatManualAgentRunResult(result: ManualAgentRunResult): string {
     `Status: ${result.finalStatus}`,
     ...(result.error === null ? [] : [`Error: ${result.error}`]),
   ].join("\n");
+}
+
+function formatCompletionSignal(result: IssueInspectionResult): string {
+  const report = result.latest.completionReport;
+  if (!report) return "none";
+  return `${report.id} run=${report.runId} acceptedAt=${report.acceptedAt}; ${oneLineCli(report.summary)}`;
+}
+
+function formatReviewSignal(result: IssueInspectionResult): string {
+  const verdict = result.latest.reviewVerdict;
+  if (!verdict) return "none";
+  return `${verdict.id} ${verdict.verdict} run=${verdict.runId} submittedAt=${verdict.submittedAt}; gate=${verdict.gateFindings.length} discovery=${verdict.discoveryFindings.length} unsatisfied=${verdict.unsatisfiedAcceptanceCount}`;
+}
+
+function formatTriageSignal(result: IssueInspectionResult): string {
+  const triage = result.latest.issueTriageReport;
+  if (!triage) return "none";
+  return `${triage.id} ${triage.disposition}/${triage.confidence} run=${triage.runId} submittedAt=${triage.submittedAt}; blockers=${triage.blockers.length}; ${oneLineCli(triage.summary)}`;
+}
+
+function formatRunSignal(result: IssueInspectionResult): string {
+  const run = result.latest.run;
+  if (!run) return "none";
+  return `${run.runId} ${run.role}/${run.runPhase ?? "n/a"} ${run.status} updatedAt=${run.updatedAt}${run.error ? ` error=${oneLineCli(run.error)}` : ""}`;
+}
+
+function formatRecentRuns(result: IssueInspectionResult): string[] {
+  if (result.runs.recent.length === 0) return ["  Recent: none"];
+  return result.runs.recent.map(
+    (run) =>
+      `  - ${run.runId}: ${run.role}/${run.runPhase ?? "n/a"} ${run.status} started=${run.startedAt} completed=${run.completedAt ?? "n/a"}${run.manualDispatch ? " manual" : ""}`,
+  );
+}
+
+function formatPendingWritebacks(result: IssueInspectionResult): string[] {
+  if (result.writebacks.pending.length === 0) return ["  Pending items: none"];
+  return result.writebacks.pending.map(
+    (operation) =>
+      `  - ${operation.kind} ${operation.status} key=${operation.idempotencyKey} run=${operation.runId ?? "n/a"} next=${operation.nextAttemptAt}${operation.lastError ? ` error=${oneLineCli(operation.lastError)}` : ""}`,
+  );
+}
+
+function formatEligibility(eligibility: IssueInspectionResult["eligibility"]): string[] {
+  const lines: string[] = [];
+  for (const stage of DEFAULT_ISSUE_INSPECTION_STAGES) {
+    const result = eligibility[stage];
+    if (!result) continue;
+    lines.push(`  - ${formatManualStage(stage)}: ${formatEligibilityResult(result)}`);
+  }
+  return lines.length === 0 ? ["  n/a"] : lines;
+}
+
+function formatEligibilityResult(result: ManualAgentEligibilityResult): string {
+  const status = result.eligible ? "eligible" : `blocked (${result.reason ?? "unknown"})`;
+  return `${status}; role=${result.role}; phase=${result.runPhase}${result.explanation ? `; ${oneLineCli(result.explanation)}` : ""}`;
+}
+
+function formatManualStage(stage: ManualAgentRunStage): string {
+  return stage === "merge_conflict" ? "merge-conflict" : stage;
+}
+
+function formatCliList(values: string[]): string {
+  return values.length === 0 ? "none" : values.join(", ");
+}
+
+function formatCliBoolean(value: boolean | undefined): string {
+  return value === undefined ? "n/a" : value ? "yes" : "no";
+}
+
+function formatCliPullRequest(number: number | null, url: string | null): string {
+  if (number === null && url === null) return "n/a";
+  return [number === null ? null : `#${number}`, url].filter((value): value is string => value !== null).join(" ");
+}
+
+function stateInCliList(state: string, states: string[]): boolean {
+  return states.some((candidate) => candidate.toLowerCase() === state.toLowerCase());
+}
+
+function oneLineCli(value: string): string {
+  const rendered = value.replace(/\s+/g, " ").trim();
+  return rendered.length <= 180 ? rendered : `${rendered.slice(0, 177)}...`;
 }
 
 interface RuntimeProjectionPersistence {

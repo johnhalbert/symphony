@@ -198,6 +198,12 @@ export interface ManualAgentRunOptions {
   ignoreState?: boolean;
 }
 
+export interface ManualAgentEligibilityOptions {
+  stage: ManualAgentRunStage;
+  forceLabels?: boolean;
+  ignoreState?: boolean;
+}
+
 export type ManualAgentRunResult =
   | {
       status: "completed";
@@ -219,6 +225,16 @@ export type ManualAgentRunResult =
       runKind: AgentRunKind;
       reason: string;
     };
+
+export interface ManualAgentEligibilityResult {
+  issue: Issue | null;
+  role: AgentRunRole;
+  runPhase: AgentRunPhase;
+  runKind: AgentRunKind;
+  eligible: boolean;
+  reason: string | null;
+  explanation: string | null;
+}
 
 export type PromptPreviewResult =
   | {
@@ -1230,6 +1246,49 @@ export class Orchestrator {
     };
   }
 
+  async inspectManualAgentEligibility(
+    issueIdOrIdentifier: string,
+    options: ManualAgentEligibilityOptions,
+  ): Promise<ManualAgentEligibilityResult> {
+    const target = manualAgentRunTarget(options.stage);
+    const issue = await this.fetchSingleIssue(issueIdOrIdentifier);
+    if (!issue) {
+      return manualAgentEligibility(null, target, "issue_not_found", null);
+    }
+    return this.inspectManualAgentEligibilityForIssue(issue, options);
+  }
+
+  async inspectManualAgentEligibilityForIssue(
+    issue: Issue,
+    options: ManualAgentEligibilityOptions,
+  ): Promise<ManualAgentEligibilityResult> {
+    const target = manualAgentRunTarget(options.stage);
+    if (options.ignoreState === true && options.forceLabels !== true) {
+      return manualAgentEligibility(issue, target, "ignore_state_requires_force", "--ignore-state requires --force");
+    }
+
+    const gateOptions: DispatchGateOptions = {
+      ignoreExcludeLabels: options.forceLabels === true,
+      ignoreState: options.ignoreState === true,
+    };
+    const preflight = await this.manualDispatchInspectionBlockReason(issue, target, gateOptions);
+    if (preflight.reason !== null) {
+      return manualAgentEligibility(issue, target, preflight.reason, preflight.explanation);
+    }
+    if (target.role === "reviewer") {
+      const reviewEvidence = await this.loadReviewerDispatchEvidence(issue);
+      if (!reviewEvidence) {
+        return manualAgentEligibility(
+          issue,
+          target,
+          "review_evidence_unavailable",
+          "No accepted completion report evidence is available for reviewer dispatch.",
+        );
+      }
+    }
+    return manualAgentEligibility(issue, target, null, preflight.explanation);
+  }
+
   private async fetchSingleIssue(issueIdOrIdentifier: string): Promise<Issue | null> {
     const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
     return refreshed[0] ?? null;
@@ -1250,6 +1309,29 @@ export class Orchestrator {
     });
     if (!lifecycleAllowed) return "lifecycle_gate_blocked";
     return null;
+  }
+
+  private async manualDispatchInspectionBlockReason(
+    issue: Issue,
+    target: { role: AgentRunRole; runPhase: AgentRunPhase },
+    options: DispatchGateOptions,
+  ): Promise<{ reason: string | null; explanation: string | null }> {
+    if (this.availableSlots() <= 0) {
+      return { reason: "no_agent_slots_available", explanation: "No configured agent slot is currently available." };
+    }
+    if (await this.activeProviderDispatchGate()) {
+      return { reason: "provider_dispatch_gate_active", explanation: "A provider dispatch gate is active for this runtime." };
+    }
+    const roleReason = this.manualRoleGateBlockReason(issue, target, options);
+    if (roleReason !== null) return { reason: roleReason, explanation: null };
+    const lifecycle = await this.lifecycleDispatchInspection(issue, target.role, target.runPhase, {
+      ...options,
+      manualDispatch: target.role === "triage" && target.runPhase === "issue_triage",
+    });
+    if (lifecycle.blocked) {
+      return { reason: "lifecycle_gate_blocked", explanation: lifecycle.explanation };
+    }
+    return { reason: null, explanation: lifecycle.explanation };
   }
 
   private manualRoleGateBlockReason(
@@ -2019,6 +2101,124 @@ export class Orchestrator {
     }
 
     return true;
+  }
+
+  private async lifecycleDispatchInspection(
+    issue: Issue,
+    role: AgentRunRole,
+    runPhase: AgentRunPhase = role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : role === "planner" ? "issue_breakdown" : "implementation",
+    options: DispatchGateOptions & { manualDispatch?: boolean } = {},
+  ): Promise<{ blocked: boolean; explanation: string | null }> {
+    const store = this.options.lifecycleStore;
+    if (!store) return { blocked: false, explanation: "No lifecycle store is configured; lifecycle gates are not applied." };
+    const lifecycle = await store.get(issue.id);
+    if (!lifecycle) return { blocked: false, explanation: "No lifecycle record exists for this issue." };
+
+    if (role === "triage") {
+      const allowed =
+        runPhase === "issue_triage" &&
+        (options.manualDispatch === true
+          ? shouldIssueTriageManualRun(lifecycle, this.config)
+          : shouldIssueTriageRun(lifecycle, this.config));
+      return {
+        blocked: !allowed,
+        explanation: allowed
+          ? `Issue triage is eligible for blocked reason: ${lifecycle.blockedReason ?? "n/a"}.`
+          : `Issue triage is not eligible for lifecycle phase=${lifecycle.phase}, blockedReason=${lifecycle.blockedReason ?? "n/a"}.`,
+      };
+    }
+
+    const conflict = lifecycle.mergeConflict;
+    if (
+      conflict &&
+      this.config.mergePolicy.conflictsState !== null &&
+      isStateIn(issue.state, [this.config.mergePolicy.conflictsState]) &&
+      (conflict.status === "blocked" || conflict.resolutionStatus === "blocked")
+    ) {
+      return {
+        blocked: true,
+        explanation: conflict.blockedReason ?? mergeConflictBlockedReason(conflict.fixTurnCount, conflict.maxFixTurns),
+      };
+    }
+
+    const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
+    const plannerAllowedFromBlocked =
+      role === "planner" &&
+      runPhase === "issue_breakdown" &&
+      blockedByLifecycle &&
+      isStateIn(issue.state, this.config.reviewLoop.blockedStates) &&
+      reportHasActiveTriageBlocker(
+        latestIssueTriageReportForFingerprint(lifecycle, issueTriageTriggerFingerprint(lifecycle)),
+        "under_specified_needs_decomposition",
+      );
+    let explanation: string | null = null;
+    if (blockedByLifecycle) {
+      if (plannerAllowedFromBlocked) {
+        explanation = "Lifecycle is blocked, but the latest triage report allows planner decomposition from blocked state.";
+      } else {
+        if (isPendingPublicationApprovalReason(lifecycle.blockedReason)) {
+          return {
+            blocked: true,
+            explanation: lifecycle.blockedReason ?? "Publication approval is pending.",
+          };
+        }
+        if (this.config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
+          return {
+            blocked: true,
+            explanation: lifecycle.blockedReason ?? "Lifecycle is blocked.",
+          };
+        }
+        explanation = `Lifecycle is stale-blocked (${lifecycle.blockedReason ?? "blocked"}); dispatch would clear it for current tracker state ${issue.state}, but inspection is read-only.`;
+      }
+    }
+
+    if (role === "planner" && runPhase === "issue_breakdown") {
+      if (lifecycle.planningFailureCount >= this.config.issueBreakdown.maxPlanningFailures) {
+        return {
+          blocked: true,
+          explanation: maxPlanningFailuresReason(lifecycle.planningFailureCount, this.config.issueBreakdown.maxPlanningFailures),
+        };
+      }
+      const backoffMs = planningBackoffRemainingMs(lifecycle, this.config);
+      if (backoffMs > 0) {
+        return {
+          blocked: true,
+          explanation: `Planning retry backoff is active for ${backoffMs}ms.`,
+        };
+      }
+    }
+    if (role === "worker" && runPhase === "merge_conflict_resolution") {
+      if (!conflict || conflict.status !== "open") {
+        return {
+          blocked: true,
+          explanation: "No open merge-conflict lifecycle record is available for conflict resolution.",
+        };
+      }
+      if (conflict.fixTurnCount >= conflict.maxFixTurns) {
+        return {
+          blocked: true,
+          explanation: mergeConflictBlockedReason(conflict.fixTurnCount, conflict.maxFixTurns),
+        };
+      }
+    }
+    if (
+      role === "worker" &&
+      runPhase === "implementation" &&
+      lifecycle.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns
+    ) {
+      return {
+        blocked: true,
+        explanation: `max incomplete turns reached (${lifecycle.incompleteTurnCount}/${this.config.reviewLoop.maxIncompleteTurns})`,
+      };
+    }
+    if (role === "reviewer" && lifecycle.reviewRound >= this.config.reviewLoop.failureLimits.reviewerFailures) {
+      return {
+        blocked: true,
+        explanation: `max reviewer failures reached (${lifecycle.reviewRound}/${this.config.reviewLoop.failureLimits.reviewerFailures})`,
+      };
+    }
+
+    return { blocked: false, explanation };
   }
 
   private passesLabelGuardrails(issue: Issue, role: AgentRunRole | "merge_policy", options: DispatchGateOptions = {}): boolean {
@@ -5998,6 +6198,23 @@ function manualAgentNotDispatched(
     runPhase: target.runPhase,
     runKind: runKindForPhase(target.runPhase),
     reason,
+  };
+}
+
+function manualAgentEligibility(
+  issue: Issue | null,
+  target: { role: AgentRunRole; runPhase: AgentRunPhase },
+  reason: string | null,
+  explanation: string | null,
+): ManualAgentEligibilityResult {
+  return {
+    issue,
+    role: target.role,
+    runPhase: target.runPhase,
+    runKind: runKindForPhase(target.runPhase),
+    eligible: reason === null,
+    reason,
+    explanation,
   };
 }
 
