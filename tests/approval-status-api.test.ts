@@ -234,7 +234,7 @@ describe("approval status API", () => {
     const address = await server.start();
 
     try {
-      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-1`);
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:TEST-1`);
       const body = (await response.json()) as {
         pendingApproval: {
           requestId: string;
@@ -717,6 +717,7 @@ describe("approval status API", () => {
       lifecycleStore,
       writebackOutbox: outboxStore,
       operatorApproval: service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -853,6 +854,7 @@ describe("approval status API", () => {
       lifecycleStore,
       writebackOutbox: outboxStore,
       operatorApproval: service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -1132,6 +1134,7 @@ describe("approval status API", () => {
       lifecycleStore,
       writebackOutbox: outboxStore,
       operatorApproval: service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -1886,6 +1889,7 @@ describe("approval status API", () => {
       runStore,
       lifecycleStore,
       operatorApproval: options.operatorApproval ?? service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: options.openWorkspaceToken === undefined ? "secret" : options.openWorkspaceToken,

@@ -20,7 +20,7 @@ import {
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
-import { resolveCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
+import { resolveCursorRuntimeApiKey, resolveScopedCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
 import {
   sanitizeAgentEventForPublicOutput,
   sanitizedPreviewValue,
@@ -683,12 +683,20 @@ export class CursorHarness implements AgentHarness {
     const cliPath = currentSymphonyCliPath();
     await writeInitialHandoffMcpContexts(ctx);
     const mcpServers = symphonyRoleMcpServers(ctx, { cliPath });
-    const createOptions = cursorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
-      mcpServers,
-    });
-    const resumeOptions = cursorAgentBaseOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
-      mcpServers,
-    });
+    const createOptions = cursorAgentCreateOptions(
+      ctx,
+      resolveScopedCursorRuntimeApiKey(ctx.config, ctx.role, { projectContext: ctx.projectContext }),
+      {
+        mcpServers,
+      },
+    );
+    const resumeOptions = cursorAgentBaseOptions(
+      ctx,
+      resolveScopedCursorRuntimeApiKey(ctx.config, ctx.role, { projectContext: ctx.projectContext }),
+      {
+        mcpServers,
+      },
+    );
     const latestRun =
       options.allowResume && ctx.role === "worker" && cursorRunPhase(ctx) === "implementation"
         ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, { role: "worker", runPhase: "implementation" })
@@ -924,7 +932,9 @@ function safeJsonPreview(value: unknown): string {
 
 export function cursorAgentCreateOptions(
   ctx: AgentRunContext,
-  apiKey: string | null | undefined = resolveCursorRuntimeApiKey(ctx.config, ctx.role),
+  apiKey: string | null | undefined = resolveScopedCursorRuntimeApiKey(ctx.config, ctx.role, {
+    projectContext: ctx.projectContext,
+  }),
   options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
 ): Parameters<typeof Agent.create>[0] {
   return {

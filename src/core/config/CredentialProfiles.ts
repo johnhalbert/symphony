@@ -44,6 +44,70 @@ const rawGitHubAppCredentialProfileSchema = rawCredentialProfileBaseSchema.exten
   token_refresh_buffer_seconds: z.number().int().nonnegative().optional(),
 });
 
+const rawCredentialProfileOverrideSchema = z
+  .object({
+    kind: z.enum(["static_token", "github_app"]).optional(),
+    capabilities: z.array(credentialCapabilitySchema).min(1).optional(),
+    value: z.string().optional(),
+    app_id: z.string().optional(),
+    client_id: z.string().optional(),
+    installation_id: z.string().optional(),
+    private_key: z.string().optional(),
+    private_key_path: z.string().optional(),
+    token_refresh_buffer_seconds: z.number().int().nonnegative().optional(),
+  })
+  .passthrough()
+  .superRefine((value, ctx) => {
+    const hasStaticFields = value.value !== undefined;
+    const hasGitHubAppFields =
+      value.app_id !== undefined ||
+      value.client_id !== undefined ||
+      value.installation_id !== undefined ||
+      value.private_key !== undefined ||
+      value.private_key_path !== undefined ||
+      value.token_refresh_buffer_seconds !== undefined;
+    if (
+      value.kind === undefined &&
+      value.capabilities === undefined &&
+      !hasStaticFields &&
+      !hasGitHubAppFields
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Credential profile override must specify at least one field",
+      });
+    }
+    if (value.kind === "static_token" && hasGitHubAppFields) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["kind"],
+        message: "static_token credential profile overrides cannot define GitHub App fields",
+      });
+    }
+    if (value.kind === "github_app" && hasStaticFields) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["kind"],
+        message: "github_app credential profile overrides cannot define static token value",
+      });
+    }
+    if (value.kind === undefined && hasStaticFields && hasGitHubAppFields) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["kind"],
+        message: "Credential profile overrides mixing static token and GitHub App fields must declare kind",
+      });
+    }
+  });
+
+const credentialProfileRoleAssignmentsSchema = z
+  .object({
+    worker: z.record(z.string(), z.string()).optional(),
+    reviewer: z.record(z.string(), z.string()).optional(),
+    service: z.record(z.string(), z.string()).optional(),
+  })
+  .strict();
+
 export const rawCredentialProfilesSchema = z
   .object({
     profiles: z
@@ -52,18 +116,19 @@ export const rawCredentialProfilesSchema = z
         z.union([rawGitHubAppCredentialProfileSchema, rawStaticCredentialProfileSchema]),
       )
       .optional(),
-    roles: z
-      .object({
-        worker: z.record(z.string(), z.string()).optional(),
-        reviewer: z.record(z.string(), z.string()).optional(),
-        service: z.record(z.string(), z.string()).optional(),
-      })
-      .strict()
-      .optional(),
+    roles: credentialProfileRoleAssignmentsSchema.optional(),
+  })
+  .passthrough();
+
+export const rawCredentialProfilesOverrideSchema = z
+  .object({
+    profiles: z.record(z.string(), rawCredentialProfileOverrideSchema).optional(),
+    roles: credentialProfileRoleAssignmentsSchema.optional(),
   })
   .passthrough();
 
 export type RawCredentialProfilesConfig = z.infer<typeof rawCredentialProfilesSchema>;
+export type RawCredentialProfilesOverrideConfig = z.infer<typeof rawCredentialProfilesOverrideSchema>;
 
 export interface CredentialLegacyFallbacks {
   githubToken: string | null;
@@ -256,15 +321,23 @@ export function createCredentialProfileRegistry(input: {
   env: NodeJS.ProcessEnv;
   workflowDir: string;
   fallbacks: CredentialLegacyFallbacks;
+  errorTransformer?: (error: unknown) => Error;
 }): CredentialProfileRegistry {
-  const profiles = parseProfiles(input.raw?.profiles, input.workflowDir, input.env);
-  const roleAssignments = parseRoleAssignments(input.raw?.roles, profiles);
-  return new CredentialProfileRegistry({
-    profiles,
-    roleAssignments,
-    env: input.env,
-    fallbacks: input.fallbacks,
-  });
+  try {
+    const profiles = parseProfiles(input.raw?.profiles, input.workflowDir, input.env);
+    const roleAssignments = parseRoleAssignments(input.raw?.roles, profiles);
+    return new CredentialProfileRegistry({
+      profiles,
+      roleAssignments,
+      env: input.env,
+      fallbacks: input.fallbacks,
+    });
+  } catch (error) {
+    if (input.errorTransformer) {
+      throw input.errorTransformer(error);
+    }
+    throw error;
+  }
 }
 
 function parseProfiles(

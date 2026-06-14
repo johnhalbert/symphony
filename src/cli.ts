@@ -254,6 +254,7 @@ program
     const orchestrator = new Orchestrator({
       config,
       tracker,
+      trackerResolver: (projectContext) => createRuntimeTrackerClient(configRef.value, undefined, projectContext),
       workspaceManager,
       harness,
       logger,
@@ -267,10 +268,13 @@ program
       operatorApproval,
     });
 
+    let statusServer: StatusServer | null = null;
+
     loader.watch((event) => {
       if (event.loaded) {
         configRef.value = event.loaded.serviceConfig;
         orchestrator.updateConfig(event.loaded.serviceConfig, event.loaded.definition.promptTemplate);
+        statusServer?.setDefaultProjectContextId(event.loaded.serviceConfig.projectContexts.defaultContextId);
         logger.info("workflow reloaded", { workflow_path: event.loaded.definition.workflowPath });
       } else if (event.error) {
         logger.error("workflow reload failed", { error: event.error.message, code: event.error.code });
@@ -281,13 +285,14 @@ program
       workspaceRoot: config.workspace.root,
       openerCommand: config.cursor.openerCommand,
     });
-    const statusServer =
+    statusServer =
       config.server.port === null
         ? null
         : new StatusServer({
             orchestrator,
             workspaceManager,
             workspaceOpener: opener,
+            defaultProjectContextId: config.projectContexts.defaultContextId,
             runStore,
             orchestratorConversationStore,
             lifecycleStore,

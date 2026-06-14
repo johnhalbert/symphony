@@ -160,28 +160,7 @@ export function formatDoctorResult(result: DoctorResult): string {
 }
 
 export function projectContextSummaryDoctorCheck(config: ServiceConfig): DoctorCheck {
-  const summary = config.projectContexts.contexts.map((context) => ({
-    id: context.id,
-    label: context.label,
-    enabled: context.enabled,
-    tracker: {
-      projectSlug: context.tracker.projectSlug,
-      apiKeyPresent: context.tracker.apiKey !== "",
-    },
-    workspace: {
-      source: {
-        kind: context.workspace.source.kind,
-        pathConfigured: context.workspace.source.path != null,
-        repositoryConfigured: context.workspace.source.repository != null,
-        refConfigured: context.workspace.source.ref != null,
-        baseRefConfigured: context.workspace.source.baseRef != null,
-        branchTemplateConfigured: context.workspace.source.branchTemplate != null,
-        cachePathConfigured: context.workspace.source.cachePath != null,
-        cleanup: context.workspace.source.cleanup,
-      },
-    },
-    github: { tokenPresent: context.github.token !== null },
-  }));
+  const summary = config.projectContexts.contexts.map((context) => context.publicSummary);
   return {
     id: "workflow.project_contexts",
     status: "ok",

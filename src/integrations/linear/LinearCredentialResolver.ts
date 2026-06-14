@@ -1,6 +1,9 @@
 import type { ServiceConfig, TrackerConfig, WorkflowProjectContext } from "../../core/config/Config.js";
+import {
+  resolveProjectContextCredentialView,
+  type ProjectContextCredentialResolutionOptions,
+} from "../../core/config/ProjectContextCredentialView.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../../core/config/CredentialProfiles.js";
-import { normalizeProjectContextResolution, type ProjectContextResolution } from "../../core/config/ProjectContexts.js";
 import { SymphonyError } from "../../core/errors.js";
 import { LinearTrackerClient } from "./LinearTrackerClient.js";
 
@@ -23,25 +26,20 @@ export interface ResolvedLinearClientConfig {
 export function resolveLinearClientConfig(
   config: ServiceConfig,
   capability: LinearCredentialCapability,
+  options: ProjectContextCredentialResolutionOptions = {},
 ): ResolvedLinearClientConfig {
-  return resolveLinearClientConfigForProjectContext(config, capability);
-}
-
-export function resolveLinearClientConfigForProjectContext(
-  config: ServiceConfig,
-  capability: LinearCredentialCapability,
-  projectContext?: ProjectContextResolution,
-): ResolvedLinearClientConfig {
+  const view = resolveProjectContextCredentialView({
+    config,
+    projectContext: options.projectContext,
+    env: options.env,
+  });
   const role = LINEAR_CREDENTIAL_CAPABILITY_OWNERS[capability];
   if (!role) {
     throw new SymphonyError("config_validation_error", `Unsupported Linear credential capability: ${capability}`);
   }
 
-  const context = resolveLinearProjectContext(config, projectContext);
-  const credentialProfiles = context.credentialProfileRegistry;
-
-  const assignedRoles = credentialProfiles.assignmentRolesFor(capability);
-  if (!credentialProfiles.hasAssignment(role, capability) && assignedRoles.length > 0) {
+  const assignedRoles = view.credentialProfiles.assignmentRolesFor(capability);
+  if (!view.credentialProfiles.hasAssignment(role, capability) && assignedRoles.length > 0) {
     throw new SymphonyError(
       "config_validation_error",
       `Linear credential capability ${capability} is owned by ${role}, but is assigned only to ${assignedRoles.join(
@@ -50,50 +48,47 @@ export function resolveLinearClientConfigForProjectContext(
     );
   }
 
-  const credential = credentialProfiles.resolveForRole(role, capability);
+  const credential = view.credentialProfiles.resolveForRole(role, capability);
   return {
     capability,
     role,
     tracker: {
-      ...context.tracker,
-      apiKey: credential?.value ?? context.tracker.apiKey,
+      ...view.tracker,
+      apiKey: credential?.value ?? view.tracker.apiKey,
     },
     credential,
   };
+}
+
+export function resolveLinearClientConfigForProjectContext(
+  config: ServiceConfig,
+  capability: LinearCredentialCapability,
+  projectContext?: ProjectContextCredentialResolutionOptions["projectContext"],
+): ResolvedLinearClientConfig {
+  return resolveLinearClientConfig(config, capability, { projectContext });
 }
 
 export function createLinearTrackerClientForCapability(
   config: ServiceConfig,
   capability: LinearCredentialCapability,
   fetchImpl?: FetchLike,
+  options: ProjectContextCredentialResolutionOptions = {},
 ): LinearTrackerClient {
-  return createLinearTrackerClientForProjectContext(config, capability, undefined, fetchImpl);
+  return new LinearTrackerClient(resolveLinearClientConfig(config, capability, options).tracker, fetchImpl);
 }
 
 export function createLinearTrackerClientForProjectContext(
   config: ServiceConfig,
   capability: LinearCredentialCapability,
-  projectContext: ProjectContextResolution | undefined,
+  projectContext: ProjectContextCredentialResolutionOptions["projectContext"],
   fetchImpl?: FetchLike,
 ): LinearTrackerClient {
-  return new LinearTrackerClient(resolveLinearClientConfigForProjectContext(config, capability, projectContext).tracker, fetchImpl);
+  return createLinearTrackerClientForCapability(config, capability, fetchImpl, { projectContext });
 }
 
 export function resolveLinearProjectContext(
   config: ServiceConfig,
-  projectContext?: ProjectContextResolution,
+  projectContext?: ProjectContextCredentialResolutionOptions["projectContext"],
 ): WorkflowProjectContext {
-  const resolvedProjectContext = normalizeProjectContextResolution(projectContext);
-  const configuredContext = config.projectContexts.byId.get(resolvedProjectContext.projectContextId);
-  if (configuredContext) return configuredContext;
-  if (
-    projectContext === undefined ||
-    resolvedProjectContext.projectContextId === config.projectContexts.defaultContextId
-  ) {
-    return config.projectContexts.defaultContext;
-  }
-  throw new SymphonyError(
-    "config_validation_error",
-    `Resolved project context "${resolvedProjectContext.projectContextId}" is not configured`,
-  );
+  return resolveProjectContextCredentialView({ config, projectContext }).projectContext;
 }

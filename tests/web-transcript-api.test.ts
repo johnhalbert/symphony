@@ -70,6 +70,32 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("serves literal colon-bearing session IDs before treating the request as a contextual alias", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const sessionId = "sym_eng-447_worker_issue:00dcda50:hermes-run-1";
+    await startRun(runStore, config, { runId: "colon-session-run", sessionId, issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "colon-session-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "colon session transcript",
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/${encodeURIComponent(sessionId)}/transcript`);
+      expect(response.status).toBe(200);
+      const body = transcriptMessages(await response.json());
+      expectRunPrelude(body, { session: sessionId, issue: "TEST-1" });
+      expect(body.at(-1)).toMatchObject({ kind: "assistant", text: "colon session transcript" });
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("returns empty transcript windows for missing, blank, or unavailable transcript stores", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);

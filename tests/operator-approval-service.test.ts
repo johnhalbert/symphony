@@ -8,6 +8,11 @@ import {
   OperatorApprovalService,
   type OperatorApprovalAction,
 } from "../src/core/approval/OperatorApprovalService.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { testConfig } from "./helpers.js";
 
@@ -68,6 +73,13 @@ describe("OperatorApprovalService", () => {
     const approvalPath = path.join(config.workspace.stateDir, "approval-requests", `${requestId}.json`);
     const record = JSON.parse(await readFile(approvalPath, "utf8")) as Record<string, unknown>;
     delete record.projectContext;
+    await writeFile(approvalPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  }
+
+  async function replacePersistedProjectContext(requestId: string, projectContext: unknown): Promise<void> {
+    const approvalPath = path.join(config.workspace.stateDir, "approval-requests", `${requestId}.json`);
+    const record = JSON.parse(await readFile(approvalPath, "utf8")) as Record<string, unknown>;
+    record.projectContext = projectContext;
     await writeFile(approvalPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
   }
 
@@ -280,6 +292,67 @@ describe("OperatorApprovalService", () => {
     await expect(store.get("approval_legacy")).resolves.toMatchObject({
       projectContext: docsProjectContext,
     });
+  });
+
+  it("backfills partial project context metadata from the run on direct read", async () => {
+    const { record } = await store.requestOrGetPending({ ...request(), evidenceCursor: "idem-partial-read-backfill" }, null);
+    await replacePersistedProjectContext(record.requestId, { projectContextId: "docs" });
+
+    await expect(store.get(record.requestId)).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+    });
+
+    const approvalPath = path.join(config.workspace.stateDir, "approval-requests", `${record.requestId}.json`);
+    await expect(readFile(approvalPath, "utf8")).resolves.toContain('"projectContextLabel": "Documentation Site"');
+    await expect(readFile(approvalPath, "utf8")).resolves.toContain('"linearProjectSlug": "DOCS"');
+    await expect(readFile(approvalPath, "utf8")).resolves.toContain('"routingSource": "candidate_poll"');
+  });
+
+  it("backfills synthesized default project context metadata on read when run context is unavailable", async () => {
+    const approvalDir = path.join(config.workspace.stateDir, "approval-requests");
+    await mkdir(approvalDir, { recursive: true });
+    await writeFile(
+      path.join(approvalDir, "approval_legacy_default.json"),
+      `${JSON.stringify(
+        {
+          requestId: "approval_legacy_default",
+          status: "pending",
+          issueId: "issue-legacy-default",
+          issueIdentifier: "LEGACY-DEFAULT",
+          projectContext: {},
+          runId: "run-missing",
+          evidenceCursor: "legacy-default-cursor",
+          dedupeKey: "run-missing:legacy-default-cursor:push_and_pr",
+          action: action(),
+          requestedAt: "2026-01-01T00:00:00.000Z",
+          expiresAt: null,
+          resolvedAt: null,
+          resolvedBy: null,
+          decision: null,
+          staleReason: null,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    await expect(store.get("approval_legacy_default")).resolves.toMatchObject({
+      projectContext: {
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+        linearProjectSlug: null,
+        routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+      },
+    });
+
+    const approvalPath = path.join(approvalDir, "approval_legacy_default.json");
+    await expect(readFile(approvalPath, "utf8")).resolves.toContain(`"projectContextId": "${LEGACY_DEFAULT_PROJECT_CONTEXT_ID}"`);
+    await expect(readFile(approvalPath, "utf8")).resolves.toContain(`"projectContextLabel": "${LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL}"`);
+    await expect(readFile(approvalPath, "utf8")).resolves.toContain('"linearProjectSlug": null');
+    await expect(readFile(approvalPath, "utf8")).resolves.toContain(
+      `"routingSource": "${LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE}"`,
+    );
   });
 
   it("repairs legacy pending approvals on run and issue read paths before filtering", async () => {

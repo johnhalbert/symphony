@@ -186,6 +186,7 @@ export class CompletionReportService {
     this.validateCaller(report, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
+    validateCompletionReportProjectContext(context, existingLifecycle);
     const existing = existingLifecycle?.completionReports.find((item) => item.idempotencyKey === report.idempotencyKey);
     if (existing && isFinalizedCompletionReport(existing)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
@@ -357,8 +358,9 @@ export class CompletionReportService {
     }
 
     const report = completionReportInputFromRecord(existing);
+    const issueTitle = lifecycle.summaryPointers.issueTitle ?? input.issue.title;
     const context: CompletionReportActiveContext = {
-      issue: input.issue,
+      issue: { ...input.issue, title: issueTitle },
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -402,8 +404,9 @@ export class CompletionReportService {
     }
 
     const report = completionReportInputFromRecord(existing);
+    const issueTitle = lifecycle.summaryPointers.issueTitle ?? input.issue.title;
     const context: CompletionReportActiveContext = {
-      issue: input.issue,
+      issue: { ...input.issue, title: issueTitle },
       activeRunId: input.approval.runId,
       role: "worker",
       sessionId: null,
@@ -776,11 +779,12 @@ export class CompletionReportService {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree workspace path");
     }
     const branchName =
-      context.workspace?.gitBranchName ??
-      report.branchName ??
-      existingLifecycle?.summaryPointers.gitBranchName ??
-      existingLifecycle?.summaryPointers.branchName ??
-      context.issue.branchName;
+      resolveServiceOwnedCompletionReportBranchName({
+        workspaceGitBranchName: context.workspace?.gitBranchName ?? null,
+        lifecycleGitBranchName: existingLifecycle?.summaryPointers.gitBranchName ?? null,
+        lifecycleBranchName: existingLifecycle?.summaryPointers.branchName ?? null,
+        issueBranchName: context.issue.branchName,
+      }) || report.branchName || null;
     if (!branchName) {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree branch");
     }
@@ -788,11 +792,12 @@ export class CompletionReportService {
     if (!baseBranch) {
       throw new SymphonyError("invalid_request", "PR publication requires a base branch");
     }
+    const issueTitle = existingLifecycle?.summaryPointers.issueTitle ?? context.issue.title;
     return {
       workspacePath,
       branchName,
       baseBranch,
-      title: `${context.issue.identifier}: ${context.issue.title}`,
+      title: `${context.issue.identifier}: ${issueTitle}`,
       body: formatPullRequestBody(report, context),
       evidenceCursor: report.idempotencyKey,
     };
@@ -816,7 +821,11 @@ export class CompletionReportService {
         "Publication approval requires a writeback processor to apply pending Linear audit before waiting",
       );
     }
-    await this.processDueForOperations(operations);
+    const projectContext = sharedWritebackProjectContext(operations);
+    await processor.processDue({
+      idempotencyKeys: operations.map((operation) => operation.idempotencyKey),
+      ...(projectContext === undefined ? {} : { projectContext }),
+    });
     for (const operation of operations) {
       const record = await this.options.writebackOutbox.get(operation.idempotencyKey, operation.projectContext);
       if (!record || !SETTLED_WRITEBACK_STATUSES.has(record.status)) {
@@ -913,16 +922,11 @@ export class CompletionReportService {
     operations: ReadonlyArray<Pick<WritebackOperation, "idempotencyKey" | "projectContext">>,
   ): Promise<void> {
     if (operations.length === 0) return;
-    const seen = new Set<string>();
-    for (const operation of operations) {
-      const scopedKey = writebackIdentityKey(operation.idempotencyKey, operation.projectContext);
-      if (seen.has(scopedKey)) continue;
-      seen.add(scopedKey);
-      await this.options.writebackProcessor?.processDue({
-        idempotencyKeys: [operation.idempotencyKey],
-        projectContext: operation.projectContext,
-      });
-    }
+    const projectContext = sharedWritebackProjectContext(operations);
+    await this.options.writebackProcessor?.processDue({
+      idempotencyKeys: operations.map((operation) => operation.idempotencyKey),
+      ...(projectContext === undefined ? {} : { projectContext }),
+    });
   }
 
   private async recordPublicationApprovalTerminalRun(approval: OperatorApprovalRecord): Promise<void> {
@@ -1052,8 +1056,34 @@ function resolveCompletionReportProjectContext(
   existingLifecycle: ExistingIssueLifecycle = null,
 ): ProjectContextResolution {
   return normalizeProjectContextResolution(
-    context.projectContext ?? existingLifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+    existingLifecycle?.projectContext ?? context.projectContext ?? projectContextResolutionFromIssue(context.issue),
   );
+}
+
+function projectContextEquals(
+  left: ProjectContextResolution | undefined,
+  right: ProjectContextResolution | undefined,
+): boolean {
+  const normalizedLeft = normalizeProjectContextResolution(left);
+  const normalizedRight = normalizeProjectContextResolution(right);
+  return (
+    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
+    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
+    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
+    normalizedLeft.routingSource === normalizedRight.routingSource
+  );
+}
+
+function sharedWritebackProjectContext(
+  operations: ReadonlyArray<Pick<NewWritebackOperation, "projectContext"> | Pick<WritebackOperation, "projectContext">>,
+): ProjectContextResolution | undefined {
+  if (operations.length === 0) return undefined;
+  const first = normalizeProjectContextResolution(operations[0]?.projectContext);
+  return operations.every(
+    (operation) => normalizeProjectContextResolution(operation.projectContext).projectContextId === first.projectContextId,
+  )
+    ? first
+    : undefined;
 }
 
 function upsertCompletionReport(
@@ -1069,11 +1099,17 @@ function summaryPointersFor(
   publication: CompletionReportPullRequestPublication | null,
   existingLifecycle: ExistingIssueLifecycle,
 ) {
+  const branchName = resolveServiceOwnedCompletionReportBranchName({
+    workspaceGitBranchName: context.workspace?.gitBranchName ?? null,
+    lifecycleGitBranchName: existingLifecycle?.summaryPointers.gitBranchName ?? null,
+    lifecycleBranchName: existingLifecycle?.summaryPointers.branchName ?? null,
+    issueBranchName: context.issue.branchName,
+  });
   return {
     workspacePath: context.workspacePath ?? context.workspace?.path ?? existingLifecycle?.summaryPointers.workspacePath ?? null,
-    branchName: context.workspace?.gitBranchName ?? context.issue.branchName ?? existingLifecycle?.summaryPointers.branchName ?? null,
-    gitBranchName:
-      context.workspace?.gitBranchName ?? context.issue.branchName ?? existingLifecycle?.summaryPointers.gitBranchName ?? null,
+    branchName,
+    issueTitle: context.issue.title,
+    gitBranchName: branchName,
     repoPath: context.workspace?.repoPath ?? existingLifecycle?.summaryPointers.repoPath ?? null,
     baseRef: context.workspace?.baseRef ?? existingLifecycle?.summaryPointers.baseRef ?? null,
     lastRunId: context.activeRunId,
@@ -1086,12 +1122,42 @@ function summaryPointersFor(
   };
 }
 
+function resolveServiceOwnedCompletionReportBranchName(input: {
+  workspaceGitBranchName?: string | null;
+  lifecycleGitBranchName?: string | null;
+  lifecycleBranchName?: string | null;
+  runGitBranchName?: string | null;
+  issueBranchName?: string | null;
+}): string | null {
+  return (
+    input.workspaceGitBranchName ??
+    input.lifecycleGitBranchName ??
+    input.lifecycleBranchName ??
+    input.runGitBranchName ??
+    input.issueBranchName ??
+    null
+  );
+}
+
 function normalizeChecklist(items: CompletionReportInput["acceptanceChecklist"]): CompletionReportChecklistItem[] {
   return items.map((item) => ({
     text: item.text,
     satisfied: item.satisfied,
     evidence: item.evidence,
   }));
+}
+
+
+function validateCompletionReportProjectContext(
+  context: CompletionReportActiveContext,
+  existingLifecycle: ExistingIssueLifecycle,
+): void {
+  if (!context.projectContext || !existingLifecycle?.projectContext) return;
+  if (projectContextEquals(context.projectContext, existingLifecycle.projectContext)) return;
+  throw new SymphonyError(
+    "invalid_request",
+    "Completion report issue project context does not match the lifecycle record",
+  );
 }
 
 function normalizeInputPullRequest(
@@ -1123,12 +1189,12 @@ function recoveryContextFor(input: {
   run: ExistingRunRecord;
   config: ServiceConfig;
 }): CompletionReportActiveContext {
-  const branchName =
-    input.pendingReport.branchName ??
-    input.lifecycle.summaryPointers.gitBranchName ??
-    input.lifecycle.summaryPointers.branchName ??
-    input.run?.gitBranchName ??
-    input.issue.branchName;
+  const branchName = resolveServiceOwnedCompletionReportBranchName({
+    lifecycleGitBranchName: input.lifecycle.summaryPointers.gitBranchName,
+    lifecycleBranchName: input.lifecycle.summaryPointers.branchName,
+    runGitBranchName: input.run?.gitBranchName ?? null,
+    issueBranchName: input.issue.branchName,
+  });
   const workspacePath = input.lifecycle.summaryPointers.workspacePath ?? input.run?.workspacePath ?? null;
   const baseRef = input.lifecycle.summaryPointers.baseRef ?? input.run?.baseRef ?? input.config.workspace.source.baseRef;
   const repoPath = input.lifecycle.summaryPointers.repoPath ?? input.run?.repoPath ?? null;
@@ -1150,6 +1216,7 @@ function recoveryContextFor(input: {
       ...input.issue,
       id: input.pendingReport.issueId,
       identifier: input.pendingReport.issueIdentifier,
+      title: input.lifecycle.summaryPointers.issueTitle ?? input.issue.title,
       state: input.config.writeback.dispatchState,
       branchName,
     },

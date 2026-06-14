@@ -434,8 +434,41 @@ describe("FileIssueLifecycleStore", () => {
     });
 
     const legacyPath = path.join(root, "issue-lifecycle", "issue-1.json");
-    const legacyRecord = JSON.parse(await nodeFs.readFile(legacyPath, "utf8")) as Record<string, unknown>;
-    delete legacyRecord.projectContext;
+    const topLevelMissingRecord = JSON.parse(await nodeFs.readFile(legacyPath, "utf8")) as Record<string, unknown>;
+    delete topLevelMissingRecord.projectContext;
+    await writeFile(legacyPath, `${JSON.stringify(topLevelMissingRecord, null, 2)}
+`, "utf8");
+    const beforeExplicitBackfillRead = await nodeFs.readFile(legacyPath, "utf8");
+
+    const explicitBackfilled = await store.get("TEST-1");
+    expect(explicitBackfilled).toMatchObject({
+      projectContext: normalizedDocsProjectContext,
+      summaryPointers: {
+        projectContext: normalizedDocsProjectContext,
+      },
+      issueBreakdownPlans: [{ projectContext: normalizedDocsProjectContext }],
+      completionReports: [{ projectContext: normalizedDocsProjectContext }],
+      reviewVerdicts: [{ projectContext: normalizedDocsProjectContext }],
+      reviewFeedback: [{ projectContext: normalizedDocsProjectContext }],
+      mergeConflictResolutionReports: [{ projectContext: normalizedDocsProjectContext }],
+      handoff: {
+        memo: {
+          projectContext: normalizedDocsProjectContext,
+          pointers: {
+            projectContext: normalizedDocsProjectContext,
+          },
+        },
+      },
+    });
+    expect(buildWorkerHandoffPacket(explicitBackfilled!, "2026-01-01T00:04:00.000Z")).toMatchObject({
+      projectContext: normalizedDocsProjectContext,
+      pointers: {
+        projectContext: normalizedDocsProjectContext,
+      },
+    });
+    expect(await nodeFs.readFile(legacyPath, "utf8")).toBe(beforeExplicitBackfillRead);
+
+    const legacyRecord = JSON.parse(beforeExplicitBackfillRead) as Record<string, unknown>;
     const summaryPointers = legacyRecord.summaryPointers as Record<string, unknown> | undefined;
     summaryPointers && delete summaryPointers.projectContext;
     const issueBreakdownPlans = legacyRecord.issueBreakdownPlans as Array<Record<string, unknown>> | undefined;
@@ -456,7 +489,7 @@ describe("FileIssueLifecycleStore", () => {
     }
     await writeFile(legacyPath, `${JSON.stringify(legacyRecord, null, 2)}
 `, "utf8");
-    const beforeRead = await nodeFs.readFile(legacyPath, "utf8");
+    const beforeLegacyDefaultRead = await nodeFs.readFile(legacyPath, "utf8");
 
     const legacyReloaded = await store.get("TEST-1");
     expect(legacyReloaded).toMatchObject({
@@ -478,15 +511,65 @@ describe("FileIssueLifecycleStore", () => {
         },
       },
     });
-    expect(buildWorkerHandoffPacket(legacyReloaded!, "2026-01-01T00:04:00.000Z")).toMatchObject({
+    expect(buildWorkerHandoffPacket(legacyReloaded!, "2026-01-01T00:05:00.000Z")).toMatchObject({
       projectContext: legacyDefaultProjectContext,
       pointers: {
         projectContext: legacyDefaultProjectContext,
       },
     });
-    expect(await nodeFs.readFile(legacyPath, "utf8")).toBe(beforeRead);
+    expect(await nodeFs.readFile(legacyPath, "utf8")).toBe(beforeLegacyDefaultRead);
   });
 
+
+  it("rejects legacy lifecycle records with conflicting nested project contexts", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const platformProjectContext = {
+      projectContextId: "platform-services",
+      projectContextLabel: "Platform Services",
+      linearProjectSlug: "PLAT",
+      routingSource: "workflow_default",
+    } as const;
+
+    await store.ensureIssue(issue(), {
+      projectContext: docsProjectContext,
+      completionReports: [
+        {
+          id: "report-1",
+          idempotencyKey: "report-key",
+          runId: "worker-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Updated documentation routing.",
+          validationEvidence: ["npm run typecheck -- --pretty false"],
+          acceptanceChecklist: [],
+          changedFiles: ["src/core/persistence/IssueLifecycleStore.ts"],
+          branchName: "symphony/TEST-1",
+          pullRequest: null,
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+    });
+
+    const lifecyclePath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const conflictingRecord = JSON.parse(await nodeFs.readFile(lifecyclePath, "utf8")) as Record<string, unknown>;
+    delete conflictingRecord.projectContext;
+    const completionReports = conflictingRecord.completionReports as Array<Record<string, unknown>> | undefined;
+    if (completionReports?.[0]) {
+      completionReports[0].projectContext = platformProjectContext;
+    }
+    await writeFile(lifecyclePath, `${JSON.stringify(conflictingRecord, null, 2)}
+`, "utf8");
+
+    await expect(store.get("TEST-1")).rejects.toBeInstanceOf(SymphonyError);
+  });
 
   it("surfaces corrupt lifecycle records", async () => {
     await mkdir(path.join(root, "issue-lifecycle"), { recursive: true });

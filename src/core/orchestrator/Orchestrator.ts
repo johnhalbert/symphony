@@ -2,11 +2,15 @@ import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
   LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+  normalizeProjectContextResolution,
+  normalizeProjectContextId,
   projectContextResolutionFromIssue,
   resolveProjectContextForIssue,
   type ProjectContextResolution,
 } from "../config/ProjectContexts.js";
+import { resolveServiceConfigForProjectContext } from "../config/ProjectContextServiceConfig.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
@@ -130,6 +134,7 @@ import type {
 export interface OrchestratorOptions {
   config: ServiceConfig;
   tracker: TrackerClient;
+  trackerResolver?: (projectContext?: ProjectContextResolution) => TrackerClient;
   workspaceManager: WorkspaceManager;
   harness: AgentHarness;
   logger: Logger;
@@ -169,6 +174,7 @@ export interface ContinuationSummaryCreationResult {
 
 export interface RunningEntry {
   issue: Issue;
+  projectContext: ProjectContextResolution | null;
   role: AgentRunRole;
   runPhase: AgentRunPhase;
   workspacePath: string | null;
@@ -224,7 +230,7 @@ interface ReviewerDispatchEvidence {
 }
 
 type WorkerDispatchDecision =
-  | { action: "dispatch"; runPhase: AgentRunPhase }
+  | { action: "dispatch"; runPhase: AgentRunPhase; projectContext?: ProjectContextResolution | undefined }
   | { action: "skip"; reason: string };
 
 export interface RetryEntry {
@@ -235,6 +241,7 @@ export interface RetryEntry {
   timer: NodeJS.Timeout;
   error: string | null;
   runPhase: AgentRunPhase;
+  projectContext: ProjectContextResolution | undefined;
 }
 
 type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
@@ -277,6 +284,7 @@ export interface RuntimeSnapshot {
     runPhase: AgentRunPhase;
     runKind: AgentRunKind;
     state: string;
+    projectContext?: ProjectContextResolution | undefined;
     workspacePath: string | null;
     sessionId: string | null;
     runId: string | null;
@@ -935,13 +943,13 @@ export class Orchestrator {
     if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
   }
 
-  async requestIssueBreakdown(issueIdOrIdentifier: string): Promise<{ queued: boolean; issue: Issue; reason: string }> {
+  async requestIssueBreakdown(
+    issueIdOrIdentifier: string,
+    options: { projectContext?: ProjectContextResolution } = {},
+  ): Promise<{ queued: boolean; issue: Issue; reason: string }> {
     const gate = await this.activeProviderDispatchGate();
     if (gate) {
       throw new SymphonyError("conflict", providerGateDispatchBlockedMessage(gate));
-    }
-    if (!this.config.issueBreakdown.enabled) {
-      throw new SymphonyError("invalid_request", "Issue breakdown planning is disabled");
     }
     if (!this.options.lifecycleStore) {
       throw new SymphonyError("invalid_request", "Issue breakdown planning requires a lifecycle store");
@@ -949,9 +957,15 @@ export class Orchestrator {
     if (this.availableSlots() <= 0) {
       throw new SymphonyError("conflict", "No agent slots are available for issue breakdown planning");
     }
-    const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
-    const issue = refreshed[0];
+    const issue = await this.resolveTrackedIssue(issueIdOrIdentifier, options.projectContext, {
+      allowCandidateIdentifierLookup: true,
+    });
     if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    const projectContext = this.requestedProjectContextForIssue(issue, options.projectContext);
+    const config = this.configForProjectContext(projectContext);
+    if (!config.issueBreakdown.enabled) {
+      throw new SymphonyError("invalid_request", "Issue breakdown planning is disabled");
+    }
     if (this.running.has(issue.id)) throw new SymphonyError("conflict", "Issue already has a running Symphony agent");
     if (this.isMergeConflictState(issue.state)) {
       throw new SymphonyError("conflict", "Merge conflict states are only eligible for conflict-fix workers");
@@ -959,33 +973,244 @@ export class Orchestrator {
     if (!this.shouldDispatchWorker(issue, false, "issue_breakdown")) {
       throw new SymphonyError("conflict", "Issue is not currently eligible for worker dispatch");
     }
-    if (!(await this.lifecycleAllowsDispatch(issue, "worker", "issue_breakdown"))) {
+    if (!(await this.lifecycleAllowsDispatch(issue, "worker", "issue_breakdown", projectContext))) {
       throw new SymphonyError("conflict", "Issue lifecycle does not currently allow issue breakdown planning");
     }
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
-    if (latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) !== null) {
+    if (latestFreshIssueBreakdownPlan(lifecycle, issue, config) !== null) {
       return { queued: false, issue, reason: "fresh_plan_exists" };
     }
-    this.dispatchIssue(issue, null, "worker", null, "issue_breakdown");
+    this.dispatchIssue(issue, null, "worker", null, "issue_breakdown", projectContext ?? null);
     return { queued: true, issue, reason: "explicit_request" };
   }
 
-  async applyIssueBreakdownPlan(issueIdOrIdentifier: string, options: { dryRun?: boolean } = {}) {
-    if (!this.config.issueBreakdown.enabled || !this.config.issueBreakdown.applyToLinear.enabled) {
-      throw new SymphonyError("invalid_request", "Issue breakdown Linear application is disabled");
-    }
+  async applyIssueBreakdownPlan(
+    issueIdOrIdentifier: string,
+    options: { dryRun?: boolean; projectContext?: ProjectContextResolution } = {},
+  ) {
     if (!this.options.lifecycleStore) {
       throw new SymphonyError("invalid_request", "Issue breakdown Linear application requires a lifecycle store");
     }
-    const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
-    const issue = refreshed[0];
+    const issue = await this.resolveTrackedIssue(issueIdOrIdentifier, options.projectContext, {
+      allowCandidateIdentifierLookup: true,
+    });
     if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    const projectContext = this.requestedProjectContextForIssue(issue, options.projectContext);
+    const config = this.configForProjectContext(projectContext);
+    if (!config.issueBreakdown.enabled || !config.issueBreakdown.applyToLinear.enabled) {
+      throw new SymphonyError("invalid_request", "Issue breakdown Linear application is disabled");
+    }
     const service = new IssueBreakdownPlanApplyService({
-      config: this.config,
+      config,
       lifecycleStore: this.options.lifecycleStore,
       writeback: this.options.writeback,
     });
     return options.dryRun === true ? service.previewLatestFreshPlan(issue) : service.applyLatestFreshPlan(issue);
+  }
+
+  private trackerClientForProjectContext(projectContext?: ProjectContextResolution): TrackerClient {
+    return this.options.trackerResolver?.(projectContext) ?? this.options.tracker;
+  }
+
+  private pollingProjectContexts(): Array<ProjectContextResolution | undefined> {
+    if (!this.options.trackerResolver) return [undefined];
+    return this.config.projectContexts.enabledContexts.map((context) =>
+      normalizeProjectContextResolution({
+        projectContextId: context.id,
+        projectContextLabel: context.label,
+        linearProjectSlug: context.tracker.projectSlug ?? null,
+        routingSource: context.source === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE ? context.source : "candidate_poll",
+      }),
+    );
+  }
+
+  private issueWithRequestedProjectContext(issue: Issue, requestedProjectContext?: ProjectContextResolution): Issue {
+    const projectContext = this.requestedProjectContextForIssue(issue, requestedProjectContext);
+    if (!projectContext || this.issueHasProjectContextProof(issue)) return issue;
+    return { ...issue, projectContext } as Issue;
+  }
+
+  private async fetchCandidateIssuesForProjectContext(projectContext?: ProjectContextResolution): Promise<Issue[]> {
+    const tracker = this.trackerClientForProjectContext(projectContext);
+    return (await tracker.fetchCandidateIssues()).map((issue) => this.issueWithRequestedProjectContext(issue, projectContext));
+  }
+
+  private async fetchIssuesByStatesForProjectContext(
+    states: readonly string[],
+    projectContext?: ProjectContextResolution,
+  ): Promise<Issue[]> {
+    const tracker = this.trackerClientForProjectContext(projectContext);
+    return (await tracker.fetchIssuesByStates([...states])).map((issue) => this.issueWithRequestedProjectContext(issue, projectContext));
+  }
+
+  private async fetchIssueStatesByIdsForProjectContext(
+    issueIds: readonly string[],
+    projectContext?: ProjectContextResolution,
+  ): Promise<Issue[]> {
+    const tracker = this.trackerClientForProjectContext(projectContext);
+    return (await tracker.fetchIssueStatesByIds([...issueIds])).map((issue) => this.issueWithRequestedProjectContext(issue, projectContext));
+  }
+
+  private async fetchPollingIssues(read: (projectContext?: ProjectContextResolution) => Promise<Issue[]>): Promise<Issue[]> {
+    const projectContexts = this.pollingProjectContexts();
+    if (projectContexts.length === 1) {
+      return read(projectContexts[0]);
+    }
+
+    const issues = new Map<string, Issue>();
+    for (const projectContext of projectContexts) {
+      for (const issue of await read(projectContext)) {
+        issues.set(issue.id, issue);
+      }
+    }
+    return [...issues.values()];
+  }
+
+  private async fetchIssueStatesByIdsGroupedByProjectContext(
+    requests: Array<{ issueId: string; projectContext: ProjectContextResolution | undefined }>,
+  ): Promise<Map<string, Issue>> {
+    if (!this.options.trackerResolver) {
+      return new Map(
+        (await this.fetchIssueStatesByIdsForProjectContext(
+          requests.map((request) => request.issueId),
+          undefined,
+        )).map((issue) => [issue.id, issue]),
+      );
+    }
+
+    const groupedRequests = new Map<string, { issueIds: string[]; projectContext: ProjectContextResolution | undefined }>();
+    for (const request of requests) {
+      const key = this.comparableProjectContextId(request.projectContext) ?? "__default__";
+      const group = groupedRequests.get(key);
+      if (group) {
+        group.issueIds.push(request.issueId);
+        continue;
+      }
+      groupedRequests.set(key, { issueIds: [request.issueId], projectContext: request.projectContext });
+    }
+
+    const issues = new Map<string, Issue>();
+    for (const { issueIds, projectContext } of groupedRequests.values()) {
+      for (const issue of await this.fetchIssueStatesByIdsForProjectContext(issueIds, projectContext)) {
+        issues.set(issue.id, issue);
+      }
+    }
+    return issues;
+  }
+
+  private configForProjectContext(projectContext?: ProjectContextResolution): ServiceConfig {
+    try {
+      return resolveServiceConfigForProjectContext(this.config, projectContext);
+    } catch (error) {
+      if (error instanceof SymphonyError && error.code === "config_validation_error") {
+        return this.config;
+      }
+      throw error;
+    }
+  }
+
+  private requestedProjectContextForIssue(
+    issue: Issue,
+    requestedProjectContext?: ProjectContextResolution,
+  ): ProjectContextResolution | undefined {
+    if (requestedProjectContext) return requestedProjectContext;
+    const issueProjectContext = projectContextResolutionFromIssue(issue);
+    if (this.issueHasExplicitProjectContextProof(issue)) {
+      return issueProjectContext ?? undefined;
+    }
+    const routing = resolveProjectContextForIssue(issue, this.config.projectContexts);
+    return routing.kind === "resolved" ? routing.projectContext : undefined;
+  }
+
+  private serviceConfigForIssue(issue: Issue, requestedProjectContext?: ProjectContextResolution): ServiceConfig {
+    return this.configForProjectContext(this.requestedProjectContextForIssue(issue, requestedProjectContext));
+  }
+
+  private serviceConfigForEntry(entry: RunningEntry): ServiceConfig {
+    return this.configForProjectContext(this.resolvedProjectContext(entry) ?? undefined);
+  }
+
+  private comparableProjectContextId(projectContext?: ProjectContextResolution | null): string | null {
+    if (!projectContext) return null;
+    const normalizedProjectContextId = normalizeProjectContextId(projectContext.projectContextId);
+    return normalizedProjectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+      ? this.config.projectContexts.defaultContextId
+      : normalizedProjectContextId;
+  }
+
+  private issueHasExplicitProjectContextProof(issue: Issue): boolean {
+    const candidate = issue as {
+      projectContext?: { projectContextId?: unknown } | null;
+      projectContextId?: unknown;
+    };
+    return (
+      typeof candidate.projectContext?.projectContextId === "string" || typeof candidate.projectContextId === "string"
+    );
+  }
+
+  private issueHasProjectContextProof(issue: Issue): boolean {
+    return this.issueHasExplicitProjectContextProof(issue);
+  }
+
+  private issueMatchesRequestedProjectContext(
+    issue: Issue,
+    requestedProjectContext?: ProjectContextResolution,
+  ): boolean {
+    if (!requestedProjectContext) return true;
+    const issueProjectContext = projectContextResolutionFromIssue(issue);
+    if (!issueProjectContext) return false;
+    return this.comparableProjectContextId(issueProjectContext) === this.comparableProjectContextId(requestedProjectContext);
+  }
+
+  private canTrustRequestedProjectContextFromTrackerLookup(
+    tracker: TrackerClient,
+    requestedProjectContext?: ProjectContextResolution,
+  ): boolean {
+    if (!requestedProjectContext) return true;
+    const requestedProjectContextId = this.comparableProjectContextId(requestedProjectContext);
+    if (requestedProjectContextId === this.config.projectContexts.defaultContextId) {
+      return tracker === this.options.tracker || Boolean(this.options.trackerResolver);
+    }
+    return Boolean(this.options.trackerResolver && tracker !== this.options.tracker);
+  }
+
+  private async resolveTrackedIssue(
+    issueIdOrIdentifier: string,
+    projectContext: ProjectContextResolution | undefined,
+    options: { allowCandidateIdentifierLookup?: boolean } = {},
+  ): Promise<Issue | null> {
+    try {
+      const tracker = this.trackerClientForProjectContext(projectContext);
+      const trackerLookupProvesRequestedContext = this.canTrustRequestedProjectContextFromTrackerLookup(
+        tracker,
+        projectContext,
+      );
+      const direct = (await tracker.fetchIssueStatesByIds([issueIdOrIdentifier]))[0] ?? null;
+      if (direct) {
+        if (
+          this.issueMatchesRequestedProjectContext(direct, projectContext) ||
+          (!this.issueHasProjectContextProof(direct) && trackerLookupProvesRequestedContext)
+        ) {
+          return this.issueWithRequestedProjectContext(direct, projectContext);
+        }
+      }
+      if (options.allowCandidateIdentifierLookup !== true) return null;
+      const candidate = (await tracker.fetchCandidateIssues()).find((candidateIssue) => {
+        if (candidateIssue.id !== issueIdOrIdentifier && candidateIssue.identifier !== issueIdOrIdentifier) {
+          return false;
+        }
+        return (
+          this.issueMatchesRequestedProjectContext(candidateIssue, projectContext) ||
+          (!this.issueHasProjectContextProof(candidateIssue) && trackerLookupProvesRequestedContext)
+        );
+      });
+      return candidate ? this.issueWithRequestedProjectContext(candidate, projectContext) : null;
+    } catch (error) {
+      if (error instanceof SymphonyError && error.code === "config_validation_error") {
+        return null;
+      }
+      throw error;
+    }
   }
 
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
@@ -994,7 +1219,10 @@ export class Orchestrator {
     const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
     const publisher =
       this.options.completionReportPublisher ??
-      createGitHubPullRequestClientForCapability(this.config, "github.publication");
+      this.defaultGitHubPullRequestClientForCapability(
+        "github.publication",
+        request.projectContext ?? projectContextResolutionFromIssue(issue) ?? undefined,
+      );
     const result = await new CompletionReportService({
       config: this.config,
       lifecycleStore: this.options.lifecycleStore,
@@ -1077,29 +1305,33 @@ export class Orchestrator {
         manual: this.activeProviderGates.filter((gate) => gate.resumePolicy === "manual").length,
         autoResume: this.activeProviderGates.filter((gate) => gate.resumePolicy === "auto_at_window_close").length,
       },
-      running: [...this.running.entries()].map(([issueId, entry]) => ({
-        issueId,
-        issueIdentifier: entry.issue.identifier,
-        role: entry.role,
-        runPhase: entry.runPhase,
-        runKind: runKindForPhase(entry.runPhase),
-        state: entry.issue.state,
-        workspacePath: entry.workspacePath,
-        sessionId: entry.sessionId,
-        runId: entry.runId,
-        turnCount: entry.turnCount,
-        lastEvent: entry.lastEvent,
-        lastMessage: entry.lastMessage,
-        startedAt: entry.startedAt.toISOString(),
-        lastEventAt: entry.lastEventAt?.toISOString() ?? null,
-        liveness: this.livenessForEntry(entry, now),
-        cancellation: cancellationForEntry(entry),
-        activity: activityForEntry(entry),
-        tokens: entry.tokens,
-        lifecycle: entry.lifecycle,
-        metadata: metadataForRunningEntry(entry),
-        issueDetails: toIssueStatusView(entry.issue),
-      })),
+      running: [...this.running.entries()].map(([issueId, entry]) => {
+        const projectContext = this.resolvedProjectContext(entry);
+        return {
+          issueId,
+          issueIdentifier: entry.issue.identifier,
+          role: entry.role,
+          runPhase: entry.runPhase,
+          runKind: runKindForPhase(entry.runPhase),
+          state: entry.issue.state,
+          ...(projectContext === undefined ? {} : { projectContext }),
+          workspacePath: entry.workspacePath,
+          sessionId: entry.sessionId,
+          runId: entry.runId,
+          turnCount: entry.turnCount,
+          lastEvent: entry.lastEvent,
+          lastMessage: entry.lastMessage,
+          startedAt: entry.startedAt.toISOString(),
+          lastEventAt: entry.lastEventAt?.toISOString() ?? null,
+          liveness: this.livenessForEntry(entry, now),
+          cancellation: cancellationForEntry(entry),
+          activity: activityForEntry(entry),
+          tokens: entry.tokens,
+          lifecycle: entry.lifecycle,
+          metadata: metadataForRunningEntry(entry),
+          issueDetails: toIssueStatusView(entry.issue),
+        };
+      }),
       retrying: [...this.retryAttempts.values()].map((entry) => ({
         issueId: entry.issueId,
         issueIdentifier: entry.identifier,
@@ -1153,12 +1385,19 @@ export class Orchestrator {
         return;
       }
       await this.recoverPendingPublicationApprovalHandoffs();
-      const workerCandidates = await this.options.tracker.fetchCandidateIssues();
+      const workerCandidates = await this.fetchPollingIssues((projectContext) =>
+        this.fetchCandidateIssuesForProjectContext(projectContext),
+      );
       for (const issue of sortIssuesForDispatch(workerCandidates)) {
         if (this.availableSlots() <= 0) break;
         await this.tryDispatchWorkerIssue(issue, null);
       }
-      const reviewerCandidates = await this.options.tracker.fetchIssuesByStates(this.config.reviewLoop.reviewStates);
+      const reviewerCandidates = await this.fetchPollingIssues((projectContext) =>
+        this.fetchIssuesByStatesForProjectContext(
+          this.configForProjectContext(projectContext).reviewLoop.reviewStates,
+          projectContext,
+        ),
+      );
       for (const issue of sortIssuesForDispatch(reviewerCandidates)) {
         if (this.availableSlots() <= 0) break;
         await this.tryDispatchReviewerIssue(issue);
@@ -1234,20 +1473,22 @@ export class Orchestrator {
       this.options.logger.warn("pending publication approval recovery issue refresh failed", { error: errorMessage(error) });
     }
     const issuesById = new Map(latestIssues.map((issue) => [issue.id, issue]));
-    const service = new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
-      writebackProcessor: this.options.writeback,
-      ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
-      pullRequestPublisher:
-        this.options.completionReportPublisher ??
-        createGitHubPullRequestClientForCapability(this.config, "github.publication"),
-      operatorApproval: this.options.operatorApproval,
-    });
-
     for (const lifecycle of candidates) {
       const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
+      const service = new CompletionReportService({
+        config: this.config,
+        lifecycleStore: this.options.lifecycleStore,
+        writebackOutbox: new FileWritebackOutboxStore(this.config.workspace.stateDir),
+        writebackProcessor: this.options.writeback,
+        ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
+        pullRequestPublisher:
+          this.options.completionReportPublisher ??
+          this.defaultGitHubPullRequestClientForCapability(
+            "github.publication",
+            lifecycle.projectContext ?? projectContextResolutionFromIssue(issue) ?? undefined,
+          ),
+        operatorApproval: this.options.operatorApproval,
+      });
       try {
         const result = await service.recoverPendingPublicationApproval({ issue, lifecycle });
         if (result.recovered) {
@@ -1272,34 +1513,39 @@ export class Orchestrator {
   private async reconcileRunningIssues(): Promise<void> {
     const runningIds = [...this.running.keys()];
     if (runningIds.length === 0) return;
-    let refreshed: Issue[];
+    let refreshedById: Map<string, Issue>;
     try {
-      refreshed = await this.options.tracker.fetchIssueStatesByIds(runningIds);
+      refreshedById = await this.fetchIssueStatesByIdsGroupedByProjectContext(
+        [...this.running.entries()].map(([issueId, entry]) => ({
+          issueId,
+          projectContext: this.resolvedProjectContext(entry) ?? undefined,
+        })),
+      );
     } catch (error) {
       this.options.logger.warn("running issue refresh failed", { error: errorMessage(error) });
       return;
     }
 
-    const byId = new Map(refreshed.map((issue) => [issue.id, issue]));
     for (const [issueId, entry] of this.running) {
-      const latest = byId.get(issueId);
+      const latest = refreshedById.get(issueId);
       if (!latest) continue;
       entry.issue = latest;
+      const config = this.serviceConfigForEntry(entry);
       const preservePendingApprovalWorker =
         entry.role === "worker" && (await this.hasPendingPublicationApprovalHandoff(entry));
-      if (isStateIn(latest.state, this.config.tracker.terminalStates)) {
+      if (isStateIn(latest.state, config.tracker.terminalStates)) {
         await this.terminateRunningIssue(issueId, true, "terminal state");
       } else if (preservePendingApprovalWorker) {
         entry.lastMessage = "Awaiting operator approval for push/PR";
-      } else if (entry.role === "worker" && isStateIn(latest.state, this.config.tracker.handoffStates)) {
+      } else if (entry.role === "worker" && isStateIn(latest.state, config.tracker.handoffStates)) {
         await this.terminateRunningIssue(issueId, false, "handoff state");
       } else if (entry.role === "worker" && !latest.assignedToWorker) {
         await this.terminateRunningIssue(issueId, false, "worker route changed");
-      } else if (entry.role === "worker" && !this.isWorkerStateActiveForRunPhase(latest, entry.runPhase)) {
+      } else if (entry.role === "worker" && !this.isWorkerStateActiveForRunPhase(latest, entry.runPhase, config)) {
         await this.terminateRunningIssue(issueId, false, "non-active state");
-      } else if (entry.role === "reviewer" && isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
+      } else if (entry.role === "reviewer" && isStateIn(latest.state, config.reviewLoop.blockedStates)) {
         await this.terminateRunningIssue(issueId, false, "blocked state");
-      } else if (entry.role === "reviewer" && !isStateIn(latest.state, this.config.reviewLoop.reviewStates)) {
+      } else if (entry.role === "reviewer" && !isStateIn(latest.state, config.reviewLoop.reviewStates)) {
         await this.terminateRunningIssue(issueId, false, "non-review state");
       }
     }
@@ -1349,37 +1595,43 @@ export class Orchestrator {
     allowExistingClaim = false,
     runPhase: AgentRunPhase = "implementation",
   ): boolean {
+    const config = this.serviceConfigForIssue(issue);
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
     if (!issue.assignedToWorker) return false;
-    if (isStateIn(issue.state, this.config.tracker.handoffStates)) return false;
-    if (isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
-    if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
-    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
-    if (!this.isWorkerStateActiveForRunPhase(issue, runPhase)) return false;
-    if (!this.passesLabelGuardrails(issue)) return false;
+    if (isStateIn(issue.state, config.tracker.handoffStates)) return false;
+    if (isStateIn(issue.state, config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(issue.state, config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(issue.state, config.tracker.terminalStates)) return false;
+    if (!this.isWorkerStateActiveForRunPhase(issue, runPhase, config)) return false;
+    if (!this.passesLabelGuardrails(issue, config)) return false;
     if (issue.state.toLowerCase() === "todo") {
-      if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
+      if (hasOpenBlocker(issue, config.tracker.terminalStates)) return false;
     }
     return this.hasStateSlot(issue.state);
   }
 
-  private isWorkerStateActiveForRunPhase(issue: Issue, runPhase: AgentRunPhase): boolean {
+  private isWorkerStateActiveForRunPhase(
+    issue: Issue,
+    runPhase: AgentRunPhase,
+    config: ServiceConfig = this.serviceConfigForIssue(issue),
+  ): boolean {
     if (runPhase === "merge_conflict_resolution") return this.isMergeConflictState(issue.state);
     if (this.isMergeConflictState(issue.state)) return false;
-    return isStateIn(issue.state, this.config.tracker.activeStates);
+    return isStateIn(issue.state, config.tracker.activeStates);
   }
 
   private shouldDispatchReviewer(issue: Issue, allowExistingClaim = false): boolean {
+    const config = this.serviceConfigForIssue(issue);
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
-    if (!isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return false;
-    if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
-    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
-    if (!this.passesLabelGuardrails(issue)) return false;
-    if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
+    if (!isStateIn(issue.state, config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(issue.state, config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(issue.state, config.tracker.terminalStates)) return false;
+    if (!this.passesLabelGuardrails(issue, config)) return false;
+    if (hasOpenBlocker(issue, config.tracker.terminalStates)) return false;
     return this.hasStateSlot(issue.state);
   }
 
@@ -1387,18 +1639,22 @@ export class Orchestrator {
     issue: Issue,
     role: AgentRunRole,
     runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
+    projectContext?: ProjectContextResolution,
   ): Promise<boolean> {
     const store = this.options.lifecycleStore;
     if (!store) return true;
     const lifecycle = await store.get(issue.id);
     if (!lifecycle) return true;
 
-    const phase = phaseForIssueState(issue.state, this.config);
+    const config = this.configForProjectContext(
+      projectContext ?? lifecycle.projectContext ?? projectContextResolutionFromIssue(issue) ?? undefined,
+    );
+    const phase = phaseForIssueState(issue.state, config);
     const conflict = lifecycle.mergeConflict;
     if (
       conflict &&
-      this.config.mergePolicy.conflictsState !== null &&
-      isStateIn(issue.state, [this.config.mergePolicy.conflictsState]) &&
+      config.mergePolicy.conflictsState !== null &&
+      isStateIn(issue.state, [config.mergePolicy.conflictsState]) &&
       (conflict.status === "blocked" || conflict.resolutionStatus === "blocked")
     ) {
       const blockedReason =
@@ -1417,7 +1673,7 @@ export class Orchestrator {
       if (isPendingPublicationApprovalReason(lifecycle.blockedReason)) {
         return false;
       }
-      if (this.config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
+      if (config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, config.reviewLoop.blockedStates)) {
         return false;
       }
       await store.updateIssue(issue, {
@@ -1430,16 +1686,20 @@ export class Orchestrator {
     }
 
     if (role === "worker" && runPhase === "issue_breakdown") {
-      if (lifecycle.planningFailureCount >= this.config.issueBreakdown.maxPlanningFailures) {
+      const issueBreakdownConfig = config;
+      if (lifecycle.planningFailureCount >= issueBreakdownConfig.issueBreakdown.maxPlanningFailures) {
         await this.escalateLifecycleBlocked(
           issue,
           lifecycle,
           lifecycle.summaryPointers.lastRunId ?? issue.id,
-          maxPlanningFailuresReason(lifecycle.planningFailureCount, this.config.issueBreakdown.maxPlanningFailures),
+          maxPlanningFailuresReason(
+            lifecycle.planningFailureCount,
+            issueBreakdownConfig.issueBreakdown.maxPlanningFailures,
+          ),
         );
         return false;
       }
-      if (planningBackoffRemainingMs(lifecycle, this.config) > 0) return false;
+      if (planningBackoffRemainingMs(lifecycle, issueBreakdownConfig) > 0) return false;
     }
     if (role === "worker" && runPhase === "merge_conflict_resolution") {
       if (!conflict || conflict.status !== "open") return false;
@@ -1451,22 +1711,22 @@ export class Orchestrator {
     if (
       role === "worker" &&
       runPhase === "implementation" &&
-      lifecycle.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns
+      lifecycle.incompleteTurnCount >= config.reviewLoop.maxIncompleteTurns
     ) {
       await this.escalateLifecycleBlocked(
         issue,
         lifecycle,
         lifecycle.summaryPointers.lastRunId ?? issue.id,
-        `max incomplete turns reached (${lifecycle.incompleteTurnCount}/${this.config.reviewLoop.maxIncompleteTurns})`,
+        `max incomplete turns reached (${lifecycle.incompleteTurnCount}/${config.reviewLoop.maxIncompleteTurns})`,
       );
       return false;
     }
-    if (role === "reviewer" && lifecycle.reviewRound >= this.config.reviewLoop.maxReviewRounds) {
+    if (role === "reviewer" && lifecycle.reviewRound >= config.reviewLoop.maxReviewRounds) {
       await this.escalateLifecycleBlocked(
         issue,
         lifecycle,
         lifecycle.summaryPointers.lastRunId ?? issue.id,
-        `max review rounds reached (${lifecycle.reviewRound}/${this.config.reviewLoop.maxReviewRounds})`,
+        `max review rounds reached (${lifecycle.reviewRound}/${config.reviewLoop.maxReviewRounds})`,
       );
       return false;
     }
@@ -1474,10 +1734,10 @@ export class Orchestrator {
     return true;
   }
 
-  private passesLabelGuardrails(issue: Issue): boolean {
+  private passesLabelGuardrails(issue: Issue, config: ServiceConfig = this.serviceConfigForIssue(issue)): boolean {
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
-    if (this.config.agent.requireLabels.some((label) => !labels.has(label))) return false;
-    if (this.config.agent.excludeLabels.some((label) => labels.has(label))) return false;
+    if (config.agent.requireLabels.some((label) => !labels.has(label))) return false;
+    if (config.agent.excludeLabels.some((label) => labels.has(label))) return false;
     return true;
   }
 
@@ -1487,9 +1747,10 @@ export class Orchestrator {
     const initialRunPhase = this.isMergeConflictState(issue.state) ? "merge_conflict_resolution" : "implementation";
     if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase)) return false;
 
+    const requestedProjectContext = this.requestedProjectContextForIssue(issue);
     let refreshed: Issue[];
     try {
-      refreshed = await this.options.tracker.fetchIssueStatesByIds([issue.id]);
+      refreshed = await this.fetchIssueStatesByIdsForProjectContext([issue.id], requestedProjectContext);
     } catch (error) {
       this.options.logger.warn("pre-dispatch issue refresh failed", {
         issue_id: issue.id,
@@ -1505,6 +1766,7 @@ export class Orchestrator {
     if (await this.activeProviderDispatchGate()) return false;
     const latestRunPhase = this.isMergeConflictState(latest.state) ? "merge_conflict_resolution" : "implementation";
     if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase)) return false;
+    const latestProjectContext = this.requestedProjectContextForIssue(latest, requestedProjectContext);
 
     const decision = await this.resolveWorkerDispatchDecision(latest);
     if (decision.action === "skip") {
@@ -1516,11 +1778,17 @@ export class Orchestrator {
       return false;
     }
     let runPhase = decision.runPhase;
-    if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase))) return false;
-    const dispatchWriteback = runPhase === "implementation" ? planDispatchWriteback(latest, this.config) : null;
+    if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase, latestProjectContext))) return false;
+    const dispatchWriteback =
+      runPhase === "implementation"
+        ? planDispatchWriteback(latest, this.serviceConfigForIssue(latest, latestProjectContext), latestProjectContext)
+        : null;
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
-    const afterWriteback = dispatchWriteback ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] : latest;
+    const afterWriteback = dispatchWriteback
+      ? (await this.fetchIssueStatesByIdsForProjectContext([issue.id], latestProjectContext))[0]
+      : latest;
     if (!afterWriteback) return false;
+    const afterWritebackProjectContext = this.requestedProjectContextForIssue(afterWriteback, latestProjectContext);
     if (dispatchWriteback) {
       const postWritebackDecision = await this.resolveWorkerDispatchDecision(afterWriteback);
       if (postWritebackDecision.action === "skip") {
@@ -1534,21 +1802,22 @@ export class Orchestrator {
       runPhase = postWritebackDecision.runPhase;
     }
     if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim, runPhase)) return false;
-    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase))) return false;
+    if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase, afterWritebackProjectContext))) return false;
 
-    this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase);
+    this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase, afterWritebackProjectContext ?? null);
     return true;
   }
 
   private async tryDispatchReviewerIssue(issue: Issue, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
+    const requestedProjectContext = this.requestedProjectContextForIssue(issue);
     if (!this.shouldDispatchReviewer(issue, allowExistingClaim)) return false;
-    if (!(await this.lifecycleAllowsDispatch(issue, "reviewer"))) return false;
+    if (!(await this.lifecycleAllowsDispatch(issue, "reviewer", "review", requestedProjectContext))) return false;
 
     let refreshed: Issue[];
     try {
-      refreshed = await this.options.tracker.fetchIssueStatesByIds([issue.id]);
+      refreshed = await this.fetchIssueStatesByIdsForProjectContext([issue.id], requestedProjectContext);
     } catch (error) {
       this.options.logger.warn("pre-review issue refresh failed", {
         issue_id: issue.id,
@@ -1562,25 +1831,27 @@ export class Orchestrator {
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
+    const latestProjectContext = this.requestedProjectContextForIssue(latest, requestedProjectContext);
     if (!this.shouldDispatchReviewer(latest, allowExistingClaim)) return false;
-    if (!(await this.lifecycleAllowsDispatch(latest, "reviewer"))) return false;
+    if (!(await this.lifecycleAllowsDispatch(latest, "reviewer", "review", latestProjectContext))) return false;
 
     const reviewEvidence = await this.loadReviewerDispatchEvidence(latest);
     if (!reviewEvidence) return false;
 
-    this.dispatchIssue(latest, null, "reviewer", reviewEvidence);
+    this.dispatchIssue(latest, null, "reviewer", reviewEvidence, "review", latestProjectContext ?? null);
     return true;
   }
 
   private async resolveWorkerDispatchDecision(issue: Issue): Promise<WorkerDispatchDecision> {
     if (this.isMergeConflictState(issue.state)) return { action: "dispatch", runPhase: "merge_conflict_resolution" };
-    if (!this.config.issueBreakdown.enabled) return { action: "dispatch", runPhase: "implementation" };
-    if (!this.passesIssueBreakdownRouting(issue)) return { action: "dispatch", runPhase: "implementation" };
+    const config = this.configForProjectContext(this.requestedProjectContextForIssue(issue));
+    if (!config.issueBreakdown.enabled) return { action: "dispatch", runPhase: "implementation" };
+    if (!this.passesIssueBreakdownRouting(issue, config)) return { action: "dispatch", runPhase: "implementation" };
     if (!this.options.lifecycleStore) return { action: "skip", reason: "planning_required_no_lifecycle_store" };
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
-    const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, this.config);
+    const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, config);
     if (plan === null) return { action: "dispatch", runPhase: "issue_breakdown" };
-    if (this.config.issueBreakdown.applyToLinear.enabled) {
+    if (config.issueBreakdown.applyToLinear.enabled) {
       return {
         action: "skip",
         reason:
@@ -1597,10 +1868,10 @@ export class Orchestrator {
     };
   }
 
-  private passesIssueBreakdownRouting(issue: Issue): boolean {
-    if (this.config.issueBreakdown.planningLabels.length === 0) return false;
+  private passesIssueBreakdownRouting(issue: Issue, config: ServiceConfig): boolean {
+    if (config.issueBreakdown.planningLabels.length === 0) return false;
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
-    return this.config.issueBreakdown.planningLabels.some((label) => labels.has(label));
+    return config.issueBreakdown.planningLabels.some((label) => labels.has(label));
   }
 
   private isMergeConflictState(_state: string): boolean {
@@ -1613,11 +1884,13 @@ export class Orchestrator {
     role: AgentRunRole,
     reviewEvidence: ReviewerDispatchEvidence | null,
     runPhase: AgentRunPhase = role === "reviewer" ? "review" : "implementation",
+    projectContext: ProjectContextResolution | null = null,
   ): void {
     const abortController = new AbortController();
     const retryAttempt = attempt ?? 0;
     const entry: RunningEntry = {
       issue,
+      projectContext,
       role,
       runPhase,
       workspacePath: null,
@@ -1706,7 +1979,10 @@ export class Orchestrator {
     try {
       entry.lifecycle ??= await this.options.lifecycleStore?.get(entry.issue.id) ?? null;
       const resolvedProjectContext =
-        entry.runPhase === "issue_breakdown" ? null : await this.resolveWorkerProjectContext(entry);
+        entry.runPhase === "issue_breakdown"
+          ? this.resolvedProjectContext(entry) ?? null
+          : await this.resolveWorkerProjectContext(entry);
+      entry.projectContext = resolvedProjectContext;
       if (
         entry.runPhase !== "issue_breakdown" &&
         entry.lifecycle !== null &&
@@ -1720,10 +1996,14 @@ export class Orchestrator {
           : await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
+
       await this.updateLifecycle(
         entry,
         entry.runPhase === "issue_breakdown"
-          ? { phase: phaseForIssueState(entry.issue.state, this.config) }
+          ? {
+              phase: phaseForIssueState(entry.issue.state, this.config),
+              ...(resolvedProjectContext === null ? {} : { projectContext: resolvedProjectContext }),
+            }
           : {
               phase: phaseForIssueState(entry.issue.state, this.config),
               ...(resolvedProjectContext === null ? {} : { projectContext: resolvedProjectContext }),
@@ -1783,7 +2063,10 @@ export class Orchestrator {
         if (entry.completionReportAccepted || entry.mergeConflictResolutionAccepted) break;
         if (entry.lifecycle?.phase === "blocked" || entry.lifecycle?.blockedReason !== null) break;
 
-        const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
+        const refreshed = await this.fetchIssueStatesByIdsForProjectContext(
+          [entry.issue.id],
+          this.resolvedProjectContext(entry) ?? undefined,
+        );
         const latest = refreshed[0];
         if (latest) {
           entry.issue = latest;
@@ -2303,7 +2586,15 @@ export class Orchestrator {
       }
       if (entry.runPhase === "merge_conflict_resolution") {
         if (await this.shouldScheduleContinuation(entry)) {
-          this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
+          this.scheduleRetry(
+            issueId,
+            entry.issue.identifier,
+            1,
+            1_000,
+            null,
+            entry.runPhase,
+            this.resolvedProjectContext(entry) ?? undefined,
+          );
         } else {
           this.claimed.delete(issueId);
         }
@@ -2327,7 +2618,15 @@ export class Orchestrator {
         return;
       }
       if (await this.shouldScheduleContinuation(entry)) {
-        this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
+        this.scheduleRetry(
+          issueId,
+          entry.issue.identifier,
+          1,
+          1_000,
+          null,
+          entry.runPhase,
+          this.resolvedProjectContext(entry) ?? undefined,
+        );
       } else {
         this.claimed.delete(issueId);
       }
@@ -2434,7 +2733,15 @@ export class Orchestrator {
       }
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
-      this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error, entry.runPhase);
+      this.scheduleRetry(
+        issueId,
+        entry.issue.identifier,
+        nextAttempt,
+        delayMs,
+        error,
+        entry.runPhase,
+        this.resolvedProjectContext(entry) ?? undefined,
+      );
     }
   }
 
@@ -2490,7 +2797,15 @@ export class Orchestrator {
     }
 
     const delayMs = planningRetryDelayMs(nextCount, this.config);
-    this.scheduleRetry(issueId, entry.issue.identifier, nextCount, delayMs, error, "issue_breakdown");
+    this.scheduleRetry(
+      issueId,
+      entry.issue.identifier,
+      nextCount,
+      delayMs,
+      error,
+      "issue_breakdown",
+      this.resolvedProjectContext(entry) ?? undefined,
+    );
   }
 
   private async consecutiveSdkErrorFailures(issue: Issue): Promise<number> {
@@ -2552,7 +2867,10 @@ export class Orchestrator {
   private async shouldScheduleContinuation(entry: RunningEntry): Promise<boolean> {
     let refreshed: Issue[];
     try {
-      refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
+      refreshed = await this.fetchIssueStatesByIdsForProjectContext(
+        [entry.issue.id],
+        this.resolvedProjectContext(entry) ?? undefined,
+      );
     } catch (error) {
       this.options.logger.warn("post-run issue refresh failed", {
         issue_id: entry.issue.id,
@@ -2574,6 +2892,7 @@ export class Orchestrator {
     delayMs: number,
     error: string | null,
     runPhase: AgentRunPhase = "implementation",
+    projectContext: ProjectContextResolution | undefined = undefined,
   ): void {
     this.clearRetry(issueId);
     if (this.stopped) {
@@ -2584,7 +2903,7 @@ export class Orchestrator {
     const timer = setTimeout(() => {
       void this.onRetryTimer(issueId);
     }, delayMs);
-    this.retryAttempts.set(issueId, { issueId, identifier, attempt, dueAtMs, timer, error, runPhase });
+    this.retryAttempts.set(issueId, { issueId, identifier, attempt, dueAtMs, timer, error, runPhase, projectContext });
   }
 
   private async onRetryTimer(issueId: string): Promise<void> {
@@ -2602,22 +2921,24 @@ export class Orchestrator {
           Math.max(delayMs, this.config.polling.intervalMs),
           retry.error ?? providerGateDispatchBlockedMessage(providerGate),
           retry.runPhase,
+          retry.projectContext,
         );
         return;
       }
       const candidates =
         retry.runPhase === "merge_conflict_resolution"
-          ? await this.options.tracker.fetchIssueStatesByIds([issueId])
-          : await this.options.tracker.fetchCandidateIssues();
+          ? await this.fetchIssueStatesByIdsForProjectContext([issueId], retry.projectContext)
+          : await this.fetchCandidateIssuesForProjectContext(retry.projectContext);
       const issue = candidates.find((candidate) => candidate.id === issueId);
       if (!issue) {
         this.claimed.delete(issueId);
         return;
       }
+      const retryProjectContext = this.requestedProjectContextForIssue(issue, retry.projectContext);
       if (retry.runPhase === "issue_breakdown") {
         const remainingMs = await this.planningBackoffRemainingForIssue(issue);
         if (remainingMs > 0) {
-          this.scheduleRetry(issueId, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+          this.scheduleRetry(issueId, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase, retryProjectContext);
           return;
         }
       }
@@ -2625,7 +2946,15 @@ export class Orchestrator {
         if (retry.runPhase === "issue_breakdown") {
           await this.recordPlanningDispatchRetry(issue, retry, "no available orchestrator slots");
         } else {
-          this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, "no available orchestrator slots", retry.runPhase);
+          this.scheduleRetry(
+            issueId,
+            retry.identifier,
+            retry.attempt + 1,
+            1_000,
+            "no available orchestrator slots",
+            retry.runPhase,
+            retryProjectContext,
+          );
         }
         return;
       }
@@ -2642,7 +2971,15 @@ export class Orchestrator {
         this.claimed.delete(issueId);
         return;
       }
-      this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, errorMessage(error), retry.runPhase);
+      this.scheduleRetry(
+        issueId,
+        retry.identifier,
+        retry.attempt + 1,
+        1_000,
+        errorMessage(error),
+        retry.runPhase,
+        retry.projectContext,
+      );
     }
   }
 
@@ -2662,7 +2999,7 @@ export class Orchestrator {
     if (current) {
       const remainingMs = planningBackoffRemainingMs(current, this.config);
       if (remainingMs > 0) {
-        this.scheduleRetry(issue.id, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+        this.scheduleRetry(issue.id, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase, retry.projectContext);
         return;
       }
     }
@@ -2681,7 +3018,7 @@ export class Orchestrator {
       return;
     }
     const delayMs = planningRetryDelayMs(Math.max(lifecycle.planningFailureCount, 1), this.config);
-    this.scheduleRetry(issue.id, retry.identifier, retry.attempt + 1, delayMs, error, retry.runPhase);
+    this.scheduleRetry(issue.id, retry.identifier, retry.attempt + 1, delayMs, error, retry.runPhase, retry.projectContext);
   }
 
   private clearRetry(issueId: string): void {
@@ -2691,8 +3028,21 @@ export class Orchestrator {
     this.retryAttempts.delete(issueId);
   }
 
+  private defaultGitHubPullRequestClientForCapability(
+    capability: "github.discovery" | "github.publication" | "github.review_evidence_read",
+    projectContext: ProjectContextResolution | undefined,
+  ) {
+    return createGitHubPullRequestClientForCapability(
+      this.config,
+      capability,
+      undefined,
+      projectContext === undefined ? {} : { projectContext },
+    );
+  }
+
   private resolvedProjectContext(entry: RunningEntry): ProjectContextResolution | undefined {
-    const resolvedFromLifecycleOrIssue = entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue);
+    const resolvedFromLifecycleOrIssue =
+      entry.projectContext ?? entry.lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue);
     const defaultContext = this.config.projectContexts.defaultContext;
 
     if (resolvedFromLifecycleOrIssue) {
@@ -2755,16 +3105,18 @@ export class Orchestrator {
     attempt: number | null,
     turnNumber: number,
   ) {
+    const projectContext = this.resolvedProjectContext(entry);
+    const config = this.configForProjectContext(projectContext);
     return {
       issue: entry.issue,
-      projectContext: this.resolvedProjectContext(entry),
+      projectContext,
       role: entry.role,
       runPhase: entry.runPhase,
       attempt,
       workspace,
-      config: this.config,
+      config,
       turnNumber,
-      ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: this.config.issueBreakdown.cursorMode } : {}),
+      ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: config.issueBreakdown.cursorMode } : {}),
       abortSignal: entry.abortController.signal,
       logger: this.options.logger,
     };
@@ -2917,7 +3269,10 @@ export class Orchestrator {
 
   private async refreshEntryIssue(entry: RunningEntry, reason: string): Promise<boolean> {
     try {
-      const refreshed = await this.options.tracker.fetchIssueStatesByIds([entry.issue.id]);
+      const refreshed = await this.fetchIssueStatesByIdsForProjectContext(
+        [entry.issue.id],
+        this.resolvedProjectContext(entry) ?? undefined,
+      );
       const latest = refreshed[0];
       if (!latest) return false;
       entry.issue = latest;
@@ -3181,7 +3536,7 @@ export class Orchestrator {
     try {
       const client =
         this.options.pullRequestClient ??
-        createGitHubPullRequestClientForCapability(this.config, "github.discovery");
+        this.defaultGitHubPullRequestClientForCapability("github.discovery", this.resolvedProjectContext(entry));
       pullRequest = await client.findOpenPullRequestByBranch({ branchName });
     } catch (error) {
       this.options.logger.warn("pull request discovery failed", {
@@ -3312,7 +3667,8 @@ export class Orchestrator {
   }
 
   private async renderIssueBreakdownPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
-    const basePrompt = await this.promptRenderer.render(this.config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
+    const config = this.configForProjectContext(this.resolvedProjectContext(entry));
+    const basePrompt = await this.promptRenderer.render(config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
     return [basePrompt, this.issueBreakdownMcpPrompt(entry)].join("\n");
   }
 
@@ -3507,15 +3863,16 @@ export class Orchestrator {
   }
 
   private async loadIssueBreakdownPlanPrompt(entry: RunningEntry): Promise<string | null> {
-    if (!this.config.issueBreakdown.enabled) return null;
+    const config = this.configForProjectContext(this.resolvedProjectContext(entry));
+    if (!config.issueBreakdown.enabled) return null;
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
-    const plan = latestFreshIssueBreakdownPlan(lifecycle, entry.issue, this.config);
+    const plan = latestFreshIssueBreakdownPlan(lifecycle, entry.issue, config);
     if (plan === null) return null;
     return [
       "",
       "Issue breakdown plan:",
       `- Source: ${plan.id}; accepted at ${plan.acceptedAt}`,
-      `- Runtime mode: ${plan.cursorMode ?? this.config.issueBreakdown.cursorMode}`,
+      `- Runtime mode: ${plan.cursorMode ?? config.issueBreakdown.cursorMode}`,
       `- Transcript pointers: ${formatList(plan.transcriptPointers)}`,
       `- Status pointers: ${formatList(plan.statusApiPointers)}`,
       "",
@@ -3590,7 +3947,10 @@ export class Orchestrator {
     try {
       const client =
         this.options.pullRequestReviewClient ??
-        createGitHubPullRequestClientForCapability(this.config, "github.review_evidence_read");
+        this.defaultGitHubPullRequestClientForCapability(
+          "github.review_evidence_read",
+          this.resolvedProjectContext(entry),
+        );
       const service = new PullRequestReviewEvidenceService({
         lifecycleStore: this.options.lifecycleStore,
         client,
