@@ -1031,7 +1031,7 @@ export class Orchestrator {
 
   private issueWithRequestedProjectContext(issue: Issue, requestedProjectContext?: ProjectContextResolution): Issue {
     const projectContext = this.requestedProjectContextForIssue(issue, requestedProjectContext);
-    if (!projectContext || this.issueHasProjectContextProof(issue)) return issue;
+    if (!projectContext || this.issueHasExplicitProjectContextProof(issue)) return issue;
     return { ...issue, projectContext } as Issue;
   }
 
@@ -1119,6 +1119,10 @@ export class Orchestrator {
     requestedProjectContext?: ProjectContextResolution,
   ): ProjectContextResolution | undefined {
     if (requestedProjectContext) return requestedProjectContext;
+    return this.resolvedProjectContextFromIssue(issue);
+  }
+
+  private resolvedProjectContextFromIssue(issue: Issue): ProjectContextResolution | undefined {
     const issueProjectContext = projectContextResolutionFromIssue(issue);
     if (this.issueHasExplicitProjectContextProof(issue)) {
       return issueProjectContext ?? undefined;
@@ -1154,7 +1158,7 @@ export class Orchestrator {
   }
 
   private issueHasProjectContextProof(issue: Issue): boolean {
-    return this.issueHasExplicitProjectContextProof(issue);
+    return this.resolvedProjectContextFromIssue(issue) !== undefined;
   }
 
   private issueMatchesRequestedProjectContext(
@@ -1162,7 +1166,7 @@ export class Orchestrator {
     requestedProjectContext?: ProjectContextResolution,
   ): boolean {
     if (!requestedProjectContext) return true;
-    const issueProjectContext = projectContextResolutionFromIssue(issue);
+    const issueProjectContext = this.resolvedProjectContextFromIssue(issue);
     if (!issueProjectContext) return false;
     return this.comparableProjectContextId(issueProjectContext) === this.comparableProjectContextId(requestedProjectContext);
   }
@@ -1182,12 +1186,12 @@ export class Orchestrator {
   private buildIssueRouteEvidence(input: {
     kind: IssueRouteEvidence["kind"];
     requestKey: string;
-    requestedProjectContext?: ProjectContextResolution;
-    resolvedProjectContext?: ProjectContextResolution | null;
-    lookupKey?: string | null;
+    requestedProjectContext?: ProjectContextResolution | undefined;
+    resolvedProjectContext?: ProjectContextResolution | null | undefined;
+    lookupKey?: string | null | undefined;
     sources: IssueRouteEvidenceSource[];
     status: IssueRouteEvidence["status"];
-    reason?: string | null;
+    reason?: string | null | undefined;
   }): IssueRouteEvidence {
     const trimmedRequestKey = input.requestKey.trim();
     return {
@@ -1217,10 +1221,7 @@ export class Orchestrator {
         projectContext,
       );
       const direct = (await tracker.fetchIssueStatesByIds([issueIdOrIdentifier]))[0] ?? null;
-      const directMatchesRequestedContext =
-        direct !== null &&
-        (this.issueMatchesRequestedProjectContext(direct, projectContext) ||
-          (!this.issueHasProjectContextProof(direct) && trackerLookupProvesRequestedContext));
+      const directMatchesRequestedContext = direct !== null && this.issueMatchesRequestedProjectContext(direct, projectContext);
       if (direct && directMatchesRequestedContext) {
         const issue = this.issueWithRequestedProjectContext(direct, projectContext);
         return {
@@ -1280,16 +1281,16 @@ export class Orchestrator {
         };
       }
       const mismatchedCandidate = matchingCandidates[0] ?? null;
-      if (mismatchedCandidate || mismatchedDirect) {
-        const mismatchedIssue = mismatchedCandidate ?? mismatchedDirect;
+      const mismatchedIssue = mismatchedCandidate ?? mismatchedDirect;
+      if (mismatchedIssue) {
         return {
           issue: null,
           routeEvidence: this.buildIssueRouteEvidence({
             kind: options.kind,
             requestKey: trimmedRequestKey,
             requestedProjectContext: projectContext,
-            resolvedProjectContext: projectContextResolutionFromIssue(mismatchedIssue) ?? null,
-            lookupKey: mismatchedIssue?.id ?? trimmedRequestKey,
+            resolvedProjectContext: this.resolvedProjectContextFromIssue(mismatchedIssue) ?? null,
+            lookupKey: mismatchedIssue.id,
             sources: ["tracker_direct", "tracker_candidate"],
             status: "wrong_context",
             reason: mismatchedCandidate ? "candidate_issue_outside_requested_project_context" : "resolved_issue_outside_requested_project_context",

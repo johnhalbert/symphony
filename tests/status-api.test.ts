@@ -2595,6 +2595,16 @@ describe("StatusServer durable API", () => {
         runPhase: string;
         runKind: string;
         reason: string;
+        routeEvidence: {
+          kind: string;
+          status: string;
+          requestedProjectContextId: string | null;
+          resolvedProjectContextId: string | null;
+          lookupKey: string | null;
+          reason: string | null;
+          redacted: true;
+          sources: string[];
+        };
       };
 
       expect(response.status).toBe(202);
@@ -2765,6 +2775,16 @@ describe("StatusServer durable API", () => {
         runPhase: "issue_breakdown",
         runKind: "planning",
         reason: "explicit_request",
+        routeEvidence: {
+          kind: "issue_breakdown",
+          status: "resolved",
+          requestedProjectContextId: "docs",
+          resolvedProjectContextId: "docs",
+          lookupKey: docsRuntimeIssue.id,
+          reason: "candidate_identifier_fallback",
+          redacted: true,
+          sources: ["tracker_direct", "tracker_candidate"],
+        },
       });
       expect(body.routeEvidence).toMatchObject({
         kind: "issue_breakdown",
@@ -2813,7 +2833,7 @@ describe("StatusServer durable API", () => {
     }
   });
 
-  it("routes context-qualified planning-run direct lookups through the resolved issue project context when scoped tracker issues omit project-context proof", async () => {
+  it("routes context-qualified planning-run direct lookups through the resolved issue project context when direct tracker issues include project proof", async () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({
         topLevel: {
@@ -2839,12 +2859,20 @@ describe("StatusServer durable API", () => {
     docsContext.issueBreakdown.planningLabels = ["docs-planning"];
     docsContext.issueBreakdown.promptTemplate = "Docs planning prompt for {{ issue.identifier }}";
     docsContext.issueBreakdown.cursorMode = "plan";
-    const docsRuntimeIssue = issue({
-      id: "linear-docs-179",
-      identifier: "ENG-179",
-      state: "Docs Todo",
-      labels: ["docs-planning"],
-    });
+    const docsRuntimeIssue = {
+      ...issue({
+        id: "linear-docs-179",
+        identifier: "ENG-179",
+        state: "Docs Todo",
+        labels: ["docs-planning"],
+      }),
+      linearProjectIdentity: {
+        kind: "linear",
+        slug: "DOCS",
+        id: "linear-project-docs",
+      },
+      routingSource: "tracker_direct",
+    } as Issue;
     const symphonyTracker = trackerClientFixture({ candidates: [], issues: [] });
     const docsRequestedIds: string[][] = [];
     let docsCandidateFetchCount = 0;
@@ -2907,6 +2935,16 @@ describe("StatusServer durable API", () => {
         runPhase: string;
         runKind: string;
         reason: string;
+        routeEvidence: {
+          kind: string;
+          status: string;
+          requestedProjectContextId: string | null;
+          resolvedProjectContextId: string | null;
+          lookupKey: string | null;
+          reason: string | null;
+          redacted: true;
+          sources: string[];
+        };
       };
 
       expect(response.status).toBe(202);
@@ -2917,6 +2955,16 @@ describe("StatusServer durable API", () => {
         runPhase: "issue_breakdown",
         runKind: "planning",
         reason: "explicit_request",
+        routeEvidence: {
+          kind: "issue_breakdown",
+          status: "resolved",
+          requestedProjectContextId: "docs",
+          resolvedProjectContextId: "docs",
+          lookupKey: docsRuntimeIssue.id,
+          reason: null,
+          redacted: true,
+          sources: ["tracker_direct"],
+        },
       });
       expect(symphonyTracker.requestedIds).toEqual([]);
       expect(symphonyTracker.candidateFetchCount).toBe(0);

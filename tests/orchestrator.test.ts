@@ -1412,6 +1412,83 @@ const docsProjectContext = {
     expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
   });
 
+  it("fails closed for direct issue-breakdown lookups when the direct tracker hit resolves outside the requested project context", async () => {
+    const config = testConfig(root);
+    addDocsPollingProjectContext(config);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    const directRuntimeIssue = {
+      ...issue({
+        id: "linear-symphony-179",
+        identifier: "ENG-179",
+        state: "Todo",
+        labels: ["planning"],
+      }),
+      linearProjectIdentity: {
+        kind: "linear",
+        slug: config.tracker.projectSlug,
+        id: "linear-project-symphony",
+      },
+      routingSource: "tracker_direct",
+    } as Issue;
+    const requestedIds: string[][] = [];
+    let candidateFetchCount = 0;
+    const sharedTracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        candidateFetchCount += 1;
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds: string[]) {
+        requestedIds.push([...issueIds]);
+        return issueIds.includes(directRuntimeIssue.id) ? [structuredClone(directRuntimeIssue)] : [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: sharedTracker,
+      workspaceManager,
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await expect(
+      orchestrator.requestIssueBreakdown(directRuntimeIssue.id, { projectContext: docsProjectContext }),
+    ).rejects.toMatchObject({
+      code: "not_found",
+      details: {
+        routeEvidence: {
+          kind: "issue_breakdown",
+          status: "wrong_context",
+          requestedProjectContextId: docsProjectContext.projectContextId,
+          resolvedProjectContextId: config.projectContexts.defaultContextId,
+          lookupKey: directRuntimeIssue.id,
+          sources: ["tracker_direct", "tracker_candidate"],
+          reason: "resolved_issue_outside_requested_project_context",
+          redacted: true,
+        },
+      },
+    });
+    expect(requestedIds).toEqual([[directRuntimeIssue.id]]);
+    expect(candidateFetchCount).toBe(1);
+    await expect(
+      runStore.latestRunForIssue(directRuntimeIssue.id, {
+        role: "worker",
+        runPhase: "issue_breakdown",
+      }),
+    ).resolves.toBeNull();
+    await orchestrator.stop();
+  });
+
   it("redacts orchestrator route evidence when issue breakdown tracker credentials are unavailable", async () => {
     const config = testConfig(root);
     addDocsPollingProjectContext(config);

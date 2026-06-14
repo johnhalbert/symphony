@@ -65,6 +65,10 @@ interface LinearIssueNode {
   labels?: {
     nodes?: Array<{ name?: unknown }>;
   } | null;
+  project?: {
+    id?: unknown;
+    slugId?: unknown;
+  } | null;
   inverseRelations?: {
     nodes?: LinearRelationNode[];
   } | null;
@@ -153,6 +157,7 @@ const ISSUE_FIELDS = `
   assignee { id }
   delegate { id }
   labels { nodes { name } }
+  project { id slugId }
   inverseRelations { nodes { type issue { id identifier state { name } } } }
 `;
 
@@ -197,22 +202,7 @@ const ISSUES_BY_STATES_QUERY = `
 const ISSUE_STATES_QUERY = `
   query SymphonyIssueStates($ids: [ID!]) {
     issues(filter: { id: { in: $ids } }) {
-      nodes {
-        id
-        identifier
-        title
-        description
-        priority
-        branchName
-        url
-        createdAt
-        updatedAt
-        state { name }
-        assignee { id }
-        delegate { id }
-        labels { nodes { name } }
-        inverseRelations { nodes { type issue { id identifier state { name } } } }
-      }
+      nodes { ${ISSUE_FIELDS} }
     }
   }
 `;
@@ -715,6 +705,8 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
   if (!id || !identifier || !title || !state) return null;
   const assigneeId = asNullableString(node.assignee?.id);
   const delegateId = asNullableString(node.delegate?.id);
+  const linearProjectSlug = asNullableString(node.project?.slugId);
+  const linearProjectId = asNullableString(node.project?.id);
 
   return {
     id,
@@ -732,7 +724,16 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
     blockedBy: normalizeBlockers(node.inverseRelations?.nodes),
     createdAt: asNullableString(node.createdAt),
     updatedAt: asNullableString(node.updatedAt),
-  };
+    ...(linearProjectSlug
+      ? {
+          linearProjectIdentity: {
+            kind: "linear",
+            slug: linearProjectSlug,
+            ...(linearProjectId === null ? {} : { id: linearProjectId }),
+          },
+        }
+      : {}),
+  } as Issue;
 }
 
 function normalizeLabels(nodes: Array<{ name?: unknown }> | undefined): string[] {

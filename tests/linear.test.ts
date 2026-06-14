@@ -114,6 +114,41 @@ describe("LinearTrackerClient", () => {
     expect(issues.map((item) => item.identifier)).toEqual(["T-1", "T-2"]);
   });
 
+  it("retains Linear project identity on direct issue lookups", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+      requests.push(request);
+      return jsonResponse({
+        data: {
+          issues: {
+            nodes: [
+              {
+                id: "linear-docs-179",
+                identifier: "ENG-179",
+                title: "Docs title",
+                state: { name: "Todo" },
+                project: { id: "project-docs", slugId: "DOCS" },
+              },
+            ],
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const issues = await client.fetchIssueStatesByIds(["linear-docs-179"]);
+
+    expect(requests[0]).toMatchObject({ variables: { ids: ["linear-docs-179"] } });
+    expect(requests[0]?.query).toContain("project { id slugId }");
+    expect(issues[0]).toMatchObject({
+      id: "linear-docs-179",
+      identifier: "ENG-179",
+      linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "project-docs" },
+    });
+  });
+
   it("fetches bounded project workflow states with team identity", async () => {
     const config = testConfig("/tmp/symphony");
     const requests: unknown[] = [];
