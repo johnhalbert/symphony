@@ -23,6 +23,20 @@ The current apply path resolves sibling dependencies by normalized child title, 
 | 5 | `ENG-392 child — orchestrator proof` | `REQ-392-TEST-PROOF` | `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, `ENG-392 child — approval writeback repair` | Adds the final focused orchestrator proof after the underlying runtime and approval invariants are explicit and deterministic. |
 | 6 | `ENG-392 child — publication hygiene closure` | `REQ-392-PUBLICATION-HYGIENE` | `ENG-392 child — decision and scope lock`, `ENG-392 child — orchestrator proof`, `ENG-392 child — approval writeback repair` | Closes the loop by keeping the final diff, evidence packet, and repository hygiene aligned with the declared child scopes. |
 
+## Current operator boundary decision — T019
+
+The current operator decision remains **split/retarget**, not widened.
+
+- **Widened-boundary status**: No widened child-contract path has been selected. No additional surface families or repo paths are authorized beyond the six child families below and their per-family `Touched Surfaces` lists.
+- **Authoritative child contract list while not widened**:
+  1. `ENG-392 child — decision and scope lock` (`REQ-392-DECISION`)
+  2. `ENG-392 child — runtime routing repair` (`REQ-392-RUNTIME-ROUTING`)
+  3. `ENG-392 child — reload preservation repair` (`REQ-392-RELOAD-PRESERVATION`)
+  4. `ENG-392 child — approval writeback repair` (`REQ-392-APPROVAL-WRITEBACK`)
+  5. `ENG-392 child — orchestrator proof` (`REQ-392-TEST-PROOF`)
+  6. `ENG-392 child — publication hygiene closure` (`REQ-392-PUBLICATION-HYGIENE`)
+- **If widening is later selected**: Record the widened child contract title(s), newly authorized surface families or repo paths, and the validation proof that makes the broader boundary intentional before renewed worker or reviewer dispatch resumes.
+
 ## Cross-artifact consistency review — T011
 
 This review compared the expected planning surfaces `specs/009-eng-392-routing-reload-split/spec.md`, `specs/009-eng-392-routing-reload-split/plan.md`, `specs/009-eng-392-routing-reload-split/data-model.md`, and `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`.
