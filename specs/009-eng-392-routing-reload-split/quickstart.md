@@ -111,9 +111,9 @@ Keep these adjacent PR #286 paths excluded unless a later child contract names t
 
 - The routing/reload tests and the shipped runtime behavior were coupled: reviewer feedback repeatedly traced gaps through routed workspace opening, prompt preservation across reload, worker retry redispatch, reviewer redispatch, and lifecycle-only pending-publication suppression.
 - The branch eventually demonstrated working behavior only with the broader runtime surface present, which is why the final blocker shifted from implementation gaps to a scope mismatch between the ENG-392 contract and PR #286 publication surface.
-- The review direction at the final blocker was to either:
-  1. split or retarget PR #286 so `origin/main...HEAD` stays contract-scoped to `tests/orchestrator.test.ts`, or
-  2. update the ENG-392 contract so the coupled runtime-routing surface is explicitly authorized and validated.
+- **Selected decomposition decision: split/retarget.** Keep ENG-392 decomposed into contract-scoped child issues and retarget any renewed publication candidate to the child title / requirement ID that owns its surface, instead of reopening the parent issue with the old tests-only vs. runtime ambiguity.
+- Evidence for selecting split/retarget: `contracts/child-issue-contracts.md` defines the six-child contract family as the durable baseline, says `REQ-392-DECISION` / `ENG-392 child — decision and scope lock` "freezes whether the repair stays split into child issues," and makes every later repair family depend on that scope lock; `data-model.md` records the durable decision model with `resolution: decompose`; and the protected-surface inventory above already maps the coupled runtime/publication paths into later child families while keeping adjacent paths explicitly excluded.
+- Redispatch stays blocked until a renewed worker or reviewer candidate cites the owning child title / requirement ID, proves its diff stays within that child contract's authorized surfaces (or cites a later child contract that explicitly widens them), and keeps the excluded paths below out of scope. That proof requirement prevents automation from resuming against the old ambiguous ENG-392 contract.
 
 ## Current `tests/orchestrator.test.ts` coverage inventory
 
