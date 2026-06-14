@@ -10,6 +10,7 @@ import { FileWritebackOutboxStore, WritebackProcessor } from "../core/writeback/
 import {
   createLinearTrackerClientForCapability,
   createLinearTrackerClientForProjectContext,
+  resolveLinearProjectContext,
 } from "../integrations/linear/LinearCredentialResolver.js";
 
 type FetchLike = typeof fetch;
@@ -27,11 +28,13 @@ export function createRuntimeWritebackProcessor(
     lifecycleStore?: Pick<IssueLifecycleStore, "get">;
   } = {},
 ): WritebackProcessor | undefined {
-  const getConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
+  const getBaseConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
+  const getConfig = (projectContext?: ProjectContextResolution) =>
+    resolveRuntimeConfigForProjectContext(getBaseConfig(), projectContext);
   const config = getConfig();
   if (!config.writeback.enabled) return undefined;
   const resolveWritebackWriter = (projectContext?: ProjectContextResolution) =>
-    createLinearTrackerClientForProjectContext(getConfig(), "linear.writeback", projectContext, fetchImpl);
+    createLinearTrackerClientForProjectContext(getBaseConfig(), "linear.writeback", projectContext, fetchImpl);
   return new WritebackProcessor(
     stores.outboxStore ?? new FileWritebackOutboxStore(config.workspace.stateDir),
     resolveWritebackWriter(),
@@ -41,7 +44,8 @@ export function createRuntimeWritebackProcessor(
     config.writeback.mode === "dry_run",
     {
       getConfig,
-      resolveIssue: (issueId) => resolveIssueForBreakdownFreshness(issueId, getConfig, fetchImpl),
+      resolveIssue: (issueId, projectContext) =>
+        resolveIssueForBreakdownFreshness(issueId, getConfig, fetchImpl, projectContext),
     },
     resolveWritebackWriter,
   );
@@ -49,16 +53,37 @@ export function createRuntimeWritebackProcessor(
 
 export async function resolveIssueForBreakdownFreshness(
   issueId: string,
-  getConfig: () => ServiceConfig,
+  getConfig: (projectContext?: ProjectContextResolution) => ServiceConfig,
   fetchImpl?: FetchLike,
+  projectContext?: ProjectContextResolution,
 ): Promise<IssueBreakdownIssueLookupResult> {
   try {
-    const tracker = createRuntimeTrackerClient(getConfig(), fetchImpl);
+    const tracker = createLinearTrackerClientForProjectContext(getConfig(projectContext), "linear.tracker", projectContext, fetchImpl);
     const issue = (await tracker.fetchIssueStatesByIds([issueId]))[0];
     return issue ? { status: "ok", issue } : { status: "not_found" };
   } catch (error) {
     return { status: "transient_error", message: errorMessage(error) };
   }
+}
+
+function resolveRuntimeConfigForProjectContext(
+  config: ServiceConfig,
+  projectContext?: ProjectContextResolution,
+): ServiceConfig {
+  const context = resolveLinearProjectContext(config, projectContext);
+  if (context.id === config.projectContexts.defaultContextId) {
+    return config;
+  }
+  return {
+    ...config,
+    tracker: context.tracker,
+    workspace: context.workspace,
+    agent: context.agent,
+    issueBreakdown: context.issueBreakdown,
+    github: context.github,
+    reviewLoop: context.reviewLoop,
+    credentialProfiles: context.credentialProfileRegistry,
+  };
 }
 
 export function resolveCursorRuntimeApiKey(config: ServiceConfig, role: AgentRunRole): string | null {

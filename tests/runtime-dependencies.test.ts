@@ -2,8 +2,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { parseServiceConfig } from "../src/core/config/Config.js";
+import { agentEligibleIssueContract } from "./helpers.js";
+import { parseServiceConfig, type ServiceConfig } from "../src/core/config/Config.js";
+import { issueBreakdownConfigFingerprint, issueContentFingerprint } from "../src/core/IssueBreakdownPlanService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import { FileIssueLifecycleStore, type IssueBreakdownPlanRecord } from "../src/core/persistence/IssueLifecycleStore.js";
+import type { Issue } from "../src/core/types.js";
+import { writebackIdentityKey } from "../src/core/writeback/WritebackOutbox.js";
 import {
   createRuntimeTrackerClient,
   createRuntimeWritebackProcessor,
@@ -123,6 +128,136 @@ describe("runtime dependency credential wiring", () => {
       "docs-writeback-secret",
       "docs-writeback-secret",
     ]);
+  });
+
+  it("routes issue breakdown freshness lookup by operation project context in runtime writeback processing", async () => {
+    const config = multiProjectRuntimeConfig();
+    const docsProjectContext = explicitProjectContext("docs", "DOCS");
+    const docsContext = config.projectContexts.byId.get("docs");
+    if (!docsContext) throw new Error("expected docs project context");
+    docsContext.issueBreakdown.planningLabels = ["docs-planning"];
+
+    const docsIssue = issueFixture({
+      id: "issue-docs-parent",
+      identifier: "DOCS-1",
+      title: "Docs parent",
+      labels: ["planning"],
+      updatedAt: "2026-01-03T00:00:00.000Z",
+    });
+    const docsConfig = runtimeConfigForProjectContext(config, docsProjectContext);
+    const operationKey = "issue-create:issue-docs-parent:plan-docs:0:hash";
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(
+      { id: docsIssue.id, identifier: docsIssue.identifier },
+      {
+        projectContext: docsProjectContext,
+        issueBreakdownPlans: [issueBreakdownPlanRecord({ config: docsConfig, issue: docsIssue, planId: "plan-docs", operationKey })],
+        lastIssueBreakdownPlanId: "plan-docs",
+      },
+    );
+
+    const calls: Array<{ authorization: string; query: string }> = [];
+    const processor = createRuntimeWritebackProcessor(
+      config,
+      new StructuredLogger(() => undefined),
+      async (_input, init) => {
+        const authorization = String((init?.headers as Record<string, string> | undefined)?.authorization);
+        const body = JSON.parse(String(init?.body)) as { query?: string };
+        const query = body.query ?? "";
+        calls.push({ authorization, query });
+        if (query.includes("SymphonyIssueStates")) {
+          return jsonResponse({
+            data: {
+              issues: {
+                nodes: [linearIssueStateNode(docsIssue)],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          });
+        }
+        if (query.includes("SymphonyIssueCreateContext")) {
+          return jsonResponse({
+            data: {
+              issue: {
+                id: docsIssue.id,
+                identifier: docsIssue.identifier,
+                team: { id: "team-docs", labels: { nodes: [] } },
+                project: { id: "project-docs" },
+                children: { nodes: [] },
+              },
+            },
+          });
+        }
+        if (query.includes("issueCreate")) {
+          return jsonResponse({
+            data: {
+              issueCreate: {
+                success: true,
+                issue: { id: "child-1", identifier: "DOCS-2", url: "https://linear.example/DOCS-2" },
+              },
+            },
+          });
+        }
+        throw new Error(`unexpected query: ${query}`);
+      },
+      { lifecycleStore },
+    );
+
+    const result = await processor?.enqueueAndProcess({
+      kind: "issue_create",
+      idempotencyKey: operationKey,
+      issueId: docsIssue.id,
+      runId: "run-plan-docs",
+      projectContext: docsProjectContext,
+      payload: {
+        parentIssueId: docsIssue.id,
+        title: "Docs child",
+        description: agentEligibleIssueContract(),
+        acceptanceCriteria: ["Docs child created"],
+        requestedLabels: [],
+        dependencies: [],
+        dedupeKey: "issue-breakdown:plan-docs:0:hash",
+        payloadHash: "hash",
+        planId: "plan-docs",
+        proposedIssueIndex: 0,
+      },
+    });
+
+    expect(result).toMatchObject({ status: "succeeded" });
+    expect(calls.map((call) => call.authorization)).toEqual([
+      "docs-read-secret",
+      "docs-writeback-secret",
+      "docs-writeback-secret",
+    ]);
+
+    expect(calls[0]?.query).toContain("SymphonyIssueStates");
+    expect(calls[1]?.query).toContain("SymphonyIssueCreateContext");
+    expect(calls[2]?.query).toContain("issueCreate");
+  });
+
+  it("fails closed for explicit unknown project contexts before runtime writeback execution", async () => {
+    const config = runtimeConfig();
+    const authorizations: string[] = [];
+    const processor = createRuntimeWritebackProcessor(
+      config,
+      new StructuredLogger(() => undefined),
+      async (_input, init) => {
+        authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+        return jsonResponse({ data: { issueUpdate: { success: true } } });
+      },
+    );
+
+    const result = await processor?.enqueueAndProcess({
+      kind: "transition",
+      idempotencyKey: "transition:issue-unknown:Done",
+      issueId: "issue-unknown",
+      projectContext: explicitProjectContext("docs", "DOCS"),
+      payload: { toState: "Done", fromStates: ["Ready to Merge"] },
+    });
+
+    expect(result).toMatchObject({ status: "retrying" });
+    expect(result?.lastError).toContain('Resolved project context "docs" is not configured');
+    expect(authorizations).toEqual([]);
   });
 
   it("rejects wrong-role-only service writeback assignments in runtime writeback construction", () => {
@@ -349,6 +484,113 @@ function multiProjectRuntimeConfig() {
       DOCS_LINEAR_WRITEBACK_TOKEN: "docs-writeback-secret",
     },
   );
+}
+
+function explicitProjectContext(projectContextId: string, linearProjectSlug: string) {
+  return {
+    projectContextId,
+    projectContextLabel: projectContextId === "docs" ? "Documentation Site" : projectContextId,
+    linearProjectSlug,
+    routingSource: "explicit",
+  };
+}
+
+function runtimeConfigForProjectContext(config: ServiceConfig, projectContext = explicitProjectContext("docs", "DOCS")): ServiceConfig {
+  const context = config.projectContexts.byId.get(projectContext.projectContextId);
+  if (!context) {
+    throw new Error(`expected configured project context ${projectContext.projectContextId}`);
+  }
+  if (context.id === config.projectContexts.defaultContextId) {
+    return config;
+  }
+  return {
+    ...config,
+    tracker: context.tracker,
+    workspace: context.workspace,
+    agent: context.agent,
+    issueBreakdown: context.issueBreakdown,
+    github: context.github,
+    reviewLoop: context.reviewLoop,
+    credentialProfiles: context.credentialProfileRegistry,
+  };
+}
+
+function issueFixture(overrides: Partial<Issue> = {}): Issue {
+  return {
+    id: overrides.id ?? "issue-1",
+    identifier: overrides.identifier ?? "TEST-1",
+    title: overrides.title ?? "Parent issue",
+    description: overrides.description ?? "Parent issue description",
+    priority: overrides.priority ?? 0,
+    labels: overrides.labels ?? ["planning"],
+    blockedBy: overrides.blockedBy ?? [],
+    state: overrides.state ?? "Todo",
+    assigneeId: overrides.assigneeId ?? null,
+    delegateId: overrides.delegateId ?? null,
+    assignedToWorker: overrides.assignedToWorker ?? true,
+    branchName: overrides.branchName ?? null,
+    url: overrides.url ?? null,
+    createdAt: overrides.createdAt ?? "2026-01-01T00:00:00.000Z",
+    updatedAt: overrides.updatedAt ?? "2026-01-01T00:00:00.000Z",
+  };
+}
+
+function linearIssueStateNode(issue: Issue) {
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    description: issue.description,
+    priority: issue.priority,
+    branchName: issue.branchName,
+    url: issue.url,
+    createdAt: issue.createdAt,
+    updatedAt: issue.updatedAt,
+    state: { name: issue.state },
+    assignee: issue.assigneeId ? { id: issue.assigneeId } : null,
+    delegate: issue.delegateId ? { id: issue.delegateId } : null,
+    labels: { nodes: issue.labels.map((name) => ({ name })) },
+    inverseRelations: { nodes: [] },
+  };
+}
+
+function issueBreakdownPlanRecord(input: {
+  config: ServiceConfig;
+  issue: Issue;
+  planId: string;
+  operationKey: string;
+}): IssueBreakdownPlanRecord {
+  return {
+    id: input.planId,
+    idempotencyKey: `${input.planId}:idem`,
+    requestHash: `${input.planId}:request`,
+    runId: "run-plan-docs",
+    issueId: input.issue.id,
+    issueIdentifier: input.issue.identifier,
+    projectContext: explicitProjectContext("docs", "DOCS"),
+    summary: "Split docs work into a child issue.",
+    proposedIssues: [
+      {
+        title: "Docs child",
+        description: agentEligibleIssueContract(),
+        acceptanceCriteria: ["Docs child created"],
+        dependencies: [],
+        labels: [],
+      },
+    ],
+    transcriptPointers: [],
+    statusApiPointers: [],
+    issueUpdatedAt: input.issue.updatedAt,
+    issueContentFingerprint: issueContentFingerprint(input.issue),
+    configFingerprint: issueBreakdownConfigFingerprint(input.config),
+    cursorMode: input.config.issueBreakdown.cursorMode,
+    acceptedAt: "2026-01-03T00:00:00.000Z",
+    applicationStatus: "pending",
+    applicationOperationKeys: [writebackIdentityKey(input.operationKey, explicitProjectContext("docs", "DOCS"))],
+    createdIssueRefs: [],
+    appliedAt: null,
+    applicationBlockedReason: null,
+  };
 }
 
 function jsonResponse(body: unknown): Response {

@@ -185,6 +185,43 @@ describe("Linear credential resolver", () => {
     expect(resolveLinearClientConfig(config, "linear.writeback").tracker.projectSlug).toBe("TEST");
   });
 
+  it("fails closed for explicit unknown project contexts during writeback resolution", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$DEFAULT_LINEAR_READ_TOKEN", project_slug: "TEST" },
+        workspace: { root: "/repo/workspaces", state_dir: "/repo/state" },
+        credential_profiles: {
+          profiles: {
+            "default-writeback": {
+              value: "$DEFAULT_LINEAR_WRITEBACK_TOKEN",
+              capabilities: ["linear.writeback"],
+            },
+          },
+          roles: {
+            service: {
+              "linear.writeback": "default-writeback",
+            },
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      {
+        DEFAULT_LINEAR_READ_TOKEN: "default-read-secret",
+        DEFAULT_LINEAR_WRITEBACK_TOKEN: "default-writeback-secret",
+      },
+    );
+
+    expect(() =>
+      resolveLinearClientConfigForProjectContext(config, "linear.writeback", {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "explicit",
+      }),
+    ).toThrow('Resolved project context "docs" is not configured');
+    expect(resolveLinearClientConfig(config, "linear.writeback").tracker.projectSlug).toBe("TEST");
+  });
+
   it("rejects wrong-role-only writeback assignments before legacy fallback", () => {
     const config = parseServiceConfig(
       {

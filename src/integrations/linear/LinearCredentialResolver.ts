@@ -79,10 +79,21 @@ export function createLinearTrackerClientForProjectContext(
   return new LinearTrackerClient(resolveLinearClientConfigForProjectContext(config, capability, projectContext).tracker, fetchImpl);
 }
 
-function resolveLinearProjectContext(
+export function resolveLinearProjectContext(
   config: ServiceConfig,
   projectContext?: ProjectContextResolution,
 ): WorkflowProjectContext {
-  const projectContextId = normalizeProjectContextResolution(projectContext).projectContextId;
-  return config.projectContexts.byId.get(projectContextId) ?? config.projectContexts.defaultContext;
+  const resolvedProjectContext = normalizeProjectContextResolution(projectContext);
+  const configuredContext = config.projectContexts.byId.get(resolvedProjectContext.projectContextId);
+  if (configuredContext) return configuredContext;
+  if (
+    projectContext === undefined ||
+    resolvedProjectContext.projectContextId === config.projectContexts.defaultContextId
+  ) {
+    return config.projectContexts.defaultContext;
+  }
+  throw new SymphonyError(
+    "config_validation_error",
+    `Resolved project context "${resolvedProjectContext.projectContextId}" is not configured`,
+  );
 }
