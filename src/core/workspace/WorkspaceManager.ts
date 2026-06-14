@@ -41,6 +41,13 @@ export interface WorkspaceMetadata {
   gitBranchName?: string;
 }
 
+interface ResolvedWorkspaceTarget {
+  workspaceKey: string;
+  workspacePath: string;
+  existing: WorkspaceRecord | null;
+  createdNow: boolean;
+}
+
 export class WorkspaceManager {
   private readonly branchRenderer = new Liquid({ strictVariables: true });
   private readonly branchTemplateSafetyCache = new Map<string, ScopedBranchNameDecision>();
@@ -53,14 +60,15 @@ export class WorkspaceManager {
   async createForIssue(issueInput: WorkspaceIssueInput): Promise<Workspace> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
-    const workspaceKey = workspaceKeyForIssue(issue);
-    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
-    assertPathInsideRoot(workspacePath, this.options.workspace.root);
 
     await fs.mkdir(this.options.workspace.root, { recursive: true });
     await fs.mkdir(this.options.workspace.stateDir, { recursive: true });
+    const { workspaceKey, workspacePath, existing, createdNow } = await this.resolveWorkspaceTarget(issue);
     await assertWorkspaceParentInsideRoot(workspacePath, this.options.workspace.root);
-    const createdNow = !(await pathExists(workspacePath));
+    let repoPath = existing?.repoPath;
+    let baseRef = existing?.baseRef;
+    let gitBranchName = existing?.gitBranchName;
+    const sourceKind = this.options.workspace.source.kind;
     if (createdNow && this.options.workspace.source.kind === "git_worktree") {
       const branch = await this.resolveBranchSelection(issue);
       const result = await createGitWorktree({
@@ -71,20 +79,10 @@ export class WorkspaceManager {
         timeoutMs: this.options.hooks.timeoutMs,
         logger: this.options.logger,
       });
+      repoPath = result.repoPath;
+      baseRef = result.baseRef;
+      gitBranchName = result.branchName;
       await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
-      await this.writeMetadata({
-        workspaceKey,
-        issueId: issue.id,
-        issueIdentifier,
-        ...(issue.projectContext === null ? {} : { projectContext: issue.projectContext }),
-        path: workspacePath,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        sourceKind: this.options.workspace.source.kind,
-        repoPath: result.repoPath,
-        baseRef: result.baseRef,
-        gitBranchName: result.branchName,
-      });
       await this.runHook("after_create", this.options.hooks.afterCreate, workspacePath, true);
     } else if (!createdNow && this.options.workspace.source.kind === "git_worktree") {
       await this.assertExistingWorktree(workspaceKey, workspacePath);
@@ -100,7 +98,6 @@ export class WorkspaceManager {
     }
 
     await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
-    const existing = await this.store.getWorkspace(workspaceKey);
     const metadata: WorkspaceMetadata = {
       workspaceKey,
       issueId: issue.id,
@@ -109,10 +106,10 @@ export class WorkspaceManager {
       path: workspacePath,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      sourceKind: this.options.workspace.source.kind,
-      ...(existing?.repoPath === undefined ? {} : { repoPath: existing.repoPath }),
-      ...(existing?.baseRef === undefined ? {} : { baseRef: existing.baseRef }),
-      ...(existing?.gitBranchName === undefined ? {} : { gitBranchName: existing.gitBranchName }),
+      sourceKind,
+      ...(repoPath === undefined ? {} : { repoPath }),
+      ...(baseRef === undefined ? {} : { baseRef }),
+      ...(gitBranchName === undefined ? {} : { gitBranchName }),
     };
     await this.writeMetadata(metadata);
 
@@ -132,16 +129,12 @@ export class WorkspaceManager {
   async createForPlanning(issueInput: WorkspaceIssueInput): Promise<Workspace> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
-    const workspaceKey = workspaceKeyForPlanningIssue(issue);
-    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
-    assertPathInsideRoot(workspacePath, this.options.workspace.root);
 
     await fs.mkdir(this.options.workspace.root, { recursive: true });
     await fs.mkdir(this.options.workspace.stateDir, { recursive: true });
+    const { workspaceKey, workspacePath, existing, createdNow } = await this.resolveWorkspaceTarget(issue, { planning: true });
     await assertWorkspaceParentInsideRoot(workspacePath, this.options.workspace.root);
     const source = this.options.workspace.source;
-    const createdNow = !(await pathExists(workspacePath));
-    const existing = await this.store.getWorkspace(workspaceKey);
     let repoPath = existing?.repoPath;
     let baseRef = existing?.baseRef;
     let sourceKind: string = source.kind;
@@ -354,6 +347,39 @@ export class WorkspaceManager {
     await this.store.deleteWorkspace(workspaceKey);
   }
 
+  private async resolveWorkspaceTarget(
+    issue: WorkspaceIssue,
+    options: { planning?: boolean } = {},
+  ): Promise<ResolvedWorkspaceTarget> {
+    const planningSuffix = options.planning ? "-planning" : "";
+    const requestedWorkspaceKeyBase = workspaceKeyForIssue(issue);
+    const requestedWorkspaceKey = `${requestedWorkspaceKeyBase}${planningSuffix}`;
+    const fallbackWorkspaceKeys = fallbackWorkspaceKeysForIssue(issue, requestedWorkspaceKeyBase, planningSuffix);
+    const numberedFallbackBase = fallbackWorkspaceKeys.at(-1) ?? `${requestedWorkspaceKey}__alt`;
+    const candidateWorkspaceKeys = [requestedWorkspaceKey, ...fallbackWorkspaceKeys];
+    let fallbackOrdinal = 2;
+    while (true) {
+      const nextCandidate = candidateWorkspaceKeys.shift();
+      const workspaceKey = nextCandidate ?? numberedWorkspaceCollisionKey(numberedFallbackBase, fallbackOrdinal++);
+      const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+      assertPathInsideRoot(workspacePath, this.options.workspace.root);
+      const existing = await this.store.getWorkspace(workspaceKey);
+      const createdNow = !(await pathExists(workspacePath));
+      if (!requiresWorkspaceCollisionFallback(issue) || !workspaceTargetConflictsWithIssue(existing, issue, createdNow)) {
+        if (workspaceKey !== requestedWorkspaceKey) {
+          this.options.logger.warn("workspace key collision avoided", {
+            issue_id: issue.id,
+            issue_identifier: issue.identifier,
+            project_context_id: issue.projectContext?.projectContextId ?? null,
+            requested_workspace_key: requestedWorkspaceKey,
+            resolved_workspace_key: workspaceKey,
+          });
+        }
+        return { workspaceKey, workspacePath, existing, createdNow };
+      }
+    }
+  }
+
   getPathForIssue(issueInput: WorkspaceIssueInput): string {
     const workspaceKey = workspaceKeyForIssue(normalizeIssueInput(issueInput));
     const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
@@ -558,6 +584,40 @@ function matchesWorkspaceProjectContext(
 function scopedWorkspaceKey(baseWorkspaceKey: string, projectContext: ProjectContextResolution | null): string {
   if (!projectContext || projectContext.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return baseWorkspaceKey;
   return `${sanitizeWorkspaceKey(projectContext.projectContextId)}__${baseWorkspaceKey}`;
+}
+
+function requiresWorkspaceCollisionFallback(issue: WorkspaceIssue): boolean {
+  return issue.projectContext !== null && issue.projectContext.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+}
+
+function fallbackWorkspaceKeysForIssue(
+  issue: WorkspaceIssue,
+  baseWorkspaceKey: string,
+  planningSuffix: string,
+): string[] {
+  const exactIssueId = issue.id ? sanitizeWorkspaceKey(issue.id) : null;
+  if (exactIssueId) {
+    return [`${baseWorkspaceKey}__id__${exactIssueId}${planningSuffix}`];
+  }
+  return [`${baseWorkspaceKey}__alt${planningSuffix}`];
+}
+
+function numberedWorkspaceCollisionKey(baseWorkspaceKey: string, ordinal: number): string {
+  return `${baseWorkspaceKey}__${ordinal}`;
+}
+
+function workspaceTargetConflictsWithIssue(
+  existing: WorkspaceRecord | null,
+  issue: WorkspaceIssue,
+  createdNow: boolean,
+): boolean {
+  if (existing) return !workspaceRecordMatchesIssue(existing, issue);
+  return !createdNow;
+}
+
+function workspaceRecordMatchesIssue(record: WorkspaceRecord, issue: WorkspaceIssue): boolean {
+  if (issue.id !== null) return record.issueId === issue.id;
+  return record.issueIdentifier === issue.identifier && matchesWorkspaceProjectContext(record.projectContext, issue.projectContext);
 }
 
 function defaultBranchNameForIssue(issue: WorkspaceIssue): string {
