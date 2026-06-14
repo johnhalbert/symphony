@@ -53,6 +53,8 @@ This quickstart records the source links and concise blocked-state notes needed 
 
 ### Routing and route-selection coverage already present
 
+- `tests/orchestrator.test.ts:978` — `uses resolved project-context issue breakdown planning config during automatic polling` proves automatic polling resolves the non-default project context before planning dispatch, applies the project-context planning labels/prompt/run mode, and persists the routed project context on lifecycle state.
+- `tests/orchestrator.test.ts:1043` — `uses resolved project-context fresh-plan and apply-to-linear config during automatic polling` proves automatic polling carries project-context planning and apply-to-linear configuration through planning-to-implementation routing, with docs-context run records and lifecycle persistence.
 - `tests/orchestrator.test.ts:1229` — `reroutes implementation dispatch to planning when writeback reveals stale issue content` proves stale post-writeback issue content reroutes back into planning instead of continuing to implementation.
 - `tests/orchestrator.test.ts:1309` — `routes worker dispatch to planning when only a superseded plan matches the issue` proves superseded planning artifacts route back to planning.
 - `tests/orchestrator.test.ts:1359` — `queues explicit issue breakdown planning when the only matching plan is superseded` covers the explicit-request variant of the superseded-plan reroute.
@@ -73,6 +75,7 @@ This quickstart records the source links and concise blocked-state notes needed 
 
 ### Approval recovery coverage already present
 
+- `tests/orchestrator.test.ts:3136` — `recovers a real post-exit pending publication approval handoff after partial audit failure: $name` is the core post-exit pending-approval recovery suite. It proves recovery re-establishes the pending approval request, preserves the single run record, emits one approval-request transcript event, and finishes the pending approval audit operations after the initial partial failure.
 - `tests/orchestrator.test.ts:3284`, `tests/orchestrator.test.ts:3381`, and `tests/orchestrator.test.ts:3459` — `skips recovery for an already linked pending publication approval wait`, `leaves missing_run pending publication approval recovery untouched during orchestrator ticks`, and `leaves audit_not_settled pending publication approval recovery unfinalized during orchestrator ticks` cover negative and edge approval-recovery paths.
 - `tests/orchestrator.test.ts:3548` and `tests/orchestrator.test.ts:3675` — `recovers a pre-approved publication approval handoff during an orchestrator tick` and `recovers a terminal publication approval handoff during an orchestrator tick` cover happy-path and terminal approval recovery during ticks.
 - `tests/orchestrator.test.ts:4370` and `tests/orchestrator.test.ts:4472` — `preserves fail-policy approval rejection through abnormal worker exit` and `preserves cancel-policy approval rejection through cancelled worker exit` cover rejection persistence across abnormal/cancelled exits.
