@@ -124,7 +124,7 @@ Required contents:
 
 - a redaction summary
 - confirmation that unnecessary operator-local filesystem paths were omitted
-- any protected-surface or no-touch checks relevant to the issue
+- `protectedSurfaceChecks`: `[]` when no protected-surface or no-touch check applies; otherwise one or more entries naming the protected/no-touch surface, the expectation, and the proof
 - every live integration boundary that was intentionally not exercised
 - a `findings` summary, even when it is an explicit zero-findings statement
 - `status: recorded` only when no live boundary was intentionally skipped
@@ -139,6 +139,7 @@ surfacesChecked:
 redactions:
   - none
 localPathHandling: repo-relative paths only
+protectedSurfaceChecks: []
 intentionallyUnverified: []
 findings: []
 ```
@@ -152,6 +153,7 @@ surfacesChecked:
 redactions:
   - none
 localPathHandling: repo-relative paths only
+protectedSurfaceChecks: []
 intentionallyUnverified:
   - boundary: <Linear writeback | GitHub publication | live tracker lookup>
     reason: <out of scope | manual-only | credentials intentionally unavailable>
@@ -160,6 +162,15 @@ findings: []
 ```
 
 Use the intentionally-unverified variant whenever any live boundary was skipped.
+
+When protected-surface or no-touch checks are relevant, replace `protectedSurfaceChecks: []` with one or more entries in this shape:
+
+```yaml
+protectedSurfaceChecks:
+  - surface: <repo-relative protected path or no-touch surface>
+    expectation: <must remain untouched | protected/manual-only>
+    proof: <safe artifact | command | line range>
+```
 
 ## Redaction and safe-citation rules
 
@@ -234,6 +245,7 @@ Use the following shape when recording future evidence:
 - surfacesChecked: [`<safe surface label>`]
 - redactions: [`none`]
 - localPathHandling: `repo-relative paths only`
+- protectedSurfaceChecks: `[]` when none apply; otherwise one or more `{ surface, expectation, proof }` entries
 - intentionallyUnverified: []
 - findings: []
 
@@ -242,6 +254,7 @@ Use the following shape when recording future evidence:
 - surfacesChecked: [`<safe surface label>`]
 - redactions: [`none`]
 - localPathHandling: `repo-relative paths only`
+- protectedSurfaceChecks: `[]` when none apply; otherwise one or more `{ surface, expectation, proof }` entries
 - intentionallyUnverified:
   - boundary: `<live integration boundary>`
     reason: `<out of scope | manual-only | credentials intentionally unavailable>`
