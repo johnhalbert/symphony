@@ -142,6 +142,212 @@ describe("project context normalization", () => {
     });
   });
 
+  it.each([
+    {
+      label: "userinfo url",
+      repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+      expectedRepository: "https://example.com/org/docs.git",
+      forbiddenSubstrings: ["repo-secret", "x-access-token"],
+    },
+    {
+      label: "query url",
+      repository: "https://example.com/org/docs.git?token=query-secret",
+      expectedRepository: "https://example.com/org/docs.git",
+      forbiddenSubstrings: ["query-secret", "token=query-secret"],
+    },
+    {
+      label: "fragment url",
+      repository: "https://example.com/org/docs.git#fragment-secret",
+      expectedRepository: "https://example.com/org/docs.git",
+      forbiddenSubstrings: ["fragment-secret", "#fragment-secret"],
+    },
+    {
+      label: "pathless url",
+      repository: "https://repo-secret@example.com",
+      expectedRepository: "https://example.com/",
+      forbiddenSubstrings: ["repo-secret"],
+    },
+    {
+      label: "single-label value",
+      repository: "repo-secret",
+      expectedRepository: null,
+      forbiddenSubstrings: ["repo-secret"],
+    },
+    {
+      label: "dot-delimited credential-like value",
+      repository: "ghp_abcd.efgh",
+      expectedRepository: null,
+      forbiddenSubstrings: ["ghp_abcd.efgh"],
+    },
+    {
+      label: "colon-delimited credential-like value",
+      repository: "token:secret",
+      expectedRepository: null,
+      forbiddenSubstrings: ["token:secret"],
+    },
+    {
+      label: "invalid url-shaped value",
+      repository: "https://user:secret#fragment@example.com/org/docs.git",
+      expectedRepository: null,
+      forbiddenSubstrings: ["user", "secret", "fragment@example.com"],
+    },
+    {
+      label: "ambiguous at-sign slash form",
+      repository: "repo-secret@example.com/org/docs.git",
+      expectedRepository: "example.com/org/docs.git",
+      forbiddenSubstrings: ["repo-secret"],
+    },
+    {
+      label: "scp-like at-sign form",
+      repository: "repo-secret@docs:org/docs.git?token=query-secret",
+      expectedRepository: "docs:org/docs.git",
+      forbiddenSubstrings: ["repo-secret", "query-secret"],
+    },
+  ])("sanitizes $label repository summaries and drops unexpected fields from public metadata", ({
+    repository,
+    expectedRepository,
+    forbiddenSubstrings,
+  }) => {
+    const metadata = projectContextMetadataForPublicRead({
+      id: "docs",
+      label: "Documentation Site",
+      enabled: false,
+      tracker: { projectSlug: "DOCS", apiKey: "linear-secret", teamId: "team-1" } as unknown as { projectSlug: string },
+      workspace: {
+        root: "   ",
+        checkoutToken: "workspace-secret",
+        source: {
+          kind: "git_worktree",
+          repository,
+          path: "packages/site",
+          branch: "secret-branch",
+        },
+      } as unknown as {
+        root: string;
+        source: { kind: string; repository: string; path: string };
+      },
+    });
+
+    expect(metadata).toEqual({
+      id: "docs",
+      label: "Documentation Site",
+      enabled: false,
+      linearProjectSlug: "DOCS",
+      workspaceRoot: null,
+      workspaceSourceKind: "git_worktree",
+      repository: expectedRepository,
+      path: "packages/site",
+    });
+    expect(Object.keys(metadata).sort()).toEqual([
+      "enabled",
+      "id",
+      "label",
+      "linearProjectSlug",
+      "path",
+      "repository",
+      "workspaceRoot",
+      "workspaceSourceKind",
+    ]);
+    const serialized = JSON.stringify(metadata);
+    expect(serialized).not.toContain("linear-secret");
+    expect(serialized).not.toContain("workspace-secret");
+    expect(serialized).not.toContain("secret-branch");
+    for (const fragment of forbiddenSubstrings) {
+      expect(serialized).not.toContain(fragment);
+    }
+  });
+
+  it("sanitizes credential-bearing repository/source forms in normalized workflow-config public metadata", () => {
+    const cases = [
+      {
+        id: "docs-userinfo",
+        repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+        expectedRepository: "https://example.com/org/docs.git",
+        forbiddenSubstrings: ["repo-secret", "x-access-token"],
+      },
+      {
+        id: "docs-query",
+        repository: "https://example.com/org/docs.git?token=query-secret",
+        expectedRepository: "https://example.com/org/docs.git",
+        forbiddenSubstrings: ["query-secret"],
+      },
+      {
+        id: "docs-fragment",
+        repository: "https://example.com/org/docs.git#fragment-secret",
+        expectedRepository: "https://example.com/org/docs.git",
+        forbiddenSubstrings: ["fragment-secret"],
+      },
+      {
+        id: "docs-pathless",
+        repository: "https://repo-secret@example.com",
+        expectedRepository: "https://example.com/",
+        forbiddenSubstrings: ["repo-secret"],
+      },
+      {
+        id: "docs-single-label",
+        repository: "repo-secret",
+        expectedRepository: null,
+        forbiddenSubstrings: ["repo-secret", path.resolve("/repo", "repo-secret")],
+      },
+      {
+        id: "docs-env-single-label",
+        repository: "$REPO_SECRET",
+        expectedRepository: null,
+        forbiddenSubstrings: ["repo-secret", path.resolve("/repo", "repo-secret")],
+      },
+      {
+        id: "docs-dot-delimited",
+        repository: "ghp_abcd.efgh",
+        expectedRepository: null,
+        forbiddenSubstrings: ["ghp_abcd.efgh", path.resolve("/repo", "ghp_abcd.efgh")],
+      },
+      {
+        id: "docs-colon-delimited",
+        repository: "token:secret",
+        expectedRepository: null,
+        forbiddenSubstrings: ["token:secret"],
+      },
+      {
+        id: "docs-invalid-url",
+        repository: "https://user:secret#fragment@example.com/org/docs.git",
+        expectedRepository: null,
+        forbiddenSubstrings: ["user", "secret", "fragment@example.com"],
+      },
+      {
+        id: "docs-ssh",
+        repository: "ssh://repo-secret@docs/org/docs.git?token=query-secret",
+        expectedRepository: "ssh://docs/org/docs.git",
+        forbiddenSubstrings: ["repo-secret", "query-secret"],
+      },
+      {
+        id: "docs-ambiguous",
+        repository: "repo-secret@docs:org/docs.git#fragment-secret",
+        expectedRepository: "docs:org/docs.git",
+        forbiddenSubstrings: ["repo-secret", "fragment-secret"],
+      },
+    ] as const;
+
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+          ...cases.map((testCase) => projectContextFixture({ id: testCase.id, repository: testCase.repository })),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key", REPO_SECRET: "repo-secret" },
+    );
+
+    for (const testCase of cases) {
+      const context = config.projectContexts.byId.get(testCase.id);
+      expect(context?.publicMetadata.repository).toBe(testCase.expectedRepository);
+      const serialized = JSON.stringify(context?.publicMetadata ?? null);
+      for (const fragment of testCase.forbiddenSubstrings) {
+        expect(serialized).not.toContain(fragment);
+      }
+    }
+  });
+
   it("normalizes legacy top-level config into an explicit default project context", () => {
     expect(
       normalizeLegacyDefaultProjectContext({
@@ -731,6 +937,7 @@ describe("project context normalization", () => {
       branchTemplate: "global/{{ issue.identifier }}",
       cleanup: "force",
     };
+    const inheritedPublicRepository = ".";
 
     expect(symphonyContext).toMatchObject({
       workspace: {
@@ -741,7 +948,7 @@ describe("project context normalization", () => {
       publicMetadata: {
         workspaceRoot: path.resolve("/repo", "./symphony-workspaces"),
         workspaceSourceKind: "git_worktree",
-        repository: path.resolve("/repo", "."),
+        repository: inheritedPublicRepository,
         path: path.resolve("/repo", "./default-source"),
       },
     });
@@ -754,7 +961,7 @@ describe("project context normalization", () => {
       publicMetadata: {
         workspaceRoot: path.resolve("/repo", "./docs-workspaces"),
         workspaceSourceKind: "git_worktree",
-        repository: path.resolve("/repo", "."),
+        repository: inheritedPublicRepository,
         path: path.resolve("/repo", "./default-source"),
       },
     });
@@ -847,7 +1054,7 @@ describe("project context normalization", () => {
       linearProjectSlug: "DOCS_GIT",
       workspaceRoot: path.resolve("/repo", "./symphony_workspaces"),
       workspaceSourceKind: "git",
-      repository: path.resolve("/repo", "../docs-repo"),
+      repository: "../docs-repo",
       path: null,
     });
   });
@@ -941,6 +1148,101 @@ describe("project context normalization", () => {
       profileName: "feedback",
       value: "context-feedback-secret",
     });
+  });
+
+  it("inherits omitted credential profile fields for partial project-context overrides", () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          credential_profiles: {
+            profiles: {
+              publication: {
+                value: "$GLOBAL_GITHUB_PUBLICATION_TOKEN",
+                capabilities: ["github.publication", "github.merge"],
+              },
+            },
+            roles: {
+              service: {
+                "github.publication": "publication",
+                "github.merge": "publication",
+              },
+            },
+          },
+        },
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$CONTEXT_GITHUB_PUBLICATION_TOKEN" },
+              },
+            },
+          }),
+          projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+        ],
+      }),
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-test-key",
+        GLOBAL_GITHUB_PUBLICATION_TOKEN: "global-publication-secret",
+        CONTEXT_GITHUB_PUBLICATION_TOKEN: "context-publication-secret",
+      },
+    );
+
+    expect(config.projectContexts.defaultContext.credentialProfiles).toMatchObject({
+      profiles: {
+        publication: {
+          value: "$CONTEXT_GITHUB_PUBLICATION_TOKEN",
+          capabilities: ["github.publication", "github.merge"],
+        },
+      },
+      roles: {
+        service: {
+          "github.publication": "publication",
+          "github.merge": "publication",
+        },
+      },
+    });
+    expect(config.credentialProfiles.resolveForRole("service", "github.merge")).toMatchObject({
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+  });
+
+  it("fails closed when partial project-context overrides still leave required credential profile fields missing", () => {
+    expect(() =>
+      parseServiceConfig(
+        multiProjectWorkflowConfig({
+          projectContexts: [
+            projectContextFixture({
+              id: "docs",
+              label: "Documentation Site",
+              projectSlug: "DOCS",
+              repository: "../docs-site",
+              credential_profiles: {
+                profiles: {
+                  publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN" },
+                },
+                roles: {
+                  service: {
+                    "github.publication": "publication",
+                  },
+                },
+              },
+            }),
+          ],
+        }),
+        "/repo/WORKFLOW.md",
+        {
+          LINEAR_API_KEY: "linear-test-key",
+          DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+        },
+      ),
+    ).toThrow(/credential_profiles\.profiles\.publication/);
   });
 
   it("replaces inherited GitHub App profiles when project contexts override them with static-token shorthand", () => {

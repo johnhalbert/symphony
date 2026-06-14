@@ -21,7 +21,7 @@ import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubpro
 import { projectContextResolutionFromIssue } from "../../src/core/config/ProjectContexts.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
-import { resolveCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
+import { resolveCursorRuntimeApiKey, resolveScopedCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
 import {
   sanitizeAgentEventForPublicOutput,
   sanitizedPreviewValue,
@@ -684,13 +684,14 @@ export class CursorHarness implements AgentHarness {
     const cliPath = currentSymphonyCliPath();
     await writeInitialHandoffMcpContexts(ctx);
     const mcpServers = symphonyRoleMcpServers(ctx, { cliPath });
-    const createOptions = cursorAgentCreateOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
+    const projectContext = ctx.projectContext ?? projectContextResolutionFromIssue(ctx.issue) ?? undefined;
+    const runtimeApiKey = resolveScopedCursorRuntimeApiKey(ctx.config, ctx.role, { projectContext: configuredCursorRuntimeProjectContext(ctx) });
+    const createOptions = cursorAgentCreateOptions(ctx, runtimeApiKey, {
       mcpServers,
     });
-    const resumeOptions = cursorAgentBaseOptions(ctx, resolveCursorRuntimeApiKey(ctx.config, ctx.role), {
+    const resumeOptions = cursorAgentBaseOptions(ctx, runtimeApiKey, {
       mcpServers,
     });
-    const projectContext = projectContextResolutionFromIssue(ctx.issue) ?? undefined;
     const latestRun =
       options.allowResume && ctx.role === "worker" && cursorRunPhase(ctx) === "implementation"
         ? await this.options.runStore?.latestRunForIssue(ctx.issue.id, {
@@ -928,9 +929,16 @@ function safeJsonPreview(value: unknown): string {
   }
 }
 
+function configuredCursorRuntimeProjectContext(ctx: Pick<AgentRunContext, "config" | "issue" | "projectContext">) {
+  const projectContext = ctx.projectContext ?? projectContextResolutionFromIssue(ctx.issue) ?? undefined;
+  return projectContext && ctx.config.projectContexts.byId.has(projectContext.projectContextId) ? projectContext : undefined;
+}
+
 export function cursorAgentCreateOptions(
   ctx: AgentRunContext,
-  apiKey: string | null | undefined = resolveCursorRuntimeApiKey(ctx.config, ctx.role),
+  apiKey: string | null | undefined = resolveScopedCursorRuntimeApiKey(ctx.config, ctx.role, {
+    projectContext: configuredCursorRuntimeProjectContext(ctx),
+  }),
   options: { mcpServers?: Record<string, McpSubprocessServerConfig> } = {},
 ): Parameters<typeof Agent.create>[0] {
   return {

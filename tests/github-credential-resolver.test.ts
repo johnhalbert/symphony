@@ -257,6 +257,91 @@ describe("GitHub credential resolver", () => {
     });
   });
 
+  it("resolves context-specific GitHub publication credentials while inheriting omitted capabilities", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        workspace: { root: "/repo/workspaces", state_dir: "/repo/state" },
+        github: { owner: "acme", repo: "symphony", token: "legacy-github-token" },
+        credential_profiles: {
+          profiles: {
+            publication: {
+              value: "$GLOBAL_GITHUB_PUBLICATION_TOKEN",
+              capabilities: ["github.publication", "github.merge"],
+            },
+          },
+          roles: {
+            service: {
+              "github.publication": "publication",
+              "github.merge": "publication",
+            },
+          },
+        },
+        project_contexts: [
+          {
+            id: "symphony",
+            tracker: { project_slug: "SYMPHONY" },
+            workspace: { source: { kind: "git", repository: "." } },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$SYMPHONY_GITHUB_PUBLICATION_TOKEN" },
+              },
+            },
+          },
+          {
+            id: "docs",
+            tracker: { project_slug: "DOCS" },
+            workspace: { source: { kind: "git", repository: "../docs-site" } },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN" },
+              },
+            },
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LINEAR_API_KEY: "linear-secret",
+        GLOBAL_GITHUB_PUBLICATION_TOKEN: "global-publication-token",
+        SYMPHONY_GITHUB_PUBLICATION_TOKEN: "symphony-publication-token",
+        DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-token",
+      },
+    );
+
+    const symphonyContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "SYMPHONY",
+      routingSource: "test",
+    } as const;
+    const docsContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "test",
+    } as const;
+    const contextEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      GLOBAL_GITHUB_PUBLICATION_TOKEN: "global-publication-token",
+      SYMPHONY_GITHUB_PUBLICATION_TOKEN: "symphony-publication-token",
+      DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-token",
+    };
+
+    expect(resolveGitHubClientConfig(config, "github.publication", { projectContext: symphonyContext, env: contextEnv })).toMatchObject({
+      github: { token: "symphony-publication-token" },
+      credential: { source: "profile", profileName: "publication", value: "symphony-publication-token" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.publication", { projectContext: docsContext, env: contextEnv })).toMatchObject({
+      github: { token: "docs-publication-token" },
+      credential: { source: "profile", profileName: "publication", value: "docs-publication-token" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.merge", { projectContext: docsContext, env: contextEnv })).toMatchObject({
+      github: { token: "docs-publication-token" },
+      credential: { source: "profile", profileName: "publication", value: "docs-publication-token" },
+    });
+  });
+
   it("rejects wrong-role-only GitHub assignments before legacy fallback", () => {
     for (const capability of githubCapabilities()) {
       const owner = expectedRole(capability);

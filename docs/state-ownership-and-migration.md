@@ -15,6 +15,15 @@ The active migration runner surface is `migrations/postgres/0001_migration_found
 - `migrations/postgres/0007_project_context_attribution.sql` adds project context attribution columns plus legacy/default backfills across owned operational and projection tables, then re-scopes primary keys, unique constraints, foreign keys, and read indexes by `project_context_id`.
 - `migrations/postgres/README.md` is the schema entry point engineers should read first. It links here for state ownership and migration compatibility guidance.
 
+## Context attribution and legacy/default fallback state
+
+Project context is part of Symphony's durable identity surface, not just transient routing metadata.
+
+- On Postgres, `0007_project_context_attribution.sql` backfills `project_context_id = 'default'` across workspace, issue, run-session, run-activity, chat-message, writeback, approval, projection-revision, and projection child tables. It also backfills `run_session.project_context_label = 'Default'` and `run_session.routing_source = 'legacy_default'` so legacy single-project rows remain attributable after upgrade.
+- On file-backed state, readers normalize missing `projectContext` blocks on workspace, run, lifecycle, writeback, approval, and handoff records to `{ projectContextId: "default", projectContextLabel: "Default", linearProjectSlug: null, routingSource: "legacy_default" }` without rewriting the historical file just because the field was synthesized.
+- Status/API and projection rebuild paths must carry the attributed `projectContextId` into durable transcript/history reads. Historical runs missing explicit metadata still read through `default`; they must not fan out across multiple contexts by bare `runId` or `sessionId`.
+- Replay/state-refresh flows may preserve explicit historical project contexts even if the current config registry has drifted. Compatibility reads should report the recorded context rather than silently re-routing old data through today's enabled-context list.
+
 ## Ownership decision rules
 
 1. **Canonical Symphony state** is state Symphony must replay to make orchestration decisions: run terminal status, review-loop phase and counters, writeback/approval operation state, idempotency keys, normalized transcript/activity events, chat message reconstruction records, and sync cursors.
@@ -66,6 +75,7 @@ The active migration runner surface is `migrations/postgres/0001_migration_found
 - The configured `migrations/postgres` schema is additive. `0002_symphony_owned_state.sql`, `0003_projection_freshness_indexes.sql`, `0004_run_activity_canonical_channels.sql`, `0005_projection_source_freshness.sql`, `0006_projection_build_modes.sql`, and `0007_project_context_attribution.sql` do not, by themselves, switch lifecycle, writeback, approval, or transcript reads away from the current file-backed stores.
 - The legacy `db/migrations/postgres/0001_symphony_owned_state.sql` copy remains documentation/history for the original schema proposal. The service-configured runner path is `migrations/postgres`, and repository implementations should validate against that current path.
 - Existing stores under `workspace.stateDir` remain compatibility contracts: `FileRunTranscriptStore`, `FileIssueLifecycleStore`, `FileWritebackOutboxStore`, `FileOperatorApprovalStore`, and related projection revision notifications must keep their observable API behavior until a later repository layer explicitly migrates them.
+- Context attribution is part of that compatibility contract: preserve recorded `projectContext` when it exists, synthesize the legacy/default context when it does not, and never merge records from different contexts just because legacy ids overlap.
 - A future persistence implementation should introduce repository interfaces or adapters first, then dual-write/import, then switch reads behind configuration after replay and recovery tests pass.
 - Importers must be side-effect free. They may write Postgres rows and projection revisions; they must not post Linear comments, transition Linear issues, push branches, create/update PRs, merge PRs, start harness sessions, or cancel runs.
 - Writeback and approval rows must remain idempotent across process restarts. `writeback_operation.idempotency_key` and `approval_request.dedupe_key` are the replay boundaries for publication and tracker writes.

@@ -6,8 +6,10 @@ import type { IssueBoardColumnId, IssueBoardColumnMapping } from "../types.js";
 import {
   createCredentialProfileRegistry,
   rawCredentialProfilesSchema,
+  rawCredentialProfilesOverrideSchema,
   type CredentialProfileRegistry,
   type RawCredentialProfilesConfig,
+  type RawCredentialProfilesOverrideConfig,
 } from "./CredentialProfiles.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
@@ -15,7 +17,7 @@ import {
   defaultProjectContextLabel,
   normalizeLegacyDefaultProjectContext,
   normalizeProjectContextId,
-  projectContextMetadataForPublicRead,
+  projectContextSummaryForPublicRead,
   type NormalizedProjectContext,
   type ProjectContextConfig,
   type ProjectContextRegistry,
@@ -172,7 +174,7 @@ const rawProjectContextSchema = z
     review_loop: rawReviewLoopSchema.optional(),
     issue_breakdown: rawIssueBreakdownSchema.optional(),
     agent: rawAgentSchema.optional(),
-    credential_profiles: rawCredentialProfilesSchema.optional(),
+    credential_profiles: rawCredentialProfilesOverrideSchema.optional(),
   })
   .passthrough();
 
@@ -1066,6 +1068,36 @@ function normalizeWorkflowProjectContext(
       });
     }
 
+    const publicMetadataRepository =
+      workspace.source.kind === "git" || workspace.source.kind === "git_worktree"
+        ? resolveOptionalConfigStringValue(merged.workspace?.source?.repository, env)
+        : undefined;
+    const publicSummary = projectContextSummaryForPublicRead({
+      id,
+      label,
+      enabled,
+      tracker: {
+        projectSlug: tracker.projectSlug,
+        apiKey: tracker.apiKey,
+      },
+      workspace: {
+        root: workspace.root,
+        source: {
+          kind: workspace.source.kind,
+          repository: publicMetadataRepository ?? null,
+          path: workspace.source.path ?? null,
+          ref: workspace.source.ref ?? null,
+          baseRef: workspace.source.baseRef ?? null,
+          branchTemplate: workspace.source.branchTemplate ?? null,
+          cachePath: workspace.source.cachePath ?? null,
+          cleanup: workspace.source.cleanup ?? null,
+        },
+      },
+      github: {
+        token: github.token,
+      },
+    });
+
     return {
       id,
       label,
@@ -1078,7 +1110,8 @@ function normalizeWorkflowProjectContext(
       issueBreakdown,
       agent,
       credentialProfiles: merged.credential_profiles,
-      publicMetadata: projectContextMetadataForPublicRead({ id, label, enabled, tracker, workspace }),
+      publicMetadata: publicSummary.publicMetadata,
+      publicSummary,
     };
   } catch (error) {
     throw attachProjectContextValidationSignal(error, contextPath);
@@ -1469,28 +1502,31 @@ function mergeCredentialProfileDefaults(
           service: mergeCredentialProfileRoleAssignments(base?.roles?.service, override?.roles?.service),
         };
 
-  return {
+  const { profiles: _overrideProfiles, roles: _overrideRoles, ...overrideRest } = override ?? {};
+
+  return validateMergedCredentialProfiles({
     ...(base ?? {}),
-    ...(override ?? {}),
+    ...overrideRest,
     ...(mergedProfiles === undefined ? {} : { profiles: mergedProfiles }),
     ...(mergedRoles === undefined ? {} : { roles: mergedRoles }),
-  };
+  });
 }
 
 function mergeCredentialProfileDefinitionMap(
   base: RawCredentialProfilesConfig["profiles"] | undefined,
-  override: RawCredentialProfilesConfig["profiles"] | undefined,
+  override: RawCredentialProfilesOverrideConfig["profiles"] | undefined,
 ): RawCredentialProfilesConfig["profiles"] | undefined {
   if (base === undefined && override === undefined) return undefined;
 
   const merged: NonNullable<RawCredentialProfilesConfig["profiles"]> = { ...(base ?? {}) };
   for (const [name, profile] of Object.entries(override ?? {})) {
     const baseProfile = base?.[name] as NonNullable<RawCredentialProfilesConfig["profiles"]>[string] | undefined;
-    const overrideProfile = profile as NonNullable<RawCredentialProfilesConfig["profiles"]>[string];
+    const overrideProfile = profile as NonNullable<RawCredentialProfilesOverrideConfig["profiles"]>[string];
+    const overrideKind = inferRawCredentialProfileOverrideKind(overrideProfile);
 
     merged[name] =
-      baseProfile !== undefined && inferRawCredentialProfileKind(baseProfile) !== inferRawCredentialProfileKind(overrideProfile)
-        ? overrideProfile
+      baseProfile !== undefined && overrideKind !== null && inferRawCredentialProfileKind(baseProfile) !== overrideKind
+        ? (overrideProfile as NonNullable<RawCredentialProfilesConfig["profiles"]>[string])
         : ({
             ...(baseProfile ?? {}),
             ...overrideProfile,
@@ -1503,6 +1539,56 @@ function inferRawCredentialProfileKind(
   profile: NonNullable<RawCredentialProfilesConfig["profiles"]>[string],
 ): "github_app" | "static_token" {
   return profile.kind === "github_app" ? "github_app" : "static_token";
+}
+
+function inferRawCredentialProfileOverrideKind(
+  profile: NonNullable<RawCredentialProfilesOverrideConfig["profiles"]>[string],
+): "github_app" | "static_token" | null {
+  if (profile.kind === "github_app") return "github_app";
+  if (profile.kind === "static_token") return "static_token";
+
+  const hasStaticFields = profile.value !== undefined;
+  const hasGitHubAppFields =
+    profile.app_id !== undefined ||
+    profile.client_id !== undefined ||
+    profile.installation_id !== undefined ||
+    profile.private_key !== undefined ||
+    profile.private_key_path !== undefined ||
+    profile.token_refresh_buffer_seconds !== undefined;
+  if (hasGitHubAppFields && !hasStaticFields) return "github_app";
+  if (hasStaticFields && !hasGitHubAppFields) return "static_token";
+  return null;
+}
+
+function validateMergedCredentialProfiles(
+  value: RawWorkflowConfig["credential_profiles"] | undefined,
+): RawWorkflowConfig["credential_profiles"] | undefined {
+  if (value === undefined) return undefined;
+  const parsed = rawCredentialProfilesSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+
+  const firstIssue = parsed.error.issues[0];
+  const issuePath = firstIssue ? formatZodIssuePath(firstIssue.path) : "";
+  const fieldPath =
+    issuePath.length === 0 ? "credential_profiles" : `credential_profiles.${issuePath}`;
+  throw configValidationError(
+    issuePath.length > 0
+      ? `credential_profiles.${issuePath} ${normalizeZodIssueMessage(firstIssue)}`
+      : `credential_profiles ${normalizeZodIssueMessage(firstIssue)}`,
+    [fieldPath],
+  );
+}
+
+function formatZodIssuePath(path: readonly PropertyKey[]): string {
+  return path
+    .map((segment) => (typeof segment === "number" ? `[${segment}]` : String(segment)))
+    .join(".")
+    .replace(/\.\[/g, "[");
+}
+
+function normalizeZodIssueMessage(issue: z.ZodIssue | undefined): string {
+  if (!issue) return "is invalid";
+  return issue.message;
 }
 
 function mergeCredentialProfileRoleAssignments(

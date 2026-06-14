@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -74,14 +75,14 @@ import {
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import type { Issue, TokenCounts, TrackerStateLists } from "../src/core/types.js";
-import { agentEligibleIssueContract, issue, testConfig, trackerIssue } from "./helpers.js";
+import { agentEligibleIssueContract, issue, testConfig, trackerClientFixture, trackerIssue } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
 type CommentWriteback = Extract<NewWritebackOperation, { kind: "comment" }>;
 
 const docsProjectContext = {
-  projectContextId: "docs-site",
+  projectContextId: "docs",
   projectContextLabel: "Documentation Site",
   linearProjectSlug: "DOCS",
   routingSource: "candidate_poll",
@@ -94,8 +95,81 @@ const legacyDefaultProjectContext = {
   routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
 } as const;
 
+
+function addDocsPollingProjectContext(config: ReturnType<typeof testConfig>): void {
+  if (config.projectContexts.byId.has(docsProjectContext.projectContextId)) return;
+
+  const defaultContext = config.projectContexts.defaultContext;
+  const docsContext = {
+    ...defaultContext,
+    id: docsProjectContext.projectContextId,
+    label: docsProjectContext.projectContextLabel,
+    source: "explicit" as const,
+    tracker: {
+      ...defaultContext.tracker,
+      projectSlug: docsProjectContext.linearProjectSlug,
+    },
+    reviewLoop: {
+      ...config.reviewLoop,
+    },
+    issueBreakdown: {
+      ...config.issueBreakdown,
+    },
+    agent: {
+      ...config.agent,
+    },
+    publicMetadata: {
+      ...defaultContext.publicMetadata,
+      id: docsProjectContext.projectContextId,
+      label: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    },
+    publicSummary: {
+      ...defaultContext.publicSummary,
+      id: docsProjectContext.projectContextId,
+      label: docsProjectContext.projectContextLabel,
+      tracker: {
+        ...defaultContext.publicSummary.tracker,
+        projectSlug: docsProjectContext.linearProjectSlug,
+      },
+      publicMetadata: {
+        ...defaultContext.publicSummary.publicMetadata,
+        id: docsProjectContext.projectContextId,
+        label: docsProjectContext.projectContextLabel,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+      },
+    },
+  };
+
+  config.projectContexts.contexts = [...config.projectContexts.contexts, docsContext];
+  config.projectContexts.enabledContexts = [...config.projectContexts.enabledContexts, docsContext];
+  (config.projectContexts.byId as unknown as Map<string, typeof docsContext>).set(docsContext.id, docsContext);
+}
+
+function requireDocsPollingContext(config: ReturnType<typeof testConfig>) {
+  const docsContext = config.projectContexts.byId.get(docsProjectContext.projectContextId);
+  expect(docsContext).toBeDefined();
+  if (!docsContext) throw new Error("Expected docs project context in orchestrator test fixture");
+  return docsContext;
+}
+
 describe("Orchestrator", () => {
   let root: string;
+
+const symphonyProjectContext = {
+  projectContextId: "symphony",
+  projectContextLabel: "Symphony",
+  linearProjectSlug: "TEST",
+  routingSource: "candidate_poll",
+} as const;
+
+const docsProjectContext = {
+  projectContextId: "docs",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
+
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-orchestrator-"));
@@ -981,6 +1055,190 @@ describe("Orchestrator", () => {
     expect(harness.runs.filter((run) => run.ctx.runPhase === "implementation")).toHaveLength(0);
     expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("not_requested");
     expect(lifecycle?.issueBreakdownPlans[0]?.createdIssueRefs).toEqual([]);
+  }, 10_000);
+
+  it("uses resolved project-context issue breakdown planning config during automatic polling", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = false;
+    config.issueBreakdown.promptTemplate = "Default planning prompt for {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.issueBreakdown.enabled = true;
+    docsContext.issueBreakdown.planningLabels = ["docs-planning"];
+    docsContext.issueBreakdown.promptTemplate = "Docs planning prompt for {{ issue.identifier }}";
+    docsContext.issueBreakdown.cursorMode = "plan";
+    const candidate = trackerIssue({
+      id: "issue-docs-plan-routing-1",
+      identifier: "DOCS-PLAN-1",
+      state: "Todo",
+      labels: ["docs-planning"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    const defaultTracker = trackerClientFixture();
+    const docsTracker = trackerClientFixture({
+      candidates: [candidate],
+      issues: [candidate],
+    });
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore: new FileRunTranscriptStore(config.workspace.stateDir),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    expect(defaultTracker.candidateFetchCount).toBe(1);
+    expect(docsTracker.candidateFetchCount).toBe(1);
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(docsTracker.requestedIds.length).toBeGreaterThanOrEqual(1);
+    expect(docsTracker.requestedIds.every((issueIds) => issueIds.length === 1 && issueIds[0] === candidate.id)).toBe(true);
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(docsProjectContext);
+    expect(harness.runs[0]?.ctx.config.issueBreakdown.enabled).toBe(true);
+    expect(harness.runs[0]?.ctx.config.issueBreakdown.planningLabels).toEqual(["docs-planning"]);
+    expect(harness.runs[0]?.ctx.runModeOverride).toBe("plan");
+    expect(harness.runs[0]?.prompt).toContain("Docs planning prompt for DOCS-PLAN-1");
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+    });
+  }, 10_000);
+
+  it("uses resolved project-context fresh-plan and apply-to-linear config during automatic polling", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.issueBreakdown.promptTemplate = "Default planning prompt for {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.issueBreakdown.enabled = true;
+    docsContext.issueBreakdown.applyToLinear.enabled = false;
+    docsContext.issueBreakdown.planningLabels = ["docs-planning"];
+    docsContext.issueBreakdown.promptTemplate = "Docs planning prompt for {{ issue.identifier }}";
+    docsContext.issueBreakdown.cursorMode = "plan";
+    const candidate = trackerIssue({
+      id: "issue-docs-plan-routing-2",
+      identifier: "DOCS-PLAN-2",
+      state: "Todo",
+      labels: ["docs-planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    let currentState = "Todo";
+    let updatedAt = "2026-01-02T00:00:00Z";
+    const defaultTracker = trackerClientFixture();
+    const docsTrackerStats = {
+      candidateFetchCount: 0,
+      requestedIds: [] as string[][],
+    };
+    const docsTracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        docsTrackerStats.candidateFetchCount += 1;
+        return [{ ...candidate, state: currentState, updatedAt }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        docsTrackerStats.requestedIds.push([...issueIds]);
+        return issueIds.includes(candidate.id) ? [{ ...candidate, state: currentState, updatedAt }] : [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+      updatedAt = "2026-01-02T00:01:00Z";
+    });
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await waitForAsync(
+      async () => ((await lifecycleStore.get(candidate.id))?.issueBreakdownPlans.length ?? 0) === 1,
+      "persisted docs issue breakdown plan",
+    );
+    await settleOrchestratorExit();
+    await waitForAsync(async () => {
+      await orchestrator.refreshNow();
+      return harness.runs.length === 2;
+    }, "docs implementation dispatch after accepted plan", 5_000);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await settleOrchestratorExit();
+    await orchestrator.stop();
+
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(docsTrackerStats.candidateFetchCount).toBeGreaterThanOrEqual(2);
+    expect(docsTrackerStats.requestedIds.length).toBeGreaterThanOrEqual(2);
+    expect(docsTrackerStats.requestedIds.every((issueIds) => issueIds.length === 1 && issueIds[0] === candidate.id)).toBe(true);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.issueCreates).toEqual([]);
+    expect(harness.runs.map((run) => run.ctx.runPhase)).toEqual(["issue_breakdown", "implementation"]);
+    expect(harness.runs[0]?.ctx.config.issueBreakdown.planningLabels).toEqual(["docs-planning"]);
+    expect(harness.runs[0]?.prompt).toContain("Docs planning prompt for DOCS-PLAN-2");
+    expect(harness.runs[1]?.ctx.projectContext).toMatchObject(docsProjectContext);
+    expect(harness.runs[1]?.ctx.config.issueBreakdown.applyToLinear.enabled).toBe(false);
+    expect(harness.runs[1]?.prompt).toContain("Issue breakdown plan:");
+    expect(harness.runs[1]?.prompt).toContain("Create implementation task");
+    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "issue_breakdown" })).resolves.toMatchObject({
+      runPhase: "issue_breakdown",
+      runKind: "planning",
+      projectContext: docsProjectContext,
+    });
+    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "implementation" })).resolves.toMatchObject({
+      runPhase: "implementation",
+      runKind: "implementation",
+      projectContext: docsProjectContext,
+    });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+      issueBreakdownPlans: [
+        expect.objectContaining({
+          applicationStatus: "not_requested",
+        }),
+      ],
+    });
   }, 10_000);
 
   it("startup processDue skips superseded issue breakdown children, relations, and comments", async () => {
@@ -2034,6 +2292,7 @@ describe("Orchestrator", () => {
     config.writeback.enabled = true;
     config.writeback.mode = "live";
     config.tracker.handoffStates = ["Human Review"];
+    addDocsPollingProjectContext(config);
     const candidate = trackerIssue({
       id: "issue-1",
       identifier: "TEST-1",
@@ -2044,17 +2303,11 @@ describe("Orchestrator", () => {
       linearProjectSlug: docsProjectContext.linearProjectSlug,
     });
     let currentState = "Todo";
-    const tracker: TrackerClient = {
-      async fetchCandidateIssues() {
-        return [{ ...candidate, state: currentState }];
-      },
-      async fetchIssuesByStates() {
-        return [];
-      },
-      async fetchIssueStatesByIds() {
-        return [{ ...candidate, state: currentState }];
-      },
-    };
+    const defaultTracker = trackerClientFixture();
+    const docsTracker = trackerClientFixture({
+      candidates: [{ ...candidate, state: currentState }],
+      issues: [{ ...candidate, state: currentState }],
+    });
     const logger = new StructuredLogger(() => undefined);
     const writer = new StateChangingWriter((state) => {
       currentState = state;
@@ -2067,7 +2320,10 @@ describe("Orchestrator", () => {
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
-      tracker,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
       workspaceManager,
       harness,
       logger,
@@ -2081,6 +2337,11 @@ describe("Orchestrator", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
+    expect(defaultTracker.candidateFetchCount).toBe(1);
+    expect(docsTracker.candidateFetchCount).toBe(1);
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(docsTracker.requestedIds.length).toBeGreaterThanOrEqual(2);
+    expect(docsTracker.requestedIds.every((issueIds) => issueIds.length === 1 && issueIds[0] === candidate.id)).toBe(true);
     expect(harness.runs).toHaveLength(1);
     expect(harness.runs[0]?.ctx.projectContext).toMatchObject(docsProjectContext);
     expect(currentState).toBe("In Progress");
@@ -2349,17 +2610,35 @@ describe("Orchestrator", () => {
     config.writeback.mode = "live";
     config.writeback.dispatchState = "In Progress";
     config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    addDocsPollingProjectContext(config);
+    const candidate = trackerIssue({
+      id: "issue-docs-sdk-retry-1",
+      identifier: "DOCS-SDK-RETRY-1",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
     let currentState = "Todo";
-    const tracker: TrackerClient = {
+    const defaultTracker = trackerClientFixture();
+    const docsTrackerStats = {
+      candidateFetchCount: 0,
+      requestedStates: [] as string[][],
+      requestedIds: [] as string[][],
+    };
+    const docsTracker: TrackerClient = {
       async fetchCandidateIssues() {
+        docsTrackerStats.candidateFetchCount += 1;
         return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
+      async fetchIssuesByStates(states) {
+        docsTrackerStats.requestedStates.push([...states]);
+        return currentState === "Blocked" || !states.includes(currentState) ? [] : [{ ...candidate, state: currentState }];
       },
-      async fetchIssueStatesByIds() {
-        return [{ ...candidate, state: currentState }];
+      async fetchIssueStatesByIds(issueIds) {
+        docsTrackerStats.requestedIds.push([...issueIds]);
+        return [{ ...candidate, state: currentState }].filter((issue) => issueIds.includes(issue.id));
       },
     };
     const logger = new StructuredLogger(() => undefined);
@@ -2373,7 +2652,10 @@ describe("Orchestrator", () => {
     const harness = new SdkWaitErrorHarness();
     const orchestrator = new Orchestrator({
       config,
-      tracker,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
       workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
       harness,
       logger,
@@ -2391,6 +2673,9 @@ describe("Orchestrator", () => {
     }
 
     expect(harness.runs).toEqual(["sdk-error-run-1", "sdk-error-run-2", "sdk-error-run-3"]);
+    expect(docsTrackerStats.candidateFetchCount).toBeGreaterThan(defaultTracker.candidateFetchCount);
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(docsTrackerStats.requestedIds.length).toBeGreaterThan(2);
     const runs = await runStore.listRunsForIssue(candidate.id);
     expect(runs.map((run) => [run.runId, run.status, run.sdkRunStatus, run.sdkRunStatusSource])).toEqual([
       ["sdk-error-run-1", "failed", "error", "wait"],
@@ -2405,6 +2690,7 @@ describe("Orchestrator", () => {
     expect(writer.comments.at(-1)?.body).toContain("consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)");
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       phase: "blocked",
+      projectContext: docsProjectContext,
       blockedReason: "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
     });
   });
@@ -2740,10 +3026,10 @@ describe("Orchestrator", () => {
       await waitFor(() => typeof orchestrator.snapshot().running[0]?.runId === "string", "worker run start");
       const runId = orchestrator.snapshot().running[0]?.runId ?? "";
       await waitForRunRecord(runStore, runId);
-      await lifecycleStore.ensureIssue(
-        candidate,
-        pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
-      );
+      await lifecycleStore.ensureIssue(candidate, {
+        ...pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
+        phase: "implementation",
+      });
       await runStore.updateRun(runId, {
         metadata: {
           pendingApprovalRequestId: null,
@@ -2761,7 +3047,7 @@ describe("Orchestrator", () => {
       expect(runningRun?.pendingApprovalRequestId ?? null).toBeNull();
       expect(runningRun?.cancellationRequestedAt ?? null).toBeNull();
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-        phase: "blocked",
+        phase: "implementation",
         blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
         incompleteTurnCount: 0,
       });
@@ -4330,6 +4616,325 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("records terminal publication approval recovery through the orchestrator when an approval is replayed after worker exit", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.github.publishPullRequests = true;
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    config.github.token = "github-token";
+    config.workspace.source.baseRef = "main";
+    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Blocked";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await startApprovalRun(runStore, candidate, "run-1", root);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+    const approval = approvalRecordFor("stale", candidate, "run-1", root, "run cancellation has been requested");
+
+    await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+    await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+
+    expect(writer.comments).toHaveLength(1);
+    expect(writer.comments[0]?.body).toContain("## Symphony Publication Approval Not Completed");
+    expect(writer.comments[0]?.body).toContain("Status: stale");
+    expect(writer.comments[0]?.body).toContain("Reason: run cancellation has been requested");
+    expect(writer.comments[0]?.body).toContain("The worker completion report remains stored");
+    expect(writer.transitions).toEqual([]);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "publication approval stale",
+    });
+  });
+
+  it("resumes approved publication with project-context GitHub publication credentials", async () => {
+    const config = githubProfileConfig(root, {
+      profiles: {
+        publication: { value: "$GLOBAL_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+      },
+      roles: {
+        service: {
+          "github.publication": "publication",
+        },
+      },
+      env: {
+        GLOBAL_GITHUB_PUBLICATION_TOKEN: "global-publication-secret",
+        DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+      },
+      projectContexts: [
+        {
+          id: "symphony",
+          tracker: { project_slug: "TEST" },
+          workspace: { source: { kind: "git", repository: "." } },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$GLOBAL_GITHUB_PUBLICATION_TOKEN" },
+            },
+          },
+        },
+        {
+          id: "docs",
+          tracker: { project_slug: "DOCS" },
+          workspace: { source: { kind: "git", repository: "../docs-site" } },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN" },
+            },
+          },
+        },
+      ],
+    });
+    vi.stubEnv("GLOBAL_GITHUB_PUBLICATION_TOKEN", "global-publication-secret");
+    vi.stubEnv("DOCS_GITHUB_PUBLICATION_TOKEN", "docs-publication-secret");
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.github.publishPullRequests = true;
+    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Blocked";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const workspace = await initPublishRepo(root, { remote: true });
+    await writeFile(path.join(workspace, "feature.txt"), "changed\n", "utf8");
+    await startApprovalRun(runStore, candidate, "run-1", root);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1", PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON, docsProjectContext));
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
+      const url = new URL(String(input));
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      if (init?.method === "POST") {
+        return jsonResponse(
+          {
+            html_url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            head: {
+              ref: "symphony/TEST-1",
+              sha: "abc123",
+              repo: { pushed_at: "2026-01-01T00:00:01Z" },
+            },
+          },
+          201,
+        );
+      }
+      return jsonResponse([]);
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await expect(orchestrator.resumeApprovedPublication(approvalRecordFor("approved", candidate, "run-1", root, null, docsProjectContext))).resolves.toBe(
+      true,
+    );
+
+    expect(authorizations).toEqual(["Bearer docs-publication-secret", "Bearer docs-publication-secret"]);
+    expect(writer.transitions).toHaveLength(1);
+    expect(writer.transitions[0]).toMatchObject({ toState: "In Review" });
+  });
+
+  it("recovers approved publication with project-context GitHub publication credentials after worker exit", async () => {
+    const config = githubProfileConfig(root, {
+      profiles: {
+        publication: { value: "$GLOBAL_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+      },
+      roles: {
+        service: {
+          "github.publication": "publication",
+        },
+      },
+      env: {
+        GLOBAL_GITHUB_PUBLICATION_TOKEN: "global-publication-secret",
+        DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+      },
+      projectContexts: [
+        {
+          id: "symphony",
+          tracker: { project_slug: "TEST" },
+          workspace: { source: { kind: "git", repository: "." } },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$GLOBAL_GITHUB_PUBLICATION_TOKEN" },
+            },
+          },
+        },
+        {
+          id: "docs",
+          tracker: { project_slug: "DOCS" },
+          workspace: { source: { kind: "git", repository: "../docs-site" } },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN" },
+            },
+          },
+        },
+      ],
+    });
+    vi.stubEnv("GLOBAL_GITHUB_PUBLICATION_TOKEN", "global-publication-secret");
+    vi.stubEnv("DOCS_GITHUB_PUBLICATION_TOKEN", "docs-publication-secret");
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Todo";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.github.publishPullRequests = true;
+    config.github.operatorApproval!.requiredForPublication = true;
+    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    let currentState = "Blocked";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const approvalStore = new FileOperatorApprovalStore(stateDir);
+    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    const workspace = await initPublishRepo(root, { remote: true });
+    await writeFile(path.join(workspace, "feature.txt"), "changed\n", "utf8");
+    await startApprovalRun(runStore, candidate, "run-1", root);
+    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
+    const { record } = await approvalStore.requestOrGetPending(
+      {
+        issueId: candidate.id,
+        issueIdentifier: candidate.identifier,
+        runId: "run-1",
+        evidenceCursor: "idem-1",
+        projectContext: docsProjectContext,
+        action: {
+          kind: "push_and_pr",
+          branchName: "symphony/TEST-1",
+          baseBranch: "main",
+          workspacePath: workspace,
+          title: `${candidate.identifier}: ${candidate.title}`,
+          evidenceCursor: "idem-1",
+          summaryPreview: "Implemented the requested handoff.",
+          changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
+          plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+        },
+      },
+      null,
+    );
+    await operatorApproval.resolve(record.requestId, "approve");
+    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1", PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON, docsProjectContext));
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
+      const url = new URL(String(input));
+      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      if (init?.method === "POST") {
+        return jsonResponse(
+          {
+            html_url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            head: {
+              ref: "symphony/TEST-1",
+              sha: "abc123",
+              repo: { pushed_at: "2026-01-01T00:00:01Z" },
+            },
+          },
+          201,
+        );
+      }
+      return jsonResponse([]);
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      operatorApproval,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await orchestrator.refreshNow();
+    } finally {
+      await orchestrator.stop();
+    }
+
+    expect(authorizations).toEqual(["Bearer docs-publication-secret", "Bearer docs-publication-secret"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Blocked", "In Review"]);
+  });
+
   it.each([
     ["stale", "run cancellation has been requested"],
     ["expired", "approval request expired"],
@@ -4548,27 +5153,27 @@ describe("Orchestrator", () => {
     });
   }, 15_000);
 
-  it("dispatches reviewer runs from configured review states with reviewer evidence", async () => {
+  it("dispatches reviewer runs from resolved project-context review states with reviewer evidence", async () => {
     const config = testConfig(root);
     config.tracker.handoffStates = ["In Review"];
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewerPromptTemplate =
       "Review {{ issue.identifier }} as {{ role }}: {{ completionReport.summary }}\n{% for item in workspaceEvidence %}{{ item }}\n{% endfor %}{% for item in runDigest %}{{ item }}\n{% endfor %}";
     config.reviewLoop.reviewerPromptExtensions = ["Custom project reviewer extension."];
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
-    const fetchedReviewStates: string[][] = [];
-    const tracker: TrackerClient = {
-      async fetchCandidateIssues() {
-        return [];
-      },
-      async fetchIssuesByStates(states) {
-        fetchedReviewStates.push(states);
-        return states.includes("In Review") ? [candidate] : [];
-      },
-      async fetchIssueStatesByIds() {
-        return [candidate];
-      },
-    };
+    addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.reviewLoop.reviewStates = ["Docs Review"];
+    const candidate = trackerIssue({
+      id: "issue-review-docs-1",
+      identifier: "TEST-1",
+      state: "Docs Review",
+      branchName: "symphony/docs/TEST-1",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    const defaultTracker = trackerClientFixture();
+    const docsTracker = trackerClientFixture({ issues: [candidate] });
     const logger = new StructuredLogger(() => undefined);
     const stateDir = path.join(root, "state");
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
@@ -4576,11 +5181,12 @@ describe("Orchestrator", () => {
     const report = completionReportRecord(candidate);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "review",
+      projectContext: docsProjectContext,
       lastCompletionReportId: report.id,
       completionReports: [report],
       summaryPointers: {
-        branchName: "symphony/TEST-1",
-        gitBranchName: "symphony/TEST-1",
+        branchName: "symphony/docs/TEST-1",
+        gitBranchName: "symphony/docs/TEST-1",
         prUrl: "https://github.com/acme/symphony/pull/42",
         prNumber: 42,
         prHeadSha: "abc123",
@@ -4598,9 +5204,10 @@ describe("Orchestrator", () => {
       prompt: "Worker prompt",
       workspaceKey: candidate.identifier,
       workspacePath: path.join(root, candidate.identifier),
-      gitBranchName: "symphony/TEST-1",
+      gitBranchName: "symphony/docs/TEST-1",
       repoPath: root,
       baseRef: "main",
+      projectContext: docsProjectContext,
     });
     await runStore.appendEvent({
       runId: report.runId,
@@ -4613,7 +5220,10 @@ describe("Orchestrator", () => {
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
-      tracker,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
       workspaceManager,
       harness,
       logger,
@@ -4626,9 +5236,14 @@ describe("Orchestrator", () => {
     await waitFor(() => harness.runs.length === 1, "reviewer dispatch");
     await orchestrator.stop();
 
-    expect(fetchedReviewStates).toEqual([["In Review"]]);
+    expect(defaultTracker.requestedStates).toEqual([["In Review"]]);
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(docsTracker.requestedStates).toEqual([["Docs Review"]]);
+    expect(docsTracker.requestedIds).toEqual([[candidate.id]]);
     expect(harness.runs).toHaveLength(1);
     expect(harness.runs[0]?.ctx.role).toBe("reviewer");
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(docsProjectContext);
+    expect(harness.runs[0]?.ctx.config.reviewLoop.reviewStates).toEqual(["Docs Review"]);
     expect(harness.runs[0]?.prompt).toContain("Review TEST-1 as reviewer");
     expect(harness.runs[0]?.prompt).toContain("Implemented the requested change.");
     expect(harness.runs[0]?.prompt).toContain("Pull request: https://github.com/acme/symphony/pull/42");
@@ -4636,7 +5251,7 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).not.toContain("Custom project reviewer extension.");
     expect(harness.runs[0]?.prompt).not.toContain("General software review matrix:");
     const runs = await runStore.listRunsForIssue(candidate.identifier);
-    expect(runs.find((run) => run.runId === "fake-issue-1-1")).toMatchObject({ role: "reviewer" });
+    expect(runs.find((run) => run.runId === "fake-issue-review-docs-1-1")).toMatchObject({ role: "reviewer" });
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 0 });
   });
 
@@ -5188,7 +5803,7 @@ describe("Orchestrator", () => {
     });
   });
 
-  it("lazy-resolves worker GitHub discovery credentials when no discovery client override is injected", async () => {
+  it("lazy-resolves worker GitHub discovery credentials from the running issue project context", async () => {
     const config = githubProfileConfig(root, {
       profiles: {
         discovery: { value: "$GITHUB_DISCOVERY_TOKEN", capabilities: ["github.discovery"] },
@@ -5199,21 +5814,36 @@ describe("Orchestrator", () => {
         },
       },
       env: {
-        GITHUB_DISCOVERY_TOKEN: "discovery-secret",
+        GITHUB_DISCOVERY_TOKEN: "global-discovery-secret",
+        DOCS_GITHUB_DISCOVERY_TOKEN: "docs-discovery-secret",
       },
+      projectContexts: [
+        {
+          id: "symphony",
+          tracker: { project_slug: "TEST" },
+          workspace: { source: { kind: "git", repository: "." } },
+          credential_profiles: {
+            profiles: {
+              discovery: { value: "$GITHUB_DISCOVERY_TOKEN" },
+            },
+          },
+        },
+        {
+          id: "docs",
+          tracker: { project_slug: "DOCS" },
+          workspace: { source: { kind: "git", repository: "../docs-site" } },
+          credential_profiles: {
+            profiles: {
+              discovery: { value: "$DOCS_GITHUB_DISCOVERY_TOKEN" },
+            },
+          },
+        },
+      ],
     });
+    vi.stubEnv("GITHUB_DISCOVERY_TOKEN", "global-discovery-secret");
+    vi.stubEnv("DOCS_GITHUB_DISCOVERY_TOKEN", "docs-discovery-secret");
     const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });
-    const tracker: TrackerClient = {
-      async fetchCandidateIssues() {
-        return [candidate];
-      },
-      async fetchIssuesByStates() {
-        return [];
-      },
-      async fetchIssueStatesByIds() {
-        return [candidate];
-      },
-    };
+    const candidateWithContext = { ...candidate, projectContext: docsProjectContext };
     const authorizations: string[] = [];
     vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
       authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
@@ -5230,23 +5860,49 @@ describe("Orchestrator", () => {
         { status: 200, headers: { "content-type": "application/json" } },
       );
     });
-    const logger = new StructuredLogger(() => undefined);
-    const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const orchestrator = new Orchestrator({
       config,
-      tracker,
-      workspaceManager,
-      harness,
-      logger,
+      tracker: {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [];
+        },
+      },
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger: new StructuredLogger(() => undefined) }),
+      harness: new FakeHarness(),
+      logger: new StructuredLogger(() => undefined),
       promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const entry = {
+      issue: candidateWithContext,
+      lifecycle: null,
+      activeRunId: null,
+      runId: null,
+    };
+
+    await (orchestrator as any).discoverPullRequestForEntry(entry, {
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
-
-    expect(authorizations).toEqual(["Bearer discovery-secret", "Bearer discovery-secret"]);
+    expect(authorizations).toEqual(["Bearer docs-discovery-secret"]);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: "symphony/TEST-1",
+      },
+    });
   });
 
   it("injects PR review evidence into the next worker prompt after requested changes", async () => {
@@ -5493,7 +6149,7 @@ describe("Orchestrator", () => {
     });
   });
 
-  it("lazy-resolves reviewer GitHub review-evidence credentials for worker feedback prompts", async () => {
+  it("lazy-resolves reviewer GitHub review-evidence credentials from the issue project context for worker feedback prompts", async () => {
     const config = githubProfileConfig(root, {
       profiles: {
         "review-read": {
@@ -5507,29 +6163,54 @@ describe("Orchestrator", () => {
         },
       },
       env: {
-        GITHUB_REVIEW_READ_TOKEN: "review-read-secret",
+        GITHUB_REVIEW_READ_TOKEN: "global-review-read-secret",
+        DOCS_GITHUB_REVIEW_READ_TOKEN: "docs-review-read-secret",
       },
+      projectContexts: [
+        {
+          id: "symphony",
+          tracker: { project_slug: "TEST" },
+          workspace: { source: { kind: "git", repository: "." } },
+          credential_profiles: {
+            profiles: {
+              "review-read": { value: "$GITHUB_REVIEW_READ_TOKEN" },
+            },
+          },
+        },
+        {
+          id: "docs",
+          tracker: { project_slug: "DOCS" },
+          workspace: { source: { kind: "git", repository: "../docs-site" } },
+          credential_profiles: {
+            profiles: {
+              "review-read": { value: "$DOCS_GITHUB_REVIEW_READ_TOKEN" },
+            },
+          },
+        },
+      ],
     });
+    vi.stubEnv("GITHUB_REVIEW_READ_TOKEN", "global-review-read-secret");
+    vi.stubEnv("DOCS_GITHUB_REVIEW_READ_TOKEN", "docs-review-read-secret");
     config.reviewLoop.continuationHistoryThreshold = 5;
     const candidate = issue({ state: "In Progress", branchName: null });
-    const tracker: TrackerClient = {
-      async fetchCandidateIssues() {
-        return [candidate];
-      },
-      async fetchIssuesByStates() {
-        return [];
-      },
-      async fetchIssueStatesByIds() {
-        return [candidate];
-      },
-    };
-    const logger = new StructuredLogger(() => undefined);
+    const candidateWithContext = { ...candidate, projectContext: docsProjectContext };
     const stateDir = config.workspace.stateDir;
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "implementation",
+      projectContext: docsProjectContext,
       lastCompletionReportId: "completion-report:issue-1:idem-1",
+      lastReviewVerdictId: "review-verdict:issue-1:verdict-1",
       completionReports: [completionReportRecord(candidate)],
+      reviewVerdicts: [reviewVerdictRecord(candidate)],
+      summaryPointers: {
+        workspacePath: "/tmp/old-workspace",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+      },
     });
     const calls: Array<{ pathname: string; authorization: string }> = [];
     vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
@@ -5567,30 +6248,41 @@ describe("Orchestrator", () => {
       }
       return jsonResponse([]);
     });
-    const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
-      tracker,
-      workspaceManager,
-      harness,
-      logger,
+      tracker: {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [];
+        },
+      },
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger: new StructuredLogger(() => undefined) }),
+      harness: new FakeHarness(),
+      logger: new StructuredLogger(() => undefined),
       promptTemplate: "Work on {{ issue.identifier }}",
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    const prompt = await (orchestrator as any).loadWorkerReviewEvidencePrompt({
+      issue: candidateWithContext,
+      lifecycle: await lifecycleStore.get(candidate.id),
+      activeRunId: null,
+      runId: null,
+    });
 
     expect(calls.map((call) => call.authorization)).toEqual([
-      "Bearer review-read-secret",
-      "Bearer review-read-secret",
-      "Bearer review-read-secret",
-      "Bearer review-read-secret",
+      "Bearer docs-review-read-secret",
+      "Bearer docs-review-read-secret",
+      "Bearer docs-review-read-secret",
+      "Bearer docs-review-read-secret",
     ]);
-    expect(harness.runs[0]?.prompt).toContain("PR review feedback to address");
-    expect(harness.runs[0]?.prompt).toContain("Please address the reviewer-owned evidence path.");
+    expect(prompt).toContain("PR review feedback to address");
+    expect(prompt).toContain("Please address the reviewer-owned evidence path.");
   });
 
   it("injects the latest fail verdict findings and workspace context into the next worker prompt", async () => {
@@ -6868,9 +7560,16 @@ function pendingApprovalLifecyclePatch(
   root: string,
   runId: string,
   blockedReason = PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+  projectContext?: {
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string;
+    routingSource: string;
+  },
 ): IssueLifecyclePatch {
   return {
     phase: "blocked",
+    ...(projectContext === undefined ? {} : { projectContext }),
     blockedReason,
     lastCompletionReportId: `completion-report:${candidate.id}:idem-1`,
     completionReports: [
@@ -6879,6 +7578,7 @@ function pendingApprovalLifecyclePatch(
         runId,
         branchName: candidate.branchName,
         pullRequest: null,
+        ...(projectContext === undefined ? {} : { projectContext }),
       },
     ],
     summaryPointers: {
@@ -6899,6 +7599,12 @@ function approvalRecordFor(
   runId: string,
   root: string,
   staleReason: string | null = null,
+  projectContext?: {
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string;
+    routingSource: string;
+  },
 ): OperatorApprovalRecord {
   return {
     requestId: `approval-${status}`,
@@ -6908,6 +7614,7 @@ function approvalRecordFor(
     runId,
     evidenceCursor: "idem-1",
     dedupeKey: `${runId}:idem-1:push_and_pr`,
+    ...(projectContext === undefined ? {} : { projectContext }),
     action: {
       kind: "push_and_pr",
       branchName: candidate.branchName ?? "symphony/TEST-1",
@@ -6932,8 +7639,9 @@ function githubProfileConfig(
   workspaceRoot: string,
   input: {
     profiles: Record<string, { value: string; capabilities: string[] }>;
-    roles: { worker?: Record<string, string>; reviewer?: Record<string, string> };
+    roles: { worker?: Record<string, string>; reviewer?: Record<string, string>; service?: Record<string, string> };
     env: Record<string, string>;
+    projectContexts?: Array<Record<string, unknown>>;
   },
 ) {
   return parseServiceConfig(
@@ -6963,6 +7671,7 @@ function githubProfileConfig(
         profiles: input.profiles,
         roles: input.roles,
       },
+      ...(input.projectContexts === undefined ? {} : { project_contexts: input.projectContexts }),
     },
     path.join(workspaceRoot, "WORKFLOW.md"),
     {
@@ -6970,6 +7679,45 @@ function githubProfileConfig(
       ...input.env,
     },
   );
+}
+
+async function initPublishRepo(root: string, options: { remote?: boolean } = {}): Promise<string> {
+  const workspace = path.join(root, "workspace");
+  await mkdir(workspace, { recursive: true });
+  await git(["init"], workspace);
+  await git(["checkout", "-b", "main"], workspace);
+  await writeFile(path.join(workspace, "README.md"), "hello\n", "utf8");
+  await git(["add", "README.md"], workspace);
+  await git(["-c", "user.name=Symphony Test", "-c", "user.email=symphony@example.com", "commit", "-m", "initial"], workspace);
+  if (options.remote) {
+    const remote = path.join(root, "remote.git");
+    await git(["init", "--bare", remote], root);
+    await git(["remote", "add", "origin", remote], workspace);
+  }
+  await git(["checkout", "-b", "symphony/TEST-1"], workspace);
+  return workspace;
+}
+
+function git(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`git exited with ${code}: ${stderr}`));
+    });
+  });
 }
 
 function jsonResponse(body: unknown, status = 200): Response {

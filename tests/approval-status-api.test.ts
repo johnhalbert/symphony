@@ -214,7 +214,7 @@ describe("approval status API", () => {
     }
   });
 
-  it("rejects ambiguous identifier issue lookups when project-context siblings collide", async () => {
+  it("returns pending approval for context-qualified issue lookups when project-context siblings collide", async () => {
     const pending = await createPending("idem-project-context-collision-status");
     await runStore.startRun({
       runId: "run-2",
@@ -234,14 +234,19 @@ describe("approval status API", () => {
     const address = await server.start();
 
     try {
-      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-1`);
-      const body = (await response.json()) as { error: { code: string; message: string } };
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:TEST-1`);
+      const body = (await response.json()) as {
+        pendingApproval: {
+          requestId: string;
+          projectContext: typeof docsProjectContext;
+        } | null;
+      };
 
       expect(pending.projectContext).toMatchObject(docsProjectContext);
-      expect(response.status).toBe(409);
-      expect(body.error).toMatchObject({
-        code: "conflict",
-        message: expect.stringContaining("Ambiguous issue identifier: TEST-1"),
+      expect(response.status).toBe(200);
+      expect(body.pendingApproval).toMatchObject({
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
       });
     } finally {
       await server.stop();
@@ -713,6 +718,7 @@ describe("approval status API", () => {
       lifecycleStore,
       writebackOutbox: outboxStore,
       operatorApproval: service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -849,6 +855,7 @@ describe("approval status API", () => {
       lifecycleStore,
       writebackOutbox: outboxStore,
       operatorApproval: service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -1128,6 +1135,7 @@ describe("approval status API", () => {
       lifecycleStore,
       writebackOutbox: outboxStore,
       operatorApproval: service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -1882,6 +1890,7 @@ describe("approval status API", () => {
       runStore,
       lifecycleStore,
       operatorApproval: options.operatorApproval ?? service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: options.openWorkspaceToken === undefined ? "secret" : options.openWorkspaceToken,

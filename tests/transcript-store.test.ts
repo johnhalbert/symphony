@@ -1298,6 +1298,68 @@ describe("FileRunTranscriptStore", () => {
     await expect(readFile(legacyWorkspacePath, "utf8")).resolves.toBe(legacyWorkspaceBeforeRead);
   });
 
+  it("drops unexpected project context metadata fields when reading persisted runs and workspaces", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const expectedProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await store.upsertWorkspace({
+      workspaceKey: "docs-workspace-redacted",
+      issueId: "issue-docs-redacted",
+      issueIdentifier: "DOCS-REDACTED-1",
+      projectContext: expectedProjectContext,
+      path: "/tmp/docs-redacted-workspace",
+      sourceKind: "git_worktree",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await startBasicRun(store, "run-docs-redacted", {
+      issueId: "issue-docs-redacted",
+      issueIdentifier: "DOCS-REDACTED-1",
+      workspaceKey: "docs-workspace-redacted",
+      workspacePath: "/tmp/docs-redacted-workspace",
+      projectContext: expectedProjectContext,
+    });
+
+    const injectedProjectContext = {
+      ...expectedProjectContext,
+      repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+      path: "packages/site",
+      token: "workspace-secret",
+      githubToken: "gh-secret",
+    };
+    const runPath = path.join(root, "runs", "run-docs-redacted", "meta.json");
+    const rawRun = JSON.parse(await readFile(runPath, "utf8")) as Record<string, unknown>;
+    rawRun.projectContext = injectedProjectContext;
+    await writeFile(runPath, `${JSON.stringify(rawRun, null, 2)}\n`, "utf8");
+
+    const workspacePath = path.join(root, "workspaces", "docs-workspace-redacted.json");
+    const rawWorkspace = JSON.parse(await readFile(workspacePath, "utf8")) as Record<string, unknown>;
+    rawWorkspace.projectContext = injectedProjectContext;
+    await writeFile(workspacePath, `${JSON.stringify(rawWorkspace, null, 2)}\n`, "utf8");
+
+    const runRecord = await store.getRun("run-docs-redacted");
+    const workspaceRecord = await store.getWorkspace("docs-workspace-redacted");
+    const listedRun = (await store.listRuns()).find((run) => run.runId === "run-docs-redacted") ?? null;
+    const listedWorkspace =
+      (await store.listWorkspaces()).find((workspace) => workspace.workspaceKey === "docs-workspace-redacted") ?? null;
+
+    expect(runRecord?.projectContext).toEqual(expectedProjectContext);
+    expect(workspaceRecord?.projectContext).toEqual(expectedProjectContext);
+    expect(listedRun?.projectContext).toEqual(expectedProjectContext);
+    expect(listedWorkspace?.projectContext).toEqual(expectedProjectContext);
+
+    const serialized = JSON.stringify({ runRecord, workspaceRecord, listedRun, listedWorkspace });
+    expect(serialized).not.toContain("repo-secret");
+    expect(serialized).not.toContain("x-access-token");
+    expect(serialized).not.toContain("workspace-secret");
+    expect(serialized).not.toContain("gh-secret");
+  });
+
   it("updates run project context attribution while preserving existing context on unrelated updates", async () => {
     const store = new FileRunTranscriptStore(root);
     const docsProjectContext = {

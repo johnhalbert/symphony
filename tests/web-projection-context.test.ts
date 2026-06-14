@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildWebProjectionSourceIndex,
@@ -12,6 +15,8 @@ import {
   type WebProjectionContext,
   type WebProjectionSourceIndex,
 } from "../src/app/WebProjectionContext.js";
+import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 
 type AssertFalse<T extends false> = T;
 type SourceIndexRequiresTranscriptEvents = WebProjectionSourceIndex extends { transcriptEvents: readonly unknown[] } ? true : false;
@@ -406,6 +411,90 @@ describe("WebProjectionContext contracts and cache key utilities", () => {
       },
     });
     expect(sourceIndex.runs.runById.has("run-1")).toBe(true);
+  });
+
+  it("indexes normalized project context metadata from durable run and lifecycle stores", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-web-projection-"));
+    try {
+      const runStore = new FileRunTranscriptStore(root);
+      const lifecycleStore = new FileIssueLifecycleStore(root);
+      const expectedProjectContext = {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      } as const;
+
+      await runStore.upsertWorkspace({
+        workspaceKey: "workspace-projection",
+        issueId: "issue-projection",
+        issueIdentifier: "DOCS-PROJECTION-1",
+        projectContext: expectedProjectContext,
+        path: "/tmp/projection-workspace",
+        sourceKind: "git_worktree",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      await runStore.startRun({
+        runId: "run-projection",
+        sessionId: "session-projection",
+        agentId: "agent-projection",
+        role: "worker",
+        issueId: "issue-projection",
+        issueIdentifier: "DOCS-PROJECTION-1",
+        attempt: null,
+        turnNumber: 1,
+        prompt: "work",
+        workspaceKey: "workspace-projection",
+        workspacePath: "/tmp/projection-workspace",
+        projectContext: expectedProjectContext,
+      });
+      await lifecycleStore.ensureIssue(
+        { id: "issue-projection", identifier: "DOCS-PROJECTION-1" },
+        { phase: "implementation", projectContext: expectedProjectContext },
+      );
+
+      const injectedProjectContext = {
+        ...expectedProjectContext,
+        repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+        path: "packages/site",
+        token: "projection-secret",
+      };
+      const runPath = path.join(root, "runs", "run-projection", "meta.json");
+      const rawRun = JSON.parse(await readFile(runPath, "utf8")) as Record<string, unknown>;
+      rawRun.projectContext = injectedProjectContext;
+      await writeFile(runPath, `${JSON.stringify(rawRun, null, 2)}\n`, "utf8");
+
+      const workspacePath = path.join(root, "workspaces", "workspace-projection.json");
+      const rawWorkspace = JSON.parse(await readFile(workspacePath, "utf8")) as Record<string, unknown>;
+      rawWorkspace.projectContext = injectedProjectContext;
+      await writeFile(workspacePath, `${JSON.stringify(rawWorkspace, null, 2)}\n`, "utf8");
+
+      const lifecyclePath = path.join(root, "issue-lifecycle", "issue-projection.json");
+      const rawLifecycle = JSON.parse(await readFile(lifecyclePath, "utf8")) as Record<string, unknown>;
+      rawLifecycle.projectContext = injectedProjectContext;
+      await writeFile(lifecyclePath, `${JSON.stringify(rawLifecycle, null, 2)}\n`, "utf8");
+
+      const sourceIndex = await buildWebProjectionSourceIndex({
+        runStore,
+        lifecycleStore,
+        clock: () => new Date("2026-01-01T00:00:01.000Z"),
+      });
+
+      const run = sourceIndex.runs.runById.get("run-projection");
+      const workspace = sourceIndex.workspaces.workspaces.find((item) => item.workspaceKey === "workspace-projection") ?? null;
+      const lifecycle = sourceIndex.lifecycles.records.find((item) => item.issueId === "issue-projection") ?? null;
+      expect(run?.projectContext).toEqual(expectedProjectContext);
+      expect(workspace?.projectContext).toEqual(expectedProjectContext);
+      expect(lifecycle?.projectContext).toEqual(expectedProjectContext);
+
+      const serialized = JSON.stringify({ run, workspace, lifecycle });
+      expect(serialized).not.toContain("repo-secret");
+      expect(serialized).not.toContain("x-access-token");
+      expect(serialized).not.toContain("projection-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

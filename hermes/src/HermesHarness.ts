@@ -340,7 +340,10 @@ export class HermesHarness implements AgentHarness {
     const hermesSessionKey = reusable ? this.reusableSessionKeys.get(key) ?? persistedHermesSessionKey : null;
     if (reusable && hermesSessionKey) this.reusableSessionKeys.set(key, hermesSessionKey);
 
-    const credential = requiredAuthProviders.length > 0 ? null : resolveRuntimeCredential(ctx.config, ctx.role, this.id);
+    const credential =
+      requiredAuthProviders.length > 0
+        ? null
+        : resolveRuntimeCredential(ctx.config, ctx.role, this.id, { projectContext: ctx.projectContext });
     const extraEnv: Record<string, string> = {};
     if (credential?.value) extraEnv[ctx.config.hermes.runtimeCredentialEnv] = credential.value;
     const client = this.gatewayFactory({

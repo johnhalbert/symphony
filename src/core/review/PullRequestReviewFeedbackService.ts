@@ -7,6 +7,10 @@ import type {
   PullRequestReviewFeedbackResult,
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
+import {
+  normalizeProjectContextResolution,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { SymphonyError } from "../errors.js";
 import type {
   CompletionReportPullRequestRef,
@@ -87,6 +91,7 @@ export interface PullRequestReviewFeedbackClient {
 
 export interface ReviewFeedbackActiveContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string;
   role: "reviewer" | string;
   token?: string | null;
@@ -193,6 +198,13 @@ export class PullRequestReviewFeedbackService {
     }
     if (lifecycle.summaryPointers.lastRunId !== context.activeRunId) {
       throw new SymphonyError("invalid_request", "Review feedback run does not match the active reviewer run");
+    }
+    if (
+      context.projectContext &&
+      lifecycle.projectContext &&
+      !projectContextEquals(context.projectContext, lifecycle.projectContext)
+    ) {
+      throw new SymphonyError("invalid_request", "Review feedback issue project context does not match the lifecycle record");
     }
     const lifecyclePhase = context.phase ?? lifecycle.phase ?? phaseForIssueState(context.issue.state, this.options.config);
     if (lifecyclePhase !== "review") {
@@ -380,6 +392,20 @@ function stableJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function projectContextEquals(
+  left: ProjectContextResolution | undefined,
+  right: ProjectContextResolution | undefined,
+): boolean {
+  const normalizedLeft = normalizeProjectContextResolution(left);
+  const normalizedRight = normalizeProjectContextResolution(right);
+  return (
+    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
+    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
+    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
+    normalizedLeft.routingSource === normalizedRight.routingSource
+  );
 }
 
 function resultFromRecord(record: IssueReviewFeedbackRecord, replayed: boolean): PullRequestReviewFeedbackSubmitResult {
