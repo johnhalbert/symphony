@@ -394,6 +394,28 @@ describe("IssueContractLint", () => {
     }
   });
 
+  it("keeps the ENG-392 child contract family examples lintable and mapped to stable requirement ids", () => {
+    const examples = eng392ContractExamples();
+    const expectedRequirementIds = new Map<string, string[]>([
+      ["Family A — `REQ-392-DECISION`", ["REQ-392-DECISION"]],
+      ["Family B — `REQ-392-RUNTIME-ROUTING`", ["REQ-392-RUNTIME-ROUTING"]],
+      ["Family C — `REQ-392-RELOAD-PRESERVATION`", ["REQ-392-RELOAD-PRESERVATION"]],
+      ["Family D — `REQ-392-APPROVAL-WRITEBACK`", ["REQ-392-APPROVAL-WRITEBACK"]],
+      ["Family E — `REQ-392-TEST-PROOF`", ["REQ-392-TEST-PROOF"]],
+      ["Family F — `REQ-392-PUBLICATION-HYGIENE`", ["REQ-392-PUBLICATION-HYGIENE"]],
+    ]);
+
+    expect(examples.map((example) => example.title)).toEqual([...expectedRequirementIds.keys()]);
+    for (const example of examples) {
+      const analysis = analyzeIssueContractDescription(example.description, []);
+      expect(analysis.missingSections, example.title).toEqual([]);
+      expect(analysis.issueContractErrors, example.title).toEqual([]);
+      expect(extractIssueContractRequirementIds(example.description), example.title).toEqual(
+        expectedRequirementIds.get(example.title),
+      );
+    }
+  });
+
   it("documents the ENG-372 routing validation matrix and redacted evidence quickstart", () => {
     const quickstart = eng372Quickstart();
 
@@ -415,14 +437,26 @@ describe("IssueContractLint", () => {
     expect(quickstart).not.toContain("LINEAR_API_KEY=");
     expect(quickstart).not.toContain("credential_profiles.roles.worker.linear.tracker");
   });
+
+  it("documents the mirrored ENG-392 contract source, blocked-state findings, and issue-contract lint entry point", () => {
+    const quickstart = eng392Quickstart();
+
+    expect(quickstart).toContain("REQ-T037");
+    expect(quickstart).toContain("PR #286 issue comment");
+    expect(quickstart).toContain("tests/orchestrator.test.ts");
+    expect(quickstart).toContain("reviewDecision: CHANGES_REQUESTED");
+    expect(quickstart).toContain("mergeStateStatus: DIRTY");
+    expect(quickstart).toContain("npm test -- tests/issue-contract-lint.test.ts");
+    expect(quickstart).toContain("required headings, fenced JSON `Issue Contract` blocks, and stable requirement IDs");
+  });
 });
 
-interface Eng371ContractExample {
+interface IssueContractExample {
   title: string;
   description: string;
 }
 
-function eng371ContractExamples(): Eng371ContractExample[] {
+function eng371ContractExamples(): IssueContractExample[] {
   const content = readFileSync(
     new URL("../specs/005-eng-371-public-metadata-closure/contracts/public-metadata-redaction.md", import.meta.url),
     "utf8",
@@ -444,7 +478,7 @@ function eng371Quickstart(): string {
   return readFileSync(new URL("../specs/005-eng-371-public-metadata-closure/quickstart.md", import.meta.url), "utf8");
 }
 
-function eng372ContractExamples(): Eng371ContractExample[] {
+function eng372ContractExamples(): IssueContractExample[] {
   const content = readFileSync(
     new URL("../specs/006-eng-372-context-credential-routing/contracts/live-tracker-routing.md", import.meta.url),
     "utf8",
@@ -455,6 +489,19 @@ function eng372ContractExamples(): Eng371ContractExample[] {
 
 function eng372Quickstart(): string {
   return readFileSync(new URL("../specs/006-eng-372-context-credential-routing/quickstart.md", import.meta.url), "utf8");
+}
+
+function eng392ContractExamples(): IssueContractExample[] {
+  const content = readFileSync(
+    new URL("../specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md", import.meta.url),
+    "utf8",
+  );
+  const matches = Array.from(content.matchAll(/^## (Family .+?)\r?\n[\s\S]*?````markdown\r?\n([\s\S]*?)\r?\n````/gm));
+  return matches.map((match) => ({ title: match[1] ?? "", description: (match[2] ?? "").trim() }));
+}
+
+function eng392Quickstart(): string {
+  return readFileSync(new URL("../specs/009-eng-392-routing-reload-split/quickstart.md", import.meta.url), "utf8");
 }
 
 function extractDocumentedPythonRawRegex(document: string, detectorName: string): RegExp {
