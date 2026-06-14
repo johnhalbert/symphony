@@ -47,6 +47,8 @@ The table below supplies the minimum prerequisite map referenced by `data-model.
 
 - Suggested child title: `ENG-392 child — decision and scope lock`
 - Dependency order: **1 of 6**
+- Draft label guidance for Linear creation: keep the parent `dogfood` label, do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload, and let the operator add readiness labels only after review.
+- Draft dependency guidance for Linear creation: no earlier sibling blocks this first child, and every later ENG-392 child should depend on this exact suggested title when it needs the scope lock.
 - Authorized surfaces to list in `Touched Surfaces`:
   - `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`
   - `specs/009-eng-392-routing-reload-split/quickstart.md`
@@ -56,6 +58,12 @@ The table below supplies the minimum prerequisite map referenced by `data-model.
 ## Problem / Goal
 
 Record the ENG-392 decomposition decision before any child implementation work starts so later child issues either stay split into contract-scoped siblings or explicitly document any authorized scope expansion instead of reintroducing the original tests-only/runtime mismatch.
+
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label.
+- Do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload; operator review owns readiness-label changes even though the issue is eligible to recommend readiness below.
+- Sibling dependency guidance: this first child has no earlier sibling blocker, and later ENG-392 children should depend on `ENG-392 child — decision and scope lock` by exact title when they require the decomposition decision.
 
 ## Issue Contract
 
@@ -73,6 +81,7 @@ Record the ENG-392 decomposition decision before any child implementation work s
 ## Acceptance Criteria
 
 - The issue names the chosen decomposition path and the child titles or superseding replacement that depend on it.
+- The issue includes operator-facing label and dependency guidance that keeps the drafted payload free of auto-ready labels and keeps later sibling blockers title-stable.
 - The issue limits operator outcomes to split/retarget, widened child-contract authorization, or close/replace with durable proof.
 - The issue states the evidence required before renewed worker or reviewer dispatch can resume.
 - The issue keeps excluded runtime, test, publication, and debug-capture surfaces explicit until a later child contract names them directly or replacement evidence retires them.
@@ -99,6 +108,7 @@ Record the ENG-392 decomposition decision before any child implementation work s
 
 ## Validation Requirements
 
+- Review this child issue body and confirm the `Labels / Dependencies` section preserves the no-auto-ready-label rule, the exact dependency title, and the no-earlier-sibling baseline for the first child.
 - Review `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` and confirm the operator decision checklist lists all three allowed outcomes and the proof each one requires before redispatch.
 - Review `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` and confirm every later family depends on this title directly or transitively, or stays intentionally independent.
 - Review `specs/009-eng-392-routing-reload-split/quickstart.md` and confirm excluded surfaces remain explicitly excluded until a later child contract authorizes them.
