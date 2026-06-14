@@ -2501,6 +2501,151 @@ const docsProjectContext = {
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
+  it("preserves an in-progress run's original project context and persisted routing snapshot across config reload", async () => {
+    const config = testConfig(root);
+    addDocsPollingProjectContext(config);
+    const initialCandidate = {
+      ...issue({
+        id: "issue-docs-1",
+        identifier: "ENG-123",
+        title: "Docs work item",
+        state: "Todo",
+        branchName: "symphony/docs/ENG-123",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: docsProjectContext.linearProjectSlug,
+        id: "linear-project-docs-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const reroutedCandidate = {
+      ...issue({
+        id: "issue-rerouted-1",
+        identifier: "ENG-456",
+        title: "Rerouted docs work item",
+        state: "Todo",
+        branchName: "symphony/default/ENG-456",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: docsProjectContext.linearProjectSlug,
+        id: "linear-project-docs-2",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    let includeReroutedCandidate = false;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return includeReroutedCandidate ? [initialCandidate, reroutedCandidate] : [initialCandidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        return [initialCandidate, ...(includeReroutedCandidate ? [reroutedCandidate] : [])].filter((candidate) =>
+          issueIds.includes(candidate.id),
+        );
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const harness: AgentHarness & {
+      runs: Array<{ ctx: AgentRunContext; prompt: string }>;
+      stoppedRunIds: string[];
+    } = {
+      id: "project-context-reload-blocking",
+      capabilities: { continuation: true, mcpHandoff: true },
+      runs: [],
+      stoppedRunIds: [],
+      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+        this.runs.push({ ctx, prompt });
+        const runId = `run-${ctx.issue.id}-${ctx.turnNumber}`;
+        yield { type: "session_started", sessionId: `session-${ctx.issue.id}-${ctx.turnNumber}`, runId };
+        if (!ctx.abortSignal.aborted) {
+          await new Promise<void>((resolve) =>
+            ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        }
+        yield { type: "cancelled" };
+      },
+      async stop(runId: string): Promise<void> {
+        this.stoppedRunIds.push(runId);
+      },
+    };
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 1, "initial docs dispatch");
+      await waitFor(
+        () => typeof orchestrator.snapshot().running.find((run) => run.issueId === initialCandidate.id)?.runId === "string",
+        "initial docs run start",
+      );
+
+      const initialRunning = orchestrator.snapshot().running.find((run) => run.issueId === initialCandidate.id);
+      const initialRunId = initialRunning?.runId ?? "";
+      expect(initialRunning?.projectContext).toMatchObject(docsProjectContext);
+      expect(harness.runs[0]?.ctx.projectContext).toMatchObject(docsProjectContext);
+      await waitForRunRecord(runStore, initialRunId);
+      await expect(runStore.getRun(initialRunId)).resolves.toMatchObject({
+        projectContext: docsProjectContext,
+      });
+      await expect(lifecycleStore.get(initialCandidate.identifier)).resolves.toMatchObject({
+        projectContext: docsProjectContext,
+      });
+
+      const reloadedConfig = testConfig(root);
+      addDocsPollingProjectContext(reloadedConfig);
+      reloadedConfig.projectContexts.defaultContext.tracker.projectSlug = docsProjectContext.linearProjectSlug;
+      requireDocsPollingContext(reloadedConfig).tracker.projectSlug = "GUIDES";
+      includeReroutedCandidate = true;
+
+      orchestrator.updateConfig(reloadedConfig, "Reloaded work on {{ issue.identifier }}");
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => harness.runs.some((run) => run.ctx.issue.id === reroutedCandidate.id),
+        "rerouted dispatch after config reload",
+      );
+
+      const runningAfterReload = orchestrator.snapshot().running;
+      const preservedRun = runningAfterReload.find((run) => run.issueId === initialCandidate.id);
+      const reroutedRun = harness.runs.find((run) => run.ctx.issue.id === reroutedCandidate.id);
+
+      expect(preservedRun?.projectContext).toMatchObject(docsProjectContext);
+      expect(preservedRun?.projectContext?.routingSource).toBe("candidate_poll");
+      await expect(runStore.getRun(initialRunId)).resolves.toMatchObject({
+        projectContext: docsProjectContext,
+      });
+      await expect(lifecycleStore.get(initialCandidate.identifier)).resolves.toMatchObject({
+        projectContext: docsProjectContext,
+      });
+      expect(reroutedRun?.ctx.projectContext).toMatchObject({
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+        routingSource: "candidate_poll",
+      });
+      expect(harness.runs[0]?.prompt).toContain("Work on ENG-123");
+      expect(reroutedRun?.prompt).toContain("Reloaded work on ENG-456");
+    } finally {
+      await orchestrator.stop();
+    }
+  });
+
   it("dispatches legacy single-project workflows as the synthesized default context", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
