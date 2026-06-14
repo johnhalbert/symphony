@@ -6,7 +6,12 @@ import { CompletionReportService, type CompletionReportActiveContext, type Compl
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore, buildWorkerHandoffPacket, type IssueMergeGateState } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
-import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
+import {
+  FileWritebackOutboxStore,
+  type NewWritebackOperation,
+  type ProcessDueOptions,
+  type WritebackOperation,
+} from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
 import type { OperatorApprovalRecord } from "../src/core/approval/OperatorApprovalService.js";
 import type {
@@ -731,7 +736,7 @@ describe("CompletionReportService", () => {
     expect((await lifecycleStore.get("issue-1"))?.completionReports).toHaveLength(1);
   });
 
-  it("scopes publication approval setup drains to the report writeback keys", async () => {
+  it("scopes publication approval setup drains to the report writeback keys and project context", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
@@ -745,7 +750,23 @@ describe("CompletionReportService", () => {
     const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);
     await startRun(runStore);
+    const reportCommentKey = "comment:issue-1:run-1:completion-report:idem-1:publication-approval-pending";
+    const reportTransitionKey = "transition:issue-1:run-1:completion-report:idem-1:publication-approval-pending:Blocked";
     const siblingKey = "issue-create:issue-1:plan-1:0:hash";
+    await outbox.enqueueOnce({
+      idempotencyKey: reportCommentKey,
+      kind: "comment",
+      issueId: "issue-1",
+      runId: "run-1",
+      payload: { body: "Legacy default pending approval comment", dedupeKey: "run-1:completion-report:idem-1:publication-approval-pending" },
+    });
+    await outbox.enqueueOnce({
+      idempotencyKey: reportTransitionKey,
+      kind: "transition",
+      issueId: "issue-1",
+      runId: "run-1",
+      payload: { fromStates: ["In Progress"], toState: "Blocked", reason: "awaiting operator approval for PR publication" },
+    });
     await outbox.enqueueOnce({
       idempotencyKey: siblingKey,
       kind: "issue_create",
@@ -793,15 +814,37 @@ describe("CompletionReportService", () => {
       },
     });
 
-    await service.submitCompletionReport(report(), contextWithWorkspace());
+    await service.submitCompletionReport(report(), contextWithWorkspace({ projectContext: docsProjectContext }));
 
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
       summaryPointers: { issueTitle: contextWithWorkspace().issue.title },
     });
     expect(processedKeyBatches).toHaveLength(1);
-    expect(processedProjectContextIds).toHaveLength(1);
-    expect(processedProjectContextIds[0]).toBeTruthy();
+    expect(processedProjectContextIds).toEqual([docsProjectContext.projectContextId]);
+    expect(processedKeyBatches[0]).toEqual(expect.arrayContaining([reportCommentKey, reportTransitionKey]));
     expect(processedKeyBatches[0]).not.toContain(siblingKey);
+
+    const operations = await outbox.list();
+    expect(
+      operations.filter(
+        (operation) =>
+          [reportCommentKey, reportTransitionKey].includes(operation.idempotencyKey) &&
+          operation.projectContext?.projectContextId === docsProjectContext.projectContextId,
+      ),
+    ).toEqual([
+      expect.objectContaining({ idempotencyKey: reportCommentKey, status: "succeeded", projectContext: docsProjectContext }),
+      expect.objectContaining({ idempotencyKey: reportTransitionKey, status: "succeeded", projectContext: docsProjectContext }),
+    ]);
+    expect(
+      operations.filter(
+        (operation) =>
+          [reportCommentKey, reportTransitionKey].includes(operation.idempotencyKey) &&
+          operation.projectContext?.projectContextId === "default",
+      ),
+    ).toEqual([
+      expect.objectContaining({ idempotencyKey: reportCommentKey, status: "pending" }),
+      expect.objectContaining({ idempotencyKey: reportTransitionKey, status: "pending" }),
+    ]);
 
     await expect(outbox.get(siblingKey)).resolves.toMatchObject({ status: "pending" });
   });

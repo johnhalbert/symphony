@@ -72,6 +72,7 @@ import {
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
   ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
   WritebackProcessor,
+  writebackIdentityKey,
 } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
@@ -7770,7 +7771,7 @@ async function expectStartupReplayActivitySkipReasons(
   const activity = await fetchActivityForIssue(fixture);
   const expectedKinds = ["issue_create", "issue_relation", "comment"];
   for (const [index, key] of fixture.replayOperationKeys.entries()) {
-    const item = activity.find((candidate) => candidate.id === `writeback:${key}`);
+    const item = activity.find((candidate) => candidate.id === `writeback:${writebackIdentityKey(key)}`);
     expect(item).toMatchObject({
       kind: "writeback_operation",
       writeback: {

@@ -612,8 +612,10 @@ export type WorkflowProjectContext = NormalizedProjectContext<
   ReviewLoopConfig,
   IssueBreakdownConfig,
   AgentConfig,
-  RawWorkflowConfig["credential_profiles"]
->;
+  RawCredentialProfilesConfig
+> & {
+  credentialProfileRegistry: CredentialProfileRegistry;
+};
 
 export type WorkflowProjectContextRegistry = ProjectContextRegistry<WorkflowProjectContext>;
 
@@ -1047,6 +1049,19 @@ function normalizeWorkflowProjectContext(
     );
     const agent = normalizeAgentConfigForProjectContext(merged.agent);
 
+    const credentialProfileRegistry = createCredentialProfileRegistry({
+      raw: merged.credential_profiles,
+      env,
+      workflowDir,
+      fallbacks: {
+        githubToken: github.token,
+        linearApiKey: tracker.apiKey,
+        cursorRuntimeApiKey: null,
+        openWorkspaceToken: null,
+      },
+      errorTransformer: (error) => prefixProjectContextValidationPath(error, contextPath),
+    });
+
     if (enabled) {
       validateStateBuckets({
         activeStates: tracker.activeStates,
@@ -1109,7 +1124,8 @@ function normalizeWorkflowProjectContext(
       reviewLoop,
       issueBreakdown,
       agent,
-      credentialProfiles: merged.credential_profiles,
+      ...(merged.credential_profiles === undefined ? {} : { credentialProfiles: merged.credential_profiles }),
+      credentialProfileRegistry,
       publicMetadata: publicSummary.publicMetadata,
       publicSummary,
     };
@@ -1726,6 +1742,14 @@ function configValidationError(message: string, projectContextFieldPaths?: reado
     message,
     normalizedFieldPaths.length === 0 ? undefined : { projectContextFieldPaths: normalizedFieldPaths },
   );
+}
+
+function prefixProjectContextValidationPath(error: unknown, contextPath: string): SymphonyError {
+  const symphonyError =
+    error instanceof SymphonyError
+      ? error
+      : new SymphonyError("config_validation_error", error instanceof Error ? error.message : String(error));
+  return new SymphonyError(symphonyError.code, `${contextPath}.${symphonyError.message}`, symphonyError.details);
 }
 
 function attachProjectContextValidationSignal(error: unknown, contextPath: string): SymphonyError {

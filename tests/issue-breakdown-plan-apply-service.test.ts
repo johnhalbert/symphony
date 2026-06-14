@@ -19,7 +19,7 @@ import type {
   TrackerWriteResult,
   TrackerWriter,
 } from "../src/core/tracker/TrackerWriter.js";
-import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
+import { FileWritebackOutboxStore, WritebackProcessor, writebackIdentityKey } from "../src/core/writeback/WritebackOutbox.js";
 import type { WritebackOperation, WritebackProcessor as WritebackProcessorType } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { ISSUE_BREAKDOWN_PLAN_STALE_REASON } from "../src/core/writeback/WritebackOutbox.js";
@@ -274,7 +274,9 @@ describe("IssueBreakdownPlanApplyService", () => {
     expect(dryRunPlan?.applicationStatus).toBe("blocked");
     expect(dryRunPlan?.applicationBlockedReason).toBe("Writeback dry_run");
     expect(dryRunPlan?.applicationOperationKeys).toHaveLength(1);
-    expect(dryRunPlan?.applicationOperationKeys[0]).toBe(childRecord?.idempotencyKey);
+    expect(dryRunPlan?.applicationOperationKeys[0]).toBe(
+      childRecord ? writebackIdentityKey(childRecord.idempotencyKey, childRecord.projectContext) : undefined,
+    );
     expect(dryRunPlan?.createdIssueRefs).toEqual([]);
     expect(childRecord?.status).toBe("skipped");
     expect(childRecord?.lastError).toBe("Writeback dry_run");

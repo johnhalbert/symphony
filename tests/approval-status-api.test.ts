@@ -29,7 +29,7 @@ import { FileRunTranscriptStore, type RunRecord } from "../src/core/persistence/
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import type { Issue } from "../src/core/types.js";
-import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
+import { FileWritebackOutboxStore, WritebackProcessor, writebackIdentityKey } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { issue, testConfig } from "./helpers.js";
@@ -1300,8 +1300,8 @@ describe("approval status API", () => {
               branch: "symphony/TEST-1",
             },
             writebackOperationKeys: [
-              "comment:issue-1:run-1:completion-report:idem-1",
-              "transition:issue-1:run-1:completion-report:idem-1:In Review",
+              writebackIdentityKey("comment:issue-1:run-1:completion-report:idem-1"),
+              writebackIdentityKey("transition:issue-1:run-1:completion-report:idem-1:In Review"),
             ],
           }),
         ],
