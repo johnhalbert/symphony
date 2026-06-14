@@ -1113,7 +1113,13 @@ export class Orchestrator {
     issue: Issue,
     requestedProjectContext?: ProjectContextResolution,
   ): ProjectContextResolution | undefined {
-    return requestedProjectContext ?? projectContextResolutionFromIssue(issue) ?? undefined;
+    if (requestedProjectContext) return requestedProjectContext;
+    const issueProjectContext = projectContextResolutionFromIssue(issue);
+    if (this.issueHasExplicitProjectContextProof(issue)) {
+      return issueProjectContext ?? undefined;
+    }
+    const routing = resolveProjectContextForIssue(issue, this.config.projectContexts);
+    return routing.kind === "resolved" ? routing.projectContext : undefined;
   }
 
   private serviceConfigForIssue(issue: Issue, requestedProjectContext?: ProjectContextResolution): ServiceConfig {
@@ -1132,8 +1138,18 @@ export class Orchestrator {
       : normalizedProjectContextId;
   }
 
+  private issueHasExplicitProjectContextProof(issue: Issue): boolean {
+    const candidate = issue as {
+      projectContext?: { projectContextId?: unknown } | null;
+      projectContextId?: unknown;
+    };
+    return (
+      typeof candidate.projectContext?.projectContextId === "string" || typeof candidate.projectContextId === "string"
+    );
+  }
+
   private issueHasProjectContextProof(issue: Issue): boolean {
-    return projectContextResolutionFromIssue(issue) !== null;
+    return this.issueHasExplicitProjectContextProof(issue);
   }
 
   private issueMatchesRequestedProjectContext(
@@ -1966,6 +1982,7 @@ export class Orchestrator {
         entry.runPhase === "issue_breakdown"
           ? this.resolvedProjectContext(entry) ?? null
           : await this.resolveWorkerProjectContext(entry);
+      entry.projectContext = resolvedProjectContext;
       if (
         entry.runPhase !== "issue_breakdown" &&
         entry.lifecycle !== null &&
@@ -1979,6 +1996,7 @@ export class Orchestrator {
           : await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
+
       await this.updateLifecycle(
         entry,
         entry.runPhase === "issue_breakdown"

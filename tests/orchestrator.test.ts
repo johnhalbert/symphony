@@ -2941,6 +2941,7 @@ const docsProjectContext = {
       await orchestrator.refreshNow();
       await waitFor(() => typeof orchestrator.snapshot().running[0]?.runId === "string", "worker run start");
       const runId = orchestrator.snapshot().running[0]?.runId ?? "";
+      await waitForRunRecord(runStore, runId);
       await lifecycleStore.ensureIssue(candidate, {
         ...pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
         phase: "implementation",
