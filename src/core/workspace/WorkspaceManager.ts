@@ -226,10 +226,13 @@ export class WorkspaceManager {
 
   async removeForPlanning(issueInput: WorkspaceIssueInput): Promise<void> {
     const issue = normalizeIssueInput(issueInput);
-    const workspaceKey = workspaceKeyForPlanningIssue(issue);
-    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+    const persistedWorkspace = await this.findPlanningWorkspaceForRemoval(issue);
+    const resolvedIssue =
+      !issue.projectContext && persistedWorkspace?.projectContext ? { ...issue, projectContext: persistedWorkspace.projectContext } : issue;
+    const workspaceKey = persistedWorkspace?.workspaceKey ?? workspaceKeyForPlanningIssue(resolvedIssue);
+    const workspacePath = persistedWorkspace?.path ?? path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
-    const metadata = await this.store.getWorkspace(workspaceKey);
+    const metadata = persistedWorkspace ?? (await this.store.getWorkspace(workspaceKey));
     await this.removePlanningWorkspace(workspaceKey, workspacePath, metadata);
   }
 
@@ -299,6 +302,19 @@ export class WorkspaceManager {
       return this.store.findWorkspace(issue.identifier, { projectContext: issue.projectContext });
     }
     return null;
+  }
+
+  private async findPlanningWorkspaceForRemoval(issue: WorkspaceIssue): Promise<WorkspaceRecord | null> {
+    if (!issue.id && !issue.projectContext) return null;
+    const records = await this.store.listWorkspaces();
+    return (
+      records.find(
+        (record) =>
+          isPlanningWorkspaceKey(record.workspaceKey) &&
+          (issue.id ? record.issueId === issue.id : record.issueIdentifier === issue.identifier) &&
+          matchesWorkspaceProjectContext(record.projectContext, issue.projectContext),
+      ) ?? null
+    );
   }
 
   private async removePlanningWorkspace(
@@ -469,6 +485,19 @@ function workspaceKeyForIssue(issue: WorkspaceIssue): string {
 
 function workspaceKeyForPlanningIssue(issue: WorkspaceIssue): string {
   return `${workspaceKeyForIssue(issue)}-planning`;
+}
+
+function isPlanningWorkspaceKey(workspaceKey: string): boolean {
+  return workspaceKey.endsWith("-planning");
+}
+
+function matchesWorkspaceProjectContext(
+  recordProjectContext: ProjectContextResolution | undefined,
+  issueProjectContext: ProjectContextResolution | null,
+): boolean {
+  if (!issueProjectContext) return true;
+  const recordProjectContextId = recordProjectContext?.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+  return recordProjectContextId === issueProjectContext.projectContextId;
 }
 
 function scopedWorkspaceKey(baseWorkspaceKey: string, projectContext: ProjectContextResolution | null): string {

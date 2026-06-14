@@ -242,6 +242,46 @@ describe("git worktree workspace source", () => {
     });
   });
 
+  it("backfills persisted project context when removing duplicate-identifier planning workspaces without incoming context", async () => {
+    const manager = newManager(root, repo, "force");
+    const docsIssue = trackerIssue({
+      id: "issue-docs-plan-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-plan-1",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: null,
+    });
+
+    const docsWorkspace = await manager.createForPlanning(docsIssue);
+    const symphonyWorkspace = await manager.createForPlanning(symphonyIssue);
+
+    await manager.removeForPlanning(
+      issue({
+        id: docsIssue.id,
+        identifier: docsIssue.identifier,
+        branchName: docsIssue.branchName,
+      }),
+    );
+
+    await expect(readFile(path.join(docsWorkspace.path, ".symphony-planning.json"), "utf8")).rejects.toThrow();
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    await expect(readFile(path.join(symphonyWorkspace.path, ".symphony-planning.json"), "utf8")).resolves.toContain(
+      '"mode": "none"',
+    );
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: { projectContextId: "symphony" },
+    });
+  });
+
   it("refuses to remove dirty worktrees by default", async () => {
     const manager = newManager(root, repo);
     const dirtyIssue = issue({ identifier: "TEST-3", branchName: "symphony/TEST-3" });
