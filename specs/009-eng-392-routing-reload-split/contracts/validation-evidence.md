@@ -127,8 +127,10 @@ Required contents:
 - any protected-surface or no-touch checks relevant to the issue
 - every live integration boundary that was intentionally not exercised
 - a `findings` summary, even when it is an explicit zero-findings statement
+- `status: recorded` only when no live boundary was intentionally skipped
+- `status: intentionally_unverified` whenever the hygiene entry names one or more skipped live boundaries
 
-Recommended shape:
+Recommended shapes:
 
 ```yaml
 status: recorded
@@ -137,12 +139,27 @@ surfacesChecked:
 redactions:
   - none
 localPathHandling: repo-relative paths only
+intentionallyUnverified: []
+findings: []
+```
+
+Use the recorded variant only when the hygiene entry has no skipped live boundary to report.
+
+```yaml
+status: intentionally_unverified
+surfacesChecked:
+  - <repo-relative path or safe surface label>
+redactions:
+  - none
+localPathHandling: repo-relative paths only
 intentionallyUnverified:
-  - boundary: <Linear writeback | GitHub publication | live tracker lookup | none>
+  - boundary: <Linear writeback | GitHub publication | live tracker lookup>
     reason: <out of scope | manual-only | credentials intentionally unavailable>
     nearestLocalProof: <repo-relative path, test name, or safe artifact>
 findings: []
 ```
+
+Use the intentionally-unverified variant whenever any live boundary was skipped.
 
 ## Redaction and safe-citation rules
 
@@ -212,13 +229,21 @@ Use the following shape when recording future evidence:
 | `<authorized surface>` | `<changed or inspected surface>` | `<proof artifact>` | `recorded` | `<scope note>` |
 | `<adjacent excluded surface>` | `<none>` | `<n/a or safe note>` | `intentionally_unverified` | `<why it stayed out of scope>` |
 
-### hygiene
+### hygiene (no skipped live boundary)
 - status: recorded
 - surfacesChecked: [`<safe surface label>`]
 - redactions: [`none`]
 - localPathHandling: `repo-relative paths only`
+- intentionallyUnverified: []
+- findings: []
+
+### hygiene (with intentionally unverified live boundary)
+- status: intentionally_unverified
+- surfacesChecked: [`<safe surface label>`]
+- redactions: [`none`]
+- localPathHandling: `repo-relative paths only`
 - intentionallyUnverified:
-  - boundary: `<live integration boundary | none>`
+  - boundary: `<live integration boundary>`
     reason: `<out of scope | manual-only | credentials intentionally unavailable>`
     nearestLocalProof: `<repo-relative path | focused test | safe review artifact>`
 - findings: []
