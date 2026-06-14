@@ -101,6 +101,7 @@ export interface ReviewVerdictActiveContext {
   expectedToken?: string | null;
   reviewer?: string | null;
   phase?: IssueLifecyclePhase | null;
+  ignoreStateGate?: boolean;
 }
 
 export interface ReviewVerdictServiceOptions {
@@ -197,7 +198,9 @@ export class ReviewVerdictService {
         ? planReviewFailWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails)
         : planReviewPassWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails);
     if (operations.length === 0) {
-      throw new SymphonyError("invalid_request", "Review verdict cannot be accepted for the current issue state");
+      if (context.ignoreStateGate !== true) {
+        throw new SymphonyError("invalid_request", "Review verdict cannot be accepted for the current issue state");
+      }
     }
 
     const storedVerdict: IssueReviewVerdictRecord = {
@@ -243,7 +246,7 @@ export class ReviewVerdictService {
     if (lifecyclePhase !== "review") {
       throw new SymphonyError("invalid_request", `Review verdict cannot be accepted while lifecycle phase is ${lifecyclePhase}`);
     }
-    if (!sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
+    if (context.ignoreStateGate !== true && !sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
       throw new SymphonyError("invalid_request", "Review verdict requires the issue to be in a review state");
     }
   }

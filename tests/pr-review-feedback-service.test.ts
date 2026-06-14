@@ -168,6 +168,27 @@ describe("PullRequestReviewFeedbackService", () => {
     });
   });
 
+  it("accepts reviewer feedback with the issue state gate explicitly ignored", async () => {
+    const { service, lifecycleStore, client } = fixture();
+    await seedLifecycle(lifecycleStore);
+
+    const result = await service.submitPullRequestReviewFeedback(
+      issueComment(),
+      context({
+        issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+        phase: "review",
+        ignoreStateGate: true,
+      }),
+    );
+
+    expect(result.accepted).toBe(true);
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0]).toMatchObject({
+      kind: "issue_comment",
+      input: { pullRequestNumber: 42, body: "High-level note." },
+    });
+  });
+
   it("fails closed when inline feedback lacks a lifecycle-bound head SHA", async () => {
     const { service, lifecycleStore, client } = fixture();
     await seedLifecycle(lifecycleStore, { headSha: null });

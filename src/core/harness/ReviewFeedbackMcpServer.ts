@@ -22,6 +22,7 @@ export interface ReviewFeedbackMcpContextFile {
   expectedToken?: string | null;
   reviewer?: string | null;
   phase: "review";
+  ignoreStateGate?: boolean;
 }
 
 export async function writeReviewFeedbackMcpContext(
@@ -58,6 +59,7 @@ export async function submitReviewFeedbackFromMcp(input: unknown, options: {
       expectedToken: loadedContext.expectedToken ?? null,
       reviewer: loadedContext.reviewer ?? null,
       phase: loadedContext.phase,
+      ignoreStateGate: loadedContext.ignoreStateGate === true,
     };
     const result = await service.submit_pull_request_review_feedback(input, context);
     return {

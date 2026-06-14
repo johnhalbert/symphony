@@ -50,6 +50,7 @@ export interface MergeConflictResolutionActiveContext {
   workspacePath?: string | null;
   workspace?: Workspace | null;
   phase?: "merge_conflict_resolution" | null;
+  ignoreStateGate?: boolean;
 }
 
 export interface MergeConflictResolutionServiceOptions {
@@ -182,7 +183,7 @@ export class MergeConflictResolutionService {
     if (
       this.options.config.mergePolicy.mode !== "gated" ||
       conflictsState === null ||
-      !sameState(context.issue.state, conflictsState)
+      (context.ignoreStateGate !== true && !sameState(context.issue.state, conflictsState))
     ) {
       throw new SymphonyError("invalid_request", "Merge conflict resolution requires the configured conflict-fix state");
     }

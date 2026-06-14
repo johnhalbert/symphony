@@ -163,6 +163,28 @@ describe("MergeConflictResolutionService", () => {
     ).rejects.toMatchObject({ code: "invalid_request" });
   });
 
+  it("accepts conflict-resolution reports with the issue state gate explicitly ignored", async () => {
+    const { service, lifecycleStore } = await fixture();
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({ resolutionStatus: "resolved", headSha: "head-sha-2" }),
+      context({
+        issue: issue({ state: "In Progress" }),
+        ignoreStateGate: true,
+      }),
+    );
+
+    expect(result.replayed).toBe(false);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "passed",
+      mergeConflict: {
+        status: "resolved",
+        resolutionStatus: "resolved",
+        resolvedHeadSha: "head-sha-2",
+      },
+    });
+  });
+
   async function fixture(input: { fixTurnCount?: number } = {}) {
     const config = testConfig(root);
     config.writeback.enabled = true;

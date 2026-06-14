@@ -145,6 +145,31 @@ describe("ReviewVerdictService", () => {
     });
   });
 
+  it("accepts a manual fail verdict with the issue state gate explicitly ignored", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "Todo" }), {
+      phase: "review",
+      reviewRound: 0,
+    });
+
+    const result = await service.submitReviewVerdict(
+      failVerdict(),
+      context({
+        issue: issue({ state: "Todo", branchName: "symphony/TEST-1" }),
+        ignoreStateGate: true,
+      }),
+    );
+
+    expect(result.replayed).toBe(false);
+    expect(result.writebackOperations).toHaveLength(0);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "implementation",
+      reviewRound: 1,
+      lastReviewVerdictId: "review-verdict:issue-1:verdict-1",
+    });
+    expect(await outbox.list()).toHaveLength(0);
+  });
+
   it("rejects a pass verdict when the active reviewer run has not approved the lifecycle-bound PR", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {

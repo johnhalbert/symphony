@@ -82,6 +82,7 @@ export interface CompletionReportActiveContext {
   workspacePath?: string | null;
   workspace?: Workspace | null;
   phase?: IssueLifecyclePhase | null;
+  ignoreStateGate?: boolean;
 }
 
 export interface CompletionReportServiceOptions {
@@ -538,12 +539,14 @@ export class CompletionReportService {
         : []
       : planCompletionReportAcceptedWritebacks(writebackContext, this.options.config, writebackReport);
     if (operations.length === 0) {
-      throw new SymphonyError(
-        "invalid_request",
-        this.options.config.github.prHandoff.enabled
-          ? "Completion report handoff requires a verified pull request that satisfies the handoff policy"
-          : "Completion report cannot be accepted for the current issue state",
-      );
+      if (input.context.ignoreStateGate !== true || this.options.config.github.prHandoff.enabled) {
+        throw new SymphonyError(
+          "invalid_request",
+          this.options.config.github.prHandoff.enabled
+            ? "Completion report handoff requires a verified pull request that satisfies the handoff policy"
+            : "Completion report cannot be accepted for the current issue state",
+        );
+      }
     }
 
     const storedReport = buildCompletionReportRecord({
@@ -614,7 +617,7 @@ export class CompletionReportService {
       throw new SymphonyError("invalid_request", `Completion report cannot be accepted while lifecycle phase is ${lifecyclePhase}`);
     }
     const allowedStates = [this.options.config.writeback.dispatchState];
-    if (!sameStateIn(context.issue.state, allowedStates)) {
+    if (context.ignoreStateGate !== true && !sameStateIn(context.issue.state, allowedStates)) {
       throw new SymphonyError("invalid_request", "Completion report requires the issue to be in the active implementation state");
     }
   }

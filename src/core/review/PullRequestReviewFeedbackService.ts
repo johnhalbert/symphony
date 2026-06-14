@@ -93,6 +93,7 @@ export interface ReviewFeedbackActiveContext {
   expectedToken?: string | null;
   reviewer?: string | null;
   phase?: IssueLifecyclePhase | null;
+  ignoreStateGate?: boolean;
 }
 
 export interface PullRequestReviewFeedbackServiceOptions {
@@ -198,7 +199,7 @@ export class PullRequestReviewFeedbackService {
     if (lifecyclePhase !== "review") {
       throw new SymphonyError("invalid_request", `Review feedback cannot be accepted while lifecycle phase is ${lifecyclePhase}`);
     }
-    if (!sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
+    if (context.ignoreStateGate !== true && !sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
       throw new SymphonyError("invalid_request", "Review feedback requires the issue to be in a review state");
     }
   }

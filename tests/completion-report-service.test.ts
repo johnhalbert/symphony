@@ -630,6 +630,26 @@ describe("CompletionReportService", () => {
     expect(await outbox.list()).toHaveLength(0);
   });
 
+  it("accepts a manual completion report with the issue state gate explicitly ignored", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+
+    const result = await service.submitCompletionReport(
+      report(),
+      context({
+        issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+        ignoreStateGate: true,
+      }),
+    );
+
+    expect(result.replayed).toBe(false);
+    expect(result.writebackOperations).toHaveLength(0);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+    });
+    expect(await outbox.list()).toHaveLength(0);
+  });
+
   it("rejects missing required report fields", async () => {
     const { service } = fixture();
     const { summary: _summary, ...missingSummary } = report();

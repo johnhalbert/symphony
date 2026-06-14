@@ -29,6 +29,7 @@ export interface CompletionReportMcpContextFile {
   workspacePath: string | null;
   workspace: Workspace;
   phase: "implementation";
+  ignoreStateGate?: boolean;
 }
 
 export async function writeCompletionReportMcpContext(
@@ -91,6 +92,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       workspacePath: loadedContext.workspacePath,
       workspace: loadedContext.workspace,
       phase: loadedContext.phase,
+      ignoreStateGate: loadedContext.ignoreStateGate === true,
     };
     const result = await service.submit_completion_report(completionReportInputFromMcp(input, context), context);
     return {

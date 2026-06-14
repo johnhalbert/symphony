@@ -149,6 +149,7 @@ export interface RunMetadata {
   manualDispatch?: boolean;
   manualDispatchStage?: string | null;
   manualDispatchForceLabels?: boolean;
+  manualDispatchIgnoreState?: boolean;
 }
 
 export interface RunRecord {
@@ -240,6 +241,7 @@ export interface RunRecord {
   manualDispatch?: boolean;
   manualDispatchStage?: string | null;
   manualDispatchForceLabels?: boolean;
+  manualDispatchIgnoreState?: boolean;
 }
 
 export interface TranscriptEvent {
@@ -941,6 +943,7 @@ function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
     ...(metadata.manualDispatch === undefined ? {} : { manualDispatch: metadata.manualDispatch }),
     ...(metadata.manualDispatchStage === undefined ? {} : { manualDispatchStage: metadata.manualDispatchStage }),
     ...(metadata.manualDispatchForceLabels === undefined ? {} : { manualDispatchForceLabels: metadata.manualDispatchForceLabels }),
+    ...(metadata.manualDispatchIgnoreState === undefined ? {} : { manualDispatchIgnoreState: metadata.manualDispatchIgnoreState }),
   };
 }
 

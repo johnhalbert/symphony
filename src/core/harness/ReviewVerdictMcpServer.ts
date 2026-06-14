@@ -22,6 +22,7 @@ export interface ReviewVerdictMcpContextFile {
   expectedToken?: string | null;
   reviewer?: string | null;
   phase: "review";
+  ignoreStateGate?: boolean;
 }
 
 export async function writeReviewVerdictMcpContext(
@@ -59,6 +60,7 @@ export async function submitReviewVerdictFromMcp(input: unknown, options: {
       expectedToken: loadedContext.expectedToken ?? null,
       reviewer: loadedContext.reviewer ?? null,
       phase: loadedContext.phase,
+      ignoreStateGate: loadedContext.ignoreStateGate === true,
     };
     const result = await service.submit_review_verdict(reviewVerdictInputFromMcp(input, context), context);
     return {

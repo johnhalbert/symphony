@@ -2599,6 +2599,74 @@ describe("Orchestrator", () => {
     expect(harness.runs).toHaveLength(0);
   });
 
+  it("manual triage can ignore the current issue state gate when force is explicit", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Todo", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max reviewer failures reached (3/3)",
+    });
+    const harness = new IssueTriageAcceptingHarness(lifecycleStore, outboxStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    const forceOnly = await orchestrator.runManualAgent(candidate.id, { stage: "triage", forceLabels: true });
+    const forcedStateOverride = await orchestrator.runManualAgent(candidate.id, {
+      stage: "triage",
+      forceLabels: true,
+      ignoreState: true,
+    });
+    await orchestrator.stop();
+
+    expect(forceOnly).toMatchObject({ status: "not_dispatched", reason: "issue_not_in_blocked_state" });
+    expect(forcedStateOverride).toMatchObject({
+      status: "completed",
+      role: "triage",
+      runPhase: "issue_triage",
+      finalStatus: "succeeded",
+    });
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "triage",
+      runPhase: "issue_triage",
+      manualDispatch: true,
+      manualDispatchIgnoreState: true,
+    });
+    await expect(runStore.getRun("triage-run-1")).resolves.toMatchObject({
+      manualDispatch: true,
+      manualDispatchStage: "triage",
+      manualDispatchForceLabels: true,
+      manualDispatchIgnoreState: true,
+    });
+  });
+
   it("manual worker dispatch force bypasses worker exclude labels only", async () => {
     const config = testConfig(root);
     config.agent.workerExcludeLabels = ["review_only"];
@@ -2639,6 +2707,74 @@ describe("Orchestrator", () => {
     expect(forced).toMatchObject({ status: "completed", role: "worker", runPhase: "implementation" });
     expect(harness.runs).toHaveLength(1);
     expect(harness.runs[0]?.ctx).toMatchObject({ role: "worker", runPhase: "implementation", manualDispatch: true });
+  });
+
+  it("manual worker dispatch requires force to ignore the current issue state gate", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [candidate];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    const missingForce = await orchestrator.runManualAgent(candidate.id, { stage: "worker", ignoreState: true });
+    const forceOnly = await orchestrator.runManualAgent(candidate.id, { stage: "worker", forceLabels: true });
+    const forcedStateOverride = await orchestrator.runManualAgent(candidate.id, {
+      stage: "worker",
+      forceLabels: true,
+      ignoreState: true,
+    });
+    await orchestrator.stop();
+
+    expect(missingForce).toMatchObject({ status: "not_dispatched", reason: "ignore_state_requires_force" });
+    expect(forceOnly).toMatchObject({ status: "not_dispatched", reason: "issue_not_in_worker_active_state" });
+    expect(forcedStateOverride).toMatchObject({
+      status: "completed",
+      role: "worker",
+      runPhase: "implementation",
+      finalStatus: "succeeded",
+    });
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "worker",
+      runPhase: "implementation",
+      manualDispatch: true,
+      manualDispatchIgnoreState: true,
+    });
+    await expect(runStore.getRun("manual-run-1")).resolves.toMatchObject({
+      manualDispatch: true,
+      manualDispatchStage: "worker",
+      manualDispatchForceLabels: true,
+      manualDispatchIgnoreState: true,
+    });
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "review",
+      lastCompletionReportId: "completion-report:issue-1:manual-run-1",
+    });
   });
 
   it("manual worker dispatch does not auto-route planning-labeled issues to planner", async () => {
@@ -8186,6 +8322,7 @@ class ManualDispatchRecordingHarness implements AgentHarness {
           workspacePath: ctx.workspace.path,
           workspace: ctx.workspace,
           phase: "implementation",
+          ...(ctx.manualDispatchIgnoreState === true ? { ignoreStateGate: true } : {}),
         },
       );
     }

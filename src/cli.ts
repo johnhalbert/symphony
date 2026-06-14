@@ -231,9 +231,13 @@ agentCommand
   .argument("<issue>", "issue id or identifier")
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
   .requiredOption("--stage <stage>", "agent stage: worker, reviewer, review, triage, planner, breakdown, merge-conflict")
-  .option("--force", "bypass configured label exclude guardrails only")
+  .option("--force", "bypass configured label exclude guardrails; required with --ignore-state")
+  .option("--ignore-state", "with --force, bypass the selected stage's current issue state gate")
   .option("--json", "print JSON result")
-  .action(async (issue: string, workflow: string, options: { stage: string; force?: boolean; json?: boolean }) => {
+  .action(async (issue: string, workflow: string, options: { stage: string; force?: boolean; ignoreState?: boolean; json?: boolean }) => {
+    if (options.ignoreState === true && options.force !== true) {
+      throw new Error("--ignore-state requires --force");
+    }
     const logger = new StructuredLogger();
     const workflowPath = path.resolve(process.cwd(), workflow);
     const loader = new WorkflowLoader(workflowPath);
@@ -271,6 +275,7 @@ agentCommand
       const result = await orchestrator.runManualAgent(issue, {
         stage: parseManualAgentRunStage(options.stage),
         forceLabels: options.force === true,
+        ignoreState: options.ignoreState === true,
       });
       if (options.json) {
         console.log(JSON.stringify(result, null, 2));

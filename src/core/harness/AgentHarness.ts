@@ -62,6 +62,7 @@ export interface AgentRunContext {
     attempt: number;
   } | null;
   manualDispatch?: boolean;
+  manualDispatchIgnoreState?: boolean;
   hermesResume?: AgentHermesResumeContext | null;
   ephemeralSystemPrompt?: string | null;
   abortSignal: AbortSignal;

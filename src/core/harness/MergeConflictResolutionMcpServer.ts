@@ -23,6 +23,7 @@ export interface MergeConflictResolutionMcpContextFile {
   workspacePath: string | null;
   workspace: Workspace;
   phase: "merge_conflict_resolution";
+  ignoreStateGate?: boolean;
 }
 
 export async function writeMergeConflictResolutionMcpContext(
@@ -61,6 +62,7 @@ export async function submitMergeConflictResolutionFromMcp(input: unknown, optio
       workspacePath: loadedContext.workspacePath,
       workspace: loadedContext.workspace,
       phase: loadedContext.phase,
+      ignoreStateGate: loadedContext.ignoreStateGate === true,
     };
     const result = await service.submit_merge_conflict_resolution(
       mergeConflictResolutionInputFromMcp(input, context),

@@ -195,6 +195,7 @@ export type ManualAgentRunStage = "worker" | "reviewer" | "triage" | "planner" |
 export interface ManualAgentRunOptions {
   stage: ManualAgentRunStage;
   forceLabels?: boolean;
+  ignoreState?: boolean;
 }
 
 export type ManualAgentRunResult =
@@ -289,6 +290,7 @@ export interface RunningEntry {
   manualDispatch: {
     stage: ManualAgentRunStage;
     forceLabels: boolean;
+    ignoreState: boolean;
   } | null;
   handoffRepair: {
     sourceRunId: string;
@@ -322,6 +324,7 @@ type WorkerDispatchDecision =
 
 interface DispatchGateOptions {
   ignoreExcludeLabels?: boolean;
+  ignoreState?: boolean;
 }
 
 export interface RetryEntry {
@@ -1168,8 +1171,14 @@ export class Orchestrator {
     const target = manualAgentRunTarget(options.stage);
     const issue = await this.fetchSingleIssue(issueIdOrIdentifier);
     if (!issue) return manualAgentNotDispatched(null, target, "issue_not_found");
+    if (options.ignoreState === true && options.forceLabels !== true) {
+      return manualAgentNotDispatched(issue, target, "ignore_state_requires_force");
+    }
 
-    const gateOptions: DispatchGateOptions = { ignoreExcludeLabels: options.forceLabels === true };
+    const gateOptions: DispatchGateOptions = {
+      ignoreExcludeLabels: options.forceLabels === true,
+      ignoreState: options.ignoreState === true,
+    };
     let dispatchIssue = issue;
     let reviewEvidence: ReviewerDispatchEvidence | null = null;
 
@@ -1181,7 +1190,7 @@ export class Orchestrator {
       if (!reviewEvidence) return manualAgentNotDispatched(dispatchIssue, target, "review_evidence_unavailable");
     }
 
-    if (target.role === "worker" && target.runPhase === "implementation") {
+    if (target.role === "worker" && target.runPhase === "implementation" && options.ignoreState !== true) {
       const dispatchWriteback = planDispatchWriteback(dispatchIssue, this.config);
       if (!(await this.applyWriteback(dispatchWriteback, "manual dispatch"))) {
         return manualAgentNotDispatched(dispatchIssue, target, "dispatch_writeback_failed");
@@ -1201,7 +1210,7 @@ export class Orchestrator {
       target.role,
       reviewEvidence,
       target.runPhase,
-      { stage: options.stage, forceLabels: options.forceLabels === true },
+      { stage: options.stage, forceLabels: options.forceLabels === true, ignoreState: options.ignoreState === true },
     );
     await entry.worker;
     const runId = entry.activeRunId ?? entry.runId;
@@ -1248,6 +1257,7 @@ export class Orchestrator {
     target: { role: AgentRunRole; runPhase: AgentRunPhase },
     options: DispatchGateOptions,
   ): string | null {
+    const ignoreState = options.ignoreState === true;
     if (this.running.has(issue.id)) return "issue_already_running";
     if (this.pausedIssues.has(issue.id)) return "issue_paused";
     if (isStateIn(issue.state, this.config.tracker.terminalStates)) return "issue_in_terminal_state";
@@ -1257,12 +1267,12 @@ export class Orchestrator {
     if (target.role === "worker") {
       if (!issue.assignedToWorker) return "worker_not_assigned";
       if (target.runPhase === "merge_conflict_resolution") {
-        if (!this.isMergeConflictState(issue.state)) return "issue_not_in_merge_conflict_state";
+        if (!ignoreState && !this.isMergeConflictState(issue.state)) return "issue_not_in_merge_conflict_state";
       } else {
-        if (!isStateIn(issue.state, this.config.tracker.activeStates)) return "issue_not_in_worker_active_state";
-        if (isStateIn(issue.state, this.config.tracker.handoffStates)) return "issue_in_handoff_state";
-        if (isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return "issue_in_review_state";
-        if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return "issue_in_blocked_state";
+        if (!ignoreState && !isStateIn(issue.state, this.config.tracker.activeStates)) return "issue_not_in_worker_active_state";
+        if (!ignoreState && isStateIn(issue.state, this.config.tracker.handoffStates)) return "issue_in_handoff_state";
+        if (!ignoreState && isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return "issue_in_review_state";
+        if (!ignoreState && isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return "issue_in_blocked_state";
       }
       if (issue.hasChildren) return "issue_has_children";
       if (issue.state.toLowerCase() === "todo" && hasOpenBlocker(issue, this.config.tracker.terminalStates)) return "issue_has_open_blocker";
@@ -1271,8 +1281,8 @@ export class Orchestrator {
     }
 
     if (target.role === "reviewer") {
-      if (!isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return "issue_not_in_review_state";
-      if (isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return "issue_in_blocked_state";
+      if (!ignoreState && !isStateIn(issue.state, this.config.reviewLoop.reviewStates)) return "issue_not_in_review_state";
+      if (!ignoreState && isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return "issue_in_blocked_state";
       if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return "issue_has_open_blocker";
       if (!this.hasStateSlot(issue.state)) return "state_slot_unavailable";
       return null;
@@ -1280,15 +1290,15 @@ export class Orchestrator {
 
     if (target.role === "triage") {
       if (!this.config.issueTriage.enabled || !this.options.lifecycleStore) return "issue_triage_not_configured";
-      if (!isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return "issue_not_in_blocked_state";
+      if (!ignoreState && !isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return "issue_not_in_blocked_state";
       if (!this.hasStateSlot(issue.state)) return "state_slot_unavailable";
       return null;
     }
 
     if (!this.config.issueBreakdown.enabled || !this.options.lifecycleStore) return "issue_breakdown_not_configured";
     if (!issue.assignedToWorker) return "planner_not_assigned";
-    if (this.isMergeConflictState(issue.state)) return "issue_in_merge_conflict_state";
-    if (!isStateIn(issue.state, this.config.tracker.activeStates) && !isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
+    if (!ignoreState && this.isMergeConflictState(issue.state)) return "issue_in_merge_conflict_state";
+    if (!ignoreState && !isStateIn(issue.state, this.config.tracker.activeStates) && !isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
       return "issue_not_in_planner_state";
     }
     if (issue.hasChildren) return "issue_has_children";
@@ -1758,26 +1768,28 @@ export class Orchestrator {
       const latest = byId.get(issueId);
       if (!latest) continue;
       entry.issue = latest;
+      const ignoreStateForManualRun = entry.manualDispatch?.ignoreState === true;
       const preservePendingApprovalWorker =
         entry.role === "worker" && (await this.hasPendingPublicationApprovalHandoff(entry));
       if (isStateIn(latest.state, this.config.tracker.terminalStates)) {
         await this.terminateRunningIssue(issueId, true, "terminal state");
       } else if (preservePendingApprovalWorker) {
         entry.lastMessage = "Awaiting operator approval for push/PR";
-      } else if (entry.role === "worker" && isStateIn(latest.state, this.config.tracker.handoffStates)) {
+      } else if (entry.role === "worker" && !ignoreStateForManualRun && isStateIn(latest.state, this.config.tracker.handoffStates)) {
         await this.terminateRunningIssue(issueId, false, "handoff state");
       } else if (entry.role === "worker" && !latest.assignedToWorker) {
         await this.terminateRunningIssue(issueId, false, "worker route changed");
-      } else if (entry.role === "worker" && !this.isWorkerStateActiveForRunPhase(latest, entry.runPhase)) {
+      } else if (entry.role === "worker" && !ignoreStateForManualRun && !this.isWorkerStateActiveForRunPhase(latest, entry.runPhase)) {
         await this.terminateRunningIssue(issueId, false, "non-active state");
-      } else if (entry.role === "reviewer" && isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
+      } else if (entry.role === "reviewer" && !ignoreStateForManualRun && isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
         await this.terminateRunningIssue(issueId, false, "blocked state");
-      } else if (entry.role === "reviewer" && !isStateIn(latest.state, this.config.reviewLoop.reviewStates)) {
+      } else if (entry.role === "reviewer" && !ignoreStateForManualRun && !isStateIn(latest.state, this.config.reviewLoop.reviewStates)) {
         await this.terminateRunningIssue(issueId, false, "non-review state");
-      } else if (entry.role === "triage" && !isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
+      } else if (entry.role === "triage" && !ignoreStateForManualRun && !isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
         await this.terminateRunningIssue(issueId, false, "non-blocked state");
       } else if (
         entry.role === "planner" &&
+        !ignoreStateForManualRun &&
         !isStateIn(latest.state, this.config.tracker.activeStates) &&
         !isStateIn(latest.state, this.config.reviewLoop.blockedStates)
       ) {
@@ -2386,7 +2398,12 @@ export class Orchestrator {
         entry.runPhase === "issue_breakdown"
           ? { phase: phaseForIssueState(entry.issue.state, this.config) }
           : {
-              phase: phaseForIssueState(entry.issue.state, this.config),
+              phase:
+                entry.manualDispatch?.ignoreState === true
+                  ? entry.runPhase === "merge_conflict_resolution"
+                    ? "merge_conflict_resolution"
+                    : "implementation"
+                  : phaseForIssueState(entry.issue.state, this.config),
               summaryPointers: {
                 workspaceKey: workspace.workspaceKey,
                 workspacePath: workspace.path,
@@ -2457,12 +2474,19 @@ export class Orchestrator {
         const latest = refreshed[0];
         if (latest) {
           entry.issue = latest;
-          await this.updateLifecycle(entry, { phase: phaseForIssueState(entry.issue.state, this.config) });
+          await this.updateLifecycle(entry, {
+            phase:
+              entry.manualDispatch?.ignoreState === true
+                ? entry.runPhase === "merge_conflict_resolution"
+                  ? "merge_conflict_resolution"
+                  : "implementation"
+                : phaseForIssueState(entry.issue.state, this.config),
+          });
         }
         if (
           !entry.issue.assignedToWorker ||
-          isStateIn(entry.issue.state, this.config.tracker.handoffStates) ||
-          !isStateIn(entry.issue.state, this.config.tracker.activeStates)
+          (entry.manualDispatch?.ignoreState !== true && isStateIn(entry.issue.state, this.config.tracker.handoffStates)) ||
+          (entry.manualDispatch?.ignoreState !== true && !isStateIn(entry.issue.state, this.config.tracker.activeStates))
         ) {
           break;
         }
@@ -3530,6 +3554,7 @@ export class Orchestrator {
       ...(entry.runPhase === "issue_breakdown" ? { runModeOverride: this.config.issueBreakdown.cursorMode } : {}),
       ...(entry.handoffRepair === null ? {} : { handoffRepair: entry.handoffRepair }),
       ...(entry.manualDispatch === null ? {} : { manualDispatch: true }),
+      ...(entry.manualDispatch?.ignoreState === true ? { manualDispatchIgnoreState: true } : {}),
       ...(entry.hermesResume === null ? {} : { hermesResume: entry.hermesResume }),
       ...(promptBundle === undefined ? {} : { ephemeralSystemPrompt: promptBundle.ephemeralSystemPrompt }),
       abortSignal: entry.abortController.signal,
@@ -4035,7 +4060,9 @@ export class Orchestrator {
     const report = lifecycle?.completionReports.find((item) => item.runId === runId) ?? null;
     if (!lifecycle || !report) return entry.completionReportAccepted;
     if (!isFinalizedCompletionReport(report)) {
-      if (!pendingPublicationHandoffForRun(lifecycle, { runId })) return false;
+      if (!pendingPublicationHandoffForRun(lifecycle, { runId })) {
+        if (lifecycle.phase !== "review" || lifecycle.blockedReason !== null) return false;
+      }
       entry.lifecycle = lifecycle;
       entry.completionReportAccepted = true;
       return true;
@@ -6224,12 +6251,15 @@ function terminalRunMetadata(entry: RunningEntry, terminalStatus: "succeeded" | 
   };
 }
 
-function manualDispatchRunMetadata(entry: RunningEntry): Pick<RunMetadata, "manualDispatch" | "manualDispatchStage" | "manualDispatchForceLabels"> {
+function manualDispatchRunMetadata(
+  entry: RunningEntry,
+): Pick<RunMetadata, "manualDispatch" | "manualDispatchStage" | "manualDispatchForceLabels" | "manualDispatchIgnoreState"> {
   if (entry.manualDispatch === null) return {};
   return {
     manualDispatch: true,
     manualDispatchStage: entry.manualDispatch.stage,
     manualDispatchForceLabels: entry.manualDispatch.forceLabels,
+    manualDispatchIgnoreState: entry.manualDispatch.ignoreState,
   };
 }
 

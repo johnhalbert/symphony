@@ -259,6 +259,7 @@ async function writeHandoffMcpContexts(
       workspacePath: ctx.workspace.path,
       workspace: ctx.workspace,
       phase: "implementation",
+      ...(ctx.manualDispatchIgnoreState === true ? { ignoreStateGate: true } : {}),
     });
     return;
   }
@@ -273,6 +274,7 @@ async function writeHandoffMcpContexts(
       workspacePath: ctx.workspace.path,
       workspace: ctx.workspace,
       phase: "merge_conflict_resolution",
+      ...(ctx.manualDispatchIgnoreState === true ? { ignoreStateGate: true } : {}),
     });
     return;
   }
@@ -308,6 +310,7 @@ async function writeHandoffMcpContexts(
     expectedToken: null,
     reviewer: input.sessionId,
     phase: "review",
+    ...(ctx.manualDispatchIgnoreState === true ? { ignoreStateGate: true } : {}),
   });
   await writeReviewFeedbackMcpContext(reviewFeedbackContextFilePath(ctx), {
     issue: ctx.issue,
@@ -317,6 +320,7 @@ async function writeHandoffMcpContexts(
     expectedToken: null,
     reviewer: input.sessionId,
     phase: "review",
+    ...(ctx.manualDispatchIgnoreState === true ? { ignoreStateGate: true } : {}),
   });
 }
 
