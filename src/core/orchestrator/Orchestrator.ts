@@ -37,6 +37,8 @@ import {
   type AgentRunKind,
   type AgentRunRole,
   type Issue,
+  type IssueRouteEvidence,
+  type IssueRouteEvidenceSource,
   type IssueStatusView,
   type RuntimeTotals,
   type TokenCounts,
@@ -946,7 +948,7 @@ export class Orchestrator {
   async requestIssueBreakdown(
     issueIdOrIdentifier: string,
     options: { projectContext?: ProjectContextResolution } = {},
-  ): Promise<{ queued: boolean; issue: Issue; reason: string }> {
+  ): Promise<{ queued: boolean; issue: Issue; reason: string; routeEvidence: IssueRouteEvidence }> {
     const gate = await this.activeProviderDispatchGate();
     if (gate) {
       throw new SymphonyError("conflict", providerGateDispatchBlockedMessage(gate));
@@ -957,10 +959,11 @@ export class Orchestrator {
     if (this.availableSlots() <= 0) {
       throw new SymphonyError("conflict", "No agent slots are available for issue breakdown planning");
     }
-    const issue = await this.resolveTrackedIssue(issueIdOrIdentifier, options.projectContext, {
+    const { issue, routeEvidence } = await this.resolveTrackedIssue(issueIdOrIdentifier, options.projectContext, {
       allowCandidateIdentifierLookup: true,
+      kind: "issue_breakdown",
     });
-    if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`, { routeEvidence });
     const projectContext = this.requestedProjectContextForIssue(issue, options.projectContext);
     const config = this.configForProjectContext(projectContext);
     if (!config.issueBreakdown.enabled) {
@@ -978,10 +981,10 @@ export class Orchestrator {
     }
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
     if (latestFreshIssueBreakdownPlan(lifecycle, issue, config) !== null) {
-      return { queued: false, issue, reason: "fresh_plan_exists" };
+      return { queued: false, issue, reason: "fresh_plan_exists", routeEvidence };
     }
     this.dispatchIssue(issue, null, "worker", null, "issue_breakdown", projectContext ?? null);
-    return { queued: true, issue, reason: "explicit_request" };
+    return { queued: true, issue, reason: "explicit_request", routeEvidence };
   }
 
   async applyIssueBreakdownPlan(
@@ -991,10 +994,11 @@ export class Orchestrator {
     if (!this.options.lifecycleStore) {
       throw new SymphonyError("invalid_request", "Issue breakdown Linear application requires a lifecycle store");
     }
-    const issue = await this.resolveTrackedIssue(issueIdOrIdentifier, options.projectContext, {
+    const { issue, routeEvidence } = await this.resolveTrackedIssue(issueIdOrIdentifier, options.projectContext, {
       allowCandidateIdentifierLookup: true,
+      kind: "issue_breakdown_apply",
     });
-    if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
+    if (!issue) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`, { routeEvidence });
     const projectContext = this.requestedProjectContextForIssue(issue, options.projectContext);
     const config = this.configForProjectContext(projectContext);
     if (!config.issueBreakdown.enabled || !config.issueBreakdown.applyToLinear.enabled) {
@@ -1005,7 +1009,8 @@ export class Orchestrator {
       lifecycleStore: this.options.lifecycleStore,
       writeback: this.options.writeback,
     });
-    return options.dryRun === true ? service.previewLatestFreshPlan(issue) : service.applyLatestFreshPlan(issue);
+    const result = options.dryRun === true ? await service.previewLatestFreshPlan(issue) : await service.applyLatestFreshPlan(issue);
+    return { ...result, routeEvidence };
   }
 
   private trackerClientForProjectContext(projectContext?: ProjectContextResolution): TrackerClient {
@@ -1174,11 +1179,37 @@ export class Orchestrator {
     return Boolean(this.options.trackerResolver && tracker !== this.options.tracker);
   }
 
+  private buildIssueRouteEvidence(input: {
+    kind: IssueRouteEvidence["kind"];
+    requestKey: string;
+    requestedProjectContext?: ProjectContextResolution;
+    resolvedProjectContext?: ProjectContextResolution | null;
+    lookupKey?: string | null;
+    sources: IssueRouteEvidenceSource[];
+    status: IssueRouteEvidence["status"];
+    reason?: string | null;
+  }): IssueRouteEvidence {
+    const trimmedRequestKey = input.requestKey.trim();
+    return {
+      kind: input.kind,
+      requestKey: trimmedRequestKey,
+      requestAlias: trimmedRequestKey,
+      requestedProjectContextId: input.requestedProjectContext?.projectContextId ?? null,
+      resolvedProjectContextId: input.resolvedProjectContext?.projectContextId ?? null,
+      lookupKey: input.lookupKey ?? null,
+      sources: [...new Set(input.sources)],
+      status: input.status,
+      reason: input.reason ?? null,
+      redacted: true,
+    };
+  }
+
   private async resolveTrackedIssue(
     issueIdOrIdentifier: string,
     projectContext: ProjectContextResolution | undefined,
-    options: { allowCandidateIdentifierLookup?: boolean } = {},
-  ): Promise<Issue | null> {
+    options: { allowCandidateIdentifierLookup?: boolean; kind: IssueRouteEvidence["kind"] },
+  ): Promise<{ issue: Issue | null; routeEvidence: IssueRouteEvidence }> {
+    const trimmedRequestKey = issueIdOrIdentifier.trim();
     try {
       const tracker = this.trackerClientForProjectContext(projectContext);
       const trackerLookupProvesRequestedContext = this.canTrustRequestedProjectContextFromTrackerLookup(
@@ -1186,28 +1217,112 @@ export class Orchestrator {
         projectContext,
       );
       const direct = (await tracker.fetchIssueStatesByIds([issueIdOrIdentifier]))[0] ?? null;
-      if (direct) {
-        if (
-          this.issueMatchesRequestedProjectContext(direct, projectContext) ||
-          (!this.issueHasProjectContextProof(direct) && trackerLookupProvesRequestedContext)
-        ) {
-          return this.issueWithRequestedProjectContext(direct, projectContext);
-        }
+      const directMatchesRequestedContext =
+        direct !== null &&
+        (this.issueMatchesRequestedProjectContext(direct, projectContext) ||
+          (!this.issueHasProjectContextProof(direct) && trackerLookupProvesRequestedContext));
+      if (direct && directMatchesRequestedContext) {
+        const issue = this.issueWithRequestedProjectContext(direct, projectContext);
+        return {
+          issue,
+          routeEvidence: this.buildIssueRouteEvidence({
+            kind: options.kind,
+            requestKey: trimmedRequestKey,
+            requestedProjectContext: projectContext,
+            resolvedProjectContext: this.requestedProjectContextForIssue(issue, projectContext) ?? projectContext,
+            lookupKey: issue.id,
+            sources: ["tracker_direct"],
+            status: "resolved",
+          }),
+        };
       }
-      if (options.allowCandidateIdentifierLookup !== true) return null;
-      const candidate = (await tracker.fetchCandidateIssues()).find((candidateIssue) => {
+      const mismatchedDirect = direct && !directMatchesRequestedContext ? direct : null;
+      if (options.allowCandidateIdentifierLookup !== true) {
+        return {
+          issue: null,
+          routeEvidence: this.buildIssueRouteEvidence({
+            kind: options.kind,
+            requestKey: trimmedRequestKey,
+            requestedProjectContext: projectContext,
+            lookupKey: trimmedRequestKey,
+            sources: ["tracker_direct"],
+            status: "missing",
+            reason: "issue_not_found",
+          }),
+        };
+      }
+      const matchingCandidates = (await tracker.fetchCandidateIssues()).filter((candidateIssue) => {
         if (candidateIssue.id !== issueIdOrIdentifier && candidateIssue.identifier !== issueIdOrIdentifier) {
           return false;
         }
+        return true;
+      });
+      const candidate = matchingCandidates.find((candidateIssue) => {
         return (
           this.issueMatchesRequestedProjectContext(candidateIssue, projectContext) ||
           (!this.issueHasProjectContextProof(candidateIssue) && trackerLookupProvesRequestedContext)
         );
       });
-      return candidate ? this.issueWithRequestedProjectContext(candidate, projectContext) : null;
+      if (candidate) {
+        const issue = this.issueWithRequestedProjectContext(candidate, projectContext);
+        return {
+          issue,
+          routeEvidence: this.buildIssueRouteEvidence({
+            kind: options.kind,
+            requestKey: trimmedRequestKey,
+            requestedProjectContext: projectContext,
+            resolvedProjectContext: this.requestedProjectContextForIssue(issue, projectContext) ?? projectContext,
+            lookupKey: issue.id,
+            sources: ["tracker_direct", "tracker_candidate"],
+            status: "resolved",
+            reason: "candidate_identifier_fallback",
+          }),
+        };
+      }
+      const mismatchedCandidate = matchingCandidates[0] ?? null;
+      if (mismatchedCandidate || mismatchedDirect) {
+        const mismatchedIssue = mismatchedCandidate ?? mismatchedDirect;
+        return {
+          issue: null,
+          routeEvidence: this.buildIssueRouteEvidence({
+            kind: options.kind,
+            requestKey: trimmedRequestKey,
+            requestedProjectContext: projectContext,
+            resolvedProjectContext: projectContextResolutionFromIssue(mismatchedIssue) ?? null,
+            lookupKey: mismatchedIssue?.id ?? trimmedRequestKey,
+            sources: ["tracker_direct", "tracker_candidate"],
+            status: "wrong_context",
+            reason: mismatchedCandidate ? "candidate_issue_outside_requested_project_context" : "resolved_issue_outside_requested_project_context",
+          }),
+        };
+      }
+      return {
+        issue: null,
+        routeEvidence: this.buildIssueRouteEvidence({
+          kind: options.kind,
+          requestKey: trimmedRequestKey,
+          requestedProjectContext: projectContext,
+          lookupKey: trimmedRequestKey,
+          sources: ["tracker_direct", "tracker_candidate"],
+          status: "missing",
+          reason: "issue_not_found",
+        }),
+      };
     } catch (error) {
       if (error instanceof SymphonyError && error.code === "config_validation_error") {
-        return null;
+        return {
+          issue: null,
+          routeEvidence: this.buildIssueRouteEvidence({
+            kind: options.kind,
+            requestKey: trimmedRequestKey,
+            requestedProjectContext: projectContext,
+            resolvedProjectContext: projectContext ?? null,
+            lookupKey: trimmedRequestKey,
+            sources: [],
+            status: "credential_unavailable",
+            reason: "resolved_project_context_tracker_unavailable",
+          }),
+        };
       }
       throw error;
     }

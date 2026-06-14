@@ -27,6 +27,7 @@ import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
 } from "../src/core/config/ProjectContexts.js";
 import { ReviewVerdictService } from "../src/core/ReviewVerdictService.js";
+import { SymphonyError } from "../src/core/errors.js";
 import { FakeHarness } from "../src/core/harness/FakeHarness.js";
 import type {
   AgentEvent,
@@ -1397,8 +1398,73 @@ const docsProjectContext = {
     await settleOrchestratorExit();
     await orchestrator.stop();
 
-    expect(result).toMatchObject({ queued: true, reason: "explicit_request" });
+    expect(result).toMatchObject({
+      queued: true,
+      reason: "explicit_request",
+      routeEvidence: {
+        kind: "issue_breakdown",
+        status: "resolved",
+        lookupKey: candidate.id,
+        sources: ["tracker_direct"],
+        redacted: true,
+      },
+    });
     expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
+  });
+
+  it("redacts orchestrator route evidence when issue breakdown tracker credentials are unavailable", async () => {
+    const config = testConfig(root);
+    addDocsPollingProjectContext(config);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    const rawCredentialMessage =
+      "Linear credential capability linear.tracker is owned by worker, but is assigned only to service. Configure credential_profiles.roles.worker.linear.tracker or remove the non-owning assignment to use legacy tracker api key/LINEAR_API_KEY.";
+    const tracker = trackerClientFixture({ candidates: [], issues: [] });
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      trackerResolver: (projectContext) => {
+        if (projectContext?.projectContextId === docsProjectContext.projectContextId) {
+          throw new SymphonyError("config_validation_error", rawCredentialMessage);
+        }
+        return tracker;
+      },
+      workspaceManager,
+      harness: new IssueBreakdownAcceptingHarness(lifecycleStore),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    let thrown: unknown = null;
+    try {
+      await orchestrator.requestIssueBreakdown("ENG-179", { projectContext: docsProjectContext });
+    } catch (error) {
+      thrown = error;
+    } finally {
+      await orchestrator.stop();
+    }
+
+    expect(thrown).toMatchObject({
+      code: "not_found",
+      details: {
+        routeEvidence: {
+          kind: "issue_breakdown",
+          status: "credential_unavailable",
+          requestedProjectContextId: "docs",
+          resolvedProjectContextId: "docs",
+          reason: "resolved_project_context_tracker_unavailable",
+          redacted: true,
+        },
+      },
+    });
+    expect(JSON.stringify((thrown as { details?: unknown })?.details ?? null)).not.toContain(rawCredentialMessage);
+    expect(JSON.stringify((thrown as { details?: unknown })?.details ?? null)).not.toContain("LINEAR_API_KEY");
   });
 
   it("allows issue breakdown planning when implementation incomplete-turn limits are exhausted", async () => {

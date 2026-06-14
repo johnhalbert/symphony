@@ -1216,8 +1216,28 @@ describe("StatusServer durable API", () => {
         method: "POST",
         headers: { "x-symphony-token": "secret" },
       });
-      const defaultBody = (await defaultResponse.json()) as { error: { code: string; message: string } };
-      const docsBody = (await docsResponse.json()) as { workspace_path: string };
+      const defaultBody = (await defaultResponse.json()) as {
+        error: { code: string; message: string };
+        routeEvidence: {
+          kind: string;
+          status: string;
+          requestAlias: string;
+          requestedProjectContextId: string | null;
+          redacted: true;
+          sources: string[];
+        };
+      };
+      const docsBody = (await docsResponse.json()) as {
+        workspace_path: string;
+        routeEvidence: {
+          kind: string;
+          status: string;
+          requestAlias: string;
+          resolvedProjectContextId: string | null;
+          redacted: true;
+          sources: string[];
+        };
+      };
 
       expect(defaultResponse.status).toBe(404);
       expect(docsResponse.status).toBe(202);
@@ -1227,7 +1247,22 @@ describe("StatusServer durable API", () => {
           message: "Issue alias is ambiguous across project contexts: ENG-179. Use a context-qualified alias.",
         },
       });
+      expect(defaultBody.routeEvidence).toMatchObject({
+        kind: "open_workspace",
+        status: "ambiguous",
+        requestAlias: "ENG-179",
+        requestedProjectContextId: null,
+        redacted: true,
+      });
       expect(docsBody.workspace_path).toBe(docsPath);
+      expect(docsBody.routeEvidence).toMatchObject({
+        kind: "open_workspace",
+        status: "resolved",
+        requestAlias: "ENG-179",
+        resolvedProjectContextId: "docs",
+        redacted: true,
+      });
+      expect(docsBody.routeEvidence.sources).toEqual(expect.arrayContaining(["alias_workspace", "workspace_record"]));
       expect(openedPaths).toEqual([docsPath]);
     } finally {
       await server.stop();
@@ -1339,11 +1374,29 @@ describe("StatusServer durable API", () => {
         method: "POST",
         headers: { "x-symphony-token": "secret" },
       });
-      const body = (await response.json()) as { error: { code: string; message: string } };
+      const body = (await response.json()) as {
+        error: { code: string; message: string };
+        routeEvidence: {
+          kind: string;
+          status: string;
+          resolvedProjectContextId: string | null;
+          reason: string | null;
+          redacted: true;
+          sources: string[];
+        };
+      };
 
       expect(response.status).toBe(404);
       expect(body.error.code).toBe("not_found");
       expect(body.error.message).toBe(`Workspace not found: ${docsPath}`);
+      expect(body.routeEvidence).toMatchObject({
+        kind: "open_workspace",
+        status: "missing",
+        resolvedProjectContextId: "docs",
+        reason: "workspace_path_not_found",
+        redacted: true,
+      });
+      expect(body.routeEvidence.sources).toEqual(expect.arrayContaining(["workspace_filesystem_fallback"]));
       expect(openedPaths).toEqual([]);
     } finally {
       await server.stop();
@@ -1399,11 +1452,29 @@ describe("StatusServer durable API", () => {
         method: "POST",
         headers: { "x-symphony-token": "secret" },
       });
-      const body = (await response.json()) as { error: { code: string; message: string } };
+      const body = (await response.json()) as {
+        error: { code: string; message: string };
+        routeEvidence: {
+          kind: string;
+          status: string;
+          resolvedProjectContextId: string | null;
+          reason: string | null;
+          redacted: true;
+          sources: string[];
+        };
+      };
 
       expect(response.status).toBe(404);
       expect(body.error.code).toBe("not_found");
       expect(body.error.message).toBe(`Workspace not found: ${docsPath}`);
+      expect(body.routeEvidence).toMatchObject({
+        kind: "open_workspace",
+        status: "missing",
+        resolvedProjectContextId: "docs",
+        reason: "workspace_path_not_found",
+        redacted: true,
+      });
+      expect(body.routeEvidence.sources).toEqual(expect.arrayContaining(["workspace_filesystem_fallback"]));
       expect(openedPaths).toEqual([]);
     } finally {
       await server.stop();
@@ -1467,11 +1538,29 @@ describe("StatusServer durable API", () => {
         method: "POST",
         headers: { "x-symphony-token": "secret" },
       });
-      const body = (await response.json()) as { error: { code: string; message: string } };
+      const body = (await response.json()) as {
+        error: { code: string; message: string };
+        routeEvidence: {
+          kind: string;
+          status: string;
+          resolvedProjectContextId: string | null;
+          reason: string | null;
+          redacted: true;
+          sources: string[];
+        };
+      };
 
       expect(response.status).toBe(404);
       expect(body.error.code).toBe("not_found");
       expect(body.error.message).toBe(`Workspace not found: ${docsPath}`);
+      expect(body.routeEvidence).toMatchObject({
+        kind: "open_workspace",
+        status: "missing",
+        resolvedProjectContextId: "docs",
+        reason: "workspace_path_not_found",
+        redacted: true,
+      });
+      expect(body.routeEvidence.sources).toEqual(expect.arrayContaining(["workspace_filesystem_fallback"]));
       expect(openedPaths).toEqual([]);
     } finally {
       await server.stop();
@@ -2656,6 +2745,16 @@ describe("StatusServer durable API", () => {
         runPhase: string;
         runKind: string;
         reason: string;
+        routeEvidence: {
+          kind: string;
+          status: string;
+          requestAlias: string;
+          requestedProjectContextId: string | null;
+          resolvedProjectContextId: string | null;
+          reason: string | null;
+          redacted: true;
+          sources: string[];
+        };
       };
 
       expect(response.status).toBe(202);
@@ -2667,6 +2766,16 @@ describe("StatusServer durable API", () => {
         runKind: "planning",
         reason: "explicit_request",
       });
+      expect(body.routeEvidence).toMatchObject({
+        kind: "issue_breakdown",
+        status: "resolved",
+        requestAlias: "ENG-179",
+        requestedProjectContextId: "docs",
+        resolvedProjectContextId: "docs",
+        reason: "candidate_identifier_fallback",
+        redacted: true,
+      });
+      expect(body.routeEvidence.sources).toEqual(expect.arrayContaining(["tracker_direct", "tracker_candidate"]));
       expect(symphonyTracker.requestedIds).toEqual([]);
       expect(symphonyTracker.candidateFetchCount).toBe(0);
       expect(docsRequestedIds[0]).toEqual(["ENG-179"]);
@@ -3137,7 +3246,18 @@ describe("StatusServer durable API", () => {
         method: "POST",
         headers: { "x-symphony-token": "secret" },
       });
-      const body = (await response.json()) as { error: { code: string; message: string } };
+      const body = (await response.json()) as {
+        error: { code: string; message: string };
+        routeEvidence: {
+          kind: string;
+          status: string;
+          requestedProjectContextId: string | null;
+          resolvedProjectContextId: string | null;
+          reason: string | null;
+          redacted: true;
+          sources: string[];
+        };
+      };
 
       expect(response.status).toBe(404);
       expect(body.error.code).toBe("not_found");
@@ -3145,6 +3265,17 @@ describe("StatusServer durable API", () => {
       expect(body.error.message).not.toContain("Linear credential capability linear.tracker is owned by worker");
       expect(body.error.message).not.toContain("credential_profiles.roles.worker.linear.tracker");
       expect(body.error.message).not.toContain("LINEAR_API_KEY");
+      expect(body.routeEvidence).toMatchObject({
+        kind: "issue_breakdown",
+        status: "credential_unavailable",
+        requestedProjectContextId: "docs",
+        resolvedProjectContextId: "docs",
+        reason: "resolved_project_context_tracker_unavailable",
+        redacted: true,
+      });
+      expect(JSON.stringify(body.routeEvidence)).not.toContain(rawCredentialMessage);
+      expect(JSON.stringify(body.routeEvidence)).not.toContain("credential_profiles.roles.worker.linear.tracker");
+      expect(JSON.stringify(body.routeEvidence)).not.toContain("LINEAR_API_KEY");
       expect(resolverProjectContextIds).toEqual(["docs"]);
       expect(baseTracker.requestedIds).toEqual([]);
       expect(baseTracker.candidateFetchCount).toBe(0);
@@ -3218,7 +3349,18 @@ describe("StatusServer durable API", () => {
         headers: { "x-symphony-token": "secret" },
         body: JSON.stringify({ dryRun: true }),
       });
-      const body = (await response.json()) as { error: { code: string; message: string } };
+      const body = (await response.json()) as {
+        error: { code: string; message: string };
+        routeEvidence: {
+          kind: string;
+          status: string;
+          requestedProjectContextId: string | null;
+          resolvedProjectContextId: string | null;
+          reason: string | null;
+          redacted: true;
+          sources: string[];
+        };
+      };
 
       expect(response.status).toBe(404);
       expect(body.error.code).toBe("not_found");
@@ -3226,6 +3368,17 @@ describe("StatusServer durable API", () => {
       expect(body.error.message).not.toContain("Linear credential capability linear.tracker is owned by worker");
       expect(body.error.message).not.toContain("credential_profiles.roles.worker.linear.tracker");
       expect(body.error.message).not.toContain("LINEAR_API_KEY");
+      expect(body.routeEvidence).toMatchObject({
+        kind: "issue_breakdown_apply",
+        status: "credential_unavailable",
+        requestedProjectContextId: "docs",
+        resolvedProjectContextId: "docs",
+        reason: "resolved_project_context_tracker_unavailable",
+        redacted: true,
+      });
+      expect(JSON.stringify(body.routeEvidence)).not.toContain(rawCredentialMessage);
+      expect(JSON.stringify(body.routeEvidence)).not.toContain("credential_profiles.roles.worker.linear.tracker");
+      expect(JSON.stringify(body.routeEvidence)).not.toContain("LINEAR_API_KEY");
       expect(resolverProjectContextIds).toEqual(["docs"]);
       expect(baseTracker.requestedIds).toEqual([]);
       expect(baseTracker.candidateFetchCount).toBe(0);
@@ -3321,11 +3474,29 @@ describe("StatusServer durable API", () => {
           headers: { "x-symphony-token": "secret" },
         },
       );
-      const body = (await response.json()) as { error: { code: string; message: string } };
+      const body = (await response.json()) as {
+        error: { code: string; message: string };
+        routeEvidence: {
+          kind: string;
+          status: string;
+          requestedProjectContextId: string | null;
+          reason: string | null;
+          redacted: true;
+          sources: string[];
+        };
+      };
 
       expect(response.status).toBe(404);
       expect(body.error.code).toBe("not_found");
       expect(body.error.message).toContain("Issue not found");
+      expect(body.routeEvidence).toMatchObject({
+        kind: "issue_breakdown",
+        status: "wrong_context",
+        requestedProjectContextId: "docs",
+        redacted: true,
+      });
+      expect(body.routeEvidence.reason).toBeDefined();
+      expect(body.routeEvidence.sources).toEqual(expect.arrayContaining(["tracker_direct", "tracker_candidate"]));
       expect(requestedIds[0]).toEqual([directRuntimeIssue.id]);
       expect(candidateFetchCount).toBe(1);
       expect(harness.runs).toHaveLength(0);
@@ -3423,11 +3594,29 @@ describe("StatusServer durable API", () => {
         headers: { "x-symphony-token": "secret" },
         body: JSON.stringify({ dryRun: true }),
       });
-      const body = (await response.json()) as { error: { code: string; message: string } };
+      const body = (await response.json()) as {
+        error: { code: string; message: string };
+        routeEvidence: {
+          kind: string;
+          status: string;
+          requestedProjectContextId: string | null;
+          reason: string | null;
+          redacted: true;
+          sources: string[];
+        };
+      };
 
       expect(response.status).toBe(404);
       expect(body.error.code).toBe("not_found");
       expect(body.error.message).toContain("Issue not found");
+      expect(body.routeEvidence).toMatchObject({
+        kind: "issue_breakdown_apply",
+        status: "wrong_context",
+        requestedProjectContextId: "docs",
+        redacted: true,
+      });
+      expect(body.routeEvidence.reason).toBeDefined();
+      expect(body.routeEvidence.sources).toEqual(expect.arrayContaining(["tracker_direct", "tracker_candidate"]));
       expect(requestedIds[0]).toEqual([directRuntimeIssue.id]);
       expect(candidateFetchCount).toBe(1);
       expect(harness.runs).toHaveLength(0);
