@@ -314,6 +314,63 @@ export interface IssueTriageReportRecord {
   writebackOperationKeys: string[];
 }
 
+export type IssuePostMortemCompletionStatus = "valid_done" | "valid_with_followups" | "questionable_done";
+export type IssuePostMortemSpecificationQuality = "strong" | "adequate" | "weak";
+export type IssuePostMortemSpecificationClassification =
+  | "well_scoped"
+  | "underspecified"
+  | "overbroad"
+  | "speckit_candidate"
+  | "needs_clarification";
+export type IssuePostMortemFollowUpPriority = "high" | "medium" | "low";
+export type IssuePostMortemFollowUpKind = "hardening" | "test_gap" | "scope_gap" | "refactor" | "process_gap";
+
+export interface IssuePostMortemCompletionJudgmentRecord {
+  status: IssuePostMortemCompletionStatus;
+  rationale: string;
+}
+
+export interface IssuePostMortemSpecificationAssessmentRecord {
+  quality: IssuePostMortemSpecificationQuality;
+  classifications: IssuePostMortemSpecificationClassification[];
+  missingContractAreas: string[];
+  speckitRecommended: boolean;
+  speckitRationale: string;
+}
+
+export interface IssuePostMortemReviewAssessmentRecord {
+  gateDecisionLooksValid: boolean;
+  missedGateFindings: string[];
+  missedDiscoveryFindings: string[];
+}
+
+export interface IssuePostMortemFollowUpCandidateRecord {
+  title: string;
+  priority: IssuePostMortemFollowUpPriority;
+  kind: IssuePostMortemFollowUpKind;
+  rationale: string;
+  readyForSpecKit: boolean;
+  suggestedIssueContract: string | null;
+}
+
+export interface IssuePostMortemReportRecord {
+  id: string;
+  idempotencyKey: string;
+  requestHash: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  triggerFingerprint: string;
+  summary: string;
+  completionJudgment: IssuePostMortemCompletionJudgmentRecord;
+  specificationAssessment: IssuePostMortemSpecificationAssessmentRecord;
+  reviewAssessment: IssuePostMortemReviewAssessmentRecord;
+  followUpCandidates: IssuePostMortemFollowUpCandidateRecord[];
+  processLessons: string[];
+  submittedAt: string;
+  writebackOperationKeys: string[];
+}
+
 export interface IssueMergeMetadata {
   id: string;
   pullRequest: CompletionReportPullRequestRef;
@@ -503,6 +560,7 @@ export interface IssueLifecycleRecord {
   lastPlanningFailureRunId: string | null;
   lastPlanningFailureAt: string | null;
   lastIssueTriageReportId: string | null;
+  lastPostMortemReportId: string | null;
   lastCompletionReportId: string | null;
   lastReviewVerdictId: string | null;
   blockedReason: string | null;
@@ -513,6 +571,7 @@ export interface IssueLifecycleRecord {
   reviewVerdicts: IssueReviewVerdictRecord[];
   reviewFeedback: IssueReviewFeedbackRecord[];
   issueTriageReports: IssueTriageReportRecord[];
+  postMortemReports: IssuePostMortemReportRecord[];
   reviewEvidence: PullRequestReviewEvidenceState;
   mergeGate?: IssueMergeGateState | null;
   merge: IssueMergeMetadata | null;
@@ -533,6 +592,7 @@ export interface IssueLifecyclePatch {
   lastPlanningFailureRunId?: string | null;
   lastPlanningFailureAt?: string | null;
   lastIssueTriageReportId?: string | null;
+  lastPostMortemReportId?: string | null;
   lastCompletionReportId?: string | null;
   lastReviewVerdictId?: string | null;
   blockedReason?: string | null;
@@ -543,6 +603,7 @@ export interface IssueLifecyclePatch {
   reviewVerdicts?: IssueReviewVerdictRecord[];
   reviewFeedback?: IssueReviewFeedbackRecord[];
   issueTriageReports?: IssueTriageReportRecord[];
+  postMortemReports?: IssuePostMortemReportRecord[];
   reviewEvidence?: PullRequestReviewEvidenceState;
   mergeGate?: IssueMergeGateState | null;
   merge?: IssueMergeMetadata | null;
@@ -593,6 +654,11 @@ export class FileIssueLifecycleStore {
         "lastIssueTriageReportId",
         existing?.lastIssueTriageReportId ?? null,
       ),
+      lastPostMortemReportId: patchValue(
+        patch,
+        "lastPostMortemReportId",
+        existing?.lastPostMortemReportId ?? null,
+      ),
       lastCompletionReportId: patchValue(patch, "lastCompletionReportId", existing?.lastCompletionReportId ?? null),
       lastReviewVerdictId: patchValue(patch, "lastReviewVerdictId", existing?.lastReviewVerdictId ?? null),
       blockedReason: patchValue(patch, "blockedReason", existing?.blockedReason ?? null),
@@ -607,6 +673,7 @@ export class FileIssueLifecycleStore {
       reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
       reviewFeedback: patch.reviewFeedback ?? existing?.reviewFeedback ?? [],
       issueTriageReports: patch.issueTriageReports ?? existing?.issueTriageReports ?? [],
+      postMortemReports: patch.postMortemReports ?? existing?.postMortemReports ?? [],
       reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
       mergeGate: patchValue(patch, "mergeGate", existing?.mergeGate ?? null),
       merge: patchValue(patch, "merge", existing?.merge ?? null),
@@ -1068,6 +1135,10 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
       value.lastIssueTriageReportId === undefined
         ? null
         : nullableString(value.lastIssueTriageReportId, filePath, "lastIssueTriageReportId"),
+    lastPostMortemReportId:
+      value.lastPostMortemReportId === undefined
+        ? null
+        : nullableString(value.lastPostMortemReportId, filePath, "lastPostMortemReportId"),
     lastCompletionReportId: nullableString(value.lastCompletionReportId, filePath, "lastCompletionReportId"),
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
@@ -1078,6 +1149,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
     reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
     issueTriageReports: normalizeIssueTriageReports(value.issueTriageReports, filePath),
+    postMortemReports: normalizePostMortemReports(value.postMortemReports, filePath),
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
     mergeGate: normalizeMergeGateState(value.mergeGate, filePath),
     merge: normalizeMergeMetadata(value.merge, filePath),
@@ -1323,6 +1395,12 @@ function normalizeIssueTriageReports(value: unknown, filePath: string): IssueTri
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "issueTriageReports is invalid");
   return value.map((item, index) => normalizeIssueTriageReport(item, filePath, index));
+}
+
+function normalizePostMortemReports(value: unknown, filePath: string): IssuePostMortemReportRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "postMortemReports is invalid");
+  return value.map((item, index) => normalizePostMortemReport(item, filePath, index));
 }
 
 function normalizeMergeConflictResolutionReports(
@@ -1635,6 +1713,200 @@ function normalizeIssueTriageReport(value: unknown, filePath: string, index: num
         ? []
         : requiredStringArray(value.writebackOperationKeys, filePath, `issueTriageReports[${index}].writebackOperationKeys`),
   };
+}
+
+function normalizePostMortemReport(value: unknown, filePath: string, index: number): IssuePostMortemReportRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `postMortemReports[${index}] is invalid`);
+  return {
+    id: requiredString(value.id, filePath, `postMortemReports[${index}].id`),
+    idempotencyKey: requiredString(value.idempotencyKey, filePath, `postMortemReports[${index}].idempotencyKey`),
+    requestHash: requiredString(value.requestHash, filePath, `postMortemReports[${index}].requestHash`),
+    runId: requiredString(value.runId, filePath, `postMortemReports[${index}].runId`),
+    issueId: requiredString(value.issueId, filePath, `postMortemReports[${index}].issueId`),
+    issueIdentifier: requiredString(value.issueIdentifier, filePath, `postMortemReports[${index}].issueIdentifier`),
+    triggerFingerprint: requiredString(value.triggerFingerprint, filePath, `postMortemReports[${index}].triggerFingerprint`),
+    summary: requiredString(value.summary, filePath, `postMortemReports[${index}].summary`),
+    completionJudgment: normalizePostMortemCompletionJudgment(value.completionJudgment, filePath, index),
+    specificationAssessment: normalizePostMortemSpecificationAssessment(value.specificationAssessment, filePath, index),
+    reviewAssessment: normalizePostMortemReviewAssessment(value.reviewAssessment, filePath, index),
+    followUpCandidates: normalizePostMortemFollowUpCandidates(value.followUpCandidates, filePath, index),
+    processLessons: requiredStringArray(value.processLessons, filePath, `postMortemReports[${index}].processLessons`),
+    submittedAt: requiredString(value.submittedAt, filePath, `postMortemReports[${index}].submittedAt`),
+    writebackOperationKeys:
+      value.writebackOperationKeys === undefined
+        ? []
+        : requiredStringArray(value.writebackOperationKeys, filePath, `postMortemReports[${index}].writebackOperationKeys`),
+  };
+}
+
+function normalizePostMortemCompletionJudgment(
+  value: unknown,
+  filePath: string,
+  reportIndex: number,
+): IssuePostMortemCompletionJudgmentRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `postMortemReports[${reportIndex}].completionJudgment is invalid`);
+  return {
+    status: normalizePostMortemCompletionStatus(
+      value.status,
+      filePath,
+      `postMortemReports[${reportIndex}].completionJudgment.status`,
+    ),
+    rationale: requiredString(value.rationale, filePath, `postMortemReports[${reportIndex}].completionJudgment.rationale`),
+  };
+}
+
+function normalizePostMortemSpecificationAssessment(
+  value: unknown,
+  filePath: string,
+  reportIndex: number,
+): IssuePostMortemSpecificationAssessmentRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `postMortemReports[${reportIndex}].specificationAssessment is invalid`);
+  return {
+    quality: normalizePostMortemSpecificationQuality(
+      value.quality,
+      filePath,
+      `postMortemReports[${reportIndex}].specificationAssessment.quality`,
+    ),
+    classifications: requiredArray(
+      value.classifications,
+      filePath,
+      `postMortemReports[${reportIndex}].specificationAssessment.classifications`,
+    ).map((item, index) =>
+      normalizePostMortemSpecificationClassification(
+        item,
+        filePath,
+        `postMortemReports[${reportIndex}].specificationAssessment.classifications[${index}]`,
+      ),
+    ),
+    missingContractAreas: requiredStringArray(
+      value.missingContractAreas,
+      filePath,
+      `postMortemReports[${reportIndex}].specificationAssessment.missingContractAreas`,
+    ),
+    speckitRecommended: requiredBoolean(
+      value.speckitRecommended,
+      filePath,
+      `postMortemReports[${reportIndex}].specificationAssessment.speckitRecommended`,
+    ),
+    speckitRationale: requiredString(
+      value.speckitRationale,
+      filePath,
+      `postMortemReports[${reportIndex}].specificationAssessment.speckitRationale`,
+    ),
+  };
+}
+
+function normalizePostMortemReviewAssessment(
+  value: unknown,
+  filePath: string,
+  reportIndex: number,
+): IssuePostMortemReviewAssessmentRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `postMortemReports[${reportIndex}].reviewAssessment is invalid`);
+  return {
+    gateDecisionLooksValid: requiredBoolean(
+      value.gateDecisionLooksValid,
+      filePath,
+      `postMortemReports[${reportIndex}].reviewAssessment.gateDecisionLooksValid`,
+    ),
+    missedGateFindings: requiredStringArray(
+      value.missedGateFindings,
+      filePath,
+      `postMortemReports[${reportIndex}].reviewAssessment.missedGateFindings`,
+    ),
+    missedDiscoveryFindings: requiredStringArray(
+      value.missedDiscoveryFindings,
+      filePath,
+      `postMortemReports[${reportIndex}].reviewAssessment.missedDiscoveryFindings`,
+    ),
+  };
+}
+
+function normalizePostMortemFollowUpCandidates(
+  value: unknown,
+  filePath: string,
+  reportIndex: number,
+): IssuePostMortemFollowUpCandidateRecord[] {
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, `postMortemReports[${reportIndex}].followUpCandidates is invalid`);
+  return value.map((item, index) => {
+    if (!isRecord(item)) {
+      throw corruptLifecycle(filePath, `postMortemReports[${reportIndex}].followUpCandidates[${index}] is invalid`);
+    }
+    return {
+      title: requiredString(item.title, filePath, `postMortemReports[${reportIndex}].followUpCandidates[${index}].title`),
+      priority: normalizePostMortemFollowUpPriority(
+        item.priority,
+        filePath,
+        `postMortemReports[${reportIndex}].followUpCandidates[${index}].priority`,
+      ),
+      kind: normalizePostMortemFollowUpKind(
+        item.kind,
+        filePath,
+        `postMortemReports[${reportIndex}].followUpCandidates[${index}].kind`,
+      ),
+      rationale: requiredString(item.rationale, filePath, `postMortemReports[${reportIndex}].followUpCandidates[${index}].rationale`),
+      readyForSpecKit: requiredBoolean(
+        item.readyForSpecKit,
+        filePath,
+        `postMortemReports[${reportIndex}].followUpCandidates[${index}].readyForSpecKit`,
+      ),
+      suggestedIssueContract: optionalNullableString(
+        item.suggestedIssueContract,
+        filePath,
+        `postMortemReports[${reportIndex}].followUpCandidates[${index}].suggestedIssueContract`,
+      ),
+    };
+  });
+}
+
+function normalizePostMortemCompletionStatus(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssuePostMortemCompletionStatus {
+  if (value === "valid_done" || value === "valid_with_followups" || value === "questionable_done") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function normalizePostMortemSpecificationQuality(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssuePostMortemSpecificationQuality {
+  if (value === "strong" || value === "adequate" || value === "weak") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function normalizePostMortemSpecificationClassification(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssuePostMortemSpecificationClassification {
+  if (
+    value === "well_scoped" ||
+    value === "underspecified" ||
+    value === "overbroad" ||
+    value === "speckit_candidate" ||
+    value === "needs_clarification"
+  ) {
+    return value;
+  }
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function normalizePostMortemFollowUpPriority(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssuePostMortemFollowUpPriority {
+  if (value === "high" || value === "medium" || value === "low") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function normalizePostMortemFollowUpKind(value: unknown, filePath: string, field: string): IssuePostMortemFollowUpKind {
+  if (value === "hardening" || value === "test_gap" || value === "scope_gap" || value === "refactor" || value === "process_gap") {
+    return value;
+  }
+  throw corruptLifecycle(filePath, `${field} is invalid`);
 }
 
 function normalizeIssueTriageDisposition(
@@ -2355,6 +2627,16 @@ function optionalNullableNumber(value: unknown, filePath: string, field: string)
 function optionalNullableBoolean(value: unknown, filePath: string, field: string): boolean | null {
   if (value === undefined || value === null) return null;
   if (typeof value === "boolean") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function requiredBoolean(value: unknown, filePath: string, field: string): boolean {
+  if (typeof value === "boolean") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function requiredArray(value: unknown, filePath: string, field: string): unknown[] {
+  if (Array.isArray(value)) return value;
   throw corruptLifecycle(filePath, `${field} is invalid`);
 }
 

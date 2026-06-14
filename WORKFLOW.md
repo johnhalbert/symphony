@@ -62,6 +62,15 @@ issue_triage:
   mode: classify_only
   max_attempts_per_trigger: 1
 
+post_mortem:
+  enabled: true
+  done_states:
+    - Done
+  require_labels:
+    - post_mortem
+  exclude_labels: []
+  max_attempts_per_trigger: 1
+
 handoff_repair:
   enabled: true
   max_attempts: 1
@@ -70,6 +79,7 @@ handoff_repair:
     - review
     - issue_breakdown
     - issue_triage
+    - post_mortem
     - merge_conflict_resolution
 
 issue_breakdown:
@@ -99,6 +109,8 @@ prompts:
     reviewer.review.exhaustive.system: reviewer/review/exhaustive.system.md.liquid
     triage.issue_blocked.classify: triage/issue_blocked/classify.md.liquid
     triage.issue_blocked.classify.system: triage/issue_blocked/classify.system.md.liquid
+    post_mortem.issue_done.analyze: post_mortem/issue_done/analyze.md.liquid
+    post_mortem.issue_done.analyze.system: post_mortem/issue_done/analyze.system.md.liquid
     planner.issue_breakdown.speckit_to_linear: planner/issue_breakdown/speckit_to_linear.md.liquid
     planner.issue_breakdown.speckit_to_linear.system: planner/issue_breakdown/speckit_to_linear.system.md.liquid
     handoff_repair.mcp_only: handoff_repair/mcp_only.md.liquid

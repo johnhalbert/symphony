@@ -20,6 +20,7 @@ import {
 } from "./core/IssueContractLint.js";
 import { resolveCursorRuntimeApiKey, resolveRuntimeApiKey } from "./app/RuntimeDependencies.js";
 import { COMPLETION_REPORT_TOOL_NAME } from "./core/harness/CompletionReportMcpServer.js";
+import { ISSUE_POST_MORTEM_TOOL_NAME } from "./core/harness/IssuePostMortemMcpServer.js";
 import { ISSUE_TRIAGE_TOOL_NAME } from "./core/harness/IssueTriageMcpServer.js";
 import {
   runHermesGatewayMcpToolExposureProbe,
@@ -88,6 +89,7 @@ export interface RuntimeHarnessDependencyDoctorCheckOptions {
 export type McpToolServerCommand =
   | "completion-report-mcp"
   | "issue-triage-mcp"
+  | "issue-post-mortem-mcp"
   | "review-verdict-mcp"
   | "review-feedback-mcp";
 
@@ -943,7 +945,12 @@ async function mcpToolAvailabilityCheck(
     }
     const stage = await runSubprocessMcpToolExposureProbe(config, {
       cliPath: options.cliPath,
-      roles: config.issueTriage.enabled ? ["worker", "reviewer", "triage"] : ["worker", "reviewer"],
+      roles: [
+        "worker",
+        "reviewer",
+        ...(config.issueTriage.enabled ? (["triage"] as const) : []),
+        ...(config.postMortem.enabled ? (["post_mortem"] as const) : []),
+      ],
     });
     if (stage.status === "failure") {
       return {
@@ -964,6 +971,9 @@ async function mcpToolAvailabilityCheck(
     { command: "review-verdict-mcp" as const, tool: REVIEW_VERDICT_TOOL_NAME },
     { command: "review-feedback-mcp" as const, tool: REVIEW_FEEDBACK_TOOL_NAME },
     ...(config.issueTriage.enabled ? [{ command: "issue-triage-mcp" as const, tool: ISSUE_TRIAGE_TOOL_NAME }] : []),
+    ...(config.postMortem.enabled
+      ? [{ command: "issue-post-mortem-mcp" as const, tool: ISSUE_POST_MORTEM_TOOL_NAME }]
+      : []),
   ];
   try {
     const missing: string[] = [];

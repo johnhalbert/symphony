@@ -43,6 +43,7 @@ import type {
   IssueLifecycleStore,
   IssueMergeConflictMetadata,
   IssueMergeGateMergeabilityState,
+  IssuePostMortemReportRecord,
   IssueReviewVerdictRecord,
   IssueTriageReportRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
@@ -7797,6 +7798,7 @@ function reviewLoopStatus(input: {
     lastCompletionReport: latestCompletionReport(lifecycle),
     lastReviewVerdict: latestReviewVerdict(lifecycle),
     lastIssueTriageReport: latestIssueTriageReport(lifecycle),
+    lastIssuePostMortemReport: latestIssuePostMortemReport(lifecycle),
     mergeConflict: lifecycle?.mergeConflict ?? null,
     blockedReason: lifecycleBlockedReason(lifecycle),
   };
@@ -7837,6 +7839,15 @@ function latestIssueTriageReport(lifecycle: IssueLifecycleRecord | null): IssueT
     if (exact) return exact;
   }
   return lifecycle.issueTriageReports[lifecycle.issueTriageReports.length - 1] ?? null;
+}
+
+function latestIssuePostMortemReport(lifecycle: IssueLifecycleRecord | null): IssuePostMortemReportRecord | null {
+  if (!lifecycle) return null;
+  if (lifecycle.lastPostMortemReportId) {
+    const exact = lifecycle.postMortemReports.find((report) => report.id === lifecycle.lastPostMortemReportId);
+    if (exact) return exact;
+  }
+  return lifecycle.postMortemReports[lifecycle.postMortemReports.length - 1] ?? null;
 }
 
 function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {

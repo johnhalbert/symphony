@@ -321,6 +321,29 @@ interface IssueBoardCardReviewLoopInput {
     submittedAt?: string | null;
     id?: string | null;
   } | null;
+  lastIssuePostMortemReport?: {
+    summary?: string | null;
+    completionJudgment?: { status?: string | null; rationale?: string | null } | null;
+    specificationAssessment?: {
+      quality?: string | null;
+      classifications?: string[] | null;
+      missingContractAreas?: string[] | null;
+      speckitRationale?: string | null;
+    } | null;
+    reviewAssessment?: {
+      missedGateFindings?: string[] | null;
+      missedDiscoveryFindings?: string[] | null;
+    } | null;
+    followUpCandidates?: Array<{
+      title?: string | null;
+      priority?: string | null;
+      kind?: string | null;
+      rationale?: string | null;
+    }> | null;
+    processLessons?: string[] | null;
+    submittedAt?: string | null;
+    id?: string | null;
+  } | null;
 }
 
 export interface IssueBoardCardProjectionInput {
@@ -1613,9 +1636,32 @@ function projectIssueDescription(
   addUniqueText(description, reviewLoop?.lastCompletionReport?.summary ?? null);
   addUniqueText(description, reviewLoop?.lastIssueTriageReport?.summary ?? null);
   addUniqueText(description, reviewLoop?.lastIssueTriageReport?.recommendedAction ?? null);
+  addUniqueText(description, reviewLoop?.lastIssuePostMortemReport?.summary ?? null);
+  addUniqueText(description, reviewLoop?.lastIssuePostMortemReport?.completionJudgment?.rationale ?? null);
+  addUniqueText(description, reviewLoop?.lastIssuePostMortemReport?.specificationAssessment?.speckitRationale ?? null);
   for (const blocker of reviewLoop?.lastIssueTriageReport?.blockers ?? []) {
     addUniqueText(description, blocker.summary ?? null);
     addUniqueText(description, blocker.recommendedAction ?? null);
+  }
+  for (const classification of reviewLoop?.lastIssuePostMortemReport?.specificationAssessment?.classifications ?? []) {
+    addUniqueText(description, classification);
+  }
+  for (const area of reviewLoop?.lastIssuePostMortemReport?.specificationAssessment?.missingContractAreas ?? []) {
+    addUniqueText(description, area);
+  }
+  for (const finding of reviewLoop?.lastIssuePostMortemReport?.reviewAssessment?.missedGateFindings ?? []) {
+    addUniqueText(description, finding);
+  }
+  for (const finding of reviewLoop?.lastIssuePostMortemReport?.reviewAssessment?.missedDiscoveryFindings ?? []) {
+    addUniqueText(description, finding);
+  }
+  for (const candidate of reviewLoop?.lastIssuePostMortemReport?.followUpCandidates ?? []) {
+    addUniqueText(description, candidate.title ?? null);
+    addUniqueText(description, candidate.kind ?? null);
+    addUniqueText(description, candidate.rationale ?? null);
+  }
+  for (const lesson of reviewLoop?.lastIssuePostMortemReport?.processLessons ?? []) {
+    addUniqueText(description, lesson);
   }
   for (const finding of reviewLoop?.lastReviewVerdict?.findings ?? []) {
     addUniqueText(description, finding);

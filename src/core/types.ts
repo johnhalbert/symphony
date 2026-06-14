@@ -205,9 +205,15 @@ export interface Workspace {
   baseRef?: string;
 }
 
-export type AgentRunRole = "worker" | "reviewer" | "triage" | "planner";
-export type AgentRunPhase = "issue_breakdown" | "implementation" | "merge_conflict_resolution" | "review" | "issue_triage";
-export type AgentRunKind = "planning" | "implementation" | "review" | "triage";
+export type AgentRunRole = "worker" | "reviewer" | "triage" | "planner" | "post_mortem";
+export type AgentRunPhase =
+  | "issue_breakdown"
+  | "implementation"
+  | "merge_conflict_resolution"
+  | "review"
+  | "issue_triage"
+  | "post_mortem";
+export type AgentRunKind = "planning" | "implementation" | "review" | "triage" | "post_mortem";
 
 export function runKindForPhase(runPhase: AgentRunPhase): AgentRunKind {
   switch (runPhase) {
@@ -217,6 +223,8 @@ export function runKindForPhase(runPhase: AgentRunPhase): AgentRunKind {
       return "review";
     case "issue_triage":
       return "triage";
+    case "post_mortem":
+      return "post_mortem";
     case "merge_conflict_resolution":
     case "implementation":
       return "implementation";

@@ -137,13 +137,30 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    post_mortem: z
+      .object({
+        enabled: z.boolean().optional(),
+        done_states: stringArray.optional(),
+        require_labels: stringArray.optional(),
+        exclude_labels: stringArray.optional(),
+        max_attempts_per_trigger: z.number().int().positive().optional(),
+      })
+      .passthrough()
+      .optional(),
     handoff_repair: z
       .object({
         enabled: z.boolean().optional(),
         max_attempts: z.number().int().positive().optional(),
         phases: z
           .array(
-            z.enum(["implementation", "review", "issue_breakdown", "issue_triage", "merge_conflict_resolution"]),
+            z.enum([
+              "implementation",
+              "review",
+              "issue_breakdown",
+              "issue_triage",
+              "post_mortem",
+              "merge_conflict_resolution",
+            ]),
           )
           .optional(),
       })
@@ -257,6 +274,7 @@ const rawConfigSchema = z
             worker: z.string().optional(),
             reviewer: z.string().optional(),
             planner: z.string().optional(),
+            post_mortem: z.string().optional(),
             merge_conflict_resolution: z.string().optional(),
           })
           .passthrough()
@@ -444,6 +462,7 @@ export interface HermesRoleTemplatesConfig {
   worker: string;
   reviewer: string;
   planner: string;
+  postMortem: string;
   mergeConflictResolution: string;
 }
 
@@ -613,6 +632,14 @@ export interface IssueTriageConfig {
   maxAttemptsPerTrigger: number;
 }
 
+export interface PostMortemConfig {
+  enabled: boolean;
+  doneStates: string[];
+  requireLabels: string[];
+  excludeLabels: string[];
+  maxAttemptsPerTrigger: number;
+}
+
 export interface HandoffRepairConfig {
   enabled: boolean;
   maxAttempts: number;
@@ -648,6 +675,7 @@ export interface ServiceConfig {
   database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
   issueTriage: IssueTriageConfig;
+  postMortem: PostMortemConfig;
   handoffRepair: HandoffRepairConfig;
   raw: RawWorkflowConfig;
 }
@@ -679,6 +707,7 @@ const DEFAULT_HANDOFF_REPAIR_PHASES: AgentRunPhase[] = [
   "review",
   "issue_breakdown",
   "issue_triage",
+  "post_mortem",
   "merge_conflict_resolution",
 ];
 const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
@@ -1008,6 +1037,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
         worker: raw.hermes?.role_templates?.worker ?? "worker",
         reviewer: raw.hermes?.role_templates?.reviewer ?? "reviewer",
         planner: raw.hermes?.role_templates?.planner ?? "planner",
+        postMortem: raw.hermes?.role_templates?.post_mortem ?? raw.hermes?.role_templates?.reviewer ?? "reviewer",
         mergeConflictResolution: raw.hermes?.role_templates?.merge_conflict_resolution ?? "worker",
       },
     },
@@ -1093,6 +1123,13 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       enabled: raw.issue_triage?.enabled ?? false,
       mode: raw.issue_triage?.mode ?? "classify_only",
       maxAttemptsPerTrigger: raw.issue_triage?.max_attempts_per_trigger ?? 1,
+    },
+    postMortem: {
+      enabled: raw.post_mortem?.enabled ?? false,
+      doneStates: uniqueStateNames(raw.post_mortem?.done_states ?? [mergePolicy.doneState]),
+      requireLabels: normalizeLabels(raw.post_mortem?.require_labels),
+      excludeLabels: normalizeLabels(raw.post_mortem?.exclude_labels),
+      maxAttemptsPerTrigger: raw.post_mortem?.max_attempts_per_trigger ?? 1,
     },
     handoffRepair: {
       enabled: raw.handoff_repair?.enabled ?? false,

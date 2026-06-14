@@ -10,6 +10,7 @@ export type McpSubprocessCommand =
   | "merge-conflict-resolution-mcp"
   | "issue-breakdown-plan-mcp"
   | "issue-triage-mcp"
+  | "issue-post-mortem-mcp"
   | "operator-chat-mcp"
   | "review-verdict-mcp"
   | "review-feedback-mcp"

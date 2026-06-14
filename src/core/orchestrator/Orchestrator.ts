@@ -18,6 +18,7 @@ import {
   harnessSupportsMcpHandoff,
   renderCompletionMcpHandoffPrompt,
   renderIssueBreakdownMcpHandoffPrompt,
+  renderIssuePostMortemMcpHandoffPrompt,
   renderIssueTriageMcpHandoffPrompt,
   renderMergeConflictResolutionMcpHandoffPrompt,
   renderOperatorChatMcpPrompt,
@@ -63,6 +64,12 @@ import {
   shouldIssueTriageRun,
   sortIssueTriageBlockers,
 } from "../IssueTriageService.js";
+import {
+  issuePostMortemTriggerFingerprint,
+  latestIssuePostMortemReportForFingerprint,
+  shouldIssuePostMortemManualRun,
+  shouldIssuePostMortemRun,
+} from "../IssuePostMortemService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
 import { summarizeIssueContractForPrompt } from "../IssueContractLint.js";
 import {
@@ -126,6 +133,7 @@ import { FileWritebackOutboxStore, type WritebackProcessor } from "../writeback/
 import {
   planBlockedEscalationWritebacks,
   planDispatchWriteback,
+  planIssuePostMortemReportWritebacks,
   planIssueTriageReportWritebacks,
   planRunCancelledComment,
   planRunFailedComment,
@@ -190,7 +198,7 @@ export interface PromptPreviewOptions {
   force?: boolean;
 }
 
-export type ManualAgentRunStage = "worker" | "reviewer" | "triage" | "planner" | "merge_conflict";
+export type ManualAgentRunStage = "worker" | "reviewer" | "triage" | "planner" | "post_mortem" | "merge_conflict";
 
 export interface ManualAgentRunOptions {
   stage: ManualAgentRunStage;
@@ -300,6 +308,7 @@ export interface RunningEntry {
   mergeConflictResolutionAccepted: boolean;
   issueBreakdownPlanAccepted: boolean;
   issueTriageReportAccepted: boolean;
+  issuePostMortemReportAccepted: boolean;
   pullRequestHandoffAccepted: boolean;
   reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
@@ -360,6 +369,7 @@ type AcceptedHandoffKind =
   | "pull_request_handoff"
   | "issue_breakdown_plan"
   | "issue_triage_report"
+  | "issue_post_mortem_report"
   | "merge_conflict_resolution";
 type RepairableHandoffKind = AgentHandoffRepairKind;
 
@@ -378,6 +388,7 @@ interface OperatorChatQueueEntry {
 const PLANNING_NO_PLAN_ERROR = "Planning run completed without submit_issue_breakdown_plan";
 const PLANNING_FAILURE_DIAGNOSTIC_CODE = "planning_run_failed";
 const TRIAGE_NO_REPORT_ERROR = "Issue triage run completed without submit_issue_triage_report";
+const POST_MORTEM_NO_REPORT_ERROR = "Issue post-mortem run completed without submit_issue_post_mortem_report";
 
 export interface RuntimeSnapshot {
   generatedAt: string;
@@ -1305,7 +1316,9 @@ export class Orchestrator {
     if (roleReason !== null) return roleReason;
     const lifecycleAllowed = await this.lifecycleAllowsDispatch(issue, target.role, target.runPhase, {
       ...options,
-      manualDispatch: target.role === "triage" && target.runPhase === "issue_triage",
+      manualDispatch:
+        (target.role === "triage" && target.runPhase === "issue_triage") ||
+        (target.role === "post_mortem" && target.runPhase === "post_mortem"),
     });
     if (!lifecycleAllowed) return "lifecycle_gate_blocked";
     return null;
@@ -1326,7 +1339,9 @@ export class Orchestrator {
     if (roleReason !== null) return { reason: roleReason, explanation: null };
     const lifecycle = await this.lifecycleDispatchInspection(issue, target.role, target.runPhase, {
       ...options,
-      manualDispatch: target.role === "triage" && target.runPhase === "issue_triage",
+      manualDispatch:
+        (target.role === "triage" && target.runPhase === "issue_triage") ||
+        (target.role === "post_mortem" && target.runPhase === "post_mortem"),
     });
     if (lifecycle.blocked) {
       return { reason: "lifecycle_gate_blocked", explanation: lifecycle.explanation };
@@ -1342,7 +1357,7 @@ export class Orchestrator {
     const ignoreState = options.ignoreState === true;
     if (this.running.has(issue.id)) return "issue_already_running";
     if (this.pausedIssues.has(issue.id)) return "issue_paused";
-    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return "issue_in_terminal_state";
+    if (target.role !== "post_mortem" && isStateIn(issue.state, this.config.tracker.terminalStates)) return "issue_in_terminal_state";
     const labelReason = this.labelGuardrailBlockReason(issue, target.role, options);
     if (labelReason !== null) return labelReason;
 
@@ -1377,6 +1392,13 @@ export class Orchestrator {
       return null;
     }
 
+    if (target.role === "post_mortem") {
+      if (!this.config.postMortem.enabled || !this.options.lifecycleStore) return "post_mortem_not_configured";
+      if (!ignoreState && !isStateIn(issue.state, this.config.postMortem.doneStates)) return "issue_not_in_post_mortem_done_state";
+      if (!this.hasStateSlot(issue.state)) return "state_slot_unavailable";
+      return null;
+    }
+
     if (!this.config.issueBreakdown.enabled || !this.options.lifecycleStore) return "issue_breakdown_not_configured";
     if (!issue.assignedToWorker) return "planner_not_assigned";
     if (!ignoreState && this.isMergeConflictState(issue.state)) return "issue_in_merge_conflict_state";
@@ -1393,6 +1415,10 @@ export class Orchestrator {
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
     const missingRequired = this.config.agent.requireLabels.find((label) => !labels.has(label));
     if (missingRequired) return `missing_required_label:${missingRequired}`;
+    if (role === "post_mortem") {
+      const missingPostMortemRequired = this.config.postMortem.requireLabels.find((label) => !labels.has(label));
+      if (missingPostMortemRequired) return `post_mortem_missing_required_label:${missingPostMortemRequired}`;
+    }
     if (options.ignoreExcludeLabels === true) return null;
     const globalExcluded = this.config.agent.excludeLabels.find((label) => labels.has(label));
     if (globalExcluded) return `excluded_label:${globalExcluded}`;
@@ -1407,6 +1433,10 @@ export class Orchestrator {
     if (role === "planner") {
       const excluded = this.config.agent.plannerExcludeLabels.find((label) => labels.has(label));
       if (excluded) return `planner_excluded_label:${excluded}`;
+    }
+    if (role === "post_mortem") {
+      const excluded = this.config.postMortem.excludeLabels.find((label) => labels.has(label));
+      if (excluded) return `post_mortem_excluded_label:${excluded}`;
     }
     return null;
   }
@@ -1425,7 +1455,7 @@ export class Orchestrator {
       return {
         status: "rendered",
         role: forcedRole,
-        runPhase: forcedPhase ?? (forcedRole === "reviewer" ? "review" : forcedRole === "triage" ? "issue_triage" : forcedRole === "planner" ? "issue_breakdown" : "implementation"),
+        runPhase: forcedPhase ?? defaultRunPhaseForRole(forcedRole),
       };
     }
 
@@ -1447,6 +1477,11 @@ export class Orchestrator {
       return this.shouldDispatchPlanner(issue, true)
         ? { status: "rendered", role: "planner", runPhase: "issue_breakdown" }
         : { status: "no_prompt", role: "planner", runPhase: "issue_breakdown", reason: "planner_would_not_dispatch" };
+    }
+    if (forcedRole === "post_mortem" || (!forcedRole && isStateIn(issue.state, this.config.postMortem.doneStates))) {
+      return this.shouldDispatchPostMortem(issue, true)
+        ? { status: "rendered", role: "post_mortem", runPhase: "post_mortem" }
+        : { status: "no_prompt", role: "post_mortem", runPhase: "post_mortem", reason: "post_mortem_would_not_dispatch" };
     }
     if (forcedRole === "worker" || isStateIn(issue.state, this.config.tracker.activeStates) || this.isMergeConflictState(issue.state)) {
       const runPhase = forcedPhase ?? (this.isMergeConflictState(issue.state) ? "merge_conflict_resolution" : "implementation");
@@ -1507,6 +1542,7 @@ export class Orchestrator {
       mergeConflictResolutionAccepted: false,
       issueBreakdownPlanAccepted: false,
       issueTriageReportAccepted: false,
+      issuePostMortemReportAccepted: false,
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence: null,
@@ -1544,6 +1580,7 @@ export class Orchestrator {
   private async renderPromptBundleForPreview(entry: RunningEntry, workspace: Workspace): Promise<AgentPromptBundle> {
     if (entry.role === "planner") return this.renderIssueBreakdownPromptBundle(entry, null);
     if (entry.role === "triage") return this.renderIssueTriagePromptBundle(entry);
+    if (entry.role === "post_mortem") return this.renderIssuePostMortemPromptBundle(entry);
     if (entry.role === "reviewer") {
       const evidence = entry.reviewEvidence ?? (await this.loadReviewerDispatchEvidence(entry.issue));
       if (!evidence) throw new SymphonyError("invalid_request", "Reviewer prompt preview requires completion report evidence");
@@ -1729,6 +1766,7 @@ export class Orchestrator {
       }
       await this.reconcileIssueTriageIssues();
       await this.reconcileMergePolicyIssues();
+      await this.reconcileIssuePostMortemIssues();
     } catch (error) {
       this.options.logger.warn("orchestrator tick failed", { error: errorMessage(error) });
     } finally {
@@ -1853,7 +1891,7 @@ export class Orchestrator {
       const ignoreStateForManualRun = entry.manualDispatch?.ignoreState === true;
       const preservePendingApprovalWorker =
         entry.role === "worker" && (await this.hasPendingPublicationApprovalHandoff(entry));
-      if (isStateIn(latest.state, this.config.tracker.terminalStates)) {
+      if (entry.role !== "post_mortem" && isStateIn(latest.state, this.config.tracker.terminalStates)) {
         await this.terminateRunningIssue(issueId, true, "terminal state");
       } else if (preservePendingApprovalWorker) {
         entry.lastMessage = "Awaiting operator approval for push/PR";
@@ -1869,6 +1907,8 @@ export class Orchestrator {
         await this.terminateRunningIssue(issueId, false, "non-review state");
       } else if (entry.role === "triage" && !ignoreStateForManualRun && !isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
         await this.terminateRunningIssue(issueId, false, "non-blocked state");
+      } else if (entry.role === "post_mortem" && !ignoreStateForManualRun && !isStateIn(latest.state, this.config.postMortem.doneStates)) {
+        await this.terminateRunningIssue(issueId, false, "non-post-mortem-done state");
       } else if (
         entry.role === "planner" &&
         !ignoreStateForManualRun &&
@@ -1975,6 +2015,16 @@ export class Orchestrator {
     return this.hasStateSlot(issue.state);
   }
 
+  private shouldDispatchPostMortem(issue: Issue, allowExistingClaim = false, options: DispatchGateOptions = {}): boolean {
+    if (!this.config.postMortem.enabled || !this.options.lifecycleStore) return false;
+    if (this.running.has(issue.id)) return false;
+    if (this.pausedIssues.has(issue.id)) return false;
+    if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
+    if (!isStateIn(issue.state, this.config.postMortem.doneStates)) return false;
+    if (!this.passesLabelGuardrails(issue, "post_mortem", options)) return false;
+    return this.hasStateSlot(issue.state);
+  }
+
   private shouldDispatchPlanner(issue: Issue, allowExistingClaim = false, options: DispatchGateOptions = {}): boolean {
     if (!this.config.issueBreakdown.enabled || !this.options.lifecycleStore) return false;
     if (this.running.has(issue.id)) return false;
@@ -1995,7 +2045,7 @@ export class Orchestrator {
   private async lifecycleAllowsDispatch(
     issue: Issue,
     role: AgentRunRole,
-    runPhase: AgentRunPhase = role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : role === "planner" ? "issue_breakdown" : "implementation",
+    runPhase: AgentRunPhase = defaultRunPhaseForRole(role),
     options: DispatchGateOptions & { manualDispatch?: boolean } = {},
   ): Promise<boolean> {
     const store = this.options.lifecycleStore;
@@ -2007,6 +2057,15 @@ export class Orchestrator {
       return runPhase === "issue_triage" && (options.manualDispatch === true
         ? shouldIssueTriageManualRun(lifecycle, this.config)
         : shouldIssueTriageRun(lifecycle, this.config));
+    }
+
+    if (role === "post_mortem") {
+      return (
+        runPhase === "post_mortem" &&
+        (options.manualDispatch === true
+          ? shouldIssuePostMortemManualRun(lifecycle, this.config)
+          : shouldIssuePostMortemRun(lifecycle, issue, this.config))
+      );
     }
 
     const phase = phaseForIssueState(issue.state, this.config);
@@ -2106,7 +2165,7 @@ export class Orchestrator {
   private async lifecycleDispatchInspection(
     issue: Issue,
     role: AgentRunRole,
-    runPhase: AgentRunPhase = role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : role === "planner" ? "issue_breakdown" : "implementation",
+    runPhase: AgentRunPhase = defaultRunPhaseForRole(role),
     options: DispatchGateOptions & { manualDispatch?: boolean } = {},
   ): Promise<{ blocked: boolean; explanation: string | null }> {
     const store = this.options.lifecycleStore;
@@ -2125,6 +2184,24 @@ export class Orchestrator {
         explanation: allowed
           ? `Issue triage is eligible for blocked reason: ${lifecycle.blockedReason ?? "n/a"}.`
           : `Issue triage is not eligible for lifecycle phase=${lifecycle.phase}, blockedReason=${lifecycle.blockedReason ?? "n/a"}.`,
+      };
+    }
+
+    if (role === "post_mortem") {
+      const allowed =
+        runPhase === "post_mortem" &&
+        (options.manualDispatch === true
+          ? shouldIssuePostMortemManualRun(lifecycle, this.config)
+          : shouldIssuePostMortemRun(lifecycle, issue, this.config));
+      const fingerprint = issuePostMortemTriggerFingerprint(lifecycle, issue);
+      const existing = latestIssuePostMortemReportForFingerprint(lifecycle, fingerprint);
+      return {
+        blocked: !allowed,
+        explanation: allowed
+          ? `Issue post-mortem is eligible for completion/review trigger ${fingerprint}.`
+          : existing
+            ? `Issue post-mortem already exists for completion/review trigger ${fingerprint}.`
+            : "Issue post-mortem is not eligible; it requires enabled config, configured Done state, accepted completion report, and current passing review evidence.",
       };
     }
 
@@ -2224,11 +2301,13 @@ export class Orchestrator {
   private passesLabelGuardrails(issue: Issue, role: AgentRunRole | "merge_policy", options: DispatchGateOptions = {}): boolean {
     const labels = new Set(issue.labels.map((label) => label.toLowerCase()));
     if (this.config.agent.requireLabels.some((label) => !labels.has(label))) return false;
+    if (role === "post_mortem" && this.config.postMortem.requireLabels.some((label) => !labels.has(label))) return false;
     if (options.ignoreExcludeLabels === true) return true;
     if (this.config.agent.excludeLabels.some((label) => labels.has(label))) return false;
     if (role === "worker" && this.config.agent.workerExcludeLabels.some((label) => labels.has(label))) return false;
     if (role === "reviewer" && this.config.agent.reviewerExcludeLabels.some((label) => labels.has(label))) return false;
     if (role === "planner" && this.config.agent.plannerExcludeLabels.some((label) => labels.has(label))) return false;
+    if (role === "post_mortem" && this.config.postMortem.excludeLabels.some((label) => labels.has(label))) return false;
     return true;
   }
 
@@ -2415,6 +2494,78 @@ export class Orchestrator {
     return true;
   }
 
+  private async reconcileIssuePostMortemIssues(): Promise<void> {
+    if (!this.config.postMortem.enabled || !this.options.lifecycleStore || this.config.postMortem.doneStates.length === 0) {
+      return;
+    }
+    let candidates: Issue[];
+    try {
+      candidates = await this.options.tracker.fetchIssuesByStates(this.config.postMortem.doneStates);
+    } catch (error) {
+      this.options.logger.warn("issue post-mortem candidate fetch failed", { error: errorMessage(error) });
+      return;
+    }
+    for (const issue of sortIssuesForDispatch(candidates)) {
+      await this.reconcileIssuePostMortemReportWriteback(issue);
+      if (this.availableSlots() <= 0) break;
+      await this.tryDispatchIssuePostMortem(issue);
+    }
+  }
+
+  private async reconcileIssuePostMortemReportWriteback(issue: Issue): Promise<void> {
+    if (!this.options.lifecycleStore) return;
+    const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    if (!lifecycle) return;
+    const report = latestIssuePostMortemReportForFingerprint(lifecycle, issuePostMortemTriggerFingerprint(lifecycle, issue));
+    if (!report || report.writebackOperationKeys.length > 0) return;
+    const operations = planIssuePostMortemReportWritebacks({ issue, report }, this.config);
+    if (operations.length === 0) return;
+
+    await this.applyWritebacks(operations, "issue post-mortem report writeback reconciliation");
+    const operationKeys = operations.map((operation) => operation.idempotencyKey);
+    const current = (await this.options.lifecycleStore.get(issue.id)) ?? lifecycle;
+    await this.options.lifecycleStore.updateIssue(issue, {
+      lastPostMortemReportId: current.lastPostMortemReportId ?? report.id,
+      postMortemReports: current.postMortemReports.map((candidate) =>
+        candidate.id === report.id
+          ? {
+              ...candidate,
+              writebackOperationKeys: operationKeys,
+            }
+          : candidate,
+      ),
+    });
+  }
+
+  private async tryDispatchIssuePostMortem(issue: Issue, allowExistingClaim = false): Promise<boolean> {
+    if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
+    if (!this.shouldDispatchPostMortem(issue, allowExistingClaim)) return false;
+    if (!(await this.lifecycleAllowsDispatch(issue, "post_mortem", "post_mortem"))) return false;
+
+    let refreshed: Issue[];
+    try {
+      refreshed = await this.options.tracker.fetchIssueStatesByIds([issue.id]);
+    } catch (error) {
+      this.options.logger.warn("pre-post-mortem issue refresh failed", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        error: errorMessage(error),
+      });
+      return false;
+    }
+
+    const latest = refreshed[0];
+    if (!latest) return false;
+    if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
+    if (!this.shouldDispatchPostMortem(latest, allowExistingClaim)) return false;
+    if (!(await this.lifecycleAllowsDispatch(latest, "post_mortem", "post_mortem"))) return false;
+
+    this.dispatchIssue(latest, null, "post_mortem", null, "post_mortem");
+    return true;
+  }
+
   private async tryDispatchPlanner(issue: Issue, allowExistingClaim = false, attempt: number | null = null): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
@@ -2488,7 +2639,7 @@ export class Orchestrator {
     attempt: number | null,
     role: AgentRunRole,
     reviewEvidence: ReviewerDispatchEvidence | null,
-    runPhase: AgentRunPhase = role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : role === "planner" ? "issue_breakdown" : "implementation",
+    runPhase: AgentRunPhase = defaultRunPhaseForRole(role),
     manualDispatch: RunningEntry["manualDispatch"] = null,
   ): RunningEntry {
     const abortController = new AbortController();
@@ -2527,6 +2678,7 @@ export class Orchestrator {
       mergeConflictResolutionAccepted: false,
       issueBreakdownPlanAccepted: false,
       issueTriageReportAccepted: false,
+      issuePostMortemReportAccepted: false,
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence,
@@ -2549,7 +2701,13 @@ export class Orchestrator {
     this.claimed.add(issue.id);
     this.clearRetry(issue.id);
     const run =
-      role === "reviewer" ? this.runReviewer(entry) : role === "triage" ? this.runIssueTriage(entry) : this.runWorker(entry, attempt);
+      role === "reviewer"
+        ? this.runReviewer(entry)
+        : role === "triage"
+          ? this.runIssueTriage(entry)
+          : role === "post_mortem"
+            ? this.runIssuePostMortem(entry)
+            : this.runWorker(entry, attempt);
     const worker = this.monitorRunExit(entry, run);
     entry.worker = worker;
     this.activeWorkers.add(worker);
@@ -2838,6 +2996,65 @@ export class Orchestrator {
     }
   }
 
+  private async runIssuePostMortem(entry: RunningEntry): Promise<void> {
+    let workspace: Workspace | null = null;
+    try {
+      const lifecycle = (await this.options.lifecycleStore?.get(entry.issue.id)) ?? null;
+      const eligible =
+        entry.manualDispatch === null
+          ? shouldIssuePostMortemRun(lifecycle, entry.issue, this.config)
+          : shouldIssuePostMortemManualRun(lifecycle, this.config);
+      if (!eligible) {
+        this.options.logger.warn("issue post-mortem dispatch skipped because lifecycle is not post-mortem-eligible", {
+          issue_id: entry.issue.id,
+          issue_identifier: entry.issue.identifier,
+          manual_dispatch: entry.manualDispatch !== null,
+        });
+        return;
+      }
+      if (!lifecycle) return;
+      const eligibleLifecycle = lifecycle;
+      entry.lifecycle = lifecycle;
+      workspace = await this.options.workspaceManager.createForIssue(entry.issue);
+      entry.workspacePath = workspace.path;
+      entry.workspace = workspace;
+      await this.updateLifecycle(entry, {
+        summaryPointers: {
+          workspaceKey: workspace.workspaceKey,
+          workspacePath: workspace.path,
+          branchName: workspace.gitBranchName ?? entry.issue.branchName ?? eligibleLifecycle.summaryPointers.branchName,
+          gitBranchName: workspace.gitBranchName ?? entry.issue.branchName ?? eligibleLifecycle.summaryPointers.gitBranchName,
+          repoPath: workspace.repoPath ?? eligibleLifecycle.summaryPointers.repoPath,
+          baseRef: workspace.baseRef ?? eligibleLifecycle.summaryPointers.baseRef,
+        },
+      });
+      await this.options.workspaceManager.beforeRun(workspace.path);
+      await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, null, 1));
+      await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
+      this.requireMcpHandoff("post_mortem");
+
+      entry.turnCount = 1;
+      const promptBundle = await this.renderIssuePostMortemPromptBundle(entry);
+      this.assertPromptBundleSupported(promptBundle);
+      await this.consumeHarnessEvents(
+        entry,
+        this.options.harness.run(this.buildRunContext(entry, workspace, null, 1, promptBundle), promptBundle.userPrompt),
+        {
+          workspace,
+          prompt: promptBundle.userPrompt,
+          promptBundle,
+          attempt: null,
+          turnNumber: 1,
+        },
+      );
+      await this.runHandoffRepairIfNeeded(entry, workspace, null, 2);
+    } finally {
+      if (workspace) {
+        await this.options.workspaceManager.afterRun(workspace.path);
+      }
+    }
+  }
+
   private async consumeHarnessEvents(
     entry: RunningEntry,
     events: AsyncIterable<AgentEvent>,
@@ -2967,6 +3184,26 @@ export class Orchestrator {
             status: "failed",
             completedAt,
             error: TRIAGE_NO_REPORT_ERROR,
+            tokens: entry.activeRunTokens,
+            metadata: terminalRunMetadata(entry, "failed"),
+          });
+          await this.persistHarnessEvent(entry, event);
+          if (!terminal.updated) return;
+          continue;
+        }
+        if (entry.runPhase === "post_mortem") {
+          const accepted = await this.reconcileIssuePostMortemHandoff(entry);
+          if (accepted) {
+            const terminal = await this.terminalizeAcceptedHandoff(entry, "issue_post_mortem_report");
+            await this.persistHarnessEvent(entry, event);
+            if (!terminal.updated) return;
+            continue;
+          }
+          const completedAt = new Date().toISOString();
+          const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
+            status: "failed",
+            completedAt,
+            error: POST_MORTEM_NO_REPORT_ERROR,
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "failed"),
           });
@@ -3157,6 +3394,11 @@ export class Orchestrator {
         ? "issue_triage_report"
         : null;
     }
+    if (entry.role === "post_mortem") {
+      return entry.issuePostMortemReportAccepted || (await this.reconcileIssuePostMortemHandoff(entry))
+        ? "issue_post_mortem_report"
+        : null;
+    }
     if (entry.role === "planner" && entry.runPhase === "issue_breakdown") {
       return entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry))
         ? "issue_breakdown_plan"
@@ -3259,6 +3501,23 @@ export class Orchestrator {
           status: entry.suppressRetryOnExit ? "cancelled" : "failed",
           completedAt: new Date().toISOString(),
           error: entry.suppressRetryOnExit ? error : error ?? TRIAGE_NO_REPORT_ERROR,
+          tokens: entry.activeRunTokens,
+          metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
+        });
+      }
+      this.claimed.delete(issueId);
+      return;
+    }
+
+    if (entry.runPhase === "post_mortem") {
+      const accepted = entry.issuePostMortemReportAccepted || (await this.reconcileIssuePostMortemHandoff(entry));
+      if (accepted && entry.runId) {
+        await this.terminalizeAcceptedHandoff(entry, "issue_post_mortem_report");
+      } else if (entry.runId) {
+        await this.updateRunTerminalStateIfRunning(entry.runId, {
+          status: entry.suppressRetryOnExit ? "cancelled" : "failed",
+          completedAt: new Date().toISOString(),
+          error: entry.suppressRetryOnExit ? error : error ?? POST_MORTEM_NO_REPORT_ERROR,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
         });
@@ -3841,6 +4100,11 @@ export class Orchestrator {
         ? null
         : "issue_triage_report";
     }
+    if (entry.role === "post_mortem") {
+      return entry.issuePostMortemReportAccepted || (await this.reconcileIssuePostMortemHandoff(entry))
+        ? null
+        : "issue_post_mortem_report";
+    }
     if (entry.role === "reviewer") {
       return entry.reviewVerdictAccepted || (await this.reconcileReviewVerdictHandoff(entry)) ? null : "review_verdict";
     }
@@ -3875,6 +4139,8 @@ export class Orchestrator {
         return entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
       case "issue_triage_report":
         return entry.issueTriageReportAccepted || (await this.reconcileIssueTriageHandoff(entry));
+      case "issue_post_mortem_report":
+        return entry.issuePostMortemReportAccepted || (await this.reconcileIssuePostMortemHandoff(entry));
       case "merge_conflict_resolution":
         return entry.mergeConflictResolutionAccepted || (await this.reconcileMergeConflictResolutionHandoff(entry));
     }
@@ -4001,6 +4267,8 @@ export class Orchestrator {
         return this.issueBreakdownMcpPrompt(entry);
       case "issue_triage_report":
         return this.issueTriageMcpPrompt(entry);
+      case "issue_post_mortem_report":
+        return this.issuePostMortemMcpPrompt(entry);
       case "merge_conflict_resolution":
         return this.mergeConflictResolutionMcpPrompt(entry) ?? "";
     }
@@ -4343,6 +4611,32 @@ export class Orchestrator {
         run_id: runId,
         report_id: report.id,
         blockers: report.blockers.map((blocker) => ({ kind: blocker.kind, status: blocker.status, nextActor: blocker.nextActor })),
+      });
+    }
+
+    return true;
+  }
+
+  private async reconcileIssuePostMortemHandoff(entry: RunningEntry): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!store || !runId) return entry.issuePostMortemReportAccepted;
+    const lifecycle = await store.get(entry.issue.id);
+    const report = lifecycle?.postMortemReports.find((item) => item.runId === runId) ?? null;
+    if (!lifecycle || !report) return entry.issuePostMortemReportAccepted;
+    entry.lifecycle = lifecycle;
+    entry.issuePostMortemReportAccepted = true;
+
+    if (this.options.writeback) {
+      await this.options.writeback.processDue();
+    } else if (this.config.writeback.enabled) {
+      this.options.logger.warn("issue post-mortem report accepted but writeback processor is not configured", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        run_id: runId,
+        report_id: report.id,
+        completion_status: report.completionJudgment.status,
+        specification_quality: report.specificationAssessment.quality,
       });
     }
 
@@ -4947,6 +5241,112 @@ export class Orchestrator {
     );
   }
 
+  private async renderIssuePostMortemPrompt(entry: RunningEntry): Promise<string> {
+    const lifecycle = (await this.options.lifecycleStore?.get(entry.issue.id)) ?? entry.lifecycle;
+    if (!lifecycle) throw new SymphonyError("invalid_request", "Issue post-mortem prompt requires lifecycle evidence");
+    const workspace = entry.workspace;
+    const report = latestCompletionReport(lifecycle);
+    const verdict = latestReviewVerdict(lifecycle);
+    const triggerFingerprint = issuePostMortemTriggerFingerprint(lifecycle, entry.issue);
+    if (this.config.prompts.templates["post_mortem.issue_done.analyze"] !== undefined) {
+      const basePrompt = await this.renderConfiguredPromptTemplate("post_mortem.issue_done.analyze", "", {
+        issue: entry.issue,
+        attempt: null,
+        role: entry.role,
+        lifecycle,
+        report,
+        verdict,
+        triggerFingerprint,
+      });
+      return [basePrompt, this.issuePostMortemMcpPrompt(entry)].join("\n");
+    }
+    return [
+      `Post-mortem ${entry.issue.identifier} after Done.`,
+      "",
+      "You are a scoped, read-only Symphony post-mortem agent. Perform an exhaustive outcome review, but do not reopen the issue or mutate any external state.",
+      "Your output is a report for humans: judge whether Done was valid under the explicit issue contract, identify specification/process lessons, and propose follow-up candidates.",
+      "",
+      "Issue:",
+      `- Identifier: ${entry.issue.identifier}`,
+      `- Title: ${entry.issue.title}`,
+      `- State: ${entry.issue.state}`,
+      `- URL: ${entry.issue.url ?? "n/a"}`,
+      `- Labels: ${formatList(entry.issue.labels)}`,
+      `- Has children: ${entry.issue.hasChildren === true ? "yes" : "no"}`,
+      "",
+      "Post-mortem trigger:",
+      `- Trigger fingerprint: ${triggerFingerprint}`,
+      `- Lifecycle phase: ${lifecycle.phase}`,
+      `- Review round: ${lifecycle.reviewRound}`,
+      `- Incomplete worker turns: ${lifecycle.incompleteTurnCount}`,
+      "",
+      "Workspace/git evidence:",
+      `- Workspace path: ${workspace?.path ?? lifecycle.summaryPointers.workspacePath ?? entry.workspacePath ?? "n/a"}`,
+      `- Branch: ${workspace?.gitBranchName ?? lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName ?? entry.issue.branchName ?? "n/a"}`,
+      `- Repository path: ${workspace?.repoPath ?? lifecycle.summaryPointers.repoPath ?? "n/a"}`,
+      `- Base ref: ${workspace?.baseRef ?? lifecycle.summaryPointers.baseRef ?? "n/a"}`,
+      `- Pull request: ${formatPullRequest(lifecycle.summaryPointers.prNumber, lifecycle.summaryPointers.prUrl)}`,
+      `- PR head SHA: ${lifecycle.summaryPointers.prHeadSha ?? "n/a"}`,
+      `- CI status: ${lifecycle.summaryPointers.ciStatus ?? "n/a"}`,
+      "",
+      "Latest completion report:",
+      ...(report
+        ? [
+            `- Report: ${report.id}; run: ${report.runId}`,
+            `- Summary: ${report.summary}`,
+            `- Changed files: ${formatList(report.changedFiles)}`,
+            `- Validation: ${formatList(report.validationEvidence)}`,
+            `- Risks: ${formatList(report.risks)}`,
+            "Acceptance checklist:",
+            ...report.acceptanceChecklist.map(
+              (item) => `- ${item.satisfied ? "[x]" : "[ ]"} ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`,
+            ),
+          ]
+        : ["- None"]),
+      "",
+      "Latest review verdict:",
+      ...(verdict
+        ? [
+            `- Verdict: ${verdict.verdict}; record: ${verdict.id}; run: ${verdict.runId}`,
+            `- Findings: ${formatList(verdict.findings)}`,
+            `- Evidence: ${formatList(verdict.evidence)}`,
+            "Gate findings:",
+            ...formatDirectiveGateFindings(verdict),
+            "Discovery findings:",
+            ...formatDirectiveDiscoveryFindings(verdict),
+            "Acceptance results:",
+            ...verdict.acceptanceResults.map(
+              (item) => `- ${item.satisfied ? "[x]" : "[ ]"} ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`,
+            ),
+          ]
+        : ["- None"]),
+      "",
+      "Review history signals:",
+      ...reviewScopeDiscoveryLedgerLines(lifecycle),
+      "",
+      "Assessment standard:",
+      "- completionJudgment.status=valid_done only when Done appears correct and no material follow-up is worth tracking.",
+      "- completionJudgment.status=valid_with_followups when Done appears valid under the explicit contract but hardening, tests, decomposition, or process follow-up should be tracked.",
+      "- completionJudgment.status=questionable_done only when there is a likely contract-entitled defect that should have blocked Done.",
+      "- missedGateFindings are only for explicit-contract defects or necessary core behavior failures that should have blocked final approval.",
+      "- missedDiscoveryFindings and followUpCandidates are for non-gating hardening, hidden scope, weak specification, matrix gaps, sibling scope, or future work.",
+      "- Use speckitRecommended when follow-up work should go through specify, plan, tasks, and analyze before implementation.",
+      "",
+      this.issuePostMortemMcpPrompt(entry),
+    ].join("\n");
+  }
+
+  private async renderIssuePostMortemPromptBundle(entry: RunningEntry): Promise<AgentPromptBundle> {
+    const userPrompt = await this.renderIssuePostMortemPrompt(entry);
+    return this.renderPromptBundle(
+      entry,
+      userPrompt,
+      "post_mortem.issue_done.analyze",
+      { issue: entry.issue, attempt: null, role: entry.role, lifecycle: entry.lifecycle },
+      { attempt: null, turnNumber: 1 },
+    );
+  }
+
   private async renderMergeConflictResolutionPrompt(entry: RunningEntry): Promise<string> {
     const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
     const conflict = lifecycle?.mergeConflict ?? null;
@@ -5010,6 +5410,19 @@ export class Orchestrator {
     this.requireMcpHandoff("issue_triage");
     const workspace = entry.workspace;
     return renderIssueTriageMcpHandoffPrompt({
+      issue: entry.issue,
+      role: entry.role,
+      workspacePath: workspace?.path ?? entry.workspacePath,
+      branchName: workspace?.gitBranchName ?? entry.issue.branchName ?? null,
+      repoPath: workspace?.repoPath ?? null,
+      baseRef: workspace?.baseRef ?? null,
+    });
+  }
+
+  private issuePostMortemMcpPrompt(entry: RunningEntry): string {
+    this.requireMcpHandoff("post_mortem");
+    const workspace = entry.workspace;
+    return renderIssuePostMortemMcpHandoffPrompt({
       issue: entry.issue,
       role: entry.role,
       workspacePath: workspace?.path ?? entry.workspacePath,
@@ -5459,6 +5872,8 @@ function phaseForRepairableHandoffKind(kind: RepairableHandoffKind): AgentRunPha
       return "issue_breakdown";
     case "issue_triage_report":
       return "issue_triage";
+    case "issue_post_mortem_report":
+      return "post_mortem";
     case "merge_conflict_resolution":
       return "merge_conflict_resolution";
   }
@@ -5478,6 +5893,8 @@ function repairToolName(kind: RepairableHandoffKind): string {
       return "submit_issue_breakdown_plan";
     case "issue_triage_report":
       return "submit_issue_triage_report";
+    case "issue_post_mortem_report":
+      return "submit_issue_post_mortem_report";
     case "merge_conflict_resolution":
       return "submit_merge_conflict_resolution";
   }
@@ -5745,6 +6162,7 @@ function cleanRuntimeMetadataString(value: string | null | undefined): string | 
 
 function hermesTemplateForEntry(entry: RunningEntry, config: ServiceConfig): string {
   if (entry.role === "reviewer") return config.hermes.roleTemplates.reviewer;
+  if (entry.role === "post_mortem") return config.hermes.roleTemplates.postMortem;
   if (entry.runPhase === "issue_breakdown") return config.hermes.roleTemplates.planner;
   if (entry.runPhase === "merge_conflict_resolution") return config.hermes.roleTemplates.mergeConflictResolution;
   return config.hermes.roleTemplates.worker;
@@ -5931,6 +6349,9 @@ function currentObjectiveDirective(
   if (entry.runPhase === "issue_triage") {
     return "Identify every blocker behind this max-failure block and submit a read-only issue triage blocker report.";
   }
+  if (entry.runPhase === "post_mortem") {
+    return "Perform a read-only post-mortem for the completed issue and submit an exhaustive issue post-mortem report.";
+  }
   if (entry.runPhase === "review") {
     return "Perform an exhaustive independent review against the issue contract and current implementation evidence.";
   }
@@ -6103,6 +6524,14 @@ function successConditionsForRun(
       "- Call submit_issue_triage_report before ending the run.",
     ].join("\n");
   }
+  if (entry.runPhase === "post_mortem") {
+    return [
+      "- Judge whether Done was valid under the explicit contract standard.",
+      "- Report hardening opportunities, hidden scope, weak specification, and process lessons as follow-up candidates rather than retroactive gates unless they are contract-entitled defects.",
+      "- Include completionJudgment, specificationAssessment, reviewAssessment, followUpCandidates, and processLessons.",
+      "- Call submit_issue_post_mortem_report before ending the run.",
+    ].join("\n");
+  }
   if (entry.runPhase === "issue_breakdown") {
     return [
       "- Complete specify, plan, tasks, analyze, fix, and task-to-Linear issue planning in one planner session.",
@@ -6134,6 +6563,13 @@ function scopeGuardsForRun(entry: RunningEntry, _options: { turnNumber: number }
     "- The current run directive is authoritative over stale session assumptions.",
     "- Do not commit, push, transition Linear, comment on Linear, or create/update GitHub PRs directly unless a Symphony MCP tool explicitly performs that service-owned action.",
   ];
+  if (entry.runPhase === "post_mortem") {
+    return [
+      "- This run is read-only except for the required Symphony MCP post-mortem handoff.",
+      "- Do not edit files or alter repository, Linear, or GitHub state directly.",
+      ...common,
+    ].join("\n");
+  }
   if (entry.runPhase === "review" || entry.runPhase === "issue_triage") {
     return [
       "- This run is read-only except for the required Symphony MCP handoff and allowed review feedback.",
@@ -6162,6 +6598,8 @@ function requiredHandoffForRun(entry: RunningEntry): string {
       return "Call submit_review_verdict before ending the run.";
     case "issue_triage":
       return "Call submit_issue_triage_report before ending the run.";
+    case "post_mortem":
+      return "Call submit_issue_post_mortem_report before ending the run.";
     case "issue_breakdown":
       return "Call submit_issue_breakdown_plan before ending the run.";
     case "merge_conflict_resolution":
@@ -6181,8 +6619,25 @@ function manualAgentRunTarget(stage: ManualAgentRunStage): { role: AgentRunRole;
       return { role: "triage", runPhase: "issue_triage" };
     case "planner":
       return { role: "planner", runPhase: "issue_breakdown" };
+    case "post_mortem":
+      return { role: "post_mortem", runPhase: "post_mortem" };
     case "merge_conflict":
       return { role: "worker", runPhase: "merge_conflict_resolution" };
+  }
+}
+
+function defaultRunPhaseForRole(role: AgentRunRole): AgentRunPhase {
+  switch (role) {
+    case "reviewer":
+      return "review";
+    case "triage":
+      return "issue_triage";
+    case "post_mortem":
+      return "post_mortem";
+    case "planner":
+      return "issue_breakdown";
+    case "worker":
+      return "implementation";
   }
 }
 
@@ -6389,6 +6844,8 @@ function formatAcceptedHandoffKind(kind: AcceptedHandoffKind): string {
       return "issue breakdown plan";
     case "issue_triage_report":
       return "issue triage report";
+    case "issue_post_mortem_report":
+      return "issue post-mortem report";
     case "merge_conflict_resolution":
       return "merge conflict resolution";
   }

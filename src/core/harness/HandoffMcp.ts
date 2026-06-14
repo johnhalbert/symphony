@@ -2,6 +2,7 @@ import path from "node:path";
 import type { AgentHarness, AgentRunContext, OperatorChatRunContext } from "./AgentHarness.js";
 import { writeCompletionReportMcpContext } from "./CompletionReportMcpServer.js";
 import { writeIssueBreakdownPlanMcpContext } from "./IssueBreakdownPlanMcpServer.js";
+import { writeIssuePostMortemMcpContext } from "./IssuePostMortemMcpServer.js";
 import { writeIssueTriageMcpContext } from "./IssueTriageMcpServer.js";
 import { writeMergeConflictResolutionMcpContext } from "./MergeConflictResolutionMcpServer.js";
 import {
@@ -63,6 +64,12 @@ export function symphonyRoleMcpServers(
   if (ctx.role === "triage" && currentRunPhase(ctx) === "issue_triage") {
     return {
       symphony_triage: applyCwd(issueTriageMcpServerConfig(ctx, issueTriageContextFilePath(ctx), options)),
+      ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
+    };
+  }
+  if (ctx.role === "post_mortem" && currentRunPhase(ctx) === "post_mortem") {
+    return {
+      symphony_post_mortem: applyCwd(issuePostMortemMcpServerConfig(ctx, issuePostMortemContextFilePath(ctx), options)),
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
     };
   }
@@ -207,6 +214,26 @@ export function renderIssueTriageMcpHandoffPrompt(input: RuntimeHandoffPromptInp
   ].join("\n");
 }
 
+export function renderIssuePostMortemMcpHandoffPrompt(input: RuntimeHandoffPromptInput): string {
+  return [
+    "",
+    "Symphony MCP issue-post-mortem handoff:",
+    `- Active issue: ${input.issue.identifier} (${input.issue.id})`,
+    "- Active role: post_mortem",
+    "- Active phase: post_mortem",
+    `- Workspace path: ${input.workspacePath ?? "n/a"}`,
+    `- Repository path: ${input.repoPath ?? "n/a"}`,
+    `- Base ref: ${input.baseRef ?? "n/a"}`,
+    "- Before ending the run, call the submit_issue_post_mortem_report MCP tool with summary, completionJudgment, specificationAssessment, reviewAssessment, followUpCandidates, processLessons, and idempotencyKey.",
+    "- This is an exhaustive read-only post-mortem. Inspect the issue contract, lifecycle evidence, final worker report, final review, PR, tests, and repository context as needed.",
+    "- Do not edit files, create commits, push branches, transition Linear state, comment on Linear, create subissues, or reopen work.",
+    "- Keep the gate assessment bounded: missedGateFindings are only for defects that should have blocked Done under the explicit contract standard.",
+    "- Put hardening opportunities, hidden scope, weak specifications, missing matrix lanes, and future work in followUpCandidates or missedDiscoveryFindings instead of treating them as retroactive gate failures.",
+    "- Use speckitRecommended when the follow-up work should go through specify/plan/tasks/analyze before implementation.",
+    "- After the MCP tool accepts the report, Symphony publishes a service-owned Linear post-mortem comment. Do not write to Linear directly.",
+  ].join("\n");
+}
+
 export function renderMergeConflictResolutionMcpHandoffPrompt(input: RuntimeHandoffPromptInput): string {
   return [
     "",
@@ -297,6 +324,18 @@ async function writeHandoffMcpContexts(
       workspacePath: ctx.workspace.path,
       workspace: ctx.workspace,
       phase: "issue_triage",
+      ...(ctx.manualDispatch === true ? { manualDispatch: true } : {}),
+    });
+    return;
+  }
+  if (ctx.role === "post_mortem" && phase === "post_mortem") {
+    await writeIssuePostMortemMcpContext(issuePostMortemContextFilePath(ctx), {
+      issue: ctx.issue,
+      activeRunId: input.activeRunId,
+      role: "post_mortem",
+      workspacePath: ctx.workspace.path,
+      workspace: ctx.workspace,
+      phase: "post_mortem",
       ...(ctx.manualDispatch === true ? { manualDispatch: true } : {}),
     });
     return;
@@ -392,6 +431,20 @@ export function issueTriageMcpServerConfig(
   });
 }
 
+export function issuePostMortemMcpServerConfig(
+  ctx: AgentRunContext,
+  contextFile: string,
+  options: { cliPath: string },
+): McpSubprocessServerConfig {
+  return buildMcpSubprocessServerConfig({
+    config: ctx.config,
+    command: "issue-post-mortem-mcp",
+    cliPath: options.cliPath,
+    workflowPath: ctx.config.workflowPath,
+    contextFile,
+  });
+}
+
 export function reviewVerdictMcpServerConfig(
   ctx: AgentRunContext,
   contextFile: string,
@@ -480,6 +533,14 @@ export function issueTriageContextFilePath(ctx: AgentRunContext): string {
   );
 }
 
+export function issuePostMortemContextFilePath(ctx: AgentRunContext): string {
+  return path.join(
+    ctx.config.workspace.stateDir,
+    "issue-post-mortem-mcp",
+    `${safeFileName(ctx.issue.id)}-${ctx.turnNumber}.json`,
+  );
+}
+
 export function reviewVerdictContextFilePath(ctx: AgentRunContext): string {
   return path.join(
     ctx.config.workspace.stateDir,
@@ -513,7 +574,7 @@ export function operatorChatContextFilePath(ctx: OperatorChatRunContext): string
 }
 
 export function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
-  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : ctx.role === "planner" ? "issue_breakdown" : "implementation");
+  return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : ctx.role === "post_mortem" ? "post_mortem" : ctx.role === "planner" ? "issue_breakdown" : "implementation");
 }
 
 function operatorChatRunContextFromAgentContext(ctx: AgentRunContext): OperatorChatRunContext {

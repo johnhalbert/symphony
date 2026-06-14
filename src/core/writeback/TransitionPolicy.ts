@@ -2,6 +2,7 @@ import type { ServiceConfig } from "../config/Config.js";
 import type {
   IssueCompletionReportRecord,
   IssueMergeGateMergeabilityState,
+  IssuePostMortemReportRecord,
   IssueReviewVerdictRecord,
   IssueTriageReportRecord,
   PullRequestReviewEvidenceItem,
@@ -51,6 +52,11 @@ export interface IssueTriageReportWritebackContext {
   issue: Issue;
   report: IssueTriageReportRecord;
   blockedReason?: string | null;
+}
+
+export interface IssuePostMortemReportWritebackContext {
+  issue: Issue;
+  report: IssuePostMortemReportRecord;
 }
 
 export interface MergeCompletedWritebackContext {
@@ -662,6 +668,84 @@ function formatIssueTriageBlockerWritebackLines(report: IssueTriageReportRecord)
     "Recommended action:",
     blocker.recommendedAction,
   ]);
+}
+
+export function planIssuePostMortemReportWritebacks(
+  context: IssuePostMortemReportWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  const eventKey = `issue-post-mortem:${safeKeySegment(context.report.idempotencyKey)}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.report.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Post-Mortem",
+          "",
+          "Status: post-mortem complete, follow-up candidates reported",
+          "",
+          `Run: ${context.report.runId}`,
+          `Trigger fingerprint: ${context.report.triggerFingerprint}`,
+          "",
+          "Summary:",
+          context.report.summary,
+          "",
+          "Completion judgment:",
+          `- Status: ${context.report.completionJudgment.status}`,
+          `- Rationale: ${context.report.completionJudgment.rationale}`,
+          "",
+          "Specification assessment:",
+          `- Quality: ${context.report.specificationAssessment.quality}`,
+          `- Classifications: ${context.report.specificationAssessment.classifications.join(", ")}`,
+          `- Spec Kit recommended: ${context.report.specificationAssessment.speckitRecommended ? "yes" : "no"}`,
+          `- Spec Kit rationale: ${context.report.specificationAssessment.speckitRationale}`,
+          "",
+          "Missing contract areas:",
+          ...formatListOrNone(context.report.specificationAssessment.missingContractAreas),
+          "",
+          "Review assessment:",
+          `- Gate decision looks valid: ${context.report.reviewAssessment.gateDecisionLooksValid ? "yes" : "no"}`,
+          "- Missed gate findings:",
+          ...formatListOrNone(context.report.reviewAssessment.missedGateFindings),
+          "- Missed discovery findings:",
+          ...formatListOrNone(context.report.reviewAssessment.missedDiscoveryFindings),
+          "",
+          "Follow-up candidates:",
+          ...formatPostMortemFollowUpWritebackLines(context.report),
+          "",
+          "Process lessons:",
+          ...formatListOrNone(context.report.processLessons),
+        ].join("\n"),
+      },
+    },
+  ];
+}
+
+function formatPostMortemFollowUpWritebackLines(report: IssuePostMortemReportRecord): string[] {
+  if (report.followUpCandidates.length === 0) return ["- None"];
+  return report.followUpCandidates.flatMap((candidate, index) => [
+    "",
+    `### ${index + 1}. ${candidate.title}`,
+    "",
+    `Priority: ${candidate.priority}`,
+    `Kind: ${candidate.kind}`,
+    `Ready for Spec Kit: ${candidate.readyForSpecKit ? "yes" : "no"}`,
+    "",
+    "Rationale:",
+    candidate.rationale,
+    ...(candidate.suggestedIssueContract === null
+      ? []
+      : ["", "Suggested issue contract:", "```markdown", candidate.suggestedIssueContract, "```"]),
+  ]);
+}
+
+function formatListOrNone(items: readonly string[]): string[] {
+  return items.length === 0 ? ["- None"] : items.map((item) => `- ${item}`);
 }
 
 export function planMergeCompletedWritebacks(

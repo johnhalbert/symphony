@@ -58,6 +58,7 @@ export const rawCredentialProfilesSchema = z
         reviewer: z.record(z.string(), z.string()).optional(),
         triage: z.record(z.string(), z.string()).optional(),
         planner: z.record(z.string(), z.string()).optional(),
+        post_mortem: z.record(z.string(), z.string()).optional(),
         service: z.record(z.string(), z.string()).optional(),
       })
       .strict()
@@ -135,10 +136,15 @@ export const DEFAULT_ROLE_CREDENTIAL_CAPABILITIES: Readonly<Record<CredentialRol
     "linear.tracker",
     "runtime.cursor",
   ],
+  post_mortem: [
+    "github.review_evidence_read",
+    "linear.tracker",
+    "runtime.cursor",
+  ],
   service: ["github.publication", "github.merge", "linear.writeback"],
 };
 
-const ROLE_NAMES: readonly CredentialRole[] = ["worker", "reviewer", "triage", "planner", "service"];
+const ROLE_NAMES: readonly CredentialRole[] = ["worker", "reviewer", "triage", "planner", "post_mortem", "service"];
 const VALID_CAPABILITIES = new Set<CredentialCapability>(CREDENTIAL_CAPABILITIES);
 const ENV_REFERENCE_PATTERN = /^\$([A-Za-z_][A-Za-z0-9_]*)$/;
 const DEFAULT_GITHUB_APP_TOKEN_REFRESH_BUFFER_SECONDS = 300;
@@ -235,6 +241,7 @@ export class CredentialProfileRegistry {
         reviewer: Object.fromEntries(this.#roleAssignments.get("reviewer") ?? []),
         triage: Object.fromEntries(this.#roleAssignments.get("triage") ?? []),
         planner: Object.fromEntries(this.#roleAssignments.get("planner") ?? []),
+        post_mortem: Object.fromEntries(this.#roleAssignments.get("post_mortem") ?? []),
         service: Object.fromEntries(this.#roleAssignments.get("service") ?? []),
       },
     };

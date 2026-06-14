@@ -44,6 +44,7 @@ import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { formatDoctorResult, runDoctor } from "./doctor.js";
 import { runCompletionReportMcpServer } from "./core/harness/CompletionReportMcpServer.js";
 import { runIssueBreakdownPlanMcpServer } from "./core/harness/IssueBreakdownPlanMcpServer.js";
+import { runIssuePostMortemMcpServer } from "./core/harness/IssuePostMortemMcpServer.js";
 import { runIssueTriageMcpServer } from "./core/harness/IssueTriageMcpServer.js";
 import { runMergeConflictResolutionMcpServer } from "./core/harness/MergeConflictResolutionMcpServer.js";
 import { runOperatorChatMcpServer } from "./core/harness/OperatorChatMcpServer.js";
@@ -164,6 +165,18 @@ program
   });
 
 program
+  .command("issue-post-mortem-mcp")
+  .description("Run the internal Symphony issue-post-mortem MCP server")
+  .requiredOption("--workflow <path>", "path to WORKFLOW.md")
+  .requiredOption("--context-file <path>", "path to the active post-mortem context file")
+  .action(async (options: { workflow: string; contextFile: string }) => {
+    await runIssuePostMortemMcpServer({
+      workflowPath: path.resolve(process.cwd(), options.workflow),
+      contextFile: path.resolve(process.cwd(), options.contextFile),
+    });
+  });
+
+program
   .command("review-verdict-mcp")
   .description("Run the internal Symphony review-verdict MCP server")
   .requiredOption("--workflow <path>", "path to WORKFLOW.md")
@@ -236,7 +249,7 @@ agentCommand
   .description("Dispatch one Symphony agent stage for a specific issue and wait for completion")
   .argument("<issue>", "issue id or identifier")
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
-  .requiredOption("--stage <stage>", "agent stage: worker, reviewer, review, triage, planner, breakdown, merge-conflict")
+  .requiredOption("--stage <stage>", "agent stage: worker, reviewer, review, triage, planner, breakdown, post-mortem, merge-conflict")
   .option("--force", "bypass configured label exclude guardrails; required with --ignore-state")
   .option("--ignore-state", "with --force, bypass the selected stage's current issue state gate")
   .option("--json", "print JSON result")
@@ -308,8 +321,8 @@ promptCommand
   .argument("<issue>", "issue id or identifier")
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
   .option("--state <state>", "simulate the issue in a specific tracker state")
-  .option("--role <role>", "force or constrain role: auto, worker, reviewer, triage, planner", "auto")
-  .option("--phase <phase>", "force or constrain phase: auto, implementation, review, issue_breakdown, issue_triage, merge_conflict_resolution", "auto")
+  .option("--role <role>", "force or constrain role: auto, worker, reviewer, triage, planner, post_mortem", "auto")
+  .option("--phase <phase>", "force or constrain phase: auto, implementation, review, issue_breakdown, issue_triage, post_mortem, merge_conflict_resolution", "auto")
   .option("--force", "render the requested role/phase even if Symphony would not dispatch it")
   .option("--json", "print JSON output including prompt metadata")
   .option("--out <path>", "write the rendered prompt to a file instead of stdout")
@@ -379,7 +392,7 @@ issueCommand
   .description("Inspect tracker, lifecycle, run, writeback, approval, and dispatch metadata for an issue")
   .argument("<issue>", "issue id or identifier")
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
-  .option("--stage <stage>", "limit eligibility to one stage: worker, reviewer, review, triage, planner, breakdown, merge-conflict")
+  .option("--stage <stage>", "limit eligibility to one stage: worker, reviewer, review, triage, planner, breakdown, post-mortem, merge-conflict")
   .option("--json", "print JSON result")
   .option("--raw", "include raw lifecycle, run, writeback, and approval records; implies --json")
   .option("--runs-limit <count>", "number of recent runs to include", "10")
@@ -593,14 +606,15 @@ function localStatusHost(host: string): string {
   return host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
 }
 
-function parsePromptRenderRole(value: string | undefined): "auto" | "worker" | "reviewer" | "triage" | "planner" {
-  const normalized = (value ?? "auto").trim().toLowerCase();
+function parsePromptRenderRole(value: string | undefined): "auto" | "worker" | "reviewer" | "triage" | "planner" | "post_mortem" {
+  const normalized = (value ?? "auto").trim().toLowerCase().replace(/-/g, "_");
   if (
     normalized === "auto" ||
     normalized === "worker" ||
     normalized === "reviewer" ||
     normalized === "triage" ||
-    normalized === "planner"
+    normalized === "planner" ||
+    normalized === "post_mortem"
   ) {
     return normalized;
   }
@@ -609,14 +623,15 @@ function parsePromptRenderRole(value: string | undefined): "auto" | "worker" | "
 
 function parsePromptRenderPhase(
   value: string | undefined,
-): "auto" | "implementation" | "review" | "issue_breakdown" | "issue_triage" | "merge_conflict_resolution" {
-  const normalized = (value ?? "auto").trim().toLowerCase();
+): "auto" | "implementation" | "review" | "issue_breakdown" | "issue_triage" | "post_mortem" | "merge_conflict_resolution" {
+  const normalized = (value ?? "auto").trim().toLowerCase().replace(/-/g, "_");
   if (
     normalized === "auto" ||
     normalized === "implementation" ||
     normalized === "review" ||
     normalized === "issue_breakdown" ||
     normalized === "issue_triage" ||
+    normalized === "post_mortem" ||
     normalized === "merge_conflict_resolution"
   ) {
     return normalized;
@@ -634,6 +649,9 @@ function parseManualAgentRunStage(value: string | undefined): ManualAgentRunStag
       return "reviewer";
     case "triage":
       return "triage";
+    case "post-mortem":
+    case "postmortem":
+      return "post_mortem";
     case "breakdown":
     case "planner":
       return "planner";
@@ -692,6 +710,7 @@ function formatIssueInspectionResult(result: IssueInspectionResult): string {
     `  Completion: ${formatCompletionSignal(result)}`,
     `  Review: ${formatReviewSignal(result)}`,
     `  Triage: ${formatTriageSignal(result)}`,
+    `  Post-mortem: ${formatPostMortemSignal(result)}`,
     `  Run: ${formatRunSignal(result)}`,
     `  Pending approval: ${result.latest.pendingApproval ? `${result.latest.pendingApproval.requestId} (${result.latest.pendingApproval.status})` : "none"}`,
     "",
@@ -753,6 +772,12 @@ function formatTriageSignal(result: IssueInspectionResult): string {
   return `${triage.id} ${triage.disposition}/${triage.confidence} run=${triage.runId} submittedAt=${triage.submittedAt}; blockers=${triage.blockers.length}; ${oneLineCli(triage.summary)}`;
 }
 
+function formatPostMortemSignal(result: IssueInspectionResult): string {
+  const report = result.latest.issuePostMortemReport;
+  if (!report) return "none";
+  return `${report.id} ${report.completionStatus}/${report.specificationQuality} run=${report.runId} submittedAt=${report.submittedAt}; followups=${report.followUpCandidateCount}; ${oneLineCli(report.summary)}`;
+}
+
 function formatRunSignal(result: IssueInspectionResult): string {
   const run = result.latest.run;
   if (!run) return "none";
@@ -791,6 +816,7 @@ function formatEligibilityResult(result: ManualAgentEligibilityResult): string {
 }
 
 function formatManualStage(stage: ManualAgentRunStage): string {
+  if (stage === "post_mortem") return "post-mortem";
   return stage === "merge_conflict" ? "merge-conflict" : stage;
 }
 

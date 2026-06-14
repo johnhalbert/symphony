@@ -1239,7 +1239,7 @@ Work on {{ issue.identifier }}.
     expect(defaults.handoffRepair).toEqual({
       enabled: false,
       maxAttempts: 1,
-      phases: ["implementation", "review", "issue_breakdown", "issue_triage", "merge_conflict_resolution"],
+      phases: ["implementation", "review", "issue_breakdown", "issue_triage", "post_mortem", "merge_conflict_resolution"],
     });
     expect(defaults.hermes.mergeConflictSessionReuse).toBe("implementation_worker");
 
@@ -1446,7 +1446,14 @@ Work on {{ issue.identifier }}.
     expect(config.handoffRepair).toEqual({
       enabled: true,
       maxAttempts: 1,
-      phases: ["implementation", "review", "issue_breakdown", "issue_triage", "merge_conflict_resolution"],
+      phases: ["implementation", "review", "issue_breakdown", "issue_triage", "post_mortem", "merge_conflict_resolution"],
+    });
+    expect(config.postMortem).toEqual({
+      enabled: true,
+      doneStates: ["Done"],
+      requireLabels: ["post_mortem"],
+      excludeLabels: [],
+      maxAttemptsPerTrigger: 1,
     });
     expect(config.agent.workerExcludeLabels).toEqual(["review_only"]);
     expect(config.agent.protectedPaths).toContain("hermes/src/**");

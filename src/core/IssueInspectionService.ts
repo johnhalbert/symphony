@@ -3,6 +3,7 @@ import { errorMessage } from "./errors.js";
 import type {
   IssueCompletionReportRecord,
   IssueLifecycleRecord,
+  IssuePostMortemReportRecord,
   IssueReviewVerdictRecord,
   IssueTriageReportRecord,
   IssueLifecycleStore,
@@ -28,6 +29,7 @@ export const DEFAULT_ISSUE_INSPECTION_STAGES: readonly ManualAgentRunStage[] = [
   "reviewer",
   "triage",
   "planner",
+  "post_mortem",
   "merge_conflict",
 ];
 
@@ -63,6 +65,7 @@ export interface IssueInspectionResult {
     completionReport: CompletionReportInspectionSummary | null;
     reviewVerdict: ReviewVerdictInspectionSummary | null;
     issueTriageReport: IssueTriageInspectionSummary | null;
+    issuePostMortemReport: IssuePostMortemInspectionSummary | null;
     run: RunInspectionSummary | null;
     pendingApproval: OperatorApprovalInspectionSummary | null;
   };
@@ -96,6 +99,7 @@ export interface IssueLifecycleInspectionSummary {
   planningDispatchRetryCount: number;
   lastIssueBreakdownPlanId: string | null;
   lastIssueTriageReportId: string | null;
+  lastPostMortemReportId: string | null;
   lastCompletionReportId: string | null;
   lastReviewVerdictId: string | null;
   summaryPointers: IssueLifecycleRecord["summaryPointers"];
@@ -105,6 +109,7 @@ export interface IssueLifecycleInspectionSummary {
     reviewVerdicts: number;
     reviewFeedback: number;
     issueTriageReports: number;
+    postMortemReports: number;
     reviewEvidence: number;
     mergeConflictResolutionReports: number;
   };
@@ -156,6 +161,20 @@ export interface IssueTriageInspectionSummary {
   summary: string;
   recommendedAction: string;
   blockers: IssueTriageReportRecord["blockers"];
+}
+
+export interface IssuePostMortemInspectionSummary {
+  id: string;
+  runId: string;
+  submittedAt: string;
+  triggerFingerprint: string;
+  summary: string;
+  completionStatus: IssuePostMortemReportRecord["completionJudgment"]["status"];
+  specificationQuality: IssuePostMortemReportRecord["specificationAssessment"]["quality"];
+  specificationClassifications: IssuePostMortemReportRecord["specificationAssessment"]["classifications"];
+  gateDecisionLooksValid: boolean;
+  followUpCandidateCount: number;
+  processLessonCount: number;
 }
 
 export interface RunInspectionSummary {
@@ -284,6 +303,7 @@ export class IssueInspectionService {
         completionReport: completionReportSummary(latestCompletionReport(lifecycle)),
         reviewVerdict: reviewVerdictSummary(latestReviewVerdict(lifecycle)),
         issueTriageReport: issueTriageSummary(latestIssueTriageReport(lifecycle)),
+        issuePostMortemReport: issuePostMortemSummary(latestIssuePostMortemReport(lifecycle)),
         run: latestRun === null ? null : runSummary(latestRun),
         pendingApproval: pendingApproval === null ? null : approvalSummary(pendingApproval),
       },
@@ -450,6 +470,15 @@ function latestIssueTriageReport(lifecycle: IssueLifecycleRecord | null): IssueT
   return lifecycle.issueTriageReports[lifecycle.issueTriageReports.length - 1] ?? null;
 }
 
+function latestIssuePostMortemReport(lifecycle: IssueLifecycleRecord | null): IssuePostMortemReportRecord | null {
+  if (!lifecycle) return null;
+  if (lifecycle.lastPostMortemReportId) {
+    const exact = lifecycle.postMortemReports.find((report) => report.id === lifecycle.lastPostMortemReportId);
+    if (exact) return exact;
+  }
+  return lifecycle.postMortemReports[lifecycle.postMortemReports.length - 1] ?? null;
+}
+
 function lifecycleSummary(lifecycle: IssueLifecycleRecord): IssueLifecycleInspectionSummary {
   return {
     issueId: lifecycle.issueId,
@@ -462,6 +491,7 @@ function lifecycleSummary(lifecycle: IssueLifecycleRecord): IssueLifecycleInspec
     planningDispatchRetryCount: lifecycle.planningDispatchRetryCount,
     lastIssueBreakdownPlanId: lifecycle.lastIssueBreakdownPlanId,
     lastIssueTriageReportId: lifecycle.lastIssueTriageReportId,
+    lastPostMortemReportId: lifecycle.lastPostMortemReportId,
     lastCompletionReportId: lifecycle.lastCompletionReportId,
     lastReviewVerdictId: lifecycle.lastReviewVerdictId,
     summaryPointers: lifecycle.summaryPointers,
@@ -471,6 +501,7 @@ function lifecycleSummary(lifecycle: IssueLifecycleRecord): IssueLifecycleInspec
       reviewVerdicts: lifecycle.reviewVerdicts.length,
       reviewFeedback: lifecycle.reviewFeedback.length,
       issueTriageReports: lifecycle.issueTriageReports.length,
+      postMortemReports: lifecycle.postMortemReports.length,
       reviewEvidence: lifecycle.reviewEvidence.items.length,
       mergeConflictResolutionReports: lifecycle.mergeConflictResolutionReports.length,
     },
@@ -537,6 +568,23 @@ function issueTriageSummary(report: IssueTriageReportRecord | null): IssueTriage
     summary: report.summary,
     recommendedAction: report.recommendedAction,
     blockers: report.blockers,
+  };
+}
+
+function issuePostMortemSummary(report: IssuePostMortemReportRecord | null): IssuePostMortemInspectionSummary | null {
+  if (!report) return null;
+  return {
+    id: report.id,
+    runId: report.runId,
+    submittedAt: report.submittedAt,
+    triggerFingerprint: report.triggerFingerprint,
+    summary: report.summary,
+    completionStatus: report.completionJudgment.status,
+    specificationQuality: report.specificationAssessment.quality,
+    specificationClassifications: report.specificationAssessment.classifications,
+    gateDecisionLooksValid: report.reviewAssessment.gateDecisionLooksValid,
+    followUpCandidateCount: report.followUpCandidates.length,
+    processLessonCount: report.processLessons.length,
   };
 }
 
@@ -639,6 +687,8 @@ function manualStageTarget(stage: ManualAgentRunStage): Pick<ManualAgentEligibil
       return { role: "triage", runPhase: "issue_triage", runKind: runKindForPhase("issue_triage") };
     case "planner":
       return { role: "planner", runPhase: "issue_breakdown", runKind: runKindForPhase("issue_breakdown") };
+    case "post_mortem":
+      return { role: "post_mortem", runPhase: "post_mortem", runKind: runKindForPhase("post_mortem") };
     case "merge_conflict":
       return { role: "worker", runPhase: "merge_conflict_resolution", runKind: runKindForPhase("merge_conflict_resolution") };
   }

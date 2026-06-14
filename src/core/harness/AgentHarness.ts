@@ -10,6 +10,7 @@ export type AgentHandoffRepairKind =
   | "review_verdict"
   | "issue_breakdown_plan"
   | "issue_triage_report"
+  | "issue_post_mortem_report"
   | "merge_conflict_resolution";
 export type AgentHermesResumeReason = "handoff_repair" | "merge_conflict_original_worker";
 

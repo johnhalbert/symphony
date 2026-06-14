@@ -922,7 +922,7 @@ github:
       id: "review_loop.mcp_tools",
       status: "ok",
       message:
-        "Configured MCP subprocess runner lists tools: submit_completion_report, submit_review_verdict, submit_pull_request_review_feedback, submit_issue_triage_report",
+          "Configured MCP subprocess runner lists tools: submit_completion_report, submit_review_verdict, submit_pull_request_review_feedback, submit_issue_triage_report",
     });
   });
 
@@ -1388,6 +1388,7 @@ function mcpToolsFor(command: string): string[] {
   if (command === "review-verdict-mcp") return ["submit_review_verdict"];
   if (command === "review-feedback-mcp") return ["submit_pull_request_review_feedback"];
   if (command === "issue-triage-mcp") return ["submit_issue_triage_report"];
+  if (command === "issue-post-mortem-mcp") return ["submit_issue_post_mortem_report"];
   return [];
 }
 
@@ -1460,7 +1461,7 @@ class DoctorFakeHermesGatewayClient extends EventEmitter implements HermesGatewa
 }
 
 async function writeHermesTemplates(root: string): Promise<void> {
-  for (const template of ["worker", "reviewer", "planner"]) {
+  for (const template of ["worker", "reviewer", "planner", "post_mortem"]) {
     const templateDir = path.join(root, "templates", template);
     await mkdir(templateDir, { recursive: true });
     await writeFile(path.join(templateDir, "SOUL.md"), `${template} soul\n`, "utf8");

@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { ServiceConfig } from "../src/core/config/Config.js";
-import type { IssueTriageReportRecord, PullRequestReviewEvidenceItem } from "../src/core/persistence/IssueLifecycleStore.js";
+import type {
+  IssuePostMortemReportRecord,
+  IssueTriageReportRecord,
+  PullRequestReviewEvidenceItem,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import {
   planBlockedEscalationWritebacks,
   planCompletionReportAcceptedWritebacks,
+  planIssuePostMortemReportWritebacks,
   planIssueTriageReportWritebacks,
   planMergeGateBlockedWritebacks,
   planMergeGateRepairWritebacks,
@@ -377,6 +382,76 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(commentBody(operations, 0)).toContain("- review-verdict:issue-1:verdict-3 found sibling path");
     expect(commentBody(operations, 0)).toContain("Recommended human action:");
     expect(commentBody(operations, 0)).toContain(report.recommendedAction);
+  });
+
+  it("plans issue post-mortem report comments", () => {
+    const config = reviewLoopConfig();
+    const report: IssuePostMortemReportRecord = {
+      id: "issue-post-mortem-report:issue-1:postmortem-1",
+      idempotencyKey: "postmortem-1",
+      requestHash: "request-hash-1",
+      runId: "post-mortem-run-1",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      triggerFingerprint: "trigger-fingerprint-1",
+      summary: "Done state is valid with one follow-up test gap.",
+      completionJudgment: {
+        status: "valid_with_followups",
+        rationale: "The implementation satisfies the written contract.",
+      },
+      specificationAssessment: {
+        quality: "adequate",
+        classifications: ["well_scoped"],
+        missingContractAreas: [],
+        speckitRecommended: false,
+        speckitRationale: "No decomposition need was found.",
+      },
+      reviewAssessment: {
+        gateDecisionLooksValid: true,
+        missedGateFindings: [],
+        missedDiscoveryFindings: ["Add a stale-state regression later."],
+      },
+      followUpCandidates: [
+        {
+          title: "Add stale-state regression",
+          priority: "medium",
+          kind: "test_gap",
+          rationale: "Adjacent stale behavior is worth capturing after Done.",
+          readyForSpecKit: true,
+          suggestedIssueContract: "Add a stale-state regression without changing shipped behavior.",
+        },
+      ],
+      processLessons: ["The issue was specified well enough to complete, but had one follow-up gap."],
+      submittedAt: "2026-01-01T00:00:00.000Z",
+      writebackOperationKeys: [],
+    };
+
+    const operations = planIssuePostMortemReportWritebacks(
+      {
+        issue: issue({ state: "Done" }),
+        report,
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:issue-post-mortem:postmortem-1",
+      kind: "comment",
+      issueId: "issue-1",
+      runId: "post-mortem-run-1",
+      payload: {
+        dedupeKey: "issue-post-mortem:postmortem-1",
+      },
+    });
+    expect(commentBody(operations, 0)).toContain("## Symphony Post-Mortem");
+    expect(commentBody(operations, 0)).toContain("Status: post-mortem complete, follow-up candidates reported");
+    expect(commentBody(operations, 0)).toContain("Completion judgment:");
+    expect(commentBody(operations, 0)).toContain("- Status: valid_with_followups");
+    expect(commentBody(operations, 0)).toContain("Specification assessment:");
+    expect(commentBody(operations, 0)).toContain("Review assessment:");
+    expect(commentBody(operations, 0)).toContain("Follow-up candidates:");
+    expect(commentBody(operations, 0)).toContain("Add stale-state regression");
   });
 
   it("does not plan blocked escalation writebacks outside active or review states", () => {

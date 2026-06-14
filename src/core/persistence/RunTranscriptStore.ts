@@ -888,7 +888,13 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
 
 function defaultRunPhase(role: PersistedRunRole): AgentRunPhase {
   if (role === "planner") return "issue_breakdown";
-  return role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : "implementation";
+  return role === "reviewer"
+    ? "review"
+    : role === "triage"
+      ? "issue_triage"
+      : role === "post_mortem"
+        ? "post_mortem"
+        : "implementation";
 }
 
 function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {

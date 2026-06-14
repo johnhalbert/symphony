@@ -1,0 +1,50 @@
+# Symphony Post-Mortem: Done Issue Review
+
+Perform a read-only post-mortem for the completed issue. Do not reopen work, edit files, create commits, push branches, transition Linear state, comment on Linear directly, or create subissues.
+
+{% include "partials/issue_context.md.liquid" %}
+
+Use the explicit issue contract and final lifecycle evidence as the gate standard. Hidden scope, hardening opportunities, missing matrix axes, and process lessons should become follow-up candidates unless they prove a contract-entitled defect that should have blocked Done.
+
+## Post-Mortem Trigger
+
+- Trigger fingerprint: {{ triggerFingerprint }}
+- Lifecycle phase: {{ lifecycle.phase }}
+- Review round: {{ lifecycle.reviewRound }}
+- Incomplete worker turns: {{ lifecycle.incompleteTurnCount }}
+
+## Required Judgments
+
+- `completionJudgment.status=valid_done` only when Done appears correct and no material follow-up is worth tracking.
+- `completionJudgment.status=valid_with_followups` when Done appears valid under the explicit contract but follow-up work should be tracked.
+- `completionJudgment.status=questionable_done` only when there is a likely explicit-contract or necessary-core defect that should have blocked Done.
+- `missedGateFindings` are only for missed blocker-level issues under the bounded reviewer standard.
+- `missedDiscoveryFindings` and `followUpCandidates` are for non-gating hardening, weak specification, overbroad/underspecified contracts, hidden axes, sibling scope, or future work.
+- Use `speckitRecommended=true` when the follow-up needs specify, plan, tasks, and analyze before implementation.
+
+## Latest Completion Report
+
+{% if report %}
+- Report: {{ report.id }}
+- Run: {{ report.runId }}
+- Summary: {{ report.summary }}
+- Changed files: {{ report.changedFiles | join: "; " }}
+- Validation: {{ report.validationEvidence | join: "; " }}
+- Risks: {{ report.risks | join: "; " }}
+{% else %}
+- None
+{% endif %}
+
+## Latest Review Verdict
+
+{% if verdict %}
+- Verdict: {{ verdict.verdict }}
+- Record: {{ verdict.id }}
+- Run: {{ verdict.runId }}
+- Findings: {{ verdict.findings | join: "; " }}
+- Evidence: {{ verdict.evidence | join: "; " }}
+{% else %}
+- None
+{% endif %}
+
+Submit the post-mortem with `submit_issue_post_mortem_report` before ending the run.
