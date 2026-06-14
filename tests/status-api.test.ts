@@ -1597,6 +1597,97 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("opens a context-qualified canonical Linear-id workspace through durable lifecycle and run fallback data", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        topLevel: {
+          workspace: {
+            root: path.join(root, "workspaces"),
+            state_dir: path.join(root, ".symphony"),
+          },
+        },
+      }),
+      path.join(root, "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-secret" },
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger: new StructuredLogger(() => undefined),
+    });
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const docsPath = workspaceManager.getPathForIssue("docs:ENG-179");
+    await mkdir(docsPath, { recursive: true });
+    await runStore.startRun({
+      runId: "run-docs-open-workspace-canonical-id-1",
+      sessionId: "session-docs-open-workspace-canonical-id-1",
+      agentId: "agent-docs-open-workspace-canonical-id-1",
+      role: "worker",
+      issueId: "linear-docs-179",
+      issueIdentifier: "ENG-179",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      workspaceKey: "docs:ENG-179",
+      workspacePath: docsPath,
+      gitBranchName: "symphony/docs/ENG-179",
+      repoPath: "/repo-docs",
+      baseRef: "origin/main",
+      projectContext: docsProjectContext,
+    });
+    await lifecycleStore.ensureIssue(issue({ id: "linear-docs-179", identifier: "ENG-179" }), {
+      phase: "implementation",
+      projectContext: docsProjectContext,
+      summaryPointers: {
+        workspaceKey: "docs:ENG-179",
+        workspacePath: docsPath,
+        branchName: "symphony/docs/ENG-179",
+        gitBranchName: "symphony/docs/ENG-179",
+        repoPath: "/repo-docs",
+        baseRef: "origin/main",
+      },
+    });
+    const openedPaths: string[] = [];
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager,
+      workspaceOpener: {
+        async open(workspacePath: string) {
+          openedPaths.push(workspacePath);
+        },
+      },
+      defaultProjectContextId: config.projectContexts.defaultContextId,
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:linear-docs-179/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const body = (await response.json()) as { workspace_path: string };
+
+      expect(response.status).toBe(202);
+      expect(body.workspace_path).toBe(docsPath);
+      expect(openedPaths).toEqual([docsPath]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("fails closed for ambiguous legacy unqualified status and transcript aliases across project contexts", async () => {
     const config = parseServiceConfig(
       multiProjectWorkflowConfig({

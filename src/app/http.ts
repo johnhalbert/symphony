@@ -1399,10 +1399,10 @@ export class StatusServer {
           throw statusAliasResolutionError("Issue", issueId, resolvedTarget.status);
         }
         const { target } = resolvedTarget;
-        const workspaceLookupKey = (target.workspace?.workspaceKey ?? issueId) || target.lookupKey;
+        const workspaceLookupKey = resolvedWorkspaceActionLookupKey(target, this.options.defaultProjectContextId);
         const scopedIssueLookupKeys = Array.from(
           new Set(
-            [target.live?.issueId, target.latestRun?.issueId, target.lifecycle?.issueId, target.workspace?.issueId, issueId].filter(
+            [target.live?.issueId, target.latestRun?.issueId, target.lifecycle?.issueId, target.workspace?.issueId, workspaceLookupKey, issueId].filter(
               (key): key is string => typeof key === "string" && key.length > 0,
             ),
           ),
@@ -1415,9 +1415,17 @@ export class StatusServer {
           null;
         const scopedWorkspaceLookupKeys = Array.from(
           new Set(
-            [target.workspace?.workspaceKey, target.workspace?.issueId, target.live?.issueId, target.latestRun?.issueId, target.lifecycle?.issueId, issueId].filter(
-              (key): key is string => typeof key === "string" && key.length > 0,
-            ),
+            [
+              target.workspace?.workspaceKey,
+              target.latestRun?.workspaceKey,
+              target.lifecycle?.summaryPointers.workspaceKey,
+              target.workspace?.issueId,
+              target.live?.issueId,
+              target.latestRun?.issueId,
+              target.lifecycle?.issueId,
+              workspaceLookupKey,
+              issueId,
+            ].filter((key): key is string => typeof key === "string" && key.length > 0),
           ),
         );
         let workspace = target.workspace;
@@ -1428,7 +1436,11 @@ export class StatusServer {
           }
         }
         const workspacePath =
-          details?.workspacePath ?? workspace?.path ?? this.options.workspaceManager.getPathForIssue(workspaceLookupKey);
+          details?.workspacePath ??
+          workspace?.path ??
+          target.latestRun?.workspacePath ??
+          target.lifecycle?.summaryPointers.workspacePath ??
+          this.options.workspaceManager.getPathForIssue(workspaceLookupKey);
 
         if (!(await pathExists(workspacePath))) {
           throw new SymphonyError("not_found", `Workspace not found: ${workspacePath}`);
@@ -5837,6 +5849,41 @@ function resolvedIssueActionProjectContext(
   input: Pick<ResolvedIssueAliasData, "live" | "workspace" | "latestRun" | "lifecycle">,
 ): ProjectContextResolution | undefined {
   return input.lifecycle?.projectContext ?? input.workspace?.projectContext ?? projectContextResolutionFromIssue(input.live) ?? input.latestRun?.projectContext;
+}
+
+function contextualWorkspaceLookupKey(
+  issueIdentifier: string,
+  projectContext: ProjectContextResolution | undefined,
+  defaultProjectContextId: string | null | undefined,
+): string {
+  const normalizedIssueIdentifier = issueIdentifier.trim();
+  if (normalizedIssueIdentifier.length === 0) return normalizedIssueIdentifier;
+  const projectContextId = normalizeOptionalProjectContextId(projectContext?.projectContextId);
+  if (!projectContextId) return normalizedIssueIdentifier;
+  if (compatibilityDefaultProjectContextIds(defaultProjectContextId).has(projectContextId)) {
+    return normalizedIssueIdentifier;
+  }
+  return `${projectContextId}:${normalizedIssueIdentifier}`;
+}
+
+function resolvedWorkspaceActionLookupKey(
+  target: ResolvedIssueActionTarget,
+  defaultProjectContextId: string | null | undefined,
+): string {
+  const persistedWorkspaceKey =
+    target.workspace?.workspaceKey ?? target.latestRun?.workspaceKey ?? target.lifecycle?.summaryPointers.workspaceKey;
+  if (typeof persistedWorkspaceKey === "string" && persistedWorkspaceKey.trim().length > 0) {
+    return persistedWorkspaceKey;
+  }
+
+  const canonicalIssueIdentifier =
+    target.workspace?.issueIdentifier ??
+    target.latestRun?.issueIdentifier ??
+    target.lifecycle?.issueIdentifier ??
+    target.live?.issueIdentifier ??
+    target.requestAlias ??
+    target.lookupKey;
+  return contextualWorkspaceLookupKey(canonicalIssueIdentifier, target.projectContext, defaultProjectContextId);
 }
 
 function normalizeOptionalProjectContextId(value: string | null | undefined): string | null {
