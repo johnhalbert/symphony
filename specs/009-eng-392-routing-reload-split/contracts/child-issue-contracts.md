@@ -23,6 +23,26 @@ The current apply path resolves sibling dependencies by normalized child title, 
 | 5 | `ENG-392 child — orchestrator proof` | `REQ-392-TEST-PROOF` | `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, `ENG-392 child — approval writeback repair` | Adds the final focused orchestrator proof after the underlying runtime and approval invariants are explicit and deterministic. |
 | 6 | `ENG-392 child — publication hygiene closure` | `REQ-392-PUBLICATION-HYGIENE` | `ENG-392 child — decision and scope lock`, `ENG-392 child — orchestrator proof`, `ENG-392 child — approval writeback repair` | Closes the loop by keeping the final diff, evidence packet, and repository hygiene aligned with the declared child scopes. |
 
+## Cross-artifact consistency review — T011
+
+This review compared the expected planning surfaces `specs/009-eng-392-routing-reload-split/spec.md`, `specs/009-eng-392-routing-reload-split/plan.md`, `specs/009-eng-392-routing-reload-split/data-model.md`, and `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`.
+
+- `spec.md` and `plan.md` are not tracked in the current `009-eng-392-routing-reload-split` snapshot. Treat that absence as an explicit planning gap rather than implicit agreement with the generic Spec Kit layout.
+- Until those files exist or the task source is retargeted, use `data-model.md` plus this contract family as the durable baseline for decomposition scope, dependency order, and runtime prerequisite mapping.
+- Family A dependency validation is evaluated over direct or transitive dependency edges unless a later family is intentionally independent and says so explicitly.
+
+### Runtime prerequisite crosswalk
+
+The table below supplies the minimum prerequisite map referenced by `data-model.md` for a confirmed decomposition decision.
+
+| Data-model surface family | Child contract owner(s) | Consistency note |
+| --- | --- | --- |
+| `routing-reload-core` | `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, `REQ-392-TEST-PROOF` | Family B establishes routed identity, Family C preserves it across reload, and Family E proves it end to end. |
+| `workspace-lifecycle` | `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, `REQ-392-APPROVAL-WRITEBACK` | Family B separates routed workspace and lifecycle buckets, Family C preserves them, and Family D reuses them during approval and writeback recovery. |
+| `operator-http-entrypoints` | `REQ-392-RUNTIME-ROUTING`, `REQ-392-APPROVAL-WRITEBACK` | Routed status or workspace entrypoints land in Family B and routed approval or status recovery lands in Family D. |
+| `publication-handoff` | `REQ-392-APPROVAL-WRITEBACK`, `REQ-392-PUBLICATION-HYGIENE` | Family D repairs completion-report, approval, and writeback recovery; Family F closes the publication-facing evidence surface. |
+| `writeback-guardrails` | `REQ-392-APPROVAL-WRITEBACK`, `REQ-392-PUBLICATION-HYGIENE` | Family D restores durable audit and writeback invariants while Family F confirms no unauthorized closure surface remains. |
+
 ## Family A — `REQ-392-DECISION`
 
 - Suggested child title: `ENG-392 child — decision and scope lock`
@@ -67,7 +87,7 @@ Record the ENG-392 decomposition decision before any child implementation work s
 
 ## Validation Requirements
 
-- Review `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` and confirm every later family depends on this title or stays intentionally independent.
+- Review `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` and confirm every later family depends on this title directly or transitively, or stays intentionally independent.
 - Review `specs/009-eng-392-routing-reload-split/quickstart.md` and confirm excluded surfaces remain explicitly excluded until a later child contract authorizes them.
 
 ## Out Of Scope
