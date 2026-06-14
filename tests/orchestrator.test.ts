@@ -5360,7 +5360,16 @@ const docsProjectContext = {
       eventType: "progress",
       message: "Implemented the reviewer dispatch lane.",
     });
-    const harness = new FakeHarness();
+    class ReloadTrackingFakeHarness extends FakeHarness {
+      readonly reloadCtxs: AgentRunContext[] = [];
+
+      override async reload(ctx?: AgentRunContext): Promise<void> {
+        if (ctx) this.reloadCtxs.push(ctx);
+        await super.reload();
+      }
+    }
+
+    const harness = new ReloadTrackingFakeHarness();
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
@@ -5384,10 +5393,31 @@ const docsProjectContext = {
     expect(defaultTracker.requestedIds).toEqual([]);
     expect(docsTracker.requestedStates).toEqual([["Docs Review"]]);
     expect(docsTracker.requestedIds).toEqual([[candidate.id]]);
+    expect(harness.reloadCount).toBe(1);
+    expect(harness.reloadCtxs).toHaveLength(1);
+    expect(harness.reloadCtxs[0]?.role).toBe("reviewer");
+    expect(harness.reloadCtxs[0]?.projectContext).toMatchObject(docsProjectContext);
+    expect(harness.reloadCtxs[0]?.config.reviewLoop.reviewStates).toEqual(["Docs Review"]);
+    expect(harness.reloadCtxs[0]?.issue).toEqual(
+      expect.objectContaining({
+        identifier: candidate.identifier,
+        state: "Docs Review",
+        projectContextId: docsProjectContext.projectContextId,
+        projectContextLabel: docsProjectContext.projectContextLabel,
+      }),
+    );
     expect(harness.runs).toHaveLength(1);
     expect(harness.runs[0]?.ctx.role).toBe("reviewer");
     expect(harness.runs[0]?.ctx.projectContext).toMatchObject(docsProjectContext);
     expect(harness.runs[0]?.ctx.config.reviewLoop.reviewStates).toEqual(["Docs Review"]);
+    expect(harness.runs[0]?.ctx.issue).toEqual(
+      expect.objectContaining({
+        identifier: candidate.identifier,
+        state: "Docs Review",
+        projectContextId: docsProjectContext.projectContextId,
+        projectContextLabel: docsProjectContext.projectContextLabel,
+      }),
+    );
     expect(harness.runs[0]?.prompt).toContain("Review TEST-1 as reviewer");
     expect(harness.runs[0]?.prompt).toContain("Implemented the requested change.");
     expect(harness.runs[0]?.prompt).toContain("Pull request: https://github.com/acme/symphony/pull/42");
