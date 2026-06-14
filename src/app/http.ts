@@ -42,6 +42,8 @@ import {
   type Issue,
   type IssueBoardColumnId,
   type IssueBoardColumnMapping,
+  type IssueRouteEvidence,
+  type IssueRouteEvidenceSource,
 } from "../core/types.js";
 import type {
   IssueCompletionReportRecord,
@@ -1176,20 +1178,46 @@ export class StatusServer {
           defaultProjectContextId: this.options.defaultProjectContextId,
         });
         if (resolvedTarget.status !== "resolved") {
-          throw statusAliasResolutionError("Issue", issueId, resolvedTarget.status);
+          throw statusAliasResolutionError(
+            "Issue",
+            issueId,
+            resolvedTarget.status,
+            buildIssueRouteEvidence({
+              kind: "issue_breakdown",
+              requestKey: issueId,
+              status: resolvedTarget.status,
+              reason:
+                resolvedTarget.status === "ambiguous"
+                  ? "alias_ambiguous_across_project_contexts"
+                  : "alias_not_available_through_default_project_context",
+            }),
+          );
         }
         const { target } = resolvedTarget;
-        const result = await this.options.orchestrator.requestIssueBreakdown(target.lookupKey, {
-          ...(target.projectContext ? { projectContext: target.projectContext } : {}),
+        const aliasRouteEvidence = buildIssueRouteEvidence({
+          kind: "issue_breakdown",
+          requestKey: issueId,
+          status: "resolved",
+          resolvedProjectContextId: target.projectContext?.projectContextId ?? null,
+          lookupKey: target.lookupKey,
+          sources: issueRouteEvidenceAliasSources(target),
         });
-        sendJson(response, result.queued ? 202 : 200, {
-          queued: result.queued,
-          issue: result.issue.identifier,
-          issueId: result.issue.id,
-          runPhase: "issue_breakdown",
-          runKind: "planning",
-          reason: result.reason,
-        });
+        try {
+          const result = await this.options.orchestrator.requestIssueBreakdown(target.lookupKey, {
+            ...(target.projectContext ? { projectContext: target.projectContext } : {}),
+          });
+          sendJson(response, result.queued ? 202 : 200, {
+            queued: result.queued,
+            issue: result.issue.identifier,
+            issueId: result.issue.id,
+            runPhase: "issue_breakdown",
+            runKind: "planning",
+            reason: result.reason,
+            routeEvidence: result.routeEvidence ? mergeIssueRouteEvidence(aliasRouteEvidence, result.routeEvidence) : aliasRouteEvidence,
+          });
+        } catch (error) {
+          throw mergeRouteEvidenceIntoError(error, aliasRouteEvidence);
+        }
         return;
       }
 
@@ -1205,19 +1233,45 @@ export class StatusServer {
           defaultProjectContextId: this.options.defaultProjectContextId,
         });
         if (resolvedTarget.status !== "resolved") {
-          throw statusAliasResolutionError("Issue", issueId, resolvedTarget.status);
+          throw statusAliasResolutionError(
+            "Issue",
+            issueId,
+            resolvedTarget.status,
+            buildIssueRouteEvidence({
+              kind: "issue_breakdown_apply",
+              requestKey: issueId,
+              status: resolvedTarget.status,
+              reason:
+                resolvedTarget.status === "ambiguous"
+                  ? "alias_ambiguous_across_project_contexts"
+                  : "alias_not_available_through_default_project_context",
+            }),
+          );
         }
         const { target } = resolvedTarget;
-        const options = parseIssueBreakdownApplyRequest(await readJsonBody(request));
-        const result = await this.options.orchestrator.applyIssueBreakdownPlan(target.lookupKey, {
-          ...options,
-          ...(target.projectContext ? { projectContext: target.projectContext } : {}),
+        const aliasRouteEvidence = buildIssueRouteEvidence({
+          kind: "issue_breakdown_apply",
+          requestKey: issueId,
+          status: "resolved",
+          resolvedProjectContextId: target.projectContext?.projectContextId ?? null,
+          lookupKey: target.lookupKey,
+          sources: issueRouteEvidenceAliasSources(target),
         });
-        sendJson(response, result.status === "pending" ? 202 : 200, {
-          issue: issueId,
-          mode: options.dryRun ? "preview" : "apply",
-          ...result,
-        });
+        try {
+          const options = parseIssueBreakdownApplyRequest(await readJsonBody(request));
+          const result = await this.options.orchestrator.applyIssueBreakdownPlan(target.lookupKey, {
+            ...options,
+            ...(target.projectContext ? { projectContext: target.projectContext } : {}),
+          });
+          sendJson(response, result.status === "pending" ? 202 : 200, {
+            issue: issueId,
+            mode: options.dryRun ? "preview" : "apply",
+            ...result,
+            routeEvidence: result.routeEvidence ? mergeIssueRouteEvidence(aliasRouteEvidence, result.routeEvidence) : aliasRouteEvidence,
+          });
+        } catch (error) {
+          throw mergeRouteEvidenceIntoError(error, aliasRouteEvidence);
+        }
         return;
       }
 
@@ -1396,9 +1450,23 @@ export class StatusServer {
           defaultProjectContextId: this.options.defaultProjectContextId,
         });
         if (resolvedTarget.status !== "resolved") {
-          throw statusAliasResolutionError("Issue", issueId, resolvedTarget.status);
+          throw statusAliasResolutionError(
+            "Issue",
+            issueId,
+            resolvedTarget.status,
+            buildIssueRouteEvidence({
+              kind: "open_workspace",
+              requestKey: issueId,
+              status: resolvedTarget.status,
+              reason:
+                resolvedTarget.status === "ambiguous"
+                  ? "alias_ambiguous_across_project_contexts"
+                  : "alias_not_available_through_default_project_context",
+            }),
+          );
         }
         const { target } = resolvedTarget;
+        const aliasSources = issueRouteEvidenceAliasSources(target);
         const workspaceLookupKey = resolvedWorkspaceActionLookupKey(target, this.options.defaultProjectContextId);
         const scopedIssueLookupKeys = Array.from(
           new Set(
@@ -1441,12 +1509,44 @@ export class StatusServer {
           target.latestRun?.workspacePath ??
           target.lifecycle?.summaryPointers.workspacePath ??
           this.options.workspaceManager.getPathForIssue(workspaceLookupKey);
+        let workspaceSource: IssueRouteEvidenceSource = "workspace_filesystem_fallback";
+        if (details?.workspacePath) {
+          workspaceSource = "workspace_live";
+        } else if (workspace?.path) {
+          workspaceSource = "workspace_record";
+        } else if (target.latestRun?.workspacePath) {
+          workspaceSource = "workspace_run";
+        } else if (target.lifecycle?.summaryPointers.workspacePath) {
+          workspaceSource = "workspace_lifecycle";
+        }
 
         if (!(await pathExists(workspacePath))) {
-          throw new SymphonyError("not_found", `Workspace not found: ${workspacePath}`);
+          throw new SymphonyError("not_found", `Workspace not found: ${workspacePath}`, {
+            routeEvidence: buildIssueRouteEvidence({
+              kind: "open_workspace",
+              requestKey: issueId,
+              status: "missing",
+              reason: "workspace_path_not_found",
+              resolvedProjectContextId: target.projectContext?.projectContextId ?? null,
+              lookupKey: workspaceLookupKey,
+              sources: [...aliasSources, workspaceSource],
+            }),
+          });
         }
         await this.options.workspaceOpener.open(workspacePath);
-        sendJson(response, 202, { opened: true, workspace_path: workspacePath });
+        sendJson(response, 202, {
+          opened: true,
+          workspace_path: workspacePath,
+          routeEvidence: buildIssueRouteEvidence({
+            kind: "open_workspace",
+            requestKey: issueId,
+            status: "resolved",
+            reason: workspaceSource === "workspace_filesystem_fallback" ? "workspace_filesystem_fallback" : null,
+            resolvedProjectContextId: target.projectContext?.projectContextId ?? null,
+            lookupKey: workspaceLookupKey,
+            sources: [...aliasSources, workspaceSource],
+          }),
+        });
         return;
       }
 
@@ -1466,11 +1566,13 @@ export class StatusServer {
           : error instanceof SymphonyError && error.code === "invalid_request"
             ? 401
             : 500;
+      const routeEvidence = issueRouteEvidenceFromError(error);
       sendJson(response, status, {
         error: {
           code: error instanceof SymphonyError ? error.code : "internal_error",
           message: errorMessage(error),
         },
+        ...(routeEvidence ? { routeEvidence } : {}),
       });
     }
   }
@@ -6253,16 +6355,109 @@ async function resolveIssueActionTarget(input: {
   };
 }
 
-function statusAliasResolutionError(entityLabel: string, requestKey: string, status: Extract<AliasResolutionStatus, "ambiguous" | "wrong_context">): SymphonyError {
+function issueRouteEvidenceRequest(
+  requestKey: string,
+): Pick<IssueRouteEvidence, "requestKey" | "requestAlias" | "requestedProjectContextId" | "lookupKey"> {
+  const parsed = parseContextualAlias(requestKey);
+  const trimmedRequestKey = requestKey.trim();
+  const normalizedAlias = parsed.alias || trimmedRequestKey;
+  return {
+    requestKey: trimmedRequestKey,
+    requestAlias: normalizedAlias,
+    requestedProjectContextId: parsed.projectContextId ?? null,
+    lookupKey: normalizedAlias,
+  };
+}
+
+function issueRouteEvidenceAliasSources(
+  input: Pick<ResolvedIssueActionTarget, "live" | "workspace" | "latestRun" | "lifecycle">,
+): IssueRouteEvidenceSource[] {
+  const sources: IssueRouteEvidenceSource[] = [];
+  if (input.live) sources.push("alias_live");
+  if (input.workspace) sources.push("alias_workspace");
+  if (input.latestRun) sources.push("alias_run");
+  if (input.lifecycle) sources.push("alias_lifecycle");
+  return sources;
+}
+
+function buildIssueRouteEvidence(input: {
+  kind: IssueRouteEvidence["kind"];
+  requestKey: string;
+  status: IssueRouteEvidence["status"];
+  reason?: string | null;
+  lookupKey?: string | null;
+  requestedProjectContextId?: string | null;
+  resolvedProjectContextId?: string | null;
+  sources?: IssueRouteEvidenceSource[];
+}): IssueRouteEvidence {
+  const request = issueRouteEvidenceRequest(input.requestKey);
+  return {
+    kind: input.kind,
+    requestKey: request.requestKey,
+    requestAlias: request.requestAlias,
+    requestedProjectContextId: input.requestedProjectContextId ?? request.requestedProjectContextId,
+    resolvedProjectContextId: input.resolvedProjectContextId ?? null,
+    lookupKey: input.lookupKey ?? request.lookupKey,
+    sources: [...new Set(input.sources ?? [])],
+    status: input.status,
+    reason: input.reason ?? null,
+    redacted: true,
+  };
+}
+
+function mergeIssueRouteEvidence(base: IssueRouteEvidence, overlay: IssueRouteEvidence): IssueRouteEvidence {
+  return {
+    ...overlay,
+    requestKey: base.requestKey,
+    requestAlias: base.requestAlias,
+    requestedProjectContextId: base.requestedProjectContextId,
+    resolvedProjectContextId: overlay.resolvedProjectContextId ?? base.resolvedProjectContextId,
+    lookupKey: overlay.lookupKey ?? base.lookupKey,
+    sources: [...new Set([...base.sources, ...overlay.sources])],
+    reason: overlay.reason ?? base.reason,
+    redacted: true,
+  };
+}
+
+function issueRouteEvidenceFromError(error: unknown): IssueRouteEvidence | null {
+  if (!(error instanceof SymphonyError)) return null;
+  const details = error.details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return null;
+  const routeEvidence = (details as { routeEvidence?: unknown }).routeEvidence;
+  if (!routeEvidence || typeof routeEvidence !== "object" || Array.isArray(routeEvidence)) return null;
+  return (routeEvidence as IssueRouteEvidence).redacted === true ? (routeEvidence as IssueRouteEvidence) : null;
+}
+
+function mergeRouteEvidenceIntoError(error: unknown, routeEvidence: IssueRouteEvidence): unknown {
+  if (!(error instanceof SymphonyError)) return error;
+  const details =
+    error.details && typeof error.details === "object" && !Array.isArray(error.details)
+      ? { ...(error.details as Record<string, unknown>) }
+      : {};
+  const existing = issueRouteEvidenceFromError(error);
+  return new SymphonyError(error.code, error.message, {
+    ...details,
+    routeEvidence: existing ? mergeIssueRouteEvidence(routeEvidence, existing) : routeEvidence,
+  });
+}
+
+function statusAliasResolutionError(
+  entityLabel: string,
+  requestKey: string,
+  status: Extract<AliasResolutionStatus, "ambiguous" | "wrong_context">,
+  routeEvidence?: IssueRouteEvidence,
+): SymphonyError {
   if (status === "ambiguous") {
     return new SymphonyError(
       "not_found",
       `${entityLabel} alias is ambiguous across project contexts: ${requestKey}. Use a context-qualified alias.`,
+      routeEvidence ? { routeEvidence } : undefined,
     );
   }
   return new SymphonyError(
     "not_found",
     `${entityLabel} alias is not available through the default project context: ${requestKey}. Use a context-qualified alias.`,
+    routeEvidence ? { routeEvidence } : undefined,
   );
 }
 

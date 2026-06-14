@@ -87,6 +87,37 @@ export interface IssueWorkspaceSummary {
   baseRef: string | null;
 }
 
+export type IssueRouteEvidenceKind = "issue_breakdown" | "issue_breakdown_apply" | "open_workspace";
+export type IssueRouteEvidenceStatus = "resolved" | "ambiguous" | "wrong_context" | "missing" | "credential_unavailable";
+export type IssueRouteEvidenceSource =
+  | "alias_live"
+  | "alias_workspace"
+  | "alias_run"
+  | "alias_lifecycle"
+  | "tracker_direct"
+  | "tracker_candidate"
+  | "workspace_live"
+  | "workspace_record"
+  | "workspace_run"
+  | "workspace_lifecycle"
+  | "workspace_filesystem_fallback";
+
+export interface IssueRouteEvidenceBase {
+  requestKey: string;
+  requestAlias: string;
+  requestedProjectContextId: string | null;
+  resolvedProjectContextId: string | null;
+  lookupKey: string | null;
+  sources: IssueRouteEvidenceSource[];
+}
+
+export interface IssueRouteEvidence extends IssueRouteEvidenceBase {
+  kind: IssueRouteEvidenceKind;
+  status: IssueRouteEvidenceStatus;
+  reason: string | null;
+  redacted: true;
+}
+
 export interface IssuePullRequestSummary {
   url: string | null;
   number: number | null;
