@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Stats } from "node:fs";
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
-import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
+import type { WorkspaceIssueInput, WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
@@ -1036,8 +1036,11 @@ export class StatusServer {
       if (request.method === "POST" && pauseMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(pauseMatch[1] ?? "");
-        this.options.orchestrator.pauseIssue(issueId);
-        sendJson(response, 202, { paused: true, issue: issueId });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
+        if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+        const lookupIssueId = lookup.issueId ?? issueId;
+        this.options.orchestrator.pauseIssue(lookupIssueId);
+        sendJson(response, 202, { paused: true, issue: lookupIssueId });
         return;
       }
 
@@ -1045,8 +1048,11 @@ export class StatusServer {
       if (request.method === "POST" && resumeMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(resumeMatch[1] ?? "");
-        this.options.orchestrator.resumeIssue(issueId);
-        sendJson(response, 202, { paused: false, issue: issueId });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
+        if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+        const lookupIssueId = lookup.issueId ?? issueId;
+        this.options.orchestrator.resumeIssue(lookupIssueId);
+        sendJson(response, 202, { paused: false, issue: lookupIssueId });
         return;
       }
 
@@ -1054,8 +1060,11 @@ export class StatusServer {
       if (request.method === "POST" && cancelMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(cancelMatch[1] ?? "");
-        await this.options.orchestrator.cancelIssue(issueId);
-        sendJson(response, 202, { cancelled: true, issue: issueId });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
+        if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+        const lookupIssueId = lookup.issueId ?? issueId;
+        await this.options.orchestrator.cancelIssue(lookupIssueId);
+        sendJson(response, 202, { cancelled: true, issue: lookupIssueId });
         return;
       }
 
@@ -1077,6 +1086,11 @@ export class StatusServer {
       if (request.method === "GET" && issueRunsMatch) {
         const issueId = decodeURIComponent(issueRunsMatch[1] ?? "").trim();
         const snapshot = this.options.orchestrator.snapshot();
+        const parsedIssueAlias = parseContextualAlias(issueId);
+        const preferRouteLookup =
+          parsedIssueAlias.projectContextId === null && (!this.options.defaultProjectContextId || Boolean(this.options.tracker));
+        const routeLookup =
+          parsedIssueAlias.projectContextId === null ? await this.resolveRouteIssueLookup(issueId, snapshot) : null;
         const resolvedIssue = await resolveIssueAliasData({
           requestKey: issueId,
           snapshot,
@@ -1084,20 +1098,58 @@ export class StatusServer {
           lifecycleStore: this.options.lifecycleStore,
           defaultProjectContextId: this.options.defaultProjectContextId,
         });
-        if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
-          throw statusAliasResolutionError("Issue", issueId, resolvedIssue.status);
+        let issueResponseKey = issueId;
+        let lookupIssueId: string | null = null;
+        let live: RunningRow | null = null;
+        let workspace: WorkspaceRecord | null = null;
+        let latestRun: RunRecord | null = null;
+        let runs: RunRecord[] = [];
+        let rawLifecycle: IssueLifecycleRecord | null = null;
+        if (routeLookup?.resolutionKind === "exact_issue_id" && routeLookup.issueId) {
+          lookupIssueId = routeLookup.issueId;
+          issueResponseKey = lookupIssueId;
+          live = this.options.orchestrator.getIssueDetails(lookupIssueId);
+          rawLifecycle = (await this.options.lifecycleStore?.get(lookupIssueId)) ?? null;
+          workspace = (await this.options.runStore?.findWorkspace(lookupIssueId)) ?? null;
+          latestRun = (await this.options.runStore?.latestRunForIssue(lookupIssueId)) ?? null;
+          runs = (await this.options.runStore?.listRunsForIssue(lookupIssueId)) ?? [];
+        } else if (preferRouteLookup && routeLookup?.ambiguousCandidates.length) {
+          throw ambiguousIssueLookupError(issueId, routeLookup.ambiguousCandidates);
+        } else if (preferRouteLookup && routeLookup?.issueId) {
+          lookupIssueId = routeLookup.issueId;
+          issueResponseKey = lookupIssueId;
+          live = this.options.orchestrator.getIssueDetails(lookupIssueId);
+          rawLifecycle = (await this.options.lifecycleStore?.get(lookupIssueId)) ?? null;
+          workspace = (await this.options.runStore?.findWorkspace(lookupIssueId)) ?? null;
+          latestRun = (await this.options.runStore?.latestRunForIssue(lookupIssueId)) ?? null;
+          runs = (await this.options.runStore?.listRunsForIssue(lookupIssueId)) ?? [];
+        } else {
+          if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+            throw statusAliasResolutionError("Issue", issueId, resolvedIssue.status);
+          }
+          if (resolvedIssue.status === "resolved") {
+            issueResponseKey = parsedIssueAlias.projectContextId !== null ? issueId : resolvedIssue.requestKey;
+            lookupIssueId =
+              resolvedIssue.lifecycle?.issueId ??
+              resolvedIssue.latestRun?.issueId ??
+              resolvedIssue.workspace?.issueId ??
+              resolvedIssue.live?.issueId ??
+              null;
+            live = resolvedIssue.live;
+            workspace = resolvedIssue.workspace;
+            latestRun = resolvedIssue.latestRun;
+            runs = [...resolvedIssue.runs];
+            rawLifecycle = resolvedIssue.lifecycle;
+          } else {
+            throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
+          }
         }
-        if (resolvedIssue.status !== "resolved") throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
-        const live = resolvedIssue.live;
-        const workspace = resolvedIssue.workspace;
-        const latestRun = resolvedIssue.latestRun;
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
-        const runs = resolvedIssue.runs;
         const lifecycle = sanitizeStatusLifecycle({
           live,
           workspace,
           latestRun,
-          lifecycle: resolvedIssue.lifecycle,
+          lifecycle: rawLifecycle,
         });
         const enrichedRuns = await Promise.all(
           runs.map(async (run) => ({
@@ -1107,9 +1159,9 @@ export class StatusServer {
           })),
         );
         sendJson(response, 200, {
-          issue: issueId,
+          issue: lookupIssueId ?? issueResponseKey,
           issueDetails: buildIssueDetailsEnvelope({
-            requestKey: resolvedIssue.requestKey,
+            requestKey: issueResponseKey,
             generatedAt: snapshot.generatedAt,
             trackerStateLists: this.options.trackerStateLists,
             staleThresholdMs: this.options.staleThresholdMs,
@@ -1137,26 +1189,51 @@ export class StatusServer {
       if (request.method === "POST" && continuationSummaryMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(continuationSummaryMatch[1] ?? "").trim();
+        const parsedIssueAlias = parseContextualAlias(issueId);
+        const preferRouteLookup =
+          parsedIssueAlias.projectContextId === null && (!this.options.defaultProjectContextId || Boolean(this.options.tracker));
+        if (parsedIssueAlias.projectContextId === null) {
+          const lookup = await this.resolveRouteIssueLookup(issueId);
+          if (lookup.resolutionKind === "exact_issue_id" && lookup.issueId) {
+            const result = await this.options.orchestrator.createContinuationSummary(lookup.issueId);
+            sendJson(response, 201, {
+              issue: lookup.issueId,
+              summaryReference: result.summaryReference,
+              lifecycle: result.lifecycle,
+            });
+            return;
+          }
+          if (preferRouteLookup && lookup.ambiguousCandidates.length > 0) {
+            throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+          }
+          if (preferRouteLookup && lookup.issueId) {
+            const result = await this.options.orchestrator.createContinuationSummary(lookup.issueId);
+            sendJson(response, 201, {
+              issue: lookup.issueId,
+              summaryReference: result.summaryReference,
+              lifecycle: result.lifecycle,
+            });
+            return;
+          }
+        }
+        const resolvedIssue = await resolveIssueAliasData({
+          requestKey: issueId,
+          snapshot: this.options.orchestrator.snapshot(),
+          runStore: this.options.runStore,
+          lifecycleStore: this.options.lifecycleStore,
+          defaultProjectContextId: this.options.defaultProjectContextId,
+        });
+        if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+          throw statusAliasResolutionError("Issue", issueId, resolvedIssue.status);
+        }
         let continuationSummaryIssueId = issueId;
-        if (this.options.lifecycleStore || this.options.runStore) {
-          const resolvedIssue = await resolveIssueAliasData({
-            requestKey: issueId,
-            snapshot: this.options.orchestrator.snapshot(),
-            runStore: this.options.runStore,
-            lifecycleStore: this.options.lifecycleStore,
-            defaultProjectContextId: this.options.defaultProjectContextId,
-          });
-          if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
-            throw statusAliasResolutionError("Issue", issueId, resolvedIssue.status);
-          }
-          if (resolvedIssue.status === "resolved") {
-            continuationSummaryIssueId =
-              resolvedIssue.lifecycle?.issueId ??
-              resolvedIssue.latestRun?.issueId ??
-              resolvedIssue.workspace?.issueId ??
-              resolvedIssue.live?.issueId ??
-              continuationSummaryIssueId;
-          }
+        if (resolvedIssue.status === "resolved") {
+          continuationSummaryIssueId =
+            resolvedIssue.lifecycle?.issueId ??
+            resolvedIssue.latestRun?.issueId ??
+            resolvedIssue.workspace?.issueId ??
+            resolvedIssue.live?.issueId ??
+            continuationSummaryIssueId;
         }
         const result = await this.options.orchestrator.createContinuationSummary(continuationSummaryIssueId);
         sendJson(response, 201, {
@@ -1280,6 +1357,11 @@ export class StatusServer {
       if (request.method === "GET" && issueMatch) {
         const issueId = decodeURIComponent(issueMatch[1] ?? "").trim();
         const snapshot = this.options.orchestrator.snapshot();
+        const parsedIssueAlias = parseContextualAlias(issueId);
+        const preferRouteLookup =
+          parsedIssueAlias.projectContextId === null && (!this.options.defaultProjectContextId || Boolean(this.options.tracker));
+        const routeLookup =
+          parsedIssueAlias.projectContextId === null ? await this.resolveRouteIssueLookup(issueId, snapshot) : null;
         const resolvedIssue = await resolveIssueAliasData({
           requestKey: issueId,
           snapshot,
@@ -1287,22 +1369,57 @@ export class StatusServer {
           lifecycleStore: this.options.lifecycleStore,
           defaultProjectContextId: this.options.defaultProjectContextId,
         });
-        if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
-          throw statusAliasResolutionError("Issue", issueId, resolvedIssue.status);
+        let issueRouteKey = issueId;
+        let lookupIssueId: string | null = null;
+        let live: RunningRow | null = null;
+        let workspace: WorkspaceRecord | null = null;
+        let latestRun: RunRecord | null = null;
+        let rawLifecycle: IssueLifecycleRecord | null = null;
+        if (routeLookup?.resolutionKind === "exact_issue_id" && routeLookup.issueId) {
+          lookupIssueId = routeLookup.issueId;
+          issueRouteKey = lookupIssueId;
+          live = this.options.orchestrator.getIssueDetails(lookupIssueId);
+          rawLifecycle = (await this.options.lifecycleStore?.get(lookupIssueId)) ?? null;
+          workspace = (await this.options.runStore?.findWorkspace(lookupIssueId)) ?? null;
+          latestRun = (await this.options.runStore?.latestRunForIssue(lookupIssueId)) ?? null;
+        } else if (preferRouteLookup && routeLookup?.ambiguousCandidates.length) {
+          throw ambiguousIssueLookupError(issueId, routeLookup.ambiguousCandidates);
+        } else if (preferRouteLookup && routeLookup?.issueId) {
+          lookupIssueId = routeLookup.issueId;
+          issueRouteKey = lookupIssueId;
+          live = this.options.orchestrator.getIssueDetails(lookupIssueId);
+          rawLifecycle = (await this.options.lifecycleStore?.get(lookupIssueId)) ?? null;
+          workspace = (await this.options.runStore?.findWorkspace(lookupIssueId)) ?? null;
+          latestRun = (await this.options.runStore?.latestRunForIssue(lookupIssueId)) ?? null;
+        } else {
+          if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+            throw statusAliasResolutionError("Issue", issueId, resolvedIssue.status);
+          }
+          if (resolvedIssue.status === "resolved") {
+            issueRouteKey = parsedIssueAlias.projectContextId !== null ? issueId : resolvedIssue.requestKey;
+            lookupIssueId =
+              resolvedIssue.lifecycle?.issueId ??
+              resolvedIssue.latestRun?.issueId ??
+              resolvedIssue.workspace?.issueId ??
+              resolvedIssue.live?.issueId ??
+              null;
+            live = resolvedIssue.live;
+            workspace = resolvedIssue.workspace;
+            latestRun = resolvedIssue.latestRun;
+            rawLifecycle = resolvedIssue.lifecycle;
+          } else {
+            throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
+          }
         }
-        if (resolvedIssue.status !== "resolved") throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
-        const live = resolvedIssue.live;
-        const workspace = resolvedIssue.workspace;
-        const latestRun = resolvedIssue.latestRun;
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const lifecycle = sanitizeStatusLifecycle({
           live,
           workspace,
           latestRun,
-          lifecycle: resolvedIssue.lifecycle,
+          lifecycle: rawLifecycle,
         });
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
-        const keys = issueKeys(resolvedIssue.requestKey, { live, latestRun, lifecycle });
+        const keys = issueKeys(issueRouteKey, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
         const issueProjectContext = lifecycle?.projectContext ?? workspace?.projectContext ?? projectContextResolutionFromIssue(live) ?? latestRun?.projectContext;
@@ -1324,16 +1441,17 @@ export class StatusServer {
         });
         const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: Boolean(this.options.openWorkspaceToken) });
         const affordances = operatorAffordances({
-          issueKey: issueId,
+          issueKey: issueRouteKey,
           lifecycle,
           continuationSummaryAvailable: Boolean(this.options.lifecycleStore && this.options.runStore),
           mutationsRequireToken: controls.mutationsRequireToken,
         });
         sendJson(response, 200, {
-          issue: issueId,
+          issue: lookupIssueId ?? issueRouteKey,
           issueDetails: buildIssueDetailsEnvelope({
-            requestKey: resolvedIssue.requestKey,
+            requestKey: issueRouteKey,
             generatedAt: snapshot.generatedAt,
+
             trackerStateLists: this.options.trackerStateLists,
             staleThresholdMs: this.options.staleThresholdMs,
             live,
@@ -1403,11 +1521,12 @@ export class StatusServer {
         const runId = decodeURIComponent(runMatch[1] ?? "");
         const run = await this.options.runStore?.getRun(runId);
         if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
-        const issueRunsByIdentifier = (await this.options.runStore?.listRunsForIssue(run.issueIdentifier)) ?? [];
+        const issueLookupOptions = run.projectContext ? { projectContext: run.projectContext } : {};
+        const issueRunsByIdentifier = (await this.options.runStore?.listRunsForIssue(run.issueIdentifier, issueLookupOptions)) ?? [];
         const issueRuns =
           issueRunsByIdentifier.length > 0 || run.issueIdentifier === run.issueId
             ? issueRunsByIdentifier
-            : ((await this.options.runStore?.listRunsForIssue(run.issueId)) ?? []);
+            : ((await this.options.runStore?.listRunsForIssue(run.issueId, issueLookupOptions)) ?? []);
         const lifecycle =
           (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
@@ -1423,6 +1542,25 @@ export class StatusServer {
       const workspaceMatch = /^\/api\/v1\/workspaces\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && workspaceMatch) {
         const workspaceKey = decodeURIComponent(workspaceMatch[1] ?? "").trim();
+        const directWorkspace = await this.options.runStore?.getWorkspace(workspaceKey);
+        if (directWorkspace && (directWorkspace.workspaceKey !== directWorkspace.issueIdentifier || !this.options.defaultProjectContextId)) {
+          sendJson(response, 200, directWorkspace);
+          return;
+        }
+        const parsedWorkspaceAlias = parseContextualAlias(workspaceKey);
+        if (parsedWorkspaceAlias.projectContextId === null) {
+          const lookup = await this.resolveRouteIssueLookup(workspaceKey);
+          if (lookup.resolutionKind === "exact_issue_id" && lookup.issueId) {
+            const exactWorkspace = await this.options.runStore?.findWorkspace(lookup.issueId);
+            if (exactWorkspace) {
+              sendJson(response, 200, exactWorkspace);
+              return;
+            }
+          }
+          if (lookup.ambiguousCandidates.length > 0 && (!this.options.defaultProjectContextId || this.options.tracker)) {
+            throw ambiguousIssueLookupError(workspaceKey, lookup.ambiguousCandidates);
+          }
+        }
         const snapshot = this.options.orchestrator.snapshot();
         const resolvedIssue = await resolveIssueAliasData({
           requestKey: workspaceKey,
@@ -1443,6 +1581,42 @@ export class StatusServer {
       if (request.method === "POST" && openMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(openMatch[1] ?? "").trim();
+        const parsedIssueAlias = parseContextualAlias(issueId);
+        const preferRouteLookup =
+          parsedIssueAlias.projectContextId === null && (!this.options.defaultProjectContextId || Boolean(this.options.tracker));
+        if (parsedIssueAlias.projectContextId === null) {
+          const lookup = await this.resolveRouteIssueLookup(issueId);
+          if (preferRouteLookup && lookup.ambiguousCandidates.length > 0) {
+            throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+          }
+          if (lookup.issueId && (lookup.resolutionKind === "exact_issue_id" || preferRouteLookup)) {
+            const lookupIssueId = lookup.issueId;
+            const details = this.options.orchestrator.getIssueDetails(lookupIssueId);
+            const lifecycle = await this.options.lifecycleStore?.get(lookupIssueId);
+            const workspace = await this.options.runStore?.findWorkspace(lookupIssueId);
+            const workspacePath =
+              details?.workspacePath ??
+              workspace?.path ??
+              lifecycle?.summaryPointers.workspacePath ??
+              (lifecycle
+                ? this.options.workspaceManager.getPathForIssue({
+                    id: lifecycle.issueId,
+                    identifier: lifecycle.issueIdentifier,
+                    branchName: lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName ?? null,
+                    ...(lifecycle.projectContext === undefined ? {} : { projectContext: lifecycle.projectContext }),
+                  })
+                : null);
+            if (!workspacePath) {
+              throw new SymphonyError("not_found", `Workspace not found for issue: ${issueId}`);
+            }
+            if (!(await pathExists(workspacePath))) {
+              throw new SymphonyError("not_found", `Workspace not found: ${workspacePath}`);
+            }
+            await this.options.workspaceOpener.open(workspacePath);
+            sendJson(response, 202, { opened: true, workspace_path: workspacePath });
+            return;
+          }
+        }
         const resolvedTarget = await resolveIssueActionTarget({
           requestKey: issueId,
           snapshot: this.options.orchestrator.snapshot(),
@@ -1509,7 +1683,7 @@ export class StatusServer {
           workspace?.path ??
           target.latestRun?.workspacePath ??
           target.lifecycle?.summaryPointers.workspacePath ??
-          this.options.workspaceManager.getPathForIssue(workspaceLookupKey);
+          workspacePathForLookupKey(workspaceLookupKey, this.options.workspaceManager);
         let workspaceSource: IssueRouteEvidenceSource = "workspace_filesystem_fallback";
         if (details?.workspacePath) {
           workspaceSource = "workspace_live";
@@ -2160,8 +2334,8 @@ export class StatusServer {
     try {
       const detail = await this.fetchBoardIssueDetail(issueId, forceRefresh);
       const issueActivityKey =
-        detail.issueDetails.issue.identifier ??
         detail.issueDetails.issue.id ??
+        detail.issueDetails.issue.identifier ??
         detail.boardCard?.issueIdentifier ??
         detail.boardCard?.issueId ??
         issueId;
@@ -2846,8 +3020,32 @@ export class StatusServer {
     });
   }
 
+  private resolveBoardIssueLookup(issueId: string, sourceIndex: BuiltWebProjectionSourceIndex): IssueLookupResult {
+    return resolveIssueLookupFromCandidates(
+      issueId,
+      dedupeIssueLookupCandidates([
+        ...(sourceIndex.trackerIssues.error ? [] : sourceIndex.trackerIssues.issues.map(issueLookupCandidateFromIssue)),
+        ...sourceIndex.runtime.snapshot.running.map(issueLookupCandidateFromRunningRow),
+        ...sourceIndex.lifecycles.records.map(issueLookupCandidateFromLifecycle),
+        ...sourceIndex.workspaces.workspaces.map(issueLookupCandidateFromWorkspace),
+        ...sourceIndex.runs.runs.map(issueLookupCandidateFromRun),
+      ].filter((candidate): candidate is IssueLookupCandidate => candidate !== null)),
+    );
+  }
+
   private async fetchBoardIssueDetail(issueId: string, forceRefresh: boolean) {
-    const { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
+    let { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
+    let lookup = this.resolveBoardIssueLookup(issueId, sourceIndex);
+    const refreshedIdentifierLookup = lookup.resolutionKind === "issue_identifier" && this.options.tracker && sourceIndex.trackerIssues.cached;
+    if (refreshedIdentifierLookup) {
+      ({ sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(true));
+      lookup = this.resolveBoardIssueLookup(issueId, sourceIndex);
+    }
+    if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+    if (this.options.tracker && sourceIndex.trackerIssues.error && (lookup.resolutionKind === "issue_identifier" || refreshedIdentifierLookup)) {
+      throw trackerFailureFromSourceIndex(sourceIndex);
+    }
+    const lookupIssueId = lookup.issueId ?? issueId;
     let board: IssueBoardResponse | null = null;
     let trackerFailure: SymphonyError | null = null;
     if (sourceIndex.trackerIssues.error) {
@@ -2864,9 +3062,9 @@ export class StatusServer {
       });
     }
 
-    const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), [issueId])) ?? null;
+    const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), [lookupIssueId])) ?? null;
     const detail = await buildBoardIssueDetail({
-      requestKey: issueId,
+      requestKey: lookupIssueId,
       card,
       sourceIndex,
       mutationsConfigured: Boolean(this.options.openWorkspaceToken),
@@ -2982,8 +3180,57 @@ export class StatusServer {
     return this.options.issueBoardColumns ?? defaultWebProjectionIssueBoardColumns(this.options.trackerStateLists);
   }
 
+  private async resolveRouteIssueLookup(
+    issueKey: string,
+    snapshot: RuntimeSnapshot = this.options.orchestrator.snapshot(),
+  ): Promise<IssueLookupResult> {
+    const resolveLookup = async (trackerIssues: readonly Issue[]): Promise<IssueLookupResult> =>
+      resolveIssueLookupKey(issueKey, {
+        snapshot,
+        lifecycleStore: this.options.lifecycleStore,
+        runStore: this.options.runStore,
+        trackerIssues,
+      });
+
+    const initialTrackerLookup = await this.loadTrackerIssuesForRouteLookup();
+    let lookup = await resolveLookup(initialTrackerLookup.trackerIssues);
+    if (lookup.resolutionKind === "issue_identifier") {
+      if (initialTrackerLookup.trackerFailure) {
+        throw initialTrackerLookup.trackerFailure;
+      }
+      if (initialTrackerLookup.trackerCached) {
+        const refreshedTrackerLookup = await this.loadTrackerIssuesForRouteLookup(true);
+        lookup = await resolveLookup(refreshedTrackerLookup.trackerIssues);
+        if (refreshedTrackerLookup.trackerFailure) {
+          throw refreshedTrackerLookup.trackerFailure;
+        }
+      }
+    }
+    return lookup;
+  }
+
+  private async loadTrackerIssuesForRouteLookup(forceRefresh = false): Promise<{
+    trackerIssues: readonly Issue[];
+    trackerFailure: SymphonyError | null;
+    trackerCached: boolean;
+  }> {
+    if (!this.options.tracker) return { trackerIssues: [], trackerFailure: null, trackerCached: false };
+    try {
+      const projection = await this.fetchIssueBoardTrackerProjection(
+        this.resolveWebProjectionIssueBoardColumns(),
+        forceRefresh,
+      );
+      return { trackerIssues: projection.trackerIssues, trackerFailure: null, trackerCached: projection.cached };
+    } catch (error) {
+      if (error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")) {
+        return { trackerIssues: [], trackerFailure: error, trackerCached: false };
+      }
+      throw error;
+    }
+  }
+
   private async createWebProjectionContextFingerprint(
-    snapshot: ReturnType<Orchestrator["snapshot"]>,
+    snapshot: RuntimeSnapshot,
     issueBoardColumns: IssueBoardColumnMapping,
   ): Promise<WebProjectionCacheFingerprint> {
     const fetchedStates = webProjectionIssueBoardFetchStates(issueBoardColumns);
@@ -5187,7 +5434,7 @@ async function buildBoardIssueDetail(input: {
   continuationSummaryAvailable: boolean;
 }) {
   const snapshot = input.sourceIndex.runtime.snapshot;
-  const keys = input.card ? boardCardKeys(input.card) : [input.requestKey];
+  const keys = input.card?.issueId ? [input.card.issueId] : input.card ? boardCardKeys(input.card) : [input.requestKey];
   const live = liveIssueByKeys(input.sourceIndex, keys);
   const workspace = workspaceByKeys(input.sourceIndex, keys);
   const latestRun = latestRunByKeys(input.sourceIndex, keys);
@@ -5195,7 +5442,7 @@ async function buildBoardIssueDetail(input: {
   const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
   if (!input.card && !live && !workspace && !latestRun && !lifecycle) return null;
 
-  const issueKey = input.card?.issueIdentifier ?? input.card?.issueId ?? input.requestKey;
+  const issueKey = input.card?.issueId ?? input.card?.issueIdentifier ?? input.requestKey;
   const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore, input.sourceIndex.runs);
   const runs = runsByKeys(input.sourceIndex, keys);
   const enrichedRuns = await Promise.all(
@@ -5208,7 +5455,7 @@ async function buildBoardIssueDetail(input: {
   const issueDetails =
     input.card?.issueDetails ??
     buildIssueDetailsEnvelope({
-      requestKey: input.requestKey,
+      requestKey: issueKey,
       generatedAt: snapshot.generatedAt,
       trackerStateLists: input.trackerStateLists,
       staleThresholdMs: input.staleThresholdMs,
@@ -5239,7 +5486,7 @@ async function buildBoardIssueDetail(input: {
   const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
   const metadata = statusMetadata({ live, workspace, latestRun, lifecycle });
   return {
-    issue: input.requestKey,
+    issue: issueKey,
     boardCard: input.card ? acceptedBoardCard(input.card) : null,
     issueDetails,
     live: live ? liveIssueResponse(live, operatorLiveness) : null,
@@ -5340,8 +5587,9 @@ async function buildActivityFeed(input: {
   const allRuns = input.runs ?? (input.runStore ? await input.runStore.listRuns() : []);
   const includeTranscriptEvents = input.includeTranscriptEvents ?? true;
   const lifecycleRecords = input.lifecycleRecords ?? (await input.lifecycleStore?.list()) ?? [];
-  const issueFilter = input.query.issue;
-  const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter)) : allRuns;
+  const requestedIssueFilter = input.query.issue;
+  const resolvedIssueFilter = requestedIssueFilter ? resolveActivityIssueFilter(requestedIssueFilter, allRuns, lifecycleRecords) : null;
+  const runs = resolvedIssueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, resolvedIssueFilter)) : allRuns;
   const activity: ActivityItem[] = [];
   let transcriptEventsConsidered = 0;
   let transcriptEventsTotal = 0;
@@ -5372,8 +5620,8 @@ async function buildActivityFeed(input: {
   }
 
   const writebackOperations = input.writebackOperations ?? (await input.writebackOutbox?.list()) ?? [];
-  const filteredWritebackOperations = issueFilter
-    ? writebackOperations.filter((operation) => writebackOperationMatchesIssue(operation, issueFilter, allRuns, lifecycleRecords))
+  const filteredWritebackOperations = resolvedIssueFilter
+    ? writebackOperations.filter((operation) => writebackOperationMatchesIssue(operation, resolvedIssueFilter, allRuns, lifecycleRecords))
     : writebackOperations;
   writebackOperationsConsidered = filteredWritebackOperations.length;
   activity.push(...filteredWritebackOperations.map((operation) => activityItemForWritebackOperation(operation, allRuns, lifecycleRecords)));
@@ -5459,6 +5707,7 @@ function activityItemForWritebackOperation(
   const run = operation.runId ? (runs.find((candidate) => candidate.runId === operation.runId) ?? null) : null;
   const lifecycle =
     lifecycles.find((candidate) => candidate.issueId === operation.issueId || candidate.issueIdentifier === operation.issueId) ?? null;
+  const issueId = run?.issueId ?? lifecycle?.issueId ?? operation.issueId;
   const issueIdentifier = run?.issueIdentifier ?? lifecycle?.issueIdentifier ?? operation.issueId;
   return {
     id: `writeback:${writebackIdentityKey(operation.idempotencyKey, operation.projectContext)}`,
@@ -5466,7 +5715,7 @@ function activityItemForWritebackOperation(
     kind: "writeback_operation",
     source: "writeback",
     issue: {
-      id: operation.issueId,
+      id: issueId,
       identifier: issueIdentifier,
     },
     run: run ? activityRun(run) : null,
@@ -5496,7 +5745,7 @@ function activityItemForWritebackOperation(
           : null,
     },
     links: {
-      issue: `/api/v1/board/issues/${encodeURIComponent(issueIdentifier)}`,
+      issue: `/api/v1/board/issues/${encodeURIComponent(issueId)}`,
       run: operation.runId ? `/api/v1/runs/${encodeURIComponent(operation.runId)}` : null,
       transcript: null,
     },
@@ -5544,7 +5793,7 @@ function activityRun(run: RunRecord): ActivityItem["run"] {
 
 function activityLinks(run: RunRecord, event: TranscriptEvent | null): ActivityItem["links"] {
   return {
-    issue: `/api/v1/board/issues/${encodeURIComponent(run.issueIdentifier)}`,
+    issue: `/api/v1/board/issues/${encodeURIComponent(run.issueId)}`,
     run: `/api/v1/runs/${encodeURIComponent(run.runId)}`,
     transcript: event
       ? `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript?offset=${Math.max(event.sequence - 1, 0)}&limit=1`
@@ -5687,13 +5936,13 @@ async function buildSymphonyOnlyBoardCards(input: {
   };
 
   for (const live of snapshot.running) {
-    await maybeAdd(live.issueIdentifier, live);
+    await maybeAdd(live.issueId, live);
   }
   for (const pausedKey of snapshot.paused) {
     await maybeAdd(pausedKey);
   }
   for (const lifecycle of input.sourceIndex.lifecycles.records) {
-    if (isLifecycleBlocked(lifecycle)) await maybeAdd(lifecycle.issueIdentifier);
+    if (isLifecycleBlocked(lifecycle)) await maybeAdd(lifecycle.issueId);
   }
   return cards;
 }
@@ -5713,7 +5962,7 @@ async function buildBoardCard(input: {
   runIndex?: BuiltWebProjectionSourceIndex["runs"];
   continuationSummaryAvailable: boolean;
 }): Promise<IssueBoardCard> {
-  const issueKey = input.issueDetails.issue.identifier ?? input.issueDetails.issue.id ?? input.key;
+  const issueKey = input.issueDetails.issue.id ?? input.issueDetails.issue.identifier ?? input.key;
   const lifecycle = sanitizeStatusLifecycle({
     live: input.live,
     workspace: input.workspace,
@@ -5946,6 +6195,21 @@ function projectContextResolutionFromParsedAlias(parsed: ParsedContextualAlias):
     linearProjectSlug: null,
     routingSource: "explicit",
   };
+}
+
+function workspaceIssueInputFromLookupKey(lookupKey: string): WorkspaceIssueInput {
+  const parsed = parseContextualAlias(lookupKey);
+  const projectContext = projectContextResolutionFromParsedAlias(parsed);
+  return {
+    id: null,
+    identifier: parsed.alias || lookupKey.trim(),
+    branchName: null,
+    ...(projectContext === undefined ? {} : { projectContext }),
+  };
+}
+
+function workspacePathForLookupKey(lookupKey: string, workspaceManager: WorkspaceManager): string {
+  return workspaceManager.getPathForIssue(workspaceIssueInputFromLookupKey(lookupKey));
 }
 
 function resolvedIssueActionProjectContext(
@@ -6519,23 +6783,36 @@ function boardCardKeys(card: IssueBoardCard): string[] {
   return [card.key, card.issueId, card.issueIdentifier].filter((value): value is string => value !== null && value !== undefined);
 }
 
-function activityRunMatchesIssue(run: RunRecord, issue: string): boolean {
-  return run.issueId === issue || run.issueIdentifier === issue;
+function resolveActivityIssueFilter(issue: string, runs: readonly RunRecord[], lifecycles: readonly IssueLifecycleRecord[]): string {
+  const lookup = resolveIssueLookupFromCandidates(
+    issue,
+    dedupeIssueLookupCandidates(
+      [...runs.map(issueLookupCandidateFromRun), ...lifecycles.map(issueLookupCandidateFromLifecycle)].filter(
+        (candidate): candidate is IssueLookupCandidate => candidate !== null,
+      ),
+    ),
+  );
+  if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issue, lookup.ambiguousCandidates);
+  return lookup.issueId ?? issue;
+}
+
+function activityRunMatchesIssue(run: RunRecord, issueKey: string): boolean {
+  return run.issueId === issueKey || run.issueIdentifier === issueKey;
 }
 
 function writebackOperationMatchesIssue(
   operation: WritebackOperation,
-  issue: string,
+  issueId: string,
   runs: readonly RunRecord[],
   lifecycles: readonly IssueLifecycleRecord[],
 ): boolean {
-  if (operation.issueId === issue) return true;
+  if (operation.issueId === issueId) return true;
   const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
-  if (run && activityRunMatchesIssue(run, issue)) return true;
+  if (run && activityRunMatchesIssue(run, issueId)) return true;
   return lifecycles.some(
     (lifecycle) =>
-      (lifecycle.issueId === operation.issueId || lifecycle.issueIdentifier === operation.issueId) &&
-      (lifecycle.issueId === issue || lifecycle.issueIdentifier === issue),
+      lifecycle.issueId === issueId &&
+      (lifecycle.issueId === operation.issueId || lifecycle.issueIdentifier === operation.issueId),
   );
 }
 
@@ -6684,7 +6961,7 @@ function renderRunningRow(
   const operator = runningOperatorLiveness(row, paused, row.lifecycle, agentId);
   const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
   const affordances = operatorAffordances({
-    issueKey: row.issueIdentifier,
+    issueKey: row.issueId,
     lifecycle: row.lifecycle,
     continuationSummaryAvailable,
     mutationsRequireToken: controls.mutationsRequireToken,
@@ -6736,14 +7013,18 @@ async function operatorSnapshotView(
       const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
       const paused = isIssuePaused(snapshot, keys);
       const agentId = await resolveRunningAgentId(row, runStore);
-      const workspace = (await runStore?.findWorkspace(row.issueId)) ?? (await runStore?.findWorkspace(row.issueIdentifier));
+      const lookupOptions = row.lifecycle?.projectContext ? { projectContext: row.lifecycle.projectContext } : {};
+      const workspace =
+        (await runStore?.findWorkspace(row.issueId, lookupOptions)) ??
+        (await runStore?.findWorkspace(row.issueIdentifier, lookupOptions));
       const latestRun =
-        (await runStore?.latestRunForIssue(row.issueId)) ?? (await runStore?.latestRunForIssue(row.issueIdentifier));
+        (await runStore?.latestRunForIssue(row.issueId, lookupOptions)) ??
+        (await runStore?.latestRunForIssue(row.issueIdentifier, lookupOptions));
       const summaryRun = await resolveIssueDetailsSummaryRun(row, latestRun, runStore);
       const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
       const mergeConflict = mergeConflictOperatorSummary(row.lifecycle?.mergeConflict ?? null);
       const affordances = operatorAffordances({
-        issueKey: row.issueIdentifier,
+        issueKey: row.issueId,
         lifecycle: row.lifecycle,
         continuationSummaryAvailable: Boolean(lifecycleStore && runStore),
         mutationsRequireToken: controls.mutationsRequireToken,
@@ -6760,7 +7041,7 @@ async function operatorSnapshotView(
         workspacePath: row.workspacePath,
         paused,
         issueDetails: buildIssueDetailsEnvelope({
-          requestKey: row.issueIdentifier,
+          requestKey: row.issueId,
           generatedAt: snapshot.generatedAt,
           trackerStateLists,
           staleThresholdMs,
@@ -6900,8 +7181,9 @@ async function resolveRunningAgentId(
     const run = await runStore.getRun(runId);
     if (runMatchesLiveRow(row, run)) return run.agentId;
   }
+  const lookupOptions = row.lifecycle?.projectContext ? { projectContext: row.lifecycle.projectContext } : {};
   for (const issueKey of [row.issueId, row.issueIdentifier]) {
-    const run = await runStore.latestRunForIssue(issueKey);
+    const run = await runStore.latestRunForIssue(issueKey, lookupOptions);
     if (runMatchesLiveRow(row, run)) return run.agentId;
   }
   return null;
@@ -6924,8 +7206,9 @@ async function pausedOperatorViews(
   return Promise.all(
     pausedKeys.map(async (pausedKey) => {
       const lifecycle = (await lifecycleStore?.get(pausedKey)) ?? null;
-      const workspace = await runStore?.findWorkspace(pausedKey);
-      const latestRun = await runStore?.latestRunForIssue(pausedKey);
+      const lookupOptions = lifecycle?.projectContext ? { projectContext: lifecycle.projectContext } : {};
+      const workspace = await runStore?.findWorkspace(pausedKey, lookupOptions);
+      const latestRun = await runStore?.latestRunForIssue(pausedKey, lookupOptions);
       const live = running.find((row) => row.issueId === pausedKey || row.issueIdentifier === pausedKey) ?? null;
       const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, runStore);
       const issueIdentifier = lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? pausedKey;
@@ -6937,7 +7220,7 @@ async function pausedOperatorViews(
         paused: true,
         controls,
         issueDetails: buildIssueDetailsEnvelope({
-          requestKey: pausedKey,
+          requestKey: lifecycle?.issueId ?? workspace?.issueId ?? latestRun?.issueId ?? pausedKey,
           generatedAt,
           trackerStateLists,
           staleThresholdMs,
@@ -6948,7 +7231,7 @@ async function pausedOperatorViews(
           lifecycle,
         }),
         ...operatorAffordances({
-          issueKey: issueIdentifier,
+          issueKey: lifecycle?.issueId ?? workspace?.issueId ?? latestRun?.issueId ?? pausedKey,
           lifecycle,
           continuationSummaryAvailable: Boolean(lifecycleStore && runStore),
           mutationsRequireToken: controls.mutationsRequireToken,
@@ -7883,6 +8166,146 @@ function defaultTrackerStateLists(): TrackerStateLists {
 
 function isStateNameIn(state: string, states: readonly string[]): boolean {
   return states.some((candidate) => candidate.toLowerCase() === state.toLowerCase());
+}
+
+interface IssueLookupCandidate {
+  issueId: string;
+  issueIdentifier: string;
+  projectContextId: string | null;
+}
+
+interface IssueLookupResult {
+  issueId: string | null;
+  ambiguousCandidates: IssueLookupCandidate[];
+  resolutionKind: "exact_issue_id" | "issue_identifier" | "unresolved";
+}
+
+async function resolveIssueLookupKey(
+  issueKey: string,
+  input: {
+    snapshot: RuntimeSnapshot;
+    lifecycleStore: IssueLifecycleStore | undefined;
+    runStore: RunTranscriptStore | undefined;
+    trackerIssues?: readonly Issue[];
+  },
+): Promise<IssueLookupResult> {
+  const [lifecycleRecords, workspaces, runs] = await Promise.all([
+    input.lifecycleStore?.list() ?? Promise.resolve([]),
+    input.runStore?.listWorkspaces() ?? Promise.resolve([]),
+    input.runStore?.listRuns() ?? Promise.resolve([]),
+  ]);
+  return resolveIssueLookupFromCandidates(
+    issueKey,
+    dedupeIssueLookupCandidates(
+      [
+        ...(input.trackerIssues ?? []).map(issueLookupCandidateFromIssue),
+        ...input.snapshot.running.map(issueLookupCandidateFromRunningRow),
+        ...lifecycleRecords.map(issueLookupCandidateFromLifecycle),
+        ...workspaces.map(issueLookupCandidateFromWorkspace),
+        ...runs.map(issueLookupCandidateFromRun),
+      ].filter((candidate): candidate is IssueLookupCandidate => candidate !== null),
+    ),
+  );
+}
+
+function resolveIssueLookupFromCandidates(
+  issueKey: string,
+  candidates: readonly IssueLookupCandidate[],
+): IssueLookupResult {
+  const exactIssueIdMatch = candidates.find((candidate) => candidate.issueId === issueKey);
+  if (exactIssueIdMatch) {
+    return { issueId: exactIssueIdMatch.issueId, ambiguousCandidates: [], resolutionKind: "exact_issue_id" };
+  }
+  const identifierMatches = candidates.filter((candidate) => candidate.issueIdentifier === issueKey);
+  if (identifierMatches.length === 1) {
+    return { issueId: identifierMatches[0]?.issueId ?? null, ambiguousCandidates: [], resolutionKind: "issue_identifier" };
+  }
+  return {
+    issueId: null,
+    ambiguousCandidates: identifierMatches.length > 1 ? identifierMatches : [],
+    resolutionKind: "unresolved",
+  };
+}
+
+function ambiguousIssueLookupError(issueKey: string, candidates: readonly IssueLookupCandidate[]): SymphonyError {
+  const details = candidates.map((candidate) => {
+    const context = candidate.projectContextId ? ` [${candidate.projectContextId}]` : "";
+    return `${candidate.issueId}${context}`;
+  });
+  return new SymphonyError(
+    "conflict",
+    `Ambiguous issue identifier: ${issueKey}. Use exact issue id. Candidates: ${details.join(", ")}`,
+  );
+}
+
+function issueLookupCandidateFromRunningRow(row: RunningRow): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: row.issueId,
+    issueIdentifier: row.issueIdentifier,
+    projectContext: projectContextResolutionFromIssue(row) ?? undefined,
+  });
+}
+
+function issueLookupCandidateFromIssue(issue: Issue): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    projectContext: projectContextResolutionFromIssue(issue) ?? undefined,
+  });
+}
+
+function issueLookupCandidateFromLifecycle(record: IssueLifecycleRecord): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: record.issueId,
+    issueIdentifier: record.issueIdentifier,
+    projectContext: record.projectContext,
+  });
+}
+
+function issueLookupCandidateFromWorkspace(record: WorkspaceRecord): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: record.issueId ?? null,
+    issueIdentifier: record.issueIdentifier,
+    projectContext: record.projectContext,
+  });
+}
+
+function issueLookupCandidateFromRun(record: RunRecord): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: record.issueId,
+    issueIdentifier: record.issueIdentifier,
+    projectContext: record.projectContext,
+  });
+}
+
+function issueLookupCandidate(input: {
+  issueId: string | null;
+  issueIdentifier: string | null;
+  projectContext?: IssueLifecycleRecord["projectContext"] | WorkspaceRecord["projectContext"] | RunRecord["projectContext"];
+}): IssueLookupCandidate | null {
+  if (!input.issueId || !input.issueIdentifier) {
+    return null;
+  }
+  return {
+    issueId: input.issueId,
+    issueIdentifier: input.issueIdentifier,
+    projectContextId: input.projectContext?.projectContextId ?? null,
+  };
+}
+
+function dedupeIssueLookupCandidates(candidates: readonly IssueLookupCandidate[]): IssueLookupCandidate[] {
+  const byIssueId = new Map<string, IssueLookupCandidate>();
+  for (const candidate of candidates) {
+    const existing = byIssueId.get(candidate.issueId);
+    if (!existing) {
+      byIssueId.set(candidate.issueId, candidate);
+      continue;
+    }
+    if (existing.projectContextId === null && candidate.projectContextId !== null) {
+      byIssueId.set(candidate.issueId, candidate);
+    }
+  }
+  return [...byIssueId.values()].sort((left, right) => compareString(left.issueId, right.issueId));
 }
 
 function issueKeys(

@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
-import { issue } from "./helpers.js";
+import { issue, trackerIssue } from "./helpers.js";
 
 describe("git worktree workspace source", () => {
   let root: string;
@@ -44,6 +44,242 @@ describe("git worktree workspace source", () => {
 
     expect(currentBranch.trim()).toBe("symphony/TEST-2");
     expect(workspace.workspaceKey).toBe("TEST-2");
+  });
+
+  it("creates duplicate-identifier context worktrees without collision and cleans up only the targeted sibling", async () => {
+    const manager = newManager(root, repo);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-1",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-123",
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(symphonyWorkspace.workspaceKey).toBe("symphony__ENG-123");
+    expect(docsWorkspace.path).not.toBe(symphonyWorkspace.path);
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
+    expect((await git(["branch", "--show-current"], symphonyWorkspace.path)).trim()).toBe("symphony/symphony/ENG-123");
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toMatchObject({
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      projectContext: { projectContextId: "docs" },
+    });
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: { projectContextId: "symphony" },
+    });
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    await expect(readFile(path.join(symphonyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: { projectContextId: "symphony" },
+    });
+  });
+
+  it("scopes identical upstream branch names by project context and cleans up only the targeted sibling", async () => {
+    const manager = newManager(root, repo);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-2",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-2",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/ENG-123",
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(symphonyWorkspace.workspaceKey).toBe("symphony__ENG-123");
+    expect(docsWorkspace.gitBranchName).toBe("symphony/docs/ENG-123");
+    expect(symphonyWorkspace.gitBranchName).toBe("symphony/symphony/ENG-123");
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
+    expect((await git(["branch", "--show-current"], symphonyWorkspace.path)).trim()).toBe("symphony/symphony/ENG-123");
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(symphonyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      gitBranchName: "symphony/symphony/ENG-123",
+      projectContext: { projectContextId: "symphony" },
+    });
+  });
+
+  it("scopes identifier-only fallback branches by project context and cleans up only the targeted sibling", async () => {
+    const manager = newManager(root, repo);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-3",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-3",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: null,
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(symphonyWorkspace.workspaceKey).toBe("symphony__ENG-123");
+    expect(docsWorkspace.gitBranchName).toBe("symphony/docs/ENG-123");
+    expect(symphonyWorkspace.gitBranchName).toBe("symphony/symphony/ENG-123");
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
+    expect((await git(["branch", "--show-current"], symphonyWorkspace.path)).trim()).toBe("symphony/symphony/ENG-123");
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(symphonyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      gitBranchName: "symphony/symphony/ENG-123",
+      projectContext: { projectContextId: "symphony" },
+    });
+  });
+
+  it("does not rescope branch templates that already embed project context", async () => {
+    const manager = newManager(
+      root,
+      repo,
+      "refuse_dirty",
+      "none",
+      "symphony/{{ issue.identifier }}-{{ issue.projectContextId }}",
+    );
+    const docsIssue = trackerIssue({
+      id: "issue-docs-template-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-template-1",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: null,
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    expect(docsWorkspace.gitBranchName).toBe("symphony/ENG-123-docs");
+    expect(symphonyWorkspace.gitBranchName).toBe("symphony/ENG-123-symphony");
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/ENG-123-docs");
+    expect((await git(["branch", "--show-current"], symphonyWorkspace.path)).trim()).toBe("symphony/ENG-123-symphony");
+  });
+
+  it("backfills persisted project context when removing duplicate-identifier worktrees without incoming context", async () => {
+    const manager = newManager(root, repo);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-4",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-4",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-123",
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const symphonyWorkspace = await manager.createForIssue(symphonyIssue);
+
+    await manager.removeForIssue(
+      issue({
+        id: docsIssue.id,
+        identifier: docsIssue.identifier,
+        branchName: docsIssue.branchName,
+      }),
+    );
+
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    await expect(readFile(path.join(symphonyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: { projectContextId: "symphony" },
+    });
+  });
+
+  it("backfills persisted project context when removing duplicate-identifier planning workspaces without incoming context", async () => {
+    const manager = newManager(root, repo, "force");
+    const docsIssue = trackerIssue({
+      id: "issue-docs-plan-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-plan-1",
+      identifier: "ENG-123",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: null,
+    });
+
+    const docsWorkspace = await manager.createForPlanning(docsIssue);
+    const symphonyWorkspace = await manager.createForPlanning(symphonyIssue);
+
+    await manager.removeForPlanning(
+      issue({
+        id: docsIssue.id,
+        identifier: docsIssue.identifier,
+        branchName: docsIssue.branchName,
+      }),
+    );
+
+    await expect(readFile(path.join(docsWorkspace.path, ".symphony-planning.json"), "utf8")).rejects.toThrow();
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    await expect(readFile(path.join(symphonyWorkspace.path, ".symphony-planning.json"), "utf8")).resolves.toContain(
+      '"mode": "none"',
+    );
+    expect(await manager.getWorkspaceRecord(symphonyWorkspace.workspaceKey)).toMatchObject({
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: { projectContextId: "symphony" },
+    });
   });
 
   it("refuses to remove dirty worktrees by default", async () => {
@@ -122,7 +358,8 @@ describe("git worktree workspace source", () => {
     expect(workspace.sourceKind).toBe("planning_readonly");
     expect(record?.sourceKind).toBe("planning_readonly");
     expect(record?.gitBranchName).toBeUndefined();
-    await expect(writeFile(path.join(workspace.path, "write.txt"), "blocked", "utf8")).rejects.toThrow();
+    expect((await stat(workspace.path)).mode & 0o222).toBe(0);
+    expect((await stat(path.join(workspace.path, "README.md"))).mode & 0o222).toBe(0);
 
     await manager.removeForPlanning(planningIssue);
 
@@ -137,6 +374,7 @@ function newManager(
   repository: string,
   cleanup: "refuse_dirty" | "force" = "refuse_dirty",
   planningWorkspaceMode: "none" | "readonly_checkout" = "none",
+  branchTemplate = "symphony/{{ issue.identifier }}",
 ): WorkspaceManager {
   const config = parseServiceConfig(
     {
@@ -147,7 +385,7 @@ function newManager(
           kind: "git_worktree",
           repository,
           base_ref: "main",
-          branch_template: "symphony/{{ issue.identifier }}",
+          branch_template: branchTemplate,
           cleanup,
         },
       },

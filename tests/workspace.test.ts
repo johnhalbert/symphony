@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager, assertPathInsideRoot, sanitizeWorkspaceKey } from "../src/core/workspace/WorkspaceManager.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, testConfig, trackerIssue } from "./helpers.js";
 
 describe("WorkspaceManager", () => {
   let root: string;
@@ -34,6 +34,48 @@ describe("WorkspaceManager", () => {
     expect(workspace.issueId).toBe("abc-123");
     expect(metadata.issueIdentifier).toBe("ABC/123");
     expect(metadata.issueId).toBe("abc-123");
+  });
+
+  it("scopes duplicate identifier workspaces by resolved project context and persists contextual metadata", async () => {
+    const config = testConfig(root);
+    const manager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger: new StructuredLogger(() => undefined),
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+    const platformIssue = trackerIssue({
+      id: "issue-platform-1",
+      identifier: "ENG-123",
+      projectContextId: "platform",
+      projectContextLabel: "Platform Services",
+      branchName: null,
+    });
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const platformWorkspace = await manager.createForIssue(platformIssue);
+    const docsMetadata = JSON.parse(
+      await readFile(path.join(config.workspace.stateDir, "workspaces", "docs__ENG-123.json"), "utf8"),
+    ) as { projectContext?: { projectContextId?: string } };
+    const platformMetadata = JSON.parse(
+      await readFile(path.join(config.workspace.stateDir, "workspaces", "platform__ENG-123.json"), "utf8"),
+    ) as { projectContext?: { projectContextId?: string } };
+
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(platformWorkspace.workspaceKey).toBe("platform__ENG-123");
+    expect(docsWorkspace.path).toBe(path.join(config.workspace.root, "docs__ENG-123"));
+    expect(platformWorkspace.path).toBe(path.join(config.workspace.root, "platform__ENG-123"));
+    expect(docsWorkspace.path).not.toBe(platformWorkspace.path);
+    expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);
+    expect(manager.getPathForIssue(platformIssue)).toBe(platformWorkspace.path);
+    expect(docsMetadata.projectContext?.projectContextId).toBe("docs");
+    expect(platformMetadata.projectContext?.projectContextId).toBe("platform");
   });
 
   it("rejects paths outside the workspace root", () => {

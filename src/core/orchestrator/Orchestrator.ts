@@ -1396,7 +1396,7 @@ export class Orchestrator {
       runs,
       transcriptEvents,
       transcriptPointers: transcriptPointersForRuns(runs),
-      statusApiPointers: statusApiPointersForIssue(lifecycle.issueIdentifier, runs),
+      statusApiPointers: statusApiPointersForIssue(lifecycle.issueId, runs),
     });
     const updated = await lifecycleStore.updateIssue(
       { id: lifecycle.issueId, identifier: lifecycle.issueIdentifier },
@@ -1466,11 +1466,10 @@ export class Orchestrator {
 
   getIssueDetails(issueIdOrIdentifier: string): RuntimeSnapshot["running"][number] | null {
     const snapshot = this.snapshot();
-    return (
-      snapshot.running.find(
-        (row) => row.issueId === issueIdOrIdentifier || row.issueIdentifier === issueIdOrIdentifier,
-      ) ?? null
-    );
+    const exactIssueIdMatch = snapshot.running.find((row) => row.issueId === issueIdOrIdentifier);
+    if (exactIssueIdMatch) return exactIssueIdMatch;
+    const identifierMatches = snapshot.running.filter((row) => row.issueIdentifier === issueIdOrIdentifier);
+    return identifierMatches.length === 1 ? identifierMatches[0] ?? null : null;
   }
 
   private scheduleTick(delayMs: number): void {
@@ -2092,6 +2091,7 @@ export class Orchestrator {
 
   private async runWorker(entry: RunningEntry, attempt: number | null): Promise<void> {
     let workspace: Workspace | null = null;
+    let workspaceIssue = issueWithProjectContext(entry.issue, null);
     try {
       entry.lifecycle ??= await this.options.lifecycleStore?.get(entry.issue.id) ?? null;
       const resolvedProjectContext =
@@ -2099,6 +2099,7 @@ export class Orchestrator {
           ? this.resolvedProjectContext(entry) ?? null
           : await this.resolveWorkerProjectContext(entry);
       entry.projectContext = resolvedProjectContext;
+      workspaceIssue = issueWithProjectContext(entry.issue, resolvedProjectContext);
       if (
         entry.runPhase !== "issue_breakdown" &&
         entry.lifecycle !== null &&
@@ -2108,8 +2109,8 @@ export class Orchestrator {
       }
       workspace =
         entry.runPhase === "issue_breakdown"
-          ? await this.options.workspaceManager.createForPlanning(entry.issue)
-          : await this.options.workspaceManager.createForIssue(entry.issue);
+          ? await this.options.workspaceManager.createForPlanning(workspaceIssue)
+          : await this.options.workspaceManager.createForIssue(workspaceIssue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
 
@@ -2201,13 +2202,12 @@ export class Orchestrator {
         if (entry.runPhase !== "issue_breakdown") {
           await this.options.workspaceManager.afterRun(workspace.path);
         } else {
-          await this.options.workspaceManager.removeForPlanning(entry.issue);
+          await this.options.workspaceManager.removeForPlanning(workspaceIssue);
         }
-        if (entry.cleanupWorkspaceOnExit) await this.options.workspaceManager.removeForIssue(entry.issue);
+        if (entry.cleanupWorkspaceOnExit) await this.options.workspaceManager.removeForIssue(workspaceIssue);
       }
     }
   }
-
   private async runReviewer(entry: RunningEntry): Promise<void> {
     let workspace: Workspace | null = null;
     try {
@@ -2220,7 +2220,9 @@ export class Orchestrator {
         return;
       }
       entry.lifecycle = evidence.lifecycle;
-      workspace = await this.options.workspaceManager.createForIssue(entry.issue);
+      workspace = await this.options.workspaceManager.createForIssue(
+        issueWithProjectContext(entry.issue, this.resolvedProjectContext(entry) ?? null),
+      );
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
       await this.updateLifecycle(entry, {
@@ -2925,7 +2927,8 @@ export class Orchestrator {
   }
 
   private async consecutiveSdkErrorFailures(issue: Issue): Promise<number> {
-    const runs = (await this.options.runStore?.listRunsForIssue(issue.id)) ?? [];
+    const lookupOptions = projectContextLookupOptions(projectContextResolutionFromIssue(issue));
+    const runs = (await this.options.runStore?.listRunsForIssue(issue.id, lookupOptions)) ?? [];
     const seen = new Set<string>();
     const workerRuns = runs
       .filter((run) => run.role === "worker" && !seen.has(run.runId) && seen.add(run.runId))
@@ -2939,7 +2942,8 @@ export class Orchestrator {
   }
 
   private async consecutiveInfraFailures(issue: Issue): Promise<number> {
-    const runs = (await this.options.runStore?.listRunsForIssue(issue.id)) ?? [];
+    const lookupOptions = projectContextLookupOptions(projectContextResolutionFromIssue(issue));
+    const runs = (await this.options.runStore?.listRunsForIssue(issue.id, lookupOptions)) ?? [];
     const seen = new Set<string>();
     const workerRuns = runs
       .filter((run) => run.role === "worker" && !seen.has(run.runId) && seen.add(run.runId))
@@ -3189,7 +3193,8 @@ export class Orchestrator {
   private async resolveWorkerProjectContext(entry: RunningEntry): Promise<ProjectContextResolution | null> {
     const persistedOrIssueResolution = this.resolvedProjectContext(entry) ?? null;
     const usesConfiguredRouting =
-      entry.runPhase === "implementation" && this.config.projectContexts.contexts.some((context) => context.source === "explicit");
+      entry.runPhase !== "merge_conflict_resolution" &&
+      this.config.projectContexts.contexts.some((context) => context.source === "explicit");
     if (!usesConfiguredRouting) {
       return persistedOrIssueResolution;
     }
@@ -3856,7 +3861,8 @@ export class Orchestrator {
 
   private async renderContinuationBrief(entry: RunningEntry): Promise<string> {
     const lifecycle = entry.lifecycle ?? (await this.options.lifecycleStore?.get(entry.issue.id)) ?? null;
-    const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id)) ?? [];
+    const lookupOptions = projectContextLookupOptions(lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue));
+    const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id, lookupOptions)) ?? [];
     const history = await this.loadContinuationHistory(runs);
     const threshold = this.config.reviewLoop.transcriptHistoryLimit;
     const historyMode = "summary";
@@ -3865,7 +3871,7 @@ export class Orchestrator {
     const pointers = lifecycle?.summaryPointers;
     const latestRun = runs[runs.length - 1] ?? null;
     const transcriptPointers = transcriptPointersForRuns(runs);
-    const statusApiPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
+    const statusApiPointers = statusApiPointersForIssue(entry.issue.id, runs);
 
     return [
       "Structured continuation brief:",
@@ -3998,12 +4004,13 @@ export class Orchestrator {
 
   private async loadWorkerHandoffPrompt(entry: RunningEntry): Promise<string | null> {
     const lifecycle = (await this.options.lifecycleStore?.get(entry.issue.id)) ?? entry.lifecycle ?? null;
-    const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id)) ?? [];
+    const lookupOptions = projectContextLookupOptions(lifecycle?.projectContext ?? projectContextResolutionFromIssue(entry.issue));
+    const runs = (await this.options.runStore?.listRunsForIssue(entry.issue.id, lookupOptions)) ?? [];
     if (!lifecycle || !hasRealHandoffContext(lifecycle, runs)) return null;
     const currentLifecycle = currentPromptLifecycle(lifecycle);
     const packet = buildWorkerHandoffPacket(currentLifecycle);
     const transcriptPointers = transcriptPointersForRuns(runs);
-    const statusPointers = statusApiPointersForIssue(entry.issue.identifier, runs);
+    const statusPointers = statusApiPointersForIssue(entry.issue.id, runs);
     const activeReviewEvidence = lifecycle.reviewEvidence.items.filter(isActiveReviewEvidenceItem);
     return [
       "",
@@ -4559,12 +4566,28 @@ async function listRunsForLifecycle(
   lifecycle: IssueLifecycleRecord,
 ): Promise<RunRecord[]> {
   const byId = new Map<string, RunRecord>();
+  const lookupOptions = projectContextLookupOptions(lifecycle.projectContext);
   for (const key of new Set([lifecycle.issueId, lifecycle.issueIdentifier])) {
-    for (const run of await runStore.listRunsForIssue(key)) {
+    for (const run of await runStore.listRunsForIssue(key, lookupOptions)) {
       byId.set(run.runId, run);
     }
   }
   return [...byId.values()].sort(compareRunChronology);
+}
+
+function projectContextLookupOptions(projectContext: ProjectContextResolution | null | undefined):
+  | { projectContext: ProjectContextResolution }
+  | {} {
+  return projectContext ? { projectContext } : {};
+}
+
+function issueWithProjectContext(issue: Issue, projectContext: ProjectContextResolution | null | undefined) {
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    branchName: issue.branchName,
+    ...(projectContext ? { projectContext } : {}),
+  };
 }
 
 async function readContinuationTranscriptEvents(
@@ -4598,12 +4621,12 @@ function transcriptPointersForRuns(runs: RunRecord[]): string[] {
   return runs.slice(-5).map((run) => `/api/v1/runs/${encodeURIComponent(run.runId)}/transcript`);
 }
 
-function statusApiPointersForIssue(issueIdentifier: string, runs: RunRecord[]): string[] {
-  return [
-    `/api/v1/issues/${encodeURIComponent(issueIdentifier)}`,
-    `/api/v1/issues/${encodeURIComponent(issueIdentifier)}/runs`,
-    ...runs.slice(-5).map((run) => `/api/v1/runs/${encodeURIComponent(run.runId)}`),
-  ];
+function statusApiPointersForIssue(issueKey: string, runs: RunRecord[]): string[] {
+  const pointers = new Set<string>();
+  pointers.add(`/api/v1/issues/${encodeURIComponent(issueKey)}`);
+  pointers.add(`/api/v1/issues/${encodeURIComponent(issueKey)}/runs`);
+  for (const run of runs) pointers.add(`/api/v1/runs/${encodeURIComponent(run.runId)}`);
+  return [...pointers];
 }
 
 function promptRelevantTranscriptEvents(events: TranscriptEvent[]): TranscriptEvent[] {

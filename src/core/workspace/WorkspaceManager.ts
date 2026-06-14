@@ -3,6 +3,11 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { Liquid } from "liquidjs";
 import type { HookConfig, WorkspaceConfig } from "../config/Config.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue, Workspace } from "../types.js";
 import type { Logger } from "../logging/StructuredLogger.js";
@@ -20,6 +25,7 @@ export interface WorkspaceMetadata {
   workspaceKey: string;
   issueId: string | null;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   path: string;
   createdAt: string;
   updatedAt: string;
@@ -40,7 +46,7 @@ export class WorkspaceManager {
   async createForIssue(issueInput: WorkspaceIssueInput): Promise<Workspace> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
-    const workspaceKey = sanitizeWorkspaceKey(issueIdentifier);
+    const workspaceKey = workspaceKeyForIssue(issue);
     const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
 
@@ -63,6 +69,7 @@ export class WorkspaceManager {
         workspaceKey,
         issueId: issue.id,
         issueIdentifier,
+        ...(issue.projectContext === null ? {} : { projectContext: issue.projectContext }),
         path: workspacePath,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -91,6 +98,7 @@ export class WorkspaceManager {
       workspaceKey,
       issueId: issue.id,
       issueIdentifier,
+      projectContext: issue.projectContext ?? existing?.projectContext,
       path: workspacePath,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -117,7 +125,7 @@ export class WorkspaceManager {
   async createForPlanning(issueInput: WorkspaceIssueInput): Promise<Workspace> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
-    const workspaceKey = `${sanitizeWorkspaceKey(issueIdentifier)}-planning`;
+    const workspaceKey = workspaceKeyForPlanningIssue(issue);
     const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
 
@@ -145,6 +153,7 @@ export class WorkspaceManager {
           {
             issueId: issue.id,
             issueIdentifier,
+            ...(issue.projectContext === null ? {} : { projectContext: issue.projectContext }),
             mode: "none",
             createdAt: new Date().toISOString(),
           },
@@ -177,6 +186,7 @@ export class WorkspaceManager {
           {
             issueId: issue.id,
             issueIdentifier,
+            ...(issue.projectContext === null ? {} : { projectContext: issue.projectContext }),
             mode: "readonly_checkout",
             createdAt: new Date().toISOString(),
           },
@@ -192,6 +202,7 @@ export class WorkspaceManager {
       workspaceKey,
       issueId: issue.id,
       issueIdentifier,
+      projectContext: issue.projectContext ?? existing?.projectContext,
       path: workspacePath,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -215,11 +226,13 @@ export class WorkspaceManager {
 
   async removeForPlanning(issueInput: WorkspaceIssueInput): Promise<void> {
     const issue = normalizeIssueInput(issueInput);
-    const issueIdentifier = issue.identifier;
-    const workspaceKey = `${sanitizeWorkspaceKey(issueIdentifier)}-planning`;
-    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+    const persistedWorkspace = await this.findPlanningWorkspaceForRemoval(issue);
+    const resolvedIssue =
+      !issue.projectContext && persistedWorkspace?.projectContext ? { ...issue, projectContext: persistedWorkspace.projectContext } : issue;
+    const workspaceKey = persistedWorkspace?.workspaceKey ?? workspaceKeyForPlanningIssue(resolvedIssue);
+    const workspacePath = persistedWorkspace?.path ?? path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
-    const metadata = await this.store.getWorkspace(workspaceKey);
+    const metadata = persistedWorkspace ?? (await this.store.getWorkspace(workspaceKey));
     await this.removePlanningWorkspace(workspaceKey, workspacePath, metadata);
   }
 
@@ -238,8 +251,11 @@ export class WorkspaceManager {
   async removeForIssue(issueInput: WorkspaceIssueInput): Promise<void> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
-    const workspaceKey = sanitizeWorkspaceKey(issueIdentifier);
-    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+    const persistedWorkspace = await this.findWorkspaceForRemoval(issue);
+    const resolvedIssue =
+      !issue.projectContext && persistedWorkspace?.projectContext ? { ...issue, projectContext: persistedWorkspace.projectContext } : issue;
+    const workspaceKey = persistedWorkspace?.workspaceKey ?? workspaceKeyForIssue(resolvedIssue);
+    const workspacePath = persistedWorkspace?.path ?? path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
 
     if (!(await pathExists(workspacePath))) {
@@ -248,7 +264,7 @@ export class WorkspaceManager {
     }
     await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
     await this.runHook("before_remove", this.options.hooks.beforeRemove, workspacePath, false);
-    const metadata = await this.store.getWorkspace(workspaceKey);
+    const metadata = persistedWorkspace ?? (await this.store.getWorkspace(workspaceKey));
     if (metadata?.sourceKind === "git_worktree" && metadata.repoPath) {
       await removeGitWorktree({
         repoPath: metadata.repoPath,
@@ -274,6 +290,31 @@ export class WorkspaceManager {
       issue_identifier: issueIdentifier,
       workspace_path: workspacePath,
     });
+  }
+
+  private async findWorkspaceForRemoval(issue: WorkspaceIssue): Promise<WorkspaceRecord | null> {
+    if (issue.id) {
+      return issue.projectContext
+        ? this.store.findWorkspace(issue.id, { projectContext: issue.projectContext })
+        : this.store.findWorkspace(issue.id);
+    }
+    if (issue.projectContext) {
+      return this.store.findWorkspace(issue.identifier, { projectContext: issue.projectContext });
+    }
+    return null;
+  }
+
+  private async findPlanningWorkspaceForRemoval(issue: WorkspaceIssue): Promise<WorkspaceRecord | null> {
+    if (!issue.id && !issue.projectContext) return null;
+    const records = await this.store.listWorkspaces();
+    return (
+      records.find(
+        (record) =>
+          isPlanningWorkspaceKey(record.workspaceKey) &&
+          (issue.id ? record.issueId === issue.id : record.issueIdentifier === issue.identifier) &&
+          matchesWorkspaceProjectContext(record.projectContext, issue.projectContext),
+      ) ?? null
+    );
   }
 
   private async removePlanningWorkspace(
@@ -306,8 +347,9 @@ export class WorkspaceManager {
     await this.store.deleteWorkspace(workspaceKey);
   }
 
-  getPathForIssue(issueIdentifier: string): string {
-    const workspacePath = path.resolve(this.options.workspace.root, sanitizeWorkspaceKey(issueIdentifier));
+  getPathForIssue(issueInput: WorkspaceIssueInput): string {
+    const workspaceKey = workspaceKeyForIssue(normalizeIssueInput(issueInput));
+    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
     return workspacePath;
   }
@@ -380,19 +422,25 @@ export class WorkspaceManager {
 
   private async resolveBranchName(issue: WorkspaceIssue): Promise<string> {
     const source = this.options.workspace.source;
-    const template = source.branchTemplate ?? "symphony/{{ issue.identifier }}";
+    const template = source.branchTemplate;
+    const renderedFromTemplate = !issue.branchName && Boolean(template);
     const branchName =
       issue.branchName ??
-      (await this.branchRenderer.parseAndRender(template, {
-        issue: {
-          id: issue.id,
-          identifier: issue.identifier,
-          branchName: issue.branchName,
-        },
-      }));
+      (template
+        ? await this.branchRenderer.parseAndRender(template, {
+            issue: {
+              id: issue.id,
+              identifier: issue.identifier,
+              branchName: issue.branchName,
+              projectContext: issue.projectContext,
+              projectContextId: issue.projectContext?.projectContextId ?? null,
+              projectContextLabel: issue.projectContext?.projectContextLabel ?? null,
+            },
+          })
+        : defaultBranchNameForIssue(issue));
     const trimmed = String(branchName).trim();
     if (trimmed.length === 0) throw new SymphonyError("workspace_error", "Resolved git branch name is empty");
-    return trimmed;
+    return scopeBranchNameToProjectContext(trimmed, issue, { renderedFromTemplate });
   }
 
   private async assertExistingWorktree(workspaceKey: string, workspacePath: string): Promise<void> {
@@ -412,13 +460,100 @@ export interface WorkspaceIssue {
   id: string | null;
   identifier: string;
   branchName: string | null;
+  projectContext: ProjectContextResolution | null;
 }
 
-export type WorkspaceIssueInput = string | Pick<Issue, "id" | "identifier" | "branchName">;
+export interface WorkspaceIssueInput {
+  id: string | null;
+  identifier: string;
+  branchName: string | null;
+  projectContext?: ProjectContextResolution | null;
+}
 
 function normalizeIssueInput(input: WorkspaceIssueInput): WorkspaceIssue {
-  if (typeof input === "string") return { id: null, identifier: input, branchName: null };
-  return { id: input.id, identifier: input.identifier, branchName: input.branchName };
+  return {
+    id: input.id,
+    identifier: input.identifier,
+    branchName: input.branchName,
+    projectContext: projectContextResolutionFromIssue(input),
+  };
+}
+
+function workspaceKeyForIssue(issue: WorkspaceIssue): string {
+  return scopedWorkspaceKey(sanitizeWorkspaceKey(issue.identifier), issue.projectContext);
+}
+
+function workspaceKeyForPlanningIssue(issue: WorkspaceIssue): string {
+  return `${workspaceKeyForIssue(issue)}-planning`;
+}
+
+function isPlanningWorkspaceKey(workspaceKey: string): boolean {
+  return workspaceKey.endsWith("-planning");
+}
+
+function matchesWorkspaceProjectContext(
+  recordProjectContext: ProjectContextResolution | undefined,
+  issueProjectContext: ProjectContextResolution | null,
+): boolean {
+  if (!issueProjectContext) return true;
+  const recordProjectContextId = recordProjectContext?.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+  return recordProjectContextId === issueProjectContext.projectContextId;
+}
+
+function scopedWorkspaceKey(baseWorkspaceKey: string, projectContext: ProjectContextResolution | null): string {
+  if (!projectContext || projectContext.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return baseWorkspaceKey;
+  return `${sanitizeWorkspaceKey(projectContext.projectContextId)}__${baseWorkspaceKey}`;
+}
+
+function defaultBranchNameForIssue(issue: WorkspaceIssue): string {
+  const projectContextId = issue.projectContext?.projectContextId;
+  if (projectContextId && projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+    return `symphony/${projectContextId}/${issue.identifier}`;
+  }
+  return `symphony/${issue.identifier}`;
+}
+
+function scopeBranchNameToProjectContext(
+  branchName: string,
+  issue: WorkspaceIssue,
+  options: { renderedFromTemplate?: boolean } = {},
+): string {
+  const projectContextId = issue.projectContext?.projectContextId;
+  if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return branchName;
+
+  const contextPart = sanitizeGitBranchPart(projectContextId);
+  const branchParts = branchName.split("/").filter((part) => part.length > 0);
+  const identifierParts = issue.identifier.split("/").filter((part) => part.length > 0);
+  const unscopedDefaultParts = ["symphony", ...identifierParts];
+  const matchesUnscopedDefault =
+    branchParts.length === unscopedDefaultParts.length && branchParts.every((part, index) => part === unscopedDefaultParts[index]);
+  if (options.renderedFromTemplate && !matchesUnscopedDefault && branchParts.some((part) => branchPartContainsContextToken(part, contextPart))) {
+    return branchName;
+  }
+  const identifierIndex = findBranchPartSequence(branchParts, identifierParts);
+  if (identifierIndex >= 0) {
+    if (!matchesUnscopedDefault && identifierIndex > 0 && branchParts[identifierIndex - 1] === contextPart) return branchName;
+    return [...branchParts.slice(0, identifierIndex), contextPart, ...branchParts.slice(identifierIndex)].join("/");
+  }
+
+  return [...branchParts, contextPart].join("/");
+}
+
+function sanitizeGitBranchPart(value: string): string {
+  const sanitized = value.trim().replace(/[^A-Za-z0-9._-]/g, "_");
+  return sanitized.length > 0 ? sanitized : "context";
+}
+
+function findBranchPartSequence(parts: readonly string[], sequence: readonly string[]): number {
+  if (sequence.length === 0 || parts.length < sequence.length) return -1;
+  for (let start = 0; start <= parts.length - sequence.length; start += 1) {
+    if (sequence.every((part, index) => parts[start + index] === part)) return start;
+  }
+  return -1;
+}
+
+function branchPartContainsContextToken(part: string, contextPart: string): boolean {
+  return part.split(/[-_.]/).includes(contextPart);
 }
 
 export function sanitizeWorkspaceKey(identifier: string): string {

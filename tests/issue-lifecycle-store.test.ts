@@ -9,7 +9,7 @@ import {
   FileIssueLifecycleStore,
   phaseForIssueState,
 } from "../src/core/persistence/IssueLifecycleStore.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, testConfig, trackerIssue } from "./helpers.js";
 
 describe("FileIssueLifecycleStore", () => {
   let root: string;
@@ -144,6 +144,38 @@ describe("FileIssueLifecycleStore", () => {
   it("returns null for missing lifecycle records", async () => {
     const store = new FileIssueLifecycleStore(root);
     await expect(store.get("TEST-404")).resolves.toBeNull();
+  });
+
+  it("requires exact issue id once duplicate visible identifiers collide", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(
+      trackerIssue({
+        id: "issue-docs-1",
+        identifier: "ENG-123",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      }),
+      { phase: "implementation" },
+    );
+    await store.ensureIssue(
+      trackerIssue({
+        id: "issue-platform-1",
+        identifier: "ENG-123",
+        projectContextId: "platform",
+        projectContextLabel: "Platform Services",
+      }),
+      { phase: "implementation" },
+    );
+
+    await expect(store.get("ENG-123")).resolves.toBeNull();
+    await expect(store.get("issue-docs-1")).resolves.toMatchObject({
+      issueIdentifier: "ENG-123",
+      projectContext: { projectContextId: "docs" },
+    });
+    await expect(store.get("issue-platform-1")).resolves.toMatchObject({
+      issueIdentifier: "ENG-123",
+      projectContext: { projectContextId: "platform" },
+    });
   });
 
   it("persists merge metadata for status API consumers", async () => {

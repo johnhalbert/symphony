@@ -120,8 +120,8 @@ export class IssueBreakdownPlanService {
       proposedIssues: parsed.proposedIssues,
       transcriptPointers: [`/api/v1/runs/${encodeURIComponent(parsed.runId)}/transcript`],
       statusApiPointers: [
-        `/api/v1/issues/${encodeURIComponent(context.issue.identifier)}`,
-        `/api/v1/issues/${encodeURIComponent(context.issue.identifier)}/runs`,
+        `/api/v1/issues/${encodeURIComponent(context.issue.id)}`,
+        `/api/v1/issues/${encodeURIComponent(context.issue.id)}/runs`,
         `/api/v1/runs/${encodeURIComponent(parsed.runId)}`,
       ],
       issueUpdatedAt: context.issue.updatedAt,

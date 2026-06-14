@@ -214,7 +214,7 @@ describe("approval status API", () => {
     }
   });
 
-  it("prefers the resolved issue context over unrelated latest runs when identifiers collide", async () => {
+  it("returns pending approval for context-qualified issue lookups when project-context siblings collide", async () => {
     const pending = await createPending("idem-project-context-collision-status");
     await runStore.startRun({
       runId: "run-2",
@@ -242,6 +242,7 @@ describe("approval status API", () => {
         } | null;
       };
 
+      expect(pending.projectContext).toMatchObject(docsProjectContext);
       expect(response.status).toBe(200);
       expect(body.pendingApproval).toMatchObject({
         requestId: pending.requestId,

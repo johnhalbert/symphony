@@ -924,6 +924,90 @@ const docsProjectContext = {
     });
   }, 10_000);
 
+  it("injects exact issue-id breakdown-plan status pointers into implementation prompts for context-scoped issues", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
+    config.issueBreakdown.planningLabels = ["planning"];
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    const candidate = trackerIssue({
+      id: "issue-docs-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      state: "Todo",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    let currentState = candidate.state;
+    let updatedAt = candidate.updatedAt;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState, updatedAt }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState, updatedAt }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+      updatedAt = "2026-01-02T00:01:00Z";
+    });
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await waitForAsync(
+      async () => ((await lifecycleStore.get(candidate.id))?.issueBreakdownPlans.length ?? 0) === 1,
+      "persisted context-scoped issue breakdown plan",
+    );
+    await settleOrchestratorExit();
+    await waitForAsync(async () => {
+      await orchestrator.refreshNow();
+      return harness.runs.length === 2;
+    }, "context-scoped implementation dispatch after accepted plan", 5_000);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0);
+    await orchestrator.stop();
+
+    const expectedStatusApiPointers = [
+      "/api/v1/issues/issue-docs-1",
+      "/api/v1/issues/issue-docs-1/runs",
+      "/api/v1/runs/issue_breakdown-run-1",
+    ];
+    const lifecycle = await lifecycleStore.get(candidate.id);
+
+    expect(harness.runs[1]?.ctx.runPhase).toBe("implementation");
+    expect(harness.runs[1]?.prompt).toContain("Issue breakdown plan:");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/issue-docs-1");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/issue-docs-1/runs");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/issue_breakdown-run-1");
+    expect(harness.runs[1]?.prompt).not.toContain("/api/v1/issues/ENG-123");
+    expect(lifecycle?.issueBreakdownPlans[0]?.statusApiPointers).toEqual(expectedStatusApiPointers);
+    expect(lifecycle?.summaryReferences[0]?.statusApiPointers).toEqual(expectedStatusApiPointers);
+  }, 10_000);
+
   it("does not apply accepted issue breakdown plans during normal dispatch", async () => {
     const config = testConfig(root);
     config.issueBreakdown.enabled = true;
@@ -7364,8 +7448,8 @@ const docsProjectContext = {
     expect(createdSummary.summaryReference.transcriptEventCount).toBe(2);
     expect(createdSummary.summaryReference.transcriptPointers).toEqual(["/api/v1/runs/prior-run-1/transcript"]);
     expect(createdSummary.summaryReference.statusApiPointers).toEqual([
-      "/api/v1/issues/TEST-1",
-      "/api/v1/issues/TEST-1/runs",
+      "/api/v1/issues/issue-1",
+      "/api/v1/issues/issue-1/runs",
       "/api/v1/runs/prior-run-1",
     ]);
     expect(storedLifecycle?.summaryReferences).toEqual([createdSummary.summaryReference]);
@@ -7374,9 +7458,121 @@ const docsProjectContext = {
     expect(harness.runs[1]?.prompt).toContain(`Reference: ${createdSummary.summaryReference.id}`);
     expect(harness.runs[1]?.prompt).toContain("Continuation history summarization is not automated yet.");
     expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1/transcript");
-    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/TEST-1");
+    expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/issue-1");
     expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1");
     expect(harness.runs[1]?.prompt).not.toContain("Full relevant history:");
+  });
+
+  it("scopes continuation summaries to the lifecycle project context when duplicate identifiers collide", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-orchestrator-summary-scope-"));
+    const config = testConfig(path.join(root, "workspaces"));
+    const candidate = trackerIssue({
+      id: "issue-docs-1",
+      identifier: "ENG-123",
+      state: "Todo",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await runStore.startRun({
+      runId: "docs-run-1",
+      sessionId: "docs-session-1",
+      agentId: "docs-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Docs worker prompt",
+      workspaceKey: "docs__ENG-123",
+      workspacePath: path.join(root, "docs-eng-123"),
+      gitBranchName: "symphony/docs/ENG-123",
+      repoPath: root,
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: "docs-run-1",
+      at: "2026-01-01T00:00:01Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Docs context gathered.",
+    });
+    await runStore.startRun({
+      runId: "symphony-run-1",
+      sessionId: "symphony-session-1",
+      agentId: "symphony-agent-1",
+      role: "worker",
+      issueId: "issue-symphony-1",
+      issueIdentifier: candidate.identifier,
+      projectContext: {
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        linearProjectSlug: "ENG",
+        routingSource: "candidate_poll",
+      },
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Symphony worker prompt",
+      workspaceKey: "symphony__ENG-123",
+      workspacePath: path.join(root, "symphony-eng-123"),
+      gitBranchName: "symphony/symphony/ENG-123",
+      repoPath: root,
+      baseRef: "main",
+    });
+    await runStore.appendEvent({
+      runId: "symphony-run-1",
+      at: "2026-01-01T00:00:02Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Sibling context should not bleed into docs summary.",
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+      lifecycleStore,
+    });
+
+    try {
+      const createdSummary = await orchestrator.createContinuationSummary(candidate);
+
+      expect(createdSummary.summaryReference.runIds).toEqual(["docs-run-1"]);
+      expect(createdSummary.summaryReference.transcriptPointers).toEqual(["/api/v1/runs/docs-run-1/transcript"]);
+      expect(createdSummary.summaryReference.statusApiPointers).toEqual([
+        "/api/v1/issues/issue-docs-1",
+        "/api/v1/issues/issue-docs-1/runs",
+        "/api/v1/runs/docs-run-1",
+      ]);
+      expect(createdSummary.summaryReference.summary).not.toContain("Sibling context should not bleed into docs summary.");
+    } finally {
+      await orchestrator.stop();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
