@@ -2746,6 +2746,145 @@ const docsProjectContext = {
     });
   });
 
+  it("preserves routed worker retry redispatch context through config reload", async () => {
+    const docsActiveStates = ["Docs In Progress"];
+    const config = testConfig(root);
+    config.agent.maxSdkErrorRetries = 1;
+    config.agent.maxRetryBackoffMs = 250;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "Docs In Progress";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.tracker.activeStates = ["Root Todo"];
+    addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.tracker.activeStates = [...docsActiveStates];
+
+    class ReloadRecordingSdkWaitErrorHarness implements AgentHarness {
+      readonly id = "reload-recording-sdk-wait-error";
+      readonly capabilities = { continuation: true, mcpHandoff: true };
+      readonly runs: Array<{ ctx: AgentRunContext; runId: string }> = [];
+      readonly reloads: AgentRunContext[] = [];
+
+      async reload(ctx: AgentRunContext): Promise<void> {
+        this.reloads.push(ctx);
+      }
+
+      async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
+        const runId = `reload-sdk-error-run-${this.runs.length + 1}`;
+        this.runs.push({ ctx, runId });
+        yield { type: "session_started", sessionId: `session-${runId}`, runId };
+        yield { type: "run_status", runId, sdkStatus: "error", source: "wait" };
+        yield {
+          type: "run_diagnostic",
+          code: "cursor_run_wait_terminal_error",
+          message: "Cursor run wait returned terminal SDK error",
+          payload: { runId },
+        };
+        yield { type: "failed", error: "Cursor run failed" };
+      }
+    }
+
+    const candidate = trackerIssue({
+      id: "issue-docs-sdk-retry-reload-1",
+      identifier: "DOCS-SDK-RETRY-RELOAD-1",
+      state: "Docs In Progress",
+      labels: ["dogfood-ready"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    let currentState = "Docs In Progress";
+    const defaultTracker = trackerClientFixture();
+    const docsTrackerStats = {
+      candidateFetchCount: 0,
+      requestedIds: [] as string[][],
+    };
+    const docsTracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        docsTrackerStats.candidateFetchCount += 1;
+        return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        docsTrackerStats.requestedIds.push([...issueIds]);
+        return [{ ...candidate, state: currentState }].filter((issue) => issueIds.includes(issue.id));
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 0);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const harness = new ReloadRecordingSdkWaitErrorHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    const reloadedConfig = testConfig(root);
+    reloadedConfig.agent.maxSdkErrorRetries = 1;
+    reloadedConfig.agent.maxRetryBackoffMs = 250;
+    reloadedConfig.writeback.enabled = true;
+    reloadedConfig.writeback.mode = "live";
+    reloadedConfig.writeback.dispatchState = "Docs In Progress";
+    reloadedConfig.reviewLoop.blockedStates = ["Blocked"];
+    reloadedConfig.tracker.activeStates = ["Reloaded Root Todo"];
+    addDocsPollingProjectContext(reloadedConfig);
+    const reloadedDocsContext = requireDocsPollingContext(reloadedConfig);
+    reloadedDocsContext.tracker.activeStates = [...docsActiveStates];
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 1 && orchestrator.snapshot().counts.retrying === 1, "first docs sdk retry scheduled");
+      orchestrator.updateConfig(reloadedConfig, "Work on {{ issue.identifier }}");
+      await waitFor(
+        () => harness.runs.length === 2 && orchestrator.snapshot().counts.retrying === 0,
+        "docs retry redispatch after config reload",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
+
+    expect(harness.reloads).toHaveLength(2);
+    expect(harness.runs).toHaveLength(2);
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(docsTrackerStats.candidateFetchCount).toBeGreaterThan(defaultTracker.candidateFetchCount);
+    expect(docsTrackerStats.requestedIds.length).toBeGreaterThanOrEqual(2);
+    expect(harness.reloads[1]?.projectContext).toMatchObject(docsProjectContext);
+    expect(harness.reloads[1]?.issue.state).toBe("Docs In Progress");
+    expect(harness.reloads[1]?.config.tracker.activeStates).toEqual(docsActiveStates);
+    expect(harness.reloads[1]?.config.tracker.activeStates).not.toEqual(reloadedConfig.tracker.activeStates);
+    expect(harness.runs[1]?.ctx.projectContext).toMatchObject(docsProjectContext);
+    expect(harness.runs[1]?.ctx.issue.state).toBe("Docs In Progress");
+    expect(harness.runs[1]?.ctx.config.tracker.activeStates).toEqual(docsActiveStates);
+    const runs = await runStore.listRunsForIssue(candidate.id);
+    expect(runs.map((run) => [run.runId, run.status, run.sdkRunStatus, run.sdkRunStatusSource])).toEqual([
+      ["reload-sdk-error-run-1", "failed", "error", "wait"],
+      ["reload-sdk-error-run-2", "failed", "error", "wait"],
+    ]);
+    expect(currentState).toBe("Docs In Progress");
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+    });
+  });
+
+
   it("blocks after consecutive worker SDK wait errors reach the retry cap", async () => {
     const config = testConfig(root);
     config.agent.maxSdkErrorRetries = 2;
@@ -2838,7 +2977,6 @@ const docsProjectContext = {
       blockedReason: "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
     });
   });
-
   it("blocks after consecutive worker infrastructure failures reach the configured cap", async () => {
     const config = testConfig(root);
     config.agent.maxInfraFailures = 1;
