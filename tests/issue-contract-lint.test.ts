@@ -438,16 +438,16 @@ describe("IssueContractLint", () => {
     expect(quickstart).not.toContain("credential_profiles.roles.worker.linear.tracker");
   });
 
-  it("documents the mirrored ENG-392 contract source, blocked-state findings, and issue-contract lint entry point", () => {
-    const quickstart = eng392Quickstart();
+  it("validates the original mirrored ENG-392 issue body and records its section findings", () => {
+    const description = eng392OriginalMirroredIssueBody();
+    const analysis = analyzeIssueContractDescription(description, []);
 
-    expect(quickstart).toContain("REQ-T037");
-    expect(quickstart).toContain("PR #286 issue comment");
-    expect(quickstart).toContain("tests/orchestrator.test.ts");
-    expect(quickstart).toContain("reviewDecision: CHANGES_REQUESTED");
-    expect(quickstart).toContain("mergeStateStatus: DIRTY");
-    expect(quickstart).toContain("npm test -- tests/issue-contract-lint.test.ts");
-    expect(quickstart).toContain("required headings, fenced JSON `Issue Contract` blocks, and stable requirement IDs");
+    expect(analysis.missingSections).toEqual(["Contract Checklist", "Out Of Scope"]);
+    expect(analysis.issueContractErrors).toEqual([]);
+    expect(extractIssueContractRequirementIds(description)).toEqual(["REQ-T037"]);
+    expect(description).toContain("tests/orchestrator.test.ts");
+    expect(description).toContain("## Validation Requirements");
+    expect(description).toContain("## Promotion Readiness");
   });
 });
 
@@ -500,8 +500,50 @@ function eng392ContractExamples(): IssueContractExample[] {
   return matches.map((match) => ({ title: match[1] ?? "", description: (match[2] ?? "").trim() }));
 }
 
-function eng392Quickstart(): string {
-  return readFileSync(new URL("../specs/009-eng-392-routing-reload-split/quickstart.md", import.meta.url), "utf8");
+function eng392OriginalMirroredIssueBody(): string {
+  return [
+    "<!-- linear-linkback -->",
+    "<details>",
+    "<summary><a href=\"https://linear.app/john-halbert/issue/ENG-392/t037-add-orchestrator-routing-and-config-reload-preservation-tests\">ENG-392 T037 Add orchestrator routing and config-reload preservation tests</a></summary>",
+    "<p>",
+    "",
+    "Source: `specs/003-multi-project-config/tasks.md`, commit `0f4db1e`.",
+    "",
+    "Phase: US2 Tests",
+    "",
+    "## Problem / Goal",
+    "",
+    "Add orchestrator dispatch and config-reload preservation tests for two Linear projects routing to distinct workspaces, state buckets, and persisted in-progress run contexts in `tests/orchestrator.test.ts`.",
+    "",
+    "## Issue Contract",
+    "",
+    "```json",
+    '{"schemaVersion":1,"contractVersion":"2026-06-07.1","requirements":[{"id":"REQ-T037","requirement":"Add orchestrator tests proving two Linear projects route to distinct workspaces/state buckets and in-progress contexts survive config reload.","proofHint":"Show active runs keep their persisted projectContextId after reload or definition changes."}]}',
+    "```",
+    "",
+    "## Touched Surfaces",
+    "",
+    "* Expected repo paths: `tests/orchestrator.test.ts`.",
+    "* Surface category: testing, orchestration, persistence/replay.",
+    "",
+    "## Acceptance Criteria",
+    "",
+    "* Orchestrator dispatch and reload preservation are tested before implementation.",
+    "",
+    "## Validation Requirements",
+    "",
+    "* Run focused orchestrator tests.",
+    "",
+    "## Promotion Readiness",
+    "",
+    "* Ready for `dogfood-ready`: no",
+    "* Remaining blocker: Operator review required before promotion.",
+    "</p>",
+    "</details>",
+    "<!-- linear-review-link -->",
+    "<p><a href=\"https://linear.app/john-halbert/review/eng-392-t037-add-orchestrator-routing-and-config-reload-preservation-68cc104e4ffe\">Review in Linear</a></p>",
+    "",
+  ].join("\n");
 }
 
 function extractDocumentedPythonRawRegex(document: string, detectorName: string): RegExp {
