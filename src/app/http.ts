@@ -1594,18 +1594,24 @@ export class StatusServer {
             const details = this.options.orchestrator.getIssueDetails(lookupIssueId);
             const lifecycle = await this.options.lifecycleStore?.get(lookupIssueId);
             const workspace = await this.options.runStore?.findWorkspace(lookupIssueId);
+            const latestRun = await this.options.runStore?.latestRunForIssue(lookupIssueId);
+            const persistedWorkspaceLookupKey =
+              workspace?.workspaceKey ?? latestRun?.workspaceKey ?? lifecycle?.summaryPointers.workspaceKey ?? null;
             const workspacePath =
               details?.workspacePath ??
               workspace?.path ??
+              latestRun?.workspacePath ??
               lifecycle?.summaryPointers.workspacePath ??
-              (lifecycle
-                ? this.options.workspaceManager.getPathForIssue({
-                    id: lifecycle.issueId,
-                    identifier: lifecycle.issueIdentifier,
-                    branchName: lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName ?? null,
-                    ...(lifecycle.projectContext === undefined ? {} : { projectContext: lifecycle.projectContext }),
-                  })
-                : null);
+              (persistedWorkspaceLookupKey
+                ? workspacePathForLookupKey(persistedWorkspaceLookupKey, this.options.workspaceManager)
+                : lifecycle
+                  ? this.options.workspaceManager.getPathForIssue({
+                      id: lifecycle.issueId,
+                      identifier: lifecycle.issueIdentifier,
+                      branchName: lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName ?? null,
+                      ...(lifecycle.projectContext === undefined ? {} : { projectContext: lifecycle.projectContext }),
+                    })
+                  : null);
             if (!workspacePath) {
               throw new SymphonyError("not_found", `Workspace not found for issue: ${issueId}`);
             }

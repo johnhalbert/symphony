@@ -123,6 +123,52 @@ describe("git worktree workspace source", () => {
     });
   });
 
+  it("preserves legacy reserved-prefix worktrees by allocating an exact-id fallback and removing only the new contextual sibling", async () => {
+    const manager = newManager(root, repo);
+    const legacyIssue = issue({
+      id: "legacy-docs-prefix-worktree-1",
+      identifier: "docs__ENG-123",
+      branchName: "symphony/docs__ENG-123",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-collision-worktree-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+
+    const legacyWorkspace = await manager.createForIssue(legacyIssue);
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+
+    expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-collision-worktree-1");
+    expect(docsWorkspace.path).not.toBe(legacyWorkspace.path);
+    expect((await git(["branch", "--show-current"], legacyWorkspace.path)).trim()).toBe("symphony/docs__ENG-123");
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
+    expect(await manager.getWorkspaceRecord(legacyWorkspace.workspaceKey)).toMatchObject({
+      issueId: "legacy-docs-prefix-worktree-1",
+      issueIdentifier: "docs__ENG-123",
+    });
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toMatchObject({
+      issueId: "issue-docs-collision-worktree-1",
+      issueIdentifier: "ENG-123",
+      gitBranchName: "symphony/docs/ENG-123",
+      projectContext: { projectContextId: "docs" },
+    });
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(legacyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    expect(await manager.getWorkspaceRecord(legacyWorkspace.workspaceKey)).toMatchObject({
+      issueId: "legacy-docs-prefix-worktree-1",
+      issueIdentifier: "docs__ENG-123",
+      gitBranchName: "symphony/docs__ENG-123",
+    });
+  });
+
   it("scopes identical upstream branch names by project context and cleans up only the targeted sibling", async () => {
     const manager = newManager(root, repo);
     const docsIssue = trackerIssue({

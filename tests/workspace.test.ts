@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -76,6 +76,72 @@ describe("WorkspaceManager", () => {
     expect(manager.getPathForIssue(platformIssue)).toBe(platformWorkspace.path);
     expect(docsMetadata.projectContext?.projectContextId).toBe("docs");
     expect(platformMetadata.projectContext?.projectContextId).toBe("platform");
+  });
+
+  it("preserves legacy reserved-prefix workspaces by allocating an exact-id fallback and only removing the new contextual sibling", async () => {
+    const config = testConfig(root);
+    const manager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger: new StructuredLogger(() => undefined),
+    });
+    const legacyIssue = issue({ id: "legacy-docs-prefix-1", identifier: "docs__ENG-123" });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-collision-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+
+    const legacyWorkspace = await manager.createForIssue(legacyIssue);
+    const legacyMetadataPath = path.join(config.workspace.stateDir, "workspaces", "docs__ENG-123.json");
+    const legacyMetadataBefore = JSON.parse(await readFile(legacyMetadataPath, "utf8")) as {
+      issueId: string | null;
+      issueIdentifier: string;
+      projectContext?: { projectContextId?: string };
+    };
+
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const docsMetadata = JSON.parse(
+      await readFile(
+        path.join(config.workspace.stateDir, "workspaces", "docs__ENG-123__id__issue-docs-collision-1.json"),
+        "utf8",
+      ),
+    ) as {
+      issueId: string | null;
+      issueIdentifier: string;
+      projectContext?: { projectContextId?: string };
+    };
+    const legacyMetadataAfter = JSON.parse(await readFile(legacyMetadataPath, "utf8")) as {
+      issueId: string | null;
+      issueIdentifier: string;
+      projectContext?: { projectContextId?: string };
+    };
+
+    expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-collision-1");
+    expect(docsWorkspace.path).not.toBe(legacyWorkspace.path);
+    expect(legacyMetadataBefore).toMatchObject({
+      issueId: "legacy-docs-prefix-1",
+      issueIdentifier: "docs__ENG-123",
+      projectContext: { projectContextId: "default" },
+    });
+    expect(legacyMetadataAfter).toEqual(legacyMetadataBefore);
+    expect(docsMetadata.issueId).toBe("issue-docs-collision-1");
+    expect(docsMetadata.issueIdentifier).toBe("ENG-123");
+    expect(docsMetadata.projectContext?.projectContextId).toBe("docs");
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(stat(docsWorkspace.path)).rejects.toThrow();
+    await expect(stat(legacyWorkspace.path)).resolves.toBeDefined();
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    expect(await manager.getWorkspaceRecord(legacyWorkspace.workspaceKey)).toMatchObject({
+      issueId: "legacy-docs-prefix-1",
+      issueIdentifier: "docs__ENG-123",
+    });
+    expect(JSON.parse(await readFile(legacyMetadataPath, "utf8"))).toEqual(legacyMetadataBefore);
   });
 
   it("rejects paths outside the workspace root", () => {

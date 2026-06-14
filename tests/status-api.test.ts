@@ -747,6 +747,77 @@ describe("StatusServer durable API", () => {
   });
 
 
+  it("reopens exact issue-id collision fallback workspaces from persisted workspace keys before contextual alias derivation", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger: new StructuredLogger(() => undefined),
+    });
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const legacyIssue = issue({
+      id: "legacy-docs-prefix-open-1",
+      identifier: "docs__ENG-123",
+      state: "In Progress",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-collision-open-1",
+      identifier: "ENG-123",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+
+    const legacyWorkspace = await workspaceManager.createForIssue(legacyIssue);
+    const docsWorkspace = await workspaceManager.createForIssue(docsIssue);
+    await runStore.deleteWorkspace(docsWorkspace.workspaceKey);
+    await lifecycleStore.ensureIssue(docsIssue, {
+      phase: "implementation",
+      summaryPointers: {
+        workspaceKey: docsWorkspace.workspaceKey,
+      },
+    });
+    const openedWorkspaces: string[] = [];
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager,
+      workspaceOpener: {
+        async open(workspacePath: string) {
+          openedWorkspaces.push(workspacePath);
+        },
+      },
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const openByIdResponse = await fetch(`${baseUrl}/api/v1/issues/${encodeURIComponent(docsIssue.id)}/open-workspace`, {
+        method: "POST",
+        headers: { "x-symphony-token": "secret" },
+      });
+      const openByIdBody = (await openByIdResponse.json()) as { opened: boolean; workspace_path: string };
+
+      expect(legacyWorkspace.path).not.toBe(docsWorkspace.path);
+      expect(openByIdResponse.status).toBe(202);
+      expect(openByIdBody).toEqual({
+        opened: true,
+        workspace_path: docsWorkspace.path,
+      });
+      expect(openedWorkspaces).toEqual([docsWorkspace.path]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("treats tracker-only duplicate siblings as ambiguous for issue, workspace, and mutation lookups", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
