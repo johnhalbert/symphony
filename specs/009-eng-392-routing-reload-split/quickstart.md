@@ -115,6 +115,17 @@ Keep these adjacent PR #286 paths excluded unless a later child contract names t
 - Evidence for selecting split/retarget: `contracts/child-issue-contracts.md` defines the six-child contract family as the durable baseline, says `REQ-392-DECISION` / `ENG-392 child — decision and scope lock` "freezes whether the repair stays split into child issues," and makes every later repair family depend on that scope lock; `data-model.md` records the durable decision model with `resolution: decompose`; and the protected-surface inventory above already maps the coupled runtime/publication paths into later child families while keeping adjacent paths explicitly excluded.
 - Redispatch stays blocked until a renewed worker or reviewer candidate cites the owning child title / requirement ID, proves its diff stays within that child contract's authorized surfaces (or cites a later child contract that explicitly widens them), and keeps the excluded paths below out of scope. That proof requirement prevents automation from resuming against the old ambiguous ENG-392 contract.
 
+### Parent-to-child dependency notes for the selected split/retarget path
+
+| Scope handoff | Depends on | Dependency note |
+| --- | --- | --- |
+| Parent ENG-392 retargets renewed work to `ENG-392 child — decision and scope lock` (`REQ-392-DECISION`) | none | Treat the parent issue as the blocked umbrella until the split/retarget decision stays recorded and any renewed candidate cites the owning child title / requirement ID instead of reviving the old parent contract. |
+| `ENG-392 child — runtime routing repair` (`REQ-392-RUNTIME-ROUTING`) | `ENG-392 child — decision and scope lock` | Routing and workspace-identity repair only resumes after the scope-lock child freezes the decomposition path and keeps later scope expansion explicit. |
+| `ENG-392 child — reload preservation repair` (`REQ-392-RELOAD-PRESERVATION`) | `ENG-392 child — runtime routing repair` | Reload-preservation work depends on the routed workspace/run identity established by the runtime-routing child. |
+| `ENG-392 child — approval writeback repair` (`REQ-392-APPROVAL-WRITEBACK`) | `ENG-392 child — runtime routing repair`; `ENG-392 child — reload preservation repair` | Approval and writeback recovery stay downstream from both routed runtime identity and reload-preservation fixes. |
+| `ENG-392 child — orchestrator proof` (`REQ-392-TEST-PROOF`) | `ENG-392 child — runtime routing repair`; `ENG-392 child — reload preservation repair`; `ENG-392 child — approval writeback repair` | Focused orchestrator proof only resumes after the runtime and approval invariants above are explicit and stable. |
+| `ENG-392 child — publication hygiene closure` (`REQ-392-PUBLICATION-HYGIENE`) | `ENG-392 child — decision and scope lock`; `ENG-392 child — orchestrator proof`; `ENG-392 child — approval writeback repair` | Publication-facing closure stays last so the final diff/evidence packet can prove it matches the declared child scopes and finished prerequisite repairs. |
+
 ## Current `tests/orchestrator.test.ts` coverage inventory
 
 ### Routing and route-selection coverage already present
