@@ -14,7 +14,7 @@ import type {
   WritebackOperation,
   WritebackProcessor,
 } from "./writeback/WritebackOutbox.js";
-import { ISSUE_BREAKDOWN_PLAN_STALE_REASON } from "./writeback/WritebackOutbox.js";
+import { ISSUE_BREAKDOWN_PLAN_STALE_REASON, writebackIdentityKey } from "./writeback/WritebackOutbox.js";
 
 export type IssueBreakdownPlanApplyResult =
   | { status: "not_required"; reason: string }
@@ -276,7 +276,7 @@ function createdIssueRefFromOperation(operation: WritebackOperation): IssueBreak
   }
   return {
     proposedIssueIndex: operation.payload.proposedIssueIndex,
-    operationKey: operation.idempotencyKey,
+    operationKey: writebackIdentityKey(operation.idempotencyKey, operation.projectContext),
     status: operation.resultEvidence.issueCreateStatus,
     id: operation.resultEvidence.issue.id,
     identifier: operation.resultEvidence.issue.identifier,
@@ -288,7 +288,10 @@ function issueBreakdownRetryOptions(
   operation: NewWritebackOperation,
   replayPlan: IssueBreakdownPlanRecord,
 ): EnqueueWritebackOptions {
-  if (!replayPlan.applicationOperationKeys.includes(operation.idempotencyKey)) return {};
+  const scopedKey = writebackIdentityKey(operation.idempotencyKey, operation.projectContext);
+  if (!replayPlan.applicationOperationKeys.includes(scopedKey) && !replayPlan.applicationOperationKeys.includes(operation.idempotencyKey)) {
+    return {};
+  }
   return {
     retrySkipped: true,
     retrySkippedMessages: [ISSUE_BREAKDOWN_PLAN_STALE_REASON, "Writeback dry_run"],
@@ -297,7 +300,7 @@ function issueBreakdownRetryOptions(
 
 function mergeOperationKeys(existing: string[], operations: NewWritebackOperation[]): string[] {
   const keys = new Set(existing);
-  for (const operation of operations) keys.add(operation.idempotencyKey);
+  for (const operation of operations) keys.add(writebackIdentityKey(operation.idempotencyKey, operation.projectContext));
   return [...keys];
 }
 

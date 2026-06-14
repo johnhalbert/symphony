@@ -685,7 +685,9 @@ export class CursorHarness implements AgentHarness {
     await writeInitialHandoffMcpContexts(ctx);
     const mcpServers = symphonyRoleMcpServers(ctx, { cliPath });
     const projectContext = ctx.projectContext ?? projectContextResolutionFromIssue(ctx.issue) ?? undefined;
-    const runtimeApiKey = resolveScopedCursorRuntimeApiKey(ctx.config, ctx.role, { projectContext: configuredCursorRuntimeProjectContext(ctx) });
+    const runtimeApiKey = resolveScopedCursorRuntimeApiKey(ctx.config, ctx.role, {
+      projectContext: configuredCursorRuntimeProjectContext(ctx),
+    });
     const createOptions = cursorAgentCreateOptions(ctx, runtimeApiKey, {
       mcpServers,
     });
@@ -714,10 +716,9 @@ export class CursorHarness implements AgentHarness {
         agent = await Agent.create(createOptions);
         return { agent, created: true, resumeAttempted: true, resumeUsed: false, outcome: "created" };
       }
-    } else {
-      agent = await Agent.create(createOptions);
-      return { agent, created: true, resumeAttempted: false, resumeUsed: false, outcome: "created" };
     }
+    agent = await Agent.create(createOptions);
+    return { agent, created: true, resumeAttempted: false, resumeUsed: false, outcome: "created" };
   }
 
   private async disposeAgent(agent: SDKAgent, ctx: AgentRunContext | null, reason: string): Promise<{ ok: boolean; error: string | null }> {

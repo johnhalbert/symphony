@@ -34,6 +34,7 @@ import type {
   WritebackProcessor,
   WritebackStatus,
 } from "./writeback/WritebackOutbox.js";
+import { writebackIdentityKey } from "./writeback/WritebackOutbox.js";
 
 export const PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON = "publication approval setup incomplete";
 export const PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON = "awaiting operator approval for PR publication";
@@ -562,7 +563,7 @@ export class CompletionReportService {
       issue: input.context.issue,
       projectContext: resolveCompletionReportProjectContext(input.context, lifecycle),
       pullRequest,
-      writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
+      writebackOperationKeys: operations.map((operation) => writebackIdentityKey(operation.idempotencyKey, operation.projectContext)),
       acceptedAt: input.existing?.acceptedAt ?? null,
     });
     const enqueued: WritebackOperation[] = [];

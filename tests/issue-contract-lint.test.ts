@@ -374,6 +374,47 @@ describe("IssueContractLint", () => {
     expect(quickstart).not.toContain("tool_call_completed");
     expect(quickstart).not.toContain("operator-only private logs");
   });
+
+  it("keeps the ENG-372 routing child contract examples lintable and mapped to stable requirement ids", () => {
+    const examples = eng372ContractExamples();
+    const expectedRequirementIds = new Map<string, string[]>([
+      ["Example A — Credential routing matrix", ["REQ-ENG372C-001"]],
+      ["Example B — Redacted route evidence", ["REQ-ENG372C-002"]],
+      ["Example C — Issue-contract lint coverage", ["REQ-ENG372C-003"]],
+    ]);
+
+    expect(examples.map((example) => example.title)).toEqual([...expectedRequirementIds.keys()]);
+    for (const example of examples) {
+      const analysis = analyzeIssueContractDescription(example.description, []);
+      expect(analysis.missingSections, example.title).toEqual([]);
+      expect(analysis.issueContractErrors, example.title).toEqual([]);
+      expect(extractIssueContractRequirementIds(example.description), example.title).toEqual(
+        expectedRequirementIds.get(example.title),
+      );
+    }
+  });
+
+  it("documents the ENG-372 routing validation matrix and redacted evidence quickstart", () => {
+    const quickstart = eng372Quickstart();
+
+    expect(quickstart).toContain("REQ-ENG372C-001");
+    expect(quickstart).toContain("REQ-ENG372C-002");
+    expect(quickstart).toContain("REQ-ENG372C-003");
+    expect(quickstart).toContain("npm test -- tests/linear.test.ts tests/orchestrator.test.ts tests/status-api.test.ts tests/workspace.test.ts");
+    expect(quickstart).toContain("npm test -- tests/issue-contract-lint.test.ts");
+    expect(quickstart).toContain("/api/v1/issues/docs:ENG-179/planning-run");
+    expect(quickstart).toContain("/api/v1/issues/docs:ENG-179/planning-run/apply");
+    expect(quickstart).toContain("/api/v1/issues/ENG-179/open-workspace");
+    expect(quickstart).toContain("routeEvidence");
+    expect(quickstart).toContain('"redacted": true');
+    expect(quickstart).toContain("credential_unavailable");
+    expect(quickstart).toContain("[REDACTED]");
+    expect(quickstart).toContain("requestKey");
+    expect(quickstart).toContain("requestedProjectContextId");
+    expect(quickstart).toContain("resolvedProjectContextId");
+    expect(quickstart).not.toContain("LINEAR_API_KEY=");
+    expect(quickstart).not.toContain("credential_profiles.roles.worker.linear.tracker");
+  });
 });
 
 interface Eng371ContractExample {
@@ -401,6 +442,19 @@ function extractIssueContractRequirementIds(description: string): string[] {
 
 function eng371Quickstart(): string {
   return readFileSync(new URL("../specs/005-eng-371-public-metadata-closure/quickstart.md", import.meta.url), "utf8");
+}
+
+function eng372ContractExamples(): Eng371ContractExample[] {
+  const content = readFileSync(
+    new URL("../specs/006-eng-372-context-credential-routing/contracts/live-tracker-routing.md", import.meta.url),
+    "utf8",
+  );
+  const matches = Array.from(content.matchAll(/^## (.+?)\r?\n\r?\n````markdown\r?\n([\s\S]*?)\r?\n````/gm));
+  return matches.map((match) => ({ title: match[1] ?? "", description: (match[2] ?? "").trim() }));
+}
+
+function eng372Quickstart(): string {
+  return readFileSync(new URL("../specs/006-eng-372-context-credential-routing/quickstart.md", import.meta.url), "utf8");
 }
 
 function extractDocumentedPythonRawRegex(document: string, detectorName: string): RegExp {

@@ -4,7 +4,7 @@ import { errorMessage, SymphonyError } from "../core/errors.js";
 import type { IssueLifecycleRecord, IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
 import { compareRunChronology, type RunRecord, type RunTranscriptStore, type WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
-import type { FileWritebackOutboxStore, WritebackOperation } from "../core/writeback/WritebackOutbox.js";
+import { writebackIdentityKey, type FileWritebackOutboxStore, type WritebackOperation } from "../core/writeback/WritebackOutbox.js";
 
 export type WebProjectionClock = () => Date;
 export type WebProjectionRefreshParam = string | boolean | number | null | undefined;
@@ -736,7 +736,10 @@ function buildWritebackSourceIndex(
   for (const operation of sortedOperations) {
     for (const alias of issueAliasesForWriteback(operation, runIndex, lifecycleIndex)) {
       const existing = writebacksByIssueKey.get(alias) ?? [];
-      if (!existing.some((candidate) => candidate.idempotencyKey === operation.idempotencyKey)) existing.push(operation);
+      const scopedKey = writebackIdentityKey(operation.idempotencyKey, operation.projectContext);
+      if (!existing.some((candidate) => writebackIdentityKey(candidate.idempotencyKey, candidate.projectContext) === scopedKey)) {
+        existing.push(operation);
+      }
       writebacksByIssueKey.set(alias, existing);
     }
   }
@@ -790,7 +793,7 @@ function buildSourceRevisions(input: {
     collectionSourceRevision("writebacks", input.writebackOperations, (operation) => [
       operation.updatedAt,
       operation.createdAt,
-      operation.idempotencyKey,
+      writebackIdentityKey(operation.idempotencyKey, operation.projectContext),
     ]),
     ...input.extra,
   ].sort(compareSourceRevisions);
@@ -870,7 +873,9 @@ function compareWritebackChronology(left: WritebackOperation, right: WritebackOp
   return (
     compareDateAsc(left.createdAt, right.createdAt) ||
     compareDateAsc(left.updatedAt, right.updatedAt) ||
-    left.idempotencyKey.localeCompare(right.idempotencyKey)
+    writebackIdentityKey(left.idempotencyKey, left.projectContext).localeCompare(
+      writebackIdentityKey(right.idempotencyKey, right.projectContext),
+    )
   );
 }
 

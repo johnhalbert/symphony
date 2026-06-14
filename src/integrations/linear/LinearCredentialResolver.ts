@@ -1,4 +1,4 @@
-import type { ServiceConfig, TrackerConfig } from "../../core/config/Config.js";
+import type { ServiceConfig, TrackerConfig, WorkflowProjectContext } from "../../core/config/Config.js";
 import {
   resolveProjectContextCredentialView,
   type ProjectContextCredentialResolutionOptions,
@@ -60,6 +60,14 @@ export function resolveLinearClientConfig(
   };
 }
 
+export function resolveLinearClientConfigForProjectContext(
+  config: ServiceConfig,
+  capability: LinearCredentialCapability,
+  projectContext?: ProjectContextCredentialResolutionOptions["projectContext"],
+): ResolvedLinearClientConfig {
+  return resolveLinearClientConfig(config, capability, { projectContext });
+}
+
 export function createLinearTrackerClientForCapability(
   config: ServiceConfig,
   capability: LinearCredentialCapability,
@@ -67,4 +75,20 @@ export function createLinearTrackerClientForCapability(
   options: ProjectContextCredentialResolutionOptions = {},
 ): LinearTrackerClient {
   return new LinearTrackerClient(resolveLinearClientConfig(config, capability, options).tracker, fetchImpl);
+}
+
+export function createLinearTrackerClientForProjectContext(
+  config: ServiceConfig,
+  capability: LinearCredentialCapability,
+  projectContext: ProjectContextCredentialResolutionOptions["projectContext"],
+  fetchImpl?: FetchLike,
+): LinearTrackerClient {
+  return createLinearTrackerClientForCapability(config, capability, fetchImpl, { projectContext });
+}
+
+export function resolveLinearProjectContext(
+  config: ServiceConfig,
+  projectContext?: ProjectContextCredentialResolutionOptions["projectContext"],
+): WorkflowProjectContext {
+  return resolveProjectContextCredentialView({ config, projectContext }).projectContext;
 }
