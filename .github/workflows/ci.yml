@@ -22,7 +22,7 @@ concurrency:
 jobs:
   check:
     name: Typecheck and test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 15
     env:
       SYMPHONY_REAL_SMOKE: "0"
@@ -50,7 +50,7 @@ jobs:
     name: Real integration smoke
     needs: check
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.real_smoke == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
