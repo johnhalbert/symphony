@@ -400,7 +400,8 @@ export class MergePolicyService {
     const previousMergeGateRound = lifecycle.mergeGate?.id === gate.id ? lifecycle.mergeGate.reviewRound : 0;
     const reviewRound = newRepairCycle ? previousMergeGateRound + 1 : previousMergeGateRound;
     const maxMergeGateFailures = this.options.config.reviewLoop.failureLimits.mergeGateFailures;
-    const blocked = reviewRound >= maxMergeGateFailures;
+    const missingConflictState = gate.mergeability?.status === "conflicted" && this.options.config.mergePolicy.conflictsState === null;
+    const blocked = missingConflictState || reviewRound >= maxMergeGateFailures;
     const operations = blocked
       ? planMergeGateBlockedWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config)
       : planMergeGateRepairWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound), this.options.config);
@@ -449,7 +450,9 @@ export class MergePolicyService {
       phase: blocked ? "blocked" : "implementation",
       incompleteTurnCount: 0,
       blockedReason: blocked
-        ? `max merge gate failures reached (${reviewRound}/${maxMergeGateFailures})`
+        ? missingConflictState
+          ? "merge_policy.conflicts_state is required before Symphony can prepare a service-owned merge-conflict repair"
+          : `max merge gate failures reached (${reviewRound}/${maxMergeGateFailures})`
         : null,
       lastReviewVerdictId: storedVerdict.id,
       reviewVerdicts: upsertMergeGateVerdict(lifecycle.reviewVerdicts, storedVerdict),

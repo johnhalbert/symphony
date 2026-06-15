@@ -347,7 +347,7 @@ describe("MergePolicyService", () => {
     });
   });
 
-  it("dispatches merge-gate repair for approved PRs with merge conflicts without a conflict state", async () => {
+  it("blocks approved PRs with merge conflicts when no conflict state is configured", async () => {
     const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
@@ -371,30 +371,31 @@ describe("MergePolicyService", () => {
 
     const result = await service.reconcileIssue(currentIssue);
 
-    expect(result.status).toBe("repair_dispatched");
+    expect(result.status).toBe("blocked");
     expect(client.mergeInput).toBeNull();
-    expect(currentIssue.state).toBe("In Progress");
+    expect(currentIssue.state).toBe("Blocked");
     expect(writer.transitions).toEqual([
       {
         issueId: "issue-1",
         fromStates: ["Ready to Merge"],
-        toState: "In Progress",
-        reason: "Symphony merge gate required PR repair",
+        toState: "Blocked",
+        reason: "Symphony merge gate repair ceiling reached",
       },
     ]);
     expect(writer.comments[0]?.body).toContain("Mergeability:");
     expect(writer.comments[0]?.body).toContain("GitHub mergeable_state: dirty");
+    expect(writer.comments[0]?.body).toContain("Configure merge_policy.conflicts_state");
     expect(writer.comments[0]?.body).toContain("service-owned git operations");
-    expect(writer.comments[0]?.body).toContain("Do not run git fetch");
+    expect(writer.comments[0]?.body).not.toContain("Symphony will run issue triage");
     expect(writer.comments[0]?.body).not.toContain("reconcile the lifecycle-bound PR changes with origin/main");
     expect(writer.comments[0]?.body).not.toContain("commit and push the repaired branch");
     await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
-      phase: "implementation",
-      blockedReason: null,
+      phase: "blocked",
+      blockedReason: "merge_policy.conflicts_state is required before Symphony can prepare a service-owned merge-conflict repair",
       merge: null,
       mergeConflict: null,
       mergeGate: {
-        status: "repair_dispatched",
+        status: "blocked",
         mergeability: {
           status: "conflicted",
           mergeable: false,
@@ -598,7 +599,7 @@ describe("MergePolicyService", () => {
     expect(currentIssue.state).toBe("Done");
   });
 
-  it("dispatches one combined merge-gate repair when checks fail and the PR has conflicts", async () => {
+  it("blocks combined check and conflict failures when no conflict state is configured", async () => {
     const config = mergeConfig({ requiredChecks: ["test"] });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
@@ -626,21 +627,22 @@ describe("MergePolicyService", () => {
 
     const result = await service.reconcileIssue(currentIssue);
 
-    expect(result.status).toBe("repair_dispatched");
+    expect(result.status).toBe("blocked");
     expect(writer.comments).toHaveLength(1);
     expect(writer.comments[0]?.body).toContain("Failing checks:");
     expect(writer.comments[0]?.body).toContain("test: failure / failure");
     expect(writer.comments[0]?.body).toContain("GitHub mergeable_state: dirty");
+    expect(writer.comments[0]?.body).toContain("Configure merge_policy.conflicts_state");
     const lifecycle = await lifecycleStore.get(currentIssue.id);
     expect(lifecycle?.mergeGate).toMatchObject({
-      status: "repair_dispatched",
+      status: "blocked",
       blockerFingerprint: expect.stringContaining("test:failure"),
       mergeability: { status: "conflicted" },
     });
     expect(lifecycle?.mergeGate?.blockerFingerprint).toContain("mergeability:dirty");
   });
 
-  it("dispatches conflict repair while pending checks remain observation context", async () => {
+  it("blocks conflict repair while pending checks remain observation context without a conflict state", async () => {
     const config = mergeConfig({ requiredChecks: ["test"] });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
@@ -666,13 +668,14 @@ describe("MergePolicyService", () => {
       client,
     });
 
-    await expect(service.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "repair_dispatched" });
+    await expect(service.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "blocked" });
 
     expect(writer.comments[0]?.body).toContain("Pending checks:");
     expect(writer.comments[0]?.body).toContain("test: pending");
+    expect(writer.comments[0]?.body).toContain("Configure merge_policy.conflicts_state");
     await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
       mergeGate: {
-        status: "repair_dispatched",
+        status: "blocked",
         checks: [{ name: "test", outcome: "pending" }],
         mergeability: { status: "conflicted" },
       },

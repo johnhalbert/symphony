@@ -419,7 +419,7 @@ describe("ReviewVerdictService", () => {
     expect(result?.text).not.toContain("commit and push the repaired branch");
   });
 
-  it("formats conflicted merge-gate repair prompts without worker publication commands", () => {
+  it("formats conflicted merge-gate repair prompts without claiming conflict preparation", () => {
     const result = formatWorkerMergeGatePromptResult(
       lifecycle({
         mergeGate: mergeGate({
@@ -439,9 +439,11 @@ describe("ReviewVerdictService", () => {
     );
 
     expect(result?.kind).toBe("repair");
-    expect(result?.text).toContain("service-owned git operations");
+    expect(result?.text).toContain("not generated from a service-prepared merge-conflict session");
     expect(result?.text).toContain("Do not run git fetch");
-    expect(result?.text).toContain("Symphony performs service-owned git and PR publication actions");
+    expect(result?.text).toContain("configured merge-conflict state is required");
+    expect(result?.text).not.toContain("Symphony prepares merge-conflict worktrees");
+    expect(result?.text).not.toContain("Symphony performs service-owned git and PR publication actions");
     expect(result?.text).not.toContain("reconcile the lifecycle-bound PR changes with origin/main");
     expect(result?.text).not.toContain("commit and push the repaired branch");
   });

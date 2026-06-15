@@ -337,11 +337,12 @@ export function formatWorkerMergeGatePromptResult(lifecycle: IssueLifecycleRecor
   const conflict = gate.mergeability?.status === "conflicted";
   const requiredAction = conflict
     ? [
-        "Symphony prepares merge-conflict worktrees with service-owned git operations before worker dispatch. Resolve file contents only, validate, and submit the required report.",
-        "Do not run git fetch, git pull, git merge, git rebase, git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned git and PR publication actions.",
+        "This merge-gate repair prompt was not generated from a service-prepared merge-conflict session.",
+        "Do not run git fetch, git pull, git merge, git rebase, git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony must own those operations.",
+        "A configured merge-conflict state is required before Symphony can dispatch a prepared conflict repair.",
         actionable.length > 0
           ? "Also fix the failing or missing required checks before submitting the completion report."
-          : "If checks are still pending, include the latest validation evidence you can gather before submitting the completion report.",
+          : "If mergeability is the only blocker, stop and report that Symphony needs a configured merge-conflict state before a worker can repair this.",
       ].join(" ")
     : [
         "Fix failing checks or restore missing actionable required checks in the assigned worktree, validate the repair, leave the final implementation changes uncommitted and unpushed, and submit a completion report.",

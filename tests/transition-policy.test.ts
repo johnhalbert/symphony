@@ -523,7 +523,7 @@ describe("TransitionPolicy review-loop planners", () => {
     });
   });
 
-  it("plans conflicted merge gate repair writebacks without worker publication commands", () => {
+  it("plans generic conflicted merge gate repair writebacks without claiming conflict preparation", () => {
     const config = reviewLoopConfig();
     const operations = planMergeGateRepairWritebacks(
       {
@@ -559,11 +559,56 @@ describe("TransitionPolicy review-loop planners", () => {
       config,
     );
 
-    expect(commentBody(operations, 0)).toContain("service-owned git operations");
+    expect(commentBody(operations, 0)).toContain("has not prepared the PR worktree");
     expect(commentBody(operations, 0)).toContain("Do not run git fetch");
-    expect(commentBody(operations, 0)).toContain("Symphony performs service-owned git and PR publication actions");
+    expect(commentBody(operations, 0)).toContain("configured merge-conflict state is required");
+    expect(commentBody(operations, 0)).toContain("merge_policy.conflicts_state must be configured");
+    expect(commentBody(operations, 0)).not.toContain("Symphony will prepare the lifecycle-bound PR worktree");
+    expect(commentBody(operations, 0)).not.toContain("Symphony performs service-owned git and PR publication actions");
     expect(commentBody(operations, 0)).not.toContain("reconcile the lifecycle-bound PR changes with origin/main");
     expect(commentBody(operations, 0)).not.toContain("commit and push the repaired branch");
+  });
+
+  it("plans missing conflict-state blocks ahead of triage routing", () => {
+    const config = reviewLoopConfig();
+    config.issueTriage.enabled = true;
+    const operations = planMergeGateBlockedWritebacks(
+      {
+        issue: issue({ state: "Ready to Merge" }),
+        gateId: "merge-gate:issue-1:pr-42:head-sha-1",
+        blockerFingerprint: "head-sha-1:mergeability:dirty",
+        fromState: "Ready to Merge",
+        pullRequest: {
+          number: 42,
+          url: "https://github.com/acme/symphony/pull/42",
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
+        requiredChecks: ["test"],
+        failedChecks: [],
+        actionableMissingChecks: [],
+        pendingChecks: [],
+        missingChecks: [],
+        mergeability: {
+          status: "conflicted",
+          pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+          mergeable: false,
+          mergeableState: "dirty",
+          reason: "Pull request branch is out of date",
+          baseBranch: "main",
+          baseHeadSha: "base-sha-1",
+          observedBaseHeadSha: null,
+          checkedAt: "2026-01-01T00:00:02.000Z",
+        },
+        reviewRound: 1,
+        maxReviewRounds: 3,
+      },
+      config,
+    );
+
+    expect(commentBody(operations, 0)).toContain("Configure merge_policy.conflicts_state");
+    expect(commentBody(operations, 0)).toContain("service-owned git operations");
+    expect(commentBody(operations, 0)).not.toContain("Symphony will run issue triage");
   });
 
   it("plans merge gate blocked writebacks from the merge source state", () => {

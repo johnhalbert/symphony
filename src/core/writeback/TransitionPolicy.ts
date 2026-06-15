@@ -776,11 +776,12 @@ export function planMergeGateRepairWritebacks(
   const conflict = context.mergeability?.status === "conflicted";
   const requiredAction = conflict
     ? [
-        "Symphony will prepare the lifecycle-bound PR worktree against the live base branch with service-owned git operations before dispatching conflict repair.",
-        "Do not run git fetch, git pull, git merge, git rebase, git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned git and PR publication actions.",
+        "This generic merge-gate repair path has not prepared the PR worktree for merge-conflict resolution.",
+        "Do not run git fetch, git pull, git merge, git rebase, git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony must own those operations.",
+        "A configured merge-conflict state is required before Symphony can dispatch a prepared conflict repair.",
         hasActionableCheckBlockers(context)
           ? "Also fix the failing or missing required checks before submitting the completion report."
-          : "If checks are still pending, include the latest validation evidence you can gather before submitting the completion report.",
+          : "If mergeability is the only blocker, report that merge_policy.conflicts_state must be configured so Symphony can run the service-owned conflict-prep path.",
       ].join(" ")
     : [
         "Fix the failing required checks in the assigned worktree, validate the repair, leave the final implementation changes uncommitted and unpushed, and submit a new completion report.",
@@ -815,7 +816,10 @@ export function planMergeGateBlockedWritebacks(
   const blockedState = config.reviewLoop.blockedStates[0] ?? null;
   const eventKey = mergeGateWritebackEventKey(context, "blocked");
   const conflict = context.mergeability?.status === "conflicted";
-  const requiredAction = config.issueTriage.enabled
+  const missingConflictState = conflict && config.mergePolicy.conflictsState === null;
+  const requiredAction = missingConflictState
+    ? "Configure merge_policy.conflicts_state to an existing tracker state so Symphony can prepare the lifecycle-bound PR worktree with service-owned git operations and dispatch a scoped merge-conflict worker."
+    : config.issueTriage.enabled
     ? "Symphony will run issue triage for this merge-gate ceiling and publish a follow-up recommendation on the issue. Inspect the required checks or mergeability only if the triage run does not complete or calls for immediate manual intervention."
     : conflict
     ? "Inspect the merge conflicts and required checks, then decide whether to repair manually, reset approval, or override the merge gate."
