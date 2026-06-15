@@ -220,14 +220,16 @@ export class MergePolicyService {
     if (decision.kind === "passed") {
       const gate = activeLifecycle.mergeGate;
       if (gate?.id === gateId && isActiveMergeGate(gate)) {
-        if (gate.status === "blocked") return { status: "blocked", gate: gateStatusFromState(gate) };
+        if (gate.status === "blocked" && !canAutoResolveMergeGateOnCheckPass(activeLifecycle, gateId)) {
+          return { status: "blocked", gate: gateStatusFromState(gate) };
+        }
         if (gate.status === "repair_dispatched" && !hasRepairGateClearance(activeLifecycle, gate)) {
           return { status: "repair_dispatched", gate: gateStatusFromState(gate) };
         }
       }
     }
     if (existingGateVerdict && decision.kind === "failure") {
-      if (isSameMergeGateBlocker(activeLifecycle, decision.gate)) {
+      if (shouldRefreshSameMergeGateBlocker(activeLifecycle, decision.gate)) {
         const refreshedMergeGate = refreshActiveMergeGateObservation(activeLifecycle, decision.gate, existingGateVerdict.writebackOperationKeys);
         if (refreshedMergeGate) {
           const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
@@ -1246,6 +1248,34 @@ function isSameMergeGateBlocker(lifecycle: IssueLifecycleRecord, gate: MergeGate
     current.blockerFingerprint === gate.blockerFingerprint &&
     lifecycle.lastReviewVerdictId === gate.id
   );
+}
+
+function shouldRefreshSameMergeGateBlocker(lifecycle: IssueLifecycleRecord, gate: MergeGateStatus): boolean {
+  if (!isSameMergeGateBlocker(lifecycle, gate)) return false;
+  const current = lifecycle.mergeGate ?? null;
+  if (current?.status === "repair_dispatched" && hasCompletedRepairApproval(lifecycle, current)) return false;
+  return true;
+}
+
+function hasCompletedRepairApproval(lifecycle: IssueLifecycleRecord, gate: IssueMergeGateState): boolean {
+  if (!gate.repairRunId || !gate.repairReportId) return false;
+  if (lifecycle.lastCompletionReportId !== gate.repairReportId) return false;
+  const repairReport = lifecycle.completionReports.find((report) => report.id === gate.repairReportId) ?? null;
+  if (!repairReport || repairReport.runId !== gate.repairRunId) return false;
+  if (repairReport.acceptedAt.trim().length === 0) return false;
+  if (repairReport.pullRequest?.number !== gate.pullRequest.number) return false;
+  if (repairReport.pullRequest?.headSha !== gate.headSha) return false;
+  if (gate.gateReportId && repairReport.id === gate.gateReportId) return false;
+
+  const gateVerdict = lifecycle.reviewVerdicts.find((verdict) => verdict.id === gate.id && isMergeGateVerdict(verdict)) ?? null;
+  if (!gateVerdict) return false;
+  const approvalVerdict = latestCurrentApprovalPassVerdict(lifecycle);
+  if (!approvalVerdict) return false;
+  const repairAcceptedAt = Date.parse(repairReport.acceptedAt);
+  const approvalSubmittedAt = Date.parse(approvalVerdict.submittedAt);
+  const gateFailedAt = Date.parse(gateVerdict.submittedAt);
+  if (!Number.isFinite(repairAcceptedAt) || !Number.isFinite(approvalSubmittedAt) || !Number.isFinite(gateFailedAt)) return false;
+  return repairAcceptedAt > gateFailedAt && approvalSubmittedAt > repairAcceptedAt;
 }
 
 function refreshActiveMergeGateObservation(

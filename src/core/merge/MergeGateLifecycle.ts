@@ -60,6 +60,7 @@ export function canAutoResolveMergeGateOnCheckPass(lifecycle: IssueLifecycleReco
   const gate = lifecycle.mergeGate?.id === gateId ? lifecycle.mergeGate : null;
   if (!isActiveMergeGate(gate)) return latestCurrentApprovalPassVerdict(lifecycle) !== null;
   if (gate.status === "observing") return latestCurrentApprovalPassVerdict(lifecycle) !== null;
+  if (gate.status === "blocked") return latestCurrentApprovalPassVerdict(lifecycle) !== null;
   return hasRepairGateClearance(lifecycle, gate);
 }
 
