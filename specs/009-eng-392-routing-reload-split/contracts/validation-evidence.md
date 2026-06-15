@@ -304,3 +304,70 @@ A finalized evidence packet based on this guide should let a reviewer answer yes
 - Are adjacent untouched or intentionally unverified integrations called out explicitly?
 - Are secrets, credential-bearing URLs, and unnecessary local paths absent from the cited evidence?
 - Could I re-check the cited proof using stable paths, fields, commands, or artifact labels without reading raw private payloads?
+
+## ENG-2476 T030 runtime routing evidence snapshot
+
+This packet uses the shared reviewer skeleton above to record which runtime-routing prerequisites already have branch-tip evidence and which gaps must stay mapped to prerequisite child work instead of being implied away by the test-proof issue.
+
+### Runtime routing scenario matrix
+
+| Path | Evidence bucket | Branch-tip status | Primary proof | Child-work disposition |
+| --- | --- | --- | --- | --- |
+| dispatch | `base-behavior` | `recorded` | `src/core/orchestrator/Orchestrator.ts:1487-1520`, `1859-1923`; `tests/orchestrator.test.ts:1500-1567`, `2434-2502` | No new prerequisite identified beyond the existing `REQ-392-RUNTIME-ROUTING` family mapping. |
+| retry | `base-behavior` | `recorded` | `src/core/orchestrator/Orchestrator.ts:3008-3052`; `src/core/config/Config.ts:1390-1403`; `tests/orchestrator.test.ts:2336-2371` | No new prerequisite identified beyond the existing `REQ-392-RUNTIME-ROUTING` family mapping. |
+| reconciliation | `base-behavior` | `recorded` | `src/core/orchestrator/Orchestrator.ts:1628-1665`, `3468-3567` | No new prerequisite identified beyond the existing `REQ-392-RUNTIME-ROUTING` family mapping. |
+| handoff | `base-behavior` | `recorded` | `src/core/orchestrator/Orchestrator.ts:3468-3567`, `4005-4039`; `tests/orchestrator.test.ts:3988-4097`, `5514-5600` | No new prerequisite identified beyond the existing `REQ-392-RUNTIME-ROUTING` family mapping. |
+| continuation | `base-behavior` + `failing-before` | Pointer-based continuation and scoped summary reuse are recorded; rich continuation-context routing remains blocked child work. | `src/core/orchestrator/Orchestrator.ts:2987-3005`, `3831-3914`; `tests/orchestrator.test.ts:7356-7606`; `tests/continuation-roadmap.test.ts:5-32`; `tests/continuation-summarizer.test.ts:4-53` | Keep continuation enrichment explicitly blocked under `REQ-392-RUNTIME-ROUTING`; do not fold it into `REQ-T030`. |
+| readback | `base-behavior` | `recorded` | `src/core/workspace/WorkspaceManager.ts:60-99`, `350-391`, `623-657`; `tests/status-api.test.ts:545-818` | No new prerequisite identified beyond the existing `REQ-392-RUNTIME-ROUTING` family mapping. |
+
+### base-behavior
+- status: recorded
+- surface: `src/core/orchestrator/Orchestrator.ts:1487-1520`, `1628-1665`, `1859-1923`, `2987-3052`, `3468-3567`, `3831-3914`, `4005-4039`; `src/core/config/Config.ts:927-939`, `1390-1403`, `2286-2320`; `src/core/workspace/WorkspaceManager.ts:60-99`, `350-391`, `623-657`; `tests/orchestrator.test.ts:1500-1630`, `2336-2502`, `3988-4097`, `5514-5600`, `7356-7606`; `tests/status-api.test.ts:545-818`
+- proof: `dispatch` reconciles running work before polling, refreshes candidate state inside the requested project context, reroutes worker work through `resolveWorkerDispatchDecision`, and fails closed for wrong-context issue-breakdown lookups; `retry` stores `projectContext` on retry attempts, re-fetches through routed lookups, and stops retrying once refreshed state enters a handoff state; `reconciliation` refreshes running entries grouped by project context and terminates or preserves them based on terminal, handoff, blocked, or route-changed state; `handoff` reconciliation re-reads accepted completion reports, merge-conflict reports, issue-breakdown plans, and review verdicts before writeback or merge-policy follow-up; `continuation` prompts reuse lifecycle, run-store, transcript, status, and summary pointers while scoped summary creation excludes sibling project contexts; `readback` exact-id status/workspace/open-workspace lookups return the routed workspace and run, while ambiguous identifier reads fail with `409 conflict` instead of crossing buckets. Focused validation commands exited `0`: `npm test -- tests/orchestrator.test.ts -t 'fails closed for direct issue-breakdown lookups when the direct tracker hit resolves outside the requested project context|does not retry after a handoff state|propagates non-default project context through dispatch harness, run records, and lifecycle state|does not redispatch issues with .* pending publication approval before Linear reaches Blocked|treats accepted completion reports as live handoff and suppresses continuation/no-report writeback|uses pointers instead of raw run history in continuation prompts below the event threshold|scopes continuation summaries to the lifecycle project context when duplicate identifiers collide'`; `npm test -- tests/status-api.test.ts -t 'resolves exact-id status lookups by lifecycle project context when visible identifiers collide|reopens exact issue-id collision fallback workspaces from persisted workspace keys before contextual alias derivation'`; `npm test -- tests/continuation-roadmap.test.ts tests/continuation-summarizer.test.ts`.
+- why_it_matters: Branch-tip routing evidence already covers dispatch, retry, reconciliation, handoff, pointer-based continuation reuse, and exact-id readback without requiring T030 to invent a new runtime child issue for those already-proven paths.
+- redactions: none
+
+### failing-before
+- status: recorded
+- surface: `tests/continuation-roadmap.test.ts:5-32`; `tests/continuation-summarizer.test.ts:4-53`; `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:141-201`; `specs/009-eng-392-routing-reload-split/quickstart.md:122-126`
+- proof: `tests/continuation-roadmap.test.ts` proves continuation search remains `dispatchPolicy = "no_orchestrator_dispatch"`, summarization remains `not_implemented`, and the orchestrator must not import or schedule roadmap placeholders; `tests/continuation-summarizer.test.ts` proves the placeholder summarizer still returns only transcript/status pointers with the summary text `Continuation history summarization is not automated yet`; the runtime-routing child contract (`REQ-392-RUNTIME-ROUTING`) remains the authorized owner of routed worker/reviewer/open-workspace identity proof, and `quickstart.md` keeps reload-preservation plus orchestrator-proof work downstream from that child.
+- why_it_matters: This is the explicit remaining prerequisite child work surfaced by T030: richer continuation-context routing cannot be claimed as complete here and must stay mapped to `REQ-392-RUNTIME-ROUTING` instead of being hidden inside the test-proof issue.
+- redactions: none
+
+### passing-after
+- status: recorded
+- surface: `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2476-t030-runtime-routing-evidence-snapshot`
+- proof: The `ENG-2476 T030 runtime routing evidence snapshot` section now records the runtime-routing matrix, the branch-tip base-behavior proof for dispatch/retry/reconciliation/handoff/continuation/readback, and the continuation roadmap gap that remains prerequisite child work under `REQ-392-RUNTIME-ROUTING`.
+- why_it_matters: `REQ-T030` is an evidence-capture task, so the relevant after-state is a finalized, reviewable packet that exposes prerequisite status rather than pretending the runtime gap was repaired here.
+- redactions: none
+
+### surface-comparison
+| Contract surface | Observed surface | Validation surface | Status | Notes |
+| --- | --- | --- | --- | --- |
+| `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | file inspection plus `git diff -- specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | `recorded` | T030 changes only the evidence artifact. |
+| `routing-reload-core` | `src/core/orchestrator/Orchestrator.ts`; `src/core/config/Config.ts` | cited line ranges plus `npm test -- tests/orchestrator.test.ts -t 'fails closed for direct issue-breakdown lookups when the direct tracker hit resolves outside the requested project context|does not retry after a handoff state|propagates non-default project context through dispatch harness, run records, and lifecycle state|does not redispatch issues with .* pending publication approval before Linear reaches Blocked|treats accepted completion reports as live handoff and suppresses continuation/no-report writeback|uses pointers instead of raw run history in continuation prompts below the event threshold|scopes continuation summaries to the lifecycle project context when duplicate identifiers collide'` | `recorded` | Dispatch, retry, reconciliation, handoff, and continuation routing were inspected without changing protected runtime code. |
+| `workspace-lifecycle` | `src/core/workspace/WorkspaceManager.ts` | `tests/status-api.test.ts:545-818`; `tests/orchestrator.test.ts:2434-2502`, `7496-7606` | `recorded` | Workspace keys, branch scoping, and scoped summary/readback stay project-context-qualified. |
+| `operator-http-entrypoints` | `tests/status-api.test.ts:545-818` | `npm test -- tests/status-api.test.ts -t 'resolves exact-id status lookups by lifecycle project context when visible identifiers collide|reopens exact issue-id collision fallback workspaces from persisted workspace keys before contextual alias derivation'` | `recorded` | T030 is evidence-only, so readback/open-workspace proof is cited from existing tests instead of reopening `src/app/http.ts` or `cursor/src/CursorWorkspaceOpener.ts` for implementation edits. |
+| `REQ-392-RUNTIME-ROUTING` prerequisite child work | `tests/continuation-roadmap.test.ts:5-32`; `tests/continuation-summarizer.test.ts:4-53`; `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:141-201` | file inspection plus `npm test -- tests/continuation-roadmap.test.ts tests/continuation-summarizer.test.ts` | `recorded` | Rich continuation search/summarization remains blocked child work and must stay separated from `REQ-T030`. |
+
+### hygiene (with intentionally unverified live boundary)
+- status: intentionally_unverified
+- surfacesChecked: [`specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`, `src/core/orchestrator/Orchestrator.ts`, `src/core/config/Config.ts`, `src/core/workspace/WorkspaceManager.ts`, `tests/orchestrator.test.ts`, `tests/status-api.test.ts`, `tests/continuation-roadmap.test.ts`, `tests/continuation-summarizer.test.ts`]
+- redactions: [`none`]
+- localPathHandling: `repo-relative paths only`
+- protectedSurfaceChecks:
+  - surface: `hermes/upstream-src/**`
+    expectation: `must remain untouched`
+    proof: `git diff -- specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` is the only scoped diff expected from T030; no vendored path is cited or modified in this packet.
+  - surface: `src/app/http.ts`; `cursor/src/CursorWorkspaceOpener.ts`
+    expectation: `analysis-only under T030`
+    proof: Readback/open-workspace evidence is cited from `tests/status-api.test.ts:545-818` instead of changing operator entrypoint sources.
+- intentionallyUnverified:
+  - boundary: `live tracker routing and live open-workspace HTTP execution`
+    reason: `evidence-only task; focused unit tests and source inspection were used instead of live credentials`
+    nearestLocalProof: `tests/orchestrator.test.ts:1500-1630`; `tests/status-api.test.ts:545-818`
+  - boundary: `live GitHub publication or Linear writeback outside focused unit tests`
+    reason: `out of scope for REQ-T030`
+    nearestLocalProof: `tests/orchestrator.test.ts:3988-4097`; `tests/orchestrator.test.ts:5514-5600`
+- findings:
+  - `Continuation history summarization and routed search remain explicit prerequisite child work under REQ-392-RUNTIME-ROUTING; current branch-tip continuation proof is limited to pointer-based reuse and scoped summary/readback.`
