@@ -431,6 +431,7 @@ describe("ReviewVerdictService", () => {
             reason: "Pull request branch is out of date",
             baseBranch: "main",
             baseHeadSha: "base-sha-1",
+            observedBaseHeadSha: null,
             checkedAt: "2026-01-01T00:00:02.000Z",
           },
         }),
@@ -438,9 +439,10 @@ describe("ReviewVerdictService", () => {
     );
 
     expect(result?.kind).toBe("repair");
-    expect(result?.text).toContain("reconcile the lifecycle-bound PR changes with origin/main");
-    expect(result?.text).toContain("leave the final implementation changes uncommitted and unpushed");
-    expect(result?.text).toContain("Symphony performs service-owned commit, push, and PR publication/reuse");
+    expect(result?.text).toContain("service-owned git operations");
+    expect(result?.text).toContain("Do not run git fetch");
+    expect(result?.text).toContain("Symphony performs service-owned git and PR publication actions");
+    expect(result?.text).not.toContain("reconcile the lifecycle-bound PR changes with origin/main");
     expect(result?.text).not.toContain("commit and push the repaired branch");
   });
 

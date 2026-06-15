@@ -120,7 +120,6 @@ function mergeConflictResolutionInputSchema(): Record<string, unknown> {
       "changedFiles",
       "pullRequest",
       "previousHeadSha",
-      "newHeadSha",
       "baseBranch",
       "baseHeadSha",
       "risks",
@@ -160,9 +159,9 @@ function mergeConflictResolutionInputSchema(): Record<string, unknown> {
         description: "PR head SHA from the mergeConflict.currentHeadSha field before this conflict-fix attempt.",
       },
       newHeadSha: {
-        type: "string",
-        minLength: 1,
-        description: "PR head SHA after this conflict-fix attempt; must match pullRequest.headSha.",
+        anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+        description:
+          "PR head SHA after this conflict-fix attempt when known. Omit or set null for Symphony service-prepared conflicts; Symphony finalizes the rebase and fills the final head SHA.",
       },
       baseBranch: {
         type: "string",

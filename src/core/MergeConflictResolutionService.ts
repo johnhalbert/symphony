@@ -1,6 +1,12 @@
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError } from "./errors.js";
+import { createGitHubPullRequestClientForCapability } from "../integrations/github/GitHubCredentialResolver.js";
+import {
+  ServiceOwnedMergeConflictGit,
+  type ServiceOwnedMergeConflictFinalizationInput,
+  type ServiceOwnedMergeConflictFinalizationResult,
+} from "./merge/ServiceOwnedMergeConflictGit.js";
 import type {
   CompletionReportPullRequestRef,
   IssueLifecycleStore,
@@ -29,7 +35,7 @@ const mergeConflictResolutionSchema = z.object({
     branch: z.string().trim().min(1).nullable(),
   }),
   previousHeadSha: z.string().trim().min(1),
-  newHeadSha: z.string().trim().min(1),
+  newHeadSha: z.string().trim().min(1).nullable().optional(),
   baseBranch: z.string().trim().min(1),
   baseHeadSha: z.string().trim().min(1),
   blockedReason: z.string().trim().min(1).nullable().optional(),
@@ -39,6 +45,10 @@ const mergeConflictResolutionSchema = z.object({
 
 export type MergeConflictResolutionInput = z.infer<typeof mergeConflictResolutionSchema>;
 export type MergeConflictResolutionSubmitterRole = "worker" | string;
+
+export interface MergeConflictResolutionFinalizer {
+  finalize(input: ServiceOwnedMergeConflictFinalizationInput): Promise<ServiceOwnedMergeConflictFinalizationResult>;
+}
 
 export interface MergeConflictResolutionActiveContext {
   issue: Issue;
@@ -58,6 +68,8 @@ export interface MergeConflictResolutionServiceOptions {
   lifecycleStore: IssueLifecycleStore;
   writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
   writebackProcessor?: Pick<WritebackProcessor, "processDue">;
+  finalizer?: MergeConflictResolutionFinalizer;
+  gitAuthHeaderProvider?: () => Promise<string>;
 }
 
 export interface MergeConflictResolutionResult {
@@ -91,8 +103,7 @@ export class MergeConflictResolutionService {
     const existing = lifecycle?.mergeConflictResolutionReports.find((item) => item.idempotencyKey === report.idempotencyKey);
     if (existing && mergeConflict) {
       assertPullRequestMatchesConflict(report.pullRequest, mergeConflict);
-      assertReportMatchesConflict(report, mergeConflict);
-      assertReplayMatchesReport(report, existing);
+      assertReplayMatchesReport(normalizeReplayReport(report, existing, mergeConflict), existing);
       return { accepted: true, replayed: true, report: existing, mergeConflict, writebackOperations: [] };
     }
     if (!lifecycle || !mergeConflict || mergeConflict.status === "blocked") {
@@ -100,31 +111,33 @@ export class MergeConflictResolutionService {
     }
 
     assertPullRequestMatchesConflict(report.pullRequest, mergeConflict);
-    assertReportMatchesConflict(report, mergeConflict);
-    const storedReport = buildMergeConflictResolutionReport({ report, issue: context.issue });
+    const finalReport = await this.normalizeReportForServicePreparation(report, mergeConflict, context);
+    assertReportMatchesConflict(finalReport, mergeConflict);
+    const storedReport = buildMergeConflictResolutionReport({ report: finalReport, issue: context.issue });
     const now = new Date().toISOString();
     const countedRunIds = new Set(mergeConflict.attemptRunIds);
-    const shouldCountAttempt = report.resolutionStatus !== "resolved" && !countedRunIds.has(report.runId);
+    const shouldCountAttempt = finalReport.resolutionStatus !== "resolved" && !countedRunIds.has(finalReport.runId);
     if (shouldCountAttempt) countedRunIds.add(report.runId);
     const fixTurnCount = mergeConflict.fixTurnCount + (shouldCountAttempt ? 1 : 0);
     const blocked =
-      report.resolutionStatus === "blocked" ||
-      (report.resolutionStatus === "still_conflicted" && fixTurnCount >= mergeConflict.maxFixTurns);
+      finalReport.resolutionStatus === "blocked" ||
+      (finalReport.resolutionStatus === "still_conflicted" && fixTurnCount >= mergeConflict.maxFixTurns);
     const blockedReason = blocked
-      ? report.blockedReason ?? conflictBlockedReason(fixTurnCount, mergeConflict.maxFixTurns)
+      ? finalReport.blockedReason ?? conflictBlockedReason(fixTurnCount, mergeConflict.maxFixTurns)
       : null;
     const nextConflict: IssueMergeConflictMetadata = {
       ...mergeConflict,
-      status: blocked ? "blocked" : report.resolutionStatus === "resolved" ? "resolved" : "open",
-      resolutionStatus: blocked ? "blocked" : report.resolutionStatus,
-      pullRequest: { ...report.pullRequest },
-      currentHeadSha: report.newHeadSha,
-      resolvedHeadSha: report.resolutionStatus === "resolved" ? report.newHeadSha : mergeConflict.resolvedHeadSha,
-      baseBranch: report.baseBranch,
-      baseHeadSha: report.baseHeadSha,
+      status: blocked ? "blocked" : finalReport.resolutionStatus === "resolved" ? "resolved" : "open",
+      resolutionStatus: blocked ? "blocked" : finalReport.resolutionStatus,
+      pullRequest: { ...finalReport.pullRequest },
+      currentHeadSha: finalReport.newHeadSha,
+      resolvedHeadSha: finalReport.resolutionStatus === "resolved" ? finalReport.newHeadSha : mergeConflict.resolvedHeadSha,
+      baseBranch: finalReport.baseBranch,
+      baseHeadSha: finalReport.baseHeadSha,
+      servicePreparation: servicePreparationAfterReport(mergeConflict, finalReport, now),
       updatedAt: now,
       fixTurnCount,
-      lastConflictFixRunId: report.runId,
+      lastConflictFixRunId: finalReport.runId,
       lastConflictResolutionReportId: storedReport.id,
       attemptRunIds: [...countedRunIds],
       blockedAt: blocked ? now : mergeConflict.blockedAt,
@@ -144,12 +157,12 @@ export class MergeConflictResolutionService {
         storedReport,
       ),
       summaryPointers: {
-        lastRunId: report.runId,
-        prUrl: report.pullRequest.url,
-        prNumber: report.pullRequest.number,
-        prHeadSha: report.pullRequest.headSha,
-        prBranch: report.pullRequest.branch,
-        lastEvidenceCursor: report.idempotencyKey,
+        lastRunId: finalReport.runId,
+        prUrl: finalReport.pullRequest.url,
+        prNumber: finalReport.pullRequest.number,
+        prHeadSha: finalReport.pullRequest.headSha,
+        prBranch: finalReport.pullRequest.branch,
+        lastEvidenceCursor: finalReport.idempotencyKey,
       },
     });
 
@@ -215,6 +228,59 @@ export class MergeConflictResolutionService {
     for (const operation of operations) enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
     return enqueued;
   }
+
+  private async normalizeReportForServicePreparation(
+    report: MergeConflictResolutionInput,
+    mergeConflict: IssueMergeConflictMetadata,
+    context: MergeConflictResolutionActiveContext,
+  ): Promise<NormalizedMergeConflictResolutionInput> {
+    if (report.newHeadSha !== undefined && report.newHeadSha !== null) return normalizeProvidedNewHeadSha(report);
+    if (!canOmitNewHeadShaForServicePreparation(report, mergeConflict)) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Merge conflict resolution newHeadSha is required unless Symphony service-prepared the conflict worktree",
+      );
+    }
+    if (report.resolutionStatus !== "resolved") {
+      return {
+        ...report,
+        pullRequest: { ...report.pullRequest, headSha: mergeConflict.currentHeadSha },
+        newHeadSha: mergeConflict.currentHeadSha,
+      };
+    }
+    const servicePreparation = mergeConflict.servicePreparation;
+    if (servicePreparation === null || servicePreparation.status !== "conflicted") {
+      throw new SymphonyError("invalid_request", "Service-prepared merge conflict is not ready for finalization");
+    }
+    const workspacePath = context.workspacePath ?? context.workspace?.path ?? null;
+    if (!workspacePath) {
+      throw new SymphonyError("invalid_request", "Merge conflict finalization requires the worker workspace path");
+    }
+    const branchName = requireValue(mergeConflict.pullRequest.branch, "Merge conflict finalization requires the PR branch");
+    const baseBranch = requireValue(mergeConflict.baseBranch, "Merge conflict finalization requires the PR base branch");
+    const finalizer = this.options.finalizer ?? new ServiceOwnedMergeConflictGit();
+    const authHeader = await this.gitAuthHeader();
+    const finalized = await finalizer.finalize({
+      workspacePath,
+      branchName,
+      previousRemoteHeadSha: mergeConflict.currentHeadSha,
+      preparedBaseHeadSha: servicePreparation.preparedBaseHeadSha,
+      baseBranch,
+      conflictedFiles: servicePreparation.conflictedFiles,
+      changedFiles: report.changedFiles,
+      authHeader,
+    });
+    return {
+      ...report,
+      pullRequest: { ...report.pullRequest, headSha: finalized.newHeadSha },
+      newHeadSha: finalized.newHeadSha,
+    };
+  }
+
+  private gitAuthHeader(): Promise<string> {
+    if (this.options.gitAuthHeaderProvider) return this.options.gitAuthHeaderProvider();
+    return createGitHubPullRequestClientForCapability(this.options.config, "github.merge").gitAuthHeader();
+  }
 }
 
 function parseMergeConflictResolution(input: unknown): MergeConflictResolutionInput {
@@ -225,8 +291,13 @@ function parseMergeConflictResolution(input: unknown): MergeConflictResolutionIn
   return parsed.data;
 }
 
+type NormalizedMergeConflictResolutionInput = MergeConflictResolutionInput & {
+  newHeadSha: string;
+  pullRequest: MergeConflictResolutionInput["pullRequest"] & { headSha: string };
+};
+
 function buildMergeConflictResolutionReport(input: {
-  report: MergeConflictResolutionInput;
+  report: NormalizedMergeConflictResolutionInput;
   issue: Issue;
 }): IssueMergeConflictResolutionReportRecord {
   return {
@@ -267,7 +338,7 @@ function assertPullRequestMatchesConflict(
 }
 
 function assertReportMatchesConflict(
-  report: MergeConflictResolutionInput,
+  report: NormalizedMergeConflictResolutionInput,
   mergeConflict: IssueMergeConflictMetadata,
 ): void {
   requireMatches("conflict resolution previous head SHA", report.previousHeadSha, mergeConflict.currentHeadSha);
@@ -279,7 +350,7 @@ function assertReportMatchesConflict(
 }
 
 function assertReplayMatchesReport(
-  report: MergeConflictResolutionInput,
+  report: NormalizedMergeConflictResolutionInput,
   existing: IssueMergeConflictResolutionReportRecord,
 ): void {
   const expected = {
@@ -313,6 +384,66 @@ function assertReplayMatchesReport(
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new SymphonyError("invalid_request", "Merge conflict resolution idempotency key was reused with different report metadata");
   }
+}
+
+function normalizeProvidedNewHeadSha(report: MergeConflictResolutionInput): NormalizedMergeConflictResolutionInput {
+  const newHeadSha = requireValue(report.newHeadSha, "Merge conflict resolution newHeadSha is required");
+  return { ...report, newHeadSha };
+}
+
+function normalizeReplayReport(
+  report: MergeConflictResolutionInput,
+  existing: IssueMergeConflictResolutionReportRecord,
+  mergeConflict: IssueMergeConflictMetadata,
+): NormalizedMergeConflictResolutionInput {
+  if (report.newHeadSha !== undefined && report.newHeadSha !== null) return normalizeProvidedNewHeadSha(report);
+  if (!canOmitNewHeadShaForServicePreparation(report, mergeConflict)) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Merge conflict resolution newHeadSha is required unless Symphony service-prepared the conflict worktree",
+    );
+  }
+  const existingPullRequestHeadSha = requireValue(
+    existing.pullRequest.headSha,
+    "Existing merge conflict resolution report is missing pull request head SHA",
+  );
+  const existingNewHeadSha = requireValue(existing.newHeadSha, "Existing merge conflict resolution report is missing new head SHA");
+  return {
+    ...report,
+    pullRequest: { ...report.pullRequest, headSha: existingPullRequestHeadSha },
+    newHeadSha: existingNewHeadSha,
+  };
+}
+
+function canOmitNewHeadShaForServicePreparation(
+  report: MergeConflictResolutionInput,
+  mergeConflict: IssueMergeConflictMetadata,
+): boolean {
+  return (
+    mergeConflict.servicePreparation?.strategy === "squash_rebase" &&
+    (mergeConflict.servicePreparation.status === "conflicted" || mergeConflict.servicePreparation.status === "finalized") &&
+    report.previousHeadSha === mergeConflict.servicePreparation.originalHeadSha
+  );
+}
+
+function servicePreparationAfterReport(
+  mergeConflict: IssueMergeConflictMetadata,
+  report: NormalizedMergeConflictResolutionInput,
+  now: string,
+): IssueMergeConflictMetadata["servicePreparation"] {
+  const servicePreparation = mergeConflict.servicePreparation;
+  if (servicePreparation === null || report.resolutionStatus !== "resolved") return servicePreparation;
+  return {
+    ...servicePreparation,
+    status: "finalized",
+    finalizedAt: now,
+    finalizedHeadSha: report.newHeadSha,
+  };
+}
+
+function requireValue<T>(value: T | null | undefined, message: string): T {
+  if (value === null || value === undefined) throw new SymphonyError("invalid_request", message);
+  return value;
 }
 
 function requireMatches(label: string, actual: string | number | null | undefined, expected: string | number | null | undefined): void {

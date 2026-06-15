@@ -163,6 +163,82 @@ describe("MergeConflictResolutionService", () => {
     ).rejects.toMatchObject({ code: "invalid_request" });
   });
 
+  it("finalizes a service-prepared conflict when the worker reports resolved file contents", async () => {
+    const finalizerCalls: unknown[] = [];
+    const { service, lifecycleStore } = await fixture({
+      servicePreparation: servicePreparationRecord(),
+      finalizer: {
+        async finalize(input) {
+          finalizerCalls.push(input);
+          return { newHeadSha: "head-sha-2" };
+        },
+      },
+    });
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({ resolutionStatus: "resolved", omitNewHeadSha: true }),
+      context({ workspacePath: "/tmp/service-prepared-workspace" }),
+    );
+
+    expect(result.report.newHeadSha).toBe("head-sha-2");
+    expect(finalizerCalls).toEqual([
+      expect.objectContaining({
+        workspacePath: "/tmp/service-prepared-workspace",
+        branchName: "symphony/TEST-1",
+        previousRemoteHeadSha: "head-sha-1",
+        preparedBaseHeadSha: "base-sha-1",
+        baseBranch: "main",
+        conflictedFiles: ["src/index.ts"],
+        changedFiles: ["src/index.ts"],
+        authHeader: "AUTHORIZATION: bearer test-token",
+      }),
+    ]);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "passed",
+      summaryPointers: {
+        prHeadSha: "head-sha-2",
+      },
+      mergeConflict: {
+        status: "resolved",
+        resolutionStatus: "resolved",
+        currentHeadSha: "head-sha-2",
+        resolvedHeadSha: "head-sha-2",
+        servicePreparation: {
+          status: "finalized",
+          finalizedHeadSha: "head-sha-2",
+        },
+      },
+      mergeConflictResolutionReports: [
+        expect.objectContaining({
+          newHeadSha: "head-sha-2",
+        }),
+      ],
+    });
+  });
+
+  it("accepts service-prepared still-conflicted reports without requiring worker git metadata", async () => {
+    const { service, lifecycleStore } = await fixture({ servicePreparation: servicePreparationRecord() });
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({ resolutionStatus: "still_conflicted", omitNewHeadSha: true }),
+      context(),
+    );
+
+    expect(result.report.newHeadSha).toBe("head-sha-1");
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "merge_conflict_resolution",
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "still_conflicted",
+        currentHeadSha: "head-sha-1",
+        servicePreparation: {
+          status: "conflicted",
+          finalizedHeadSha: null,
+        },
+      },
+    });
+  });
+
   it("accepts conflict-resolution reports with the issue state gate explicitly ignored", async () => {
     const { service, lifecycleStore } = await fixture();
 
@@ -185,7 +261,11 @@ describe("MergeConflictResolutionService", () => {
     });
   });
 
-  async function fixture(input: { fixTurnCount?: number } = {}) {
+  async function fixture(input: {
+    fixTurnCount?: number;
+    servicePreparation?: ReturnType<typeof servicePreparationRecord> | null;
+    finalizer?: ConstructorParameters<typeof MergeConflictResolutionService>[0]["finalizer"];
+  } = {}) {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
@@ -198,11 +278,20 @@ describe("MergeConflictResolutionService", () => {
     const conflictIssue = issue({ state: "Approved with Conflicts" });
     await lifecycleStore.ensureIssue(conflictIssue, {
       phase: "merge_conflict_resolution",
-      mergeConflict: mergeConflictRecord({ fixTurnCount: input.fixTurnCount ?? 0 }),
+      mergeConflict: mergeConflictRecord({
+        fixTurnCount: input.fixTurnCount ?? 0,
+        servicePreparation: input.servicePreparation ?? null,
+      }),
     });
     const outbox = new FileWritebackOutboxStore(config.workspace.stateDir);
     return {
-      service: new MergeConflictResolutionService({ config, lifecycleStore, writebackOutbox: outbox }),
+      service: new MergeConflictResolutionService({
+        config,
+        lifecycleStore,
+        writebackOutbox: outbox,
+        ...(input.finalizer === undefined ? {} : { finalizer: input.finalizer }),
+        gitAuthHeaderProvider: async () => "AUTHORIZATION: bearer test-token",
+      }),
       lifecycleStore,
       outbox,
     };
@@ -228,6 +317,7 @@ function resolutionReport(input: {
   baseBranch?: string;
   baseHeadSha?: string;
   blockedReason?: string;
+  omitNewHeadSha?: boolean;
 }) {
   const headSha = input.headSha ?? "head-sha-1";
   return {
@@ -244,7 +334,7 @@ function resolutionReport(input: {
       branch: "symphony/TEST-1",
     },
     previousHeadSha: input.previousHeadSha ?? "head-sha-1",
-    newHeadSha: headSha,
+    ...(input.omitNewHeadSha === true ? {} : { newHeadSha: headSha }),
     baseBranch: input.baseBranch ?? "main",
     baseHeadSha: input.baseHeadSha ?? "base-sha-1",
     ...(input.blockedReason === undefined ? {} : { blockedReason: input.blockedReason }),
@@ -253,7 +343,7 @@ function resolutionReport(input: {
   };
 }
 
-function mergeConflictRecord(input: { fixTurnCount: number }) {
+function mergeConflictRecord(input: { fixTurnCount: number; servicePreparation?: ReturnType<typeof servicePreparationRecord> | null }) {
   return {
     id: "merge-conflict:issue-1:head-sha-1",
     status: "open" as const,
@@ -273,6 +363,7 @@ function mergeConflictRecord(input: { fixTurnCount: number }) {
     conflictsState: "Approved with Conflicts",
     reason: "Pull request has merge conflicts with the base branch",
     mergeableState: "dirty",
+    servicePreparation: input.servicePreparation ?? null,
     detectedAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     fixTurnCount: input.fixTurnCount,
@@ -283,5 +374,22 @@ function mergeConflictRecord(input: { fixTurnCount: number }) {
     writebackOperationKeys: [],
     blockedAt: null,
     blockedReason: null,
+  };
+}
+
+function servicePreparationRecord() {
+  return {
+    strategy: "squash_rebase" as const,
+    status: "conflicted" as const,
+    originalHeadSha: "head-sha-1",
+    observedPrBaseHeadSha: "base-sha-0",
+    liveBaseHeadSha: "base-sha-1",
+    preparedBaseHeadSha: "base-sha-1",
+    mergeBaseSha: "base-sha-0",
+    squashCommitSha: "squash-sha-1",
+    conflictedFiles: ["src/index.ts"],
+    preparedAt: "2026-01-01T00:00:01.000Z",
+    finalizedAt: null,
+    finalizedHeadSha: null,
   };
 }

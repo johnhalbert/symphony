@@ -5369,6 +5369,7 @@ export class Orchestrator {
         `- Current conflict head SHA: ${conflict?.currentHeadSha ?? "n/a"}`,
         `- Base branch: ${conflict?.baseBranch ?? "n/a"}`,
         `- Base head SHA: ${conflict?.baseHeadSha ?? "n/a"}`,
+        ...formatMergeConflictServicePreparationPrompt(conflict),
         `- Attempts: ${conflict?.fixTurnCount ?? 0} / ${conflict?.maxFixTurns ?? this.config.mergePolicy.maxConflictFixTurns}`,
         `- Reason: ${conflict?.reason ?? "n/a"}`,
         `- GitHub mergeable_state: ${conflict?.mergeableState ?? "unknown"}`,
@@ -5387,11 +5388,13 @@ export class Orchestrator {
       `- Current conflict head SHA: ${conflict?.currentHeadSha ?? "n/a"}`,
       `- Base branch: ${conflict?.baseBranch ?? "n/a"}`,
       `- Base head SHA: ${conflict?.baseHeadSha ?? "n/a"}`,
+      ...formatMergeConflictServicePreparationPrompt(conflict),
       `- Attempts: ${conflict?.fixTurnCount ?? 0} / ${conflict?.maxFixTurns ?? this.config.mergePolicy.maxConflictFixTurns}`,
       `- Reason: ${conflict?.reason ?? "n/a"}`,
       `- GitHub mergeable_state: ${conflict?.mergeableState ?? "unknown"}`,
+      "- Git operations are service-owned for this phase. Do not fetch, pull, merge, rebase, commit, push, or continue/abort/skip a rebase.",
       "- Required handoff: call submit_merge_conflict_resolution before ending the run.",
-      "- Report resolutionStatus=\"resolved\", resolutionStatus=\"still_conflicted\", or resolutionStatus=\"blocked\"; include previousHeadSha, newHeadSha, baseBranch, and baseHeadSha.",
+      "- Report resolutionStatus=\"resolved\", resolutionStatus=\"still_conflicted\", or resolutionStatus=\"blocked\"; include previousHeadSha, baseBranch, and baseHeadSha. Omit newHeadSha for service-prepared conflicts.",
       "",
       "Workspace:",
       `- Path: ${workspace?.path ?? entry.workspacePath ?? "n/a"}`,
@@ -6314,6 +6317,18 @@ function formatUserPromptPacket(title: string, sections: Array<[string, string |
 function formatPullRequest(number: number | null, url: string | null): string {
   const parts = [number === null ? null : `#${number}`, url].filter((value): value is string => value !== null);
   return parts.length === 0 ? "n/a" : parts.join(" ");
+}
+
+function formatMergeConflictServicePreparationPrompt(conflict: IssueMergeConflictMetadata | null): string[] {
+  const servicePreparation = conflict?.servicePreparation ?? null;
+  if (servicePreparation === null) return [];
+  return [
+    `- Service preparation: ${servicePreparation.strategy} (${servicePreparation.status})`,
+    `- Service observed PR base head SHA: ${servicePreparation.observedPrBaseHeadSha ?? "n/a"}`,
+    `- Service live base head SHA: ${servicePreparation.liveBaseHeadSha}`,
+    `- Service prepared base head SHA: ${servicePreparation.preparedBaseHeadSha}`,
+    `- Service-prepared conflicted files: ${servicePreparation.conflictedFiles.length === 0 ? "none" : servicePreparation.conflictedFiles.join(", ")}`,
+  ];
 }
 
 function oneLine(value: string): string {

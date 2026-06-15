@@ -550,6 +550,7 @@ describe("TransitionPolicy review-loop planners", () => {
           reason: "Pull request branch is out of date",
           baseBranch: "main",
           baseHeadSha: "base-sha-1",
+          observedBaseHeadSha: null,
           checkedAt: "2026-01-01T00:00:02.000Z",
         },
         reviewRound: 1,
@@ -558,9 +559,10 @@ describe("TransitionPolicy review-loop planners", () => {
       config,
     );
 
-    expect(commentBody(operations, 0)).toContain("reconcile the lifecycle-bound PR changes with origin/main");
-    expect(commentBody(operations, 0)).toContain("leave the final implementation changes uncommitted and unpushed");
-    expect(commentBody(operations, 0)).toContain("Symphony performs service-owned commit, push, and PR publication/reuse");
+    expect(commentBody(operations, 0)).toContain("service-owned git operations");
+    expect(commentBody(operations, 0)).toContain("Do not run git fetch");
+    expect(commentBody(operations, 0)).toContain("Symphony performs service-owned git and PR publication actions");
+    expect(commentBody(operations, 0)).not.toContain("reconcile the lifecycle-bound PR changes with origin/main");
     expect(commentBody(operations, 0)).not.toContain("commit and push the repaired branch");
   });
 

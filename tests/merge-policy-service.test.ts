@@ -6,6 +6,10 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { MergePolicyService, type MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
 import {
+  ServiceOwnedMergeConflictGit,
+  type ServiceOwnedMergeConflictPreparationResult,
+} from "../src/core/merge/ServiceOwnedMergeConflictGit.js";
+import {
   FileIssueLifecycleStore,
   latestCurrentApprovalPassVerdict,
   type IssueMergeGateState,
@@ -380,8 +384,9 @@ describe("MergePolicyService", () => {
     ]);
     expect(writer.comments[0]?.body).toContain("Mergeability:");
     expect(writer.comments[0]?.body).toContain("GitHub mergeable_state: dirty");
-    expect(writer.comments[0]?.body).toContain("reconcile the lifecycle-bound PR changes with origin/main");
-    expect(writer.comments[0]?.body).toContain("leave the final implementation changes uncommitted and unpushed");
+    expect(writer.comments[0]?.body).toContain("service-owned git operations");
+    expect(writer.comments[0]?.body).toContain("Do not run git fetch");
+    expect(writer.comments[0]?.body).not.toContain("reconcile the lifecycle-bound PR changes with origin/main");
     expect(writer.comments[0]?.body).not.toContain("commit and push the repaired branch");
     await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
       phase: "implementation",
@@ -400,6 +405,197 @@ describe("MergePolicyService", () => {
         blockerFingerprint: expect.stringContaining("mergeability:dirty"),
       },
     });
+  });
+
+  it("service-prepares conflicted PRs against the live base branch before dispatching a conflict worker", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient({
+      mergeable: false,
+      mergeableState: "dirty",
+      baseHeadSha: "observed-base-sha",
+      liveBaseHeadSha: "live-base-sha",
+    });
+    const conflictGit = new FakeConflictGit({
+      status: "conflicted",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "observed-base-sha",
+      liveBaseHeadSha: "live-base-sha",
+      preparedBaseHeadSha: "live-base-sha",
+      mergeBaseSha: "observed-base-sha",
+      squashCommitSha: "squash-sha-1",
+      conflictedFiles: ["tests/orchestrator.test.ts"],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+      conflictGit,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("conflict_dispatched");
+    expect(conflictGit.prepareInput).toMatchObject({
+      workspacePath: path.join(root, currentIssue.identifier),
+      branchName: "symphony/TEST-1",
+      expectedHeadSha: "head-sha-1",
+      baseBranch: "main",
+      observedPrBaseHeadSha: "observed-base-sha",
+      liveBaseHeadSha: "live-base-sha",
+      authHeader: "AUTHORIZATION: bearer test-token",
+    });
+    expect(conflictGit.publishInput).toBeNull();
+    expect(currentIssue.state).toBe("Approved with Conflicts");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["Ready to Merge"],
+        toState: "Approved with Conflicts",
+        reason: expect.stringContaining("Pull request has merge conflicts"),
+      },
+    ]);
+    expect(writer.comments[0]?.body).toContain("service-owned git operations");
+    expect(writer.comments[0]?.body).toContain("must not run git fetch");
+    expect(lifecycle).toMatchObject({
+      phase: "merge_conflict_resolution",
+      mergeGate: null,
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "pending",
+        approvedHeadSha: "head-sha-1",
+        currentHeadSha: "head-sha-1",
+        baseBranch: "main",
+        baseHeadSha: "live-base-sha",
+        servicePreparation: {
+          strategy: "squash_rebase",
+          status: "conflicted",
+          originalHeadSha: "head-sha-1",
+          observedPrBaseHeadSha: "observed-base-sha",
+          liveBaseHeadSha: "live-base-sha",
+          preparedBaseHeadSha: "live-base-sha",
+          conflictedFiles: ["tests/orchestrator.test.ts"],
+        },
+      },
+    });
+  });
+
+  it("publishes a clean service-prepared rebase without moving the issue to the conflict state", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const conflictGit = new FakeConflictGit({
+      status: "clean",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      rebasedHeadSha: "rebased-head-sha",
+      conflictedFiles: [],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient({
+        mergeable: false,
+        mergeableState: "dirty",
+        baseHeadSha: "base-sha-1",
+        liveBaseHeadSha: "base-sha-2",
+      }),
+      conflictGit,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("conflict_dispatched");
+    expect(conflictGit.publishInput).toMatchObject({
+      workspacePath: path.join(root, currentIssue.identifier),
+      branchName: "symphony/TEST-1",
+      previousRemoteHeadSha: "head-sha-1",
+      authHeader: "AUTHORIZATION: bearer test-token",
+    });
+    expect(currentIssue.state).toBe("Ready to Merge");
+    expect(writer.transitions).toEqual([]);
+    expect(lifecycle).toMatchObject({
+      phase: "passed",
+      mergeGate: null,
+      summaryPointers: {
+        ciStatus: "success",
+        prHeadSha: "rebased-head-sha",
+      },
+      mergeConflict: {
+        status: "resolved",
+        resolutionStatus: "resolved",
+        approvedHeadSha: "head-sha-1",
+        currentHeadSha: "rebased-head-sha",
+        resolvedHeadSha: "rebased-head-sha",
+        servicePreparation: {
+          status: "finalized",
+          finalizedHeadSha: "rebased-head-sha",
+        },
+      },
+    });
+
+    const mergeClient = new FakeMergeClient({
+      headSha: "rebased-head-sha",
+      baseHeadSha: "base-sha-2",
+      liveBaseHeadSha: "base-sha-2",
+    });
+    const mergeService = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: mergeClient,
+    });
+
+    const mergeResult = await mergeService.reconcileIssue(currentIssue);
+
+    expect(mergeResult.status).toBe("merged");
+    expect(mergeClient.mergeInput).toMatchObject({
+      pullRequestNumber: 42,
+      expectedHeadSha: "rebased-head-sha",
+    });
+    expect(currentIssue.state).toBe("Done");
   });
 
   it("dispatches one combined merge-gate repair when checks fail and the PR has conflicts", async () => {
@@ -560,7 +756,7 @@ describe("MergePolicyService", () => {
     });
   });
 
-  it("dispatches merge-gate repair instead of reopening legacy conflict metadata when a resolved conflict head is still dirty", async () => {
+  it("service-prepares a fresh conflict instead of reopening legacy conflict metadata when a resolved conflict head is still dirty", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",
       conflictsState: "Approved with Conflicts",
@@ -575,6 +771,16 @@ describe("MergePolicyService", () => {
     });
     const writer = new MemoryWriter(currentIssue);
     const dirtyClient = new FakeMergeClient({ headSha: "head-sha-2", mergeable: false, mergeableState: "dirty" });
+    const conflictGit = new FakeConflictGit({
+      status: "conflicted",
+      originalHeadSha: "head-sha-2",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-1",
+      preparedBaseHeadSha: "base-sha-1",
+      mergeBaseSha: "head-sha-1",
+      squashCommitSha: "squash-sha-2",
+      conflictedFiles: ["src/index.ts"],
+    });
     const dirtyService = new MergePolicyService({
       config,
       tracker: tracker(currentIssue),
@@ -587,14 +793,26 @@ describe("MergePolicyService", () => {
         60_000,
       ),
       client: dirtyClient,
+      conflictGit,
     });
 
-    await expect(dirtyService.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "repair_dispatched" });
+    await expect(dirtyService.reconcileIssue(currentIssue)).resolves.toMatchObject({ status: "conflict_dispatched" });
     expect(dirtyClient.mergeInput).toBeNull();
+    expect(conflictGit.prepareInput).toMatchObject({ expectedHeadSha: "head-sha-2" });
     await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
-      phase: "implementation",
-      mergeConflict: { status: "resolved", resolutionStatus: "resolved", resolvedHeadSha: "head-sha-2" },
-      mergeGate: { status: "repair_dispatched", headSha: "head-sha-2", mergeability: { status: "conflicted" } },
+      phase: "merge_conflict_resolution",
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "pending",
+        approvedHeadSha: "head-sha-2",
+        currentHeadSha: "head-sha-2",
+        resolvedHeadSha: null,
+        servicePreparation: {
+          originalHeadSha: "head-sha-2",
+          conflictedFiles: ["src/index.ts"],
+        },
+      },
+      mergeGate: null,
     });
   });
 
@@ -2709,6 +2927,7 @@ function mergeConflictRecord(input: { resolutionStatus?: "pending" | "resolved";
     conflictsState: "Approved with Conflicts",
     reason: "Pull request has merge conflicts with the base branch",
     mergeableState: "dirty",
+    servicePreparation: null,
     detectedAt: "2026-01-01T00:00:02.000Z",
     updatedAt: "2026-01-01T00:00:03.000Z",
     fixTurnCount: 1,
@@ -2794,6 +3013,8 @@ class FakeMergeClient implements MergePolicyGitHubClient {
       serviceLogin?: string | null;
       checkResults?: PullRequestCheckResult[];
       ancestor?: boolean;
+      baseHeadSha?: string;
+      liveBaseHeadSha?: string;
     } = {},
   ) {}
 
@@ -2812,8 +3033,12 @@ class FakeMergeClient implements MergePolicyGitHubClient {
       mergedAt: this.input.mergedAt ?? "2026-01-01T00:00:02.000Z",
       mergedBy: this.input.mergedBy ?? "symphony-bot",
       baseBranch: "main",
-      baseHeadSha: "base-sha-1",
+      baseHeadSha: this.input.baseHeadSha ?? "base-sha-1",
     };
+  }
+
+  async getBranchHeadSha() {
+    return this.input.liveBaseHeadSha ?? this.input.baseHeadSha ?? "base-sha-1";
   }
 
   async getRequiredCheckResults() {
@@ -2841,6 +3066,28 @@ class FakeMergeClient implements MergePolicyGitHubClient {
 
   async isAncestor() {
     return this.input.ancestor ?? true;
+  }
+
+  async gitAuthHeader() {
+    return "AUTHORIZATION: bearer test-token";
+  }
+}
+
+class FakeConflictGit extends ServiceOwnedMergeConflictGit {
+  prepareInput: Parameters<ServiceOwnedMergeConflictGit["prepare"]>[0] | null = null;
+  publishInput: Parameters<ServiceOwnedMergeConflictGit["publishPreparedHead"]>[0] | null = null;
+
+  constructor(private readonly result: ServiceOwnedMergeConflictPreparationResult) {
+    super();
+  }
+
+  override async prepare(input: Parameters<ServiceOwnedMergeConflictGit["prepare"]>[0]) {
+    this.prepareInput = input;
+    return this.result;
+  }
+
+  override async publishPreparedHead(input: Parameters<ServiceOwnedMergeConflictGit["publishPreparedHead"]>[0]) {
+    this.publishInput = input;
   }
 }
 

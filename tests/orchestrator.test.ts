@@ -7341,6 +7341,7 @@ function openMergeConflict(candidate = issue()): IssueMergeConflictMetadata {
     conflictsState: "Merge Conflicts",
     reason: "merge conflicts",
     mergeableState: "dirty",
+    servicePreparation: null,
     detectedAt: "2026-01-01T00:00:03.000Z",
     updatedAt: "2026-01-01T00:00:03.000Z",
     fixTurnCount: 0,

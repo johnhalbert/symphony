@@ -7548,6 +7548,7 @@ function mergeGateMergeabilityStatus(
     reason: mergeability.reason,
     baseBranch: mergeability.baseBranch,
     baseHeadSha: mergeability.baseHeadSha,
+    observedBaseHeadSha: mergeability.observedBaseHeadSha,
     checkedAt: mergeability.checkedAt,
   };
 }

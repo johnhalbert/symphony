@@ -245,9 +245,10 @@ export function renderMergeConflictResolutionMcpHandoffPrompt(input: RuntimeHand
     `- Branch: ${input.branchName ?? input.issue.branchName ?? "n/a"}`,
     `- Repository path: ${input.repoPath ?? "n/a"}`,
     `- Base ref: ${input.baseRef ?? "n/a"}`,
-    "- Before ending the run, call the submit_merge_conflict_resolution MCP tool with resolutionStatus, summary, validationEvidence, changedFiles, pullRequest, previousHeadSha, newHeadSha, baseBranch, baseHeadSha, risks, and idempotencyKey.",
-    "- Use resolutionStatus=\"resolved\" only when the PR head contains the conflict fix; use resolutionStatus=\"still_conflicted\" when conflicts remain; use resolutionStatus=\"blocked\" when human intervention is required now.",
-    "- previousHeadSha must match the current conflict head from the prompt, and newHeadSha must match pullRequest.headSha after your attempt.",
+    "- Before ending the run, call the submit_merge_conflict_resolution MCP tool with resolutionStatus, summary, validationEvidence, changedFiles, pullRequest, previousHeadSha, baseBranch, baseHeadSha, risks, idempotencyKey, and newHeadSha when known.",
+    "- Use resolutionStatus=\"resolved\" only after the conflicted file contents are repaired; use resolutionStatus=\"still_conflicted\" when conflicts remain; use resolutionStatus=\"blocked\" when human intervention is required now.",
+    "- Do not run git fetch, pull, merge, rebase, commit, push, or continue/abort/skip a rebase. Symphony owns the git choreography around this worktree.",
+    "- previousHeadSha must match the current conflict head from the prompt. For service-prepared conflicts, omit newHeadSha or set it to null; otherwise newHeadSha must match pullRequest.headSha after your attempt.",
     "- The MCP server is scoped to this issue and current conflict-fix run; Symphony injects runId and issueId for you.",
   ].join("\n");
 }

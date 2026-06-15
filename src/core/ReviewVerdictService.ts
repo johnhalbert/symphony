@@ -337,8 +337,8 @@ export function formatWorkerMergeGatePromptResult(lifecycle: IssueLifecycleRecor
   const conflict = gate.mergeability?.status === "conflicted";
   const requiredAction = conflict
     ? [
-        "Fetch the latest upstream changes from origin/main, reconcile the lifecycle-bound PR changes with origin/main, resolve merge conflicts, validate the requested checks, leave the final implementation changes uncommitted and unpushed in the assigned worktree, and submit a normal completion report.",
-        "Do not run git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned commit, push, and PR publication/reuse after accepting the completion report.",
+        "Symphony prepares merge-conflict worktrees with service-owned git operations before worker dispatch. Resolve file contents only, validate, and submit the required report.",
+        "Do not run git fetch, git pull, git merge, git rebase, git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned git and PR publication actions.",
         actionable.length > 0
           ? "Also fix the failing or missing required checks before submitting the completion report."
           : "If checks are still pending, include the latest validation evidence you can gather before submitting the completion report.",
@@ -584,6 +584,9 @@ function formatMergeGatePromptMergeability(gate: IssueMergeGateState): string[] 
     `- Reason: ${mergeability.reason ?? "n/a"}`,
     `- Base branch: ${mergeability.baseBranch ?? "n/a"}`,
     `- Base head SHA: ${mergeability.baseHeadSha ?? "n/a"}`,
+    ...(mergeability.observedBaseHeadSha !== null && mergeability.observedBaseHeadSha !== mergeability.baseHeadSha
+      ? [`- Observed PR base head SHA: ${mergeability.observedBaseHeadSha}`]
+      : []),
     `- Checked at: ${mergeability.checkedAt}`,
   ];
 }

@@ -68,6 +68,10 @@ export interface CommitAncestryInput {
   descendantSha: string;
 }
 
+export interface BranchHeadLookupInput {
+  branchName: string;
+}
+
 export interface PullRequestPublicationInput {
   workspacePath: string;
   branchName: string;
@@ -383,6 +387,31 @@ export class GitHubPullRequestClient {
       const checkRun = checkRunByName.get(required);
       return checkRun ?? { name: required, status: "missing", conclusion: null, url: null };
     });
+  }
+
+  async getBranchHeadSha(input: BranchHeadLookupInput): Promise<string> {
+    this.assertConfiguredForMerge();
+    const branchName = normalizeBaseBranch(input.branchName) ?? input.branchName.trim();
+    if (branchName.length === 0) {
+      throw new SymphonyError("invalid_request", "A branch name is required for GitHub branch head lookup");
+    }
+    const response = await this.fetchImpl(this.repoUrl(`git/ref/heads/${githubRefPath(branchName)}`), {
+      method: "GET",
+      headers: await this.requestHeaders(),
+    });
+    if (!response.ok) {
+      throw new SymphonyError("tracker_error", `GitHub branch head lookup returned HTTP ${response.status}`);
+    }
+    const body = (await response.json()) as Record<string, unknown>;
+    const object = isRecord(body.object) ? body.object : null;
+    const sha = asNullableString(object?.sha);
+    if (sha === null) throw new SymphonyError("tracker_error", "GitHub branch head lookup response is invalid");
+    return sha;
+  }
+
+  async gitAuthHeader(): Promise<string> {
+    this.assertConfiguredForMerge();
+    return `AUTHORIZATION: bearer ${await this.resolveAuthToken()}`;
   }
 
   async mergePullRequest(input: PullRequestMergeInput): Promise<PullRequestMergeResult> {
@@ -1268,6 +1297,13 @@ function normalizeBaseBranch(value: string | null): string | null {
   const trimmed = value?.trim() ?? "";
   if (trimmed.length === 0) return null;
   return trimmed.replace(/^refs\/heads\//, "").replace(/^origin\//, "");
+}
+
+function githubRefPath(branchName: string): string {
+  return branchName
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
 }
 
 function assertSafePublishBranch(branchName: string): void {

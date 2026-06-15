@@ -776,8 +776,8 @@ export function planMergeGateRepairWritebacks(
   const conflict = context.mergeability?.status === "conflicted";
   const requiredAction = conflict
     ? [
-        "Fetch the latest upstream changes from origin/main, reconcile the lifecycle-bound PR changes with origin/main, resolve merge conflicts, validate the requested checks, leave the final implementation changes uncommitted and unpushed in the assigned worktree, and submit a new completion report.",
-        "Do not run git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned commit, push, and PR publication/reuse after accepting the completion report.",
+        "Symphony will prepare the lifecycle-bound PR worktree against the live base branch with service-owned git operations before dispatching conflict repair.",
+        "Do not run git fetch, git pull, git merge, git rebase, git commit, git push, gh pr create, gh pr edit, or mutate the lifecycle-bound PR directly; Symphony performs service-owned git and PR publication actions.",
         hasActionableCheckBlockers(context)
           ? "Also fix the failing or missing required checks before submitting the completion report."
           : "If checks are still pending, include the latest validation evidence you can gather before submitting the completion report.",
@@ -918,7 +918,8 @@ export function planMergeConflictsWritebacks(
           `GitHub mergeable_state: ${context.mergeableState ?? "unknown"}`,
           "",
           `Transitioning to conflict-fix state: ${context.conflictsState}`,
-          "A scoped conflict-fix worker must resolve the conflict and call submit_merge_conflict_resolution before merge can continue.",
+          "Symphony has prepared the worktree with service-owned git operations. A scoped conflict-fix worker must edit only the conflicted files and call submit_merge_conflict_resolution before merge can continue.",
+          "The worker must not run git fetch, pull, merge, rebase, commit, push, or continue/abort/skip a rebase.",
         ].join("\n"),
       },
     },
@@ -1248,6 +1249,9 @@ function formatMergeGateMergeability(mergeability: IssueMergeGateMergeabilitySta
     `- Reason: ${mergeability.reason ?? "n/a"}`,
     `- Base branch: ${mergeability.baseBranch ?? "n/a"}`,
     `- Base head SHA: ${mergeability.baseHeadSha ?? "n/a"}`,
+    ...(mergeability.observedBaseHeadSha !== null && mergeability.observedBaseHeadSha !== mergeability.baseHeadSha
+      ? [`- Observed PR base head SHA: ${mergeability.observedBaseHeadSha}`]
+      : []),
     `- Checked at: ${mergeability.checkedAt}`,
   ];
 }

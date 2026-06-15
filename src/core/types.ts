@@ -127,6 +127,7 @@ export interface IssueMergeGateMergeabilitySummary {
   reason: string | null;
   baseBranch: string | null;
   baseHeadSha: string | null;
+  observedBaseHeadSha: string | null;
   checkedAt: string;
 }
 

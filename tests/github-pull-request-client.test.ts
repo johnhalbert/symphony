@@ -650,6 +650,26 @@ describe("GitHubPullRequestClient", () => {
     expect(calls).toEqual(["/repos/octo-org/symphony/compare/approved-sha...resolved-sha"]);
   });
 
+  it("resolves the live base branch head by branch ref", async () => {
+    const calls: Array<{ pathname: string; authorization: string | undefined }> = [];
+    const client = new GitHubPullRequestClient(config(), async (input, init) => {
+      const url = new URL(String(input));
+      calls.push({
+        pathname: url.pathname,
+        authorization: (init?.headers as Record<string, string> | undefined)?.authorization,
+      });
+      return jsonResponse({ object: { sha: "live-base-sha" } });
+    });
+
+    await expect(client.getBranchHeadSha({ branchName: "origin/release/2026.06" })).resolves.toBe("live-base-sha");
+    expect(calls).toEqual([
+      {
+        pathname: "/repos/octo-org/symphony/git/ref/heads/release/2026.06",
+        authorization: "Bearer github-secret",
+      },
+    ]);
+  });
+
   it("checks required commit statuses and check runs by name", async () => {
     const client = new GitHubPullRequestClient(config(), async (input) => {
       const url = new URL(String(input));

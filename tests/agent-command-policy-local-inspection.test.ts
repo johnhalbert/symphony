@@ -452,6 +452,28 @@ describe("AgentCommandPolicy helper-free local Git inspection allowlist", () => 
       "Blocked worker/reviewer Git command: command is not classified as helper-free local inspection. Use direct local inspection commands or Symphony service-owned GitHub workflow actions.",
     );
   });
+
+  it.each([
+    ["git rebase --continue", "rebase"],
+    ["git merge --continue", "merge"],
+    ["git commit --no-edit", "commit"],
+    ["git reset --hard HEAD", "reset"],
+  ])("denies service-owned conflict git choreography command: %s", (command, gitSubcommand) => {
+    const decision = evaluateAgentCommandPolicy(terminalInput(command));
+
+    expect(decision).toMatchObject({
+      outcome: "deny",
+      reasonKind: "ambiguous_command",
+      commandClass: "ambiguous_git_command",
+      audit: {
+        normalizedExecutable: "git",
+        gitSubcommand,
+        upstreamContactAttempted: false,
+      },
+    });
+    expect(decision.message).toContain("not classified as helper-free local inspection");
+    expect(decision.message).toContain("service-owned GitHub workflow actions");
+  });
 });
 
 function terminalInput(

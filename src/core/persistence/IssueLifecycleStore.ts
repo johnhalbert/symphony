@@ -420,6 +420,7 @@ export interface IssueMergeGateMergeabilityState {
   reason: string | null;
   baseBranch: string | null;
   baseHeadSha: string | null;
+  observedBaseHeadSha: string | null;
   checkedAt: string;
 }
 
@@ -443,6 +444,21 @@ export interface IssueMergeGateState {
 }
 
 export type IssueMergeConflictResolutionStatus = "pending" | "still_conflicted" | "resolved" | "blocked";
+
+export interface IssueMergeConflictServicePreparation {
+  strategy: "squash_rebase";
+  status: "conflicted" | "clean" | "finalized";
+  originalHeadSha: string;
+  observedPrBaseHeadSha: string | null;
+  liveBaseHeadSha: string;
+  preparedBaseHeadSha: string;
+  mergeBaseSha: string;
+  squashCommitSha: string | null;
+  conflictedFiles: string[];
+  preparedAt: string;
+  finalizedAt: string | null;
+  finalizedHeadSha: string | null;
+}
 
 export interface IssueMergeConflictResolutionReportRecord {
   id: string;
@@ -478,6 +494,7 @@ export interface IssueMergeConflictMetadata {
   conflictsState: string;
   reason: string;
   mergeableState: string | null;
+  servicePreparation: IssueMergeConflictServicePreparation | null;
   detectedAt: string;
   updatedAt: string;
   fixTurnCount: number;
@@ -2184,6 +2201,11 @@ function normalizeMergeGateMergeability(value: unknown, filePath: string): Issue
     reason: optionalNullableString(value.reason, filePath, "mergeGate.mergeability.reason"),
     baseBranch: optionalNullableString(value.baseBranch, filePath, "mergeGate.mergeability.baseBranch"),
     baseHeadSha: optionalNullableString(value.baseHeadSha, filePath, "mergeGate.mergeability.baseHeadSha"),
+    observedBaseHeadSha: optionalNullableString(
+      value.observedBaseHeadSha,
+      filePath,
+      "mergeGate.mergeability.observedBaseHeadSha",
+    ),
     checkedAt: requiredString(value.checkedAt, filePath, "mergeGate.mergeability.checkedAt"),
   };
 }
@@ -2261,6 +2283,7 @@ function normalizeMergeConflictMetadata(value: unknown, filePath: string): Issue
     conflictsState: requiredString(value.conflictsState, filePath, "mergeConflict.conflictsState"),
     reason: requiredString(value.reason, filePath, "mergeConflict.reason"),
     mergeableState: optionalNullableString(value.mergeableState, filePath, "mergeConflict.mergeableState"),
+    servicePreparation: normalizeMergeConflictServicePreparation(value.servicePreparation, filePath),
     detectedAt: requiredString(value.detectedAt, filePath, "mergeConflict.detectedAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "mergeConflict.updatedAt"),
     fixTurnCount: nonNegativeInteger(value.fixTurnCount, filePath, "mergeConflict.fixTurnCount"),
@@ -2282,6 +2305,55 @@ function normalizeMergeConflictMetadata(value: unknown, filePath: string): Issue
         : requiredStringArray(value.writebackOperationKeys, filePath, "mergeConflict.writebackOperationKeys"),
     blockedAt: optionalNullableString(value.blockedAt, filePath, "mergeConflict.blockedAt"),
     blockedReason: optionalNullableString(value.blockedReason, filePath, "mergeConflict.blockedReason"),
+  };
+}
+
+function normalizeMergeConflictServicePreparation(
+  value: unknown,
+  filePath: string,
+): IssueMergeConflictServicePreparation | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "mergeConflict.servicePreparation is invalid");
+  if (value.strategy !== "squash_rebase") {
+    throw corruptLifecycle(filePath, "mergeConflict.servicePreparation.strategy is invalid");
+  }
+  const status = value.status;
+  if (status !== "conflicted" && status !== "clean" && status !== "finalized") {
+    throw corruptLifecycle(filePath, "mergeConflict.servicePreparation.status is invalid");
+  }
+  return {
+    strategy: "squash_rebase",
+    status,
+    originalHeadSha: requiredString(value.originalHeadSha, filePath, "mergeConflict.servicePreparation.originalHeadSha"),
+    observedPrBaseHeadSha: optionalNullableString(
+      value.observedPrBaseHeadSha,
+      filePath,
+      "mergeConflict.servicePreparation.observedPrBaseHeadSha",
+    ),
+    liveBaseHeadSha: requiredString(value.liveBaseHeadSha, filePath, "mergeConflict.servicePreparation.liveBaseHeadSha"),
+    preparedBaseHeadSha: requiredString(
+      value.preparedBaseHeadSha,
+      filePath,
+      "mergeConflict.servicePreparation.preparedBaseHeadSha",
+    ),
+    mergeBaseSha: requiredString(value.mergeBaseSha, filePath, "mergeConflict.servicePreparation.mergeBaseSha"),
+    squashCommitSha: optionalNullableString(
+      value.squashCommitSha,
+      filePath,
+      "mergeConflict.servicePreparation.squashCommitSha",
+    ),
+    conflictedFiles: requiredStringArray(
+      value.conflictedFiles,
+      filePath,
+      "mergeConflict.servicePreparation.conflictedFiles",
+    ),
+    preparedAt: requiredString(value.preparedAt, filePath, "mergeConflict.servicePreparation.preparedAt"),
+    finalizedAt: optionalNullableString(value.finalizedAt, filePath, "mergeConflict.servicePreparation.finalizedAt"),
+    finalizedHeadSha: optionalNullableString(
+      value.finalizedHeadSha,
+      filePath,
+      "mergeConflict.servicePreparation.finalizedHeadSha",
+    ),
   };
 }
 
