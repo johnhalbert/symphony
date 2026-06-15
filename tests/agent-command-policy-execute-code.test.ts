@@ -168,12 +168,12 @@ os.environ["GITHUB_TOKEN"]`),
     expect(decision.message).not.toContain(secret);
   });
 
-  it.each(["worker", "reviewer"])("applies execute_code denial to the %s role", (role) => {
+  it.each(["worker", "reviewer", "triage", "planner"])("applies execute_code denial to the %s role", (role) => {
     const decision = evaluateAgentCommandPolicy(
       executeCodePolicyInput(`import subprocess
 subprocess.run(["gh", "pr", "create", "--fill"])`, {
         role,
-        phase: role === "reviewer" ? "review" : "implementation",
+        phase: role === "reviewer" ? "review" : role === "triage" ? "issue_triage" : role === "planner" ? "issue_breakdown" : "implementation",
       }),
     );
 

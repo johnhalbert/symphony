@@ -1657,6 +1657,29 @@ def terminal_tool(
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
+        from tools.pre_tool_policy import pre_tool_call_block_message
+
+        block_message = pre_tool_call_block_message(
+            "terminal",
+            {
+                "command": command,
+                "background": background,
+                "timeout": timeout,
+                "workdir": workdir or cwd,
+                "pty": pty,
+                "notify_on_complete": notify_on_complete,
+                "watch_patterns": watch_patterns,
+            },
+            task_id=effective_task_id,
+        )
+        if block_message is not None:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": block_message,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:

@@ -1,8 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildHostHermesAcpCreateProfileArgs,
   buildHostHermesAcpDeleteProfileArgs,
   buildHostHermesAcpLaunchArgs,
+  buildHostHermesAcpProfileInfoArgs,
   buildHostHermesAcpProfileCheckArgs,
   buildHostHermesAcpProfileName,
   createHostHermesAcpProfileLease,
@@ -10,6 +14,7 @@ import {
   hostHermesAcpCommandEnvironment,
   normalizeHostHermesAcpProfileName,
   parseHostHermesAcpActiveProfile,
+  parseHostHermesAcpProfileHome,
   shouldDeleteHostHermesAcpProfile,
   shouldReuseHostHermesAcpLease,
   type HostHermesAcpCommandOptions,
@@ -79,7 +84,18 @@ describe("HostHermesAcpProfileLease", () => {
     ]);
     expect(buildHostHermesAcpLaunchArgs("run-profile")).toEqual(["-p", "run-profile", "acp"]);
     expect(buildHostHermesAcpProfileCheckArgs("run-profile")).toEqual(["-p", "run-profile", "acp", "--check"]);
+    expect(buildHostHermesAcpProfileInfoArgs("run-profile")).toEqual(["-p", "run-profile", "profile"]);
     expect(buildHostHermesAcpDeleteProfileArgs("run-profile")).toEqual(["profile", "delete", "run-profile", "--yes"]);
+  });
+
+  it("parses the active profile home reported by host Hermes", () => {
+    const home = parseHostHermesAcpProfileHome("\n  Profile: worker-run\n  Home:    /c/Users/john/.hermes/profiles/worker-run\n");
+
+    if (process.platform === "win32") {
+      expect(home).toBe(path.resolve("C:/Users/john/.hermes/profiles/worker-run"));
+    } else {
+      expect(home).toBe(path.resolve("/c/Users/john/.hermes/profiles/worker-run"));
+    }
   });
 
   it("keeps the runtime lease contract compatible with harness fakes", async () => {
@@ -163,6 +179,67 @@ describe("HostHermesAcpProfileLease", () => {
       deleted: true,
     });
     expect(calls[2]?.args).toEqual(["profile", "delete", lease.profileName, "--yes"]);
+  });
+
+  it("installs and verifies the Symphony command-policy hook for ACP lease profiles", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "symphony-hermes-acp-hook-"));
+    const expectedProfileName = normalizeHostHermesAcpProfileName("worker-run");
+    const profileDir = path.join(root, "profiles", expectedProfileName);
+    const { calls, runner } = commandRecorder((command) => {
+      if (command.args.join(" ") === `-p ${expectedProfileName} profile`) {
+        return {
+          stdout: `\n  Profile: ${expectedProfileName}\n  Home:    ${profileDir}\n`,
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const verifier = vi.fn(async () => undefined);
+
+    const lease = await createHostHermesAcpProfileLease({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      profileName: "worker-run",
+      sourceProfile: "operator",
+      keepProfiles: "never",
+      runner,
+      commandPolicyHookOptions: {
+        cliPath: path.join(root, "dist", "src", "cli.js"),
+        role: "triage",
+        phase: "issue_triage",
+        issueId: "ENG-2467",
+      },
+      commandPolicyHookVerifier: verifier,
+      upstreamRoot: path.join(root, "hermes-src"),
+      python: "python-test",
+    });
+
+    expect(lease.profileDir).toBe(profileDir);
+    expect(lease.commandPolicyDecisionJournalPath).toBe(path.join(profileDir, "agent-command-policy-decisions.ndjson"));
+    expect(calls.map((call) => call.args)).toEqual([
+      ["-p", "operator", "acp", "--check"],
+      ["profile", "create", expectedProfileName, "--clone", "--clone-from", "operator", "--no-alias"],
+      ["-p", expectedProfileName, "profile"],
+    ]);
+    const config = await fs.readFile(path.join(profileDir, "config.yaml"), "utf8");
+    expect(config).toContain("hooks_auto_accept: true");
+    expect(config).toContain("pre_tool_call");
+    expect(config).toContain("terminal|execute_code");
+    expect(config).toContain("agent-command-policy-hook");
+    expect(verifier).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profileDir,
+        upstreamRoot: path.join(root, "hermes-src"),
+        python: "python-test",
+        smokeCwd: "/workspace",
+        cliPath: path.join(root, "dist", "src", "cli.js"),
+        role: "triage",
+        phase: "issue_triage",
+        issueId: "ENG-2467",
+        decisionJournalPath: path.join(profileDir, "agent-command-policy-decisions.ndjson"),
+      }),
+    );
   });
 
   it("defaults source profile to active host Hermes profile and preserves failed-run profiles by default", async () => {

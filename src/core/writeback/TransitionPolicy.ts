@@ -54,6 +54,17 @@ export interface IssueTriageReportWritebackContext {
   blockedReason?: string | null;
 }
 
+export interface IssueTriageWorkerDispatchWritebackContext {
+  issue: Issue;
+  report: IssueTriageReportRecord;
+}
+
+export interface IssueTriageBlockedReboundWritebackContext {
+  issue: Issue;
+  report: IssueTriageReportRecord;
+  reason: string;
+}
+
 export interface IssuePostMortemReportWritebackContext {
   issue: Issue;
   report: IssuePostMortemReportRecord;
@@ -124,6 +135,20 @@ export interface MergeGateHeadSupersessionWritebackContext {
   reportId: string;
 }
 
+export interface MergeGateHeadSupersessionRecoveryWritebackContext {
+  issue: Issue;
+  gateId: string;
+  pullRequest: {
+    url: string | null;
+    number: number | null;
+    headSha?: string | null;
+    branch?: string | null;
+  };
+  liveHeadSha: string;
+  reportId: string;
+  verdictId: string;
+}
+
 export interface CompletionReportWritebackDetails {
   reportId: string;
   idempotencyKey: string;
@@ -170,6 +195,50 @@ export function planDispatchWriteback(issue: Issue, config: ServiceConfig): NewW
       fromStates: ["Todo"],
       toState: config.writeback.dispatchState,
       reason: "Symphony dispatch",
+    },
+  };
+}
+
+export function planIssueTriageWorkerDispatchWriteback(
+  context: IssueTriageWorkerDispatchWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation | null {
+  if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.blockedStates)) return null;
+  const dispatchStateVersion = safeKeySegment(context.issue.updatedAt ?? context.issue.createdAt ?? context.issue.state);
+  const eventKey = `issue-triage-worker:${safeKeySegment(context.report.idempotencyKey)}:${dispatchStateVersion}`;
+  return {
+    idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+    kind: "transition",
+    issueId: context.issue.id,
+    runId: context.report.runId,
+    payload: {
+      fromStates: config.reviewLoop.blockedStates,
+      toState: config.writeback.dispatchState,
+      reason: "Symphony issue triage routed worker repair",
+    },
+  };
+}
+
+export function planIssueTriageBlockedReboundWriteback(
+  context: IssueTriageBlockedReboundWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation | null {
+  if (!config.writeback.enabled) return null;
+  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
+  if (blockedState === null) return null;
+  const fromStates = uniqueStates([config.writeback.dispatchState, ...config.tracker.activeStates]);
+  if (!isStateIn(context.issue.state, fromStates)) return null;
+  const stateVersion = safeKeySegment(context.issue.updatedAt ?? context.issue.createdAt ?? context.issue.state);
+  const eventKey = `issue-triage-blocked-rebound:${safeKeySegment(context.report.idempotencyKey)}:${stateVersion}`;
+  return {
+    idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
+    kind: "transition",
+    issueId: context.issue.id,
+    runId: context.report.runId,
+    payload: {
+      fromStates,
+      toState: blockedState,
+      reason: `Symphony issue triage blocked: ${context.reason}`,
     },
   };
 }
@@ -892,6 +961,48 @@ export function planMergeGateHeadSupersessionWritebacks(
         fromStates: uniqueStates([context.fromState, config.writeback.dispatchState]),
         toState: config.writeback.dispatchState,
         reason: "Symphony merge gate head superseded",
+      },
+    },
+  ];
+}
+
+export function planMergeGateHeadSupersessionRecoveryWritebacks(
+  context: MergeGateHeadSupersessionRecoveryWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || config.reviewLoop.reviewPassState === null) return [];
+  const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:head-superseded-recovered:${safeKeySegment(context.liveHeadSha)}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Merge Gate",
+          "",
+          "Status: head superseded rebind satisfied",
+          `Next state: ${config.reviewLoop.reviewPassState} (merge gate queue)`,
+          "",
+          `PR: ${formatPullRequest(context.pullRequest)}`,
+          `Live PR head SHA: ${context.liveHeadSha}`,
+          `Current completion report: ${context.reportId}`,
+          `Current approval verdict: ${context.verdictId}`,
+          "",
+          "Required action:",
+          "Symphony will evaluate the current PR head through the merge gate instead of dispatching another worker for the stale superseded head.",
+        ].join("\n"),
+      },
+    },
+    {
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.reviewLoop.reviewPassState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      payload: {
+        fromStates: [context.issue.state],
+        toState: config.reviewLoop.reviewPassState,
+        reason: "Symphony merge gate head supersession rebound satisfied",
       },
     },
   ];

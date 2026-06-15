@@ -79,6 +79,7 @@ export interface PullRequestPublicationInput {
   title: string;
   body: string;
   evidenceCursor: string;
+  forceEmptyCommit?: boolean;
 }
 
 export interface PullRequestPublicationResult extends PullRequestMetadata {
@@ -570,11 +571,14 @@ export class GitHubPullRequestClient {
       );
     }
 
+    const forceEmptyCommit = input.forceEmptyCommit === true && existing !== null && !dirty;
     if (dirty) {
       await git.commitAll(input.title, input.body);
+    } else if (forceEmptyCommit) {
+      await git.commitEmpty(input.title, input.body);
     }
 
-    const branchDiffAfterCommit = dirty ? await git.hasBranchDiff(baseBranch) : branchDiffBeforeCommit;
+    const branchDiffAfterCommit = dirty || forceEmptyCommit ? await git.hasBranchDiff(baseBranch) : branchDiffBeforeCommit;
     if (!existing && !branchDiffAfterCommit) {
       throw new SymphonyError(
         "invalid_request",
@@ -582,7 +586,7 @@ export class GitHubPullRequestClient {
       );
     }
 
-    if (dirty || branchDiffAfterCommit) {
+    if (dirty || forceEmptyCommit || branchDiffAfterCommit) {
       await git.pushBranch(branchName, token);
     }
     const headSha = await git.headSha();
@@ -1353,6 +1357,21 @@ class GitWorktreePublisher {
       "-c",
       "user.email=symphony@users.noreply.github.com",
       "commit",
+      "-m",
+      title,
+      "-m",
+      body,
+    ]);
+  }
+
+  async commitEmpty(title: string, body: string): Promise<void> {
+    await this.git([
+      "-c",
+      "user.name=Symphony",
+      "-c",
+      "user.email=symphony@users.noreply.github.com",
+      "commit",
+      "--allow-empty",
       "-m",
       title,
       "-m",

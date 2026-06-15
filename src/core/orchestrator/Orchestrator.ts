@@ -101,6 +101,7 @@ import { sanitizeAgentEventForPublicOutput } from "../transcript/TranscriptProje
 import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
   buildWorkerHandoffPacket,
+  latestCurrentApprovalPassVerdict,
   phaseForIssueState,
   type IssueCompletionReportRecord,
   type IssueLifecyclePatch,
@@ -134,7 +135,10 @@ import {
   planBlockedEscalationWritebacks,
   planDispatchWriteback,
   planIssuePostMortemReportWritebacks,
+  planIssueTriageBlockedReboundWriteback,
   planIssueTriageReportWritebacks,
+  planIssueTriageWorkerDispatchWriteback,
+  planMergeGateHeadSupersessionRecoveryWritebacks,
   planRunCancelledComment,
   planRunFailedComment,
   planRunStartedComment,
@@ -641,6 +645,7 @@ export class Orchestrator {
     await this.refreshProviderGates();
     await this.options.writeback?.processDue();
     await this.startupCleanup();
+    await this.cleanupOrphanedRunningRuns();
     this.scheduleTick(0);
   }
 
@@ -1809,6 +1814,61 @@ export class Orchestrator {
     }
   }
 
+  private async cleanupOrphanedRunningRuns(): Promise<void> {
+    const runStore = this.options.runStore;
+    if (!runStore) return;
+    let runs: RunRecord[];
+    try {
+      runs = await runStore.listRuns();
+    } catch (error) {
+      this.options.logger.warn("startup orphan run cleanup failed", { error: errorMessage(error) });
+      return;
+    }
+
+    const runningRuns = runs.filter((run) => run.status === "running");
+    if (runningRuns.length === 0) return;
+
+    const completedAt = new Date().toISOString();
+    let cancelled = 0;
+    for (const run of runningRuns) {
+      await runStore.updateRun(run.runId, {
+        status: "cancelled",
+        completedAt,
+        error: "Run cancelled during Symphony startup because no live orchestrator owns it.",
+        metadata: {
+          cancellationRequestedAt: completedAt,
+          cancellationSource: "service_stop",
+          cancellationReason: "Symphony restarted before this run reached a terminal state.",
+          cancellationOutcome: "cancelled",
+          ...(run.sdkRunStatus === "running"
+            ? {
+                sdkRunStatus: "cancelled" as const,
+                sdkRunStatusObservedAt: completedAt,
+                sdkRunStatusSource: "wait" as const,
+              }
+            : {}),
+        },
+      });
+      await runStore.appendEvent({
+        runId: run.runId,
+        at: completedAt,
+        source: "orchestrator",
+        eventType: "cancelled",
+        message: "Run cancelled during Symphony startup",
+        payload: {
+          kind: "run_cancelled",
+          actor: "orchestrator",
+          channel: "startup",
+          protocol: "service",
+          reason: "orphaned_running_run",
+          previousStatus: "running",
+        },
+      });
+      cancelled += 1;
+    }
+    this.options.logger.info("startup orphan running runs cancelled", { count: cancelled });
+  }
+
   private async recoverPendingPublicationApprovalHandoffs(): Promise<void> {
     if (
       !this.config.github.publishPullRequests ||
@@ -2087,6 +2147,20 @@ export class Orchestrator {
       }
       return false;
     }
+    if (
+      role === "worker" &&
+      runPhase === "implementation" &&
+      (await this.recoverSatisfiedHeadSupersessionRebind(issue, lifecycle))
+    ) {
+      return false;
+    }
+    if (
+      role === "worker" &&
+      runPhase === "implementation" &&
+      (await this.recoverMixedIssueTriageBlockedRebound(issue, lifecycle))
+    ) {
+      return false;
+    }
     const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
     const plannerAllowedFromBlocked =
       role === "planner" &&
@@ -2159,6 +2233,88 @@ export class Orchestrator {
       return false;
     }
 
+    return true;
+  }
+
+  private async recoverSatisfiedHeadSupersessionRebind(issue: Issue, lifecycle: IssueLifecycleRecord): Promise<boolean> {
+    if (this.config.reviewLoop.reviewPassState === null) return false;
+    if (!isStateIn(issue.state, this.config.tracker.activeStates)) return false;
+    if (lifecycle.phase !== "implementation") return false;
+    if (lifecycle.summaryPointers.ciStatus !== "head_superseded") return false;
+    const gate = lifecycle.mergeGate ?? null;
+    if (gate === null || gate.status !== "superseded" || gate.supersededByHeadSha === null) return false;
+    const report = latestCompletionReport(lifecycle);
+    const pullRequest = report?.pullRequest ?? null;
+    const reportHeadSha = pullRequest?.headSha?.trim() ?? "";
+    if (report === null || pullRequest === null || reportHeadSha.length === 0) return false;
+    if (reportHeadSha !== gate.supersededByHeadSha) return false;
+    if (lifecycle.summaryPointers.prHeadSha !== null && lifecycle.summaryPointers.prHeadSha !== reportHeadSha) return false;
+    const verdict = latestCurrentApprovalPassVerdict(lifecycle);
+    if (verdict === null) return false;
+
+    const operations = planMergeGateHeadSupersessionRecoveryWritebacks(
+      {
+        issue,
+        gateId: gate.id,
+        pullRequest,
+        liveHeadSha: reportHeadSha,
+        reportId: report.id,
+        verdictId: verdict.id,
+      },
+      this.config,
+    );
+    if (operations.length === 0) return false;
+    if (!(await this.applyWritebacks(operations, "merge gate head supersession recovery"))) return false;
+    await this.options.lifecycleStore?.updateIssue(issue, {
+      phase: "passed",
+      blockedReason: null,
+      lastReviewVerdictId: verdict.id,
+      summaryPointers: { ciStatus: null },
+    });
+    this.options.logger.info("merge gate head supersession rebind recovered", {
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      gate_id: gate.id,
+      live_head_sha: reportHeadSha,
+      report_id: report.id,
+      verdict_id: verdict.id,
+    });
+    return true;
+  }
+
+  private async recoverMixedIssueTriageBlockedRebound(issue: Issue, lifecycle: IssueLifecycleRecord): Promise<boolean> {
+    if (!isStateIn(issue.state, this.config.tracker.activeStates)) return false;
+    if (lifecycle.phase !== "implementation") return false;
+    const gate = lifecycle.mergeGate ?? null;
+    if (gate === null || gate.status !== "blocked") return false;
+    const report = latestIssueTriageReport(lifecycle);
+    const activeBlockers = activeIssueTriageBlockers(report);
+    if (report === null || activeBlockers.length === 0) return false;
+    if (activeBlockers.every((blocker) => blocker.nextActor === "worker")) return false;
+
+    const reason =
+      lifecycle.blockedReason ??
+      `max merge gate failures reached (${gate.reviewRound}/${this.config.reviewLoop.failureLimits.mergeGateFailures})`;
+    const transition = planIssueTriageBlockedReboundWriteback({ issue, report, reason }, this.config);
+    if (transition === null) return false;
+    if (!(await this.applyWriteback(transition, "issue triage blocked rebound"))) return false;
+
+    await this.options.lifecycleStore?.updateIssue(issue, {
+      phase: "blocked",
+      blockedReason: reason,
+    });
+    this.options.logger.info("issue triage blocked rebound recovered", {
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      report_id: report.id,
+      merge_gate_id: gate.id,
+      active_blockers: activeBlockers.map((blocker) => ({
+        kind: blocker.kind,
+        nextActor: blocker.nextActor,
+        status: blocker.status,
+      })),
+      reason,
+    });
     return true;
   }
 
@@ -2429,6 +2585,7 @@ export class Orchestrator {
       await this.reconcileIssueTriageReportWriteback(issue);
       if (this.availableSlots() <= 0) break;
       if (await this.tryDispatchPlanner(issue)) continue;
+      if (await this.tryDispatchWorkerFromIssueTriage(issue)) continue;
       await this.tryDispatchIssueTriage(issue);
     }
   }
@@ -2463,6 +2620,72 @@ export class Orchestrator {
           : candidate,
       ),
     });
+  }
+
+  private async tryDispatchWorkerFromIssueTriage(issue: Issue, allowExistingClaim = false): Promise<boolean> {
+    if (!this.config.issueTriage.enabled || !this.options.lifecycleStore) return false;
+    if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
+    if (this.running.has(issue.id)) return false;
+    if (this.pausedIssues.has(issue.id)) return false;
+    if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
+    if (!issue.assignedToWorker) return false;
+    if (!isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
+    if (issue.hasChildren) return false;
+    if (!this.passesLabelGuardrails(issue, "worker")) return false;
+    if (!this.hasStateSlot(issue.state)) return false;
+
+    let lifecycle = await this.options.lifecycleStore.get(issue.id);
+    let report = workerDispatchTriageReport(lifecycle);
+    if (!report) return false;
+
+    let refreshed: Issue[];
+    try {
+      refreshed = await this.options.tracker.fetchIssueStatesByIds([issue.id]);
+    } catch (error) {
+      this.options.logger.warn("pre-triage-worker issue refresh failed", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        error: errorMessage(error),
+      });
+      return false;
+    }
+
+    const latest = refreshed[0];
+    if (!latest) return false;
+    if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
+    if (this.running.has(latest.id)) return false;
+    if (this.pausedIssues.has(latest.id)) return false;
+    if (!allowExistingClaim && this.claimed.has(latest.id)) return false;
+    if (!latest.assignedToWorker) return false;
+    if (!isStateIn(latest.state, this.config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(latest.state, this.config.tracker.terminalStates)) return false;
+    if (latest.hasChildren) return false;
+    if (!this.passesLabelGuardrails(latest, "worker")) return false;
+    if (!this.hasStateSlot(latest.state)) return false;
+
+    lifecycle = await this.options.lifecycleStore.get(latest.id);
+    report = workerDispatchTriageReport(lifecycle);
+    if (!report) return false;
+
+    const transition = planIssueTriageWorkerDispatchWriteback({ issue: latest, report }, this.config);
+    if (!transition) return false;
+    if (!(await this.applyWriteback(transition, "issue triage worker dispatch"))) return false;
+
+    const afterWriteback = (await this.options.tracker.fetchIssueStatesByIds([latest.id]))[0];
+    if (!afterWriteback) return false;
+    if (this.availableSlots() <= 0) return false;
+    if (await this.activeProviderDispatchGate()) return false;
+    if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim, "implementation")) return false;
+
+    await this.options.lifecycleStore.updateIssue(afterWriteback, {
+      phase: "implementation",
+      blockedReason: null,
+    });
+    this.dispatchIssue(afterWriteback, null, "worker", null, "implementation");
+    return true;
   }
 
   private async tryDispatchIssueTriage(issue: Issue, allowExistingClaim = false): Promise<boolean> {
@@ -5221,7 +5444,8 @@ export class Orchestrator {
       "- Submit an exhaustive blockers array; do not choose a single most-specific disposition.",
       "- Use under_specified_needs_decomposition when hidden or under-specified scope should become smaller blocking child issues.",
       "- Prefer under_specified_needs_decomposition when review history shows repeated sibling-scenario or hidden-matrix discovery under the same broad requirement.",
-      "- Use implementation_unsatisfied_requirements when the latest review failure is active or worker behavior did not satisfy the issue contract.",
+      "- Use implementation_unsatisfied_requirements when the latest non-merge-gate review failure is active or worker behavior did not satisfy the issue contract.",
+      "- A service-owned merge-gate verdict is not proof of unsatisfied implementation by itself. For current-head required-check failures, classify the concrete check, mergeability, conflict, infra, or operator blocker; mark implementation_unsatisfied_requirements active only when evidence shows worker-authored content caused the failure.",
       "- Use pr_review_gate only for review approval gates; mark it downstream when a higher-precedence active blocker still needs work.",
       "- Lower-precedence PR, CI, merge, or review-gate blockers must not mask active implementation, validation, decomposition, or orchestration-context blockers.",
       "- Use manual_decision when the evidence requires a product/owner decision before automation should continue.",
@@ -6470,7 +6694,11 @@ function issueTriageLedgerLines(
     `- Latest completion report: ${report?.id ?? "none"}${report ? ` acceptedAt=${report.acceptedAt}` : ""}`,
     `- Latest review verdict: ${verdict?.id ?? "none"}${verdict ? ` verdict=${verdict.verdict} submittedAt=${verdict.submittedAt}` : ""}`,
   ];
-  if (isUnsupersededReviewFailure(report, verdict)) {
+  if (verdict?.verdict === "fail" && isMergeGateVerdict(verdict)) {
+    lines.push(
+      "- Deterministic blocker: latest failed verdict is a service-owned merge-gate verdict; classify the concrete check, mergeability, conflict, infra, or operator blocker. Do not report implementation_unsatisfied_requirements solely because the merge gate fail is newer than the latest completion report.",
+    );
+  } else if (isUnsupersededReviewFailure(report, verdict)) {
     lines.push(
       "- Deterministic blocker: latest review failure is active and unsuperseded by worker completion; report implementation_unsatisfied_requirements unless stronger evidence proves decomposition or orchestration-context failure.",
     );
@@ -6493,7 +6721,7 @@ function isUnsupersededReviewFailure(
   report: IssueCompletionReportRecord | null,
   verdict: IssueReviewVerdictRecord | null,
 ): boolean {
-  if (!verdict || verdict.verdict !== "fail") return false;
+  if (!verdict || verdict.verdict !== "fail" || isMergeGateVerdict(verdict)) return false;
   if (!report) return true;
   return Date.parse(verdict.submittedAt) >= Date.parse(report.acceptedAt);
 }
@@ -6503,6 +6731,14 @@ function reportHasActiveTriageBlocker(
   kind: IssueTriageBlockerKind,
 ): boolean {
   return activeIssueTriageBlockers(report).some((blocker) => blocker.kind === kind);
+}
+
+function workerDispatchTriageReport(lifecycle: IssueLifecycleRecord | null): IssueLifecycleRecord["issueTriageReports"][number] | null {
+  if (!lifecycle || lifecycle.phase !== "blocked") return null;
+  const report = latestIssueTriageReportForFingerprint(lifecycle, issueTriageTriggerFingerprint(lifecycle));
+  const activeBlockers = activeIssueTriageBlockers(report);
+  if (activeBlockers.length === 0) return null;
+  return activeBlockers.every((blocker) => blocker.nextActor === "worker") ? report : null;
 }
 
 function formatTriageBlockersForDirective(blockers: readonly IssueTriageBlockerRecord[]): string[] {
@@ -6536,6 +6772,7 @@ function successConditionsForRun(
       "- Submit an exhaustive blockers list; do not collapse the situation into one disposition.",
       "- Include status, nextActor, confidence, summary, evidence, and recommendedAction for every blocker.",
       "- Lower-precedence PR, CI, merge, or review-gate blockers must not mask active implementation, validation, decomposition, or orchestration-context blockers.",
+      "- Do not convert a service-owned merge-gate verdict into an active worker blocker unless direct evidence shows worker-authored content caused the failing check.",
       "- Call submit_issue_triage_report before ending the run.",
     ].join("\n");
   }

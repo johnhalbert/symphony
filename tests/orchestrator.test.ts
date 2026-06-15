@@ -99,6 +99,78 @@ describe("Orchestrator", () => {
     expect(sorted.map((item) => item.identifier)).toEqual(["C", "A", "B"]);
   });
 
+  it("marks persisted running runs as cancelled on startup", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "In Progress" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "orphan-run-1",
+      sessionId: "orphan-session-1",
+      agentId: "orphan-agent-1",
+      role: "worker",
+      runPhase: "implementation",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: 1,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+      metadata: {
+        sdkRunStatus: "running",
+        sdkRunStatusObservedAt: "2026-01-01T00:00:00.000Z",
+        sdkRunStatusSource: "initial",
+      },
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.start();
+    await orchestrator.stop();
+
+    await expect(runStore.getRun("orphan-run-1")).resolves.toMatchObject({
+      status: "cancelled",
+      error: "Run cancelled during Symphony startup because no live orchestrator owns it.",
+      cancellationSource: "service_stop",
+      cancellationOutcome: "cancelled",
+      sdkRunStatus: "cancelled",
+      sdkRunStatusSource: "wait",
+    });
+    const transcript = await runStore.readTranscript("orphan-run-1");
+    expect(transcript.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "cancelled",
+          message: "Run cancelled during Symphony startup",
+        }),
+      ]),
+    );
+  });
+
   it("dispatches eligible work through the harness", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -2466,6 +2538,341 @@ describe("Orchestrator", () => {
       runPhase: "issue_triage",
       runKind: "triage",
       status: "succeeded",
+    });
+  });
+
+  it("routes blocked issues with active worker-owned triage blockers back to worker dispatch", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.writeback.dispatchState = "In Progress";
+    let state = "Blocked";
+    const candidate = issue({ state, branchName: "symphony/TEST-1" });
+    const currentIssue = (): Issue => ({ ...candidate, state });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.some((candidateState) => candidateState.toLowerCase() === state.toLowerCase()) ? [currentIssue()] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((nextState) => {
+      state = nextState;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const seeded = await lifecycleStore.ensureIssue(currentIssue(), {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max merge gate failures reached (3/3)",
+    });
+    await lifecycleStore.updateIssue(currentIssue(), {
+      lastIssueTriageReportId: "issue-triage-report:issue-1:triage-worker",
+      issueTriageReports: [
+        {
+          id: "issue-triage-report:issue-1:triage-worker",
+          idempotencyKey: "triage-worker",
+          requestHash: "triage-worker-hash",
+          runId: "triage-run-1",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          triggerFingerprint: issueTriageTriggerFingerprint(seeded),
+          disposition: "implementation_repair",
+          confidence: "medium",
+          summary: "Worker should produce a fresh no-diff repair packet after CI is fixed.",
+          evidence: ["blockedReason=max merge gate failures reached (3/3)"],
+          recommendedAction: "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
+          blockers: [
+            {
+              kind: "implementation_unsatisfied_requirements",
+              status: "active",
+              nextActor: "worker",
+              confidence: "medium",
+              summary: "The failed merge-gate verdict is unsuperseded by a newer completion report.",
+              evidence: ["latest review verdict was recorded after latest completion report"],
+              recommendedAction: "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
+            },
+          ],
+          submittedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-worker"],
+        },
+      ],
+    });
+    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "triage-routed worker dispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "triage-routed worker completion");
+    await orchestrator.stop();
+
+    expect(writer.transitions[0]).toMatchObject({
+      issueId: candidate.id,
+      fromStates: ["Blocked"],
+      toState: "In Progress",
+      reason: "Symphony issue triage routed worker repair",
+    });
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "worker",
+      runPhase: "implementation",
+      issue: expect.objectContaining({ state: "In Progress" }) as Partial<Issue>,
+    });
+    expect(harness.runs[0]?.ctx.ephemeralSystemPrompt).toContain("Latest issue triage:");
+    expect(harness.runs[0]?.ctx.ephemeralSystemPrompt).toContain("implementation_unsatisfied_requirements");
+  });
+
+  it("does not route mixed active triage blockers back to worker dispatch", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.writeback.dispatchState = "In Progress";
+    let state = "Blocked";
+    const candidate = issue({ state, branchName: "symphony/TEST-1" });
+    const currentIssue = (): Issue => ({ ...candidate, state });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.some((candidateState) => candidateState.toLowerCase() === state.toLowerCase()) ? [currentIssue()] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((nextState) => {
+      state = nextState;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const seeded = await lifecycleStore.ensureIssue(currentIssue(), {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason: "max merge gate failures reached (3/3)",
+    });
+    await lifecycleStore.updateIssue(currentIssue(), {
+      lastIssueTriageReportId: "issue-triage-report:issue-1:triage-mixed",
+      issueTriageReports: [
+        {
+          id: "issue-triage-report:issue-1:triage-mixed",
+          idempotencyKey: "triage-mixed",
+          requestHash: "triage-mixed-hash",
+          runId: "triage-run-1",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          triggerFingerprint: issueTriageTriggerFingerprint(seeded),
+          disposition: "implementation_repair",
+          confidence: "medium",
+          summary: "Worker blocker is mixed with an active operator-owned merge gate blocker.",
+          evidence: ["blockedReason=max merge gate failures reached (3/3)"],
+          recommendedAction: "Do not dispatch worker while the active gate blocker needs operator action.",
+          blockers: [
+            {
+              kind: "implementation_unsatisfied_requirements",
+              status: "active",
+              nextActor: "worker",
+              confidence: "medium",
+              summary: "The failed merge-gate verdict is unsuperseded by a newer completion report.",
+              evidence: ["latest merge-gate verdict was recorded after latest completion report"],
+              recommendedAction: "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
+            },
+            {
+              kind: "merge_gate_check_failure",
+              status: "active",
+              nextActor: "operator",
+              confidence: "high",
+              summary: "The current PR head is blocked on a required check failure.",
+              evidence: ["Typecheck and test failed on the current PR head"],
+              recommendedAction: "Fix or rerun the required check before dispatching another worker.",
+            },
+          ],
+          submittedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-mixed"],
+        },
+      ],
+    });
+    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    expect(state).toBe("Blocked");
+    expect(writer.transitions).toEqual([]);
+    expect(harness.runs).toEqual([]);
+  });
+
+  it("rebounds stale mixed triage dispatches back to blocked before worker dispatch", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
+    config.tracker.activeStates = ["In Progress"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.writeback.dispatchState = "In Progress";
+    let state = "In Progress";
+    const candidate = issue({ state, branchName: "symphony/TEST-1" });
+    const currentIssue = (): Issue => ({ ...candidate, state });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return config.tracker.activeStates.some((activeState) => activeState.toLowerCase() === state.toLowerCase())
+          ? [currentIssue()]
+          : [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.some((candidateState) => candidateState.toLowerCase() === state.toLowerCase()) ? [currentIssue()] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((nextState) => {
+      state = nextState;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const blockedReason = "max merge gate failures reached (5/3)";
+    const mergeGate = {
+      id: "merge-gate:issue-1:pr-42:head-sha-1",
+      status: "blocked" as const,
+      headSha: "head-sha-1",
+      pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+      requiredChecks: ["Typecheck and test"],
+      checks: [
+        {
+          name: "Typecheck and test",
+          outcome: "failing" as const,
+          rawStatus: "failure" as const,
+          conclusion: "failure",
+          url: "https://ci.test/test",
+          firstObservedAt: null,
+          actionableSince: null,
+        },
+      ],
+      mergeability: null,
+      reviewRound: 5,
+      gateRunId: "worker-run-1",
+      gateReportId: "completion-report:issue-1:repair-1",
+      repairRunId: null,
+      repairReportId: null,
+      blockerFingerprint: "head-sha-1:Typecheck and test:failure",
+      writebackOperationKeys: [],
+      supersededByHeadSha: null,
+      updatedAt: "2026-01-01T00:00:01.000Z",
+    };
+    const seeded = await lifecycleStore.ensureIssue(currentIssue(), {
+      phase: "blocked",
+      reviewRound: 3,
+      blockedReason,
+      mergeGate,
+    });
+    await lifecycleStore.updateIssue(currentIssue(), {
+      phase: "implementation",
+      blockedReason: null,
+      lastIssueTriageReportId: "issue-triage-report:issue-1:triage-mixed",
+      issueTriageReports: [
+        {
+          id: "issue-triage-report:issue-1:triage-mixed",
+          idempotencyKey: "triage-mixed",
+          requestHash: "triage-mixed-hash",
+          runId: "triage-run-1",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          triggerFingerprint: issueTriageTriggerFingerprint(seeded),
+          disposition: "implementation_repair",
+          confidence: "medium",
+          summary: "Worker blocker is mixed with an active operator-owned merge gate blocker.",
+          evidence: ["blockedReason=max merge gate failures reached (5/3)"],
+          recommendedAction: "Do not dispatch worker while the active gate blocker needs operator action.",
+          blockers: [
+            {
+              kind: "implementation_unsatisfied_requirements",
+              status: "active",
+              nextActor: "worker",
+              confidence: "medium",
+              summary: "The failed merge-gate verdict is unsuperseded by a newer completion report.",
+              evidence: ["latest merge-gate verdict was recorded after latest completion report"],
+              recommendedAction: "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
+            },
+            {
+              kind: "merge_gate_check_failure",
+              status: "active",
+              nextActor: "operator",
+              confidence: "high",
+              summary: "The current PR head is blocked on a required check failure.",
+              evidence: ["Typecheck and test failed on the current PR head"],
+              recommendedAction: "Fix or rerun the required check before dispatching another worker.",
+            },
+          ],
+          submittedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-mixed"],
+        },
+      ],
+    });
+    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => writer.transitions.length === 1, "mixed triage blocked rebound");
+    await orchestrator.stop();
+
+    expect(writer.transitions[0]).toMatchObject({
+      issueId: candidate.id,
+      fromStates: ["In Progress"],
+      toState: "Blocked",
+      reason: `Symphony issue triage blocked: ${blockedReason}`,
+    });
+    expect(harness.runs).toEqual([]);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason,
     });
   });
 
@@ -6531,6 +6938,143 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).not.toContain("test: failing / failure (https://ci.test/test)");
     expect(harness.runs[0]?.prompt).not.toContain("Repair the Symphony merge-gate checks");
     expect(harness.runs[0]?.prompt).not.toContain("completion-report:issue-1:repair-1");
+  });
+
+  it("recovers a satisfied head-superseded rebind before dispatching another worker", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    let currentState = "In Progress";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const report = {
+      ...completionReportRecord(candidate),
+      id: "completion-report:issue-1:fresh-head",
+      runId: "worker-run-2",
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "head-sha-2",
+        branch: "symphony/TEST-1",
+      },
+    };
+    const approval: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(candidate),
+      id: "review-verdict:issue-1:fresh-head-pass",
+      idempotencyKey: "fresh-head-pass",
+      runId: "review-run-2",
+      verdict: "pass",
+      acceptanceResults: [{ text: "Fresh head approved", satisfied: true, evidence: "reviewed" }],
+      findings: [],
+      evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-2"],
+    };
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "implementation",
+      lastCompletionReportId: report.id,
+      lastReviewVerdictId: approval.id,
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "head-sha-2",
+        prBranch: "symphony/TEST-1",
+        ciStatus: "head_superseded",
+      },
+      completionReports: [report],
+      reviewVerdicts: [approval],
+      reviewFeedback: [
+        {
+          ...approvalFeedbackRecord(candidate, "review-run-2"),
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "head-sha-2",
+            branch: "symphony/TEST-1",
+          },
+        },
+      ],
+      mergeGate: {
+        id: "merge-gate:issue-1:pr-42:head-sha-1",
+        status: "superseded",
+        headSha: "head-sha-1",
+        pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+        requiredChecks: ["test"],
+        checks: [
+          {
+            name: "test",
+            outcome: "failing",
+            rawStatus: "failure",
+            conclusion: "failure",
+            url: "https://ci.test/test",
+            firstObservedAt: null,
+            actionableSince: null,
+          },
+        ],
+        mergeability: null,
+        reviewRound: 4,
+        gateRunId: "worker-run-1",
+        gateReportId: "completion-report:issue-1:old-head",
+        repairRunId: "repair-run-1",
+        repairReportId: "completion-report:issue-1:repair-1",
+        blockerFingerprint: "head-sha-1:test:failure",
+        writebackOperationKeys: [],
+        supersededByHeadSha: "head-sha-2",
+        updatedAt: "2026-01-01T00:00:03.000Z",
+      },
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => writer.transitions.length === 1, "head-superseded recovery transition");
+    await orchestrator.stop();
+
+    expect(harness.runs).toEqual([]);
+    expect(currentState).toBe("Ready to Merge");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["In Progress"],
+        toState: "Ready to Merge",
+        reason: "Symphony merge gate head supersession rebound satisfied",
+      },
+    ]);
+    expect(writer.comments[0]?.dedupeKey).toContain("head-superseded-recovered:head-sha-2");
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "passed",
+      blockedReason: null,
+      lastReviewVerdictId: approval.id,
+      summaryPointers: { ciStatus: null, prHeadSha: "head-sha-2" },
+      mergeGate: { status: "superseded", supersededByHeadSha: "head-sha-2" },
+    });
   });
 
   it("cancels an active issue without retrying it", async () => {

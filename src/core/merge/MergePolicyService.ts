@@ -168,7 +168,7 @@ export class MergePolicyService {
 
     const approvedPullRequest = requirePullRequest(report);
     const approvedHeadSha = requireValue(approvedPullRequest.headSha, "Completion report pull request head SHA is required for gated merge");
-    const resolvedConflict = resolvedMergeConflictForIssue(latestIssue, lifecycle, config);
+    const resolvedConflict = resolvedMergeConflictForIssue(latestIssue, lifecycle, config, approvedPullRequest);
     const pullRequest = resolvedConflict ? pullRequestRefForResolvedConflict(resolvedConflict) : approvedPullRequest;
     const headSha = requireValue(pullRequest.headSha, "Completion report pull request head SHA is required for gated merge");
     const github = this.options.client ?? createGitHubPullRequestClientForCapability(config, "github.merge");
@@ -283,13 +283,28 @@ export class MergePolicyService {
     }
 
     const verdict = latestMergeApprovalPassVerdict(activeLifecycle, resolvedConflict !== null);
-    this.validateLifecycle(activeLifecycle, report, verdict, workerRun, latestIssue);
-    if (decision.kind === "failure") {
-      return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, null);
-    }
     if (
       decision.kind === "passed" &&
       verdict &&
+      activeLifecycle.mergeGate?.id === gateId &&
+      activeLifecycle.mergeGate.status === "blocked" &&
+      (existingGateVerdict || activeLifecycle.mergeGate?.id === gateId) &&
+      canAutoResolveMergeGateOnCheckPass(activeLifecycle, gateId)
+    ) {
+      activeLifecycle = await this.options.lifecycleStore.updateIssue(latestIssue, {
+        ...inactiveMergeGateLifecyclePatch(activeLifecycle, activeLifecycle.mergeGate, "resolved"),
+        phase: "passed",
+        blockedReason: null,
+        lastReviewVerdictId: verdict.id,
+        summaryPointers: { ciStatus: "success" },
+      });
+    }
+    this.validateLifecycle(activeLifecycle, report, verdict, workerRun, latestIssue);
+    if (
+      decision.kind === "passed" &&
+      verdict &&
+      activeLifecycle.mergeGate?.id === gateId &&
+      isActiveMergeGate(activeLifecycle.mergeGate) &&
       (existingGateVerdict || activeLifecycle.mergeGate?.id === gateId) &&
       canAutoResolveMergeGateOnCheckPass(activeLifecycle, gateId)
     ) {
@@ -304,6 +319,9 @@ export class MergePolicyService {
         lastReviewVerdictId: verdict.id,
         summaryPointers: { ciStatus: "success" },
       });
+    }
+    if (decision.kind === "failure") {
+      return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, null);
     }
 
     const checkStatus = decision.checkStatus;
@@ -399,7 +417,7 @@ export class MergePolicyService {
       existingVerdict === null ||
       lifecycle.phase === "passed" ||
       (approvalVerdict !== null && lifecycle.lastReviewVerdictId === approvalVerdict.id);
-    const previousMergeGateRound = lifecycle.mergeGate?.id === gate.id ? lifecycle.mergeGate.reviewRound : 0;
+    const previousMergeGateRound = previousMergeGateRepairRound(lifecycle, gate);
     const reviewRound = newRepairCycle ? previousMergeGateRound + 1 : previousMergeGateRound;
     const maxMergeGateFailures = this.options.config.reviewLoop.failureLimits.mergeGateFailures;
     const missingConflictState = gate.mergeability?.status === "conflicted" && this.options.config.mergePolicy.conflictsState === null;
@@ -860,10 +878,12 @@ function resolvedMergeConflictForIssue(
   issue: Issue,
   lifecycle: IssueLifecycleRecord,
   config: ServiceConfig,
+  approvedPullRequest: CompletionReportPullRequestRef,
 ): IssueMergeConflictMetadata | null {
   const conflictsState = config.mergePolicy.conflictsState;
   const mergeConflict = lifecycle.mergeConflict;
   if (conflictsState === null || mergeConflict?.resolutionStatus !== "resolved") return null;
+  if (!resolvedMergeConflictMatchesLatestReport(mergeConflict, approvedPullRequest)) return null;
   if (statesEqual(issue.state, conflictsState)) return mergeConflict;
   if (
     mergeConflict.servicePreparation?.strategy === "squash_rebase" &&
@@ -873,6 +893,19 @@ function resolvedMergeConflictForIssue(
     return mergeConflict;
   }
   return null;
+}
+
+function resolvedMergeConflictMatchesLatestReport(
+  mergeConflict: IssueMergeConflictMetadata,
+  approvedPullRequest: CompletionReportPullRequestRef,
+): boolean {
+  if (mergeConflict.pullRequest.number !== approvedPullRequest.number) return false;
+  if (mergeConflict.pullRequest.url !== approvedPullRequest.url) return false;
+  if (mergeConflict.pullRequest.branch !== approvedPullRequest.branch) return false;
+  const reportHeadSha = approvedPullRequest.headSha?.trim() ?? "";
+  if (reportHeadSha.length === 0) return false;
+  if (reportHeadSha === mergeConflict.approvedHeadSha) return true;
+  return mergeConflict.resolvedHeadSha !== null && reportHeadSha === mergeConflict.resolvedHeadSha;
 }
 
 function pullRequestRefForResolvedConflict(mergeConflict: IssueMergeConflictMetadata): CompletionReportPullRequestRef {
@@ -953,6 +986,7 @@ async function validateConflictApprovalCarryForward(
   requireMatches("merge conflict PR number", mergeConflict.pullRequest.number, approvedPullRequest.number);
   requireMatches("merge conflict PR URL", mergeConflict.pullRequest.url, approvedPullRequest.url);
   requireMatches("merge conflict PR branch", mergeConflict.pullRequest.branch, approvedPullRequest.branch);
+  if (approvedHeadSha === resolvedHeadSha) return;
   if (mergeConflict.approvedHeadSha !== approvedHeadSha) {
     throw new SymphonyError("invalid_request", "Merge conflict approved head does not match review approval metadata");
   }
@@ -1319,6 +1353,16 @@ function refreshedActiveGateLastReviewVerdictId(lifecycle: IssueLifecycleRecord,
     return lifecycle.lastReviewVerdictId;
   }
   return gate.id;
+}
+
+function previousMergeGateRepairRound(lifecycle: IssueLifecycleRecord, gate: MergeGateStatus): number {
+  const current = lifecycle.mergeGate;
+  if (!current) return 0;
+  if (current.id === gate.id) return current.reviewRound;
+  if (current.status === "superseded" && current.pullRequest.number === gate.pullRequest.number) {
+    return current.reviewRound;
+  }
+  return 0;
 }
 
 function mergeGateStateFromStatus(

@@ -49,6 +49,12 @@ export interface WriteHermesMcpConfigOptions {
   hooksAutoAccept?: boolean;
 }
 
+export interface WriteHermesShellHookConfigOptions {
+  profileDir: string;
+  hooks?: HermesShellHooksConfig;
+  hooksAutoAccept?: boolean;
+}
+
 export interface HermesAgentCommandPolicyHookInvocation {
   command: string;
   args: string[];
@@ -89,6 +95,19 @@ export async function writeHermesMcpConfig(options: WriteHermesMcpConfigOptions)
   await fs.mkdir(options.profileDir, { recursive: true });
   await fs.writeFile(configPath, YAML.stringify(next), "utf8");
   return mcpServers;
+}
+
+export async function writeHermesShellHookConfig(options: WriteHermesShellHookConfigOptions): Promise<void> {
+  const configPath = path.join(options.profileDir, "config.yaml");
+  const existing = await readYamlObject(configPath);
+  const next = {
+    ...existing,
+    ...(options.hooks === undefined ? {} : { hooks: mergeHermesShellHooks(existing.hooks, options.hooks) }),
+    ...(options.hooksAutoAccept === undefined ? {} : { hooks_auto_accept: options.hooksAutoAccept }),
+  };
+
+  await fs.mkdir(options.profileDir, { recursive: true });
+  await fs.writeFile(configPath, YAML.stringify(next), "utf8");
 }
 
 export function buildHermesAgentCommandPolicyHookConfig(options: BuildHermesAgentCommandPolicyHookOptions): HermesShellHooksConfig {
@@ -479,6 +498,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const HERMES_HOOK_REGISTRATION_VALIDATION_PY = String.raw`
 import json
+import os
 import sys
 
 expected_command = sys.argv[1]
@@ -511,7 +531,32 @@ if len(matching) != 1:
     ]
     raise AssertionError(f"expected exactly one registered generated command-policy hook, found {len(matching)} among {summary!r}")
 
-print(json.dumps({"ok": True, "registered": len(registered)}))
+from tools.terminal_tool import terminal_tool
+
+terminal_result = json.loads(terminal_tool(command="git push origin HEAD", workdir=os.getcwd()))
+if terminal_result.get("status") != "blocked":
+    raise AssertionError(f"direct terminal_tool did not block via pre_tool_call hook: {terminal_result!r}")
+
+terminal_error = terminal_result.get("error")
+if not isinstance(terminal_error, str) or not terminal_error:
+    raise AssertionError(f"direct terminal_tool block did not include an error message: {terminal_result!r}")
+
+from tools.code_execution_tool import execute_code
+
+code_result = json.loads(execute_code('import subprocess\nsubprocess.run(["gh", "pr", "view", "1"])'))
+if code_result.get("status") != "blocked":
+    raise AssertionError(f"direct execute_code did not block via pre_tool_call hook: {code_result!r}")
+
+code_error = code_result.get("error")
+if not isinstance(code_error, str) or not code_error:
+    raise AssertionError(f"direct execute_code block did not include an error message: {code_result!r}")
+
+print(json.dumps({
+    "ok": True,
+    "registered": len(registered),
+    "direct_terminal_blocked": True,
+    "direct_execute_code_blocked": True,
+}))
 `;
 
 function agentCommandPolicyHookNodeExecArgv(cliPath: string): string[] {

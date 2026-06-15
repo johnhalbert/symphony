@@ -245,6 +245,113 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("requests a fresh PR head for no-change merge-gate repair completions", async () => {
+    const publisher = new FakePublisher({
+      action: "reused",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "head-sha-2",
+      lastPushedAt: "2026-01-01T00:00:02Z",
+      evidenceCursor: "repair-2",
+    });
+    const { service, lifecycleStore, runStore } = fixture({ publisher });
+    await startRun(runStore);
+    await lifecycleStore.ensureIssue(contextWithWorkspace().issue, {
+      phase: "implementation",
+      mergeGate: mergeGate({
+        headSha: "head-sha-1",
+        repairRunId: "run-1",
+        repairReportId: null,
+      }),
+    });
+
+    await service.submitCompletionReport(
+      report({
+        idempotencyKey: "repair-2",
+        changedFiles: [],
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
+      }),
+      contextWithWorkspace(),
+    );
+
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      evidenceCursor: "repair-2",
+      forceEmptyCommit: true,
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      summaryPointers: {
+        prHeadSha: "head-sha-2",
+      },
+      mergeGate: {
+        status: "superseded",
+        headSha: "head-sha-1",
+        supersededByHeadSha: "head-sha-2",
+      },
+    });
+  });
+
+  it("requests a fresh PR head for no-change completions against blocked merge gates", async () => {
+    const publisher = new FakePublisher({
+      action: "reused",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "head-sha-2",
+      lastPushedAt: "2026-01-01T00:00:02Z",
+      evidenceCursor: "repair-blocked",
+    });
+    const { service, lifecycleStore, runStore } = fixture({ publisher });
+    await startRun(runStore);
+    await lifecycleStore.ensureIssue(contextWithWorkspace().issue, {
+      phase: "implementation",
+      mergeGate: mergeGate({
+        status: "blocked",
+        headSha: "head-sha-1",
+        repairRunId: "run-1",
+        repairReportId: null,
+      }),
+    });
+
+    await service.submitCompletionReport(
+      report({
+        idempotencyKey: "repair-blocked",
+        changedFiles: [],
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
+      }),
+      contextWithWorkspace(),
+    );
+
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({
+      evidenceCursor: "repair-blocked",
+      forceEmptyCommit: true,
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      summaryPointers: {
+        prHeadSha: "head-sha-2",
+      },
+      mergeGate: {
+        status: "superseded",
+        headSha: "head-sha-1",
+        supersededByHeadSha: "head-sha-2",
+      },
+    });
+  });
+
   it("replays duplicate reports without new lifecycle or writeback side effects", async () => {
     const { service, lifecycleStore, outbox } = fixture();
 

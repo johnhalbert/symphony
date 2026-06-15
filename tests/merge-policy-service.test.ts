@@ -759,6 +759,315 @@ describe("MergePolicyService", () => {
     });
   });
 
+  it("dispatches merge-gate repair when the latest approval is already on the resolved conflict head", async () => {
+    const config = mergeConfig({
+      requiredChecks: ["test"],
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await runStore.startRun({
+      runId: "worker-run-2",
+      role: "worker",
+      issueId: currentIssue.id,
+      issueIdentifier: currentIssue.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "resolved conflict repair",
+      workspaceKey: currentIssue.identifier,
+      workspacePath: path.join(root, currentIssue.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await runStore.recordPullRequestEvent({
+      runId: "worker-run-2",
+      action: "updated",
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "head-sha-2",
+      prBranch: "symphony/TEST-1",
+    });
+    const resolvedReport = {
+      ...(await lifecycleStore.get(currentIssue.id))!.completionReports[0]!,
+      id: "completion-report:issue-1:resolved-head",
+      idempotencyKey: "resolved-head",
+      runId: "worker-run-2",
+      acceptedAt: "2026-01-01T00:10:00.000Z",
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "head-sha-2",
+        branch: "symphony/TEST-1",
+      },
+    };
+    const resolvedApproval: IssueReviewVerdictRecord = {
+      id: "review-verdict:issue-1:resolved-head-pass",
+      idempotencyKey: "resolved-head-pass",
+      runId: "review-run-2",
+      issueId: currentIssue.id,
+      issueIdentifier: currentIssue.identifier,
+      verdict: "pass",
+      acceptanceResults: [{ text: "Resolved conflict head works", satisfied: true, evidence: "reviewed" }],
+      findings: [],
+      gateFindings: [],
+      discoveryFindings: [],
+      evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-2"],
+      reviewer: "reviewer-2",
+      submittedAt: "2026-01-01T00:11:00.000Z",
+      writebackOperationKeys: [],
+    };
+    const seeded = await lifecycleStore.get(currentIssue.id);
+    await lifecycleStore.updateIssue(currentIssue, {
+      phase: "passed",
+      lastCompletionReportId: resolvedReport.id,
+      lastReviewVerdictId: resolvedApproval.id,
+      summaryPointers: { prHeadSha: "head-sha-2" },
+      completionReports: [...seeded!.completionReports, resolvedReport],
+      reviewVerdicts: [...seeded!.reviewVerdicts, resolvedApproval],
+      reviewFeedback: [
+        ...seeded!.reviewFeedback,
+        {
+          id: "review-feedback:issue-1:review-run-2:approve",
+          idempotencyKey: "approve-resolved-head",
+          requestHash: "hash-resolved-head",
+          runId: "review-run-2",
+          issueId: currentIssue.id,
+          issueIdentifier: currentIssue.identifier,
+          kind: "review",
+          event: "APPROVE",
+          body: "Approved resolved head.",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "head-sha-2",
+            branch: "symphony/TEST-1",
+          },
+          reviewer: "reviewer-2",
+          reviewUrl: "https://github.com/acme/symphony/pull/42#pullrequestreview-2",
+          commentUrls: [],
+          submittedAt: "2026-01-01T00:10:30.000Z",
+        },
+      ],
+      mergeConflict: {
+        ...mergeConflictRecord({ resolutionStatus: "resolved", resolvedHeadSha: "head-sha-2" }),
+        servicePreparation: {
+          strategy: "squash_rebase",
+          status: "finalized",
+          originalHeadSha: "head-sha-1",
+          observedPrBaseHeadSha: "base-sha-1",
+          liveBaseHeadSha: "base-sha-1",
+          preparedBaseHeadSha: "base-sha-1",
+          mergeBaseSha: "head-sha-1",
+          squashCommitSha: "squash-sha-1",
+          conflictedFiles: ["tests/orchestrator.test.ts"],
+          preparedAt: "2026-01-01T00:02:00.000Z",
+          finalizedAt: "2026-01-01T00:09:00.000Z",
+          finalizedHeadSha: "head-sha-2",
+        },
+      },
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const client = new FakeMergeClient({
+      headSha: "head-sha-2",
+      checkResults: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" }],
+    });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+
+    expect(result.status).toBe("repair_dispatched");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["Ready to Merge"],
+        toState: "In Progress",
+        reason: "Symphony merge gate required CI repair",
+      },
+    ]);
+    expect(client.mergeInput).toBeNull();
+    await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
+      phase: "implementation",
+      mergeGate: {
+        status: "repair_dispatched",
+        headSha: "head-sha-2",
+        blockerFingerprint: "head-sha-2:test:failure",
+      },
+    });
+  });
+
+  it("ignores stale resolved conflict metadata after a newer completion report advances the PR head", async () => {
+    const config = mergeConfig({
+      requiredChecks: ["test"],
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await runStore.startRun({
+      runId: "worker-run-3",
+      role: "worker",
+      issueId: currentIssue.id,
+      issueIdentifier: currentIssue.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "fresh head repair",
+      workspaceKey: currentIssue.identifier,
+      workspacePath: path.join(root, currentIssue.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await runStore.recordPullRequestEvent({
+      runId: "worker-run-3",
+      action: "updated",
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "head-sha-3",
+      prBranch: "symphony/TEST-1",
+    });
+    const seeded = await lifecycleStore.get(currentIssue.id);
+    const freshReport = {
+      ...seeded!.completionReports[0]!,
+      id: "completion-report:issue-1:fresh-head",
+      idempotencyKey: "fresh-head",
+      runId: "worker-run-3",
+      acceptedAt: "2026-01-01T00:20:00.000Z",
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "head-sha-3",
+        branch: "symphony/TEST-1",
+      },
+    };
+    const freshApproval: IssueReviewVerdictRecord = {
+      id: "review-verdict:issue-1:fresh-head-pass",
+      idempotencyKey: "fresh-head-pass",
+      runId: "review-run-3",
+      issueId: currentIssue.id,
+      issueIdentifier: currentIssue.identifier,
+      verdict: "pass",
+      acceptanceResults: [{ text: "Fresh head is approved", satisfied: true, evidence: "reviewed" }],
+      findings: [],
+      gateFindings: [],
+      discoveryFindings: [],
+      evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-3"],
+      reviewer: "reviewer-3",
+      submittedAt: "2026-01-01T00:21:00.000Z",
+      writebackOperationKeys: [],
+    };
+    await lifecycleStore.updateIssue(currentIssue, {
+      phase: "passed",
+      reviewRound: 2,
+      lastCompletionReportId: freshReport.id,
+      lastReviewVerdictId: freshApproval.id,
+      summaryPointers: { prHeadSha: "head-sha-3" },
+      completionReports: [...seeded!.completionReports, freshReport],
+      reviewVerdicts: [...seeded!.reviewVerdicts, freshApproval],
+      reviewFeedback: [
+        ...seeded!.reviewFeedback,
+        {
+          id: "review-feedback:issue-1:review-run-3:approve",
+          idempotencyKey: "approve-fresh-head",
+          requestHash: "hash-fresh-head",
+          runId: "review-run-3",
+          issueId: currentIssue.id,
+          issueIdentifier: currentIssue.identifier,
+          kind: "review",
+          event: "APPROVE",
+          body: "Approved fresh head.",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "head-sha-3",
+            branch: "symphony/TEST-1",
+          },
+          reviewer: "reviewer-3",
+          reviewUrl: "https://github.com/acme/symphony/pull/42#pullrequestreview-3",
+          commentUrls: [],
+          submittedAt: "2026-01-01T00:20:30.000Z",
+        },
+      ],
+      mergeGate: mergeGateState({ status: "repair_dispatched", headSha: "head-sha-2", reviewRound: 2 }),
+      mergeConflict: {
+        ...mergeConflictRecord({ resolutionStatus: "resolved", resolvedHeadSha: "head-sha-2" }),
+        servicePreparation: {
+          strategy: "squash_rebase",
+          status: "finalized",
+          originalHeadSha: "head-sha-1",
+          observedPrBaseHeadSha: "base-sha-1",
+          liveBaseHeadSha: "base-sha-1",
+          preparedBaseHeadSha: "base-sha-1",
+          mergeBaseSha: "head-sha-1",
+          squashCommitSha: "squash-sha-1",
+          conflictedFiles: ["tests/orchestrator.test.ts"],
+          preparedAt: "2026-01-01T00:02:00.000Z",
+          finalizedAt: "2026-01-01T00:09:00.000Z",
+          finalizedHeadSha: "head-sha-2",
+        },
+      },
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const client = new FakeMergeClient({
+      headSha: "head-sha-3",
+      checkResults: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" }],
+    });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+
+    expect(result.status).toBe("blocked");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["Ready to Merge"],
+        toState: "Blocked",
+        reason: "Symphony merge gate repair ceiling reached",
+      },
+    ]);
+    expect(client.mergeInput).toBeNull();
+    await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "max merge gate failures reached (3/3)",
+      mergeGate: {
+        status: "blocked",
+        headSha: "head-sha-3",
+        blockerFingerprint: "head-sha-3:test:failure",
+      },
+      summaryPointers: {
+        ciStatus: "failure",
+        prHeadSha: "head-sha-3",
+      },
+    });
+  });
+
   it("service-prepares a fresh conflict instead of reopening legacy conflict metadata when a resolved conflict head is still dirty", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",
@@ -1591,6 +1900,117 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.reviewVerdicts.find((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")?.writebackOperationKeys).toEqual([
       "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:blocked:head-sha-1_test_failure:r3",
       "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:blocked:head-sha-1_test_failure:r3:Blocked",
+    ]);
+  });
+
+  it("carries merge-gate repair rounds across same-PR superseded heads", async () => {
+    const config = mergeConfig({ requiredChecks: ["test"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue, { reviewRound: 2 });
+    await runStore.startRun({
+      runId: "worker-run-2",
+      role: "worker",
+      issueId: currentIssue.id,
+      issueIdentifier: currentIssue.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "repair",
+      workspaceKey: currentIssue.identifier,
+      workspacePath: path.join(root, currentIssue.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: "/repo",
+      baseRef: "main",
+    });
+    await runStore.recordPullRequestEvent({
+      runId: "worker-run-2",
+      action: "updated",
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "head-sha-2",
+      prBranch: "symphony/TEST-1",
+    });
+    const existing = await lifecycleStore.get(currentIssue.id);
+    const previousReport = existing?.completionReports[0];
+    if (!previousReport) throw new Error("expected seeded completion report");
+    const report = {
+      ...previousReport,
+      id: "completion-report:issue-1:report-2",
+      idempotencyKey: "report-2",
+      runId: "worker-run-2",
+      changedFiles: [],
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "head-sha-2",
+        branch: "symphony/TEST-1",
+      },
+      acceptedAt: "2026-01-01T00:00:03.000Z",
+    };
+    const verdict = postRepairPassVerdict(currentIssue, "2026-01-01T00:00:04.000Z");
+    const feedback = {
+      ...postRepairApprovalFeedback(currentIssue, "2026-01-01T00:00:04.000Z"),
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "head-sha-2",
+        branch: "symphony/TEST-1",
+      },
+    };
+    await lifecycleStore.updateIssue(currentIssue, {
+      phase: "passed",
+      blockedReason: null,
+      lastCompletionReportId: report.id,
+      lastReviewVerdictId: verdict.id,
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "head-sha-2",
+        prBranch: "symphony/TEST-1",
+      },
+      completionReports: [...(existing?.completionReports ?? []), report],
+      reviewVerdicts: [...(existing?.reviewVerdicts ?? []), verdict],
+      reviewFeedback: [...(existing?.reviewFeedback ?? []), feedback],
+      mergeGate: mergeGateState({
+        status: "superseded",
+        headSha: "head-sha-1",
+        reviewRound: 2,
+        supersededByHeadSha: "head-sha-2",
+        repairRunId: null,
+        repairReportId: null,
+      }),
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, new StructuredLogger(() => undefined), 60_000),
+      client: new FakeMergeClient({
+        headSha: "head-sha-2",
+        checkResults: [{ name: "test", status: "failure", conclusion: "failure", url: "https://ci.test/test" }],
+      }),
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("blocked");
+    expect(lifecycle?.mergeGate).toMatchObject({
+      status: "blocked",
+      headSha: "head-sha-2",
+      reviewRound: 3,
+    });
+    expect(lifecycle?.blockedReason).toContain("3/3");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["Ready to Merge"],
+        toState: "Blocked",
+        reason: "Symphony merge gate repair ceiling reached",
+      },
     ]);
   });
 
@@ -2562,8 +2982,8 @@ describe("MergePolicyService", () => {
     };
     const postRepairVerdict = postRepairPassVerdict(currentIssue, "2099-01-01T00:11:00.000Z");
     await lifecycleStore.updateIssue(currentIssue, {
-      phase: "passed",
-      blockedReason: null,
+      phase: "blocked",
+      blockedReason: "max merge gate failures reached (3/3)",
       lastCompletionReportId: repairReport.id,
       lastReviewVerdictId: postRepairVerdict.id,
       completionReports: [...afterBlocked!.completionReports, repairReport],

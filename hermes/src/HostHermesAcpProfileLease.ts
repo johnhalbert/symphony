@@ -1,5 +1,15 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
+import {
+  buildHermesAgentCommandPolicyDecisionJournalPath,
+  buildHermesAgentCommandPolicyHookConfig,
+  verifyHermesAgentCommandPolicyHookInstallation,
+  writeHermesShellHookConfig,
+  type BuildHermesAgentCommandPolicyHookOptions,
+  type HermesAgentCommandPolicyHookVerifier,
+  type VerifyHermesAgentCommandPolicyHookInstallationOptions,
+} from "./HermesMcpConfig.js";
 
 export type HostHermesAcpProfileRetention = "always" | "failed" | "never";
 export type HostHermesAcpTerminalStatus = "succeeded" | "failed" | "cancelled" | null;
@@ -87,6 +97,10 @@ export interface HostHermesAcpProfileLeaseOptions {
   processHandle?: HostHermesAcpLeaseProcessHandle | null;
   acpSessionId?: string | null;
   runner?: HostHermesAcpCommandRunner;
+  commandPolicyHookOptions?: Omit<BuildHermesAgentCommandPolicyHookOptions, "decisionJournalPath"> | null;
+  commandPolicyHookVerifier?: HermesAgentCommandPolicyHookVerifier;
+  upstreamRoot?: string | null;
+  python?: string | null;
   onDisposed?: (
     lease: HostHermesAcpManagedProfileLease,
     result: HostHermesAcpProfileLeaseDisposeResult,
@@ -104,6 +118,8 @@ export interface HostHermesAcpProcessCommand {
 export interface HostHermesAcpProfileLease {
   profileName: string;
   sourceProfile: string;
+  profileDir?: string | null;
+  commandPolicyDecisionJournalPath?: string | null;
   acpCommand: HostHermesAcpProcessCommand;
   dispose(terminalStatus: HostHermesAcpTerminalStatus): Promise<HostHermesAcpProfileLeaseDisposeResult>;
 }
@@ -174,6 +190,18 @@ export async function createHostHermesAcpProfileLease(
     env,
     timeoutMs,
   });
+  const commandPolicyProfile = await installHostHermesAcpCommandPolicyHookIfRequested({
+    runner,
+    binaryPath,
+    profileName,
+    cwd,
+    env,
+    timeoutMs,
+    hookOptions: options.commandPolicyHookOptions ?? null,
+    hookVerifier: options.commandPolicyHookVerifier,
+    upstreamRoot: options.upstreamRoot,
+    python: options.python,
+  });
 
   const acpCommand = buildHostHermesAcpLaunchCommand({ binaryPath, profileName, cwd, env });
   const reusable = options.reusable ?? false;
@@ -241,6 +269,8 @@ export async function createHostHermesAcpProfileLease(
   lease = {
     profileName,
     sourceProfile,
+    profileDir: commandPolicyProfile.profileDir,
+    commandPolicyDecisionJournalPath: commandPolicyProfile.decisionJournalPath,
     reusable,
     acpCommand,
     get processHandle() {
@@ -429,6 +459,10 @@ export function buildHostHermesAcpProfileCheckArgs(profileName: string): readonl
   return ["-p", profileName, "acp", "--check"];
 }
 
+export function buildHostHermesAcpProfileInfoArgs(profileName: string): readonly string[] {
+  return ["-p", profileName, "profile"];
+}
+
 export function buildHostHermesAcpDeleteProfileArgs(profileName: string): readonly string[] {
   return ["profile", "delete", profileName, "--yes"];
 }
@@ -527,6 +561,13 @@ export function parseHostHermesAcpActiveProfile(output: string): string | null {
   return normalizeOptionalString(match?.[1]) ?? null;
 }
 
+export function parseHostHermesAcpProfileHome(output: string): string | null {
+  const sanitized = stripAnsi(output).replace(/\r/g, "");
+  const match = sanitized.match(/^\s*Home:\s*(.+?)\s*$/im);
+  const rawHome = normalizeOptionalString(match?.[1]);
+  return rawHome ? normalizeHostHermesAcpProfileHome(rawHome) : null;
+}
+
 export function shouldDeleteHostHermesAcpProfile(input: {
   keepProfiles: HostHermesAcpProfileRetention;
   terminalStatus: HostHermesAcpTerminalStatus;
@@ -574,6 +615,67 @@ async function acquireHostHermesAcpLeaseProfile(
   if (result.exitCode === 0) return "created";
   if (typeof result.exitCode === "number" && isExpectedExistingHostHermesAcpProfile(result, profileName)) return "reused";
   throw hostHermesAcpCommandResultError(result, file, args);
+}
+
+async function installHostHermesAcpCommandPolicyHookIfRequested(input: {
+  runner: HostHermesAcpCommandRunner;
+  binaryPath: string;
+  profileName: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  hookOptions: Omit<BuildHermesAgentCommandPolicyHookOptions, "decisionJournalPath"> | null;
+  hookVerifier: HermesAgentCommandPolicyHookVerifier | undefined;
+  upstreamRoot: string | null | undefined;
+  python: string | null | undefined;
+}): Promise<{ profileDir: string | null; decisionJournalPath: string | null }> {
+  if (!input.hookOptions) return { profileDir: null, decisionJournalPath: null };
+
+  const upstreamRoot = normalizeOptionalString(input.upstreamRoot);
+  if (!upstreamRoot) {
+    throw new Error("Host Hermes ACP command-policy hook installation requires hermes.upstream_root for registration validation.");
+  }
+
+  const profileDir = await resolveHostHermesAcpProfileDir(input.runner, input.binaryPath, input.profileName, {
+    cwd: input.cwd,
+    env: input.env,
+    timeoutMs: input.timeoutMs,
+  });
+  const decisionJournalPath = buildHermesAgentCommandPolicyDecisionJournalPath(profileDir);
+  const hookOptions: BuildHermesAgentCommandPolicyHookOptions = {
+    ...input.hookOptions,
+    decisionJournalPath,
+  };
+  await writeHermesShellHookConfig({
+    profileDir,
+    hooks: buildHermesAgentCommandPolicyHookConfig(hookOptions),
+    hooksAutoAccept: true,
+  });
+
+  const verifierOptions: VerifyHermesAgentCommandPolicyHookInstallationOptions = {
+    ...hookOptions,
+    profileDir,
+    upstreamRoot,
+    smokeCwd: input.cwd,
+  };
+  if (input.python !== undefined) verifierOptions.python = input.python;
+  await (input.hookVerifier ?? verifyHermesAgentCommandPolicyHookInstallation)(verifierOptions);
+  return { profileDir, decisionJournalPath };
+}
+
+async function resolveHostHermesAcpProfileDir(
+  runner: HostHermesAcpCommandRunner,
+  file: string,
+  profileName: string,
+  options: HostHermesAcpCommandOptions,
+): Promise<string> {
+  const args = buildHostHermesAcpProfileInfoArgs(profileName);
+  const result = await runRequiredHostHermesAcpCommand(runner, file, args, options);
+  const profileDir = parseHostHermesAcpProfileHome(`${result.stdout}\n${result.stderr}`);
+  if (!profileDir) {
+    throw new Error(`Host Hermes ACP profile ${profileName} did not report a profile Home from \`${file} ${args.join(" ")}\`.`);
+  }
+  return profileDir;
 }
 
 async function runRequiredHostHermesAcpCommand(
@@ -724,6 +826,17 @@ function requireNonEmpty(value: string, label: string): string {
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
+function normalizeHostHermesAcpProfileHome(value: string): string {
+  const normalized = value.trim().replace(/\\/g, "/");
+  if (process.platform === "win32") {
+    const msys = normalized.match(/^\/([a-zA-Z])\/(.+)$/);
+    if (msys) return path.resolve(`${msys[1]?.toUpperCase()}:/${msys[2]}`);
+    const wsl = normalized.match(/^\/mnt\/([a-zA-Z])\/(.+)$/);
+    if (wsl) return path.resolve(`${wsl[1]?.toUpperCase()}:/${wsl[2]}`);
+  }
+  return path.resolve(normalized);
 }
 
 function commandOutputToString(value: string | Buffer): string {

@@ -219,8 +219,13 @@ function reviewVerdictInputSchema(): Record<string, unknown> {
 
 function reviewVerdictInputFromMcp(input: unknown, context: ReviewVerdictActiveContext): unknown {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return input;
+  const record = input as Record<string, unknown>;
+  const idempotencyKey = typeof record.idempotencyKey === "string"
+    ? `${context.activeRunId}:${record.idempotencyKey.trim()}`
+    : record.idempotencyKey;
   return {
     ...input,
+    idempotencyKey,
     runId: context.activeRunId,
     issueId: context.issue.id,
   };

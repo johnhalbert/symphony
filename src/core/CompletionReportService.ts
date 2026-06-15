@@ -118,6 +118,7 @@ export interface CompletionReportPullRequestPublicationInput {
   title: string;
   body: string;
   evidenceCursor: string;
+  forceEmptyCommit?: boolean;
 }
 
 export interface CompletionReportPullRequestPublication {
@@ -785,6 +786,7 @@ export class CompletionReportService {
       title: `${context.issue.identifier}: ${context.issue.title}`,
       body: formatPullRequestBody(report, context),
       evidenceCursor: report.idempotencyKey,
+      forceEmptyCommit: shouldForceFreshHeadForNoChangeMergeGateRepair(report, existingLifecycle),
     };
   }
 
@@ -1184,6 +1186,9 @@ function assertPendingPublicationReplayMatches(input: {
   }
   if (input.incomingPublicationInput.title !== input.storedPublicationInput.title) mismatchedFields.push("title");
   if (input.incomingPublicationInput.body !== input.storedPublicationInput.body) mismatchedFields.push("body");
+  if ((input.incomingPublicationInput.forceEmptyCommit ?? false) !== (input.storedPublicationInput.forceEmptyCommit ?? false)) {
+    mismatchedFields.push("forceEmptyCommit");
+  }
   if (mismatchedFields.length > 0) {
     throw new SymphonyError("conflict", "Completion report replay differs from persisted pending publication handoff", {
       fields: mismatchedFields,
@@ -1252,6 +1257,19 @@ function formatPullRequestBody(report: CompletionReportInput, context: Completio
     "Changed files:",
     ...(report.changedFiles.length === 0 ? ["- n/a"] : report.changedFiles.map((item) => `- ${item}`)),
   ].join("\n");
+}
+
+function shouldForceFreshHeadForNoChangeMergeGateRepair(
+  report: CompletionReportInput,
+  lifecycle: ExistingIssueLifecycle,
+): boolean {
+  if (report.changedFiles.length > 0) return false;
+  const gate = lifecycle?.mergeGate ?? null;
+  if (gate?.status !== "repair_dispatched" && gate?.status !== "blocked") return false;
+  const reportPullRequest = report.pullRequest;
+  const reportNumber = reportPullRequest?.number ?? lifecycle?.summaryPointers.prNumber ?? null;
+  const reportHeadSha = reportPullRequest?.headSha ?? lifecycle?.summaryPointers.prHeadSha ?? null;
+  return reportNumber !== null && reportHeadSha !== null && gate.pullRequest.number === reportNumber && gate.headSha === reportHeadSha;
 }
 
 function sameState(left: string, right: string): boolean {

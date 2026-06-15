@@ -197,6 +197,34 @@ describe("Hermes MCP config", () => {
     await expect(verifyHermesAgentCommandPolicyHookCommandRunnable({ ...options, commandTimeoutMs: 2_000 })).resolves.toBeUndefined();
   });
 
+  it("validates direct Hermes terminal and execute_code entrypoints enforce the registered command-policy hook", async () => {
+    const profileDir = path.join(root, "profile");
+    const cliPath = await writeFakeHookCli(path.join(root, "fake-hook-cli.js"));
+    const options = {
+      profileDir,
+      cliPath,
+      role: "worker",
+      phase: "implementation",
+      issueId: "issue-1",
+      decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(profileDir),
+    };
+    await writeHermesMcpConfig({
+      profileDir,
+      servers: {},
+      hooks: buildHermesAgentCommandPolicyHookConfig(options),
+      hooksAutoAccept: true,
+    });
+
+    await expect(
+      verifyHermesAgentCommandPolicyHookRegistration({
+        ...options,
+        upstreamRoot: path.resolve("hermes", "upstream-src"),
+        python: process.env.PYTHON ?? "python",
+        registrationTimeoutMs: 10_000,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
   it.each([
     {
       name: "missing hooks",

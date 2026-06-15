@@ -748,6 +748,40 @@ describe("HermesAcpHarness", () => {
     expect(profileEvent?.runActivity?.eventId).toBe(`${sessionStarted?.runId}:activity:2`);
   });
 
+  it.each([
+    { role: "worker", phase: "implementation", installsHook: true },
+    { role: "triage", phase: "issue_triage", installsHook: true },
+    { role: "worker", phase: "issue_breakdown", installsHook: false },
+  ] as const)("passes ACP command-policy hook options for $role/$phase leases", async ({ role, phase, installsHook }) => {
+    const verifier = vi.fn(async () => undefined);
+    const { ctx, harness, leaseFactory, root } = await fixture({ commandPolicyHookVerifier: verifier });
+    const runCtx: AgentRunContext = { ...ctx, role, runPhase: phase };
+
+    await collectEvents(harness.run(runCtx, "Do work"));
+
+    const options = leaseFactory.mock.calls[0]?.[0];
+    expect(options).toBeDefined();
+    if (installsHook) {
+      expect(options).toEqual(
+        expect.objectContaining({
+          commandPolicyHookVerifier: verifier,
+          upstreamRoot: path.join(root, "hermes-src"),
+          python: null,
+          commandPolicyHookOptions: {
+            cliPath: path.join(root, "src", "cli.ts"),
+            role,
+            phase,
+            issueId: "issue-1",
+          },
+        }),
+      );
+    } else {
+      expect(options?.commandPolicyHookOptions).toBeUndefined();
+      expect(options?.commandPolicyHookVerifier).toBeUndefined();
+      expect(options?.upstreamRoot).toBeUndefined();
+    }
+  });
+
   it("creates fresh leases for fresh_per_run worker turns and only disposes each lease once", async () => {
     const { ctx, harness, leaseFactory, leases } = await fixture({ lifecycle: "fresh_per_run" });
 
@@ -2366,6 +2400,7 @@ async function fixture(
     sourceProfile?: string | null;
     permissionResolver?: HermesAcpPermissionResolver;
     permissionRequestTimeoutMs?: number;
+    commandPolicyHookVerifier?: HermesAcpHarnessOptions["commandPolicyHookVerifier"];
   } = {},
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "symphony-hermes-acp-"));
@@ -2409,6 +2444,7 @@ async function fixture(
     acpClientFactory,
     ...(input.permissionResolver === undefined ? {} : { permissionResolver: input.permissionResolver }),
     ...(input.permissionRequestTimeoutMs === undefined ? {} : { permissionRequestTimeoutMs: input.permissionRequestTimeoutMs }),
+    ...(input.commandPolicyHookVerifier === undefined ? {} : { commandPolicyHookVerifier: input.commandPolicyHookVerifier }),
   } satisfies HermesAcpHarnessOptions;
   const harness = new HermesAcpHarness(harnessOptions);
   return { root, config, ctx, client, harness, leaseFactory, acpClientFactory, leases };

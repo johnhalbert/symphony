@@ -60,6 +60,7 @@ import {
   providerLimitSignalFromHermesPayload,
   type HermesLimitMappingDefaults,
 } from "./HermesHarness.js";
+import type { BuildHermesAgentCommandPolicyHookOptions, HermesAgentCommandPolicyHookVerifier } from "./HermesMcpConfig.js";
 
 export interface AcpEnvVariable {
   name: string;
@@ -93,6 +94,7 @@ export interface HermesAcpHarnessOptions {
   acpClientFactory?: (command: HostHermesAcpProcessCommand, options: HermesAcpRuntimeClientOptions) => HermesAcpRuntimeClient;
   permissionResolver?: HermesAcpPermissionResolver;
   permissionRequestTimeoutMs?: number;
+  commandPolicyHookVerifier?: HermesAgentCommandPolicyHookVerifier;
 }
 
 export interface HermesAcpRuntimeClientOptions {
@@ -798,7 +800,7 @@ export class HermesAcpHarness implements AgentHarness {
 
     if (reusable) this.retiredReusableLeaseReasons.delete(key);
     const phase = currentRunPhase(ctx);
-    const profile = await this.profileLeaseFactory({
+    const profileLeaseOptions: HostHermesAcpProfileLeaseOptions = {
       binaryPath,
       cwd: ctx.workspace.path,
       timeoutMs: ctx.config.hermesAcp.startupTimeoutMs,
@@ -815,7 +817,17 @@ export class HermesAcpHarness implements AgentHarness {
         runId: reusable ? null : runId,
         prefix: configuredHermesAcpProfilePrefix(ctx),
       },
-    });
+    };
+    const commandPolicyHookOptions = agentCommandPolicyHookOptionsForAcpRun(ctx, phase, this.cliPath());
+    if (commandPolicyHookOptions !== undefined) {
+      profileLeaseOptions.commandPolicyHookOptions = commandPolicyHookOptions;
+      profileLeaseOptions.upstreamRoot = ctx.config.hermes.upstreamRoot;
+      if (ctx.config.hermes.python !== undefined) profileLeaseOptions.python = ctx.config.hermes.python;
+      if (this.options.commandPolicyHookVerifier !== undefined) {
+        profileLeaseOptions.commandPolicyHookVerifier = this.options.commandPolicyHookVerifier;
+      }
+    }
+    const profile = await this.profileLeaseFactory(profileLeaseOptions);
     const client = this.acpClientFactory(profile.acpCommand, { requestTimeoutMs: ctx.config.hermesAcp.requestTimeoutMs });
     const lease: HermesAcpLease = {
       key,
@@ -1439,6 +1451,27 @@ function formatHermesAcpLeaseReuseReason(reason: HermesAcpLeaseReuseDecisionReas
 
 function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
   return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : ctx.role === "triage" ? "issue_triage" : ctx.role === "planner" ? "issue_breakdown" : "implementation");
+}
+
+function agentCommandPolicyHookOptionsForAcpRun(
+  ctx: AgentRunContext,
+  phase: AgentRunPhase,
+  cliPath: string,
+): Omit<BuildHermesAgentCommandPolicyHookOptions, "decisionJournalPath"> | undefined {
+  if (!shouldInstallAgentCommandPolicyHook(ctx, phase)) return undefined;
+  return {
+    cliPath,
+    role: ctx.role,
+    phase,
+    issueId: ctx.issue.id || ctx.issue.identifier,
+  };
+}
+
+function shouldInstallAgentCommandPolicyHook(ctx: AgentRunContext, phase: AgentRunPhase): boolean {
+  if (ctx.role === "reviewer") return true;
+  if (ctx.role === "triage") return true;
+  if (ctx.role === "planner") return true;
+  return ctx.role === "worker" && phase !== "issue_breakdown";
 }
 
 function configuredHostHermesBinaryPath(ctx: AgentRunContext): string | null {

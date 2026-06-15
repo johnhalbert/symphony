@@ -134,9 +134,22 @@ export class ReviewVerdictService {
     this.validateCaller(verdict, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
-    const existing = existingLifecycle?.reviewVerdicts.find((item) => item.idempotencyKey === verdict.idempotencyKey);
-    if (existing) {
-      return { accepted: true, replayed: true, verdict: existing, writebackOperations: [] };
+    const existingScoped = existingLifecycle?.reviewVerdicts.find(
+      (item) => item.runId === context.activeRunId && item.idempotencyKey === verdict.idempotencyKey,
+    );
+    if (existingScoped) {
+      return { accepted: true, replayed: true, verdict: existingScoped, writebackOperations: [] };
+    }
+    const existingCrossRun = existingLifecycle?.reviewVerdicts.find(
+      (item) => item.idempotencyKey === verdict.idempotencyKey && item.runId !== context.activeRunId,
+    );
+    if (existingCrossRun) {
+      throw new SymphonyError("conflict", "Review verdict idempotency key was already used by another run", {
+        idempotencyKey: verdict.idempotencyKey,
+        activeRunId: context.activeRunId,
+        existingRunId: existingCrossRun.runId,
+        existingVerdictId: existingCrossRun.id,
+      });
     }
 
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);

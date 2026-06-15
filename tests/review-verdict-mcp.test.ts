@@ -66,15 +66,16 @@ describe("review verdict MCP handoff", () => {
     expect(result).toMatchObject({
       accepted: true,
       replayed: false,
-      verdictId: "review-verdict:issue-1:review-verdict-1",
+      verdictId: "review-verdict:issue-1:review-run-1:review-verdict-1",
       verdict: "fail",
     });
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
       phase: "implementation",
       reviewRound: 1,
-      lastReviewVerdictId: "review-verdict:issue-1:review-verdict-1",
+      lastReviewVerdictId: "review-verdict:issue-1:review-run-1:review-verdict-1",
       reviewVerdicts: [
         {
+          idempotencyKey: "review-run-1:review-verdict-1",
           runId: "review-run-1",
           verdict: "fail",
           reviewer: "reviewer-agent:review-run-1",
@@ -135,14 +136,15 @@ describe("review verdict MCP handoff", () => {
     expect(result).toMatchObject({
       accepted: true,
       replayed: false,
-      verdictId: "review-verdict:issue-1:review-verdict-pass-1",
+      verdictId: "review-verdict:issue-1:review-run-2:review-verdict-pass-1",
       verdict: "pass",
     });
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
       phase: "passed",
-      lastReviewVerdictId: "review-verdict:issue-1:review-verdict-pass-1",
+      lastReviewVerdictId: "review-verdict:issue-1:review-run-2:review-verdict-pass-1",
       reviewVerdicts: [
         {
+          idempotencyKey: "review-run-2:review-verdict-pass-1",
           runId: "review-run-2",
           verdict: "pass",
           reviewer: "reviewer-agent:review-run-2",

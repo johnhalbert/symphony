@@ -37,6 +37,7 @@ const RESTRICTED_ROLES = new Set([
   "worker",
   "reviewer",
   "triage",
+  "planner",
   "post_mortem",
   "merge-conflict-repair-worker",
   "merge_conflict_repair_worker",

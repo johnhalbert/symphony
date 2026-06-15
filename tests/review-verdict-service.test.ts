@@ -325,6 +325,25 @@ describe("ReviewVerdictService", () => {
     expect(await outbox.list()).toHaveLength(2);
   });
 
+  it("rejects review verdict idempotency key reuse from another reviewer run", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+    });
+
+    await service.submitReviewVerdict(failVerdict(), context());
+
+    await expect(
+      service.submitReviewVerdict(
+        failVerdict({ runId: "review-run-2", findings: ["Changed finding from another run."] }),
+        context({ activeRunId: "review-run-2" }),
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: "Review verdict idempotency key was already used by another run",
+    });
+  });
+
   it("rejects verdict calls from the wrong role, run, or state", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {

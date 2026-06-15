@@ -438,6 +438,43 @@ describe("GitHubPullRequestClient", () => {
     }
   });
 
+  it("creates a service-owned empty commit when a reused pull request needs a fresh head", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-empty-commit-"));
+    try {
+      const workspace = await initPublishRepo(root, { remote: true });
+      const previousHead = (await git(["rev-parse", "HEAD"], workspace)).trim();
+      const calls: string[] = [];
+      const client = new GitHubPullRequestClient(config(), async (input, init) => {
+        const url = new URL(String(input));
+        calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
+        return jsonResponse([
+          {
+            html_url: "https://github.com/octo-org/symphony/pull/44",
+            number: 44,
+            head: { ref: "symphony/TEST-1", sha: previousHead, repo: { pushed_at: "2026-01-01T00:00:00Z" } },
+          },
+        ]);
+      });
+
+      const result = await client.publishPullRequest({
+        workspacePath: workspace,
+        branchName: "symphony/TEST-1",
+        baseBranch: "main",
+        title: "TEST-1: Re-run merge gate",
+        body: "body",
+        evidenceCursor: "idem-1",
+        forceEmptyCommit: true,
+      });
+
+      expect(result.action).toBe("reused");
+      expect(result.headSha).not.toBe(previousHead);
+      await expect(git(["log", "-1", "--format=%s"], workspace)).resolves.toBe("TEST-1: Re-run merge gate\n");
+      expect(calls).toEqual(["GET /repos/octo-org/symphony/pulls"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("commits, pushes, and creates a pull request when none exists", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-create-"));
     try {

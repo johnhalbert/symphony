@@ -157,7 +157,7 @@ describe("AgentCommandPolicy direct upstream GitHub denial", () => {
     }
   });
 
-  it.each(["worker", "reviewer"])("applies direct upstream denial to the %s role", (role) => {
+  it.each(["worker", "reviewer", "triage", "planner"])("applies direct upstream denial to the %s role", (role) => {
     const decision = evaluateAgentCommandPolicy(terminalInput("git push origin HEAD", role));
 
     expect(decision).toMatchObject({

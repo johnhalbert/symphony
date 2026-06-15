@@ -1038,14 +1038,36 @@ def execute_code(
     Returns:
         JSON string with execution results.
     """
+    if not code or not code.strip():
+        return tool_error("No code provided.")
+
+    from tools.pre_tool_policy import pre_tool_call_block_message
+
+    try:
+        effective_workdir = os.environ.get("TERMINAL_CWD", "").strip() or os.getcwd()
+    except OSError:
+        effective_workdir = ""
+    block_message = pre_tool_call_block_message(
+        "execute_code",
+        {
+            "code": code,
+            "workdir": effective_workdir,
+        },
+        task_id=task_id,
+    )
+    if block_message is not None:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": block_message,
+            "status": "blocked",
+        }, ensure_ascii=False)
+
     if not SANDBOX_AVAILABLE:
         return json.dumps({
             "error": "execute_code sandbox is unavailable in this environment. "
                      "Use normal tool calls (terminal, read_file, write_file, ...) instead."
         })
-
-    if not code or not code.strip():
-        return tool_error("No code provided.")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config
