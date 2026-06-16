@@ -39,8 +39,17 @@ jobs:
       - run: npm run typecheck --prefix web
       - run: npm test --prefix web
       - run: npm run build --prefix web
+      - uses: browser-actions/setup-chrome@v2
+        id: setup-chrome
+        with:
+          chrome-version: stable
+          install-dependencies: true
       - run: npm run smoke:browser --prefix web
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
       - run: npm run smoke:browser-production --prefix web
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
       - run: npm run extension:ci
       - run: npm run extension:typecheck
       - run: npm run extension:test
