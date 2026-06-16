@@ -32,6 +32,13 @@ Every future runtime-child preflight entry must record the following minimum fie
 - `findings` — concrete findings if any, or an explicit `none` / zero-findings statement.
 - `redactionStatement` — the redaction statement: `none` or the class of secret/private content replaced with `[REDACTED]`.
 
+### Approved execution and capture path for ENG-2479 focused preflight
+
+- Restricted `worker` or `reviewer` runs may inspect local Git state or planning docs, but they must not treat direct `npm test`, `npx vitest`, package-script wrappers, shell wrappers, interpreter wrappers, or compound commands as the focused preflight evidence path. `AgentCommandPolicy` denies those command families for restricted roles, so repeating them only recreates the same blocker instead of producing new focused evidence.
+- The approved executor for the focused ENG-2479 preflight is a Symphony service-owned execution path that runs outside the restricted worker/reviewer boundary: either an explicitly approved unrestricted `service` role or an equivalent Symphony service-owned GitHub workflow action that can execute the focused validation command on behalf of the child issue.
+- The focused result must be captured in the accepted worker completion report for the owning child issue. Record the execution outcome in `validationEvidence` and the requirement-level proof in `acceptanceChecklist`, then rely on the persisted `IssueLifecycleRecord.completionReports[]`, `lastCompletionReportId`, and `summaryPointers.lastEvidenceCursor` entries as the lifecycle-bound evidence handle.
+- Later workers and reviewers should reference the lifecycle surfaces that expose that accepted record — `lastCompletionReport` and `lastEvidenceCursor` — instead of retrying blocked package-command execution locally. If the service-owned preflight has not run yet, record a single `blocked` preflight entry and stop rather than re-entering the denied command loop.
+
 ### Focused runtime child preflight matrix
 
 | Planned runtime child contract family | Dependency gate before execution or focused evidence capture proceeds | Per-family coverage signal to record | Later child that owns execution/evidence work |
