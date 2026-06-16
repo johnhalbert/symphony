@@ -108,6 +108,14 @@ No unmapped surfaces remain in the active test-proof comparison: every historica
 | `tmp-debug-docs-reviewer-redispatch-state/` or other ad-hoc debug captures | Review-only scratch artifacts are never valid test-proof publication surfaces. | `specs/009-eng-392-routing-reload-split/quickstart.md` (contract/publication mismatch sources call out `tmp-debug-docs-reviewer-redispatch-state/` as non-fixture debug state); this gate's `Debug artifact` fail rule |
 | `hermes/upstream-src/**` | Vendored source stays globally excluded and cannot be pulled into a focused proof publication candidate. | This gate's authorized-surface exclusions and vendored-source fail rule |
 
+### Debug artifact search disposition (T042 / `REQ-T042`)
+
+| Candidate path or artifact class | Why it was searched | Search evidence | Recorded disposition |
+| --- | --- | --- | --- |
+| `tmp-debug-docs-reviewer-redispatch-state/` | Review `4480831534` and `specs/009-eng-392-routing-reload-split/quickstart.md` identify this path as orphaned non-fixture debug state from the original publication mismatch. | `git status --short --branch` from the ENG-2488 worktree reported a clean branch with no untracked artifact rows, and repo file searches for `*tmp-debug*`, `*reviewer-redispatch*`, and `*scratch*` found no matching path in the publication candidate. The only remaining mentions are documentation references in `specs/009-eng-392-routing-reload-split/quickstart.md` and this gate. | `absent` |
+
+This records the current disposition for the known orphaned debug artifact path before publication: it is absent from the candidate rather than removed in this change, converted into a fixture, or still blocked for later cleanup. If a future child diff reintroduces any ad-hoc debug capture path, the gate must classify it as `FAIL-debug` until the artifact is removed or explicitly converted into an authorized fixture.
+
 ## Scenario matrix and explicit pass/fail criteria
 
 | Scenario | Pass when... | Fail when... | Required repair |
