@@ -538,6 +538,67 @@ This packet uses the shared reviewer skeleton above to record whether branch-tip
 - findings:
   - `Worker retry redispatch after config reload already has branch-tip proof, while explicit reviewer redispatch-after-reload or restart proof remains mapped to REQ-392-RELOAD-PRESERVATION and REQ-392-TEST-PROOF.`
 
+## ENG-2478 T032 approval/writeback recovery evidence snapshot
+
+This packet records which publication-approval outcomes already have branch-tip recovery/writeback evidence after worker exit or orchestrator reload, and which stale/expired reload behaviors still need prerequisite child work instead of being implied by nearby terminal-path tests.
+
+### Approval recovery scenario matrix
+
+| Outcome | Evidence bucket | Branch-tip status | Primary proof | Child-work disposition |
+| --- | --- | --- | --- | --- |
+| approved | `base-behavior` | `recorded` | `src/core/CompletionReportService.ts:333-509`, `710-770`; `src/core/orchestrator/Orchestrator.ts:1494-1503`, `1563-1626`; `tests/completion-report-service.test.ts:414-535`; `tests/orchestrator.test.ts:4094-4219`, `5126-5223` | No new prerequisite identified beyond keeping writeback drains scoped to report keys and project context. |
+| rejected | `base-behavior` | `recorded` | `src/core/CompletionReportService.ts:385-417`, `420-509`, `882-953`; `src/core/approval/OperatorApprovalService.ts:338-368`, `394-407`; `tests/operator-approval-service.test.ts:407-432`; `tests/orchestrator.test.ts:5018-5124` | No new prerequisite identified; reject-policy handling and terminal writeback are already explicit. |
+| stale | `base-behavior` + `failing-before` | Direct terminalization is recorded; restart-time reevaluation of approvals that become stale while the service is down remains prerequisite child work. | `src/core/CompletionReportService.ts:420-509`, `710-720`, `882-953`; `src/core/approval/OperatorApprovalService.ts:99-110`, `338-355`, `394-442`; `tests/operator-approval-service.test.ts:434-464`; `tests/orchestrator.test.ts:5240-5288`, `5544-5609` | Keep restart-time stale reclassification as prerequisite child work until reload logic reevaluates persisted `pending` approvals that age out while no waiter is running. |
+| expired | `base-behavior` + `failing-before` | Pre-terminalized expiry recovery is recorded; time-elapsed expiry while the service is down remains prerequisite child work. | `src/core/CompletionReportService.ts:420-509`, `710-720`, `882-953`; `src/core/approval/OperatorApprovalService.ts:99-110`, `338-346`, `394-442`; `tests/operator-approval-service.test.ts:466-490`; `tests/orchestrator.test.ts:4221-4324`, `5544-5609` | Keep restart-time expiry reclassification as prerequisite child work until reload logic reevaluates persisted `pending` approvals against `expiresAt` after downtime. |
+
+### base-behavior
+- status: recorded
+- surface: `src/core/CompletionReportService.ts:236-320`, `333-509`, `710-770`, `882-953`; `src/core/approval/OperatorApprovalService.ts:99-110`, `338-368`, `394-442`; `src/core/writeback/WritebackOutbox.ts:172-240`, `285-350`, `381-409`, `507-542`, `825-834`; `src/core/orchestrator/Orchestrator.ts:1332-1370`, `1494-1503`, `1563-1626`, `4839-4857`; `tests/completion-report-service.test.ts:414-535`, `739-850`; `tests/operator-approval-service.test.ts:407-490`; `tests/orchestrator.test.ts:4094-4219`, `4221-4324`, `5018-5223`, `5240-5288`, `5544-5609`; `tests/writeback-outbox.test.ts:299-463`
+- proof: `approved` recovery replays pending-approval audit writebacks, branches `recoverPendingPublicationApproval` into `resumeApprovedPublication`, republishes the stored completion report, finalizes the report, and clears the blocked lifecycle; `tests/orchestrator.test.ts:4094-4219` and `5126-5223` prove both orchestrator-tick recovery and after-worker-exit resume publish the PR, emit the accepted completion-report comment, transition to review, and clear `pendingApprovalRequestId`. `rejected` recovery shares the terminal branch (`isTerminalApprovalStatus` -> `recordPublicationApprovalTerminal`) and `recordPublicationApprovalTerminalRun` applies `rejectPolicy`; `tests/operator-approval-service.test.ts:407-432` and `tests/orchestrator.test.ts:5018-5124` prove rejected approvals persist with `status: rejected`, emit `approval_resolved`, keep the completion report stored, set blocked reason `publication approval rejected`, and suppress accepted-writeback/PR publication. `stale` and `expired` terminal handling use the same terminal writeback path once the approval record is already terminalized; `tests/operator-approval-service.test.ts:434-490`, `tests/orchestrator.test.ts:4221-4324`, `5240-5288`, and `5544-5609` prove stale/expired records emit the non-completed approval comment, preserve the stored completion report, avoid PR publication, and leave lifecycle blocked at `publication approval stale|expired`. Writeback bucket scoping is already explicit: `tests/completion-report-service.test.ts:739-850` proves pending-approval setup drains only the report's idempotency keys in the active `projectContext`, while `tests/writeback-outbox.test.ts:299-463` proves legacy default-bucket siblings remain on the default identity and non-default replay drains only the scoped sibling after reload.
+- why_it_matters: Branch-tip source and focused tests already prove approved, rejected, stale, and expired approval outcomes share durable recovery/writeback paths without requiring T032 to invent new runtime behavior for outcomes that are already implemented and covered.
+- redactions: none
+
+### failing-before
+- status: recorded
+- surface: `src/core/CompletionReportService.ts:420-509`, `710-720`; `src/core/approval/OperatorApprovalService.ts:99-110`, `338-355`, `394-442`; `tests/orchestrator.test.ts:4221-4324`, `5544-5609`
+- proof: Existing focused tests prove stale/expired recovery only once the approval record is already terminal before reload or replay (`tests/orchestrator.test.ts:4221-4324`, `5544-5609`). The reload path itself only consults `currentPublicationApproval`, which reads `operatorApproval.get()` / `getByDedupe()` (`src/core/CompletionReportService.ts:710-720`) and branches to `recordPublicationApprovalTerminal` only if the stored status is already terminal (`src/core/CompletionReportService.ts:488-507`). `FileOperatorApprovalStore.get()` only repairs missing `projectContext` metadata and does not reevaluate `staleReason` or `expiresAt` (`src/core/approval/OperatorApprovalService.ts:99-110`), while stale/expired reclassification happens only in the live `resolve()` and `waitForResolution()` paths (`src/core/approval/OperatorApprovalService.ts:338-355`, `394-442`). That contradiction means a request that becomes stale or expired while the service is down can still reload as `pending` and re-enter the pending path instead of terminal writeback, so restart-time stale/expired reevaluation remains prerequisite child work.
+- why_it_matters: T032 must not overstate reload coverage for stale/expired outcomes; the evidence packet needs to preserve the remaining gap so later child work can add restart-time timeout/staleness reconciliation instead of assuming the nearby terminal-path tests already proved it.
+- redactions: none
+
+### passing-after
+- status: recorded
+- surface: `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2478-t032-approvalwriteback-recovery-evidence-snapshot`
+- proof: The `ENG-2478 T032 approval/writeback recovery evidence snapshot` section now records branch-tip base behavior for approved, rejected, stale, and expired publication-approval outcomes, cites the writeback bucket-scoping proofs used during reload, and explicitly carries the restart-time stale/expired reevaluation gap forward as prerequisite child work.
+- why_it_matters: `REQ-T032` is an evidence-capture task, so the relevant after-state is a reviewer-safe packet that distinguishes already-satisfied approval outcomes from the remaining stale/expired reload prerequisite instead of pretending runtime behavior changed here.
+- redactions: none
+
+### surface-comparison
+| Contract surface | Observed surface | Validation surface | Status | Notes |
+| --- | --- | --- | --- | --- |
+| `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | file inspection plus scoped diff for this file | `recorded` | T032 changes only the evidence artifact. |
+| `approval/writeback analysis` | `src/core/CompletionReportService.ts`; `src/core/approval/OperatorApprovalService.ts`; `src/core/writeback/WritebackOutbox.ts`; `src/core/orchestrator/Orchestrator.ts` | cited line ranges plus `tests/completion-report-service.test.ts:414-535`, `739-850`; `tests/operator-approval-service.test.ts:407-490`; `tests/orchestrator.test.ts:4094-4219`, `4221-4324`, `5018-5223`, `5240-5288`, `5544-5609`; `tests/writeback-outbox.test.ts:299-463` | `recorded` | Approved/rejected/stale/expired recovery and writeback bucket behavior were inspected without modifying runtime code. |
+| `live GitHub/Linear writeback` | no live publication or tracker writeback execution | focused source inspection plus local tests only | `intentionally_unverified` | Out of scope for `REQ-T032`; evidence is constrained to repo-local proof. |
+| `restart-time stale/expired reevaluation` | `src/core/CompletionReportService.ts`; `src/core/approval/OperatorApprovalService.ts` | contradiction proof in `### failing-before` | `recorded` | The remaining gap is preserved as prerequisite child work instead of being hidden behind adjacent terminal-path tests. |
+
+### hygiene (with intentionally unverified live boundary)
+- status: intentionally_unverified
+- surfacesChecked: [`specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`, `src/core/CompletionReportService.ts`, `src/core/approval/OperatorApprovalService.ts`, `src/core/writeback/WritebackOutbox.ts`, `src/core/orchestrator/Orchestrator.ts`, `tests/completion-report-service.test.ts`, `tests/operator-approval-service.test.ts`, `tests/orchestrator.test.ts`, `tests/writeback-outbox.test.ts`]
+- redactions: [`none`]
+- localPathHandling: `repo-relative paths only`
+- protectedSurfaceChecks:
+  - surface: `hermes/upstream-src/**`
+    expectation: `must remain untouched`
+    proof: `REQ-T032` adds only the evidence snapshot in `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`; no vendored path is cited or modified.
+- intentionallyUnverified:
+  - boundary: `live GitHub PR publication`
+    reason: `out of scope for evidence-only task; local source/test proof was used instead of service-owned publication`
+    nearestLocalProof: `tests/orchestrator.test.ts:4094-4219`, `5126-5223`
+  - boundary: `live Linear tracker writeback`
+    reason: `out of scope for REQ-T032; local writeback tests were used instead of live tracker credentials`
+    nearestLocalProof: `tests/completion-report-service.test.ts:739-850`; `tests/writeback-outbox.test.ts:299-463`
+- findings:
+  - `Approved and rejected reload-adjacent recovery/writeback behavior is already evidenced on branch tip, while stale/expired approvals that become terminal only during service downtime still need restart-time reevaluation child work.`
+
 ## ENG-2507 T033C focused runtime child preflight evidence
 
 This packet records the focused ENG-2479 runtime-child preflight status through the approved lifecycle-bound capture path defined in `## ENG-2479 runtime child preflight proof matrix`. The accepted worker completion report for ENG-2507 is the authoritative evidence handle; this repo-side packet is the matching public-safe summary and must not be treated as a substitute for the lifecycle-bound completion-report record.
@@ -634,7 +695,7 @@ This packet is the final worker-owned closeout for ENG-2479 after the decomposit
 - `hierarchyOnlyParent`: `confirmed`
 - `childEvidenceReviewed`: [`ENG-2505`, `ENG-2506`, `ENG-2507`, `ENG-2508`]
 - `originalFocusedPreflightObligation`: `blocked`
-- `proof`: `ENG-2505` supplies the proof matrix at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:13-64`; `ENG-2506` supplies the approved execution/capture path at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:35-40`; `ENG-2507` records the exact focused command string `npm test -- tests/issue-contract-lint.test.ts` with outcomeStatus `blocked` at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:541-571`; `ENG-2508` supplies the parent-facing handoff at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:573-616`. Together they satisfy the decomposition verification requirement, but they do not convert the parent's original focused preflight obligation into a pass because the approved service-owned execution/capture result is still absent.`
+- `proof`: `ENG-2505` supplies the proof matrix at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:13-64`; `ENG-2506` supplies the approved execution/capture path at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:35-40`; `ENG-2507` records the exact focused command string `npm test -- tests/issue-contract-lint.test.ts` with outcomeStatus `blocked` at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:602-632`; `ENG-2508` supplies the parent-facing handoff at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:634-677`. Together they satisfy the decomposition verification requirement, but they do not convert the parent's original focused preflight obligation into a pass because the approved service-owned execution/capture result is still absent.`
 - `exactRemainingBlocker`: `No accepted service-owned execution/capture artifact for npm test -- tests/issue-contract-lint.test.ts is attached through the lifecycle-bound path described at specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:35-40, so ENG-2507 correctly records a single blocked preflight entry instead of a success claim.`
 - `nextLifecycleAction`: `Keep ENG-2479 on the normal Symphony service-owned review/writeback path. If the parent is to advance, the next artifact must come from the approved service-owned execution/capture path or an equivalent Symphony service-owned GitHub workflow action; no worker pass should be dispatched directly against ENG-2479.`
 - `disallowedDirectActions`: [`runtime implementation`, `focused preflight rerun from a restricted worker/reviewer`, `direct parent worker dispatch`, `publication`, `merge`, `protected-branch updates`, `manual Linear lifecycle edits`]
