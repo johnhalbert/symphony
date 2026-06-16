@@ -382,11 +382,12 @@ Add the focused orchestrator proof for ENG-392 after the runtime siblings land s
 
 - One focused proof path demonstrates distinct routed workspace/state buckets across at least two project contexts.
 - One focused proof path demonstrates reload preservation for an already-running routed context without duplicate redispatch or state drift.
+- If any declared sibling dependency is still unresolved, the child stays blocked and does not widen publication beyond `tests/orchestrator.test.ts`.
 
 ## Contract Checklist
 
 - Happy path: the new orchestrator proof passes with the intended routed runtime behavior present.
-- Negative/error path: wrong-context or duplicate-dispatch regressions fail the proof instead of remaining implicit.
+- Negative/error path: wrong-context, unresolved-dependency, or duplicate-dispatch regressions fail the proof or keep the child blocked instead of remaining implicit.
 - Adjacent sibling surface: the test stays contract-scoped to `tests/orchestrator.test.ts` while relying on runtime siblings for implementation.
 - Empty/missing/stale/fallback state: the proof distinguishes preserved active state from missing or terminal state.
 - Replay/restart/idempotency: rerunning the same proof still shows one preserved routed context and stable bucket identity.
@@ -396,7 +397,7 @@ Add the focused orchestrator proof for ENG-392 after the runtime siblings land s
 ## Validation Requirements
 
 - `npm test -- tests/orchestrator.test.ts`
-- Review the new assertions and confirm they cite routed workspace identity plus non-redispatch behavior explicitly.
+- Review the new assertions and confirm they cite routed workspace identity, non-redispatch behavior, and the dependency-blocked publication guard explicitly.
 
 ## Out Of Scope
 
@@ -405,8 +406,8 @@ Add the focused orchestrator proof for ENG-392 after the runtime siblings land s
 
 ## Promotion Readiness
 
-- Ready for `dogfood-ready`: yes
-- Remaining blocker: none
+- Ready for `dogfood-ready`: no
+- Remaining blocker: Wait for `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, and `ENG-392 child — approval writeback repair` to land; until then keep publication blocked and the child limited to `tests/orchestrator.test.ts`.
 ````
 
 ## Family F — `REQ-392-PUBLICATION-HYGIENE`
