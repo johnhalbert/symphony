@@ -6008,10 +6008,10 @@ describe("Orchestrator", () => {
     const candidate = issue({ state: "Merge Conflicts", branchName: "symphony/TEST-1" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return [candidate];
-      },
-      async fetchIssuesByStates() {
         return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("Merge Conflicts") ? [candidate] : [];
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -6080,7 +6080,47 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("submit_merge_conflict_resolution");
   });
 
-  it("reopens a blocked merge-conflict repair budget when the operator returns to the conflict state", async () => {
+  it("does not dispatch conflict-state workers without merge-conflict lifecycle metadata", async () => {
+    const config = testConfig(root);
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.conflictsState = "Merge Conflicts";
+    const candidate = issue({ state: "Merge Conflicts", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.length === 1 && states.includes("Merge Conflicts") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "merge_conflict_resolution",
+    });
+    const harness = new ContextRecordingHermesHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    expect(harness.runs).toEqual([]);
+  });
+
+  it("does not duplicate conflict dispatch when the same issue is returned by normal worker candidates", async () => {
     const config = testConfig(root);
     config.mergePolicy.mode = "gated";
     config.mergePolicy.conflictsState = "Merge Conflicts";
@@ -6089,8 +6129,51 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
+      async fetchIssuesByStates(states) {
+        return states.includes("Merge Conflicts") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "merge_conflict_resolution",
+      mergeConflict: openMergeConflict(candidate),
+    });
+    const harness = new BlockingRecordingHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "single merge conflict repair dispatch");
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.runPhase).toBe("merge_conflict_resolution");
+  });
+
+  it("reopens a blocked merge-conflict repair budget when the operator returns to the conflict state", async () => {
+    const config = testConfig(root);
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.conflictsState = "Merge Conflicts";
+    const candidate = issue({ state: "Merge Conflicts", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
         return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("Merge Conflicts") ? [candidate] : [];
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -9981,6 +10064,21 @@ class ContextRecordingHermesHarness implements AgentHarness {
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.runs.push({ ctx, prompt });
     yield { type: "session_started", sessionId: `context-session-${this.runs.length}`, runId: `context-run-${this.runs.length}` };
+    yield { type: "completed" };
+  }
+}
+
+class BlockingRecordingHarness implements AgentHarness {
+  readonly id = "blocking";
+  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly runs: AgentRunContext[] = [];
+
+  async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
+    this.runs.push(ctx);
+    yield { type: "session_started", sessionId: `blocking-session-${this.runs.length}`, runId: `blocking-run-${this.runs.length}` };
+    if (!ctx.abortSignal.aborted) {
+      await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+    }
     yield { type: "completed" };
   }
 }

@@ -1781,6 +1781,7 @@ export class Orchestrator {
         return;
       }
       await this.recoverPendingPublicationApprovalHandoffs();
+      await this.dispatchMergeConflictWorkerIssues();
       const workerCandidates = await this.options.tracker.fetchCandidateIssues();
       for (const issue of sortIssuesForDispatch(workerCandidates)) {
         if (this.availableSlots() <= 0) break;
@@ -1793,6 +1794,7 @@ export class Orchestrator {
       }
       await this.reconcileIssueTriageIssues();
       await this.reconcileMergePolicyIssues();
+      await this.dispatchMergeConflictWorkerIssues();
       await this.reconcileIssuePostMortemIssues();
     } catch (error) {
       this.options.logger.warn("orchestrator tick failed", { error: errorMessage(error) });
@@ -2635,6 +2637,26 @@ export class Orchestrator {
 
     this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase);
     return true;
+  }
+
+  private async dispatchMergeConflictWorkerIssues(): Promise<void> {
+    if (this.config.mergePolicy.mode !== "gated" || this.config.mergePolicy.conflictsState === null) return;
+    if (!this.options.lifecycleStore) return;
+    if (this.availableSlots() <= 0) return;
+    if (await this.activeProviderDispatchGate()) return;
+    let candidates: Issue[];
+    try {
+      candidates = await this.options.tracker.fetchIssuesByStates([this.config.mergePolicy.conflictsState]);
+    } catch (error) {
+      this.options.logger.warn("merge conflict worker issue fetch failed", { error: errorMessage(error) });
+      return;
+    }
+    for (const issue of sortIssuesForDispatch(candidates)) {
+      if (this.availableSlots() <= 0) break;
+      const lifecycle = await this.options.lifecycleStore.get(issue.id);
+      if (!lifecycle?.mergeConflict) continue;
+      await this.tryDispatchWorkerIssue(issue, null);
+    }
   }
 
   private async tryDispatchReviewerIssue(issue: Issue, allowExistingClaim = false): Promise<boolean> {
