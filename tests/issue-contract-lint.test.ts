@@ -465,6 +465,24 @@ describe("IssueContractLint", () => {
     );
   });
 
+  it("documents the ENG-2479 final parent closeout from child evidence", () => {
+    const validationEvidence = eng392ValidationEvidence();
+
+    expect(validationEvidence).toContain("ENG-2509 T033E final ENG-2479 parent closeout from child evidence");
+    expect(validationEvidence).toContain("ENG-2505");
+    expect(validationEvidence).toContain("ENG-2506");
+    expect(validationEvidence).toContain("ENG-2507");
+    expect(validationEvidence).toContain("ENG-2508");
+    expect(validationEvidence).toContain("merged issue-numbered commits");
+    expect(validationEvidence).toContain("originalFocusedPreflightObligation");
+    expect(validationEvidence).toContain("`blocked`");
+    expect(validationEvidence).toContain("service-owned execution/capture artifact");
+    expect(validationEvidence).toContain("normal Symphony service-owned review/writeback path");
+    expect(validationEvidence).toContain("no worker pass should be dispatched directly against ENG-2479");
+    expect(validationEvidence).toContain("hierarchy-only parent");
+    expect(validationEvidence).toContain("manual Linear lifecycle edits");
+  });
+
   it("documents the ENG-372 routing validation matrix and redacted evidence quickstart", () => {
     const quickstart = eng372Quickstart();
 

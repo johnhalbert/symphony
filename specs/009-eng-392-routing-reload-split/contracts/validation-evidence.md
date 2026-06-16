@@ -614,3 +614,44 @@ This packet records the parent-facing handoff back to ENG-2479 after ENG-2507 ca
     - `nearestLocalProof`: `The redacted parent-facing summary above explicitly separates verified local artifacts from unverified live effects.`
 - `findings`:
   - `No lifecycle state was changed outside the service-owned path while preparing this handoff; the verified work is limited to recording the parent-facing summary and linking the prerequisite ENG-2507 evidence handle.`
+
+## ENG-2509 T033E final ENG-2479 parent closeout from child evidence
+
+This packet is the final worker-owned closeout for ENG-2479 after the decomposition children landed. Local repo verification shows the four child issue artifacts are present as merged issue-numbered commits (`ENG-2505`, `ENG-2506`, `ENG-2507`, and `ENG-2508`) and that their combined evidence answers the parent-review question without reopening direct worker work on the hierarchy-only parent issue. The child evidence does not prove a passing focused preflight: ENG-2507 intentionally records the original `npm test -- tests/issue-contract-lint.test.ts` obligation as `blocked` until the approved service-owned execution/capture path produces an accepted lifecycle-bound result. Therefore ENG-2479 has no remaining worker-owned pass, but its original focused preflight obligation remains blocked on that exact service-owned artifact.
+
+### Child evidence completion and parent closeout matrix
+
+| Child issue | Local completion proof | Evidence slice contributed back to ENG-2479 | Closeout finding |
+| --- | --- | --- | --- |
+| `ENG-2505` | Merged commits `464f9cd` and `c0c2aee`; `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2479-runtime-child-preflight-proof-matrix` | Defines the fallback source order, required evidence fields, family coverage signals, dependency ownership, and out-of-scope bounds for the parent preflight. | Complete prerequisite definition; it proves how ENG-2479 must be judged but does not execute the focused preflight. |
+| `ENG-2506` | Merged commits `a57687f` and `ec36870`; `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#approved-execution-and-capture-path-for-eng-2479-focused-preflight` | Defines the only approved service-owned execution/capture path plus the lifecycle-bound evidence handles (`validationEvidence`, `acceptanceChecklist`, `IssueLifecycleRecord.completionReports[]`, `lastCompletionReportId`, `summaryPointers.lastEvidenceCursor`, `lastCompletionReport`, and `lastEvidenceCursor`). | Complete path definition; it proves where the focused result must come from, but the path still requires an accepted service-owned result artifact. |
+| `ENG-2507` | Merged commits `6584419` and `81026ff`; `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2507-t033c-focused-runtime-child-preflight-evidence` | Records the exact focused command string `npm test -- tests/issue-contract-lint.test.ts`, all three runtime-family coverage signals, and one lifecycle-bound `blocked` entry instead of a success claim. | Complete focused evidence capture; it proves the original ENG-2479 obligation remains blocked because no accepted service-owned execution/capture result is attached yet. |
+| `ENG-2508` | Merged commits `86f9486` and `3a99539`; `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2508-t033d-parent-review-unblock-evidence` | Records the parent-facing handoff, supersedes the prior missing-evidence gate, and names the smallest next lifecycle action through accepted completion-report handling. | Complete parent review-unblock handoff; it confirms the next action stays on the normal Symphony service-owned path rather than a worker pass on ENG-2479. |
+
+### ENG-2479 parent closeout decision
+
+- `status`: `recorded`
+- `hierarchyOnlyParent`: `confirmed`
+- `childEvidenceReviewed`: [`ENG-2505`, `ENG-2506`, `ENG-2507`, `ENG-2508`]
+- `originalFocusedPreflightObligation`: `blocked`
+- `proof`: `ENG-2505` supplies the proof matrix at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:13-64`; `ENG-2506` supplies the approved execution/capture path at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:35-40`; `ENG-2507` records the exact focused command string `npm test -- tests/issue-contract-lint.test.ts` with outcomeStatus `blocked` at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:541-571`; `ENG-2508` supplies the parent-facing handoff at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:573-616`. Together they satisfy the decomposition verification requirement, but they do not convert the parent's original focused preflight obligation into a pass because the approved service-owned execution/capture result is still absent.`
+- `exactRemainingBlocker`: `No accepted service-owned execution/capture artifact for npm test -- tests/issue-contract-lint.test.ts is attached through the lifecycle-bound path described at specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:35-40, so ENG-2507 correctly records a single blocked preflight entry instead of a success claim.`
+- `nextLifecycleAction`: `Keep ENG-2479 on the normal Symphony service-owned review/writeback path. If the parent is to advance, the next artifact must come from the approved service-owned execution/capture path or an equivalent Symphony service-owned GitHub workflow action; no worker pass should be dispatched directly against ENG-2479.`
+- `disallowedDirectActions`: [`runtime implementation`, `focused preflight rerun from a restricted worker/reviewer`, `direct parent worker dispatch`, `publication`, `merge`, `protected-branch updates`, `manual Linear lifecycle edits`]
+- `why_it_matters`: `ENG-2509 closes the worker-owned decomposition loop by proving child completion state, mapping the child evidence back to ENG-2479's original requirement, and leaving only the correct service-owned blocker and lifecycle next action.`
+
+### hygiene
+
+- `status`: `recorded`
+- `surfacesChecked`: [`specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`, `tests/issue-contract-lint.test.ts`, `git log --oneline --grep='ENG-2505:' -n 2`, `git log --oneline --grep='ENG-2506:' -n 2`, `git log --oneline --grep='ENG-2507:' -n 2`, `git log --oneline --grep='ENG-2508:' -n 2`]
+- `redactions`: [`none`]
+- `localPathHandling`: `repo-relative paths and short commit ids only`
+- `intentionallyUnverified`:
+  - `boundary`: `service-owned acceptance/writeback or lifecycle movement for ENG-2479 after this ENG-2509 closeout`
+    - `reason`: `the worker can verify only local repo artifacts and merged history; parent-state transitions remain service-owned`
+    - `nearestLocalProof`: `The parent closeout decision above records the exact blocker and names the service-owned next action without claiming that the parent already moved.`
+  - `boundary`: `fresh service-owned execution/capture run of npm test -- tests/issue-contract-lint.test.ts after this closeout`
+    - `reason`: `restricted workers still cannot produce that focused artifact locally, and no new service-owned result was attached during this closeout run`
+    - `nearestLocalProof`: `ENG-2507 remains the latest focused evidence handle and records the outcome as blocked.`
+- `findings`:
+  - `ENG-2479 is hierarchy-only and has no remaining worker-owned pass; the only remaining blocker is the missing accepted service-owned execution/capture artifact for the focused preflight command.`
