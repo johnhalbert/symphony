@@ -438,6 +438,16 @@ describe("IssueContractLint", () => {
     expect(validationEvidence).toContain("findings");
     expect(validationEvidence).toContain("redaction statement");
     expect(validationEvidence).toContain("redactionStatement");
+    expect(validationEvidence).toContain("explicitly approved unrestricted `service` role");
+    expect(validationEvidence).toContain("service-owned GitHub workflow action");
+    expect(validationEvidence).toContain("`validationEvidence`");
+    expect(validationEvidence).toContain("`acceptanceChecklist`");
+    expect(validationEvidence).toContain("`IssueLifecycleRecord.completionReports[]`");
+    expect(validationEvidence).toContain("`lastCompletionReportId`");
+    expect(validationEvidence).toContain("`summaryPointers.lastEvidenceCursor`");
+    expect(validationEvidence).toContain("`lastCompletionReport`");
+    expect(validationEvidence).toContain("`lastEvidenceCursor`");
+    expect(validationEvidence).toContain("record a single `blocked` preflight entry and stop");
     expect(validationEvidence).toContain("does not authorize runtime implementation");
     expect(validationEvidence).toContain("live lifecycle state changes");
     expect(validationEvidence).toContain("protected branch updates");
