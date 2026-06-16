@@ -569,3 +569,48 @@ Because restricted worker runs cannot use direct package-command execution as th
 - `broadPublicCiDisposition`: `Broad public CI and adjacent branch-tip orchestrator coverage are cited only as background findings and are explicitly not treated as focused preflight proof.`
 - `findings`:
   - `Focused runtime-child preflight remains blocked pending the approved service-owned execution/capture path; this packet records the blocker once and preserves the lifecycle-bound handoff path instead of looping on restricted local package-command execution.`
+
+## ENG-2508 T033D parent review-unblock evidence
+
+This packet records the parent-facing handoff back to ENG-2479 after ENG-2507 captured the focused preflight blocker through the approved lifecycle-bound path. It links the proof matrix, the approved execution/capture path, the focused ENG-2507 evidence packet, and the smallest remaining review action without claiming that any live tracker, GitHub, publication, merge, or lifecycle transition already happened.
+
+### Parent review-unblock status matrix
+
+| Review-unblock slice | Linked evidence | outcomeStatus | Concrete findings | Remaining review action |
+| --- | --- | --- | --- | --- |
+| Proof matrix anchor | `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2479-runtime-child-preflight-proof-matrix` | `recorded` | ENG-2479 already defines the per-family proof matrix and durable evidence-field requirements that later workers and reviewers must reuse instead of inventing a new handoff shape. | Keep this matrix as the baseline reference for the ENG-2479 parent review. |
+| Approved execution and capture path | `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#approved-execution-and-capture-path-for-eng-2479-focused-preflight` | `recorded` | Lines 35-40 require the focused preflight result to come from a service-owned execution/capture path and to be referenced through accepted completion-report lifecycle surfaces instead of blocked local package-command retries. | Review ENG-2479 against the approved path rather than against any fresh restricted-worker rerun attempt. |
+| Focused preflight evidence handle | `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2507-t033c-focused-runtime-child-preflight-evidence`; accepted worker completion report for ENG-2507 | `recorded` | ENG-2507 already records the exact focused command string, the intentionally `blocked` outcome, and the lifecycle-bound capture record that later reviewers should cite. It does not claim a passing focused preflight result. | Use the ENG-2507 handle as the prerequisite focused-preflight evidence for ENG-2479 review. |
+| Failed gate superseded by this handoff | Prior ENG-2479 failed review gate / blocked triage finding, as answered by `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2507-t033c-focused-runtime-child-preflight-evidence` plus the approved-path rule at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#approved-execution-and-capture-path-for-eng-2479-focused-preflight`, that broad public CI or adjacent branch-tip coverage could not substitute for a lifecycle-bound focused-preflight record | `recorded` | This ENG-2508 handoff exists specifically to supersede that missing-evidence review gate with a parent-facing summary that points reviewers to the approved-path proof and the completed ENG-2507 capture. | Treat the old missing-evidence gate as answered by the linked ENG-2507 evidence handle and this summary; do not claim the parent state changed automatically. |
+| Review handoff owner | ENG-2479 parent reviewer, with Symphony service-owned writeback carrying this ENG-2508 completion artifact forward | `recorded` | The worker-owned responsibility ends with this review-unblock summary and completion report. Parent review, any tracker comment/writeback, and any later lifecycle movement remain owned by the normal Symphony review/publish path rather than by direct worker action. | Route the handoff through the accepted ENG-2508 completion report and let the ENG-2479 reviewer consume it through the normal lifecycle surfaces. |
+| Smallest next lifecycle action | Accepted worker completion report for ENG-2508, followed by normal Symphony service-owned writeback/review handling for ENG-2479 | `recorded` | The next reviewer or operator step is to review this handoff summary plus the linked ENG-2507 evidence handle through the normal Symphony lifecycle path, without direct worker comments, parent-state edits, or protected-branch publication. | Accept or reject the ENG-2508 handoff through the standard Symphony completion-report flow; do not perform manual lifecycle state changes from the worker path. |
+
+### Redacted parent-facing summary
+
+- `status`: `recorded`
+- `surface`: `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2508-t033d-parent-review-unblock-evidence`; accepted worker completion report fields `summary`, `validationEvidence`, and `acceptanceChecklist`
+- `proof`: `Parent handoff for ENG-2479: use the proof matrix at #eng-2479-runtime-child-preflight-proof-matrix, the approved execution path at #approved-execution-and-capture-path-for-eng-2479-focused-preflight, and the focused evidence handle at #eng-2507-t033c-focused-runtime-child-preflight-evidence. This summary supersedes the failed ENG-2479 review gate that was blocked on a missing lifecycle-bound focused-preflight record. Verified evidence is limited to repo-side planning artifacts plus the accepted ENG-2507 completion-report handle; intentionally unverified live effects remain listed separately below. The smallest next action is normal Symphony review/writeback of this ENG-2508 handoff without manual lifecycle edits.`
+- `why_it_matters`: ENG-2508 must give the parent ENG-2479 review a public-safe, reviewer-facing summary that links the prerequisite evidence and names the remaining review action without overstating unverified live effects.
+- `redactions`: none
+
+### hygiene (intentionally unverified live effects)
+
+- `status`: `intentionally_unverified`
+- `surfacesChecked`: [`specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`, `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`, `specs/009-eng-392-routing-reload-split/quickstart.md`, `tests/issue-contract-lint.test.ts`]
+- `redactions`: [`none`]
+- `localPathHandling`: `repo-relative paths only`
+- `intentionallyUnverified`:
+  - `boundary`: `live Linear parent comment/writeback on ENG-2479`
+    - `reason`: `workers do not comment on Linear directly; Symphony performs service-owned writeback after accepted completion-report handoff`
+    - `nearestLocalProof`: `This section records the parent-facing summary as a repo-side public-safe artifact instead of claiming a live comment already exists.`
+  - `boundary`: `live Linear lifecycle transition or unblock of ENG-2479`
+    - `reason`: `the issue scope is handoff-only, and the worker path must not change lifecycle state outside the service-owned path`
+    - `nearestLocalProof`: `The status matrix above names the next review action but stops short of claiming the parent issue moved out of Blocked.`
+  - `boundary`: `GitHub publication, pull-request mutation, merge, or protected-branch updates`
+    - `reason`: `worker completion hands off to Symphony service-owned publication; this task does not publish, merge, or update protected branches directly`
+    - `nearestLocalProof`: `This packet records only documentation-side evidence and review instructions.`
+  - `boundary`: `service-owned acceptance/writeback of the ENG-2508 completion report itself`
+    - `reason`: `the worker can submit the completion report but cannot verify acceptance-side effects before handoff completes`
+    - `nearestLocalProof`: `The redacted parent-facing summary above explicitly separates verified local artifacts from unverified live effects.`
+- `findings`:
+  - `No lifecycle state was changed outside the service-owned path while preparing this handoff; the verified work is limited to recording the parent-facing summary and linking the prerequisite ENG-2507 evidence handle.`
