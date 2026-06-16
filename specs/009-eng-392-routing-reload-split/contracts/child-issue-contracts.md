@@ -39,10 +39,16 @@ The current operator decision remains **split/retarget**, not widened.
 
 ## Cross-artifact consistency review — T011
 
-This review compared the expected planning surfaces `specs/009-eng-392-routing-reload-split/spec.md`, `specs/009-eng-392-routing-reload-split/plan.md`, `specs/009-eng-392-routing-reload-split/data-model.md`, and `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`.
+This review compared the expected planning surfaces `specs/009-eng-392-routing-reload-split/spec.md`, `specs/009-eng-392-routing-reload-split/plan.md`, `specs/009-eng-392-routing-reload-split/tasks.md`, `specs/009-eng-392-routing-reload-split/data-model.md`, `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`, `specs/009-eng-392-routing-reload-split/quickstart.md`, `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`, and `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md`.
 
-- `spec.md` and `plan.md` are not tracked in the current `009-eng-392-routing-reload-split` snapshot. Treat that absence as an explicit planning gap rather than implicit agreement with the generic Spec Kit layout.
-- Until those files exist or the task source is retargeted, use `data-model.md` plus this contract family as the durable baseline for decomposition scope, dependency order, and runtime prerequisite mapping.
+- `spec.md`, `plan.md`, and `tasks.md` are not tracked in the current `009-eng-392-routing-reload-split` snapshot. Treat that absence as an explicit planning gap rather than implicit agreement with the generic Spec Kit layout.
+- When a worker workspace lacks `spec.md`, `plan.md`, or `tasks.md`, use the following authoritative fallback source order:
+  1. `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` — stable child titles, requirement IDs, dependency order, and authorized surfaces.
+  2. `specs/009-eng-392-routing-reload-split/data-model.md` — runtime prerequisite families, decomposition state rules, and blocked transitions.
+  3. `specs/009-eng-392-routing-reload-split/quickstart.md` — blocked-state proof inventory, current coverage gaps, and focused validation command baselines.
+  4. `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` — required evidence categories, redaction rules, and intentionally-unverified boundary handling.
+  5. `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` — publication-surface comparison rules, explicit exclusions, and vendored-source no-touch checks.
+- Until the missing Spec Kit files exist or the task source is retargeted, use the fallback order above as the durable baseline for decomposition scope, dependency order, runtime prerequisite mapping, evidence shape, and publication boundaries.
 - Family A dependency validation is evaluated over direct or transitive dependency edges unless a later family is intentionally independent and says so explicitly.
 
 ### Runtime prerequisite crosswalk
