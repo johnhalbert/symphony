@@ -23,6 +23,17 @@ The current apply path resolves sibling dependencies by normalized child title, 
 | 5 | `ENG-392 child — orchestrator proof` | `REQ-392-TEST-PROOF` | `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, `ENG-392 child — approval writeback repair` | Adds the final focused orchestrator proof after the underlying runtime and approval invariants are explicit and deterministic. |
 | 6 | `ENG-392 child — publication hygiene closure` | `REQ-392-PUBLICATION-HYGIENE` | `ENG-392 child — decision and scope lock`, `ENG-392 child — orchestrator proof`, `ENG-392 child — approval writeback repair` | Closes the loop by keeping the final diff, evidence packet, and repository hygiene aligned with the declared child scopes. |
 
+### Runtime prerequisite chain for proof work — T038
+
+For the runtime-focused children, keep the default prerequisite order explicit:
+
+1. `ENG-392 child — runtime routing repair`
+2. `ENG-392 child — reload preservation repair`
+3. `ENG-392 child — approval writeback repair`
+4. `ENG-392 child — orchestrator proof`
+
+Use the full chain whenever a later child still depends on unpublished or out-of-contract behavior from an earlier sibling. The chain may be shortened only when the base behavior from the removed blocker is already satisfied by accepted proof on the remaining authorized surfaces and the later child body records both (a) which blocker was removed and (b) why the remaining work no longer exercises that sibling's unpublished behavior. In practice, `ENG-392 child — orchestrator proof` stays blocked on runtime, reload, and approval/writeback by default; drop one of those blockers only after the accepted child evidence shows the corresponding base behavior is already satisfied and no longer part of the proof child's unpublished dependency set.
+
 ## Current operator boundary decision — T019
 
 The current operator decision remains **split/retarget**, not widened.
@@ -409,7 +420,8 @@ Add the focused orchestrator proof for ENG-392 only after the runtime prerequisi
 ## Labels / Dependencies
 
 - Proposed labels: keep the parent `dogfood` label and leave readiness-label changes to operator review after the prerequisite runtime children are accepted.
-- Sibling dependency guidance: declare dependencies on `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, and `ENG-392 child — approval writeback repair` by exact title because the proof must stay blocked while it relies on unpublished or out-of-contract runtime, reload, or approval/writeback behavior.
+- Sibling dependency guidance: follow the default runtime proof order `ENG-392 child — runtime routing repair` → `ENG-392 child — reload preservation repair` → `ENG-392 child — approval writeback repair` → `ENG-392 child — orchestrator proof`, and declare the first three siblings as exact-title blockers while the proof still relies on their unpublished or out-of-contract behavior.
+- Shortened-chain rule: remove one of those exact-title blockers only when accepted proof already shows the removed sibling's base behavior is satisfied and the child body records why the remaining proof no longer exercises that unpublished dependency.
 
 ## Issue Contract
 
@@ -426,7 +438,7 @@ Add the focused orchestrator proof for ENG-392 only after the runtime prerequisi
 
 - One focused proof path demonstrates distinct routed workspace/state buckets across at least two project contexts.
 - One focused proof path demonstrates reload preservation for an already-running routed context without duplicate redispatch or state drift.
-- If any declared sibling dependency is still unresolved, or the proof still relies on unpublished or out-of-contract runtime behavior from those siblings, the child stays blocked and does not widen publication beyond `tests/orchestrator.test.ts`.
+- If accepted base behavior already satisfies one prerequisite, the child body may record a shorter blocker chain for the proof; otherwise, if any declared sibling dependency is still unresolved or the proof still relies on unpublished or out-of-contract runtime behavior from those siblings, the child stays blocked and does not widen publication beyond `tests/orchestrator.test.ts`.
 
 ## Contract Checklist
 
@@ -441,7 +453,7 @@ Add the focused orchestrator proof for ENG-392 only after the runtime prerequisi
 ## Validation Requirements
 
 - `npm test -- tests/orchestrator.test.ts`
-- Review the new dependency notes and assertions and confirm they cite routed workspace identity, non-redispatch behavior, and the runtime prerequisite guard linking runtime routing, reload preservation, and approval/writeback explicitly.
+- Review the new dependency notes and assertions and confirm they cite routed workspace identity, non-redispatch behavior, the default runtime prerequisite order, and any shortened-chain justification linking runtime routing, reload preservation, and approval/writeback explicitly.
 
 ## Out Of Scope
 
@@ -451,7 +463,7 @@ Add the focused orchestrator proof for ENG-392 only after the runtime prerequisi
 ## Promotion Readiness
 
 - Ready for `dogfood-ready`: no
-- Remaining blocker: Wait for `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, and `ENG-392 child — approval writeback repair` to land; until then keep publication blocked and the child limited to `tests/orchestrator.test.ts`.
+- Remaining blocker: Wait for `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, and `ENG-392 child — approval writeback repair` to land unless accepted proof already records a shorter prerequisite chain; until then keep publication blocked and the child limited to `tests/orchestrator.test.ts`.
 ````
 
 ## Family F — `REQ-392-PUBLICATION-HYGIENE`
