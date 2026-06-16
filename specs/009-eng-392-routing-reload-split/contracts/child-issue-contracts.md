@@ -175,7 +175,7 @@ Repair the routed runtime path so two different Linear project contexts resolve 
 ## Issue Contract
 
 ```json
-{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-RUNTIME-ROUTING","requirement":"Routed worker, reviewer, and open-workspace flows must keep project-context-qualified issue lookup, workspace identity, and lifecycle state distinct so two Linear project contexts never share a workspace or state bucket by accident.","proofHint":"Cite focused orchestrator, status, or workspace-opening evidence that shows distinct projectContext-qualified workspace keys and fail-closed handling for wrong-context or ambiguous routes."}]}
+{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-RUNTIME-ROUTING","requirement":"Routed worker, reviewer, and open-workspace flows must keep project-context-qualified issue lookup, workspace identity, and lifecycle state distinct so two Linear project contexts never share a workspace or state bucket by accident.","proofHint":"Cite focused orchestrator, status, or workspace-opening evidence that shows distinct projectContext-qualified workspace keys and fail-closed handling for wrong-context or ambiguous routes, and record that parent task REQ-T035 prepared this Linear-ready child body."}]}
 ```
 
 ## Touched Surfaces
@@ -212,6 +212,7 @@ Repair the routed runtime path so two different Linear project contexts resolve 
 ## Validation Requirements
 
 - Review this child issue body and confirm the `Labels / Dependencies` section keeps only the parent `dogfood` label in the drafted payload, omits `dogfood-ready` plus configured worker-dispatch labels, and cites `ENG-392 child — decision and scope lock` as the exact earlier-sibling dependency.
+- Review the fenced JSON `Issue Contract` and confirm it remains valid JSON, preserves the child requirement id `REQ-392-RUNTIME-ROUTING`, and records parent-task traceability to `REQ-T035` in the `proofHint`.
 - `npm test -- tests/orchestrator.test.ts tests/status-api.test.ts tests/cursor-workspace-opener.test.ts`
 - Manual or API inspection that the routed issue and workspace identity differ across at least two project contexts without sharing one bucket.
 
