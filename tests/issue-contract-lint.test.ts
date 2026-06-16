@@ -416,6 +416,45 @@ describe("IssueContractLint", () => {
     }
   });
 
+  it("documents the ENG-2479 runtime-child preflight proof matrix and fallback order", () => {
+    const childContracts = eng392ChildContracts();
+    const validationEvidence = eng392ValidationEvidence();
+
+    expect(childContracts).toContain("`spec.md`, `plan.md`, and `tasks.md` are not tracked");
+    expect(childContracts).toContain("use the following authoritative fallback source order");
+    expect(childContracts).toContain("specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md");
+    expect(childContracts).toContain("specs/009-eng-392-routing-reload-split/data-model.md");
+    expect(childContracts).toContain("specs/009-eng-392-routing-reload-split/quickstart.md");
+    expect(childContracts).toContain("specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md");
+    expect(childContracts).toContain("specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md");
+
+    expect(validationEvidence).toContain("ENG-2479 runtime child preflight proof matrix");
+    expect(validationEvidence).toContain("REQ-392-RUNTIME-ROUTING");
+    expect(validationEvidence).toContain("REQ-392-RELOAD-PRESERVATION");
+    expect(validationEvidence).toContain("REQ-392-APPROVAL-WRITEBACK");
+    expect(validationEvidence).toContain("command string");
+    expect(validationEvidence).toContain("outcome status");
+    expect(validationEvidence).toContain("per-family coverage signal");
+    expect(validationEvidence).toContain("findings");
+    expect(validationEvidence).toContain("redaction statement");
+    expect(validationEvidence).toContain("redactionStatement");
+    expect(validationEvidence).toContain("does not authorize runtime implementation");
+    expect(validationEvidence).toContain("live lifecycle state changes");
+    expect(validationEvidence).toContain("protected branch updates");
+    expect(validationEvidence).toContain("REQ-392-TEST-PROOF");
+    expect(validationEvidence).toContain("REQ-392-PUBLICATION-HYGIENE");
+    expect(validationEvidence).toContain("hermes/upstream-src/**");
+    expect(validationEvidence).toContain("depends on `REQ-392-DECISION`");
+    expect(validationEvidence).toContain("depends on `REQ-392-RUNTIME-ROUTING`");
+    expect(validationEvidence).toContain("depends on both `REQ-392-RUNTIME-ROUTING` and `REQ-392-RELOAD-PRESERVATION`");
+    expect(validationEvidence).toContain(
+      "depends on `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, and `REQ-392-APPROVAL-WRITEBACK`",
+    );
+    expect(validationEvidence).toContain(
+      "depends on `REQ-392-DECISION`, `REQ-392-APPROVAL-WRITEBACK`, and `REQ-392-TEST-PROOF`",
+    );
+  });
+
   it("documents the ENG-372 routing validation matrix and redacted evidence quickstart", () => {
     const quickstart = eng372Quickstart();
 
@@ -491,11 +530,22 @@ function eng372Quickstart(): string {
   return readFileSync(new URL("../specs/006-eng-372-context-credential-routing/quickstart.md", import.meta.url), "utf8");
 }
 
-function eng392ContractExamples(): IssueContractExample[] {
-  const content = readFileSync(
+function eng392ChildContracts(): string {
+  return readFileSync(
     new URL("../specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md", import.meta.url),
     "utf8",
   );
+}
+
+function eng392ValidationEvidence(): string {
+  return readFileSync(
+    new URL("../specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md", import.meta.url),
+    "utf8",
+  );
+}
+
+function eng392ContractExamples(): IssueContractExample[] {
+  const content = eng392ChildContracts();
   const matches = Array.from(content.matchAll(/^## (Family .+?)\r?\n[\s\S]*?````markdown\r?\n([\s\S]*?)\r?\n````/gm));
   return matches.map((match) => ({ title: match[1] ?? "", description: (match[2] ?? "").trim() }));
 }

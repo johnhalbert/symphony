@@ -10,6 +10,52 @@ Use this planning contract when drafting or reviewing future ENG-392 child-issue
 
 A reviewer should be able to tell what the baseline was, what failed before the fix, what passed after the fix, which authorized surfaces were actually touched, and whether the final evidence stayed safe to publish without rereading raw logs or internal implementation details.
 
+## ENG-2479 runtime child preflight proof matrix
+
+Use this matrix before any execution-oriented runtime child or focused evidence-capture child resumes from the blocked ENG-392 split. It is a planning-only preflight contract for downstream work: define the expected proof first, then let the owning child issue execute or capture it.
+
+### Authoritative fallback source order when `spec.md`, `plan.md`, or `tasks.md` are absent
+
+1. `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` — stable child titles, requirement IDs, dependency order, and authorized surfaces.
+2. `specs/009-eng-392-routing-reload-split/data-model.md` — runtime prerequisite families, decomposition state rules, and blocked transitions.
+3. `specs/009-eng-392-routing-reload-split/quickstart.md` — blocked-state proof inventory, current coverage gaps, and focused validation command baselines.
+4. `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` — required evidence categories, redaction rules, and intentionally-unverified boundary handling.
+5. `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` — publication-surface comparison rules, explicit exclusions, and vendored-source no-touch checks.
+
+### Required evidence fields for every runtime-child preflight record
+
+Every future runtime-child preflight entry must record the following minimum fields:
+
+- `commandString` — the exact command string or safe repo-relative/file/API locator used to gather the proof.
+- `outcomeStatus` — the outcome status, such as `recorded`, `pass`, `fail`, `blocked`, `not_applicable`, or `intentionally_unverified`.
+- `coverageSignal` — the per-family coverage signal that proves the targeted runtime invariant.
+- `findings` — concrete findings if any, or an explicit `none` / zero-findings statement.
+- `redactionStatement` — the redaction statement: `none` or the class of secret/private content replaced with `[REDACTED]`.
+
+### Focused runtime child preflight matrix
+
+| Planned runtime child contract family | Dependency gate before execution or focused evidence capture proceeds | Per-family coverage signal to record | Later child that owns execution/evidence work |
+| --- | --- | --- | --- |
+| `REQ-392-RUNTIME-ROUTING` | Confirm the route-isolation prerequisite against the fallback sources above before any runtime-routing implementation or proof sweep resumes. | Two distinct project contexts keep distinct issue, workspace, and lifecycle buckets, and wrong-context or ambiguous routes fail closed instead of reusing another bucket. | `REQ-392-RUNTIME-ROUTING` owns the runtime implementation and focused routing validation once this preflight definition is accepted. |
+| `REQ-392-RELOAD-PRESERVATION` | Reuse the routed identity defined by `REQ-392-RUNTIME-ROUTING`; do not capture reload proof until the same routed workspace/lifecycle identity is the prerequisite baseline. | The same project-context-qualified workspace, prompt/context identity, and lifecycle bucket survive reload or restart without duplicate redispatch or incomplete-turn burn while the run remains intentional. | `REQ-392-RELOAD-PRESERVATION` owns the reload/restart implementation and focused preservation validation after the routing child stabilizes the baseline. |
+| `REQ-392-APPROVAL-WRITEBACK` | Treat routed approval and writeback recovery as downstream from both runtime routing and reload preservation; do not record approval proof as if those prerequisites were already implicit. | Pending, approved, rejected, cancelled, or replayed approval/writeback paths preserve one routed run lineage, one audit/writeback settlement story, and explicit terminal/recovery state instead of duplicating or losing state. | `REQ-392-APPROVAL-WRITEBACK` owns the approval/writeback implementation and focused recovery validation after the routing and reload prerequisites are stable. |
+
+### Child issue dependency ownership for later execution or evidence work
+
+- `REQ-392-RUNTIME-ROUTING` depends on `REQ-392-DECISION` and is the first runtime child allowed to own execution once the decomposition decision stays locked.
+- `REQ-392-RELOAD-PRESERVATION` depends on `REQ-392-RUNTIME-ROUTING` and owns reload or restart execution only after routed identity is stable.
+- `REQ-392-APPROVAL-WRITEBACK` depends on both `REQ-392-RUNTIME-ROUTING` and `REQ-392-RELOAD-PRESERVATION` and owns routed approval or writeback execution only after both prerequisites are stable.
+- `REQ-392-TEST-PROOF` depends on `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, and `REQ-392-APPROVAL-WRITEBACK` and owns the focused orchestrator proof execution and evidence capture after those runtime prerequisites are satisfied.
+- `REQ-392-PUBLICATION-HYGIENE` depends on `REQ-392-DECISION`, `REQ-392-APPROVAL-WRITEBACK`, and `REQ-392-TEST-PROOF` and owns the publication-facing evidence closure only after the runtime, approval, and proof families are complete.
+
+### Out-of-scope boundary for this preflight matrix
+
+- This matrix is planning-only. It does not authorize runtime implementation, focused preflight execution, focused evidence capture, live lifecycle state changes, publication, protected branch updates, or changes under `hermes/upstream-src/**`.
+- `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, and `REQ-392-APPROVAL-WRITEBACK` own the later family-specific runtime implementation and validation execution.
+- `REQ-392-TEST-PROOF` owns the focused orchestrator proof execution and evidence capture after the runtime prerequisites above are stable.
+- `REQ-392-PUBLICATION-HYGIENE` owns the publication-surface comparison, final evidence hygiene, and publication-facing closure work after the runtime and proof families are satisfied.
+- If future work would require protected branch updates or vendored upstream changes, stop and author a separate protected-surface contract first instead of treating this preflight matrix as authorization.
+
 ## Shared evidence-entry rules
 
 Every evidence entry should record:
