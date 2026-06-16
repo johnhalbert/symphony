@@ -537,3 +537,35 @@ This packet uses the shared reviewer skeleton above to record whether branch-tip
     nearestLocalProof: `tests/orchestrator.test.ts:2504-2647`; `tests/orchestrator.test.ts:3073-3209`; `tests/orchestrator.test.ts:5762-5892`
 - findings:
   - `Worker retry redispatch after config reload already has branch-tip proof, while explicit reviewer redispatch-after-reload or restart proof remains mapped to REQ-392-RELOAD-PRESERVATION and REQ-392-TEST-PROOF.`
+
+## ENG-2507 T033C focused runtime child preflight evidence
+
+This packet records the focused ENG-2479 runtime-child preflight status through the approved lifecycle-bound capture path defined in `## ENG-2479 runtime child preflight proof matrix`. The accepted worker completion report for ENG-2507 is the authoritative evidence handle; this repo-side packet is the matching public-safe summary and must not be treated as a substitute for the lifecycle-bound completion-report record.
+
+Because restricted worker runs cannot use direct package-command execution as the focused preflight path, and no service-owned execution artifact was attached to this worker run before handoff, the current focused preflight outcome is recorded as `blocked` with concrete findings instead of a success claim.
+
+### Focused runtime child preflight status matrix
+
+| Planned runtime child contract family | commandString | outcomeStatus | coverageSignal | Concrete findings |
+| --- | --- | --- | --- | --- |
+| `REQ-392-RUNTIME-ROUTING` | `npm test -- tests/issue-contract-lint.test.ts` | `blocked` | Two distinct project contexts keep distinct issue, workspace, and lifecycle buckets, and wrong-context or ambiguous routes fail closed instead of reusing another bucket. | Existing branch-tip routing evidence is summarized in `## ENG-2476 T030 runtime routing evidence snapshot`, but the approved focused preflight result must come from the service-owned execution/capture path in this issue's accepted completion report. Broad public CI or adjacent routed orchestrator coverage is not recorded here as focused preflight success. |
+| `REQ-392-RELOAD-PRESERVATION` | `npm test -- tests/issue-contract-lint.test.ts` | `blocked` | The same project-context-qualified workspace, prompt/context identity, and lifecycle bucket survive reload or restart without duplicate redispatch or incomplete-turn burn while the run remains intentional. | Existing reload-preservation evidence is summarized in `## ENG-2477 T031 reload preservation redispatch evidence snapshot`, including the still-open reviewer redispatch-after-reload gap. That branch-tip evidence is background only and is not promoted to focused preflight success without the approved service-owned capture path. |
+| `REQ-392-APPROVAL-WRITEBACK` | `npm test -- tests/issue-contract-lint.test.ts` | `blocked` | Pending, approved, rejected, cancelled, or replayed approval/writeback paths preserve one routed run lineage, one audit/writeback settlement story, and explicit terminal/recovery state instead of duplicating or losing state. | `quickstart.md` records broad approval-recovery coverage, but this file did not yet contain a dedicated focused approval/writeback snapshot before ENG-2507. Broad approval-recovery/public CI coverage therefore remains insufficient as focused preflight proof until the service-owned result is attached through the accepted completion report. |
+
+### lifecycle-bound capture record
+
+- `status`: `recorded`
+- `surface`: `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2507-t033c-focused-runtime-child-preflight-evidence`; accepted worker completion report fields `validationEvidence` and `acceptanceChecklist`; lifecycle persistence handles `IssueLifecycleRecord.completionReports[]`, `lastCompletionReportId`, and `summaryPointers.lastEvidenceCursor`
+- `proof`: The approved-path contract at `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:35-40` requires service-owned execution/capture for the focused command string `npm test -- tests/issue-contract-lint.test.ts` and directs workers to record a single `blocked` entry when that service-owned preflight has not run yet. This ENG-2507 section records that blocked state, exact command string, and per-family coverage signals without claiming that adjacent branch-tip test coverage or broad public CI satisfied the focused preflight.
+- `why_it_matters`: ENG-2507 must capture exact command, outcome status, and family coverage signals through the approved path while preserving a durable lifecycle-bound review handle.
+- `redactions`: none
+
+### hygiene
+
+- `status`: `recorded`
+- `surfacesChecked`: [`specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`, `specs/009-eng-392-routing-reload-split/quickstart.md`, `tests/issue-contract-lint.test.ts`]
+- `redactions`: [`none`]
+- `localPathHandling`: `repo-relative paths only`
+- `broadPublicCiDisposition`: `Broad public CI and adjacent branch-tip orchestrator coverage are cited only as background findings and are explicitly not treated as focused preflight proof.`
+- `findings`:
+  - `Focused runtime-child preflight remains blocked pending the approved service-owned execution/capture path; this packet records the blocker once and preserves the lifecycle-bound handoff path instead of looping on restricted local package-command execution.`
