@@ -212,9 +212,13 @@ Expected evidence to record:
 Run the focused local test sweeps that back the runtime-routing, reload-preservation, approval-writeback, and focused-proof child families:
 
 ```powershell
+# REQ-392-RUNTIME-ROUTING
 npm test -- tests/orchestrator.test.ts tests/status-api.test.ts tests/cursor-workspace-opener.test.ts
+# REQ-392-RELOAD-PRESERVATION
 npm test -- tests/orchestrator.test.ts tests/status-api.test.ts
+# REQ-392-APPROVAL-WRITEBACK
 npm test -- tests/orchestrator.test.ts tests/completion-report-service.test.ts tests/operator-approval-service.test.ts tests/approval-status-api.test.ts tests/status-api.test.ts
+# REQ-392-TEST-PROOF (the focused proof command cited by T025)
 npm test -- tests/orchestrator.test.ts
 ```
 
