@@ -148,6 +148,8 @@ Record the ENG-392 decomposition decision before any child implementation work s
 
 - Suggested child title: `ENG-392 child — runtime routing repair`
 - Dependency order: **2 of 6**
+- Draft label guidance for Linear creation: keep the parent `dogfood` label, do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload, and let operator review own readiness-label changes because this child authorizes protected runtime surfaces.
+- Draft dependency guidance for Linear creation: declare dependency on `ENG-392 child — decision and scope lock` by exact title, and keep later sibling routing, reload, approval, and proof work blocked on this title chain when they depend on routed workspace identity.
 - Declare dependency on: `ENG-392 child — decision and scope lock`
 - Authorized surfaces to list in `Touched Surfaces`:
   - `src/core/orchestrator/Orchestrator.ts`
@@ -165,10 +167,15 @@ Record the ENG-392 decomposition decision before any child implementation work s
 
 Repair the routed runtime path so two different Linear project contexts resolve to distinct issue, workspace, and lifecycle buckets instead of sharing a default bucket or reusing the wrong routed workspace.
 
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label and leave `dogfood-ready` plus any configured worker-dispatch labels for operator review after the protected routing surfaces and validation evidence are reviewed.
+- Sibling dependency guidance: declare dependency on `ENG-392 child — decision and scope lock` by exact title so routed runtime repair cannot run before the decomposition path is frozen; later sibling work that relies on routed workspace identity should continue to depend on `ENG-392 child — runtime routing repair` by exact title.
+
 ## Issue Contract
 
 ```json
-{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-RUNTIME-ROUTING","requirement":"Routed worker, reviewer, and open-workspace flows must keep project-context-qualified issue lookup, workspace identity, and lifecycle state distinct so two Linear project contexts never share a workspace or state bucket by accident.","proofHint":"Cite focused orchestrator, status, or workspace-opening evidence that shows distinct projectContext-qualified workspace keys and fail-closed handling for wrong-context or ambiguous routes."}]}
+{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-RUNTIME-ROUTING","requirement":"Routed worker, reviewer, and open-workspace flows must keep project-context-qualified issue lookup, workspace identity, and lifecycle state distinct so two Linear project contexts never share a workspace or state bucket by accident.","proofHint":"Cite focused orchestrator, status, or workspace-opening evidence that shows distinct projectContext-qualified workspace keys and fail-closed handling for wrong-context or ambiguous routes, and record that parent task REQ-T035 prepared this Linear-ready child body."}]}
 ```
 
 ## Touched Surfaces
@@ -188,6 +195,7 @@ Repair the routed runtime path so two different Linear project contexts resolve 
 
 ## Acceptance Criteria
 
+- The drafted payload includes operator-facing label and dependency guidance that keeps auto-ready or worker-dispatch labels out of the initial Linear payload and cites `ENG-392 child — decision and scope lock` as the exact earlier-sibling dependency.
 - Distinct project contexts produce distinct routed workspace and lifecycle identities.
 - Wrong-context, ambiguous, or missing routes fail closed instead of reusing another context's workspace or state bucket.
 
@@ -203,6 +211,8 @@ Repair the routed runtime path so two different Linear project contexts resolve 
 
 ## Validation Requirements
 
+- Review this child issue body and confirm the `Labels / Dependencies` section keeps only the parent `dogfood` label in the drafted payload, omits `dogfood-ready` plus configured worker-dispatch labels, and cites `ENG-392 child — decision and scope lock` as the exact earlier-sibling dependency.
+- Review the fenced JSON `Issue Contract` and confirm it remains valid JSON, preserves the child requirement id `REQ-392-RUNTIME-ROUTING`, and records parent-task traceability to `REQ-T035` in the `proofHint`.
 - `npm test -- tests/orchestrator.test.ts tests/status-api.test.ts tests/cursor-workspace-opener.test.ts`
 - Manual or API inspection that the routed issue and workspace identity differ across at least two project contexts without sharing one bucket.
 
