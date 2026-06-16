@@ -12,7 +12,7 @@ import type {
   IssueReviewVerdictRecord,
   ReviewVerdictAcceptanceResult,
 } from "./persistence/IssueLifecycleStore.js";
-import { phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
+import { isSupersededLifecycleRecord, phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
 import { isMergeGateVerdict } from "./merge/MergePolicyService.js";
 import { shouldSilentlyRetireMergeGate } from "./merge/MergeGateLifecycle.js";
 import { appendLaneMemoTelemetry } from "./persistence/LaneMemoTelemetry.js";
@@ -188,6 +188,9 @@ export class ReviewVerdictService {
       reviewer: context.reviewer ?? null,
       submittedAt: new Date().toISOString(),
       writebackOperationKeys: [],
+      supersededAt: null,
+      supersededBy: null,
+      supersededReason: null,
     };
     const operations =
       ceilingReached
@@ -469,9 +472,12 @@ function verdictIdFor(issueId: string, idempotencyKey: string): string {
 function latestReviewVerdict(lifecycle: IssueLifecycleRecord): IssueReviewVerdictRecord | null {
   if (lifecycle.lastReviewVerdictId) {
     const exact = lifecycle.reviewVerdicts.find((verdict) => verdict.id === lifecycle.lastReviewVerdictId);
-    if (exact) return exact;
+    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
   }
-  return lifecycle.reviewVerdicts[lifecycle.reviewVerdicts.length - 1] ?? null;
+  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
+    if (!isSupersededLifecycleRecord(verdict)) return verdict;
+  }
+  return null;
 }
 
 function latestCompletionReport(lifecycle: IssueLifecycleRecord) {

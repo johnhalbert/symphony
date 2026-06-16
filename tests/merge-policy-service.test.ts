@@ -282,7 +282,17 @@ describe("MergePolicyService", () => {
       checks: [{ name: "test", outcome: "failing" }],
       blockerFingerprint: "head-sha-2:test:failure",
     });
-    expect(lifecycle?.lastReviewVerdictId).toBe("merge-gate:issue-1:pr-42:head-sha-2");
+    expect(lifecycle?.lastReviewVerdictId).toBe("review-verdict:issue-1:verdict-pass-1");
+    expect(lifecycle?.lastMergeGateResultId).toBe("merge-gate:issue-1:pr-42:head-sha-2");
+    expect(lifecycle?.mergeGateResults).toHaveLength(1);
+    expect(lifecycle?.mergeGateResults?.[0]).toMatchObject({
+      id: "merge-gate:issue-1:pr-42:head-sha-2",
+      status: "repair_dispatched",
+      headSha: "head-sha-2",
+      checks: [{ name: "test", outcome: "failing" }],
+      findings: expect.arrayContaining([expect.stringContaining("Required check failed: test")]),
+    });
+    expect(lifecycle?.reviewVerdicts.some((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-2")).toBe(false);
   });
 
   it("does not treat a prior head approval as current after a new-head completion report", async () => {
@@ -1537,7 +1547,8 @@ describe("MergePolicyService", () => {
     expect(writer.comments).toEqual([]);
     expect(lifecycle?.phase).toBe("passed");
     expect(lifecycle?.reviewRound).toBe(1);
-    expect(lifecycle?.lastReviewVerdictId).toBe(activeGate.id);
+    expect(lifecycle?.lastReviewVerdictId).toBe("review-verdict:issue-1:verdict-pass-1");
+    expect(lifecycle?.lastMergeGateResultId).toBe(activeGate.id);
     expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
     expect(lifecycle?.mergeGate).toMatchObject({
       status: "repair_dispatched",
@@ -1650,7 +1661,7 @@ describe("MergePolicyService", () => {
       status: "repair_dispatched",
       checks: [{ name: "test", outcome: "passing" }, { name: "typecheck", outcome: "missing_actionable" }],
     });
-    expect(lifecycle?.reviewVerdicts.at(-1)?.findings).toEqual(["Required check missing (actionable): typecheck: missing"]);
+    expect(lifecycle?.mergeGateResults?.at(-1)?.findings).toEqual(["Required check missing (actionable): typecheck: missing"]);
   });
 
   it("dispatches a worker repair when a required check fails", async () => {
@@ -1698,13 +1709,13 @@ describe("MergePolicyService", () => {
       reviewRound: 0,
       incompleteTurnCount: 0,
       blockedReason: null,
-      lastReviewVerdictId: "merge-gate:issue-1:pr-42:head-sha-1",
+      lastReviewVerdictId: "review-verdict:issue-1:verdict-pass-1",
+      lastMergeGateResultId: "merge-gate:issue-1:pr-42:head-sha-1",
       mergeGate: { reviewRound: 1 },
     });
-    expect(lifecycle?.reviewVerdicts.at(-1)).toMatchObject({
+    expect(lifecycle?.mergeGateResults?.at(-1)).toMatchObject({
       id: "merge-gate:issue-1:pr-42:head-sha-1",
-      verdict: "fail",
-      reviewer: "symphony-merge-gate",
+      status: "repair_dispatched",
       findings: ["Required check failed: test: failure / failure (https://ci.test/test)"],
       writebackOperationKeys: [
         "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_test_failure:r1",
@@ -1816,7 +1827,7 @@ describe("MergePolicyService", () => {
 
     const result = await secondService.reconcileIssue(currentIssue);
     const lifecycle = await lifecycleStore.get(currentIssue.id);
-    const gateVerdicts = lifecycle?.reviewVerdicts.filter((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1") ?? [];
+    const gateResults = (lifecycle?.mergeGateResults ?? []).filter((result) => result.id === "merge-gate:issue-1:pr-42:head-sha-1");
 
     expect(result.status).toBe("repair_dispatched");
     expect(secondWriter.transitions).toEqual([
@@ -1830,12 +1841,13 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.reviewRound).toBe(0);
     expect(lifecycle?.mergeGate?.reviewRound).toBe(2);
     expect(lifecycle?.phase).toBe("implementation");
-    expect(lifecycle?.lastReviewVerdictId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
+    expect(lifecycle?.lastReviewVerdictId).toBe("review-verdict:issue-1:verdict-pass-1");
+    expect(lifecycle?.lastMergeGateResultId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
     expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
     expect(lifecycle?.mergeGate?.repairRunId).toBeNull();
     expect(lifecycle?.mergeGate?.repairReportId).toBeNull();
-    expect(gateVerdicts).toHaveLength(1);
-    expect(gateVerdicts[0]?.writebackOperationKeys).toEqual([
+    expect(gateResults).toHaveLength(1);
+    expect(gateResults[0]?.writebackOperationKeys).toEqual([
       "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_test_failure:r2",
       "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_test_failure:r2:In Progress",
     ]);
@@ -1894,10 +1906,11 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.phase).toBe("blocked");
     expect(lifecycle?.reviewRound).toBe(1);
     expect(lifecycle?.mergeGate?.reviewRound).toBe(3);
-    expect(lifecycle?.lastReviewVerdictId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
+    expect(lifecycle?.lastReviewVerdictId).toBe("review-verdict:issue-1:verdict-pass-1");
+    expect(lifecycle?.lastMergeGateResultId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
     expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
     expect(lifecycle?.blockedReason).toContain("3/3");
-    expect(lifecycle?.reviewVerdicts.find((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")?.writebackOperationKeys).toEqual([
+    expect(lifecycle?.mergeGateResults?.find((result) => result.id === "merge-gate:issue-1:pr-42:head-sha-1")?.writebackOperationKeys).toEqual([
       "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:blocked:head-sha-1_test_failure:r3",
       "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:blocked:head-sha-1_test_failure:r3:Blocked",
     ]);
@@ -2060,14 +2073,14 @@ describe("MergePolicyService", () => {
     expect(writer.comments).toEqual([]);
     expect(lifecycle?.lastReviewVerdictId).toBe("review-verdict:issue-1:verdict-pass-1");
     expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
-    expect(lifecycle?.reviewVerdicts.filter((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
+    expect((lifecycle?.mergeGateResults ?? []).filter((result) => result.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
     expect(lifecycle?.mergeGate).toMatchObject({
       status: "repair_dispatched",
       repairRunId: null,
       repairReportId: null,
       blockerFingerprint: "head-sha-1:test:failure",
     });
-    expect(lifecycle?.reviewVerdicts.find((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")).toMatchObject({
+    expect(lifecycle?.mergeGateResults?.find((result) => result.id === "merge-gate:issue-1:pr-42:head-sha-1")).toMatchObject({
       findings: ["Required check failed: test: failure / failure (https://ci.test/test)"],
       evidence: ["PR: #42 (https://github.com/acme/symphony/pull/42)", "PR head SHA: head-sha-1", "Failing check: test: failure / failure (https://ci.test/test)"],
     });
@@ -2188,10 +2201,8 @@ describe("MergePolicyService", () => {
       blockerFingerprint: null,
     });
     expect(lifecycle?.summaryPointers.ciStatus).toBe("success");
-    expect(lifecycle?.reviewVerdicts.find((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")).toMatchObject({
-      findings: [],
-      evidence: [],
-      acceptanceResults: [],
+    expect(lifecycle?.mergeGateResults?.find((result) => result.id === "merge-gate:issue-1:pr-42:head-sha-1")).toMatchObject({
+      supersededReason: "merge_gate_resolved",
     });
   });
 
@@ -2516,7 +2527,7 @@ describe("MergePolicyService", () => {
       completionReports: [...afterFailure!.completionReports, repairReport],
     });
     const accepted = await lifecycleStore.get(currentIssue.id);
-    expect(accepted?.reviewVerdicts.filter((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
+    expect((accepted?.mergeGateResults ?? []).filter((result) => result.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
     expect(accepted?.summaryPointers.ciStatus).toBe("failure");
     currentIssue.state = "Ready to Merge";
     await lifecycleStore.updateIssue(currentIssue, {
@@ -2541,7 +2552,8 @@ describe("MergePolicyService", () => {
     expect(result.status).toBe("repair_dispatched");
     expect(client.mergeInput).toBeNull();
     expect(writer.transitions).toHaveLength(1);
-    expect(lifecycle?.lastReviewVerdictId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
+    expect(lifecycle?.lastReviewVerdictId).toBe("review-verdict:issue-1:verdict-pass-1");
+    expect(lifecycle?.lastMergeGateResultId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
     expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
   });
 
@@ -2613,7 +2625,8 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.mergeGate?.reviewRound).toBe(2);
     expect(lifecycle?.mergeGate?.repairRunId).toBeNull();
     expect(lifecycle?.mergeGate?.repairReportId).toBeNull();
-    expect(lifecycle?.lastReviewVerdictId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
+    expect(lifecycle?.lastReviewVerdictId).toBe(postRepairVerdict.id);
+    expect(lifecycle?.lastMergeGateResultId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
     expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
   });
 
@@ -2656,7 +2669,7 @@ describe("MergePolicyService", () => {
     expect(writer.transitions).toEqual([]);
     expect(writer.comments).toEqual([]);
     expect(lifecycle?.mergeGate?.reviewRound).toBe(1);
-    expect(lifecycle?.reviewVerdicts.filter((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
+    expect((lifecycle?.mergeGateResults ?? []).filter((result) => result.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
   });
 
   it("refreshes active repair observations without duplicate writebacks or round burn in In Progress", async () => {
@@ -2728,7 +2741,7 @@ describe("MergePolicyService", () => {
     expect(refailureWriter.transitions).toEqual([]);
     expect(refailureWriter.comments).toEqual([]);
     expect(lifecycle?.mergeGate?.reviewRound).toBe(1);
-    expect(lifecycle?.reviewVerdicts.filter((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
+    expect((lifecycle?.mergeGateResults ?? []).filter((result) => result.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
     expect(lifecycle?.mergeGate).toMatchObject({
       status: "repair_dispatched",
       blockerFingerprint: "head-sha-1:test:failure",
@@ -2785,7 +2798,7 @@ describe("MergePolicyService", () => {
       blockerFingerprint: "head-sha-1:typecheck:missing",
       checks: [{ name: "test", outcome: "passing" }, { name: "typecheck", outcome: "missing_actionable" }],
     });
-    expect(lifecycle?.reviewVerdicts.filter((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
+    expect((lifecycle?.mergeGateResults ?? []).filter((result) => result.id === "merge-gate:issue-1:pr-42:head-sha-1")).toHaveLength(1);
   });
 
   it("dispatches distinct merge-gate writebacks when the same-head blocker fingerprint changes", async () => {
@@ -2826,7 +2839,7 @@ describe("MergePolicyService", () => {
 
     const result = await secondService.reconcileIssue(currentIssue);
     const lifecycle = await lifecycleStore.get(currentIssue.id);
-    const gateVerdict = lifecycle?.reviewVerdicts.find((verdict) => verdict.id === "merge-gate:issue-1:pr-42:head-sha-1");
+    const gateResult = lifecycle?.mergeGateResults?.find((result) => result.id === "merge-gate:issue-1:pr-42:head-sha-1");
 
     expect(result.status).toBe("repair_dispatched");
     expect(writer.transitions).toEqual([
@@ -2841,7 +2854,7 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.reviewRound).toBe(0);
     expect(lifecycle?.mergeGate?.reviewRound).toBe(1);
     expect(lifecycle?.mergeGate?.blockerFingerprint).toBe("head-sha-1:typecheck:missing");
-    expect(gateVerdict).toMatchObject({
+    expect(gateResult).toMatchObject({
       idempotencyKey: "merge-gate:issue-1:pr-42:head-sha-1:repair:head-sha-1:typecheck:missing",
       writebackOperationKeys: [
         "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_head-sha-1:repair:head-sha-1_typecheck_missing:r1",
@@ -2941,7 +2954,8 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.reviewRound).toBe(2);
     expect(lifecycle?.mergeGate?.reviewRound).toBe(3);
     expect(lifecycle?.blockedReason).toBe(blockedReason);
-    expect(lifecycle?.lastReviewVerdictId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
+    expect(lifecycle?.lastReviewVerdictId).toBe("review-verdict:issue-1:verdict-pass-1");
+    expect(lifecycle?.lastMergeGateResultId).toBe("merge-gate:issue-1:pr-42:head-sha-1");
     expect(lifecycle?.summaryPointers.ciStatus).toBe("failure");
     expect(lifecycle?.mergeGate).toMatchObject({
       status: "blocked",

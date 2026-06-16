@@ -64,6 +64,7 @@ import {
   shouldIssueTriageRun,
   sortIssueTriageBlockers,
 } from "../IssueTriageService.js";
+import { LifecycleReconciliationService } from "../LifecycleReconciliationService.js";
 import {
   issuePostMortemTriggerFingerprint,
   latestIssuePostMortemReportForFingerprint,
@@ -101,6 +102,7 @@ import { sanitizeAgentEventForPublicOutput } from "../transcript/TranscriptProje
 import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
   buildWorkerHandoffPacket,
+  isSupersededLifecycleRecord,
   latestCurrentApprovalPassVerdict,
   phaseForIssueState,
   type IssueCompletionReportRecord,
@@ -1161,6 +1163,7 @@ export class Orchestrator {
     const found = refreshed[0];
     if (!found) throw new SymphonyError("not_found", `Issue not found: ${issueIdOrIdentifier}`);
     const issue: Issue = options.state === undefined ? found : { ...found, state: options.state };
+    await this.reconcileLifecycleBeforeIssueWork(issue);
     const lifecycle = (await this.options.lifecycleStore?.get(issue.id)) ?? null;
     const selection = await this.selectPromptPreviewRun(issue, lifecycle, options);
     const metadataBase: Omit<PromptPreviewMetadata, "dispatchDecision"> = {
@@ -1308,6 +1311,25 @@ export class Orchestrator {
   private async fetchSingleIssue(issueIdOrIdentifier: string): Promise<Issue | null> {
     const refreshed = await this.options.tracker.fetchIssueStatesByIds([issueIdOrIdentifier]);
     return refreshed[0] ?? null;
+  }
+
+  private async reconcileLifecycleBeforeIssueWork(issue: Issue): Promise<void> {
+    if (!this.options.lifecycleStore) return;
+    const result = await new LifecycleReconciliationService({
+      lifecycleStore: this.options.lifecycleStore,
+    }).applyIssue(issue.id);
+    if (!result?.applied || result.actions.length === 0) return;
+    this.options.logger.info("issue lifecycle reconciled before agent work", {
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      action_count: result.actions.length,
+      actions: result.actions.map((action) => ({
+        kind: action.kind,
+        record_id: action.recordId,
+        superseded_by: action.supersededBy ?? null,
+        reason: action.reason ?? null,
+      })),
+    });
   }
 
   private async manualDispatchBlockReason(
@@ -2110,6 +2132,7 @@ export class Orchestrator {
   ): Promise<boolean> {
     const store = this.options.lifecycleStore;
     if (!store) return true;
+    await this.reconcileLifecycleBeforeIssueWork(issue);
     const lifecycle = await store.get(issue.id);
     if (!lifecycle) return true;
 
@@ -6142,9 +6165,12 @@ function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletio
 function latestReviewVerdict(lifecycle: IssueLifecycleRecord): IssueReviewVerdictRecord | null {
   if (lifecycle.lastReviewVerdictId) {
     const exact = lifecycle.reviewVerdicts.find((verdict) => verdict.id === lifecycle.lastReviewVerdictId);
-    if (exact) return exact;
+    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
   }
-  return lifecycle.reviewVerdicts[lifecycle.reviewVerdicts.length - 1] ?? null;
+  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
+    if (!isSupersededLifecycleRecord(verdict)) return verdict;
+  }
+  return null;
 }
 
 function acceptanceCriteriaForReport(report: IssueCompletionReportRecord): string[] {
@@ -6721,7 +6747,7 @@ function isUnsupersededReviewFailure(
   report: IssueCompletionReportRecord | null,
   verdict: IssueReviewVerdictRecord | null,
 ): boolean {
-  if (!verdict || verdict.verdict !== "fail" || isMergeGateVerdict(verdict)) return false;
+  if (!verdict || verdict.verdict !== "fail" || isMergeGateVerdict(verdict) || isSupersededLifecycleRecord(verdict)) return false;
   if (!report) return true;
   return Date.parse(verdict.submittedAt) >= Date.parse(report.acceptedAt);
 }
@@ -6993,7 +7019,9 @@ function formatDirectiveDiscoveryFindings(verdict: IssueReviewVerdictRecord): st
 }
 
 function reviewScopeDiscoveryLedgerLines(lifecycle: IssueLifecycleRecord): string[] {
-  const failedVerdicts = lifecycle.reviewVerdicts.filter((verdict) => !isMergeGateVerdict(verdict) && verdict.verdict === "fail");
+  const failedVerdicts = lifecycle.reviewVerdicts.filter(
+    (verdict) => !isMergeGateVerdict(verdict) && verdict.verdict === "fail" && !isSupersededLifecycleRecord(verdict),
+  );
   const discoveryFindings = failedVerdicts.flatMap((verdict) => verdict.discoveryFindings);
   const gateFindings = failedVerdicts.flatMap((verdict) => verdict.gateFindings);
   const requirementIds = sortedUnique(gateFindings.flatMap((finding) => finding.requirementIds));

@@ -3,11 +3,13 @@ import { errorMessage } from "./errors.js";
 import type {
   IssueCompletionReportRecord,
   IssueLifecycleRecord,
+  IssueMergeGateResultRecord,
   IssuePostMortemReportRecord,
   IssueReviewVerdictRecord,
   IssueTriageReportRecord,
   IssueLifecycleStore,
 } from "./persistence/IssueLifecycleStore.js";
+import { isSupersededLifecycleRecord } from "./persistence/IssueLifecycleStore.js";
 import {
   compareRunChronology,
   type RunRecord,
@@ -64,6 +66,7 @@ export interface IssueInspectionResult {
   latest: {
     completionReport: CompletionReportInspectionSummary | null;
     reviewVerdict: ReviewVerdictInspectionSummary | null;
+    mergeGateResult: MergeGateResultInspectionSummary | null;
     issueTriageReport: IssueTriageInspectionSummary | null;
     issuePostMortemReport: IssuePostMortemInspectionSummary | null;
     run: RunInspectionSummary | null;
@@ -102,11 +105,13 @@ export interface IssueLifecycleInspectionSummary {
   lastPostMortemReportId: string | null;
   lastCompletionReportId: string | null;
   lastReviewVerdictId: string | null;
+  lastMergeGateResultId: string | null;
   summaryPointers: IssueLifecycleRecord["summaryPointers"];
   counts: {
     issueBreakdownPlans: number;
     completionReports: number;
     reviewVerdicts: number;
+    mergeGateResults: number;
     reviewFeedback: number;
     issueTriageReports: number;
     postMortemReports: number;
@@ -149,6 +154,25 @@ export interface ReviewVerdictInspectionSummary {
   discoveryFindings: IssueReviewVerdictRecord["discoveryFindings"];
   unsatisfiedAcceptanceCount: number;
   evidence: string[];
+  supersededAt: string | null;
+  supersededBy: string | null;
+  supersededReason: string | null;
+}
+
+export interface MergeGateResultInspectionSummary {
+  id: string;
+  runId: string;
+  status: IssueMergeGateResultRecord["status"];
+  submittedAt: string;
+  headSha: string;
+  pullRequest: IssueMergeGateResultRecord["pullRequest"];
+  reviewRound: number;
+  blockerFingerprint: string | null;
+  findings: string[];
+  evidence: string[];
+  supersededAt: string | null;
+  supersededBy: string | null;
+  supersededReason: string | null;
 }
 
 export interface IssueTriageInspectionSummary {
@@ -161,6 +185,9 @@ export interface IssueTriageInspectionSummary {
   summary: string;
   recommendedAction: string;
   blockers: IssueTriageReportRecord["blockers"];
+  supersededAt: string | null;
+  supersededBy: string | null;
+  supersededReason: string | null;
 }
 
 export interface IssuePostMortemInspectionSummary {
@@ -302,6 +329,7 @@ export class IssueInspectionService {
       latest: {
         completionReport: completionReportSummary(latestCompletionReport(lifecycle)),
         reviewVerdict: reviewVerdictSummary(latestReviewVerdict(lifecycle)),
+        mergeGateResult: mergeGateResultSummary(latestMergeGateResult(lifecycle)),
         issueTriageReport: issueTriageSummary(latestIssueTriageReport(lifecycle)),
         issuePostMortemReport: issuePostMortemSummary(latestIssuePostMortemReport(lifecycle)),
         run: latestRun === null ? null : runSummary(latestRun),
@@ -456,18 +484,37 @@ function latestReviewVerdict(lifecycle: IssueLifecycleRecord | null): IssueRevie
   if (!lifecycle) return null;
   if (lifecycle.lastReviewVerdictId) {
     const exact = lifecycle.reviewVerdicts.find((verdict) => verdict.id === lifecycle.lastReviewVerdictId);
-    if (exact) return exact;
+    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
   }
-  return lifecycle.reviewVerdicts[lifecycle.reviewVerdicts.length - 1] ?? null;
+  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
+    if (!isSupersededLifecycleRecord(verdict)) return verdict;
+  }
+  return null;
+}
+
+function latestMergeGateResult(lifecycle: IssueLifecycleRecord | null): IssueMergeGateResultRecord | null {
+  if (!lifecycle) return null;
+  const results = lifecycle.mergeGateResults ?? [];
+  if (lifecycle.lastMergeGateResultId) {
+    const exact = results.find((result) => result.id === lifecycle.lastMergeGateResultId);
+    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
+  }
+  for (const result of results.slice().reverse()) {
+    if (!isSupersededLifecycleRecord(result)) return result;
+  }
+  return null;
 }
 
 function latestIssueTriageReport(lifecycle: IssueLifecycleRecord | null): IssueTriageReportRecord | null {
   if (!lifecycle) return null;
   if (lifecycle.lastIssueTriageReportId) {
     const exact = lifecycle.issueTriageReports.find((report) => report.id === lifecycle.lastIssueTriageReportId);
-    if (exact) return exact;
+    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
   }
-  return lifecycle.issueTriageReports[lifecycle.issueTriageReports.length - 1] ?? null;
+  for (const report of lifecycle.issueTriageReports.slice().reverse()) {
+    if (!isSupersededLifecycleRecord(report)) return report;
+  }
+  return null;
 }
 
 function latestIssuePostMortemReport(lifecycle: IssueLifecycleRecord | null): IssuePostMortemReportRecord | null {
@@ -494,11 +541,13 @@ function lifecycleSummary(lifecycle: IssueLifecycleRecord): IssueLifecycleInspec
     lastPostMortemReportId: lifecycle.lastPostMortemReportId,
     lastCompletionReportId: lifecycle.lastCompletionReportId,
     lastReviewVerdictId: lifecycle.lastReviewVerdictId,
+    lastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
     summaryPointers: lifecycle.summaryPointers,
     counts: {
       issueBreakdownPlans: lifecycle.issueBreakdownPlans.length,
       completionReports: lifecycle.completionReports.length,
       reviewVerdicts: lifecycle.reviewVerdicts.length,
+      mergeGateResults: lifecycle.mergeGateResults?.length ?? 0,
       reviewFeedback: lifecycle.reviewFeedback.length,
       issueTriageReports: lifecycle.issueTriageReports.length,
       postMortemReports: lifecycle.postMortemReports.length,
@@ -553,6 +602,28 @@ function reviewVerdictSummary(report: IssueReviewVerdictRecord | null): ReviewVe
     discoveryFindings: report.discoveryFindings,
     unsatisfiedAcceptanceCount: report.acceptanceResults.filter((item) => !item.satisfied).length,
     evidence: report.evidence,
+    supersededAt: report.supersededAt ?? null,
+    supersededBy: report.supersededBy ?? null,
+    supersededReason: report.supersededReason ?? null,
+  };
+}
+
+function mergeGateResultSummary(report: IssueMergeGateResultRecord | null): MergeGateResultInspectionSummary | null {
+  if (!report) return null;
+  return {
+    id: report.id,
+    runId: report.runId,
+    status: report.status,
+    submittedAt: report.submittedAt,
+    headSha: report.headSha,
+    pullRequest: report.pullRequest,
+    reviewRound: report.reviewRound,
+    blockerFingerprint: report.blockerFingerprint,
+    findings: report.findings,
+    evidence: report.evidence,
+    supersededAt: report.supersededAt ?? null,
+    supersededBy: report.supersededBy ?? null,
+    supersededReason: report.supersededReason ?? null,
   };
 }
 
@@ -568,6 +639,9 @@ function issueTriageSummary(report: IssueTriageReportRecord | null): IssueTriage
     summary: report.summary,
     recommendedAction: report.recommendedAction,
     blockers: report.blockers,
+    supersededAt: report.supersededAt ?? null,
+    supersededBy: report.supersededBy ?? null,
+    supersededReason: report.supersededReason ?? null,
   };
 }
 

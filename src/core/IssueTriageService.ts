@@ -13,6 +13,7 @@ import type {
   IssueTriageDisposition,
   IssueTriageReportRecord,
 } from "./persistence/IssueLifecycleStore.js";
+import { isSupersededLifecycleRecord } from "./persistence/IssueLifecycleStore.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 import { planIssueTriageReportWritebacks } from "./writeback/TransitionPolicy.js";
@@ -201,7 +202,7 @@ export class IssueTriageService {
     }
 
     const attemptsForTrigger = existingLifecycle.issueTriageReports.filter(
-      (report) => report.triggerFingerprint === parsed.triggerFingerprint,
+      (report) => report.triggerFingerprint === parsed.triggerFingerprint && !isSupersededLifecycleRecord(report),
     ).length;
     if (context.manualDispatch !== true && attemptsForTrigger >= this.options.config.issueTriage.maxAttemptsPerTrigger) {
       throw new SymphonyError("conflict", "Issue triage report already exists for this blocked trigger", {
@@ -228,6 +229,9 @@ export class IssueTriageService {
       blockers: parsed.blockers,
       submittedAt,
       writebackOperationKeys: [],
+      supersededAt: null,
+      supersededBy: null,
+      supersededReason: null,
     };
     const operations = planIssueTriageReportWritebacks(
       {
@@ -285,7 +289,9 @@ export function shouldIssueTriageRun(
   if (!config.issueTriage.enabled || !lifecycle || lifecycle.phase !== "blocked") return false;
   if (!isIssueTriageBlockedReason(lifecycle.blockedReason)) return false;
   const fingerprint = issueTriageTriggerFingerprint(lifecycle);
-  const attemptsForTrigger = lifecycle.issueTriageReports.filter((report) => report.triggerFingerprint === fingerprint).length;
+  const attemptsForTrigger = lifecycle.issueTriageReports.filter(
+    (report) => report.triggerFingerprint === fingerprint && !isSupersededLifecycleRecord(report),
+  ).length;
   return attemptsForTrigger < config.issueTriage.maxAttemptsPerTrigger;
 }
 
@@ -314,7 +320,7 @@ export function latestIssueTriageReportForFingerprint(
   if (!lifecycle) return null;
   for (let index = lifecycle.issueTriageReports.length - 1; index >= 0; index -= 1) {
     const report = lifecycle.issueTriageReports[index];
-    if (report?.triggerFingerprint === triggerFingerprint) return report;
+    if (report?.triggerFingerprint === triggerFingerprint && !isSupersededLifecycleRecord(report)) return report;
   }
   return null;
 }
@@ -325,9 +331,12 @@ export function latestIssueTriageReport(
   if (!lifecycle) return null;
   if (lifecycle.lastIssueTriageReportId) {
     const exact = lifecycle.issueTriageReports.find((report) => report.id === lifecycle.lastIssueTriageReportId);
-    if (exact) return exact;
+    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
   }
-  return lifecycle.issueTriageReports[lifecycle.issueTriageReports.length - 1] ?? null;
+  for (const report of lifecycle.issueTriageReports.slice().reverse()) {
+    if (!isSupersededLifecycleRecord(report)) return report;
+  }
+  return null;
 }
 
 export function issueTriageTriggerFingerprint(lifecycle: IssueLifecycleRecord): string {
@@ -341,6 +350,7 @@ export function issueTriageTriggerFingerprint(lifecycle: IssueLifecycleRecord): 
         incompleteTurnCount: lifecycle.incompleteTurnCount,
         lastCompletionReportId: lifecycle.lastCompletionReportId,
         lastReviewVerdictId: lifecycle.lastReviewVerdictId,
+        lastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
         mergeGate: lifecycle.mergeGate
           ? {
               id: lifecycle.mergeGate.id,
@@ -413,13 +423,14 @@ export function highestPrecedenceIssueTriageBlocker(
 }
 
 export function activeIssueTriageBlockers(
-  report: { blockers?: readonly IssueTriageBlockerRecord[] } | null | undefined,
+  report: ({ blockers?: readonly IssueTriageBlockerRecord[] } & { supersededAt?: string | null }) | null | undefined,
 ): IssueTriageBlockerRecord[] {
+  if (isSupersededLifecycleRecord(report)) return [];
   return sortIssueTriageBlockers((report?.blockers ?? []).filter((blocker) => blocker.status === "active"));
 }
 
 export function activeWorkerOwnedIssueTriageBlockers(
-  report: { blockers?: readonly IssueTriageBlockerRecord[] } | null | undefined,
+  report: ({ blockers?: readonly IssueTriageBlockerRecord[] } & { supersededAt?: string | null }) | null | undefined,
 ): IssueTriageBlockerRecord[] {
   return activeIssueTriageBlockers(report).filter((blocker) => blocker.nextActor === "worker");
 }

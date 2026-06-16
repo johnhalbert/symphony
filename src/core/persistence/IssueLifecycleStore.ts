@@ -213,7 +213,13 @@ export interface ReviewDiscoveryFindingRecord {
   ownerIssueIdentifier: string | null;
 }
 
-export interface IssueReviewVerdictRecord {
+export interface LifecycleSupersessionFields {
+  supersededAt?: string | null;
+  supersededBy?: string | null;
+  supersededReason?: string | null;
+}
+
+export interface IssueReviewVerdictRecord extends LifecycleSupersessionFields {
   id: string;
   idempotencyKey: string;
   runId: string;
@@ -296,7 +302,7 @@ export interface IssueTriageBlockerRecord {
   recommendedAction: string;
 }
 
-export interface IssueTriageReportRecord {
+export interface IssueTriageReportRecord extends LifecycleSupersessionFields {
   id: string;
   idempotencyKey: string;
   requestHash: string;
@@ -443,6 +449,28 @@ export interface IssueMergeGateState {
   updatedAt: string;
 }
 
+export type IssueMergeGateResultStatus = "repair_dispatched" | "blocked";
+
+export interface IssueMergeGateResultRecord extends LifecycleSupersessionFields {
+  id: string;
+  idempotencyKey: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  status: IssueMergeGateResultStatus;
+  headSha: string;
+  pullRequest: CompletionReportPullRequestRef;
+  requiredChecks: string[];
+  checks: IssueMergeGateCheckState[];
+  mergeability: IssueMergeGateMergeabilityState | null;
+  reviewRound: number;
+  blockerFingerprint: string | null;
+  findings: string[];
+  evidence: string[];
+  submittedAt: string;
+  writebackOperationKeys: string[];
+}
+
 export type IssueMergeConflictResolutionStatus = "pending" | "still_conflicted" | "resolved" | "blocked";
 
 export interface IssueMergeConflictServicePreparation {
@@ -580,12 +608,14 @@ export interface IssueLifecycleRecord {
   lastPostMortemReportId: string | null;
   lastCompletionReportId: string | null;
   lastReviewVerdictId: string | null;
+  lastMergeGateResultId?: string | null;
   blockedReason: string | null;
   summaryPointers: IssueLifecycleSummaryPointers;
   summaryReferences: IssueLifecycleSummaryReference[];
   issueBreakdownPlans: IssueBreakdownPlanRecord[];
   completionReports: IssueCompletionReportRecord[];
   reviewVerdicts: IssueReviewVerdictRecord[];
+  mergeGateResults?: IssueMergeGateResultRecord[];
   reviewFeedback: IssueReviewFeedbackRecord[];
   issueTriageReports: IssueTriageReportRecord[];
   postMortemReports: IssuePostMortemReportRecord[];
@@ -612,12 +642,14 @@ export interface IssueLifecyclePatch {
   lastPostMortemReportId?: string | null;
   lastCompletionReportId?: string | null;
   lastReviewVerdictId?: string | null;
+  lastMergeGateResultId?: string | null;
   blockedReason?: string | null;
   summaryPointers?: Partial<IssueLifecycleSummaryPointers>;
   summaryReferences?: IssueLifecycleSummaryReference[];
   issueBreakdownPlans?: IssueBreakdownPlanRecord[];
   completionReports?: IssueCompletionReportRecord[];
   reviewVerdicts?: IssueReviewVerdictRecord[];
+  mergeGateResults?: IssueMergeGateResultRecord[];
   reviewFeedback?: IssueReviewFeedbackRecord[];
   issueTriageReports?: IssueTriageReportRecord[];
   postMortemReports?: IssuePostMortemReportRecord[];
@@ -678,6 +710,7 @@ export class FileIssueLifecycleStore {
       ),
       lastCompletionReportId: patchValue(patch, "lastCompletionReportId", existing?.lastCompletionReportId ?? null),
       lastReviewVerdictId: patchValue(patch, "lastReviewVerdictId", existing?.lastReviewVerdictId ?? null),
+      lastMergeGateResultId: patchValue(patch, "lastMergeGateResultId", existing?.lastMergeGateResultId ?? null),
       blockedReason: patchValue(patch, "blockedReason", existing?.blockedReason ?? null),
       summaryPointers: {
         ...defaultSummaryPointers(),
@@ -688,6 +721,7 @@ export class FileIssueLifecycleStore {
       issueBreakdownPlans: patch.issueBreakdownPlans ?? existing?.issueBreakdownPlans ?? [],
       completionReports: patch.completionReports ?? existing?.completionReports ?? [],
       reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
+      mergeGateResults: patch.mergeGateResults ?? existing?.mergeGateResults ?? [],
       reviewFeedback: patch.reviewFeedback ?? existing?.reviewFeedback ?? [],
       issueTriageReports: patch.issueTriageReports ?? existing?.issueTriageReports ?? [],
       postMortemReports: patch.postMortemReports ?? existing?.postMortemReports ?? [],
@@ -780,6 +814,10 @@ export function phaseForIssueState(state: string, config: ServiceConfig): IssueL
   if (isStateIn(state, config.tracker.terminalStates)) return "terminal";
   if (isStateIn(state, config.tracker.activeStates)) return "implementation";
   return "unknown";
+}
+
+export function isSupersededLifecycleRecord(record: LifecycleSupersessionFields | null | undefined): boolean {
+  return typeof record?.supersededAt === "string" && record.supersededAt.trim().length > 0;
 }
 
 export function buildWorkerHandoffPacket(
@@ -888,6 +926,7 @@ export function latestCurrentApprovalPassVerdict(
   const pullRequest = currentPullRequestForReview(record);
   if (!pullRequest) return latestHumanPassVerdict(record);
   for (const verdict of record.reviewVerdicts.slice().reverse()) {
+    if (isSupersededLifecycleRecord(verdict)) continue;
     if (!isHumanPassVerdictForIssue(record, verdict)) continue;
     if (hasApprovalFeedback(record, verdict, pullRequest) || !hasAnyApprovalFeedbackForRun(record, verdict)) return verdict;
   }
@@ -898,9 +937,13 @@ function latestReviewVerdict(
   record: Pick<IssueLifecycleRecord, "reviewVerdicts" | "lastReviewVerdictId">,
 ): IssueReviewVerdictRecord | null {
   if (record.lastReviewVerdictId) {
-    return record.reviewVerdicts.find((verdict) => verdict.id === record.lastReviewVerdictId) ?? null;
+    const exact = record.reviewVerdicts.find((verdict) => verdict.id === record.lastReviewVerdictId);
+    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
   }
-  return record.reviewVerdicts.at(-1) ?? null;
+  for (const verdict of record.reviewVerdicts.slice().reverse()) {
+    if (!isSupersededLifecycleRecord(verdict)) return verdict;
+  }
+  return null;
 }
 
 function latestHumanReviewVerdict(
@@ -919,6 +962,7 @@ function latestHumanReviewVerdict(
   const pointed = latestReviewVerdict(record);
   if (pointed && !isMergeGateVerdict(pointed) && isCurrentHumanVerdict(record, pointed)) return pointed;
   for (const verdict of record.reviewVerdicts.slice().reverse()) {
+    if (isSupersededLifecycleRecord(verdict)) continue;
     if (!isMergeGateVerdict(verdict) && isCurrentHumanVerdict(record, verdict)) return verdict;
   }
   return null;
@@ -928,6 +972,7 @@ function latestHumanPassVerdict(
   record: Pick<IssueLifecycleRecord, "issueId" | "issueIdentifier" | "reviewVerdicts">,
 ): IssueReviewVerdictRecord | null {
   for (const verdict of record.reviewVerdicts.slice().reverse()) {
+    if (isSupersededLifecycleRecord(verdict)) continue;
     if (isHumanPassVerdictForIssue(record, verdict)) return verdict;
   }
   return null;
@@ -958,6 +1003,7 @@ function isHumanPassVerdictForIssue(
   return (
     verdict.verdict === "pass" &&
     !isMergeGateVerdict(verdict) &&
+    !isSupersededLifecycleRecord(verdict) &&
     verdict.issueId === record.issueId &&
     verdict.issueIdentifier === record.issueIdentifier
   );
@@ -1158,12 +1204,17 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
         : nullableString(value.lastPostMortemReportId, filePath, "lastPostMortemReportId"),
     lastCompletionReportId: nullableString(value.lastCompletionReportId, filePath, "lastCompletionReportId"),
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
+    lastMergeGateResultId:
+      value.lastMergeGateResultId === undefined
+        ? null
+        : nullableString(value.lastMergeGateResultId, filePath, "lastMergeGateResultId"),
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
     summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath),
     summaryReferences: normalizeSummaryReferences(value.summaryReferences, filePath),
     issueBreakdownPlans: normalizeIssueBreakdownPlans(value.issueBreakdownPlans, filePath),
     completionReports: normalizeCompletionReports(value.completionReports, filePath),
     reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
+    mergeGateResults: normalizeMergeGateResults(value.mergeGateResults, filePath),
     reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
     issueTriageReports: normalizeIssueTriageReports(value.issueTriageReports, filePath),
     postMortemReports: normalizePostMortemReports(value.postMortemReports, filePath),
@@ -1402,6 +1453,12 @@ function normalizeReviewVerdicts(value: unknown, filePath: string): IssueReviewV
   return value.map((item, index) => normalizeReviewVerdict(item, filePath, index));
 }
 
+function normalizeMergeGateResults(value: unknown, filePath: string): IssueMergeGateResultRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "mergeGateResults is invalid");
+  return value.map((item, index) => normalizeMergeGateResult(item, filePath, index));
+}
+
 function normalizeReviewFeedback(value: unknown, filePath: string): IssueReviewFeedbackRecord[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewFeedback is invalid");
@@ -1636,6 +1693,33 @@ function normalizeReviewVerdict(value: unknown, filePath: string, index: number)
     reviewer: nullableString(value.reviewer, filePath, `reviewVerdicts[${index}].reviewer`),
     submittedAt: requiredString(value.submittedAt, filePath, `reviewVerdicts[${index}].submittedAt`),
     writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, `reviewVerdicts[${index}].writebackOperationKeys`),
+    ...normalizeSupersessionFields(value, filePath, `reviewVerdicts[${index}]`),
+  };
+}
+
+function normalizeMergeGateResult(value: unknown, filePath: string, index: number): IssueMergeGateResultRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `mergeGateResults[${index}] is invalid`);
+  const status = value.status;
+  if (!isMergeGateResultStatus(status)) throw corruptLifecycle(filePath, `mergeGateResults[${index}].status is invalid`);
+  return {
+    id: requiredString(value.id, filePath, `mergeGateResults[${index}].id`),
+    idempotencyKey: requiredString(value.idempotencyKey, filePath, `mergeGateResults[${index}].idempotencyKey`),
+    runId: requiredString(value.runId, filePath, `mergeGateResults[${index}].runId`),
+    issueId: requiredString(value.issueId, filePath, `mergeGateResults[${index}].issueId`),
+    issueIdentifier: requiredString(value.issueIdentifier, filePath, `mergeGateResults[${index}].issueIdentifier`),
+    status,
+    headSha: requiredString(value.headSha, filePath, `mergeGateResults[${index}].headSha`),
+    pullRequest: normalizeMergeGatePullRequest(value.pullRequest, filePath),
+    requiredChecks: requiredStringArray(value.requiredChecks, filePath, `mergeGateResults[${index}].requiredChecks`),
+    checks: normalizeMergeGateChecks(value.checks, filePath, `mergeGateResults[${index}].checks`),
+    mergeability: normalizeMergeGateMergeability(value.mergeability, filePath, `mergeGateResults[${index}].mergeability`),
+    reviewRound: nonNegativeInteger(value.reviewRound, filePath, `mergeGateResults[${index}].reviewRound`),
+    blockerFingerprint: optionalNullableString(value.blockerFingerprint, filePath, `mergeGateResults[${index}].blockerFingerprint`),
+    findings: requiredStringArray(value.findings, filePath, `mergeGateResults[${index}].findings`),
+    evidence: requiredStringArray(value.evidence, filePath, `mergeGateResults[${index}].evidence`),
+    submittedAt: requiredString(value.submittedAt, filePath, `mergeGateResults[${index}].submittedAt`),
+    writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, `mergeGateResults[${index}].writebackOperationKeys`),
+    ...normalizeSupersessionFields(value, filePath, `mergeGateResults[${index}]`),
   };
 }
 
@@ -1729,6 +1813,7 @@ function normalizeIssueTriageReport(value: unknown, filePath: string, index: num
       value.writebackOperationKeys === undefined
         ? []
         : requiredStringArray(value.writebackOperationKeys, filePath, `issueTriageReports[${index}].writebackOperationKeys`),
+    ...normalizeSupersessionFields(value, filePath, `issueTriageReports[${index}]`),
   };
 }
 
@@ -2154,8 +2239,8 @@ function normalizeMergeGateState(value: unknown, filePath: string): IssueMergeGa
     headSha: requiredString(value.headSha, filePath, "mergeGate.headSha"),
     pullRequest: normalizeMergeGatePullRequest(value.pullRequest, filePath),
     requiredChecks: requiredStringArray(value.requiredChecks, filePath, "mergeGate.requiredChecks"),
-    checks: normalizeMergeGateChecks(value.checks, filePath),
-    mergeability: normalizeMergeGateMergeability(value.mergeability, filePath),
+    checks: normalizeMergeGateChecks(value.checks, filePath, "mergeGate.checks"),
+    mergeability: normalizeMergeGateMergeability(value.mergeability, filePath, "mergeGate.mergeability"),
     reviewRound: nonNegativeInteger(value.reviewRound, filePath, "mergeGate.reviewRound"),
     gateRunId: optionalNullableString(value.gateRunId, filePath, "mergeGate.gateRunId"),
     gateReportId: optionalNullableString(value.gateReportId, filePath, "mergeGate.gateReportId"),
@@ -2168,45 +2253,49 @@ function normalizeMergeGateState(value: unknown, filePath: string): IssueMergeGa
   };
 }
 
-function normalizeMergeGateChecks(value: unknown, filePath: string): IssueMergeGateCheckState[] {
-  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "mergeGate.checks is invalid");
+function normalizeMergeGateChecks(value: unknown, filePath: string, fieldPath: string): IssueMergeGateCheckState[] {
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, `${fieldPath} is invalid`);
   return value.map((item, index) => {
-    if (!isRecord(item)) throw corruptLifecycle(filePath, `mergeGate.checks[${index}] is invalid`);
+    if (!isRecord(item)) throw corruptLifecycle(filePath, `${fieldPath}[${index}] is invalid`);
     const outcome = item.outcome;
-    if (!isMergeGateCheckOutcome(outcome)) throw corruptLifecycle(filePath, `mergeGate.checks[${index}].outcome is invalid`);
+    if (!isMergeGateCheckOutcome(outcome)) throw corruptLifecycle(filePath, `${fieldPath}[${index}].outcome is invalid`);
     const rawStatus = item.rawStatus;
-    if (!isMergeGateRawCheckStatus(rawStatus)) throw corruptLifecycle(filePath, `mergeGate.checks[${index}].rawStatus is invalid`);
+    if (!isMergeGateRawCheckStatus(rawStatus)) throw corruptLifecycle(filePath, `${fieldPath}[${index}].rawStatus is invalid`);
     return {
-      name: requiredString(item.name, filePath, `mergeGate.checks[${index}].name`),
+      name: requiredString(item.name, filePath, `${fieldPath}[${index}].name`),
       outcome,
       rawStatus,
-      conclusion: optionalNullableString(item.conclusion, filePath, `mergeGate.checks[${index}].conclusion`),
-      url: optionalNullableString(item.url, filePath, `mergeGate.checks[${index}].url`),
-      firstObservedAt: optionalNullableString(item.firstObservedAt, filePath, `mergeGate.checks[${index}].firstObservedAt`),
-      actionableSince: optionalNullableString(item.actionableSince, filePath, `mergeGate.checks[${index}].actionableSince`),
+      conclusion: optionalNullableString(item.conclusion, filePath, `${fieldPath}[${index}].conclusion`),
+      url: optionalNullableString(item.url, filePath, `${fieldPath}[${index}].url`),
+      firstObservedAt: optionalNullableString(item.firstObservedAt, filePath, `${fieldPath}[${index}].firstObservedAt`),
+      actionableSince: optionalNullableString(item.actionableSince, filePath, `${fieldPath}[${index}].actionableSince`),
     };
   });
 }
 
-function normalizeMergeGateMergeability(value: unknown, filePath: string): IssueMergeGateMergeabilityState | null {
+function normalizeMergeGateMergeability(
+  value: unknown,
+  filePath: string,
+  fieldPath: string,
+): IssueMergeGateMergeabilityState | null {
   if (value === undefined || value === null) return null;
-  if (!isRecord(value)) throw corruptLifecycle(filePath, "mergeGate.mergeability is invalid");
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `${fieldPath} is invalid`);
   const status = value.status;
-  if (!isMergeGateMergeabilityStatus(status)) throw corruptLifecycle(filePath, "mergeGate.mergeability.status is invalid");
+  if (!isMergeGateMergeabilityStatus(status)) throw corruptLifecycle(filePath, `${fieldPath}.status is invalid`);
   return {
     status,
     pullRequest: normalizeMergeGatePullRequest(value.pullRequest, filePath),
-    mergeable: optionalNullableBoolean(value.mergeable, filePath, "mergeGate.mergeability.mergeable"),
-    mergeableState: optionalNullableString(value.mergeableState, filePath, "mergeGate.mergeability.mergeableState"),
-    reason: optionalNullableString(value.reason, filePath, "mergeGate.mergeability.reason"),
-    baseBranch: optionalNullableString(value.baseBranch, filePath, "mergeGate.mergeability.baseBranch"),
-    baseHeadSha: optionalNullableString(value.baseHeadSha, filePath, "mergeGate.mergeability.baseHeadSha"),
+    mergeable: optionalNullableBoolean(value.mergeable, filePath, `${fieldPath}.mergeable`),
+    mergeableState: optionalNullableString(value.mergeableState, filePath, `${fieldPath}.mergeableState`),
+    reason: optionalNullableString(value.reason, filePath, `${fieldPath}.reason`),
+    baseBranch: optionalNullableString(value.baseBranch, filePath, `${fieldPath}.baseBranch`),
+    baseHeadSha: optionalNullableString(value.baseHeadSha, filePath, `${fieldPath}.baseHeadSha`),
     observedBaseHeadSha: optionalNullableString(
       value.observedBaseHeadSha,
       filePath,
-      "mergeGate.mergeability.observedBaseHeadSha",
+      `${fieldPath}.observedBaseHeadSha`,
     ),
-    checkedAt: requiredString(value.checkedAt, filePath, "mergeGate.mergeability.checkedAt"),
+    checkedAt: requiredString(value.checkedAt, filePath, `${fieldPath}.checkedAt`),
   };
 }
 
@@ -2685,6 +2774,18 @@ function optionalNullableString(value: unknown, filePath: string, field: string)
   return nullableString(value, filePath, field);
 }
 
+function normalizeSupersessionFields(
+  value: Record<string, unknown>,
+  filePath: string,
+  field: string,
+): Required<LifecycleSupersessionFields> {
+  return {
+    supersededAt: optionalNullableString(value.supersededAt, filePath, `${field}.supersededAt`),
+    supersededBy: optionalNullableString(value.supersededBy, filePath, `${field}.supersededBy`),
+    supersededReason: optionalNullableString(value.supersededReason, filePath, `${field}.supersededReason`),
+  };
+}
+
 function nullableNumber(value: unknown, filePath: string, field: string): number | null {
   if (value === null) return null;
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -2746,6 +2847,10 @@ function isMergeGateStatus(value: unknown): value is IssueMergeGateStatus {
     value === "resolved" ||
     value === "superseded"
   );
+}
+
+function isMergeGateResultStatus(value: unknown): value is IssueMergeGateResultStatus {
+  return value === "repair_dispatched" || value === "blocked";
 }
 
 function isMergeGateMergeabilityStatus(value: unknown): value is IssueMergeGateMergeabilityStatus {

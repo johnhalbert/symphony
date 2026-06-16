@@ -11,6 +11,7 @@ export * from "./core/harness/HarnessFactory.js";
 export * from "./core/harness/MergeConflictResolutionMcpServer.js";
 export * from "./core/harness/ReviewFeedbackMcpServer.js";
 export * from "./core/IssueInspectionService.js";
+export * from "./core/LifecycleReconciliationService.js";
 export * from "./core/logging/StructuredLogger.js";
 export * from "./core/MergeConflictResolutionService.js";
 export * from "./core/merge/MergePolicyService.js";

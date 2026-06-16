@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { Command } from "commander";
 import { StatusServer } from "./app/http.js";
 import { parseDatabaseConfig, type DatabaseConfig, type ServiceConfig } from "./core/config/Config.js";
+import { SymphonyError } from "./core/errors.js";
 import { createAgentHarness } from "./core/harness/HarnessFactory.js";
 import { StructuredLogger } from "./core/logging/StructuredLogger.js";
 import {
@@ -19,6 +20,11 @@ import {
   IssueInspectionService,
   type IssueInspectionResult,
 } from "./core/IssueInspectionService.js";
+import {
+  LifecycleReconciliationService,
+  type LifecycleReconciliationApplyResult,
+  type LifecycleReconciliationResult,
+} from "./core/LifecycleReconciliationService.js";
 import { FileIssueLifecycleStore } from "./core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureDiagnosticsStore.js";
 import { FileOrchestratorConversationStore } from "./core/persistence/OrchestratorConversationStore.js";
@@ -461,6 +467,51 @@ issueCommand
     },
   );
 
+issueCommand
+  .command("reconcile-lifecycle")
+  .description("Preview or apply lifecycle cleanup for superseded review, triage, and merge-gate records")
+  .argument("[issueOrWorkflow]", "issue id or identifier, or workflow path when --all is used")
+  .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
+  .option("--all", "reconcile every lifecycle record in the workflow state directory")
+  .option("--apply", "write lifecycle cleanup changes; default is dry-run")
+  .option("--json", "print JSON result")
+  .action(
+    async (
+      issueOrWorkflow: string | undefined,
+      workflowArg: string,
+      options: { all?: boolean; apply?: boolean; json?: boolean },
+    ) => {
+      const all = options.all === true;
+      const issue = all ? null : issueOrWorkflow ?? null;
+      const workflow = all ? issueOrWorkflow ?? workflowArg : workflowArg;
+      if (!all && issue === null) {
+        throw new SymphonyError("invalid_request", "issue reconcile-lifecycle requires an issue id or --all");
+      }
+      const workflowPath = path.resolve(process.cwd(), workflow);
+      const loader = new WorkflowLoader(workflowPath);
+      const loaded = await loader.load();
+      const lifecycleStore = new FileIssueLifecycleStore(loaded.serviceConfig.workspace.stateDir);
+      const service = new LifecycleReconciliationService({ lifecycleStore });
+      try {
+        const result = all
+          ? options.apply === true
+            ? await service.applyAll()
+            : await service.previewAll()
+          : options.apply === true
+            ? await service.applyIssue(issue as string)
+            : await service.previewIssue(issue as string);
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(formatLifecycleReconciliationResult(result, { all, applied: options.apply === true }));
+        }
+        if (result === null || (Array.isArray(result) && result.length === 0)) process.exitCode = 2;
+      } finally {
+        await loader.close();
+      }
+    },
+  );
+
 program
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
   .option("--port <port>", "enable local HTTP status server on this port")
@@ -709,6 +760,7 @@ function formatIssueInspectionResult(result: IssueInspectionResult): string {
     "Latest Signals",
     `  Completion: ${formatCompletionSignal(result)}`,
     `  Review: ${formatReviewSignal(result)}`,
+    `  Merge gate result: ${formatMergeGateResultSignal(result)}`,
     `  Triage: ${formatTriageSignal(result)}`,
     `  Post-mortem: ${formatPostMortemSignal(result)}`,
     `  Run: ${formatRunSignal(result)}`,
@@ -731,6 +783,36 @@ function formatIssueInspectionResult(result: IssueInspectionResult): string {
     "Eligibility",
     ...formatEligibility(result.eligibility),
   ];
+  return lines.join("\n");
+}
+
+function formatLifecycleReconciliationResult(
+  result: LifecycleReconciliationResult | LifecycleReconciliationApplyResult | LifecycleReconciliationResult[] | LifecycleReconciliationApplyResult[] | null,
+  options: { all: boolean; applied: boolean },
+): string {
+  if (result === null) return "No lifecycle record found.";
+  const results = Array.isArray(result) ? result : [result];
+  const changed = results.filter((item) => item.changed);
+  const appliedCount = results.filter((item) => "applied" in item && item.applied).length;
+  const lines = [
+    `Lifecycle reconciliation ${options.applied ? "apply" : "dry-run"}${options.all ? " for all issues" : ""}`,
+    `  Scanned: ${results.length}`,
+    `  Changed: ${changed.length}`,
+    ...(options.applied ? [`  Applied: ${appliedCount}`] : []),
+  ];
+  if (changed.length === 0) {
+    lines.push("  No lifecycle cleanup needed.");
+    return lines.join("\n");
+  }
+  for (const item of changed) {
+    lines.push("", `${item.issueIdentifier} (${item.issueId})`);
+    for (const action of item.actions) {
+      lines.push(
+        `  - ${action.kind}: ${action.recordId}${action.supersededBy ? ` -> ${action.supersededBy}` : ""}${action.reason ? ` (${action.reason})` : ""}`,
+      );
+      lines.push(`    ${oneLineCli(action.detail)}`);
+    }
+  }
   return lines.join("\n");
 }
 
@@ -764,6 +846,12 @@ function formatReviewSignal(result: IssueInspectionResult): string {
   const verdict = result.latest.reviewVerdict;
   if (!verdict) return "none";
   return `${verdict.id} ${verdict.verdict} run=${verdict.runId} submittedAt=${verdict.submittedAt}; gate=${verdict.gateFindings.length} discovery=${verdict.discoveryFindings.length} unsatisfied=${verdict.unsatisfiedAcceptanceCount}`;
+}
+
+function formatMergeGateResultSignal(result: IssueInspectionResult): string {
+  const mergeGate = result.latest.mergeGateResult;
+  if (!mergeGate) return "none";
+  return `${mergeGate.id} ${mergeGate.status} run=${mergeGate.runId} submittedAt=${mergeGate.submittedAt}; head=${mergeGate.headSha}; findings=${mergeGate.findings.length}`;
 }
 
 function formatTriageSignal(result: IssueInspectionResult): string {

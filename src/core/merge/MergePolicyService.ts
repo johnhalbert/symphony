@@ -23,9 +23,10 @@ import type {
   IssueMergeConflictMetadata,
   IssueMergeMetadata,
   IssueMergeGateState,
+  IssueMergeGateResultRecord,
   IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
-import { latestCurrentApprovalPassVerdict } from "../persistence/IssueLifecycleStore.js";
+import { isSupersededLifecycleRecord, latestCurrentApprovalPassVerdict } from "../persistence/IssueLifecycleStore.js";
 import type { RunRecord, RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import type { Issue } from "../types.js";
@@ -52,6 +53,8 @@ import {
 } from "./ServiceOwnedMergeConflictGit.js";
 
 const MERGE_GATE_REVIEWER = "symphony-merge-gate";
+
+type MergeGateFailureRecord = Pick<IssueMergeGateResultRecord | IssueReviewVerdictRecord, "id" | "submittedAt" | "writebackOperationKeys">;
 
 export interface MergePolicyGitHubClient {
   getPullRequest(input: { pullRequestNumber: number }): Promise<PullRequestDetails>;
@@ -197,7 +200,7 @@ export class MergePolicyService {
     }
 
     const approvalVerdict = latestMergeApprovalPassVerdict(activeLifecycle, resolvedConflict !== null);
-    const existingGateVerdict = findMergeGateVerdict(activeLifecycle, gateId);
+    const existingGateFailure = findMergeGateFailure(activeLifecycle, gateId);
     const checkDecision = await this.evaluateChecks(github, headSha, pullRequest, gateId, activeLifecycle);
     const decision = mergeGateDecisionWithMergeability(
       checkDecision,
@@ -228,14 +231,15 @@ export class MergePolicyService {
         }
       }
     }
-    if (existingGateVerdict && decision.kind === "failure") {
+    if (existingGateFailure && decision.kind === "failure") {
       if (shouldRefreshSameMergeGateBlocker(activeLifecycle, decision.gate)) {
-        const refreshedMergeGate = refreshActiveMergeGateObservation(activeLifecycle, decision.gate, existingGateVerdict.writebackOperationKeys);
+        const refreshedMergeGate = refreshActiveMergeGateObservation(activeLifecycle, decision.gate, existingGateFailure.writebackOperationKeys);
         if (refreshedMergeGate) {
           const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
             phase: activeLifecycle.phase,
             blockedReason: refreshedMergeGate.status === "blocked" ? activeLifecycle.blockedReason : null,
             lastReviewVerdictId: refreshedActiveGateLastReviewVerdictId(activeLifecycle, refreshedMergeGate),
+            lastMergeGateResultId: existingGateFailure.id,
             mergeGate: refreshedMergeGate,
             summaryPointers: { ciStatus: "failure" },
           });
@@ -247,20 +251,21 @@ export class MergePolicyService {
         }
         return {
           status: activeLifecycle.mergeGate?.status === "blocked" ? "blocked" : "repair_dispatched",
-          gate: { ...decision.gate, writebackOperationKeys: activeLifecycle.mergeGate?.writebackOperationKeys ?? existingGateVerdict.writebackOperationKeys },
+          gate: { ...decision.gate, writebackOperationKeys: activeLifecycle.mergeGate?.writebackOperationKeys ?? existingGateFailure.writebackOperationKeys },
         };
       }
-      return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, existingGateVerdict);
+      return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, existingGateFailure);
     }
     if (decision.kind === "pending") {
-      const refreshedMergeGate = refreshActiveMergeGateObservation(activeLifecycle, decision.gate, existingGateVerdict?.writebackOperationKeys ?? []);
+      const refreshedMergeGate = refreshActiveMergeGateObservation(activeLifecycle, decision.gate, existingGateFailure?.writebackOperationKeys ?? []);
       if (refreshedMergeGate) {
         const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
-          phase: activeLifecycle.phase,
-          blockedReason: refreshedMergeGate.status === "blocked" ? activeLifecycle.blockedReason : null,
-          lastReviewVerdictId: refreshedActiveGateLastReviewVerdictId(activeLifecycle, refreshedMergeGate),
-          mergeGate: refreshedMergeGate,
-          summaryPointers: { ciStatus: "failure" },
+        phase: activeLifecycle.phase,
+        blockedReason: refreshedMergeGate.status === "blocked" ? activeLifecycle.blockedReason : null,
+        lastReviewVerdictId: refreshedActiveGateLastReviewVerdictId(activeLifecycle, refreshedMergeGate),
+        lastMergeGateResultId: existingGateFailure?.id ?? activeLifecycle.lastMergeGateResultId ?? null,
+        mergeGate: refreshedMergeGate,
+        summaryPointers: { ciStatus: "failure" },
         });
         const gate = updated.mergeGate ?? refreshedMergeGate;
         return {
@@ -272,7 +277,7 @@ export class MergePolicyService {
         phase: activeLifecycle.phase,
         blockedReason: null,
         lastReviewVerdictId:
-          existingGateVerdict && approvalVerdict && activeLifecycle.lastReviewVerdictId === existingGateVerdict.id
+          existingGateFailure && approvalVerdict && activeLifecycle.lastReviewVerdictId === existingGateFailure.id
             ? approvalVerdict.id
             : activeLifecycle.lastReviewVerdictId,
         mergeGate: mergeGateStateFromStatus(decision.gate, "observing", activeLifecycle, null, null),
@@ -288,7 +293,7 @@ export class MergePolicyService {
       verdict &&
       activeLifecycle.mergeGate?.id === gateId &&
       activeLifecycle.mergeGate.status === "blocked" &&
-      (existingGateVerdict || activeLifecycle.mergeGate?.id === gateId) &&
+      (existingGateFailure || activeLifecycle.mergeGate?.id === gateId) &&
       canAutoResolveMergeGateOnCheckPass(activeLifecycle, gateId)
     ) {
       activeLifecycle = await this.options.lifecycleStore.updateIssue(latestIssue, {
@@ -305,7 +310,7 @@ export class MergePolicyService {
       verdict &&
       activeLifecycle.mergeGate?.id === gateId &&
       isActiveMergeGate(activeLifecycle.mergeGate) &&
-      (existingGateVerdict || activeLifecycle.mergeGate?.id === gateId) &&
+      (existingGateFailure || activeLifecycle.mergeGate?.id === gateId) &&
       canAutoResolveMergeGateOnCheckPass(activeLifecycle, gateId)
     ) {
       const inactiveGatePatch =
@@ -410,13 +415,10 @@ export class MergePolicyService {
     report: IssueCompletionReportRecord,
     gate: MergeGateStatus,
     sourceState: string,
-    existingVerdict: IssueReviewVerdictRecord | null,
+    existingFailure: MergeGateFailureRecord | null,
   ): Promise<MergePolicyResult> {
     const approvalVerdict = latestCurrentApprovalPassVerdict(lifecycle);
-    const newRepairCycle =
-      existingVerdict === null ||
-      lifecycle.phase === "passed" ||
-      (approvalVerdict !== null && lifecycle.lastReviewVerdictId === approvalVerdict.id);
+    const newRepairCycle = existingFailure === null || lifecycle.phase === "passed";
     const previousMergeGateRound = previousMergeGateRepairRound(lifecycle, gate);
     const reviewRound = newRepairCycle ? previousMergeGateRound + 1 : previousMergeGateRound;
     const maxMergeGateFailures = this.options.config.reviewLoop.failureLimits.mergeGateFailures;
@@ -433,37 +435,35 @@ export class MergePolicyService {
 
     const blockerKind = blocked ? "blocked" : "repair";
     const operationKeys = operations.map((operation) => operation.idempotencyKey);
-    const storedVerdict: IssueReviewVerdictRecord = {
+    const storedResult: IssueMergeGateResultRecord = {
       id: gate.id,
-      idempotencyKey: mergeGateVerdictIdempotencyKey(gate, blockerKind),
+      idempotencyKey: mergeGateResultIdempotencyKey(gate, blockerKind),
       runId: report.runId,
       issueId: issue.id,
       issueIdentifier: issue.identifier,
-      verdict: "fail",
-      acceptanceResults: [
-        {
-          text: "Required checks are passing and the pull request is mergeable before gated merge",
-          satisfied: false,
-          evidence: mergeGateEvidence(gate).join("; "),
-        },
-      ],
-      findings: mergeGateFindings(gate),
-      gateFindings: mergeGateFindings(gate).map((finding) => ({
-        summary: finding,
-        requirementIds: [],
-        contractAnchor: "Merge gate policy",
-        scenario: "Lifecycle-bound pull request merge gate",
-        scenarioEntitlement: "necessary_core_behavior",
-        observedFailure: finding,
-        currentIssueOwnership: "The current issue owns clearing its lifecycle-bound merge gate.",
-        boundedRepair: "Repair the failing or missing merge-gate checks for the current pull request head.",
-        evidence: mergeGateEvidence(gate),
+      status: blocked ? "blocked" : "repair_dispatched",
+      headSha: gate.headSha,
+      pullRequest: gate.pullRequest,
+      requiredChecks: [...gate.requiredChecks],
+      checks: gate.checks.map((check) => ({
+        name: check.name,
+        outcome: check.outcome,
+        rawStatus: check.rawStatus,
+        conclusion: check.conclusion,
+        url: check.url,
+        firstObservedAt: check.firstObservedAt,
+        actionableSince: check.actionableSince,
       })),
-      discoveryFindings: [],
+      mergeability: gate.mergeability,
+      reviewRound,
+      blockerFingerprint: gate.blockerFingerprint,
+      findings: mergeGateFindings(gate),
       evidence: mergeGateEvidence(gate),
-      reviewer: MERGE_GATE_REVIEWER,
       submittedAt: new Date().toISOString(),
       writebackOperationKeys: operationKeys,
+      supersededAt: null,
+      supersededBy: null,
+      supersededReason: null,
     };
 
     await this.options.lifecycleStore.updateIssue(issue, {
@@ -474,8 +474,9 @@ export class MergePolicyService {
           ? "merge_policy.conflicts_state is required before Symphony can prepare a service-owned merge-conflict repair"
           : `max merge gate failures reached (${reviewRound}/${maxMergeGateFailures})`
         : null,
-      lastReviewVerdictId: storedVerdict.id,
-      reviewVerdicts: upsertMergeGateVerdict(lifecycle.reviewVerdicts, storedVerdict),
+      lastReviewVerdictId: approvalVerdict?.id ?? lifecycle.lastReviewVerdictId,
+      lastMergeGateResultId: storedResult.id,
+      mergeGateResults: upsertMergeGateResult(lifecycle.mergeGateResults ?? [], storedResult),
       mergeGate: mergeGateStateFromStatus(
         { ...gate, writebackOperationKeys: operationKeys },
         blocked ? "blocked" : "repair_dispatched",
@@ -810,7 +811,12 @@ function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletio
   return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
 }
 
-function findMergeGateVerdict(lifecycle: IssueLifecycleRecord, gateId: string): IssueReviewVerdictRecord | null {
+function findMergeGateFailure(lifecycle: IssueLifecycleRecord, gateId: string): MergeGateFailureRecord | null {
+  const result =
+    (lifecycle.mergeGateResults ?? []).find(
+      (item) => item.id === gateId && !isSupersededLifecycleRecord(item),
+    ) ?? null;
+  if (result) return result;
   return lifecycle.reviewVerdicts.find((verdict) => verdict.id === gateId && isMergeGateVerdict(verdict)) ?? null;
 }
 
@@ -818,12 +824,12 @@ export function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {
   return verdict.reviewer === MERGE_GATE_REVIEWER || verdict.id.startsWith("merge-gate:");
 }
 
-function upsertMergeGateVerdict(
-  verdicts: IssueReviewVerdictRecord[],
-  mergeGateVerdict: IssueReviewVerdictRecord,
-): IssueReviewVerdictRecord[] {
-  const result = verdicts.filter((verdict) => verdict.id !== mergeGateVerdict.id || !isMergeGateVerdict(verdict));
-  result.push(mergeGateVerdict);
+function upsertMergeGateResult(
+  results: IssueMergeGateResultRecord[],
+  mergeGateResult: IssueMergeGateResultRecord,
+): IssueMergeGateResultRecord[] {
+  const result = results.filter((item) => item.id !== mergeGateResult.id);
+  result.push(mergeGateResult);
   return result;
 }
 
@@ -1269,7 +1275,7 @@ function blockerFingerprint(
   return `${headSha}:${segments.sort().join("|")}`;
 }
 
-function mergeGateVerdictIdempotencyKey(gate: MergeGateStatus, kind: "repair" | "blocked"): string {
+function mergeGateResultIdempotencyKey(gate: MergeGateStatus, kind: "repair" | "blocked"): string {
   return `${gate.id}:${kind}:${gate.blockerFingerprint ?? "no-blocker-fingerprint"}`;
 }
 
@@ -1280,12 +1286,18 @@ function isSameMergeGateBlocker(lifecycle: IssueLifecycleRecord, gate: MergeGate
     current.id === gate.id &&
     (current.status === "repair_dispatched" || current.status === "blocked") &&
     current.blockerFingerprint === gate.blockerFingerprint &&
-    lifecycle.lastReviewVerdictId === gate.id
+    (lifecycle.lastMergeGateResultId === gate.id || legacyMergeGateVerdictPointer(lifecycle, gate.id))
   );
+}
+
+function legacyMergeGateVerdictPointer(lifecycle: IssueLifecycleRecord, gateId: string): boolean {
+  if (lifecycle.lastReviewVerdictId !== gateId) return false;
+  return lifecycle.reviewVerdicts.some((verdict) => verdict.id === gateId && isMergeGateVerdict(verdict));
 }
 
 function shouldRefreshSameMergeGateBlocker(lifecycle: IssueLifecycleRecord, gate: MergeGateStatus): boolean {
   if (!isSameMergeGateBlocker(lifecycle, gate)) return false;
+  if (lifecycle.phase === "passed") return false;
   const current = lifecycle.mergeGate ?? null;
   if (current?.status === "repair_dispatched" && hasCompletedRepairApproval(lifecycle, current)) return false;
   return true;
@@ -1301,15 +1313,25 @@ function hasCompletedRepairApproval(lifecycle: IssueLifecycleRecord, gate: Issue
   if (repairReport.pullRequest?.headSha !== gate.headSha) return false;
   if (gate.gateReportId && repairReport.id === gate.gateReportId) return false;
 
-  const gateVerdict = lifecycle.reviewVerdicts.find((verdict) => verdict.id === gate.id && isMergeGateVerdict(verdict)) ?? null;
-  if (!gateVerdict) return false;
+  const gateFailedAtValue = mergeGateFailureSubmittedAt(lifecycle, gate.id);
+  if (gateFailedAtValue === null) return false;
   const approvalVerdict = latestCurrentApprovalPassVerdict(lifecycle);
   if (!approvalVerdict) return false;
   const repairAcceptedAt = Date.parse(repairReport.acceptedAt);
   const approvalSubmittedAt = Date.parse(approvalVerdict.submittedAt);
-  const gateFailedAt = Date.parse(gateVerdict.submittedAt);
+  const gateFailedAt = Date.parse(gateFailedAtValue);
   if (!Number.isFinite(repairAcceptedAt) || !Number.isFinite(approvalSubmittedAt) || !Number.isFinite(gateFailedAt)) return false;
   return repairAcceptedAt > gateFailedAt && approvalSubmittedAt > repairAcceptedAt;
+}
+
+function mergeGateFailureSubmittedAt(lifecycle: IssueLifecycleRecord, gateId: string): string | null {
+  const result =
+    (lifecycle.mergeGateResults ?? []).find(
+      (item) => item.id === gateId && !isSupersededLifecycleRecord(item),
+    ) ?? null;
+  if (result) return result.submittedAt;
+  const legacyVerdict = lifecycle.reviewVerdicts.find((verdict) => verdict.id === gateId && isMergeGateVerdict(verdict)) ?? null;
+  return legacyVerdict?.submittedAt ?? null;
 }
 
 function refreshActiveMergeGateObservation(
@@ -1352,7 +1374,7 @@ function refreshedActiveGateLastReviewVerdictId(lifecycle: IssueLifecycleRecord,
   if (gate.status === "repair_dispatched" && hasRepairGateClearance(lifecycle, gate)) {
     return lifecycle.lastReviewVerdictId;
   }
-  return gate.id;
+  return latestCurrentApprovalPassVerdict(lifecycle)?.id ?? lifecycle.lastReviewVerdictId;
 }
 
 function previousMergeGateRepairRound(lifecycle: IssueLifecycleRecord, gate: MergeGateStatus): number {

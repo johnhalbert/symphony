@@ -7818,7 +7818,7 @@ function latestReviewVerdict(lifecycle: IssueLifecycleRecord | null): IssueRevie
   if (!lifecycle) return null;
   if (lifecycle.lastReviewVerdictId) {
     const exact = lifecycle.reviewVerdicts.find((verdict) => verdict.id === lifecycle.lastReviewVerdictId);
-    if (exact && !isMergeGateVerdict(exact)) {
+    if (exact && !isMergeGateVerdict(exact) && !isSupersededLifecycleRecord(exact)) {
       if (exact.verdict !== "pass") return exact;
       const currentPass = latestCurrentApprovalPassVerdict(lifecycle);
       if (currentPass?.id === exact.id) return exact;
@@ -7826,6 +7826,7 @@ function latestReviewVerdict(lifecycle: IssueLifecycleRecord | null): IssueRevie
   }
   for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
     if (isMergeGateVerdict(verdict)) continue;
+    if (isSupersededLifecycleRecord(verdict)) continue;
     if (verdict.verdict !== "pass") return verdict;
     const currentPass = latestCurrentApprovalPassVerdict(lifecycle);
     if (currentPass?.id === verdict.id) return verdict;
@@ -7837,9 +7838,12 @@ function latestIssueTriageReport(lifecycle: IssueLifecycleRecord | null): IssueT
   if (!lifecycle) return null;
   if (lifecycle.lastIssueTriageReportId) {
     const exact = lifecycle.issueTriageReports.find((report) => report.id === lifecycle.lastIssueTriageReportId);
-    if (exact) return exact;
+    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
   }
-  return lifecycle.issueTriageReports[lifecycle.issueTriageReports.length - 1] ?? null;
+  for (const report of lifecycle.issueTriageReports.slice().reverse()) {
+    if (!isSupersededLifecycleRecord(report)) return report;
+  }
+  return null;
 }
 
 function latestIssuePostMortemReport(lifecycle: IssueLifecycleRecord | null): IssuePostMortemReportRecord | null {
@@ -7853,6 +7857,10 @@ function latestIssuePostMortemReport(lifecycle: IssueLifecycleRecord | null): Is
 
 function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {
   return verdict.reviewer === "symphony-merge-gate" || verdict.id.startsWith("merge-gate:");
+}
+
+function isSupersededLifecycleRecord(record: { supersededAt?: string | null } | null | undefined): boolean {
+  return typeof record?.supersededAt === "string" && record.supersededAt.trim().length > 0;
 }
 
 function metadataValue<K extends "prUrl" | "prNumber" | "prHeadSha" | "prBranch" | "ciStatus" | "lastPushedAt" | "lastEvidenceCursor">(

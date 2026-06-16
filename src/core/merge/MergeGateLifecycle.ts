@@ -4,8 +4,10 @@ import {
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
   type IssueCompletionReportRecord,
+  type IssueMergeGateResultRecord,
   type IssueMergeGateState,
   type IssueReviewVerdictRecord,
+  isSupersededLifecycleRecord,
   latestCurrentApprovalPassVerdict,
 } from "../persistence/IssueLifecycleStore.js";
 
@@ -70,14 +72,33 @@ export function inactiveMergeGateLifecyclePatch(
   status: "resolved" | "superseded",
   supersededByHeadSha: string | null = null,
 ): IssueLifecyclePatch {
+  const now = new Date().toISOString();
   const mergeGate = inactiveMergeGate(gate, status, supersededByHeadSha);
-  const reviewVerdicts = scrubMergeGateVerdicts(lifecycle.reviewVerdicts, gate.id);
+  const reviewVerdicts = scrubMergeGateVerdicts(
+    lifecycle.reviewVerdicts,
+    gate.id,
+    now,
+    status === "resolved" ? "merge_gate_resolved" : "merge_gate_superseded",
+    mergeGate.id,
+  );
+  const mergeGateResults = supersedeMergeGateResults(
+    lifecycle.mergeGateResults ?? [],
+    gate.id,
+    now,
+    status === "resolved" ? "merge_gate_resolved" : "merge_gate_superseded",
+    mergeGate.id,
+  );
   const lastReviewVerdictId =
     lifecycle.lastReviewVerdictId === gate.id ? latestNonMergeGateVerdictId(reviewVerdicts) : lifecycle.lastReviewVerdictId;
   return {
     mergeGate,
     reviewVerdicts,
+    mergeGateResults,
     lastReviewVerdictId,
+    lastMergeGateResultId:
+      lifecycle.lastMergeGateResultId === gate.id
+        ? latestNonSupersededMergeGateResultId(mergeGateResults)
+        : lifecycle.lastMergeGateResultId ?? null,
   };
 }
 
@@ -86,13 +107,32 @@ export function supersededMergeGateLifecyclePatch(
   gate: IssueMergeGateState,
   supersededByHeadSha: string,
 ): IssueLifecyclePatch {
+  const now = new Date().toISOString();
   const mergeGate = inactiveMergeGate(gate, "superseded", supersededByHeadSha);
-  const reviewVerdicts = scrubMergeGateVerdicts(lifecycle.reviewVerdicts, gate.id);
-  const patchedLifecycle = { ...lifecycle, mergeGate, reviewVerdicts };
+  const reviewVerdicts = scrubMergeGateVerdicts(
+    lifecycle.reviewVerdicts,
+    gate.id,
+    now,
+    "merge_gate_head_superseded",
+    supersededByHeadSha,
+  );
+  const mergeGateResults = supersedeMergeGateResults(
+    lifecycle.mergeGateResults ?? [],
+    gate.id,
+    now,
+    "merge_gate_head_superseded",
+    supersededByHeadSha,
+  );
+  const patchedLifecycle = { ...lifecycle, mergeGate, reviewVerdicts, mergeGateResults };
   return {
     mergeGate,
     reviewVerdicts,
+    mergeGateResults,
     lastReviewVerdictId: latestCurrentApprovalPassVerdict(patchedLifecycle)?.id ?? null,
+    lastMergeGateResultId:
+      lifecycle.lastMergeGateResultId === gate.id
+        ? latestNonSupersededMergeGateResultId(mergeGateResults)
+        : lifecycle.lastMergeGateResultId ?? null,
   };
 }
 
@@ -101,13 +141,32 @@ export function sanitizeInactiveMergeGateLifecycle(lifecycle: IssueLifecycleReco
   if (!lifecycle || !gate) return lifecycle;
   if (gate.status !== "resolved" && gate.status !== "superseded") return lifecycle;
   const scrubbedGate = inactiveMergeGate(gate, gate.status, gate.supersededByHeadSha);
-  const reviewVerdicts = scrubMergeGateVerdicts(lifecycle.reviewVerdicts, gate.id);
+  const now = new Date().toISOString();
+  const reviewVerdicts = scrubMergeGateVerdicts(
+    lifecycle.reviewVerdicts,
+    gate.id,
+    now,
+    gate.status === "resolved" ? "merge_gate_resolved" : "merge_gate_superseded",
+    gate.supersededByHeadSha ?? scrubbedGate.id,
+  );
+  const mergeGateResults = supersedeMergeGateResults(
+    lifecycle.mergeGateResults ?? [],
+    gate.id,
+    now,
+    gate.status === "resolved" ? "merge_gate_resolved" : "merge_gate_superseded",
+    gate.supersededByHeadSha ?? scrubbedGate.id,
+  );
   const lastReviewVerdictId = lifecycle.lastReviewVerdictId === gate.id ? latestNonMergeGateVerdictId(reviewVerdicts) : lifecycle.lastReviewVerdictId;
   const sanitized = {
     ...lifecycle,
     mergeGate: scrubbedGate,
     reviewVerdicts,
+    mergeGateResults,
     lastReviewVerdictId,
+    lastMergeGateResultId:
+      lifecycle.lastMergeGateResultId === gate.id
+        ? latestNonSupersededMergeGateResultId(mergeGateResults)
+        : lifecycle.lastMergeGateResultId ?? null,
   };
   return {
     ...sanitized,
@@ -126,9 +185,12 @@ export function sanitizeStaleMergeGateLifecycle(
   const sanitized: IssueLifecycleRecord = {
     ...lifecycle,
     mergeGate: patch.mergeGate ?? lifecycle.mergeGate ?? null,
+    mergeGateResults: patch.mergeGateResults ?? lifecycle.mergeGateResults ?? [],
     reviewVerdicts: patch.reviewVerdicts ?? lifecycle.reviewVerdicts,
     lastReviewVerdictId:
       patch.lastReviewVerdictId === undefined ? lifecycle.lastReviewVerdictId : patch.lastReviewVerdictId,
+    lastMergeGateResultId:
+      patch.lastMergeGateResultId === undefined ? lifecycle.lastMergeGateResultId ?? null : patch.lastMergeGateResultId,
   };
   return {
     ...sanitized,
@@ -167,11 +229,11 @@ function bindRepairCompletionReport(
   if (repairReport.pullRequest?.number !== gate.pullRequest.number) return null;
   if (repairReport.pullRequest?.headSha !== gate.headSha) return null;
 
-  const gateVerdict = lifecycle.reviewVerdicts.find((verdict) => verdict.id === gate.id && isMergeGateVerdict(verdict)) ?? null;
-  if (!gateVerdict) return null;
+  const gateFailedAtValue = mergeGateFailureSubmittedAt(lifecycle, gate.id);
+  if (gateFailedAtValue === null) return null;
 
   const repairAcceptedAt = Date.parse(repairReport.acceptedAt);
-  const gateFailedAt = Date.parse(gateVerdict.submittedAt);
+  const gateFailedAt = Date.parse(gateFailedAtValue);
   if (!Number.isFinite(repairAcceptedAt) || !Number.isFinite(gateFailedAt)) return null;
   if (gate.gateReportId && repairReport.id === gate.gateReportId) return null;
   if (repairAcceptedAt <= gateFailedAt) return null;
@@ -190,11 +252,11 @@ function resolveRepairGateClearanceApprovalVerdict(
   if (approvalVerdict.verdict !== "pass" || isMergeGateVerdict(approvalVerdict)) return null;
   if (approvalVerdict.evidence.length === 0 || approvalVerdict.acceptanceResults.some((result) => !result.satisfied)) return null;
 
-  const gateVerdict = lifecycle.reviewVerdicts.find((verdict) => verdict.id === gate.id && isMergeGateVerdict(verdict)) ?? null;
-  if (!gateVerdict) return null;
+  const gateFailedAtValue = mergeGateFailureSubmittedAt(lifecycle, gate.id);
+  if (gateFailedAtValue === null) return null;
   const repairAcceptedAt = Date.parse(repairReport.acceptedAt);
   const approvalSubmittedAt = Date.parse(approvalVerdict.submittedAt);
-  const gateFailedAt = Date.parse(gateVerdict.submittedAt);
+  const gateFailedAt = Date.parse(gateFailedAtValue);
   if (!Number.isFinite(repairAcceptedAt) || !Number.isFinite(approvalSubmittedAt) || !Number.isFinite(gateFailedAt)) return null;
   if (approvalSubmittedAt <= repairAcceptedAt || approvalSubmittedAt <= gateFailedAt) return null;
 
@@ -220,7 +282,42 @@ function hasRepairApprovalFeedback(
   );
 }
 
-function scrubMergeGateVerdicts(verdicts: IssueReviewVerdictRecord[], gateId: string): IssueReviewVerdictRecord[] {
+function mergeGateFailureSubmittedAt(lifecycle: IssueLifecycleRecord, gateId: string): string | null {
+  const result =
+    (lifecycle.mergeGateResults ?? []).find(
+      (item) => item.id === gateId && !isSupersededLifecycleRecord(item),
+    ) ?? null;
+  if (result) return result.submittedAt;
+  const legacyVerdict = lifecycle.reviewVerdicts.find((verdict) => verdict.id === gateId && isMergeGateVerdict(verdict)) ?? null;
+  return legacyVerdict?.submittedAt ?? null;
+}
+
+function supersedeMergeGateResults(
+  results: IssueMergeGateResultRecord[],
+  gateId: string,
+  supersededAt: string,
+  supersededReason: string,
+  supersededBy: string | null,
+): IssueMergeGateResultRecord[] {
+  return results.map((result) =>
+    result.id === gateId && !isSupersededLifecycleRecord(result)
+      ? {
+          ...result,
+          supersededAt,
+          supersededBy,
+          supersededReason,
+        }
+      : result,
+  );
+}
+
+function scrubMergeGateVerdicts(
+  verdicts: IssueReviewVerdictRecord[],
+  gateId: string,
+  supersededAt: string,
+  supersededReason: string,
+  supersededBy: string | null,
+): IssueReviewVerdictRecord[] {
   return verdicts.map((verdict) =>
     verdict.id === gateId && isMergeGateVerdict(verdict)
       ? {
@@ -230,6 +327,9 @@ function scrubMergeGateVerdicts(verdicts: IssueReviewVerdictRecord[], gateId: st
           gateFindings: [],
           discoveryFindings: [],
           evidence: [],
+          supersededAt: verdict.supersededAt ?? supersededAt,
+          supersededBy: verdict.supersededBy ?? supersededBy,
+          supersededReason: verdict.supersededReason ?? supersededReason,
         }
       : verdict,
   );
@@ -239,7 +339,16 @@ function latestNonMergeGateVerdictId(verdicts: IssueReviewVerdictRecord[]): stri
   return verdicts
     .slice()
     .reverse()
-    .find((verdict) => !isMergeGateVerdict(verdict))?.id ?? null;
+    .find((verdict) => !isMergeGateVerdict(verdict) && !isSupersededLifecycleRecord(verdict))?.id ?? null;
+}
+
+function latestNonSupersededMergeGateResultId(results: IssueMergeGateResultRecord[]): string | null {
+  return (
+    results
+      .slice()
+      .reverse()
+      .find((result) => !isSupersededLifecycleRecord(result))?.id ?? null
+  );
 }
 
 function isMergeGateVerdict(verdict: IssueReviewVerdictRecord): boolean {
