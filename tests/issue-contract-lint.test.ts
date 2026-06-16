@@ -444,6 +444,15 @@ describe("IssueContractLint", () => {
     expect(validationEvidence).toContain("REQ-392-TEST-PROOF");
     expect(validationEvidence).toContain("REQ-392-PUBLICATION-HYGIENE");
     expect(validationEvidence).toContain("hermes/upstream-src/**");
+    expect(validationEvidence).toContain("depends on `REQ-392-DECISION`");
+    expect(validationEvidence).toContain("depends on `REQ-392-RUNTIME-ROUTING`");
+    expect(validationEvidence).toContain("depends on both `REQ-392-RUNTIME-ROUTING` and `REQ-392-RELOAD-PRESERVATION`");
+    expect(validationEvidence).toContain(
+      "depends on `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, and `REQ-392-APPROVAL-WRITEBACK`",
+    );
+    expect(validationEvidence).toContain(
+      "depends on `REQ-392-DECISION`, `REQ-392-APPROVAL-WRITEBACK`, and `REQ-392-TEST-PROOF`",
+    );
   });
 
   it("documents the ENG-372 routing validation matrix and redacted evidence quickstart", () => {

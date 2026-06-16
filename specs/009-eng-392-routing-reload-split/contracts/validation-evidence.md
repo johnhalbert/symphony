@@ -40,6 +40,14 @@ Every future runtime-child preflight entry must record the following minimum fie
 | `REQ-392-RELOAD-PRESERVATION` | Reuse the routed identity defined by `REQ-392-RUNTIME-ROUTING`; do not capture reload proof until the same routed workspace/lifecycle identity is the prerequisite baseline. | The same project-context-qualified workspace, prompt/context identity, and lifecycle bucket survive reload or restart without duplicate redispatch or incomplete-turn burn while the run remains intentional. | `REQ-392-RELOAD-PRESERVATION` owns the reload/restart implementation and focused preservation validation after the routing child stabilizes the baseline. |
 | `REQ-392-APPROVAL-WRITEBACK` | Treat routed approval and writeback recovery as downstream from both runtime routing and reload preservation; do not record approval proof as if those prerequisites were already implicit. | Pending, approved, rejected, cancelled, or replayed approval/writeback paths preserve one routed run lineage, one audit/writeback settlement story, and explicit terminal/recovery state instead of duplicating or losing state. | `REQ-392-APPROVAL-WRITEBACK` owns the approval/writeback implementation and focused recovery validation after the routing and reload prerequisites are stable. |
 
+### Child issue dependency ownership for later execution or evidence work
+
+- `REQ-392-RUNTIME-ROUTING` depends on `REQ-392-DECISION` and is the first runtime child allowed to own execution once the decomposition decision stays locked.
+- `REQ-392-RELOAD-PRESERVATION` depends on `REQ-392-RUNTIME-ROUTING` and owns reload or restart execution only after routed identity is stable.
+- `REQ-392-APPROVAL-WRITEBACK` depends on both `REQ-392-RUNTIME-ROUTING` and `REQ-392-RELOAD-PRESERVATION` and owns routed approval or writeback execution only after both prerequisites are stable.
+- `REQ-392-TEST-PROOF` depends on `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, and `REQ-392-APPROVAL-WRITEBACK` and owns the focused orchestrator proof execution and evidence capture after those runtime prerequisites are satisfied.
+- `REQ-392-PUBLICATION-HYGIENE` depends on `REQ-392-DECISION`, `REQ-392-APPROVAL-WRITEBACK`, and `REQ-392-TEST-PROOF` and owns the publication-facing evidence closure only after the runtime, approval, and proof families are complete.
+
 ### Out-of-scope boundary for this preflight matrix
 
 - This matrix is planning-only. It does not authorize runtime implementation, focused preflight execution, focused evidence capture, live lifecycle state changes, publication, protected branch updates, or changes under `hermes/upstream-src/**`.
