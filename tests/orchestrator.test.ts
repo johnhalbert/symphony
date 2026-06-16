@@ -2650,20 +2650,23 @@ const docsProjectContext = {
     const config = testConfig(root);
     addDocsPollingProjectContext(config);
     const sharedIdentifier = "ENG-123";
-    const defaultProjectContext = {
-      ...legacyDefaultProjectContext,
+    const defaultProjectContext = legacyDefaultProjectContext;
+    const defaultCandidate = {
+      ...issue({
+        id: "issue-default-1",
+        identifier: sharedIdentifier,
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/ENG-123",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: defaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-1",
+      },
       routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
     };
-    const defaultCandidate = trackerIssue({
-      id: "issue-default-1",
-      identifier: sharedIdentifier,
-      state: "Todo",
-      labels: ["dogfood-ready"],
-      projectContextId: defaultProjectContext.projectContextId,
-      projectContextLabel: defaultProjectContext.projectContextLabel,
-      linearProjectSlug: defaultProjectContext.linearProjectSlug,
-      branchName: "symphony/ENG-123",
-    });
     const docsCandidate = trackerIssue({
       id: "issue-docs-1",
       identifier: sharedIdentifier,
@@ -2674,10 +2677,21 @@ const docsProjectContext = {
       linearProjectSlug: docsProjectContext.linearProjectSlug,
       branchName: "symphony/docs/ENG-123",
     });
-    const defaultTracker = trackerClientFixture({
-      candidates: [defaultCandidate],
-      issues: [defaultCandidate],
-    });
+    const defaultTracker: TrackerClient & { candidateFetchCount: number; requestedIds: string[][] } = {
+      candidateFetchCount: 0,
+      requestedIds: [],
+      async fetchCandidateIssues() {
+        defaultTracker.candidateFetchCount += 1;
+        return [defaultCandidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        defaultTracker.requestedIds.push([...issueIds]);
+        return issueIds.includes(defaultCandidate.id) ? [defaultCandidate] : [];
+      },
+    };
     const docsTracker = trackerClientFixture({
       candidates: [docsCandidate],
       issues: [docsCandidate],
