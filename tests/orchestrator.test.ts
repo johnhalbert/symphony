@@ -2700,7 +2700,29 @@ const docsProjectContext = {
     const stateDir = path.join(root, "state");
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const runStore = new FileRunTranscriptStore(stateDir);
-    const harness = new FakeHarness();
+    const harness: AgentHarness & {
+      runs: Array<{ ctx: AgentRunContext; prompt: string }>;
+      stoppedRunIds: string[];
+    } = {
+      id: "project-context-routing-blocking",
+      capabilities: { continuation: true, mcpHandoff: true },
+      runs: [],
+      stoppedRunIds: [],
+      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+        this.runs.push({ ctx, prompt });
+        const runId = `run-${ctx.issue.id}-${ctx.turnNumber}`;
+        yield { type: "session_started", sessionId: `session-${ctx.issue.id}-${ctx.turnNumber}`, runId };
+        if (!ctx.abortSignal.aborted) {
+          await new Promise<void>((resolve) =>
+            ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        }
+        yield { type: "cancelled" };
+      },
+      async stop(runId: string): Promise<void> {
+        this.stoppedRunIds.push(runId);
+      },
+    };
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
@@ -2716,21 +2738,40 @@ const docsProjectContext = {
       runStore,
     });
 
-    await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "two context-scoped dispatches");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "dispatched runs to settle");
-    await settleOrchestratorExit();
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 2, "two context-scoped dispatches");
+      await waitFor(() => orchestrator.snapshot().counts.running === 2, "two context-scoped runs active");
+
+      const defaultRequestedIdsBeforeRefresh = defaultTracker.requestedIds.length;
+      const docsRequestedIdsBeforeRefresh = docsTracker.requestedIds.length;
+
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          orchestrator.snapshot().counts.running === 2 &&
+          defaultTracker.requestedIds.length > defaultRequestedIdsBeforeRefresh &&
+          docsTracker.requestedIds.length > docsRequestedIdsBeforeRefresh,
+        "running issue refresh scoped by project context",
+      );
+    } finally {
+      await orchestrator.stop();
+      await settleOrchestratorExit();
+    }
 
     const defaultHarnessRun = harness.runs.find((run) => run.ctx.issue.id === defaultCandidate.id);
     const docsHarnessRun = harness.runs.find((run) => run.ctx.issue.id === docsCandidate.id);
+    const defaultRunningRefreshIds = defaultTracker.requestedIds[defaultTracker.requestedIds.length - 1];
+    const docsRunningRefreshIds = docsTracker.requestedIds[docsTracker.requestedIds.length - 1];
     const defaultWorkspaceKey = sharedIdentifier;
     const docsWorkspaceKey = `docs__${sharedIdentifier}`;
 
-    expect(defaultTracker.candidateFetchCount).toBe(1);
-    expect(docsTracker.candidateFetchCount).toBe(1);
+    expect(defaultTracker.candidateFetchCount).toBeGreaterThanOrEqual(2);
+    expect(docsTracker.candidateFetchCount).toBeGreaterThanOrEqual(2);
     expect(defaultTracker.requestedIds.length).toBeGreaterThanOrEqual(1);
     expect(docsTracker.requestedIds.length).toBeGreaterThanOrEqual(1);
+    expect(defaultRunningRefreshIds).toEqual([defaultCandidate.id]);
+    expect(docsRunningRefreshIds).toEqual([docsCandidate.id]);
     expect(defaultTracker.requestedIds.every((issueIds) => issueIds.length === 1 && issueIds[0] === defaultCandidate.id)).toBe(true);
     expect(docsTracker.requestedIds.every((issueIds) => issueIds.length === 1 && issueIds[0] === docsCandidate.id)).toBe(true);
     expect(defaultHarnessRun?.ctx.projectContext).toMatchObject(defaultProjectContext);
