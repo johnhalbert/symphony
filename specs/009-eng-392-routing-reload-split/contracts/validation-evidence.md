@@ -305,6 +305,63 @@ A finalized evidence packet based on this guide should let a reviewer answer yes
 - Are secrets, credential-bearing URLs, and unnecessary local paths absent from the cited evidence?
 - Could I re-check the cited proof using stable paths, fields, commands, or artifact labels without reading raw private payloads?
 
+## ENG-2474 T028 test-proof validation evidence snapshot
+
+This packet uses the shared reviewer skeleton above to record the focused routing-isolation and reload-preservation proof already present in `tests/orchestrator.test.ts` for `REQ-392-TEST-PROOF`, plus the current status of broader same-file validation evidence without widening beyond the authorized orchestrator test surface.
+
+### Test-proof scenario matrix
+
+| Path | Evidence bucket | Branch-tip status | Primary proof | Child-work disposition |
+| --- | --- | --- | --- | --- |
+| focused routing isolation across project contexts | `base-behavior` + `passing-after` | `pass` | `tests/orchestrator.test.ts:2649-2826`; `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:357-395` | Satisfies the distinct-workspace/lifecycle-bucket half of `REQ-392-TEST-PROOF` within the authorized `tests/orchestrator.test.ts` surface. |
+| focused reload preservation for an already-running routed context | `base-behavior` + `passing-after` | `pass` | `tests/orchestrator.test.ts:2504-2647`; `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:357-395` | Satisfies the reload-preservation/no-identity-drift half of `REQ-392-TEST-PROOF` within the same focused test surface. |
+| broader full orchestrator-file validation | `passing-after` + `hygiene` | `blocked` | `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:397-400`; `package.json:25`; command labels `npm test -- tests/orchestrator.test.ts` and `./node_modules/.bin/vitest run --no-file-parallelism tests/orchestrator.test.ts` | Record the broader validation family and the local blocker note explicitly instead of implying a fresh full-file pass artifact that this worker run could not emit. |
+
+### base-behavior
+- status: recorded
+- surface: `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:357-400`; `tests/orchestrator.test.ts:2504-2826`; `package.json:25`
+- proof: `REQ-392-TEST-PROOF` requires one focused orchestrator scenario proving cross-project routing isolation and one proving reload preservation for an already-running routed context, while `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:397-400` names `npm test -- tests/orchestrator.test.ts` as the full orchestrator-file validation requirement. Branch tip now contains `tests/orchestrator.test.ts:2649-2826`, which routes duplicate identifiers from default and docs project contexts into distinct workspace keys, run-store records, and lifecycle buckets, plus `tests/orchestrator.test.ts:2504-2647`, which preserves the original docs project context and persisted routing snapshot across config reload while separately dispatching a rerouted candidate. `package.json:25` records the broader orchestrator-file validation family as `vitest run --no-file-parallelism`.
+- why_it_matters: This anchors the exact focused proof T028 must record and names the broader full-file validation family without widening beyond the authorized orchestrator test surface.
+- redactions: none
+
+### failing-before
+- status: recorded
+- surface: `specs/009-eng-392-routing-reload-split/quickstart.md:163-164`; `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:357-395`
+- proof: `quickstart.md` still records the original proof gap that no single existing test demonstrated cross-project workspace/state isolation and no explicit existing test demonstrated an already-running routed context surviving config reload. `REQ-392-TEST-PROOF` exists to close exactly those two focused orchestrator-proof gaps inside `tests/orchestrator.test.ts`.
+- why_it_matters: `REQ-T028` is an evidence-capture task, so the relevant before-state is the previously documented proof gap that needed an explicit validation packet once the focused tests existed.
+- redactions: none
+
+### passing-after
+- status: recorded
+- surface: `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2474-t028-test-proof-validation-evidence-snapshot`; `tests/orchestrator.test.ts:2504-2826`; `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:397-400`; `package.json:25`
+- proof: The `ENG-2474 T028 test-proof validation evidence snapshot` section now records three explicit validation states for `REQ-392-TEST-PROOF`: `pass` for focused routing isolation from `tests/orchestrator.test.ts:2649-2826`, `pass` for focused reload preservation from `tests/orchestrator.test.ts:2504-2647`, and `blocked` for a fresh broader orchestrator-file run because the child contract's required command (`npm test -- tests/orchestrator.test.ts`) and its package-level implementation (`vitest run --no-file-parallelism`) could be identified but this worker run's package/script execution boundary blocked emitting a new `tests/orchestrator.test.ts` full-file exit artifact.
+- why_it_matters: The after-state reviewers need for `REQ-T028` is an evidence packet that makes the focused proof pass signals and the broader full-file blocker note explicit instead of implying unrecorded coverage.
+- redactions: none
+
+### surface-comparison
+| Contract surface | Observed surface | Validation surface | Status | Notes |
+| --- | --- | --- | --- | --- |
+| `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | file inspection plus `git diff -- specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | `recorded` | T028 records only the evidence artifact. |
+| `tests/orchestrator.test.ts` | `tests/orchestrator.test.ts:2504-2826` | focused file inspection of the two `REQ-392-TEST-PROOF` scenarios | `recorded` | The authorized orchestrator proof surface was inspected without editing runtime or harness sources. |
+| broader `tests/orchestrator.test.ts` validation family | `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:397-400`; `package.json:25`; `tests/orchestrator.test.ts` | command labels `npm test -- tests/orchestrator.test.ts` and `./node_modules/.bin/vitest run --no-file-parallelism tests/orchestrator.test.ts` plus the recorded blocker note in this packet | `intentionally_unverified` | T028 names the broader same-file validation path, but this worker run did not produce a fresh full-file exit artifact because package/script test invocations were blocked locally. |
+| `hermes/upstream-src/**` | `none` | `git diff -- specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | `recorded` | Vendored Hermes upstream sources stay untouched. |
+
+### hygiene (with intentionally unverified local execution boundary)
+- status: intentionally_unverified
+- surfacesChecked: [`specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`, `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`, `specs/009-eng-392-routing-reload-split/quickstart.md`, `tests/orchestrator.test.ts`, `package.json`]
+- redactions: [`none`]
+- localPathHandling: `repo-relative paths only`
+- protectedSurfaceChecks:
+  - surface: `hermes/upstream-src/**`
+    expectation: `must remain untouched`
+    proof: `git diff -- specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` is the only scoped diff expected from T028; no vendored path is cited or modified in this packet.
+- intentionallyUnverified:
+  - boundary: `fresh full orchestrator-file test execution`
+    reason: `this worker run could inspect the focused proof lines and the canonical orchestrator test command family, but package/script test invocations were blocked before they could emit a new full-file result artifact`
+    nearestLocalProof: `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:397-400`; `package.json:25`; `tests/orchestrator.test.ts:2504-2826`
+- findings:
+  - `Focused REQ-392-TEST-PROOF routing-isolation and reload-preservation scenarios are present in tests/orchestrator.test.ts, while the broader full-file orchestrator validation state is recorded here as blocked rather than implied.`
+
 ## ENG-2476 T030 runtime routing evidence snapshot
 
 This packet uses the shared reviewer skeleton above to record which runtime-routing prerequisites already have branch-tip evidence and which gaps must stay mapped to prerequisite child work instead of being implied away by the test-proof issue.
