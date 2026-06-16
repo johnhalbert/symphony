@@ -222,6 +222,8 @@ Repair the routed runtime path so two different Linear project contexts resolve 
 - Suggested child title: `ENG-392 child — reload preservation repair`
 - Dependency order: **3 of 6**
 - Declare dependency on: `ENG-392 child — runtime routing repair`
+- Draft label guidance for Linear creation: keep the parent `dogfood` label and do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload because the protected reload-preservation surfaces keep this child manual-only pending operator review.
+- Draft dependency guidance for Linear creation: declare the sibling dependency on `ENG-392 child — runtime routing repair` by exact title, and keep this child blocked until that routed workspace/lifecycle baseline is stable instead of widening into adjacent routing or approval/writeback work.
 - Authorized surfaces to list in `Touched Surfaces`:
   - `src/core/orchestrator/Orchestrator.ts`
   - `src/core/workspace/WorkspaceManager.ts`
@@ -234,6 +236,12 @@ Repair the routed runtime path so two different Linear project contexts resolve 
 ## Problem / Goal
 
 Preserve the in-progress routed worker or reviewer context across config reload so the same project-context-qualified workspace, prompt identity, and lifecycle state survive restart without duplicate dispatch or bucket drift.
+
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label.
+- Do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload; protected orchestrator and persistence surfaces keep this child manual-only until operator review.
+- Sibling dependency guidance: declare a dependency on `ENG-392 child — runtime routing repair` by exact title, and keep this child blocked until that routed workspace/lifecycle baseline is stable instead of widening into adjacent routing or approval/writeback work.
 
 ## Issue Contract
 
@@ -257,12 +265,13 @@ Preserve the in-progress routed worker or reviewer context across config reload 
 
 - Reload or restart preserves the in-progress routed run with the same workspace and lifecycle identity.
 - Preservation does not redispatch a second run, burn incomplete-turn counters, or discard the routed prompt/context while the original run is still intentional.
+- The issue includes operator-facing label and dependency guidance that keeps the drafted payload free of auto-ready labels and ties the work to `ENG-392 child — runtime routing repair` by exact title.
 
 ## Contract Checklist
 
 - Happy path: an active routed run survives reload with the same workspace and lifecycle identity.
 - Negative/error path: stale, missing, or terminal runs do not get falsely treated as preservable in-progress contexts.
-- Adjacent sibling surface: reviewer and worker routed contexts follow the same preservation rule instead of diverging.
+- Adjacent sibling surface: worker and reviewer reload preservation stay downstream from `ENG-392 child — runtime routing repair` and do not implicitly authorize approval/writeback recovery or broader routing expansion.
 - Empty/missing/stale/fallback state: missing persistence falls back safely without reusing another issue's active context.
 - Replay/restart/idempotency: repeated reloads preserve the same active routed context instead of spawning duplicates.
 - Credential/security boundary: proof cites run IDs, workspace keys, and lifecycle fields, not secret prompt bodies or credential values.
@@ -270,6 +279,7 @@ Preserve the in-progress routed worker or reviewer context across config reload 
 
 ## Validation Requirements
 
+- Review this child issue body and confirm the `Labels / Dependencies` section preserves the no-auto-ready-label rule, the exact sibling dependency title, and the manual-only protected-surface blocker.
 - `npm test -- tests/orchestrator.test.ts tests/status-api.test.ts`
 - Manual or API inspection that reload leaves the active routed run in one preserved bucket and does not create a duplicate run.
 
@@ -281,7 +291,7 @@ Preserve the in-progress routed worker or reviewer context across config reload 
 ## Promotion Readiness
 
 - Ready for `dogfood-ready`: no
-- Remaining blocker: Manual operator review required because this child changes protected orchestrator and persistence surfaces that preserve active routed run state across reload.
+- Remaining blocker: Manual operator review required because this child depends on `ENG-392 child — runtime routing repair` and changes protected orchestrator and persistence surfaces that preserve active routed run state across reload.
 ````
 
 ## Family D — `REQ-392-APPROVAL-WRITEBACK`
