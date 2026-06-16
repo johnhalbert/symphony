@@ -416,6 +416,25 @@ describe("IssueContractLint", () => {
     }
   });
 
+  it("keeps the ENG-392 planned runtime child contract examples lintable and mapped to stable requirement ids", () => {
+    const expectedRequirementIds = new Map<string, string[]>([
+      ["Family B — `REQ-392-RUNTIME-ROUTING`", ["REQ-392-RUNTIME-ROUTING"]],
+      ["Family C — `REQ-392-RELOAD-PRESERVATION`", ["REQ-392-RELOAD-PRESERVATION"]],
+      ["Family D — `REQ-392-APPROVAL-WRITEBACK`", ["REQ-392-APPROVAL-WRITEBACK"]],
+    ]);
+    const examples = eng392ContractExamples().filter((example) => expectedRequirementIds.has(example.title));
+
+    expect(examples.map((example) => example.title)).toEqual([...expectedRequirementIds.keys()]);
+    for (const example of examples) {
+      const analysis = analyzeIssueContractDescription(example.description, []);
+      expect(analysis.missingSections, example.title).toEqual([]);
+      expect(analysis.issueContractErrors, example.title).toEqual([]);
+      expect(extractIssueContractRequirementIds(example.description), example.title).toEqual(
+        expectedRequirementIds.get(example.title),
+      );
+    }
+  });
+
   it("documents the ENG-372 routing validation matrix and redacted evidence quickstart", () => {
     const quickstart = eng372Quickstart();
 
