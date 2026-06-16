@@ -371,3 +371,59 @@ This packet uses the shared reviewer skeleton above to record which runtime-rout
     nearestLocalProof: `tests/orchestrator.test.ts:3988-4097`; `tests/orchestrator.test.ts:5514-5600`
 - findings:
   - `Continuation history summarization and routed search remain explicit prerequisite child work under REQ-392-RUNTIME-ROUTING; current branch-tip continuation proof is limited to pointer-based reuse and scoped summary/readback.`
+
+## ENG-2477 T031 reload preservation redispatch evidence snapshot
+
+This packet uses the shared reviewer skeleton above to record whether branch-tip reload-preservation proof already covers routed worker retry redispatch and routed reviewer redispatch, or whether either slice must stay mapped to prerequisite child work instead of being implied from adjacent routing or approval-recovery coverage.
+
+### Reload preservation redispatch scenario matrix
+
+| Path | Evidence bucket | Branch-tip status | Primary proof | Child-work disposition |
+| --- | --- | --- | --- | --- |
+| worker retry redispatch after config reload | `base-behavior` | `recorded` | `src/core/orchestrator/Orchestrator.ts:532-535`, `3008-3104`; `tests/orchestrator.test.ts:2504-2647`, `3073-3209` | No new prerequisite identified for worker retry-after-reload proof; current branch tip already records both preserved in-progress worker routing identity and routed retry redispatch through config reload. |
+| reviewer redispatch after config reload or restart | `base-behavior` + `failing-before` | Routed reviewer dispatch is recorded, but explicit reload/restart redispatch proof remains missing. | `src/core/orchestrator/Orchestrator.ts:1475-1519`, `1926-1957`, `2211-2268`; `tests/orchestrator.test.ts:5762-5892`; `specs/009-eng-392-routing-reload-split/quickstart.md:165-167`; `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:230-268`, `368-384` | Keep the reviewer reload-preservation gap mapped to `REQ-392-RELOAD-PRESERVATION` and `REQ-392-TEST-PROOF`; do not imply it from ordinary routed reviewer dispatch or approval-recovery tests. |
+
+### base-behavior
+- status: recorded
+- surface: `src/core/orchestrator/Orchestrator.ts:532-535`, `1475-1519`, `1926-1957`, `2211-2268`, `3008-3104`; `tests/orchestrator.test.ts:2504-2647`, `3073-3209`, `5762-5892`
+- proof: `updateConfig()` swaps the active config and prompt template without clearing in-memory `running` or `retryAttempts`, and the retry path stores `projectContext` on each retry entry before `onRetryTimer()` re-fetches and redispatches through routed project-context lookups. `tests/orchestrator.test.ts:2504-2647` proves an already-running routed worker keeps the same project-context-qualified run and lifecycle snapshot across config reload while a rerouted candidate dispatches separately. `tests/orchestrator.test.ts:3073-3209` proves a routed worker retry scheduled before `updateConfig()` redispatches after config reload with the same docs project context, docs tracker active states, and persisted lifecycle project context, which supersedes the earlier worker-gap note in `quickstart.md`. On the reviewer side, `tick()` still polls review states after worker polling, `tryDispatchReviewerIssue()` refreshes and revalidates the routed review candidate in project context before dispatch, and `runReviewer()` reloads the harness with reviewer role plus routed review evidence. `tests/orchestrator.test.ts:5762-5892` proves that routed reviewer dispatch path resolves `Docs Review` via the docs tracker, reloads the harness with the reviewer role and docs review state, and carries forward completion-report plus run-digest evidence into the reviewer prompt.
+- why_it_matters: This establishes the branch-tip baseline that T031 can safely claim today: worker reload-preservation and retry redispatch already have explicit routed proof, and reviewer redispatch has a concrete routed baseline to compare against the missing reload-specific proof.
+- redactions: none
+
+### failing-before
+- status: recorded
+- surface: `specs/009-eng-392-routing-reload-split/quickstart.md:165-167`; `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md:230-268`, `368-384`
+- proof: `quickstart.md` still records that no explicit reviewer redispatch-after-reload or restart scenario appears for a routed review issue and that the broader reload/restart plus approval combination remains uncovered. The reload-preservation child contract (`REQ-392-RELOAD-PRESERVATION`) still requires config reload/restart handling to preserve an already-running routed worker or reviewer context with non-redispatch invariants, and the focused-proof child contract (`REQ-392-TEST-PROOF`) still requires a proof path showing reload preservation without duplicate redispatch or identity drift.
+- why_it_matters: The remaining reviewer reload-preservation proof gap must stay visible as prerequisite child work instead of being inferred from ordinary routed reviewer dispatch or adjacent approval-recovery coverage.
+- redactions: none
+
+### passing-after
+- status: recorded
+- surface: `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md#eng-2477-t031-reload-preservation-redispatch-evidence-snapshot`
+- proof: The `ENG-2477 T031 reload preservation redispatch evidence snapshot` section now records that worker retry redispatch already has branch-tip reload-preservation evidence, while reviewer reload/restart redispatch remains explicit prerequisite child work owned by `REQ-392-RELOAD-PRESERVATION` and `REQ-392-TEST-PROOF` rather than being implied from adjacent routed-review coverage.
+- why_it_matters: `REQ-T031` is an evidence-capture task, so the relevant after-state is a finalized packet that distinguishes satisfied worker proof from the remaining reviewer proof gap.
+- redactions: none
+
+### surface-comparison
+| Contract surface | Observed surface | Validation surface | Status | Notes |
+| --- | --- | --- | --- | --- |
+| `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | file inspection plus `git diff -- specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` | `recorded` | T031 changes only the evidence artifact. |
+| `routing-reload-core` | `src/core/orchestrator/Orchestrator.ts`; `tests/orchestrator.test.ts` | cited line ranges and focused test-name inspection | `recorded` | Worker reload preservation, worker retry redispatch, and routed reviewer dispatch were inspected without editing runtime code. |
+| `reload-preservation child contracts` | `specs/009-eng-392-routing-reload-split/quickstart.md`; `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` | file inspection of the gap note plus child-contract ownership | `recorded` | Reviewer reload/restart redispatch remains mapped to prerequisite child work instead of being folded into T031. |
+| `publication-handoff` | `none` | `n/a` | `intentionally_unverified` | Approval-recovery scenarios were considered only as adjacent contrast; T031 does not reopen approval/writeback implementation surfaces or treat after-worker-exit recovery as reload-preservation proof. |
+
+### hygiene (with intentionally unverified live boundary)
+- status: intentionally_unverified
+- surfacesChecked: [`specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`, `src/core/orchestrator/Orchestrator.ts`, `tests/orchestrator.test.ts`, `specs/009-eng-392-routing-reload-split/quickstart.md`, `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`]
+- redactions: [`none`]
+- localPathHandling: `repo-relative paths only`
+- protectedSurfaceChecks:
+  - surface: `hermes/upstream-src/**`
+    expectation: `must remain untouched`
+    proof: `git diff -- specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` is the only scoped diff expected from T031; no vendored path is cited or modified in this packet.
+- intentionallyUnverified:
+  - boundary: `live tracker routing, live config reload, and live reviewer redispatch execution`
+    reason: `evidence-only task; source and focused test-artifact inspection were used instead of live runtime mutation`
+    nearestLocalProof: `tests/orchestrator.test.ts:2504-2647`; `tests/orchestrator.test.ts:3073-3209`; `tests/orchestrator.test.ts:5762-5892`
+- findings:
+  - `Worker retry redispatch after config reload already has branch-tip proof, while explicit reviewer redispatch-after-reload or restart proof remains mapped to REQ-392-RELOAD-PRESERVATION and REQ-392-TEST-PROOF.`
