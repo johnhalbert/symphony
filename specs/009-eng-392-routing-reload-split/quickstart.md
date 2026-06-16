@@ -126,6 +126,13 @@ Keep these adjacent PR #286 paths excluded unless a later child contract names t
 | `ENG-392 child — orchestrator proof` (`REQ-392-TEST-PROOF`) | `ENG-392 child — runtime routing repair`; `ENG-392 child — reload preservation repair`; `ENG-392 child — approval writeback repair` | Focused orchestrator proof only resumes after the runtime and approval invariants above are explicit and stable. |
 | `ENG-392 child — publication hygiene closure` (`REQ-392-PUBLICATION-HYGIENE`) | `ENG-392 child — decision and scope lock`; `ENG-392 child — orchestrator proof`; `ENG-392 child — approval writeback repair` | Publication-facing closure stays last so the final diff/evidence packet can prove it matches the declared child scopes and finished prerequisite repairs. |
 
+### Child issue creation path and authority boundary
+
+- **Selected creation path: prefer service-owned writeback.** The worker-owned decomposition step stops after drafting an accepted issue-breakdown plan; the actual Linear child creation should happen through Symphony's service-owned apply path, not by having a worker or reviewer write to Linear directly.
+- **Service-owned writeback path (default):** once the latest fresh plan is approved for apply and writeback is available, the apply flow creates one `issue_create` writeback per proposed child, waits for `created` or `verified` child refs before treating creation as successful, then emits the sibling `blocks` `issue_relation` writebacks and the parent summary comment. That keeps child creation, dependency wiring, and parent writeback in one service-owned audit trail instead of relying on a manual copy step.
+- **Explicit manual-apply fallback:** if service-owned apply is unavailable, intentionally withheld, or blocked on operator review, the operator may create the child issues manually from `contracts/child-issue-contracts.md`, preserving the exact suggested child titles, primary requirement IDs, dependency order, and no-auto-ready-label guidance. Manual apply should also mirror the same sibling `blocks` relations and parent summary notes explicitly rather than silently skipping them.
+- **Authority boundary:** workers and reviewers may draft or validate the child payload only. Service-owned writeback owns automated `issue_create`, `issue_relation`, and parent-comment mutations. Manual apply is an explicit operator-only fallback; it is not implicit permission for worker runs to create child issues, widen touched surfaces, or add `dogfood-ready` / worker-dispatch labels before review.
+
 ## Current `tests/orchestrator.test.ts` coverage inventory
 
 ### Routing and route-selection coverage already present
