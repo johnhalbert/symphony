@@ -55,6 +55,14 @@ export interface ServiceOwnedMergeConflictFinalizationResult {
   newHeadSha: string;
 }
 
+export interface PreparedBaseRefDriftDetails {
+  kind: "prepared_base_ref_drift";
+  refName: string;
+  actualSha: string;
+  expectedSha: string;
+  baseBranch: string;
+}
+
 export class ServiceOwnedMergeConflictGit {
   async prepare(
     input: ServiceOwnedMergeConflictPreparationInput,
@@ -65,52 +73,21 @@ export class ServiceOwnedMergeConflictGit {
     await git.assertCurrentBranch(input.branchName);
     await git.assertClean();
 
-    await git.fetchBranch(input.branchName, input.authHeader);
-    await git.fetchBranch(input.baseBranch, input.authHeader);
-    await git.assertRefSha(`refs/remotes/origin/${input.branchName}`, input.expectedHeadSha, "expected PR head");
-    await git.assertRefSha(`refs/remotes/origin/${input.baseBranch}`, input.liveBaseHeadSha, "expected live base");
-    await git.ensureCommit(input.expectedHeadSha);
+    return prepareFromCleanWorkspace(git, input);
+  }
+
+  async reprepareAfterBaseDrift(
+    input: ServiceOwnedMergeConflictPreparationInput,
+  ): Promise<ServiceOwnedMergeConflictPreparationResult> {
+    validateRefName(input.branchName, "PR branch");
+    validateRefName(input.baseBranch, "base branch");
+    const git = new ServiceGit(input.workspacePath);
+    await git.assertCurrentBranch(input.branchName);
+    await git.abortRebaseIfInProgress();
     await git.resetHard(input.expectedHeadSha);
+    await git.assertClean();
 
-    const mergeBaseSha = await git.mergeBase(input.expectedHeadSha, input.liveBaseHeadSha);
-    await git.resetSoft(mergeBaseSha);
-    const hasSquashDiff = await git.hasStagedDiff();
-    if (!hasSquashDiff) {
-      await git.resetHard(input.expectedHeadSha);
-      throw new SymphonyError("invalid_request", "Service-owned conflict preparation found no PR-side changes to squash");
-    }
-    await git.commit("Symphony service-owned merge-conflict prep", "Squash lifecycle-bound PR changes before rebasing onto the live base.");
-    const squashCommitSha = await git.headSha();
-
-    const rebase = await git.rebaseOnto(input.liveBaseHeadSha, mergeBaseSha);
-    if (rebase.code === 0) {
-      return {
-        status: "clean",
-        originalHeadSha: input.expectedHeadSha,
-        observedPrBaseHeadSha: input.observedPrBaseHeadSha,
-        liveBaseHeadSha: input.liveBaseHeadSha,
-        preparedBaseHeadSha: input.liveBaseHeadSha,
-        mergeBaseSha,
-        squashCommitSha,
-        rebasedHeadSha: await git.headSha(),
-        conflictedFiles: [],
-      };
-    }
-
-    const conflictedFiles = await git.conflictedFiles();
-    if (conflictedFiles.length === 0) {
-      throw new SymphonyError("invalid_request", `Service-owned rebase failed without file conflicts: ${rebase.stderr.trim() || rebase.stdout.trim()}`);
-    }
-    return {
-      status: "conflicted",
-      originalHeadSha: input.expectedHeadSha,
-      observedPrBaseHeadSha: input.observedPrBaseHeadSha,
-      liveBaseHeadSha: input.liveBaseHeadSha,
-      preparedBaseHeadSha: input.liveBaseHeadSha,
-      mergeBaseSha,
-      squashCommitSha,
-      conflictedFiles,
-    };
+    return prepareFromCleanWorkspace(git, input);
   }
 
   async publishPreparedHead(input: {
@@ -142,8 +119,10 @@ export class ServiceOwnedMergeConflictGit {
 
     const git = new ServiceGit(input.workspacePath);
     await git.assertCurrentBranch(input.branchName);
+    await git.fetchBranch(input.branchName, input.authHeader);
     await git.fetchBranch(input.baseBranch, input.authHeader);
-    await git.assertRefSha(`refs/remotes/origin/${input.baseBranch}`, input.preparedBaseHeadSha, "prepared base");
+    await git.assertRefSha(`refs/remotes/origin/${input.branchName}`, input.previousRemoteHeadSha, "expected PR head");
+    await git.assertPreparedBaseRefSha(`refs/remotes/origin/${input.baseBranch}`, input.preparedBaseHeadSha, input.baseBranch);
     const workerTouchedFiles = await git.workerTouchedFiles();
     const actualOutside = workerTouchedFiles.filter((file) => !allowed.has(file));
     if (actualOutside.length > 0) {
@@ -196,10 +175,20 @@ class ServiceGit {
   }
 
   async assertRefSha(refName: string, expectedSha: string, label: string): Promise<void> {
-    const actual = (await this.git(["rev-parse", `${refName}^{commit}`])).stdout.trim();
+    const actual = await this.refSha(refName);
     if (actual !== expectedSha) {
       throw new SymphonyError("invalid_request", `${refName} resolved to ${actual}, not ${label} ${expectedSha}`);
     }
+  }
+
+  async assertPreparedBaseRefSha(refName: string, expectedSha: string, baseBranch: string): Promise<void> {
+    const actual = await this.refSha(refName);
+    if (actual === expectedSha) return;
+    throw preparedBaseRefDriftError(refName, actual, expectedSha, baseBranch);
+  }
+
+  async refSha(refName: string): Promise<string> {
+    return (await this.git(["rev-parse", `${refName}^{commit}`])).stdout.trim();
   }
 
   async ensureCommit(sha: string): Promise<void> {
@@ -291,6 +280,15 @@ class ServiceGit {
     }
   }
 
+  async abortRebaseIfInProgress(): Promise<void> {
+    const rebaseMerge = (await this.git(["rev-parse", "--git-path", "rebase-merge"])).stdout.trim();
+    const rebaseApply = (await this.git(["rev-parse", "--git-path", "rebase-apply"])).stdout.trim();
+    if (!(await exists(resolveGitPath(this.workspacePath, rebaseMerge))) && !(await exists(resolveGitPath(this.workspacePath, rebaseApply)))) {
+      return;
+    }
+    await this.git(["rebase", "--abort"]);
+  }
+
   private async rebaseHeadName(): Promise<string | null> {
     const rebaseMerge = (await this.git(["rev-parse", "--git-path", "rebase-merge/head-name"])).stdout.trim();
     const rebaseApply = (await this.git(["rev-parse", "--git-path", "rebase-apply/head-name"])).stdout.trim();
@@ -323,6 +321,84 @@ class ServiceGit {
   private git(args: string[], options: { allowFailure?: boolean } = {}): Promise<GitResult> {
     return runCommand("git", args, this.workspacePath, DEFAULT_GIT_TIMEOUT_MS, options);
   }
+}
+
+async function prepareFromCleanWorkspace(
+  git: ServiceGit,
+  input: ServiceOwnedMergeConflictPreparationInput,
+): Promise<ServiceOwnedMergeConflictPreparationResult> {
+  await git.fetchBranch(input.branchName, input.authHeader);
+  await git.fetchBranch(input.baseBranch, input.authHeader);
+  await git.assertRefSha(`refs/remotes/origin/${input.branchName}`, input.expectedHeadSha, "expected PR head");
+  await git.assertRefSha(`refs/remotes/origin/${input.baseBranch}`, input.liveBaseHeadSha, "expected live base");
+  await git.ensureCommit(input.expectedHeadSha);
+  await git.resetHard(input.expectedHeadSha);
+
+  const mergeBaseSha = await git.mergeBase(input.expectedHeadSha, input.liveBaseHeadSha);
+  await git.resetSoft(mergeBaseSha);
+  const hasSquashDiff = await git.hasStagedDiff();
+  if (!hasSquashDiff) {
+    await git.resetHard(input.expectedHeadSha);
+    throw new SymphonyError("invalid_request", "Service-owned conflict preparation found no PR-side changes to squash");
+  }
+  await git.commit("Symphony service-owned merge-conflict prep", "Squash lifecycle-bound PR changes before rebasing onto the live base.");
+  const squashCommitSha = await git.headSha();
+
+  const rebase = await git.rebaseOnto(input.liveBaseHeadSha, mergeBaseSha);
+  if (rebase.code === 0) {
+    return {
+      status: "clean",
+      originalHeadSha: input.expectedHeadSha,
+      observedPrBaseHeadSha: input.observedPrBaseHeadSha,
+      liveBaseHeadSha: input.liveBaseHeadSha,
+      preparedBaseHeadSha: input.liveBaseHeadSha,
+      mergeBaseSha,
+      squashCommitSha,
+      rebasedHeadSha: await git.headSha(),
+      conflictedFiles: [],
+    };
+  }
+
+  const conflictedFiles = await git.conflictedFiles();
+  if (conflictedFiles.length === 0) {
+    throw new SymphonyError("invalid_request", `Service-owned rebase failed without file conflicts: ${rebase.stderr.trim() || rebase.stdout.trim()}`);
+  }
+  return {
+    status: "conflicted",
+    originalHeadSha: input.expectedHeadSha,
+    observedPrBaseHeadSha: input.observedPrBaseHeadSha,
+    liveBaseHeadSha: input.liveBaseHeadSha,
+    preparedBaseHeadSha: input.liveBaseHeadSha,
+    mergeBaseSha,
+    squashCommitSha,
+    conflictedFiles,
+  };
+}
+
+export function isPreparedBaseRefDriftError(error: unknown): error is SymphonyError & { details: PreparedBaseRefDriftDetails } {
+  return (
+    error instanceof SymphonyError &&
+    typeof error.details === "object" &&
+    error.details !== null &&
+    (error.details as { kind?: unknown }).kind === "prepared_base_ref_drift" &&
+    typeof (error.details as { actualSha?: unknown }).actualSha === "string" &&
+    typeof (error.details as { expectedSha?: unknown }).expectedSha === "string"
+  );
+}
+
+function preparedBaseRefDriftError(
+  refName: string,
+  actualSha: string,
+  expectedSha: string,
+  baseBranch: string,
+): SymphonyError {
+  return new SymphonyError("conflict", `${refName} resolved to ${actualSha}, not prepared base ${expectedSha}`, {
+    kind: "prepared_base_ref_drift",
+    refName,
+    actualSha,
+    expectedSha,
+    baseBranch,
+  } satisfies PreparedBaseRefDriftDetails);
 }
 
 interface GitResult {

@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { SymphonyError } from "../src/core/errors.js";
 import { MergeConflictResolutionService } from "../src/core/MergeConflictResolutionService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
@@ -214,6 +215,86 @@ describe("MergeConflictResolutionService", () => {
         }),
       ],
     });
+  });
+
+  it("re-prepares a service-owned conflict instead of blocking when the prepared base drifted", async () => {
+    const finalizerCalls: unknown[] = [];
+    const reprepareCalls: unknown[] = [];
+    const { service, lifecycleStore, outbox } = await fixture({
+      fixTurnCount: 1,
+      servicePreparation: servicePreparationRecord(),
+      finalizer: {
+        async finalize(input) {
+          finalizerCalls.push(input);
+          throw new SymphonyError("conflict", "refs/remotes/origin/main resolved to base-sha-2, not prepared base base-sha-1", {
+            kind: "prepared_base_ref_drift",
+            refName: "refs/remotes/origin/main",
+            actualSha: "base-sha-2",
+            expectedSha: "base-sha-1",
+            baseBranch: "main",
+          });
+        },
+        async reprepareAfterBaseDrift(input) {
+          reprepareCalls.push(input);
+          return {
+            status: "conflicted" as const,
+            originalHeadSha: "head-sha-1",
+            observedPrBaseHeadSha: "base-sha-2",
+            liveBaseHeadSha: "base-sha-2",
+            preparedBaseHeadSha: "base-sha-2",
+            mergeBaseSha: "base-sha-0",
+            squashCommitSha: "squash-sha-2",
+            conflictedFiles: ["src/index.ts"],
+          };
+        },
+      },
+    });
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({ resolutionStatus: "resolved", omitNewHeadSha: true }),
+      context({ workspacePath: "/tmp/service-prepared-workspace" }),
+    );
+
+    expect(result.report.resolutionStatus).toBe("still_conflicted");
+    expect(finalizerCalls).toHaveLength(1);
+    expect(reprepareCalls).toEqual([
+      expect.objectContaining({
+        workspacePath: "/tmp/service-prepared-workspace",
+        branchName: "symphony/TEST-1",
+        expectedHeadSha: "head-sha-1",
+        baseBranch: "main",
+        observedPrBaseHeadSha: "base-sha-2",
+        liveBaseHeadSha: "base-sha-2",
+      }),
+    ]);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "merge_conflict_resolution",
+      blockedReason: null,
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "pending",
+        currentHeadSha: "head-sha-1",
+        baseHeadSha: "base-sha-2",
+        fixTurnCount: 0,
+        lastConflictFixRunId: null,
+        attemptRunIds: [],
+        blockedReason: null,
+        servicePreparation: {
+          status: "conflicted",
+          liveBaseHeadSha: "base-sha-2",
+          preparedBaseHeadSha: "base-sha-2",
+          squashCommitSha: "squash-sha-2",
+        },
+      },
+      mergeConflictResolutionReports: [
+        expect.objectContaining({
+          resolutionStatus: "still_conflicted",
+          newHeadSha: "head-sha-1",
+          baseHeadSha: "base-sha-2",
+        }),
+      ],
+    });
+    await expect(outbox.list()).resolves.toEqual([]);
   });
 
   it("accepts service-prepared still-conflicted reports without requiring worker git metadata", async () => {

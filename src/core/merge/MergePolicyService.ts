@@ -161,6 +161,9 @@ export class MergePolicyService {
       return { status: "already_merged", merge: lifecycle.merge };
     }
 
+    const refreshedConflict = await this.refreshOpenMergeConflictBaseIfNeeded(latestIssue, lifecycle);
+    if (refreshedConflict !== null) return refreshedConflict;
+
     const sourceState = this.mergeSourceState(latestIssue, lifecycle);
     const staleConflictResult = this.pendingConflictsWhileTrackerCatchesUp(latestIssue, lifecycle);
     if (staleConflictResult !== null) return staleConflictResult;
@@ -490,6 +493,100 @@ export class MergePolicyService {
 
     const resultGate = { ...gate, writebackOperationKeys: operationKeys };
     return blocked ? { status: "blocked", gate: resultGate } : { status: "repair_dispatched", gate: resultGate };
+  }
+
+  private async refreshOpenMergeConflictBaseIfNeeded(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+  ): Promise<MergePolicyResult | null> {
+    const conflictsState = this.options.config.mergePolicy.conflictsState;
+    const conflict = lifecycle.mergeConflict;
+    const servicePreparation = conflict?.servicePreparation ?? null;
+    if (
+      conflictsState === null ||
+      conflict === null ||
+      servicePreparation === null ||
+      servicePreparation.strategy !== "squash_rebase" ||
+      servicePreparation.status !== "conflicted" ||
+      !statesEqual(issue.state, conflictsState)
+    ) {
+      return null;
+    }
+    if (conflict.status !== "open" && conflict.status !== "blocked") return null;
+
+    const branchName = requireValue(conflict.pullRequest.branch, "Service-owned conflict refresh requires a pull request branch");
+    const baseBranch = requireValue(conflict.baseBranch, "Service-owned conflict refresh requires the PR base branch");
+    const workspacePath = lifecycle.summaryPointers.workspacePath;
+    if (!workspacePath) return null;
+
+    const github = this.options.client ?? createGitHubPullRequestClientForCapability(this.options.config, "github.merge");
+    const livePullRequest = await github.getPullRequest({ pullRequestNumber: requireNumber(conflict.pullRequest.number) });
+    validateLivePullRequestMetadata(livePullRequest, conflict.pullRequest, conflict.currentHeadSha);
+    if (livePullRequest.headSha !== conflict.currentHeadSha || livePullRequest.baseBranch !== baseBranch) return null;
+
+    const baseObservation = await resolveLiveBaseObservation(github, livePullRequest);
+    if (baseObservation.liveBaseHeadSha === servicePreparation.preparedBaseHeadSha) return null;
+
+    const authHeader = await github.gitAuthHeader();
+    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const preparation = await conflictGit.reprepareAfterBaseDrift({
+      workspacePath,
+      branchName,
+      expectedHeadSha: conflict.currentHeadSha,
+      baseBranch,
+      observedPrBaseHeadSha: baseObservation.observedPrBaseHeadSha,
+      liveBaseHeadSha: baseObservation.liveBaseHeadSha,
+      authHeader,
+    });
+    let resolvedHeadSha: string | null = null;
+    let pullRequestHeadSha = conflict.currentHeadSha;
+    if (preparation.status === "clean") {
+      resolvedHeadSha = preparation.rebasedHeadSha;
+      pullRequestHeadSha = preparation.rebasedHeadSha;
+      await conflictGit.publishPreparedHead({
+        workspacePath,
+        branchName,
+        previousRemoteHeadSha: conflict.currentHeadSha,
+        authHeader,
+      });
+    }
+
+    const pullRequest = { ...conflict.pullRequest, headSha: pullRequestHeadSha };
+    const gate = gateWithMergeability(
+      emptyGateStatus(mergeGateId(issue.id, conflict.pullRequest, conflict.currentHeadSha), conflict.pullRequest, conflict.currentHeadSha, this.options.config.mergePolicy.requiredChecks),
+      mergeabilityStateFromPullRequest(livePullRequest, conflict.pullRequest, conflict.currentHeadSha, baseObservation),
+    );
+    const now = new Date().toISOString();
+    const refreshedConflict = buildServicePreparedMergeConflict({
+      issue,
+      gate,
+      sourceState: conflict.sourceState,
+      conflictsState,
+      mergeableState: livePullRequest.mergeableState,
+      preparation,
+      resolvedHeadSha,
+      pullRequestHeadSha,
+      maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
+      now,
+    });
+    const updated = await this.options.lifecycleStore.updateIssue(issue, {
+      phase: preparation.status === "clean" ? "passed" : "merge_conflict_resolution",
+      blockedReason: null,
+      mergeGate: null,
+      mergeConflict: {
+        ...refreshedConflict,
+        writebackOperationKeys: conflict.writebackOperationKeys,
+      },
+      summaryPointers: {
+        ciStatus: preparation.status === "clean" ? "success" : "conflicted",
+        prUrl: pullRequest.url,
+        prNumber: pullRequest.number,
+        prHeadSha: pullRequest.headSha,
+        prBranch: pullRequest.branch,
+        workspacePath,
+      },
+    });
+    return { status: "conflict_dispatched", gate, conflict: updated.mergeConflict ?? refreshedConflict };
   }
 
   private async handleServicePreparedMergeConflict(

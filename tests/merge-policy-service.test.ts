@@ -507,6 +507,106 @@ describe("MergePolicyService", () => {
     });
   });
 
+  it("refreshes stale service-prepared conflict bases before dispatching another conflict worker", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "Approved with Conflicts", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await lifecycleStore.updateIssue(currentIssue, {
+      phase: "merge_conflict_resolution",
+      blockedReason: null,
+      mergeConflict: {
+        ...mergeConflictRecord(),
+        servicePreparation: {
+          strategy: "squash_rebase",
+          status: "conflicted",
+          originalHeadSha: "head-sha-1",
+          observedPrBaseHeadSha: "base-sha-0",
+          liveBaseHeadSha: "base-sha-1",
+          preparedBaseHeadSha: "base-sha-1",
+          mergeBaseSha: "base-sha-0",
+          squashCommitSha: "squash-sha-1",
+          conflictedFiles: ["tests/orchestrator.test.ts"],
+          preparedAt: "2026-01-01T00:00:02.000Z",
+          finalizedAt: null,
+          finalizedHeadSha: null,
+        },
+      },
+      summaryPointers: {
+        workspacePath: path.join(root, currentIssue.identifier),
+      },
+    });
+    const conflictGit = new FakeConflictGit({
+      status: "conflicted",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-2",
+      conflictedFiles: ["tests/orchestrator.test.ts"],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient({
+        mergeable: false,
+        mergeableState: "dirty",
+        baseHeadSha: "base-sha-1",
+        liveBaseHeadSha: "base-sha-2",
+      }),
+      conflictGit,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("conflict_dispatched");
+    expect(conflictGit.prepareInput).toBeNull();
+    expect(conflictGit.reprepareInput).toMatchObject({
+      workspacePath: path.join(root, currentIssue.identifier),
+      branchName: "symphony/TEST-1",
+      expectedHeadSha: "head-sha-1",
+      baseBranch: "main",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      authHeader: "AUTHORIZATION: bearer test-token",
+    });
+    expect(writer.transitions).toEqual([]);
+    expect(writer.comments).toEqual([]);
+    expect(lifecycle).toMatchObject({
+      phase: "merge_conflict_resolution",
+      blockedReason: null,
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "pending",
+        currentHeadSha: "head-sha-1",
+        baseHeadSha: "base-sha-2",
+        fixTurnCount: 0,
+        attemptRunIds: [],
+        servicePreparation: {
+          status: "conflicted",
+          liveBaseHeadSha: "base-sha-2",
+          preparedBaseHeadSha: "base-sha-2",
+          squashCommitSha: "squash-sha-2",
+        },
+      },
+    });
+  });
+
   it("publishes a clean service-prepared rebase without moving the issue to the conflict state", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",
@@ -3593,6 +3693,7 @@ class FakeMergeClient implements MergePolicyGitHubClient {
 
 class FakeConflictGit extends ServiceOwnedMergeConflictGit {
   prepareInput: Parameters<ServiceOwnedMergeConflictGit["prepare"]>[0] | null = null;
+  reprepareInput: Parameters<ServiceOwnedMergeConflictGit["reprepareAfterBaseDrift"]>[0] | null = null;
   publishInput: Parameters<ServiceOwnedMergeConflictGit["publishPreparedHead"]>[0] | null = null;
 
   constructor(private readonly result: ServiceOwnedMergeConflictPreparationResult) {
@@ -3601,6 +3702,11 @@ class FakeConflictGit extends ServiceOwnedMergeConflictGit {
 
   override async prepare(input: Parameters<ServiceOwnedMergeConflictGit["prepare"]>[0]) {
     this.prepareInput = input;
+    return this.result;
+  }
+
+  override async reprepareAfterBaseDrift(input: Parameters<ServiceOwnedMergeConflictGit["reprepareAfterBaseDrift"]>[0]) {
+    this.reprepareInput = input;
     return this.result;
   }
 
