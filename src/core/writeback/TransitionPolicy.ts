@@ -54,11 +54,6 @@ export interface IssueTriageReportWritebackContext {
   blockedReason?: string | null;
 }
 
-export interface IssueTriageWorkerDispatchWritebackContext {
-  issue: Issue;
-  report: IssueTriageReportRecord;
-}
-
 export interface IssueTriageBlockedReboundWritebackContext {
   issue: Issue;
   report: IssueTriageReportRecord;
@@ -195,26 +190,6 @@ export function planDispatchWriteback(issue: Issue, config: ServiceConfig): NewW
       fromStates: ["Todo"],
       toState: config.writeback.dispatchState,
       reason: "Symphony dispatch",
-    },
-  };
-}
-
-export function planIssueTriageWorkerDispatchWriteback(
-  context: IssueTriageWorkerDispatchWritebackContext,
-  config: ServiceConfig,
-): NewWritebackOperation | null {
-  if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.blockedStates)) return null;
-  const dispatchStateVersion = safeKeySegment(context.issue.updatedAt ?? context.issue.createdAt ?? context.issue.state);
-  const eventKey = `issue-triage-worker:${safeKeySegment(context.report.idempotencyKey)}:${dispatchStateVersion}`;
-  return {
-    idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
-    kind: "transition",
-    issueId: context.issue.id,
-    runId: context.report.runId,
-    payload: {
-      fromStates: config.reviewLoop.blockedStates,
-      toState: config.writeback.dispatchState,
-      reason: "Symphony issue triage routed worker repair",
     },
   };
 }
@@ -713,6 +688,9 @@ export function planIssueTriageReportWritebacks(
           "",
           "Recommended human action:",
           context.report.recommendedAction,
+          "",
+          "Operator next-action matrix:",
+          ...formatIssueTriageNextActionMatrix(context, config),
         ].join("\n"),
       },
     },
@@ -737,6 +715,65 @@ function formatIssueTriageBlockerWritebackLines(report: IssueTriageReportRecord)
     "Recommended action:",
     blocker.recommendedAction,
   ]);
+}
+
+function formatIssueTriageNextActionMatrix(context: IssueTriageReportWritebackContext, config: ServiceConfig): string[] {
+  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
+  const dispatchState = config.writeback.dispatchState;
+  const reviewPassState = config.reviewLoop.reviewPassState;
+  const conflictsState = config.mergePolicy.mode === "gated" ? config.mergePolicy.conflictsState : null;
+  const issueKey = context.issue.identifier || context.issue.id;
+  const rows = [
+    [
+      blockedState === null ? "Leave blocked lifecycle as-is" : `Leave in ${blockedState}`,
+      "Symphony does not dispatch more issue work.",
+      "Use when the blocker still needs an external/operator fix.",
+      blockedState === null ? "Lifecycle remains blocked." : `Issue remains in ${blockedState}.`,
+    ],
+    [
+      `Move to ${dispatchState}`,
+      "Symphony resets the blocked failure budget and starts the normal worker implementation path.",
+      "Use when the triage blocker is worker-repairable code, test, or implementation behavior.",
+      "Success moves through review and then merge gate; failure gets a fresh max-failure window before blocking again.",
+    ],
+    [
+      "CLI: agent run --stage worker --force --ignore-state",
+      "Symphony resets the blocked failure budget for this explicit manual worker run.",
+      `Use when the issue should get one direct worker turn without changing tracker state first. Issue: ${issueKey}.`,
+      "Success follows the worker completion path; failure can block again after the configured budget.",
+    ],
+    [
+      "CLI: agent run --stage triage --force --ignore-state",
+      "Symphony runs read-only triage again.",
+      "Use when the operator wants a fresh diagnosis after external state changed.",
+      "This does not resolve the issue by itself; it publishes another triage report if eligible.",
+    ],
+  ];
+  if (reviewPassState !== null) {
+    rows.splice(2, 0, [
+      `Move to ${reviewPassState}`,
+      "Symphony resets the merge-gate failure budget and evaluates the lifecycle-bound pull request again.",
+      "Use when CI, mergeability, or another merge-gate input was fixed out of band.",
+      "Success merges and moves to the configured done state; failure dispatches repair or blocks after the fresh gate budget.",
+    ]);
+  }
+  if (conflictsState !== null) {
+    rows.splice(reviewPassState === null ? 2 : 3, 0, [
+      `Move to ${conflictsState}`,
+      "Symphony resets conflict-fix attempts and starts the prepared merge-conflict repair path.",
+      "Use when the current blocker is an actual pull request merge conflict.",
+      "Success lets Symphony finish the service-owned git flow and continue the merge gate; unresolved conflicts can block again after the fresh conflict-fix budget.",
+    ]);
+  }
+  return [
+    "| Action/status | Symphony reaction | When to use | Expected outcome |",
+    "|---|---|---|---|",
+    ...rows.map((row) => `| ${row.map(escapeMarkdownTableCell).join(" | ")} |`),
+  ];
+}
+
+function escapeMarkdownTableCell(value: string): string {
+  return value.replaceAll("|", "\\|").replace(/\s+/g, " ").trim();
 }
 
 export function planIssuePostMortemReportWritebacks(

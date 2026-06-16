@@ -382,6 +382,12 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(commentBody(operations, 0)).toContain("- review-verdict:issue-1:verdict-3 found sibling path");
     expect(commentBody(operations, 0)).toContain("Recommended human action:");
     expect(commentBody(operations, 0)).toContain(report.recommendedAction);
+    expect(commentBody(operations, 0)).toContain("Operator next-action matrix:");
+    expect(commentBody(operations, 0)).toContain("| Action/status | Symphony reaction | When to use | Expected outcome |");
+    expect(commentBody(operations, 0)).toContain("| Leave in Blocked | Symphony does not dispatch more issue work.");
+    expect(commentBody(operations, 0)).toContain("| Move to In Progress | Symphony resets the blocked failure budget");
+    expect(commentBody(operations, 0)).toContain("| Move to Ready to Merge | Symphony resets the merge-gate failure budget");
+    expect(commentBody(operations, 0)).toContain("| CLI: agent run --stage worker --force --ignore-state | Symphony resets the blocked failure budget");
   });
 
   it("plans issue post-mortem report comments", () => {

@@ -35,6 +35,7 @@ import {
 } from "../src/core/IssueBreakdownPlanApplyService.js";
 import { IssueBreakdownPlanService } from "../src/core/IssueBreakdownPlanService.js";
 import { IssueTriageService, issueTriageTriggerFingerprint } from "../src/core/IssueTriageService.js";
+import type { MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
 import {
@@ -44,6 +45,7 @@ import {
   type IssueBreakdownPlanRecord,
   type IssueLifecyclePatch,
   type IssueMergeConflictMetadata,
+  type IssueMergeGateState,
   type IssueReviewFeedbackRecord,
   type IssueReviewVerdictRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
@@ -2541,7 +2543,7 @@ describe("Orchestrator", () => {
     });
   });
 
-  it("routes blocked issues with active worker-owned triage blockers back to worker dispatch", async () => {
+  it("keeps blocked issues stopped after triage even when blockers are worker-owned", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
     config.writeback.enabled = true;
@@ -2621,23 +2623,11 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "triage-routed worker dispatch");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "triage-routed worker completion");
     await orchestrator.stop();
 
-    expect(writer.transitions[0]).toMatchObject({
-      issueId: candidate.id,
-      fromStates: ["Blocked"],
-      toState: "In Progress",
-      reason: "Symphony issue triage routed worker repair",
-    });
-    expect(harness.runs[0]?.ctx).toMatchObject({
-      role: "worker",
-      runPhase: "implementation",
-      issue: expect.objectContaining({ state: "In Progress" }) as Partial<Issue>,
-    });
-    expect(harness.runs[0]?.ctx.ephemeralSystemPrompt).toContain("Latest issue triage:");
-    expect(harness.runs[0]?.ctx.ephemeralSystemPrompt).toContain("implementation_unsatisfied_requirements");
+    expect(state).toBe("Blocked");
+    expect(writer.transitions).toEqual([]);
+    expect(harness.runs).toEqual([]);
   });
 
   it("does not route mixed active triage blockers back to worker dispatch", async () => {
@@ -2873,6 +2863,127 @@ describe("Orchestrator", () => {
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       phase: "blocked",
       blockedReason,
+    });
+  });
+
+  it("does not rebound mixed triage when operator moves a blocked issue to In Progress", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
+    config.tracker.activeStates = ["In Progress"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.writeback.dispatchState = "In Progress";
+    let state = "In Progress";
+    const candidate = issue({ state, branchName: "symphony/TEST-1" });
+    const currentIssue = (): Issue => ({ ...candidate, state });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return config.tracker.activeStates.some((activeState) => activeState.toLowerCase() === state.toLowerCase())
+          ? [currentIssue()]
+          : [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.some((candidateState) => candidateState.toLowerCase() === state.toLowerCase()) ? [currentIssue()] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((nextState) => {
+      state = nextState;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const blockedReason = "max merge gate failures reached (5/3)";
+    const seeded = await lifecycleStore.ensureIssue(currentIssue(), {
+      phase: "blocked",
+      reviewRound: 3,
+      incompleteTurnCount: 2,
+      blockedReason,
+      mergeGate: {
+        ...blockedMergeGate(candidate),
+        id: "merge-gate:issue-1:pr-42:head-sha-1",
+        headSha: "head-sha-1",
+        reviewRound: 5,
+        blockerFingerprint: "head-sha-1:Typecheck and test:failure",
+      },
+    });
+    await lifecycleStore.updateIssue(currentIssue(), {
+      lastIssueTriageReportId: "issue-triage-report:issue-1:triage-mixed",
+      issueTriageReports: [
+        {
+          id: "issue-triage-report:issue-1:triage-mixed",
+          idempotencyKey: "triage-mixed",
+          requestHash: "triage-mixed-hash",
+          runId: "triage-run-1",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          triggerFingerprint: issueTriageTriggerFingerprint(seeded),
+          disposition: "implementation_repair",
+          confidence: "medium",
+          summary: "Worker blocker is mixed with an active operator-owned merge gate blocker.",
+          evidence: ["blockedReason=max merge gate failures reached (5/3)"],
+          recommendedAction: "Operator moved the issue to In Progress to start a fresh worker attempt.",
+          blockers: [
+            {
+              kind: "implementation_unsatisfied_requirements",
+              status: "active",
+              nextActor: "worker",
+              confidence: "medium",
+              summary: "The failed merge-gate verdict is unsuperseded by a newer completion report.",
+              evidence: ["latest merge-gate verdict was recorded after latest completion report"],
+              recommendedAction: "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
+            },
+            {
+              kind: "merge_gate_check_failure",
+              status: "active",
+              nextActor: "operator",
+              confidence: "high",
+              summary: "The current PR head is blocked on a required check failure.",
+              evidence: ["Typecheck and test failed on the current PR head"],
+              recommendedAction: "Fix or rerun the required check before dispatching another worker.",
+            },
+          ],
+          submittedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-mixed"],
+        },
+      ],
+    });
+    const harness = new LifecycleSnapshotHarness(lifecycleStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "operator-resumed worker dispatch");
+    await orchestrator.stop();
+
+    expect(state).toBe("In Progress");
+    expect(writer.transitions).toEqual([]);
+    expect(harness.runs[0]?.runPhase).toBe("implementation");
+    expect(harness.snapshots[0]).toMatchObject({
+      phase: "implementation",
+      reviewRound: 0,
+      incompleteTurnCount: 0,
+      blockedReason: null,
+      lastIssueTriageReportId: null,
+      mergeGate: {
+        status: "resolved",
+        reviewRound: 0,
+        blockerFingerprint: null,
+      },
     });
   });
 
@@ -3182,6 +3293,189 @@ describe("Orchestrator", () => {
       phase: "review",
       lastCompletionReportId: "completion-report:issue-1:manual-run-1",
     });
+  });
+
+  it("manual worker dispatch from blocked resets the failure budget before the run starts", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [candidate];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const approvalVerdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(candidate),
+      id: "review-verdict:issue-1:approval-pass",
+      idempotencyKey: "approval-pass",
+      runId: "review-run-pass",
+      verdict: "pass",
+      findings: [],
+      acceptanceResults: [{ text: "Approved", satisfied: true, evidence: "review passed" }],
+      submittedAt: "2026-01-01T00:00:02.000Z",
+    };
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      reviewRound: 3,
+      incompleteTurnCount: 3,
+      blockedReason: "max merge gate failures reached (4/3)",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      lastReviewVerdictId: "merge-gate:issue-1:pr-42:abc123",
+      lastIssueTriageReportId: "issue-triage-report:issue-1:stale",
+      completionReports: [completionReportRecord(candidate)],
+      reviewVerdicts: [
+        approvalVerdict,
+        {
+          ...reviewVerdictRecord(candidate),
+          id: "merge-gate:issue-1:pr-42:abc123",
+          idempotencyKey: "merge-gate-fail",
+          runId: "worker-run-1",
+          reviewer: "symphony-merge-gate",
+          submittedAt: "2026-01-01T00:00:03.000Z",
+        },
+      ],
+      mergeGate: blockedMergeGate(candidate),
+    });
+    const harness = new LifecycleSnapshotHarness(lifecycleStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    const result = await orchestrator.runManualAgent(candidate.id, {
+      stage: "worker",
+      forceLabels: true,
+      ignoreState: true,
+    });
+    await orchestrator.stop();
+
+    expect(result).toMatchObject({ status: "completed", role: "worker", runPhase: "implementation" });
+    expect(harness.snapshots[0]).toMatchObject({
+      reviewRound: 0,
+      incompleteTurnCount: 0,
+      blockedReason: null,
+      lastReviewVerdictId: approvalVerdict.id,
+      lastIssueTriageReportId: null,
+      mergeGate: {
+        status: "resolved",
+        reviewRound: 0,
+        blockerFingerprint: null,
+      },
+    });
+  });
+
+  it("operator Ready to Merge resume resets merge-gate rounds before rerunning the gate", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    let state = "Ready to Merge";
+    const candidate = issue({ state, branchName: "symphony/TEST-1", labels: ["dogfood-ready"] });
+    const currentIssue = (): Issue => ({ ...candidate, state });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.some((candidateState) => candidateState.toLowerCase() === state.toLowerCase()) ? [currentIssue()] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((nextState) => {
+      state = nextState;
+    });
+    const approvalVerdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(candidate),
+      id: "review-verdict:issue-1:approval-pass",
+      idempotencyKey: "approval-pass",
+      runId: "review-run-pass",
+      verdict: "pass",
+      findings: [],
+      acceptanceResults: [{ text: "Approved", satisfied: true, evidence: "review passed" }],
+      submittedAt: "2026-01-01T00:00:02.000Z",
+    };
+    await lifecycleStore.ensureIssue(currentIssue(), {
+      phase: "blocked",
+      reviewRound: 2,
+      incompleteTurnCount: 1,
+      blockedReason: "max merge gate failures reached (4/3)",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      lastReviewVerdictId: "merge-gate:issue-1:pr-42:abc123",
+      completionReports: [completionReportRecord(candidate)],
+      reviewVerdicts: [
+        approvalVerdict,
+        {
+          ...reviewVerdictRecord(candidate),
+          id: "merge-gate:issue-1:pr-42:abc123",
+          idempotencyKey: "merge-gate-fail",
+          runId: "worker-run-1",
+          reviewer: "symphony-merge-gate",
+          submittedAt: "2026-01-01T00:00:03.000Z",
+        },
+      ],
+      mergeGate: blockedMergeGate(candidate),
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs),
+      pullRequestMergeClient: new FailingRequiredCheckMergeClient(),
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(state).toBe("In Progress");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: candidate.id,
+        fromStates: ["Ready to Merge"],
+        toState: "In Progress",
+        reason: "Symphony merge gate required CI repair",
+      },
+    ]);
+    expect(lifecycle).toMatchObject({
+      phase: "implementation",
+      reviewRound: 0,
+      incompleteTurnCount: 0,
+      blockedReason: null,
+      lastReviewVerdictId: "review-verdict:issue-1:approval-pass",
+      lastMergeGateResultId: "merge-gate:issue-1:pr-42:abc123",
+      mergeGate: {
+        status: "repair_dispatched",
+        reviewRound: 1,
+      },
+    });
+    expect(lifecycle?.mergeGateResults?.find((result) => result.id === "merge-gate:issue-1:pr-42:abc123")?.writebackOperationKeys).toEqual([
+      "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_abc123:repair:abc123_test_failure:r1",
+      "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_abc123:repair:abc123_test_failure:r1:In Progress",
+    ]);
   });
 
   it("manual worker dispatch does not auto-route planning-labeled issues to planner", async () => {
@@ -5786,6 +6080,73 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("submit_merge_conflict_resolution");
   });
 
+  it("reopens a blocked merge-conflict repair budget when the operator returns to the conflict state", async () => {
+    const config = testConfig(root);
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.conflictsState = "Merge Conflicts";
+    const candidate = issue({ state: "Merge Conflicts", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const conflict: IssueMergeConflictMetadata = {
+      ...openMergeConflict(candidate),
+      status: "blocked",
+      resolutionStatus: "blocked",
+      fixTurnCount: 3,
+      maxFixTurns: 3,
+      lastConflictFixRunId: "conflict-run-3",
+      attemptRunIds: ["conflict-run-1", "conflict-run-2", "conflict-run-3"],
+      blockedAt: "2026-01-01T00:00:04.000Z",
+      blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+    };
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      blockedReason: conflict.blockedReason,
+      mergeConflict: conflict,
+    });
+    const harness = new LifecycleSnapshotHarness(lifecycleStore);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "conflict repair dispatch after operator resume");
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.runPhase).toBe("merge_conflict_resolution");
+    expect(harness.snapshots[0]).toMatchObject({
+      phase: "merge_conflict_resolution",
+      blockedReason: null,
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "still_conflicted",
+        fixTurnCount: 0,
+        lastConflictFixRunId: null,
+        attemptRunIds: [],
+        blockedAt: null,
+        blockedReason: null,
+      },
+    });
+  });
+
   it("processes a live fail verdict submitted by a reviewer harness run", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
@@ -7899,6 +8260,42 @@ function openMergeConflict(candidate = issue()): IssueMergeConflictMetadata {
   };
 }
 
+function blockedMergeGate(candidate = issue()): IssueMergeGateState {
+  return {
+    id: "merge-gate:issue-1:pr-42:abc123",
+    status: "blocked",
+    headSha: "abc123",
+    pullRequest: {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "abc123",
+      branch: candidate.branchName,
+    },
+    requiredChecks: ["test"],
+    checks: [
+      {
+        name: "test",
+        outcome: "failing",
+        rawStatus: "failure",
+        conclusion: "failure",
+        url: "https://ci.test/test",
+        firstObservedAt: "2026-01-01T00:00:00.000Z",
+        actionableSince: "2026-01-01T00:00:01.000Z",
+      },
+    ],
+    mergeability: null,
+    reviewRound: 4,
+    gateRunId: "worker-run-1",
+    gateReportId: "completion-report:issue-1:idem-1",
+    repairRunId: null,
+    repairReportId: null,
+    blockerFingerprint: "abc123:test:failure",
+    writebackOperationKeys: ["transition:issue-1:merge-gate:blocked"],
+    supersededByHeadSha: null,
+    updatedAt: "2026-01-01T00:00:03.000Z",
+  };
+}
+
 async function appendApprovalFeedback(
   lifecycleStore: FileIssueLifecycleStore,
   candidate: Issue,
@@ -8268,6 +8665,32 @@ function testTrackerStateLists(): TrackerStateLists {
     blockedStates: ["Blocked"],
     terminalStates: ["Done", "Canceled"],
   };
+}
+
+function mergePolicyOrchestratorConfig(root: string) {
+  return parseServiceConfig(
+    {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_API_KEY",
+        project_slug: "TEST",
+      },
+      workspace: { root },
+      writeback: { enabled: true, mode: "live", dispatch_state: "In Progress" },
+      review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge", blocked_states: ["Blocked"] },
+      merge_policy: {
+        mode: "gated",
+        source_states: ["Ready to Merge"],
+        done_state: "Done",
+        merge_method: "squash",
+        required_checks: ["test"],
+        no_ci: { allowed: false },
+      },
+      github: { owner: "acme", repo: "symphony" },
+    },
+    path.join(root, "WORKFLOW.md"),
+    { LINEAR_API_KEY: "linear-secret", GITHUB_TOKEN: "github-secret" },
+  );
 }
 
 async function seedIssueBreakdownReplayWork(
@@ -8872,6 +9295,67 @@ class ManualDispatchRecordingHarness implements AgentHarness {
       );
     }
     yield { type: "completed" };
+  }
+}
+
+class LifecycleSnapshotHarness implements AgentHarness {
+  readonly id = "lifecycle-snapshot";
+  readonly capabilities = { continuation: true, mcpHandoff: true, ephemeralSystemPrompt: true };
+  readonly runs: AgentRunContext[] = [];
+  readonly snapshots: Array<Awaited<ReturnType<FileIssueLifecycleStore["get"]>>> = [];
+
+  constructor(private readonly lifecycleStore: FileIssueLifecycleStore) {}
+
+  async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
+    this.runs.push(ctx);
+    yield { type: "session_started", sessionId: "snapshot-session-1", runId: "snapshot-run-1" };
+    this.snapshots.push(await this.lifecycleStore.get(ctx.issue.id));
+    yield { type: "completed" };
+  }
+}
+
+class FailingRequiredCheckMergeClient implements MergePolicyGitHubClient {
+  async getPullRequest() {
+    return {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:02.000Z",
+      state: "open",
+      merged: false,
+      mergeCommitSha: null,
+      mergedAt: null,
+      mergedBy: null,
+      mergeable: true,
+      mergeableState: "clean",
+      baseBranch: "main",
+      baseHeadSha: "base-sha-1",
+    };
+  }
+
+  async getBranchHeadSha() {
+    return "base-sha-1";
+  }
+
+  async getRequiredCheckResults() {
+    return [{ name: "test", status: "failure" as const, conclusion: "failure", url: "https://ci.test/test" }];
+  }
+
+  async mergePullRequest(): Promise<never> {
+    throw new Error("merge should not be called while required checks fail");
+  }
+
+  async getAuthenticatedLogin() {
+    return "symphony-bot";
+  }
+
+  async isAncestor() {
+    return true;
+  }
+
+  async gitAuthHeader() {
+    return "x-access-token:token";
   }
 }
 

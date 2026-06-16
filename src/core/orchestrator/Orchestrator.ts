@@ -111,6 +111,7 @@ import {
   type IssueLifecycleSummaryReference,
   type IssueLifecycleStore,
   type IssueMergeConflictMetadata,
+  type IssueMergeGateState,
   type IssueReviewVerdictRecord,
   type IssueTriageBlockerKind,
   type IssueTriageBlockerRecord,
@@ -139,7 +140,6 @@ import {
   planIssuePostMortemReportWritebacks,
   planIssueTriageBlockedReboundWriteback,
   planIssueTriageReportWritebacks,
-  planIssueTriageWorkerDispatchWriteback,
   planMergeGateHeadSupersessionRecoveryWritebacks,
   planRunCancelledComment,
   planRunFailedComment,
@@ -2133,7 +2133,7 @@ export class Orchestrator {
     const store = this.options.lifecycleStore;
     if (!store) return true;
     await this.reconcileLifecycleBeforeIssueWork(issue);
-    const lifecycle = await store.get(issue.id);
+    let lifecycle = await store.get(issue.id);
     if (!lifecycle) return true;
 
     if (role === "triage") {
@@ -2151,24 +2151,30 @@ export class Orchestrator {
       );
     }
 
-    const phase = phaseForIssueState(issue.state, this.config);
-    const conflict = lifecycle.mergeConflict;
+    let conflict = lifecycle.mergeConflict;
     if (
       conflict &&
       this.config.mergePolicy.conflictsState !== null &&
       isStateIn(issue.state, [this.config.mergePolicy.conflictsState]) &&
       (conflict.status === "blocked" || conflict.resolutionStatus === "blocked")
     ) {
-      const blockedReason =
-        conflict.blockedReason ?? mergeConflictBlockedReason(conflict.fixTurnCount, conflict.maxFixTurns);
-      if (lifecycle.phase !== "blocked" || lifecycle.blockedReason !== blockedReason) {
-        await store.updateIssue(issue, {
-          phase: "blocked",
-          blockedReason,
-          mergeConflict: { ...conflict, status: "blocked", resolutionStatus: "blocked", blockedReason },
-        });
+      lifecycle = await this.resetFailureBudgetAfterOperatorAction(issue, lifecycle, "merge_conflict_state_resume");
+      conflict = lifecycle.mergeConflict;
+      if (conflict?.status === "open" && conflict.fixTurnCount < conflict.maxFixTurns) {
+        // Continue into the normal conflict-resolution dispatch gate with a fresh operator-granted attempt window.
+      } else {
+        if (!conflict) return false;
+        const blockedReason =
+          conflict.blockedReason ?? mergeConflictBlockedReason(conflict.fixTurnCount, conflict.maxFixTurns);
+        if (lifecycle.phase !== "blocked" || lifecycle.blockedReason !== blockedReason) {
+          await store.updateIssue(issue, {
+            phase: "blocked",
+            blockedReason,
+            mergeConflict: { ...conflict, status: "blocked", resolutionStatus: "blocked", blockedReason },
+          });
+        }
+        return false;
       }
-      return false;
     }
     if (
       role === "worker" &&
@@ -2177,6 +2183,20 @@ export class Orchestrator {
     ) {
       return false;
     }
+    const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
+    if (blockedByLifecycle && !isPendingPublicationApprovalReason(lifecycle.blockedReason)) {
+      const operatorResumeFromTrackerState =
+        this.config.reviewLoop.blockedStates.length > 0 && !isStateIn(issue.state, this.config.reviewLoop.blockedStates);
+      if (options.ignoreState === true || operatorResumeFromTrackerState) {
+        await this.resetFailureBudgetAfterOperatorAction(
+          issue,
+          lifecycle,
+          options.ignoreState === true ? "manual_ignore_state_resume" : "tracker_state_resume",
+          { reopenMergeConflict: role === "worker" && runPhase === "merge_conflict_resolution" },
+        );
+        return true;
+      }
+    }
     if (
       role === "worker" &&
       runPhase === "implementation" &&
@@ -2184,7 +2204,6 @@ export class Orchestrator {
     ) {
       return false;
     }
-    const blockedByLifecycle = lifecycle.phase === "blocked" || lifecycle.blockedReason !== null;
     const plannerAllowedFromBlocked =
       role === "planner" &&
       runPhase === "issue_breakdown" &&
@@ -2201,15 +2220,18 @@ export class Orchestrator {
         if (isPendingPublicationApprovalReason(lifecycle.blockedReason)) {
           return false;
         }
-        if (this.config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, this.config.reviewLoop.blockedStates)) {
+        if (
+          options.ignoreState !== true &&
+          (this.config.reviewLoop.blockedStates.length === 0 || isStateIn(issue.state, this.config.reviewLoop.blockedStates))
+        ) {
           return false;
         }
-        await store.updateIssue(issue, {
-          phase,
-          reviewRound: 0,
-          incompleteTurnCount: 0,
-          blockedReason: null,
-        });
+        await this.resetFailureBudgetAfterOperatorAction(
+          issue,
+          lifecycle,
+          options.ignoreState === true ? "manual_ignore_state_resume" : "tracker_state_resume",
+          { reopenMergeConflict: role === "worker" && runPhase === "merge_conflict_resolution" },
+        );
         return true;
       }
     }
@@ -2257,6 +2279,60 @@ export class Orchestrator {
     }
 
     return true;
+  }
+
+  private async resetFailureBudgetAfterOperatorAction(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    reason: "tracker_state_resume" | "manual_ignore_state_resume" | "merge_conflict_state_resume" | "merge_policy_source_state_resume",
+    options: { reopenMergeConflict?: boolean } = {},
+  ): Promise<IssueLifecycleRecord> {
+    const store = this.options.lifecycleStore;
+    if (!store) return lifecycle;
+
+    const now = new Date().toISOString();
+    const approvalVerdict = latestCurrentApprovalPassVerdict(lifecycle);
+    const mergeGate = resetMergeGateFailureBudgetForOperatorAction(lifecycle.mergeGate ?? null, now);
+    const mergeConflict = resetMergeConflictFailureBudgetForOperatorAction(
+      lifecycle.mergeConflict,
+      now,
+      options.reopenMergeConflict === true ||
+        (this.config.mergePolicy.conflictsState !== null && isStateIn(issue.state, [this.config.mergePolicy.conflictsState])),
+    );
+    const lastReviewVerdictId =
+      lifecycle.mergeGate !== null &&
+      lifecycle.mergeGate !== undefined &&
+      lifecycle.lastReviewVerdictId === lifecycle.mergeGate.id &&
+      approvalVerdict !== null
+        ? approvalVerdict.id
+        : lifecycle.lastReviewVerdictId;
+    const patch: IssueLifecyclePatch = {
+      phase: phaseForIssueState(issue.state, this.config),
+      reviewRound: 0,
+      incompleteTurnCount: 0,
+      blockedReason: null,
+      lastIssueTriageReportId: null,
+      lastReviewVerdictId,
+      mergeGate,
+      mergeConflict,
+    };
+    const updated = await store.updateIssue(issue, patch);
+    this.options.logger.info("operator action reset lifecycle failure budget", {
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      issue_state: issue.state,
+      reason,
+      previous_phase: lifecycle.phase,
+      next_phase: updated.phase,
+      previous_blocked_reason: lifecycle.blockedReason,
+      previous_review_round: lifecycle.reviewRound,
+      previous_incomplete_turn_count: lifecycle.incompleteTurnCount,
+      previous_merge_gate_round: lifecycle.mergeGate?.reviewRound ?? null,
+      next_merge_gate_round: updated.mergeGate?.reviewRound ?? null,
+      previous_conflict_fix_turn_count: lifecycle.mergeConflict?.fixTurnCount ?? null,
+      next_conflict_fix_turn_count: updated.mergeConflict?.fixTurnCount ?? null,
+    });
+    return updated;
   }
 
   private async recoverSatisfiedHeadSupersessionRebind(issue: Issue, lifecycle: IssueLifecycleRecord): Promise<boolean> {
@@ -2608,7 +2684,6 @@ export class Orchestrator {
       await this.reconcileIssueTriageReportWriteback(issue);
       if (this.availableSlots() <= 0) break;
       if (await this.tryDispatchPlanner(issue)) continue;
-      if (await this.tryDispatchWorkerFromIssueTriage(issue)) continue;
       await this.tryDispatchIssueTriage(issue);
     }
   }
@@ -2643,72 +2718,6 @@ export class Orchestrator {
           : candidate,
       ),
     });
-  }
-
-  private async tryDispatchWorkerFromIssueTriage(issue: Issue, allowExistingClaim = false): Promise<boolean> {
-    if (!this.config.issueTriage.enabled || !this.options.lifecycleStore) return false;
-    if (this.availableSlots() <= 0) return false;
-    if (await this.activeProviderDispatchGate()) return false;
-    if (this.running.has(issue.id)) return false;
-    if (this.pausedIssues.has(issue.id)) return false;
-    if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
-    if (!issue.assignedToWorker) return false;
-    if (!isStateIn(issue.state, this.config.reviewLoop.blockedStates)) return false;
-    if (isStateIn(issue.state, this.config.tracker.terminalStates)) return false;
-    if (issue.hasChildren) return false;
-    if (!this.passesLabelGuardrails(issue, "worker")) return false;
-    if (!this.hasStateSlot(issue.state)) return false;
-
-    let lifecycle = await this.options.lifecycleStore.get(issue.id);
-    let report = workerDispatchTriageReport(lifecycle);
-    if (!report) return false;
-
-    let refreshed: Issue[];
-    try {
-      refreshed = await this.options.tracker.fetchIssueStatesByIds([issue.id]);
-    } catch (error) {
-      this.options.logger.warn("pre-triage-worker issue refresh failed", {
-        issue_id: issue.id,
-        issue_identifier: issue.identifier,
-        error: errorMessage(error),
-      });
-      return false;
-    }
-
-    const latest = refreshed[0];
-    if (!latest) return false;
-    if (this.availableSlots() <= 0) return false;
-    if (await this.activeProviderDispatchGate()) return false;
-    if (this.running.has(latest.id)) return false;
-    if (this.pausedIssues.has(latest.id)) return false;
-    if (!allowExistingClaim && this.claimed.has(latest.id)) return false;
-    if (!latest.assignedToWorker) return false;
-    if (!isStateIn(latest.state, this.config.reviewLoop.blockedStates)) return false;
-    if (isStateIn(latest.state, this.config.tracker.terminalStates)) return false;
-    if (latest.hasChildren) return false;
-    if (!this.passesLabelGuardrails(latest, "worker")) return false;
-    if (!this.hasStateSlot(latest.state)) return false;
-
-    lifecycle = await this.options.lifecycleStore.get(latest.id);
-    report = workerDispatchTriageReport(lifecycle);
-    if (!report) return false;
-
-    const transition = planIssueTriageWorkerDispatchWriteback({ issue: latest, report }, this.config);
-    if (!transition) return false;
-    if (!(await this.applyWriteback(transition, "issue triage worker dispatch"))) return false;
-
-    const afterWriteback = (await this.options.tracker.fetchIssueStatesByIds([latest.id]))[0];
-    if (!afterWriteback) return false;
-    if (this.availableSlots() <= 0) return false;
-    if (await this.activeProviderDispatchGate()) return false;
-    if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim, "implementation")) return false;
-
-    await this.options.lifecycleStore.updateIssue(afterWriteback, {
-      phase: "implementation",
-      blockedReason: null,
-    });
-    this.dispatchIssue(afterWriteback, null, "worker", null, "implementation");
-    return true;
   }
 
   private async tryDispatchIssueTriage(issue: Issue, allowExistingClaim = false): Promise<boolean> {
@@ -4940,6 +4949,18 @@ export class Orchestrator {
   private async tryReconcileMergePolicy(issue: Issue): Promise<void> {
     if (this.config.mergePolicy.mode !== "gated" || !this.options.lifecycleStore) return;
     try {
+      const lifecycle = await this.options.lifecycleStore.get(issue.id);
+      if (
+        lifecycle !== null &&
+        (lifecycle.phase === "blocked" || lifecycle.blockedReason !== null) &&
+        !isStateIn(issue.state, this.config.reviewLoop.blockedStates) &&
+        !isPendingPublicationApprovalReason(lifecycle.blockedReason)
+      ) {
+        await this.resetFailureBudgetAfterOperatorAction(issue, lifecycle, "merge_policy_source_state_resume", {
+          reopenMergeConflict:
+            this.config.mergePolicy.conflictsState !== null && isStateIn(issue.state, [this.config.mergePolicy.conflictsState]),
+        });
+      }
       const service = new MergePolicyService({
         config: this.config,
         tracker: this.options.tracker,
@@ -6759,12 +6780,38 @@ function reportHasActiveTriageBlocker(
   return activeIssueTriageBlockers(report).some((blocker) => blocker.kind === kind);
 }
 
-function workerDispatchTriageReport(lifecycle: IssueLifecycleRecord | null): IssueLifecycleRecord["issueTriageReports"][number] | null {
-  if (!lifecycle || lifecycle.phase !== "blocked") return null;
-  const report = latestIssueTriageReportForFingerprint(lifecycle, issueTriageTriggerFingerprint(lifecycle));
-  const activeBlockers = activeIssueTriageBlockers(report);
-  if (activeBlockers.length === 0) return null;
-  return activeBlockers.every((blocker) => blocker.nextActor === "worker") ? report : null;
+function resetMergeGateFailureBudgetForOperatorAction(gate: IssueMergeGateState | null, now: string): IssueMergeGateState | null {
+  if (gate === null) return null;
+  const wasActive = gate.status !== "resolved" && gate.status !== "superseded";
+  return {
+    ...gate,
+    status: wasActive ? "resolved" : gate.status,
+    reviewRound: 0,
+    blockerFingerprint: wasActive ? null : gate.blockerFingerprint,
+    supersededByHeadSha: gate.status === "superseded" ? gate.supersededByHeadSha : null,
+    updatedAt: now,
+  };
+}
+
+function resetMergeConflictFailureBudgetForOperatorAction(
+  conflict: IssueMergeConflictMetadata | null,
+  now: string,
+  reopenMergeConflict: boolean,
+): IssueMergeConflictMetadata | null {
+  if (conflict === null) return null;
+  const shouldReopen =
+    reopenMergeConflict && (conflict.status === "blocked" || conflict.resolutionStatus === "blocked");
+  return {
+    ...conflict,
+    status: shouldReopen ? "open" : conflict.status,
+    resolutionStatus: shouldReopen ? "still_conflicted" : conflict.resolutionStatus,
+    fixTurnCount: shouldReopen ? 0 : conflict.fixTurnCount,
+    lastConflictFixRunId: shouldReopen ? null : conflict.lastConflictFixRunId,
+    attemptRunIds: shouldReopen ? [] : conflict.attemptRunIds,
+    blockedAt: shouldReopen ? null : conflict.blockedAt,
+    blockedReason: shouldReopen ? null : conflict.blockedReason,
+    updatedAt: shouldReopen ? now : conflict.updatedAt,
+  };
 }
 
 function formatTriageBlockersForDirective(blockers: readonly IssueTriageBlockerRecord[]): string[] {
