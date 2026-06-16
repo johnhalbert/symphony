@@ -365,7 +365,12 @@ Repair the pending-publication approval and writeback path so routed runtime ide
 ````markdown
 ## Problem / Goal
 
-Add the focused orchestrator proof for ENG-392 after the runtime siblings land so the published evidence shows both cross-project routing isolation and in-progress reload preservation in the single contract-scoped test surface.
+Add the focused orchestrator proof for ENG-392 only after the runtime prerequisite siblings land so the published evidence shows both cross-project routing isolation and in-progress reload preservation in the single contract-scoped test surface.
+
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label and leave readiness-label changes to operator review after the prerequisite runtime children are accepted.
+- Sibling dependency guidance: declare dependencies on `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, and `ENG-392 child — approval writeback repair` by exact title because the proof must stay blocked while it relies on unpublished or out-of-contract runtime, reload, or approval/writeback behavior.
 
 ## Issue Contract
 
@@ -382,7 +387,7 @@ Add the focused orchestrator proof for ENG-392 after the runtime siblings land s
 
 - One focused proof path demonstrates distinct routed workspace/state buckets across at least two project contexts.
 - One focused proof path demonstrates reload preservation for an already-running routed context without duplicate redispatch or state drift.
-- If any declared sibling dependency is still unresolved, the child stays blocked and does not widen publication beyond `tests/orchestrator.test.ts`.
+- If any declared sibling dependency is still unresolved, or the proof still relies on unpublished or out-of-contract runtime behavior from those siblings, the child stays blocked and does not widen publication beyond `tests/orchestrator.test.ts`.
 
 ## Contract Checklist
 
@@ -397,7 +402,7 @@ Add the focused orchestrator proof for ENG-392 after the runtime siblings land s
 ## Validation Requirements
 
 - `npm test -- tests/orchestrator.test.ts`
-- Review the new assertions and confirm they cite routed workspace identity, non-redispatch behavior, and the dependency-blocked publication guard explicitly.
+- Review the new dependency notes and assertions and confirm they cite routed workspace identity, non-redispatch behavior, and the runtime prerequisite guard linking runtime routing, reload preservation, and approval/writeback explicitly.
 
 ## Out Of Scope
 
