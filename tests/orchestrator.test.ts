@@ -2646,6 +2646,185 @@ const docsProjectContext = {
     }
   });
 
+  it("routes duplicate identifiers from distinct project contexts into distinct workspaces and persisted state", async () => {
+    const config = testConfig(root);
+    addDocsPollingProjectContext(config);
+    const sharedIdentifier = "ENG-123";
+    const defaultProjectContext = legacyDefaultProjectContext;
+    const defaultCandidate = {
+      ...issue({
+        id: "issue-default-1",
+        identifier: sharedIdentifier,
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/ENG-123",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: defaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const docsCandidate = trackerIssue({
+      id: "issue-docs-1",
+      identifier: sharedIdentifier,
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      branchName: "symphony/docs/ENG-123",
+    });
+    const defaultTracker: TrackerClient & { candidateFetchCount: number; requestedIds: string[][] } = {
+      candidateFetchCount: 0,
+      requestedIds: [],
+      async fetchCandidateIssues() {
+        defaultTracker.candidateFetchCount += 1;
+        return [defaultCandidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        defaultTracker.requestedIds.push([...issueIds]);
+        return issueIds.includes(defaultCandidate.id) ? [defaultCandidate] : [];
+      },
+    };
+    const docsTracker = trackerClientFixture({
+      candidates: [docsCandidate],
+      issues: [docsCandidate],
+    });
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const harness: AgentHarness & {
+      runs: Array<{ ctx: AgentRunContext; prompt: string }>;
+      stoppedRunIds: string[];
+    } = {
+      id: "project-context-routing-blocking",
+      capabilities: { continuation: true, mcpHandoff: true },
+      runs: [],
+      stoppedRunIds: [],
+      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+        this.runs.push({ ctx, prompt });
+        const runId = `run-${ctx.issue.id}-${ctx.turnNumber}`;
+        yield { type: "session_started", sessionId: `session-${ctx.issue.id}-${ctx.turnNumber}`, runId };
+        if (!ctx.abortSignal.aborted) {
+          await new Promise<void>((resolve) =>
+            ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        }
+        yield { type: "cancelled" };
+      },
+      async stop(runId: string): Promise<void> {
+        this.stoppedRunIds.push(runId);
+      },
+    };
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 2, "two context-scoped dispatches");
+      await waitFor(() => orchestrator.snapshot().counts.running === 2, "two context-scoped runs active");
+
+      const defaultRequestedIdsBeforeRefresh = defaultTracker.requestedIds.length;
+      const docsRequestedIdsBeforeRefresh = docsTracker.requestedIds.length;
+
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          orchestrator.snapshot().counts.running === 2 &&
+          defaultTracker.requestedIds.length > defaultRequestedIdsBeforeRefresh &&
+          docsTracker.requestedIds.length > docsRequestedIdsBeforeRefresh,
+        "running issue refresh scoped by project context",
+      );
+    } finally {
+      await orchestrator.stop();
+      await settleOrchestratorExit();
+    }
+
+    const defaultHarnessRun = harness.runs.find((run) => run.ctx.issue.id === defaultCandidate.id);
+    const docsHarnessRun = harness.runs.find((run) => run.ctx.issue.id === docsCandidate.id);
+    const defaultRunningRefreshIds = defaultTracker.requestedIds[defaultTracker.requestedIds.length - 1];
+    const docsRunningRefreshIds = docsTracker.requestedIds[docsTracker.requestedIds.length - 1];
+    const defaultWorkspaceKey = sharedIdentifier;
+    const docsWorkspaceKey = `docs__${sharedIdentifier}`;
+
+    expect(defaultTracker.candidateFetchCount).toBeGreaterThanOrEqual(2);
+    expect(docsTracker.candidateFetchCount).toBeGreaterThanOrEqual(2);
+    expect(defaultTracker.requestedIds.length).toBeGreaterThanOrEqual(1);
+    expect(docsTracker.requestedIds.length).toBeGreaterThanOrEqual(1);
+    expect(defaultRunningRefreshIds).toEqual([defaultCandidate.id]);
+    expect(docsRunningRefreshIds).toEqual([docsCandidate.id]);
+    expect(defaultTracker.requestedIds.every((issueIds) => issueIds.length === 1 && issueIds[0] === defaultCandidate.id)).toBe(true);
+    expect(docsTracker.requestedIds.every((issueIds) => issueIds.length === 1 && issueIds[0] === docsCandidate.id)).toBe(true);
+    expect(defaultHarnessRun?.ctx.projectContext).toMatchObject(defaultProjectContext);
+    expect(docsHarnessRun?.ctx.projectContext).toMatchObject(docsProjectContext);
+    expect(defaultHarnessRun?.ctx.workspace).toMatchObject({
+      workspaceKey: defaultWorkspaceKey,
+      path: path.join(config.workspace.root, defaultWorkspaceKey),
+    });
+    expect(docsHarnessRun?.ctx.workspace).toMatchObject({
+      workspaceKey: docsWorkspaceKey,
+      path: path.join(config.workspace.root, docsWorkspaceKey),
+    });
+    expect(defaultHarnessRun?.ctx.workspace.path).not.toBe(docsHarnessRun?.ctx.workspace.path);
+
+    const defaultRuns = await runStore.listRunsForIssue(sharedIdentifier, { projectContext: defaultProjectContext });
+    const docsRuns = await runStore.listRunsForIssue(sharedIdentifier, { projectContext: docsProjectContext });
+
+    expect(defaultRuns).toHaveLength(1);
+    expect(docsRuns).toHaveLength(1);
+    expect(defaultRuns[0]).toMatchObject({
+      issueId: defaultCandidate.id,
+      issueIdentifier: sharedIdentifier,
+      projectContext: defaultProjectContext,
+      workspaceKey: defaultWorkspaceKey,
+      workspacePath: path.join(config.workspace.root, defaultWorkspaceKey),
+    });
+    expect(docsRuns[0]).toMatchObject({
+      issueId: docsCandidate.id,
+      issueIdentifier: sharedIdentifier,
+      projectContext: docsProjectContext,
+      workspaceKey: docsWorkspaceKey,
+      workspacePath: path.join(config.workspace.root, docsWorkspaceKey),
+    });
+    await expect(lifecycleStore.get(sharedIdentifier)).resolves.toBeNull();
+    await expect(lifecycleStore.get(defaultCandidate.id)).resolves.toMatchObject({
+      issueIdentifier: sharedIdentifier,
+      projectContext: defaultProjectContext,
+      summaryPointers: {
+        workspaceKey: defaultWorkspaceKey,
+        workspacePath: path.join(config.workspace.root, defaultWorkspaceKey),
+      },
+    });
+    await expect(lifecycleStore.get(docsCandidate.id)).resolves.toMatchObject({
+      issueIdentifier: sharedIdentifier,
+      projectContext: docsProjectContext,
+      summaryPointers: {
+        workspaceKey: docsWorkspaceKey,
+        workspacePath: path.join(config.workspace.root, docsWorkspaceKey),
+      },
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
   it("dispatches legacy single-project workflows as the synthesized default context", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
