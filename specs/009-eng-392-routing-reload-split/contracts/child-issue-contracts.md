@@ -298,7 +298,9 @@ Preserve the in-progress routed worker or reviewer context across config reload 
 
 - Suggested child title: `ENG-392 child — approval writeback repair`
 - Dependency order: **4 of 6**
+- Draft label guidance for Linear creation: keep the parent `dogfood` label, do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload, and let the operator add readiness labels only after review because this child authorizes protected approval, writeback, and publication-recovery surfaces.
 - Declare dependency on: `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`
+- Draft dependency guidance for Linear creation: declare both sibling blockers by exact title because routed approval and writeback recovery depend on the project-context-qualified workspace and lifecycle identity that those prerequisite children stabilize before terminal, replay, or after-worker-exit recovery can be validated.
 - Authorized surfaces to list in `Touched Surfaces`:
   - `src/core/orchestrator/Orchestrator.ts`
   - `src/core/CompletionReportService.ts`
@@ -315,6 +317,12 @@ Preserve the in-progress routed worker or reviewer context across config reload 
 ## Problem / Goal
 
 Repair the pending-publication approval and writeback path so routed runtime identity, approval wait state, writeback audit records, and after-worker-exit recovery stay aligned without duplicate publication or redispatch.
+
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label and leave readiness-label changes to operator review because this child authorizes protected approval/writeback recovery surfaces.
+- Do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload; operator review owns readiness-label changes after the prerequisite runtime-routing and reload-preservation siblings plus the focused approval/writeback proof are in place.
+- Sibling dependency guidance: declare dependencies on `ENG-392 child — runtime routing repair` and `ENG-392 child — reload preservation repair` by exact title because routed approval/writeback recovery depends on the project-context-qualified workspace and lifecycle identity those sibling children stabilize before pending, terminal, replay, or after-worker-exit recovery can be validated.
 
 ## Issue Contract
 
@@ -343,12 +351,14 @@ Repair the pending-publication approval and writeback path so routed runtime ide
 
 - Pending, approved, rejected, cancelled, and replayed approval paths keep the correct routed lifecycle state and durable writeback records.
 - Intentional pending-approval or blocked states do not redispatch worker/reviewer runs or lose publication-handoff audit data after reload or worker exit.
+- The issue body records the exact prerequisite sibling titles, draft label guidance, and focused validation sweep needed before approval/writeback recovery can be treated as ready for operator review.
 
 ## Contract Checklist
 
 - Happy path: routed pending approval resumes or finalizes with the expected writeback and lifecycle state.
 - Negative/error path: rejected, cancelled, stale, expired, or already-terminal approvals stay distinguishable and do not trigger duplicate publication.
 - Adjacent sibling surface: HTTP approval routes, completion-report handoff, and writeback outbox agree on the same approval identity and terminal result.
+- Dependency/prerequisite boundary: approval/writeback recovery stays downstream from `ENG-392 child — runtime routing repair` and `ENG-392 child — reload preservation repair` instead of implicitly re-authorizing their routing or reload fixes.
 - Empty/missing/stale/fallback state: missing run links or unsettled audit operations remain blocked instead of being treated as complete.
 - Replay/restart/idempotency: replaying an approval or reprocessing the same writeback does not create duplicate terminalization or redispatch.
 - Credential/security boundary: validation cites public-safe run, approval, writeback, and PR metadata without leaking tokens or private repository credentials.
@@ -356,11 +366,14 @@ Repair the pending-publication approval and writeback path so routed runtime ide
 
 ## Validation Requirements
 
+- Review this child issue body and confirm the `Labels / Dependencies` section keeps the drafted payload free of auto-ready labels and names `ENG-392 child — runtime routing repair` plus `ENG-392 child — reload preservation repair` exactly.
+- Review `specs/009-eng-392-routing-reload-split/data-model.md`, `specs/009-eng-392-routing-reload-split/quickstart.md`, and `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` and confirm the child stays downstream from the routing/reload prerequisites, cites the focused approval/writeback validation sweep, and keeps public-safe durable evidence expectations explicit.
 - `npm test -- tests/orchestrator.test.ts tests/completion-report-service.test.ts tests/operator-approval-service.test.ts tests/approval-status-api.test.ts tests/status-api.test.ts`
-- Manual or API inspection that pending approval and after-worker-exit resume keep one routed lifecycle record and one durable approval/writeback trail.
+- Manual or API inspection that pending, approved, rejected, cancelled, replayed, and after-worker-exit recovery cases keep one routed lifecycle record and one durable approval/writeback trail.
 
 ## Out Of Scope
 
+- Re-authorizing or re-implementing runtime-routing or reload-preservation prerequisite behavior outside their own child contracts.
 - General repository publishing policy changes unrelated to ENG-392.
 - Docs-only cleanup that can happen after the runtime and approval repair lands.
 
