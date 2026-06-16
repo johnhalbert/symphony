@@ -74,6 +74,40 @@ Gate result: `PASS` or `FAIL`
 Blocking rows: `<none>` or a repo-relative list of every `FAIL-*` row
 ````
 
+## Recorded comparison — active test-proof contract (`REQ-392-TEST-PROOF`)
+
+This recorded comparison applies the gate to the active Family E child contract in `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`. It uses the widened PR #286 surface inventory in `specs/009-eng-392-routing-reload-split/quickstart.md` only as an exclusion baseline; those extra runtime, workspace, writeback, and status surfaces are not part of the active test-proof publication candidate.
+
+Validation evidence in `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` also keeps reviewer reload/restart redispatch proof mapped to prerequisite child work instead of treating adjacent routed-runtime behavior as implicitly authorized publication scope.
+
+### Active candidate comparison
+
+| Surface | Kind | Source of discovery | Requirement ID(s) | Authorized by | Evidence to cite | Gate disposition | Required action before publication |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `tests/orchestrator.test.ts` | `tracked file` | Family E child contract plus the focused proof command inventory | `REQ-392-TEST-PROOF` | Exact touched surface `tests/orchestrator.test.ts` | `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family E — `REQ-392-TEST-PROOF`); `specs/009-eng-392-routing-reload-split/quickstart.md` (`REQ-392-TEST-PROOF` focused proof command) | `PASS` | `none` |
+
+Gate result: `PASS` only when the publication candidate contains the single `tests/orchestrator.test.ts` surface above.
+Blocking rows: every additional runtime, CLI, workspace, writeback, status, adjacent non-contract test, debug, or vendored surface.
+
+### Blocked dependency and exclusion inventory (must stay absent from the active candidate)
+
+No unmapped surfaces remain in the active test-proof comparison: every historical extra surface from PR #286 is classified below as either a prerequisite dependency owned by another child family or an explicit exclusion that must stay out of `REQ-392-TEST-PROOF` publication.
+
+| Surface that must stay absent | Why it is blocked from `REQ-392-TEST-PROOF` publication | Dependency or exclusion proof |
+| --- | --- | --- |
+| `cursor/src/CursorWorkspaceOpener.ts` | Workspace-opening behavior belongs to the protected `workspace-lifecycle` family, not the test-proof child's single test surface. | `specs/009-eng-392-routing-reload-split/quickstart.md` (T004 protected publication surface inventory for `cursor/src/CursorWorkspaceOpener.ts`); `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family E authorized surfaces list only `tests/orchestrator.test.ts`) |
+| `src/app/ProjectContextRuntime.ts` | The original widened runtime file stays explicitly excluded from the active test-proof publication surface until a later child contract names it directly. | `specs/009-eng-392-routing-reload-split/quickstart.md` (explicit exclusions from the original mismatch surface); `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family E authorized surfaces list only `tests/orchestrator.test.ts`) |
+| `src/cli.ts` | CLI wiring stays explicitly excluded from the active test-proof publication surface. | `specs/009-eng-392-routing-reload-split/quickstart.md` (explicit exclusions from the original mismatch surface); `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family E authorized surfaces list only `tests/orchestrator.test.ts`) |
+| `src/core/CompletionReportService.ts` | Completion-report publication handling belongs to the protected `publication-handoff` family, not the focused proof child. | `specs/009-eng-392-routing-reload-split/quickstart.md` (T004 protected publication surface inventory for `src/core/CompletionReportService.ts`); `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family E dependency list keeps approval/writeback work prerequisite) |
+| `src/core/approval/OperatorApprovalService.ts` | Approval-service runtime edits stay explicitly excluded from the active test-proof publication surface. | `specs/009-eng-392-routing-reload-split/quickstart.md` (explicit exclusions from the original mismatch surface); `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family E dependency list keeps approval/writeback work prerequisite) |
+| `src/core/orchestrator/Orchestrator.ts` | Routed runtime, reload-preservation, and publication-handoff behavior remain prerequisite child work; the focused proof child may cite those invariants but may not publish the runtime file. | `specs/009-eng-392-routing-reload-split/quickstart.md` (T004 protected publication surface inventory for `src/core/orchestrator/Orchestrator.ts` and the PR #286 mismatch summary); `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` (ENG-2477 T031 reviewer reload/restart redispatch gap stays mapped to `REQ-392-RELOAD-PRESERVATION` and `REQ-392-TEST-PROOF`) |
+| `src/core/workspace/WorkspaceManager.ts` | Workspace creation/path/branch metadata belongs to the protected `workspace-lifecycle` family, not the focused proof child. | `specs/009-eng-392-routing-reload-split/quickstart.md` (T004 protected publication surface inventory for `src/core/workspace/WorkspaceManager.ts`); `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family E authorized surfaces list only `tests/orchestrator.test.ts`) |
+| `src/core/writeback/WritebackOutbox.ts` | Durable writeback settlement belongs to the protected `writeback-guardrails` family, not the focused proof child. | `specs/009-eng-392-routing-reload-split/quickstart.md` (T004 protected publication surface inventory for `src/core/writeback/WritebackOutbox.ts`); `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family E dependency list keeps approval/writeback work prerequisite) |
+| `tests/cursor-workspace-opener.test.ts` | Adjacent workspace-opener test coverage stays explicitly excluded from the active test-proof publication surface. | `specs/009-eng-392-routing-reload-split/quickstart.md` (explicit exclusions from the original mismatch surface); `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family E authorized surfaces list only `tests/orchestrator.test.ts`) |
+| `tests/status-api.test.ts` | Adjacent status API coverage stays explicitly excluded from the active test-proof publication surface. | `specs/009-eng-392-routing-reload-split/quickstart.md` (explicit exclusions from the original mismatch surface); `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family E authorized surfaces list only `tests/orchestrator.test.ts`) |
+| `tmp-debug-docs-reviewer-redispatch-state/` or other ad-hoc debug captures | Review-only scratch artifacts are never valid test-proof publication surfaces. | `specs/009-eng-392-routing-reload-split/quickstart.md` (contract/publication mismatch sources call out `tmp-debug-docs-reviewer-redispatch-state/` as non-fixture debug state); this gate's `Debug artifact` fail rule |
+| `hermes/upstream-src/**` | Vendored source stays globally excluded and cannot be pulled into a focused proof publication candidate. | This gate's authorized-surface exclusions and vendored-source fail rule |
+
 ## Scenario matrix and explicit pass/fail criteria
 
 | Scenario | Pass when... | Fail when... | Required repair |
