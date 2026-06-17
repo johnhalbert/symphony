@@ -284,3 +284,62 @@ Blocking rows: `<none>`
 | `cursor/src/CursorWorkspaceOpener.ts` | `absent` (`git diff --name-only -- cursor/src/CursorWorkspaceOpener.ts`; `git status --short -- cursor/src/CursorWorkspaceOpener.ts` both returned no output) | `REQ-392-RUNTIME-ROUTING` may authorize it only when the child contract lists the exact path directly; neither workspace-lifecycle nor operator-http-entrypoints is blanket authorization by itself. | `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family B exact touched-surface list); `## Adjacent surface findings that need separate child authorization` in this gate | `PASS` | Block publication as `FAIL-unmapped` if the path appears without that exact child-contract authorization. |
 | `tests/status-api.test.ts` | `absent` (`git diff --name-only -- tests/status-api.test.ts`; `git status --short -- tests/status-api.test.ts` both returned no output) | `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, and `REQ-392-APPROVAL-WRITEBACK` may authorize it only when the child contract lists the exact path in `Touched Surfaces`. | `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family B, Family C, and Family D exact touched-surface lists); `## Adjacent surface findings that need separate child authorization` in this gate | `PASS` | Block publication as `FAIL-unmapped` if the path appears outside those exact child-contract scopes. |
 | `tests/cursor-workspace-opener.test.ts` | `absent` (`git diff --name-only -- tests/cursor-workspace-opener.test.ts`; `git status --short -- tests/cursor-workspace-opener.test.ts` both returned no output) | `REQ-392-RUNTIME-ROUTING` may authorize it only when the child contract lists the exact path directly. | `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family B exact touched-surface list); `## Adjacent surface findings that need separate child authorization` in this gate | `PASS` | Block publication as `FAIL-unmapped` if the path appears without that exact child-contract authorization. |
+
+## Recorded debug-artifact disposition — ENG-2492 (`REQ-T046`)
+
+This recorded run applies the gate to the worker-local ENG-2492 publication candidate. The child contract authorizes only `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` and requires any debug artifacts to be removed from the candidate or, if intentionally kept, converted into deliberate redacted fixtures referenced by tests. This run records the first outcome: no orphaned debug artifact survives in the candidate, so no fixture conversion path is published.
+
+### Scenario matrix for this run
+
+| Scenario | Evidence used in this run | Result | Notes |
+| --- | --- | --- | --- |
+| Worker-local candidate surface inventory | `git diff --name-only`; `git status --short` | `PASS` | The candidate changes only `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md`. |
+| Known orphaned debug capture absence | `git status --short -- 'tmp-debug-*'`; `git diff --name-only -- 'tmp-debug-*'` | `PASS` | No `tmp-debug-*` capture path appears in tracked or visible untracked publication surfaces. |
+| Fixture-conversion fallback remains unused | `git status --short -- 'tests/fixtures'`; `git diff --name-only -- 'tests/fixtures'`; `git status --short -- 'src/app/testing'`; `git diff --name-only -- 'src/app/testing'` | `PASS` | No deliberate redacted fixture surface was added or changed, so this run satisfies the requirement by keeping orphaned debug artifacts absent rather than converting one. |
+| Redacted publication evidence | Publication surface comparison and disposition table below | `PASS` | The recorded evidence stays repo-relative and command-based; no local absolute paths or raw debug captures appear in the packet. |
+
+### Command transcript
+
+```text
+$ git diff --name-only
+specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md
+
+$ git status --short
+M specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md
+
+$ git status --short -- 'tmp-debug-*'
+<no output>
+
+$ git diff --name-only -- 'tmp-debug-*'
+<no output>
+
+$ git status --short -- 'tests/fixtures'
+<no output>
+
+$ git diff --name-only -- 'tests/fixtures'
+<no output>
+
+$ git status --short -- 'src/app/testing'
+<no output>
+
+$ git diff --name-only -- 'src/app/testing'
+<no output>
+```
+
+### Publication surface comparison
+
+| Surface | Kind | Source of discovery | Requirement ID(s) | Authorized by | Evidence to cite | Gate disposition | Required action before publication |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` | `tracked file` | `git diff --name-only`; `git status --short` | `REQ-T046` | Exact touched surface `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` | Command transcript in this section showing the single-file candidate plus empty debug/fixture checks | `PASS` | `none` |
+
+Gate result: `PASS`
+Blocking rows: `<none>`
+
+### Debug artifact disposition for this run
+
+| Candidate artifact class or path | Publication outcome | Evidence to cite | Test or fixture reference |
+| --- | --- | --- | --- |
+| `tmp-debug-docs-reviewer-redispatch-state/` and other ad-hoc debug captures | `absent from candidate` | `git status --short -- 'tmp-debug-*'`; `git diff --name-only -- 'tmp-debug-*'` both returned no output | `<none required; no converted fixture was needed>` |
+| Deliberate redacted fixtures under `tests/fixtures` or `src/app/testing` | `not used in this run` | `git status --short -- 'tests/fixtures'`; `git diff --name-only -- 'tests/fixtures'`; `git status --short -- 'src/app/testing'`; `git diff --name-only -- 'src/app/testing'` all returned no output | `<none>` |
+
+If a future child diff intentionally keeps a debug capture, it must replace the ad-hoc artifact with a redacted fixture under an authorized fixture path and cite the exact owning test in the publication-surface comparison row before this gate can pass.
