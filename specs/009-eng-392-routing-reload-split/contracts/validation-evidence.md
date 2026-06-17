@@ -716,3 +716,38 @@ This packet is the final worker-owned closeout for ENG-2479 after the decomposit
     - `nearestLocalProof`: `ENG-2507 remains the latest focused evidence handle and records the outcome as blocked.`
 - `findings`:
   - `ENG-2479 is hierarchy-only and has no remaining worker-owned pass; the only remaining blocker is the missing accepted service-owned execution/capture artifact for the focused preflight command.`
+
+## ENG-2489 T043 evidence redaction verification
+
+This packet records a focused publication-hygiene review of `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` against the shared redaction rules already defined in `## Redaction and safe-citation rules`. The review stayed inside the authorized evidence surface and checked three adjacent risk families: credential-bearing content, secret-backed profile or environment disclosures, and unnecessary operator-local absolute paths. No unsafe evidence required removal or replacement; the only local-path strings are the generic forbidden examples in the policy itself.
+
+### Redaction review scenario matrix
+
+| Scenario | Expected treatment | Review result | Proof |
+| --- | --- | --- | --- |
+| credential-bearing content in evidence entries | No raw tokens, API keys, session cookies, private keys, raw environment variable values, or embedded-credential URLs should appear. | `recorded` | `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:263-281` defines the prohibition. The credential-related lines reviewed at `:245`, `:267-269`, `:281`, `:291`, `:346`, `:358`, `:477`, and `:597` are generic rule text or intentionally-unverified boundary reasons, not secret values. |
+| secret-backed profile or live-credential references | Notes may name the credential class or explain non-use, but must not reveal secret-backed profile values. | `recorded` | `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:245`, `:291`, `:346`, `:477`, and `:597` mention credentials only as safe status explanations such as `credentials intentionally unavailable` or `used instead of live tracker credentials`; no profile fields, env var names, or values are disclosed. |
+| operator-local absolute paths | Evidence entries should stay repo-relative unless the issue contract explicitly requires an absolute path. | `recorded` | `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:271` is the only line that names absolute-path patterns, and it does so as part of the forbid-list in the redaction policy. The recorded evidence sections continue to cite repo-relative paths only. |
+
+### Redaction review result
+
+- `status`: `recorded`
+- `surface`: `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`
+- `proof`: Focused file inspection found no credential values, secret-backed profile values, raw environment variable values, embedded-credential URLs, or unnecessary local absolute paths in the evidence entries. Only generic policy placeholders and repo-relative citations remain.
+- `why_it_matters`: `REQ-T043` requires a publish-safe evidence artifact that explicitly confirms credential and path hygiene before review or Linear attachment.
+- `redactions`: `none required`
+
+### hygiene
+
+- `status`: `recorded`
+- `surfacesChecked`: [`specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`]
+- `redactions`: [`none required after review`]
+- `localPathHandling`: `repo-relative paths only outside the generic prohibited examples at specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md:271`
+- `protectedSurfaceChecks`:
+  - `surface`: `hermes/upstream-src/**`
+    - `expectation`: `must remain untouched`
+    - `proof`: `REQ-T043` inspects and updates only specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md; no vendored upstream path is cited or edited by this review.`
+- `intentionallyUnverified`: []
+- `findings`:
+  - `No credential values, secret-backed profile values, embedded-credential URLs, or unnecessary operator-local absolute paths were found in validation-evidence.md.`
+  - `The only local absolute path strings are generic forbidden examples inside the redaction rules themselves, so no evidence redaction or removal was needed.`
