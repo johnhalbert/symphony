@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
-import type { ServiceConfig } from "../config/Config.js";
+import { parseIssueRuntimeSourceScope, type ServiceConfig } from "../config/Config.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
   LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
@@ -3776,13 +3776,14 @@ export class Orchestrator {
       workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
     });
     const issueBreakdownPlan = await this.loadIssueBreakdownPlanPrompt(entry);
+    const runtimeSourceScope = this.renderRuntimeSourceScopePrompt(entry.issue);
     const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
     const mergeGate = mergeGateResult?.text ?? null;
     const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
-    return [basePrompt, issueBreakdownPlan, reviewHardening, handoff, this.workerMcpPrompt(entry), mergeGate, reviewVerdict, reviewEvidence]
+    return [basePrompt, issueBreakdownPlan, runtimeSourceScope, reviewHardening, handoff, this.workerMcpPrompt(entry), mergeGate, reviewVerdict, reviewEvidence]
       .filter((item): item is string => item !== null)
       .join("\n");
   }
@@ -3830,6 +3831,7 @@ export class Orchestrator {
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
     const continuationBrief = await this.renderContinuationBrief(entry);
+    const runtimeSourceScope = this.renderRuntimeSourceScopePrompt(entry.issue);
     const reviewHardening = this.workerReviewHardeningPrompt();
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
@@ -3838,6 +3840,7 @@ export class Orchestrator {
     const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
     return [
       continuationBrief,
+      runtimeSourceScope,
       reviewHardening,
       handoff,
       mergeGate,
@@ -3847,6 +3850,26 @@ export class Orchestrator {
     ]
       .filter((item): item is string => item !== null)
       .join("\n");
+  }
+
+  private renderRuntimeSourceScopePrompt(issue: Issue): string | null {
+    const scope = parseIssueRuntimeSourceScope(issue.description);
+    if (!scope.hasTouchedSurfacesSection) return null;
+    if (scope.authorizedPaths.length === 0) {
+      return [
+        "",
+        "Authorized runtime source scope:",
+        "- This issue does not authorize runtime source implementation under src/ or cursor/src/.",
+        "- Keep runtime source changes out of this run unless a child issue explicitly lists them in Touched Surfaces.",
+      ].join("\n");
+    }
+    return [
+      "",
+      "Authorized runtime source scope:",
+      "- If you modify runtime source files under src/ or cursor/src/, stay within these Touched Surfaces entries:",
+      ...scope.authorizedPaths.map((item) => `- ${item}`),
+      "- Do not widen runtime implementation to unlisted source surfaces; move that work to a separately authorized child issue.",
+    ].join("\n");
   }
 
   private workerReviewHardeningPrompt(): string {

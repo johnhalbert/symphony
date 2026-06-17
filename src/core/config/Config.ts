@@ -701,6 +701,178 @@ const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
   "Symphony persists these proposals locally; do not create or modify Linear issues.",
 ].join("\n");
 
+const AUTHORIZED_RUNTIME_SOURCE_PATH_PATTERN =
+  /(?:^|[^a-z0-9._\/-])((?:cursor\/)?src\/[a-z0-9._/*-]+(?:\/[a-z0-9._/*-]+)*)(?=$|[^a-z0-9._\/-])/gi;
+
+interface MarkdownFenceDelimiter {
+  marker: "`" | "~";
+  length: number;
+  trailing: string;
+}
+
+export interface IssueRuntimeSourceScope {
+  hasTouchedSurfacesSection: boolean;
+  authorizedPaths: string[];
+}
+
+export function parseIssueRuntimeSourceScope(description: string | null | undefined): IssueRuntimeSourceScope {
+  if (typeof description !== "string" || description.trim().length === 0) {
+    return { hasTouchedSurfacesSection: false, authorizedPaths: [] };
+  }
+
+  const touchedSurfaces = markdownSections(description).get("touched surfaces");
+  if (touchedSurfaces === undefined) {
+    return { hasTouchedSurfacesSection: false, authorizedPaths: [] };
+  }
+
+  const authorizedPaths = new Set<string>();
+  for (const match of normalizeRuntimeSourcePathScanText(touchedSurfaces).matchAll(AUTHORIZED_RUNTIME_SOURCE_PATH_PATTERN)) {
+    const candidate = normalizeRuntimeSourcePath(match[1] ?? "");
+    if (!isRuntimeSourcePath(candidate)) continue;
+    authorizedPaths.add(candidate);
+  }
+
+  return {
+    hasTouchedSurfacesSection: true,
+    authorizedPaths: [...authorizedPaths],
+  };
+}
+
+export function normalizeRuntimeSourcePath(value: string): string {
+  return normalizeRuntimeSourcePathScanText(value)
+    .trim()
+    .replace(/^[`"'(<[{]+/g, "")
+    .replace(/[`"')>\]}]+$/g, "")
+    .replace(/[.!?,;:]+$/g, "")
+    .replace(/^(?:\.\/)+/g, "")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/");
+}
+
+export function isRuntimeSourcePath(value: string | null | undefined): boolean {
+  if (typeof value !== "string") return false;
+  const normalized = normalizeRuntimeSourcePath(value);
+  const comparisonKey = normalized.toLowerCase();
+  if (comparisonKey.length === 0) return false;
+  if (comparisonKey.startsWith("hermes/upstream-src/")) return false;
+  return comparisonKey.startsWith("src/") || comparisonKey.startsWith("cursor/src/");
+}
+
+export function matchesRuntimeSourcePathPattern(pattern: string, value: string): boolean {
+  return runtimeSourcePathPatternMatches(normalizeRuntimeSourcePath(pattern).toLowerCase(), normalizeRuntimeSourcePath(value).toLowerCase());
+}
+
+function markdownSections(description: string): Map<string, string> {
+  const sections = new Map<string, string>();
+  let currentHeading: string | null = null;
+  let buffer: string[] = [];
+  let activeFence: MarkdownFenceDelimiter | null = null;
+
+  const flush = (): void => {
+    if (!currentHeading) return;
+    sections.set(currentHeading, buffer.join("\n").trim());
+  };
+
+  for (const line of description.split(/\r?\n/)) {
+    const fence = parseMarkdownFenceDelimiter(line);
+    if (activeFence) {
+      if (
+        fence &&
+        fence.marker === activeFence.marker &&
+        fence.length >= activeFence.length &&
+        fence.trailing.trim().length === 0
+      ) {
+        activeFence = null;
+      }
+      if (currentHeading) buffer.push(line);
+      continue;
+    }
+
+    if (fence) {
+      activeFence = fence;
+      if (currentHeading) buffer.push(line);
+      continue;
+    }
+
+    const match = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+    if (match) {
+      flush();
+      currentHeading = normalizeIssueContractHeading(match[1] ?? "");
+      buffer = [];
+      continue;
+    }
+    if (currentHeading) buffer.push(line);
+  }
+
+  flush();
+  return sections;
+}
+
+function parseMarkdownFenceDelimiter(line: string): MarkdownFenceDelimiter | null {
+  const match = line.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+  if (!match) return null;
+
+  const delimiter = match[1] ?? "";
+  const marker = delimiter[0];
+  if (marker !== "`" && marker !== "~") return null;
+
+  return {
+    marker,
+    length: delimiter.length,
+    trailing: match[2] ?? "",
+  };
+}
+
+function normalizeIssueContractHeading(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/&amp;/g, "and")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function normalizeRuntimeSourcePathScanText(value: string): string {
+  return value.replace(/\\/g, "/");
+}
+
+function runtimeSourcePathPatternMatches(pattern: string, value: string): boolean {
+  if (!runtimeSourcePathPatternHasGlob(pattern)) return pattern === value;
+  return runtimeSourceGlobPatternToRegExp(pattern).test(value);
+}
+
+function runtimeSourcePathPatternHasGlob(value: string): boolean {
+  return value.includes("*");
+}
+
+function runtimeSourceGlobPatternToRegExp(pattern: string): RegExp {
+  let source = "^";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index] ?? "";
+    if (char === "*") {
+      if (pattern[index + 1] === "*") {
+        if (pattern[index + 2] === "/") {
+          source += "(?:[^/]+/)*";
+          index += 2;
+        } else {
+          source += ".*";
+          index += 1;
+        }
+      } else {
+        source += "[^/]*";
+      }
+      continue;
+    }
+    source += escapeRegExp(char);
+  }
+  source += "$";
+  return new RegExp(source);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[\\^$+?.()|[\]{}]/g, "\\$&");
+}
+
 export function parseDatabaseConfig(rawInput: unknown, workflowPath: string, env = process.env): DatabaseConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
   if (!parsed.success) {

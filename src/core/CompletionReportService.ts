@@ -1,5 +1,13 @@
+import { spawn } from "node:child_process";
+import path from "node:path";
 import { z } from "zod";
-import type { ServiceConfig } from "./config/Config.js";
+import {
+  isRuntimeSourcePath,
+  matchesRuntimeSourcePathPattern,
+  normalizeRuntimeSourcePath,
+  parseIssueRuntimeSourceScope,
+  type ServiceConfig,
+} from "./config/Config.js";
 import { normalizeProjectContextResolution, projectContextResolutionFromIssue, type ProjectContextResolution } from "./config/ProjectContexts.js";
 import { SymphonyError } from "./errors.js";
 import type {
@@ -40,6 +48,7 @@ export const PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON = "publication approva
 export const PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON = "awaiting operator approval for PR publication";
 export const PUBLICATION_APPROVAL_BLOCKED_REASON = PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON;
 const SETTLED_WRITEBACK_STATUSES = new Set<WritebackStatus>(["succeeded", "skipped"]);
+const TRUSTED_WORKSPACE_DIFF_TIMEOUT_MS = 30_000;
 
 const completionReportSchema = z.object({
   runId: z.string().trim().min(1),
@@ -200,6 +209,9 @@ export class CompletionReportService {
         : null;
     const resumingPendingPublication =
       existing !== undefined && pendingPublicationHandoff?.pendingReport.id === existing.id;
+    if (!resumingPendingPublication) {
+      await this.validateAuthorizedRuntimeSourceScope(report, context, existingLifecycle);
+    }
 
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
     const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
@@ -633,6 +645,67 @@ export class CompletionReportService {
     if (!sameStateIn(context.issue.state, allowedStates)) {
       throw new SymphonyError("invalid_request", "Completion report requires the issue to be in the active implementation state");
     }
+  }
+
+  private async validateAuthorizedRuntimeSourceScope(
+    report: CompletionReportInput,
+    context: CompletionReportActiveContext,
+    existingLifecycle: ExistingIssueLifecycle,
+  ): Promise<void> {
+    const scope = parseIssueRuntimeSourceScope(context.issue.description);
+    if (!scope.hasTouchedSurfacesSection) return;
+
+    const changedFileRoots = changedFileNormalizationRoots(context, existingLifecycle);
+    const reportedRuntimeChangedFiles = normalizeRuntimeChangedFiles(report.changedFiles, changedFileRoots);
+    const trustedChangedFiles = await trustedChangedFilesFromWorkspace(resolveRuntimeScopeWorkspacePath(context, existingLifecycle));
+    const trustedRuntimeChangedFiles = normalizeRuntimeChangedFiles(trustedChangedFiles, changedFileRoots);
+    const trustedRuntimeChangedFileKeys = new Set(trustedRuntimeChangedFiles.map(runtimeSourcePathComparisonKey));
+    const reportedRuntimeChangedFileKeys = new Set(reportedRuntimeChangedFiles.map(runtimeSourcePathComparisonKey));
+    const omittedRuntimeChangedFiles = trustedRuntimeChangedFiles.filter(
+      (changedFile) => !reportedRuntimeChangedFileKeys.has(runtimeSourcePathComparisonKey(changedFile)),
+    );
+    const unexpectedReportedRuntimeChangedFiles = reportedRuntimeChangedFiles.filter(
+      (changedFile) => !trustedRuntimeChangedFileKeys.has(runtimeSourcePathComparisonKey(changedFile)),
+    );
+    if (omittedRuntimeChangedFiles.length > 0 || unexpectedReportedRuntimeChangedFiles.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Completion report runtime source changedFiles do not match the trusted workspace diff",
+        {
+          changedFiles: report.changedFiles,
+          trustedChangedFiles,
+          trustedRuntimeChangedFiles,
+          omittedRuntimeChangedFiles,
+          unexpectedReportedRuntimeChangedFiles,
+        },
+      );
+    }
+    if (trustedRuntimeChangedFiles.length === 0) return;
+
+    const unauthorizedRuntimeChangedFiles = trustedRuntimeChangedFiles.filter(
+      (changedFile) => !scope.authorizedPaths.some((authorizedPath) => matchesRuntimeSourcePathPattern(authorizedPath, changedFile)),
+    );
+    if (unauthorizedRuntimeChangedFiles.length === 0) return;
+
+    const details = {
+      authorizedRuntimeSourcePaths: scope.authorizedPaths,
+      unauthorizedRuntimeChangedFiles,
+      changedFiles: report.changedFiles,
+      trustedChangedFiles,
+      trustedRuntimeChangedFiles,
+    };
+    if (scope.authorizedPaths.length === 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Completion report includes runtime source changes but the issue does not authorize runtime implementation in Touched Surfaces",
+        details,
+      );
+    }
+    throw new SymphonyError(
+      "invalid_request",
+      "Completion report includes runtime source changes outside the issue's authorized Touched Surfaces scope",
+      details,
+    );
   }
 
   private async publishPullRequestIfNeeded(
@@ -1352,6 +1425,198 @@ function formatPullRequestBody(report: CompletionReportInput, context: Completio
     "Changed files:",
     ...(report.changedFiles.length === 0 ? ["- n/a"] : report.changedFiles.map((item) => `- ${item}`)),
   ].join("\n");
+}
+
+function changedFileNormalizationRoots(
+  context: CompletionReportActiveContext,
+  existingLifecycle: ExistingIssueLifecycle,
+): Array<string | null | undefined> {
+  return [
+    context.workspacePath,
+    context.workspace?.path ?? null,
+    existingLifecycle?.summaryPointers.workspacePath ?? null,
+    context.workspace?.repoPath ?? null,
+    existingLifecycle?.summaryPointers.repoPath ?? null,
+  ];
+}
+
+function normalizeRuntimeChangedFiles(
+  changedFiles: readonly string[],
+  roots: readonly (string | null | undefined)[],
+): string[] {
+  const runtimeChangedFiles = new Map<string, string>();
+  for (const changedFile of changedFiles) {
+    const normalizedChangedFile = normalizeReportedChangedFilePath(changedFile, roots);
+    if (!isRuntimeSourcePath(normalizedChangedFile)) continue;
+    const comparisonKey = runtimeSourcePathComparisonKey(normalizedChangedFile);
+    if (!runtimeChangedFiles.has(comparisonKey)) {
+      runtimeChangedFiles.set(comparisonKey, normalizedChangedFile);
+    }
+  }
+  return [...runtimeChangedFiles.values()];
+}
+
+function runtimeSourcePathComparisonKey(value: string): string {
+  return normalizeRuntimeSourcePath(value).toLowerCase();
+}
+
+function resolveRuntimeScopeWorkspacePath(
+  context: CompletionReportActiveContext,
+  existingLifecycle: ExistingIssueLifecycle,
+): string {
+  const workspacePath = context.workspacePath ?? context.workspace?.path ?? existingLifecycle?.summaryPointers.workspacePath ?? null;
+  if (workspacePath) return workspacePath;
+  throw new SymphonyError(
+    "invalid_request",
+    "Completion report runtime source scope validation requires a workspace path to inspect the trusted workspace diff",
+  );
+}
+
+async function trustedChangedFilesFromWorkspace(workspacePath: string): Promise<string[]> {
+  const result = await runGitCommand(
+    ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    workspacePath,
+    TRUSTED_WORKSPACE_DIFF_TIMEOUT_MS,
+  );
+  return parseGitStatusPorcelainChangedFiles(result.stdout);
+}
+
+interface GitCommandResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+async function runGitCommand(args: string[], cwd: string, timeoutMs: number): Promise<GitCommandResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGTERM");
+      reject(
+        new SymphonyError("invalid_request", "Unable to inspect workspace diff for completion report runtime scope validation", {
+          workspacePath: cwd,
+          gitArgs: args,
+          timeoutMs,
+          reason: "timed_out",
+        }),
+      );
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(
+        new SymphonyError("invalid_request", "Unable to inspect workspace diff for completion report runtime scope validation", {
+          workspacePath: cwd,
+          gitArgs: args,
+          reason: "spawn_error",
+          error: error.message,
+        }),
+      );
+    });
+    child.on("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const result = { code: code ?? 1, stdout, stderr };
+      if (result.code === 0) {
+        resolve(result);
+        return;
+      }
+      reject(
+        new SymphonyError("invalid_request", "Unable to inspect workspace diff for completion report runtime scope validation", {
+          workspacePath: cwd,
+          gitArgs: args,
+          exitCode: result.code,
+          stderr: result.stderr.trim() || null,
+        }),
+      );
+    });
+  });
+}
+
+function parseGitStatusPorcelainChangedFiles(output: string): string[] {
+  const changedFiles: string[] = [];
+  const entries = output.split("\0");
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index] ?? "";
+    if (entry.length < 3) continue;
+    const status = entry.slice(0, 2);
+    if (status === "!!") continue;
+
+    const primaryPath = entry.slice(3);
+    if (primaryPath.length > 0) changedFiles.push(primaryPath);
+    if (!status.includes("R") && !status.includes("C")) continue;
+
+    const secondaryPath = entries[index + 1] ?? "";
+    if (secondaryPath.length > 0) changedFiles.push(secondaryPath);
+    index += 1;
+  }
+  return [...new Set(changedFiles)];
+}
+
+function normalizeReportedChangedFilePath(changedFile: string, roots: readonly (string | null | undefined)[]): string {
+  const trimmed = changedFile.trim();
+  if (!isAbsolutePathLike(trimmed)) return normalizeRuntimeSourcePath(trimmed);
+  for (const root of roots) {
+    const relative = relativizePathIfWithinRoot(trimmed, root);
+    if (relative !== null) return normalizeRuntimeSourcePath(relative);
+  }
+  return normalizeRuntimeSourcePath(trimmed);
+}
+
+function relativizePathIfWithinRoot(candidate: string, root: string | null | undefined): string | null {
+  if (!root || !isAbsolutePathLike(candidate) || !isAbsolutePathLike(root)) return null;
+  const pathApi = pathApiForPathValues(candidate, root);
+  if (samePath(root, candidate, pathApi)) return "";
+  if (!isPathInsideRoot(root, candidate, pathApi)) return null;
+  const relative = pathApi.relative(pathApi.normalize(root), pathApi.normalize(candidate));
+  if (relative.length === 0) return "";
+  const normalizedRelative = relative.replace(/\\/g, "/");
+  if (normalizedRelative === ".." || normalizedRelative.startsWith("../")) return null;
+  return normalizedRelative;
+}
+
+function isAbsolutePathLike(value: string): boolean {
+  return path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+type PathApi = typeof path.posix;
+
+function pathApiForPathValues(...values: string[]): PathApi {
+  return values.some((value) => usesWindowsPathSemantics(value)) ? path.win32 : path.posix;
+}
+
+function usesWindowsPathSemantics(value: string): boolean {
+  return /^[a-zA-Z]:[\\/]/u.test(value) || value.includes("\\");
+}
+
+function samePath(left: string, right: string, pathApi: PathApi): boolean {
+  return pathForComparison(left, pathApi) === pathForComparison(right, pathApi);
+}
+
+function isPathInsideRoot(root: string, candidate: string, pathApi: PathApi): boolean {
+  const normalizedRoot = pathForComparison(root, pathApi);
+  const normalizedCandidate = pathForComparison(candidate, pathApi);
+  const rootWithSeparator = normalizedRoot.endsWith(pathApi.sep) ? normalizedRoot : `${normalizedRoot}${pathApi.sep}`;
+  return normalizedCandidate.startsWith(rootWithSeparator);
+}
+
+function pathForComparison(value: string, pathApi: PathApi): string {
+  const normalized = pathApi.normalize(value);
+  return pathApi === path.win32 ? normalized.toLowerCase() : normalized;
 }
 
 function sameState(left: string, right: string): boolean {
