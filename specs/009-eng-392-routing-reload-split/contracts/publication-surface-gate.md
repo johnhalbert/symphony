@@ -155,3 +155,66 @@ Declare the publication surface gate `FAIL` if any of the following are true:
 - Never use local absolute filesystem paths in the comparison packet; convert them to repo-relative paths or stable artifact labels.
 - If a row would require private implementation detail to justify publication, the row is not ready to pass the gate yet.
 - When the gate fails, record the exact blocking rows and stop publication until the contract or diff is repaired.
+
+## Recorded gate run — ENG-2487 (`REQ-T041`)
+
+This recorded run re-runs the quickstart diff-surface checks against the current committed ENG-2487 branch candidate and supplements them with `git diff --merge-base` name-only/name-status/stat evidence so the recorded mapped surface stays aligned with the pending repair candidate that will become the next committed `HEAD`. The issue contract authorizes the quickstart command source at `specs/009-eng-392-routing-reload-split/quickstart.md` and this recorded gate artifact at `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md`.
+
+### Scenario matrix for this run
+
+| Scenario | Evidence used in this run | Result | Notes |
+| --- | --- | --- | --- |
+| Quickstart publication candidate at committed `HEAD` | `git diff --name-only origin/main...HEAD`; `git status --short -- 'tmp-debug-*'`; `git diff --name-only origin/main...HEAD -- 'hermes/upstream-src'`; `git status --short -- 'hermes/upstream-src'` | `PASS` | The current committed publication candidate differs from `origin/main` by exactly `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md`, and the debug/vendored checks remain empty. |
+| Merge-base preview of the pending repair candidate | `git diff --merge-base --name-only origin/main`; `git diff --merge-base --name-status origin/main`; `git diff --merge-base --stat=200 origin/main` | `PASS` | Anchoring the repair preview to the same merge base as `origin/main...HEAD` keeps the recorded publication surface aligned with the next service-owned commit, and the preview still resolves to the same single authorized spec-doc surface. |
+| Unmapped surface inventory | Publication surface comparison table below | `PASS` | Every changed or cited surface in this run maps to `REQ-T041` and an explicit touched surface authorization. |
+| Debug artifact absence | `git status --short -- 'tmp-debug-*'` | `PASS` | The command returned no output, so no `tmp-debug-*` capture would publish. |
+| Vendored source absence | `git diff --name-only origin/main...HEAD -- 'hermes/upstream-src'`; `git status --short -- 'hermes/upstream-src'` | `PASS` | Both commands returned no output, so no vendored Hermes source would publish. |
+
+### Command transcript
+
+```text
+Quickstart diff-surface commands as documented (current committed HEAD candidate):
+
+$ git diff --name-only origin/main...HEAD
+specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md
+
+$ git status --short -- 'tmp-debug-*'
+<no output>
+
+$ git diff --name-only origin/main...HEAD -- 'hermes/upstream-src'
+<no output>
+
+$ git status --short -- 'hermes/upstream-src'
+<no output>
+
+Merge-base preview of the pending repair candidate:
+
+$ git diff --merge-base --name-only origin/main
+specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md
+
+$ git diff --merge-base --name-status origin/main
+M	specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md
+
+$ git diff --merge-base --stat=200 origin/main
+specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md | 63 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 63 insertions(+)
+```
+
+### Publication surface comparison
+
+| Surface | Kind | Source of discovery | Requirement ID(s) | Authorized by | Evidence to cite | Gate disposition | Required action before publication |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` | `tracked file` | `git diff --name-only origin/main...HEAD`; `git diff --merge-base --name-status origin/main` | `REQ-T041` | Exact touched surface `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` | Command transcript in this section, including the `origin/main...HEAD` name-only output plus the merge-base name-only/name-status/stat preview | `PASS` | `none` |
+| `specs/009-eng-392-routing-reload-split/quickstart.md` | `cited proof` | Manual artifact inventory for the quickstart command source | `REQ-T041` | Exact touched surface `specs/009-eng-392-routing-reload-split/quickstart.md` | `### 3. Diff-surface checks` in `specs/009-eng-392-routing-reload-split/quickstart.md` | `PASS` | `none` |
+
+Gate result: `PASS`
+Blocking rows: `<none>`
+
+### Mapped and unmapped surface decision
+
+- Mapped tracked surfaces: `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md`.
+- Mapped cited proof surfaces: `specs/009-eng-392-routing-reload-split/quickstart.md`.
+- Unmapped tracked surfaces: `<none>`.
+- Unmapped cited proof surfaces: `<none>`.
+- Debug artifacts: `<none>`.
+- Vendored Hermes surfaces: `<none>`.
