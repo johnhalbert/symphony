@@ -218,3 +218,69 @@ Blocking rows: `<none>`
 - Unmapped cited proof surfaces: `<none>`.
 - Debug artifacts: `<none>`.
 - Vendored Hermes surfaces: `<none>`.
+
+## Recorded adjacent-surface verification — ENG-2490 (`REQ-T044`)
+
+This recorded run applies the gate to the worker-local ENG-2490 publication candidate. The issue contract authorizes `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` as the only changed surface and treats `src/app/http.ts`, `cursor/src/CursorWorkspaceOpener.ts`, `tests/status-api.test.ts`, and `tests/cursor-workspace-opener.test.ts` as inspection-only adjacent surfaces that must stay excluded unless a child contract names them directly.
+
+### Scenario matrix for this run
+
+| Scenario | Evidence used in this run | Result | Notes |
+| --- | --- | --- | --- |
+| Worker-local candidate surface inventory | `git diff --name-only`; `git status --short`; per-path diff/status checks in the transcript below | `PASS` | The final candidate contains only `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md`. |
+| Adjacent status/workspace HTTP surface exclusion | `git diff --name-only -- src/app/http.ts`; `git status --short -- src/app/http.ts`; `git diff --name-only -- tests/status-api.test.ts`; `git status --short -- tests/status-api.test.ts` | `PASS` | Both status/workspace surfaces stay absent from the candidate, so this run does not claim any child-contract exception for them. |
+| Adjacent Cursor/editor surface exclusion | `git diff --name-only -- cursor/src/CursorWorkspaceOpener.ts`; `git status --short -- cursor/src/CursorWorkspaceOpener.ts`; `git diff --name-only -- tests/cursor-workspace-opener.test.ts`; `git status --short -- tests/cursor-workspace-opener.test.ts` | `PASS` | Both editor-launch surfaces stay absent from the candidate, so routing or workspace adjacency is not treated as implicit authorization. |
+| Child-contract authorization mapping | `## Adjacent surface findings that need separate child authorization` in this file plus the exact `Touched Surfaces` lists in `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` | `PASS` | Each adjacent surface is either excluded from this candidate or mapped to a later child contract that names the path directly. |
+| Unauthorized-surface blocking rule | Publication surface comparison and adjacent-surface authorization table below | `PASS` | Any future candidate that includes one of the listed adjacent surfaces without the mapped child contract remains blocked as `FAIL-unmapped`. |
+
+### Command transcript
+
+```text
+$ git diff --name-only
+specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md
+
+$ git status --short
+M specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md
+
+$ git diff --name-only -- src/app/http.ts
+<no output>
+
+$ git status --short -- src/app/http.ts
+<no output>
+
+$ git diff --name-only -- cursor/src/CursorWorkspaceOpener.ts
+<no output>
+
+$ git status --short -- cursor/src/CursorWorkspaceOpener.ts
+<no output>
+
+$ git diff --name-only -- tests/status-api.test.ts
+<no output>
+
+$ git status --short -- tests/status-api.test.ts
+<no output>
+
+$ git diff --name-only -- tests/cursor-workspace-opener.test.ts
+<no output>
+
+$ git status --short -- tests/cursor-workspace-opener.test.ts
+<no output>
+```
+
+### Publication surface comparison
+
+| Surface | Kind | Source of discovery | Requirement ID(s) | Authorized by | Evidence to cite | Gate disposition | Required action before publication |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` | `tracked file` | `git diff --name-only`; `git status --short` | `REQ-T044` | Exact touched surface `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` | Command transcript in this section showing the worker-local candidate surface inventory | `PASS` | `none` |
+
+Gate result: `PASS`
+Blocking rows: `<none>`
+
+### Adjacent-surface authorization status
+
+| Adjacent surface | Candidate presence in this run | Child contract authorization if the path later appears | Evidence to cite | This run's disposition | Blocking rule |
+| --- | --- | --- | --- | --- | --- |
+| `src/app/http.ts` | `absent` (`git diff --name-only -- src/app/http.ts`; `git status --short -- src/app/http.ts` both returned no output) | `REQ-392-RUNTIME-ROUTING` and `REQ-392-APPROVAL-WRITEBACK` may authorize it only when the child contract lists the exact path in `Touched Surfaces`; otherwise the adjacent-surface rule above keeps it excluded. | `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family B and Family D exact touched-surface lists); `## Adjacent surface findings that need separate child authorization` in this gate | `PASS` | Block publication as `FAIL-unmapped` if the path appears outside those exact child-contract scopes. |
+| `cursor/src/CursorWorkspaceOpener.ts` | `absent` (`git diff --name-only -- cursor/src/CursorWorkspaceOpener.ts`; `git status --short -- cursor/src/CursorWorkspaceOpener.ts` both returned no output) | `REQ-392-RUNTIME-ROUTING` may authorize it only when the child contract lists the exact path directly; neither workspace-lifecycle nor operator-http-entrypoints is blanket authorization by itself. | `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family B exact touched-surface list); `## Adjacent surface findings that need separate child authorization` in this gate | `PASS` | Block publication as `FAIL-unmapped` if the path appears without that exact child-contract authorization. |
+| `tests/status-api.test.ts` | `absent` (`git diff --name-only -- tests/status-api.test.ts`; `git status --short -- tests/status-api.test.ts` both returned no output) | `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, and `REQ-392-APPROVAL-WRITEBACK` may authorize it only when the child contract lists the exact path in `Touched Surfaces`. | `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family B, Family C, and Family D exact touched-surface lists); `## Adjacent surface findings that need separate child authorization` in this gate | `PASS` | Block publication as `FAIL-unmapped` if the path appears outside those exact child-contract scopes. |
+| `tests/cursor-workspace-opener.test.ts` | `absent` (`git diff --name-only -- tests/cursor-workspace-opener.test.ts`; `git status --short -- tests/cursor-workspace-opener.test.ts` both returned no output) | `REQ-392-RUNTIME-ROUTING` may authorize it only when the child contract lists the exact path directly. | `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` (Family B exact touched-surface list); `## Adjacent surface findings that need separate child authorization` in this gate | `PASS` | Block publication as `FAIL-unmapped` if the path appears without that exact child-contract authorization. |
