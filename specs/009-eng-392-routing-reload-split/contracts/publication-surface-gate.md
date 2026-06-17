@@ -147,3 +147,69 @@ Declare the publication surface gate `FAIL` if any of the following are true:
 - Never use local absolute filesystem paths in the comparison packet; convert them to repo-relative paths or stable artifact labels.
 - If a row would require private implementation detail to justify publication, the row is not ready to pass the gate yet.
 - When the gate fails, record the exact blocking rows and stop publication until the contract or diff is repaired.
+
+## Recorded gate run — ENG-2487 (`REQ-T041`)
+
+This recorded run executes the quickstart diff-surface checks for the active ENG-2487 publication-surface child issue. The issue contract authorizes the quickstart command source at `specs/009-eng-392-routing-reload-split/quickstart.md` and this recorded gate artifact at `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md`.
+
+### Scenario matrix for this run
+
+| Scenario | Evidence used in this run | Result | Notes |
+| --- | --- | --- | --- |
+| Quickstart publication candidate at committed `HEAD` | `git diff --name-only origin/main...HEAD`; `git status --short -- 'tmp-debug-*'`; `git diff --name-only origin/main...HEAD -- 'hermes/upstream-src'`; `git status --short -- 'hermes/upstream-src'` | `PASS` | All four documented quickstart commands returned no output, so the committed publication candidate adds no tracked, debug, or vendored surfaces beyond `origin/main`. |
+| Worktree recording artifact mapping | `git status --short --branch`; `git diff --name-status`; `git diff --stat=200`; `git diff --name-only` | `PASS` | The only uncommitted worker-run surface is `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md`, which maps directly to `REQ-T041` and an exact touched surface. |
+| Unmapped surface inventory | Publication surface comparison table below | `PASS` | Every changed or cited surface in this run maps to `REQ-T041` and an explicit touched surface authorization. |
+| Debug artifact absence | `git status --short -- 'tmp-debug-*'` | `PASS` | The command returned no output, so no `tmp-debug-*` capture would publish. |
+| Vendored source absence | `git diff --name-only origin/main...HEAD -- 'hermes/upstream-src'`; `git status --short -- 'hermes/upstream-src'` | `PASS` | Both commands returned no output, so no vendored Hermes source would publish. |
+
+### Command transcript
+
+```text
+Quickstart diff-surface commands as documented:
+
+$ git diff --name-only origin/main...HEAD
+<no output>
+
+$ git status --short -- 'tmp-debug-*'
+<no output>
+
+$ git diff --name-only origin/main...HEAD -- 'hermes/upstream-src'
+<no output>
+
+$ git status --short -- 'hermes/upstream-src'
+<no output>
+
+Supplemental working-tree inspection for this uncommitted worker run:
+
+$ git status --short --branch
+## sinfonista/eng-2487-t041-run-publication-surface-gate-commands
+ M specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md
+
+$ git diff --name-status
+M	specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md
+
+$ git diff --stat=200
+specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md | 66 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 66 insertions(+)
+
+$ git diff --name-only
+specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md
+```
+
+### Publication surface comparison
+
+| Surface | Kind | Source of discovery | Requirement ID(s) | Authorized by | Evidence to cite | Gate disposition | Required action before publication |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` | `tracked file` | `git diff --name-only` | `REQ-T041` | Exact touched surface `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` | Command transcript in this section, including `git status --short --branch`, `git diff --name-status`, and `git diff --stat=200` | `PASS` | `none` |
+| `specs/009-eng-392-routing-reload-split/quickstart.md` | `cited proof` | Manual artifact inventory for the quickstart command source | `REQ-T041` | Exact touched surface `specs/009-eng-392-routing-reload-split/quickstart.md` | `### 3. Diff-surface checks` in `specs/009-eng-392-routing-reload-split/quickstart.md` | `PASS` | `none` |
+
+Gate result: `PASS`
+Blocking rows: `<none>`
+
+### Mapped and unmapped surface decision
+
+- Mapped surfaces: `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` as the tracked diff surface and `specs/009-eng-392-routing-reload-split/quickstart.md` as the cited quickstart proof surface.
+- Unmapped tracked surfaces: `<none>`.
+- Unmapped cited proof surfaces: `<none>`.
+- Debug artifacts: `<none>`.
+- Vendored Hermes surfaces: `<none>`.
