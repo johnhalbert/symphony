@@ -126,12 +126,33 @@ Keep these adjacent PR #286 paths excluded unless a later child contract names t
 | `ENG-392 child — orchestrator proof` (`REQ-392-TEST-PROOF`) | `ENG-392 child — runtime routing repair`; `ENG-392 child — reload preservation repair`; `ENG-392 child — approval writeback repair` | Focused orchestrator proof only resumes after the runtime and approval invariants above are explicit and stable. |
 | `ENG-392 child — publication hygiene closure` (`REQ-392-PUBLICATION-HYGIENE`) | `ENG-392 child — decision and scope lock`; `ENG-392 child — orchestrator proof`; `ENG-392 child — approval writeback repair` | Publication-facing closure stays last so the final diff/evidence packet can prove it matches the declared child scopes and finished prerequisite repairs. |
 
+### Final parent resolution evidence to cite
+
+Record the parent resolution packet as one compact, public-safe evidence entry before treating ENG-392 as safely split/retargeted:
+
+- `status`: `recorded`
+- `surface`: `specs/009-eng-392-routing-reload-split/quickstart.md`, `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`, and `specs/009-eng-392-routing-reload-split/data-model.md`
+- `proof`: the selected parent resolution remains `split/retarget`; `contracts/child-issue-contracts.md` keeps `ENG-392 child — decision and scope lock` / `REQ-392-DECISION` first in the child dependency order; `data-model.md` preserves the durable `DecompositionDecision` model with `resolution: decompose`; the dependency table above keeps later child families gated through `REQ-392-PUBLICATION-HYGIENE`; and the protected-surface inventory plus explicit exclusions above still keep the old ambiguous parent contract from reopening runtime, publication, or debug-capture surfaces implicitly.
+- `why_it_matters`: renewed worker or reviewer candidates stay blocked from the old parent contract until they cite the owning child title / requirement ID, stay within that child contract's authorized surfaces, and keep the explicit exclusions untouched unless a later child contract widens them deliberately.
+- `redactions`: `none`; keep all cited proof repo-relative and public-safe.
+
 ### Child issue creation path and authority boundary
 
 - **Selected creation path: prefer service-owned writeback.** The worker-owned decomposition step stops after drafting an accepted issue-breakdown plan; the actual Linear child creation should happen through Symphony's service-owned apply path, not by having a worker or reviewer write to Linear directly.
 - **Service-owned writeback path (default):** once the latest fresh plan is approved for apply and writeback is available, the apply flow creates one `issue_create` writeback per proposed child, waits for `created` or `verified` child refs before treating creation as successful, then emits the sibling `blocks` `issue_relation` writebacks and the parent summary comment. That keeps child creation, dependency wiring, and parent writeback in one service-owned audit trail instead of relying on a manual copy step.
 - **Explicit manual-apply fallback:** if service-owned apply is unavailable, intentionally withheld, or blocked on operator review, the operator may create the child issues manually from `contracts/child-issue-contracts.md`, preserving the exact suggested child titles, primary requirement IDs, dependency order, and no-auto-ready-label guidance. Manual apply should also mirror the same sibling `blocks` relations and parent summary notes explicitly rather than silently skipping them.
 - **Authority boundary:** workers and reviewers may draft or validate the child payload only. Service-owned writeback owns automated `issue_create`, `issue_relation`, and parent-comment mutations. Manual apply is an explicit operator-only fallback; it is not implicit permission for worker runs to create child issues, widen touched surfaces, or add `dogfood-ready` / worker-dispatch labels before review.
+
+### Remaining intentionally unverified live integrations
+
+Keep the remaining live Linear/GitHub boundaries explicit in the parent packet instead of implying they were exercised locally:
+
+| Status | Live integration boundary | Why it remains intentionally unverified here |
+| --- | --- | --- |
+| `intentionally_unverified` | Linear child creation via service-owned `issue_create` writebacks | This task records the parent-resolution evidence only; the local validation quickstart avoids live Linear writeback by default, so the documented creation path is recorded but not exercised here. |
+| `intentionally_unverified` | Linear sibling dependency wiring via service-owned `issue_relation` (`blocks`) writebacks | Dependency order is documented in the parent packet, but the live relation mutations remain service-owned apply behavior outside this doc-only task. |
+| `intentionally_unverified` | Linear parent summary comment writeback after child creation | The parent summary note is part of the expected service-owned audit trail, but live parent-comment mutation is intentionally left unverified in this planning surface. |
+| `intentionally_unverified` | GitHub publication or PR-facing writeback side effects coupled to the same service-owned apply/publication flow | `Local validation quickstart` and `Review pass criteria` require repo-local, no-live-writeback proof, so no live GitHub publication/writeback side effects are exercised by this evidence packet. |
 
 ## Current `tests/orchestrator.test.ts` coverage inventory
 
