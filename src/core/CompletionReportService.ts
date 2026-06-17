@@ -1,5 +1,12 @@
+import path from "node:path";
 import { z } from "zod";
-import type { ServiceConfig } from "./config/Config.js";
+import {
+  isRuntimeSourcePath,
+  matchesRuntimeSourcePathPattern,
+  normalizeRuntimeSourcePath,
+  parseIssueRuntimeSourceScope,
+  type ServiceConfig,
+} from "./config/Config.js";
 import { normalizeProjectContextResolution, projectContextResolutionFromIssue, type ProjectContextResolution } from "./config/ProjectContexts.js";
 import { SymphonyError } from "./errors.js";
 import type {
@@ -200,6 +207,9 @@ export class CompletionReportService {
         : null;
     const resumingPendingPublication =
       existing !== undefined && pendingPublicationHandoff?.pendingReport.id === existing.id;
+    if (!resumingPendingPublication) {
+      this.validateAuthorizedRuntimeSourceScope(report, context);
+    }
 
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
     const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
@@ -633,6 +643,49 @@ export class CompletionReportService {
     if (!sameStateIn(context.issue.state, allowedStates)) {
       throw new SymphonyError("invalid_request", "Completion report requires the issue to be in the active implementation state");
     }
+  }
+
+  private validateAuthorizedRuntimeSourceScope(report: CompletionReportInput, context: CompletionReportActiveContext): void {
+    const scope = parseIssueRuntimeSourceScope(context.issue.description);
+    if (!scope.hasTouchedSurfacesSection) return;
+
+    const runtimeChangedFiles = [
+      ...new Set(
+        report.changedFiles
+          .map((changedFile) =>
+            normalizeReportedChangedFilePath(changedFile, [
+              context.workspacePath,
+              context.workspace?.path ?? null,
+              context.workspace?.repoPath ?? null,
+            ]),
+          )
+          .filter((changedFile) => isRuntimeSourcePath(changedFile)),
+      ),
+    ];
+    if (runtimeChangedFiles.length === 0) return;
+
+    const unauthorizedRuntimeChangedFiles = runtimeChangedFiles.filter(
+      (changedFile) => !scope.authorizedPaths.some((authorizedPath) => matchesRuntimeSourcePathPattern(authorizedPath, changedFile)),
+    );
+    if (unauthorizedRuntimeChangedFiles.length === 0) return;
+
+    const details = {
+      authorizedRuntimeSourcePaths: scope.authorizedPaths,
+      unauthorizedRuntimeChangedFiles,
+      changedFiles: report.changedFiles,
+    };
+    if (scope.authorizedPaths.length === 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Completion report includes runtime source changes but the issue does not authorize runtime implementation in Touched Surfaces",
+        details,
+      );
+    }
+    throw new SymphonyError(
+      "invalid_request",
+      "Completion report includes runtime source changes outside the issue's authorized Touched Surfaces scope",
+      details,
+    );
   }
 
   private async publishPullRequestIfNeeded(
@@ -1352,6 +1405,29 @@ function formatPullRequestBody(report: CompletionReportInput, context: Completio
     "Changed files:",
     ...(report.changedFiles.length === 0 ? ["- n/a"] : report.changedFiles.map((item) => `- ${item}`)),
   ].join("\n");
+}
+
+function normalizeReportedChangedFilePath(changedFile: string, roots: readonly (string | null | undefined)[]): string {
+  const trimmed = changedFile.trim();
+  if (!isAbsolutePathLike(trimmed)) return normalizeRuntimeSourcePath(trimmed);
+  for (const root of roots) {
+    const relative = relativizePathIfWithinRoot(trimmed, root);
+    if (relative !== null) return normalizeRuntimeSourcePath(relative);
+  }
+  return normalizeRuntimeSourcePath(trimmed);
+}
+
+function relativizePathIfWithinRoot(candidate: string, root: string | null | undefined): string | null {
+  if (!root || !isAbsolutePathLike(candidate) || !isAbsolutePathLike(root)) return null;
+  const relative = path.relative(root, candidate);
+  if (relative.length === 0) return "";
+  const normalizedRelative = relative.replace(/\\/g, "/");
+  if (normalizedRelative === ".." || normalizedRelative.startsWith("../")) return null;
+  return normalizedRelative;
+}
+
+function isAbsolutePathLike(value: string): boolean {
+  return path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value);
 }
 
 function sameState(left: string, right: string): boolean {
