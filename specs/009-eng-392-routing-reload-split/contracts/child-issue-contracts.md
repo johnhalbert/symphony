@@ -470,7 +470,9 @@ Add the focused orchestrator proof for ENG-392 only after the runtime prerequisi
 
 - Suggested child title: `ENG-392 child — publication hygiene closure`
 - Dependency order: **6 of 6**
+- Draft label guidance for Linear creation: keep the parent `dogfood` label, do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload, and let operator review own readiness-label changes because this child closes publication/evidence hygiene instead of re-authorizing protected runtime scope.
 - Declare dependency on: `ENG-392 child — decision and scope lock`, `ENG-392 child — orchestrator proof`, `ENG-392 child — approval writeback repair`
+- Draft dependency guidance for Linear creation: declare the decision, orchestrator proof, and approval/writeback siblings by exact title because publication closure relies on their accepted surface map, focused proof bundle, and publication-handoff evidence before it can claim the remaining diff and evidence packet are clean.
 - Authorized surfaces to list in `Touched Surfaces`:
   - `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`
   - `specs/009-eng-392-routing-reload-split/quickstart.md`
@@ -479,12 +481,19 @@ Add the focused orchestrator proof for ENG-392 only after the runtime prerequisi
 ````markdown
 ## Problem / Goal
 
-Close the ENG-392 decomposition loop by keeping the final publication and evidence surface aligned with the declared child scopes, removing stray non-fixture debug captures, and documenting the exact proof paths reviewers should rely on.
+Close the ENG-392 decomposition loop by preparing a Linear-ready publication-hygiene child that keeps the final publication and evidence surface aligned with the declared child scopes, removes stray non-fixture debug captures, and tells reviewers exactly which proof paths and redaction rules govern the final closure packet.
+
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label and leave readiness-label changes to operator review because this child documents publication hygiene closure rather than re-authorizing new runtime scope.
+- Do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload; operator review owns readiness-label changes after `ENG-392 child — decision and scope lock`, `ENG-392 child — orchestrator proof`, and `ENG-392 child — approval writeback repair` are accepted.
+- Sibling dependency guidance: declare dependencies on `ENG-392 child — decision and scope lock`, `ENG-392 child — orchestrator proof`, and `ENG-392 child — approval writeback repair` by exact title because publication closure depends on their accepted surface map, proof bundle, and publication-handoff/writeback evidence before it can claim the diff and evidence packet are contract-scoped.
+- Blocking rule: if any prerequisite child remains unresolved, if stray `tmp-debug-*` captures still exist, or if the remaining diff surface no longer matches the authorized surface map, keep the child blocked and record the missing proof instead of claiming publication closure.
 
 ## Issue Contract
 
 ```json
-{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-PUBLICATION-HYGIENE","requirement":"The final ENG-392 follow-up must keep the published diff and evidence packet limited to the authorized child surfaces, remove stray non-fixture debug captures, and document the proof paths that justify the final contract-scoped publication surface.","proofHint":"Cite the final file list, any removed tmp-debug paths, and the quickstart or child-contract references that explain why the remaining surfaces are authorized."}]}
+{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-PUBLICATION-HYGIENE","requirement":"The final ENG-392 follow-up must publish a contract-scoped surface map, remove stray non-fixture debug artifacts, and keep the evidence packet redacted to public-safe repo-relative proof paths instead of secrets, prompt bodies, or local absolute paths.","proofHint":"Cite the authorized surface list, any removed or absent `tmp-debug-*` captures, and the publication or quickstart notes that point reviewers to public-safe proof paths and redaction expectations."}]}
 ```
 
 ## Touched Surfaces
@@ -496,24 +505,26 @@ Close the ENG-392 decomposition loop by keeping the final publication and eviden
 
 ## Acceptance Criteria
 
-- The final evidence packet points reviewers to the approved child scopes and removes stray non-fixture debug artifacts.
-- Publication-facing notes explain why the remaining diff surface is contract-scoped instead of repeating the original mismatch.
+- The issue body is Linear-ready: it includes operator-facing label and dependency guidance plus a contract-scoped surface map limited to the authorized publication, quickstart, and debug-cleanup paths.
+- The issue body tells reviewers how to handle stray `tmp-debug-*` captures and which proof paths justify the final diff and evidence packet.
+- The issue body states redaction expectations: keep publication notes public-safe, repo-relative, and free of secrets, credential values, raw prompt bodies, or local absolute paths.
 
 ## Contract Checklist
 
-- Happy path: the final diff contains only the authorized proof, planning, or cleanup surfaces for the child set.
-- Negative/error path: stray debug captures or unauthorized runtime paths block closure instead of being waved through as incidental.
-- Adjacent sibling surface: the quickstart evidence stays aligned with the proof and approval siblings that actually landed.
-- Empty/missing/stale/fallback state: if a sibling child is still unfinished, the publication-hygiene issue says so instead of claiming closure.
-- Replay/restart/idempotency: rerunning the hygiene review yields the same authorized file list and zero stray debug captures.
-- Credential/security boundary: the evidence packet records only repo-relative paths and public-safe notes.
-- Side-effect verification: review the file list and quickstart references directly rather than assuming the published diff is clean.
+- Happy path: the final diff and evidence packet cite only the authorized publication, quickstart, and debug-cleanup surfaces plus the same stable proof paths.
+- Negative/error path: stray debug captures, unauthorized runtime or test paths, or missing prerequisite proof block closure instead of being waved through as incidental.
+- Adjacent sibling surface: the publication notes stay aligned with the decision, orchestrator proof, and approval/writeback siblings that authorized the remaining surface map.
+- Empty/missing/stale/fallback state: if a prerequisite child, proof path, or cleanup result is missing or stale, the issue records the blocker instead of claiming closure.
+- Replay/restart/idempotency: rerunning the hygiene review yields the same authorized file list, the same proof paths, and zero stray non-fixture debug captures.
+- Credential/security boundary: publication notes use repo-relative paths and public-safe descriptions; no secret values, raw prompt bodies, credential-bearing URLs, or local absolute paths appear.
+- Side-effect verification: review the recorded file list, quickstart references, and debug-artifact status directly rather than assuming the published diff is clean.
 
 ## Validation Requirements
 
-- `git diff --name-only origin/main...HEAD`
-- `git status --short -- tmp-debug-*`
-- Review `specs/009-eng-392-routing-reload-split/quickstart.md` and `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` for the final authorized-surface explanation.
+- Review this child issue body and confirm the `Labels / Dependencies` section keeps the parent `dogfood` label, excludes `dogfood-ready` and worker-dispatch labels, and names the exact prerequisite sibling titles.
+- Validate the fenced JSON in this child issue body parses and the `REQ-392-PUBLICATION-HYGIENE` requirement text explicitly covers surface mapping, debug-artifact hygiene, and redaction expectations.
+- Review the `Touched Surfaces`, `Acceptance Criteria`, and `Contract Checklist` sections and confirm they limit closure to `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`, `specs/009-eng-392-routing-reload-split/quickstart.md`, and `tmp-debug-*/**`.
+- Review this family body and confirm the publication-proof notes point reviewers to public-safe repo-relative evidence rather than secrets or local absolute paths.
 
 ## Out Of Scope
 
