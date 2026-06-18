@@ -21,6 +21,8 @@ export interface ResolvedLinearClientConfig {
   role: CredentialRole;
   tracker: TrackerConfig;
   credential: ResolvedCredential | null;
+  projectContextId: string;
+  projectContext: WorkflowProjectContext;
 }
 
 export function resolveLinearClientConfig(
@@ -57,6 +59,8 @@ export function resolveLinearClientConfig(
       apiKey: credential?.value ?? view.tracker.apiKey,
     },
     credential,
+    projectContextId: view.projectContextId,
+    projectContext: view.projectContext,
   };
 }
 
@@ -74,7 +78,12 @@ export function createLinearTrackerClientForCapability(
   fetchImpl?: FetchLike,
   options: ProjectContextCredentialResolutionOptions = {},
 ): LinearTrackerClient {
-  return new LinearTrackerClient(resolveLinearClientConfig(config, capability, options).tracker, fetchImpl);
+  const resolved = resolveLinearClientConfig(config, capability, options);
+  return new LinearTrackerClient(resolved.tracker, fetchImpl, {
+    projectContextId: resolved.projectContextId,
+    projectContextLabel: resolved.projectContext.label,
+    linearProjectSlug: resolved.projectContext.tracker.projectSlug,
+  });
 }
 
 export function createLinearTrackerClientForProjectContext(

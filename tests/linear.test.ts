@@ -1,8 +1,10 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
-import { resolveLinearClientConfig } from "../src/integrations/linear/LinearCredentialResolver.js";
+import { projectContextResolutionFromIssue } from "../src/core/config/ProjectContexts.js";
+import { createLinearTrackerClientForCapability, resolveLinearClientConfig } from "../src/integrations/linear/LinearCredentialResolver.js";
 import { LinearTrackerClient, normalizeIssue } from "../src/integrations/linear/LinearTrackerClient.js";
-import { testConfig } from "./helpers.js";
+import { multiProjectWorkflowConfig, testConfig } from "./helpers.js";
 
 describe("LinearTrackerClient", () => {
   it("normalizes issue labels and blockers", () => {
@@ -146,6 +148,129 @@ describe("LinearTrackerClient", () => {
       id: "linear-docs-179",
       identifier: "ENG-179",
       linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "project-docs" },
+    });
+  });
+
+  it("carries explicit project context metadata through candidate polling and state refresh", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig(),
+      path.join("/tmp/symphony", "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+      requests.push(request);
+      if (request.query.includes("SymphonyCandidateIssues") || request.query.includes("SymphonyIssuesByStates")) {
+        return jsonResponse({
+          data: {
+            issues: {
+              nodes: [
+                {
+                  id: "linear-docs-179",
+                  identifier: "DOCS-179",
+                  title: "Docs title",
+                  state: { name: "Todo" },
+                  project: { id: "project-docs", slugId: "DOCS" },
+                },
+              ],
+              pageInfo: pageInfo(),
+            },
+          },
+        });
+      }
+      if (request.query.includes("SymphonyIssueStates")) {
+        return jsonResponse({
+          data: {
+            issues: {
+              nodes: [
+                {
+                  id: "linear-docs-179",
+                  identifier: "DOCS-179",
+                  title: "Docs title",
+                  state: { name: "In Progress" },
+                  project: { id: "project-docs", slugId: "DOCS" },
+                },
+              ],
+            },
+          },
+        });
+      }
+      throw new Error(`Unexpected query: ${request.query}`);
+    };
+
+    const docsContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "manual_test",
+    } as const;
+    const client = createLinearTrackerClientForCapability(config, "linear.tracker", fetchImpl, { projectContext: docsContext });
+
+    const [candidate] = await client.fetchCandidateIssues();
+    const [refreshedByState] = await client.fetchIssuesByStates(["Todo"]);
+    const [refreshedById] = await client.fetchIssueStatesByIds(["linear-docs-179"]);
+
+    expect(requests.map((request) => request.variables)).toEqual([
+      { projectSlug: "DOCS", activeStates: ["Todo", "In Progress"], after: null },
+      { projectSlug: "DOCS", states: ["Todo"], after: null },
+      { ids: ["linear-docs-179"] },
+    ]);
+    expect(candidate).toMatchObject({
+      id: "linear-docs-179",
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "project-docs" },
+      routingSource: "candidate_poll",
+    });
+    expect(refreshedByState).toMatchObject({
+      state: "Todo",
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "state_refresh",
+      },
+      routingSource: "state_refresh",
+    });
+    expect(refreshedById).toMatchObject({
+      state: "In Progress",
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "state_refresh",
+      },
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "project-docs" },
+      routingSource: "state_refresh",
+    });
+    expect(projectContextResolutionFromIssue(candidate)).toEqual({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    });
+    expect(projectContextResolutionFromIssue(refreshedByState)).toEqual({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "state_refresh",
+    });
+    expect(projectContextResolutionFromIssue(refreshedById)).toEqual({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "state_refresh",
     });
   });
 
