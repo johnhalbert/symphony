@@ -6,6 +6,7 @@ import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbo
 import {
   planBlockedEscalationWritebacks,
   planCompletionReportAcceptedWritebacks,
+  planDispatchWriteback,
   planMergeGateBlockedWritebacks,
   planMergeGateRepairWritebacks,
   planPullRequestHandoffWritebacks,
@@ -148,6 +149,20 @@ describe("TransitionPolicy review-loop planners", () => {
     });
   });
 
+  it("uses the resolved project context dispatch bucket and fails closed for the default bucket", () => {
+    const config = contextAwareTransitionPolicyConfig();
+    const projectContext = docsProjectContext();
+
+    expect(planDispatchWriteback(issue({ state: "Todo" }), config, projectContext)).toBeNull();
+    expect(planDispatchWriteback(issue({ state: "Docs Todo" }), config, projectContext)).toMatchObject({
+      projectContext,
+      payload: {
+        fromStates: ["Docs Todo"],
+        toState: "In Progress",
+      },
+    });
+  });
+
   it("fails closed when a resolved project context does not recognize the issue state bucket", () => {
     const config = contextAwareTransitionPolicyConfig();
 
@@ -244,7 +259,7 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(blockedOperations[1]).toMatchObject({
       kind: "transition",
       payload: {
-        fromStates: ["Todo", "In Progress", "Docs Human Review", "Docs In Review"],
+        fromStates: ["Docs Todo", "In Progress", "Docs Human Review", "Docs In Review"],
         toState: "Docs Blocked",
       },
     });
@@ -604,6 +619,10 @@ function contextAwareTransitionPolicyConfig(): ServiceConfig {
           dispatch_state: "In Progress",
         },
         github: {
+          owner: "acme",
+          repo: "symphony",
+          token: "github-test-token",
+          publish_pull_requests: true,
           pr_handoff: {
             enabled: true,
             target_state: "Human Review",
@@ -626,6 +645,7 @@ function contextAwareTransitionPolicyConfig(): ServiceConfig {
             review_pass_state: "Ready to Merge",
           },
           github: {
+            publish_pull_requests: true,
             pr_handoff: {
               enabled: true,
               target_state: "Human Review",
@@ -638,7 +658,7 @@ function contextAwareTransitionPolicyConfig(): ServiceConfig {
           projectSlug: "DOCS",
           repository: "../docs-site",
           tracker: {
-            active_states: ["Todo", "In Progress"],
+            active_states: ["Docs Todo", "In Progress"],
             handoff_states: ["Docs Human Review"],
           },
           review_loop: {
@@ -647,6 +667,7 @@ function contextAwareTransitionPolicyConfig(): ServiceConfig {
             review_pass_state: "Docs Ready to Merge",
           },
           github: {
+            publish_pull_requests: true,
             pr_handoff: {
               enabled: true,
               target_state: "Docs Human Review",

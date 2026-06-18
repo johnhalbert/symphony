@@ -793,6 +793,7 @@ describe("CompletionReportService", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.github.operatorApproval!.requiredForPublication = true;
+    addDocsProjectContext(config);
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);

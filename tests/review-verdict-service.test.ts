@@ -96,6 +96,19 @@ describe("ReviewVerdictService", () => {
     );
   });
 
+  it("rejects verdicts whose supplied project context does not match the lifecycle record", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "Docs In Review" }), {
+      phase: "review",
+      projectContext: docsProjectContext,
+    });
+
+    await expect(service.submitReviewVerdict(failVerdict(), context({ projectContext: otherProjectContext }))).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Review verdict issue project context does not match the lifecycle record",
+    });
+  });
+
   it("increments review rounds on each accepted fail verdict", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
@@ -380,12 +393,14 @@ describe("ReviewVerdictService", () => {
     config.writeback.dispatchState = "In Progress";
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewPassState = "Ready to Merge";
+    addDocsProjectContext(config);
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const outbox = new FileWritebackOutboxStore(root);
     const service = new ReviewVerdictService({ config, lifecycleStore, writebackOutbox: outbox });
     return { service, lifecycleStore, outbox };
   }
 });
+
 
 function lifecycle(
   overrides: Omit<Partial<IssueLifecycleRecord>, "summaryPointers"> & {
@@ -582,6 +597,63 @@ const docsProjectContext = {
   linearProjectSlug: "DOCS",
   routingSource: "candidate_poll",
 } as const;
+
+const otherProjectContext = {
+  projectContextId: "other-site",
+  projectContextLabel: "Other Site",
+  linearProjectSlug: "OTHER",
+  routingSource: "candidate_poll",
+} as const;
+
+function addDocsProjectContext(config: ReturnType<typeof testConfig>): void {
+  if (config.projectContexts.byId.has(docsProjectContext.projectContextId)) return;
+
+  const defaultContext = config.projectContexts.defaultContext;
+  const docsContext = {
+    ...defaultContext,
+    id: docsProjectContext.projectContextId,
+    label: docsProjectContext.projectContextLabel,
+    source: "explicit" as const,
+    tracker: {
+      ...defaultContext.tracker,
+      projectSlug: docsProjectContext.linearProjectSlug,
+    },
+    reviewLoop: {
+      ...config.reviewLoop,
+    },
+    issueBreakdown: {
+      ...config.issueBreakdown,
+    },
+    agent: {
+      ...config.agent,
+    },
+    publicMetadata: {
+      ...defaultContext.publicMetadata,
+      id: docsProjectContext.projectContextId,
+      label: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    },
+    publicSummary: {
+      ...defaultContext.publicSummary,
+      id: docsProjectContext.projectContextId,
+      label: docsProjectContext.projectContextLabel,
+      tracker: {
+        ...defaultContext.publicSummary.tracker,
+        projectSlug: docsProjectContext.linearProjectSlug,
+      },
+      publicMetadata: {
+        ...defaultContext.publicSummary.publicMetadata,
+        id: docsProjectContext.projectContextId,
+        label: docsProjectContext.projectContextLabel,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+      },
+    },
+  };
+
+  config.projectContexts.contexts = [...config.projectContexts.contexts, docsContext];
+  config.projectContexts.enabledContexts = [...config.projectContexts.enabledContexts, docsContext];
+  (config.projectContexts.byId as unknown as Map<string, typeof docsContext>).set(docsContext.id, docsContext);
+}
 
 function failVerdict(overrides: Partial<ReviewVerdictInput> = {}): ReviewVerdictInput {
   return {

@@ -1287,6 +1287,8 @@ function recoveryContextFor(input: {
   run: ExistingRunRecord;
   config: ServiceConfig;
 }): CompletionReportActiveContext {
+  const projectContext = input.pendingReport.projectContext ?? input.lifecycle.projectContext ?? input.run?.projectContext ?? undefined;
+  const resolvedConfig = resolveServiceConfigForProjectContext(input.config, projectContext);
   const branchName = resolveServiceOwnedCompletionReportBranchName({
     lifecycleGitBranchName: input.lifecycle.summaryPointers.gitBranchName,
     lifecycleBranchName: input.lifecycle.summaryPointers.branchName,
@@ -1294,7 +1296,7 @@ function recoveryContextFor(input: {
     issueBranchName: input.issue.branchName,
   });
   const workspacePath = input.lifecycle.summaryPointers.workspacePath ?? input.run?.workspacePath ?? null;
-  const baseRef = input.lifecycle.summaryPointers.baseRef ?? input.run?.baseRef ?? input.config.workspace.source.baseRef;
+  const baseRef = input.lifecycle.summaryPointers.baseRef ?? input.run?.baseRef ?? resolvedConfig.workspace.source.baseRef;
   const repoPath = input.lifecycle.summaryPointers.repoPath ?? input.run?.repoPath ?? null;
   const workspace =
     workspacePath === null
@@ -1315,10 +1317,10 @@ function recoveryContextFor(input: {
       id: input.pendingReport.issueId,
       identifier: input.pendingReport.issueIdentifier,
       title: input.lifecycle.summaryPointers.issueTitle ?? input.issue.title,
-      state: input.config.writeback.dispatchState,
+      state: resolvedConfig.writeback.dispatchState,
       branchName,
     },
-    projectContext: input.pendingReport.projectContext ?? input.lifecycle.projectContext ?? input.run?.projectContext ?? undefined,
+    projectContext,
     activeRunId: input.pendingReport.runId,
     role: "worker",
     workspacePath,

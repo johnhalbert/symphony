@@ -163,16 +163,21 @@ export function planDispatchWriteback(
   config: ServiceConfig,
   projectContext?: ProjectContextResolution,
 ): NewWritebackOperation | null {
-  if (!config.writeback.enabled || !sameName(issue.state, "Todo")) return null;
+  const resolvedConfig = resolveTransitionPolicyConfig(config, projectContext);
+  if (!resolvedConfig.writeback.enabled) return null;
+  const fromStates = uniqueStates(
+    resolvedConfig.tracker.activeStates.filter((state) => !sameName(state, resolvedConfig.writeback.dispatchState)),
+  );
+  if (!isStateIn(issue.state, fromStates)) return null;
   const dispatchStateVersion = safeKeySegment(issue.updatedAt ?? issue.createdAt ?? issue.state);
   return {
-    idempotencyKey: `transition:${issue.id}:dispatch:${dispatchStateVersion}:${config.writeback.dispatchState}`,
+    idempotencyKey: `transition:${issue.id}:dispatch:${dispatchStateVersion}:${resolvedConfig.writeback.dispatchState}`,
     kind: "transition",
     issueId: issue.id,
     projectContext,
     payload: {
-      fromStates: ["Todo"],
-      toState: config.writeback.dispatchState,
+      fromStates,
+      toState: resolvedConfig.writeback.dispatchState,
       reason: "Symphony dispatch",
     },
   };

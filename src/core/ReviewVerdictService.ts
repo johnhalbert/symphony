@@ -92,6 +92,7 @@ export class ReviewVerdictService {
     this.validateCaller(verdict, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
+    validateReviewVerdictProjectContext(context, existingLifecycle);
     const existing = existingLifecycle?.reviewVerdicts.find((item) => item.idempotencyKey === verdict.idempotencyKey);
     if (existing) {
       return { accepted: true, replayed: true, verdict: existing, writebackOperations: [] };
@@ -357,6 +358,32 @@ function resolveReviewVerdictProjectContext(
 ): ProjectContextResolution {
   return normalizeProjectContextResolution(
     context.projectContext ?? lifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
+}
+
+function projectContextEquals(
+  left: ProjectContextResolution | undefined,
+  right: ProjectContextResolution | undefined,
+): boolean {
+  const normalizedLeft = normalizeProjectContextResolution(left);
+  const normalizedRight = normalizeProjectContextResolution(right);
+  return (
+    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
+    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
+    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
+    normalizedLeft.routingSource === normalizedRight.routingSource
+  );
+}
+
+function validateReviewVerdictProjectContext(
+  context: ReviewVerdictActiveContext,
+  lifecycle: IssueLifecycleRecord | null | undefined,
+): void {
+  if (!context.projectContext || !lifecycle?.projectContext) return;
+  if (projectContextEquals(context.projectContext, lifecycle.projectContext)) return;
+  throw new SymphonyError(
+    "invalid_request",
+    "Review verdict issue project context does not match the lifecycle record",
   );
 }
 

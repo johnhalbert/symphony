@@ -497,6 +497,7 @@ export class MergePolicyService {
     projectContext?: ProjectContextResolution,
   ): Promise<MergePolicyResult> {
     const liveHeadSha = requireValue(livePullRequest.headSha, "Live PR head SHA is required for merge gate supersession");
+    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
     const gateId = mergeGateId(issue.id, pullRequest, previousHeadSha);
     const gate = lifecycle.mergeGate?.id === gateId ? lifecycle.mergeGate : null;
     const supersededPatch = gate
@@ -519,7 +520,7 @@ export class MergePolicyService {
       { issue, projectContext, gateId, fromState: sourceState, pullRequest, liveHeadSha, reportId: report.id },
       this.options.config,
     );
-    await this.requireMergeGateWritebacksSucceeded(issue, operations, this.options.config.writeback.dispatchState);
+    await this.requireMergeGateWritebacksSucceeded(issue, operations, resolvedConfig.writeback.dispatchState);
     await this.options.lifecycleStore.updateIssue(issue, {
       ...(gate ? inactiveMergeGateLifecyclePatch(lifecycle, gate, "superseded", liveHeadSha) : { mergeGate: supersededGate }),
       phase: "implementation",
