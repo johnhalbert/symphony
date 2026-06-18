@@ -55,7 +55,7 @@ export function resolveLinearClientConfig(
     capability,
     role,
     projectContextId: view.projectContextId,
-    projectContextLabel: view.projectContext.label,
+    projectContextLabel: options.projectContext?.projectContextLabel ?? view.projectContext.label,
     tracker: {
       ...view.tracker,
       apiKey: credential?.value ?? view.tracker.apiKey,
