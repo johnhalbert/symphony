@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
 import { normalizeProjectContextResolution, projectContextResolutionFromIssue, type ProjectContextResolution } from "./config/ProjectContexts.js";
+import { resolveServiceConfigForProjectContext } from "./config/ProjectContextServiceConfig.js";
 import { SymphonyError } from "./errors.js";
 import type {
   CompletionReportPullRequestRef,
@@ -96,12 +97,17 @@ export class ReviewVerdictService {
       return { accepted: true, replayed: true, verdict: existing, writebackOperations: [] };
     }
 
-    const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
-    this.validateIssueIsAcceptingVerdicts(context, lifecyclePhase);
+    const projectContext = resolveReviewVerdictProjectContext(context, existingLifecycle);
+    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const resolvedContext: ReviewVerdictActiveContext = { ...context, projectContext };
+
+    const lifecyclePhase =
+      resolvedContext.phase ?? existingLifecycle?.phase ?? phaseForIssueState(resolvedContext.issue.state, resolvedConfig);
+    this.validateIssueIsAcceptingVerdicts(resolvedContext, lifecyclePhase, resolvedConfig);
     this.validateVerdictPayload(verdict);
 
-    const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
-      projectContext: resolveReviewVerdictProjectContext(context, existingLifecycle),
+    const lifecycle = await this.options.lifecycleStore.ensureIssue(resolvedContext.issue, {
+      projectContext,
       phase: lifecyclePhase,
     });
     this.validateReviewFeedbackAlignment(verdict, lifecycle);
@@ -112,20 +118,19 @@ export class ReviewVerdictService {
       evidence: verdict.evidence,
     };
     const reviewRound = verdict.verdict === "fail" ? nextReviewRound(lifecycle) : lifecycle.reviewRound;
-    const ceilingReached =
-      verdict.verdict === "fail" && reviewRound >= this.options.config.reviewLoop.maxReviewRounds;
+    const ceilingReached = verdict.verdict === "fail" && reviewRound >= resolvedConfig.reviewLoop.maxReviewRounds;
     const provisionalVerdict: IssueReviewVerdictRecord = {
-      id: verdictIdFor(context.issue.id, verdict.idempotencyKey),
+      id: verdictIdFor(resolvedContext.issue.id, verdict.idempotencyKey),
       idempotencyKey: verdict.idempotencyKey,
       runId: verdict.runId,
-      issueId: context.issue.id,
-      issueIdentifier: context.issue.identifier,
-      projectContext: resolveReviewVerdictProjectContext(context, lifecycle),
+      issueId: resolvedContext.issue.id,
+      issueIdentifier: resolvedContext.issue.identifier,
+      projectContext,
       verdict: verdict.verdict,
       acceptanceResults: normalizeAcceptanceResults(verdict.acceptanceResults),
       findings: verdict.findings,
       evidence: verdict.evidence,
-      reviewer: context.reviewer ?? null,
+      reviewer: resolvedContext.reviewer ?? null,
       submittedAt: new Date().toISOString(),
       writebackOperationKeys: [],
     };
@@ -133,14 +138,14 @@ export class ReviewVerdictService {
       ceilingReached
         ? planBlockedEscalationWritebacks(
             {
-              issue: context.issue,
-              projectContext: resolveReviewVerdictProjectContext(context, lifecycle),
+              issue: resolvedContext.issue,
+              projectContext,
               runId: verdict.runId,
-              reason: `max review rounds reached (${reviewRound}/${this.options.config.reviewLoop.maxReviewRounds})`,
+              reason: `max review rounds reached (${reviewRound}/${resolvedConfig.reviewLoop.maxReviewRounds})`,
               incompleteTurnCount: lifecycle.incompleteTurnCount,
-              maxIncompleteTurns: this.options.config.reviewLoop.maxIncompleteTurns,
+              maxIncompleteTurns: resolvedConfig.reviewLoop.maxIncompleteTurns,
               reviewRound,
-              maxReviewRounds: this.options.config.reviewLoop.maxReviewRounds,
+              maxReviewRounds: resolvedConfig.reviewLoop.maxReviewRounds,
               lastCompletionReport: latestCompletionReport(lifecycle),
               lastReviewVerdict: provisionalVerdict,
               requiredAction:
@@ -149,8 +154,8 @@ export class ReviewVerdictService {
             this.options.config,
           )
         : verdict.verdict === "fail"
-        ? planReviewFailWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails)
-        : planReviewPassWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails);
+        ? planReviewFailWritebacks(reviewWritebackContext(resolvedContext, verdict.runId), this.options.config, writebackDetails)
+        : planReviewPassWritebacks(reviewWritebackContext(resolvedContext, verdict.runId), this.options.config, writebackDetails);
     if (operations.length === 0) {
       throw new SymphonyError("invalid_request", "Review verdict cannot be accepted for the current issue state");
     }
@@ -164,18 +169,18 @@ export class ReviewVerdictService {
       enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
     }
 
-    const updatedLifecycle = await this.options.lifecycleStore.updateIssue(context.issue, {
-      projectContext: resolveReviewVerdictProjectContext(context, lifecycle),
+    const updatedLifecycle = await this.options.lifecycleStore.updateIssue(resolvedContext.issue, {
+      projectContext,
       phase: verdict.verdict === "pass" ? "passed" : ceilingReached ? "blocked" : "implementation",
       ...(verdict.verdict === "fail" ? { reviewRound } : {}),
       incompleteTurnCount: verdict.verdict === "fail" ? 0 : lifecycle.incompleteTurnCount,
       blockedReason: ceilingReached
-        ? `max review rounds reached (${reviewRound}/${this.options.config.reviewLoop.maxReviewRounds})`
+        ? `max review rounds reached (${reviewRound}/${resolvedConfig.reviewLoop.maxReviewRounds})`
         : null,
       lastReviewVerdictId: storedVerdict.id,
       reviewVerdicts: [...lifecycle.reviewVerdicts, storedVerdict],
     });
-    await appendLaneMemoTelemetry(this.options.runStore, context.activeRunId, updatedLifecycle, "review_verdict");
+    await appendLaneMemoTelemetry(this.options.runStore, resolvedContext.activeRunId, updatedLifecycle, "review_verdict");
 
     return { accepted: true, replayed: false, verdict: storedVerdict, writebackOperations: enqueued };
   }
@@ -195,11 +200,15 @@ export class ReviewVerdictService {
     }
   }
 
-  private validateIssueIsAcceptingVerdicts(context: ReviewVerdictActiveContext, lifecyclePhase: IssueLifecyclePhase): void {
+  private validateIssueIsAcceptingVerdicts(
+    context: ReviewVerdictActiveContext,
+    lifecyclePhase: IssueLifecyclePhase,
+    config: ServiceConfig,
+  ): void {
     if (lifecyclePhase !== "review") {
       throw new SymphonyError("invalid_request", `Review verdict cannot be accepted while lifecycle phase is ${lifecyclePhase}`);
     }
-    if (!sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
+    if (!sameStateIn(context.issue.state, config.reviewLoop.reviewStates)) {
       throw new SymphonyError("invalid_request", "Review verdict requires the issue to be in a review state");
     }
   }

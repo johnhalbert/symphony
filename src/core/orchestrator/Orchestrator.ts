@@ -3288,8 +3288,9 @@ export class Orchestrator {
       await this.recordMergeConflictAttempt(entry, "conflict-fix run ended without submit_merge_conflict_resolution");
       return;
     }
-    if (!refreshed || !this.isImplementationActive(entry.issue)) {
-      await this.updateLifecycle(entry, { phase: phaseForIssueState(entry.issue.state, this.config) });
+    const config = this.serviceConfigForEntry(entry);
+    if (!refreshed || !this.isImplementationActive(entry.issue, config)) {
+      await this.updateLifecycle(entry, { phase: phaseForIssueState(entry.issue.state, config) });
       return;
     }
 
@@ -3298,10 +3299,10 @@ export class Orchestrator {
       phase: "implementation",
       incompleteTurnCount,
     });
-    if (incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns && entry.lifecycle) {
+    if (incompleteTurnCount >= config.reviewLoop.maxIncompleteTurns && entry.lifecycle) {
       await this.escalateEntryBlocked(
         entry,
-        `max incomplete turns reached (${incompleteTurnCount}/${this.config.reviewLoop.maxIncompleteTurns})`,
+        `max incomplete turns reached (${incompleteTurnCount}/${config.reviewLoop.maxIncompleteTurns})`,
       );
     }
   }
@@ -3422,14 +3423,14 @@ export class Orchestrator {
     }
   }
 
-  private isImplementationActive(issue: Issue): boolean {
+  private isImplementationActive(issue: Issue, config: ServiceConfig): boolean {
     return (
       issue.assignedToWorker &&
-      isStateIn(issue.state, this.config.tracker.activeStates) &&
-      !isStateIn(issue.state, this.config.tracker.handoffStates) &&
-      !isStateIn(issue.state, this.config.reviewLoop.reviewStates) &&
-      !isStateIn(issue.state, this.config.reviewLoop.blockedStates) &&
-      !isStateIn(issue.state, this.config.tracker.terminalStates)
+      isStateIn(issue.state, config.tracker.activeStates) &&
+      !isStateIn(issue.state, config.tracker.handoffStates) &&
+      !isStateIn(issue.state, config.reviewLoop.reviewStates) &&
+      !isStateIn(issue.state, config.reviewLoop.blockedStates) &&
+      !isStateIn(issue.state, config.tracker.terminalStates)
     );
   }
 
@@ -3458,6 +3459,7 @@ export class Orchestrator {
         })
       : lifecycle;
     const projectContext = blockedLifecycle.projectContext ?? lifecycle.projectContext ?? this.resolvedProjectContextFromIssue(issue);
+    const config = this.configForProjectContext(projectContext);
     await this.applyWritebacks(
       planBlockedEscalationWritebacks(
         {
@@ -3466,9 +3468,9 @@ export class Orchestrator {
           runId,
           reason,
           incompleteTurnCount: blockedLifecycle.incompleteTurnCount,
-          maxIncompleteTurns: this.config.reviewLoop.maxIncompleteTurns,
+          maxIncompleteTurns: config.reviewLoop.maxIncompleteTurns,
           reviewRound: blockedLifecycle.reviewRound,
-          maxReviewRounds: this.config.reviewLoop.maxReviewRounds,
+          maxReviewRounds: config.reviewLoop.maxReviewRounds,
           lastCompletionReport: latestCompletionReport(blockedLifecycle),
           lastReviewVerdict: latestReviewVerdict(blockedLifecycle),
           requiredAction:
