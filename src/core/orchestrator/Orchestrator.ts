@@ -1031,7 +1031,13 @@ export class Orchestrator {
 
   private issueWithRequestedProjectContext(issue: Issue, requestedProjectContext?: ProjectContextResolution): Issue {
     const projectContext = this.requestedProjectContextForIssue(issue, requestedProjectContext);
-    if (!projectContext || this.issueHasExplicitProjectContextProof(issue)) return issue;
+    if (
+      !projectContext ||
+      this.issueHasExplicitProjectContextProof(issue) ||
+      !this.requestedProjectContextCanProveRouting(projectContext)
+    ) {
+      return issue;
+    }
     return { ...issue, projectContext } as Issue;
   }
 
@@ -1147,6 +1153,17 @@ export class Orchestrator {
       : normalizedProjectContextId;
   }
 
+  private requestedProjectContextCanProveRouting(projectContext?: ProjectContextResolution): boolean {
+    if (!projectContext) return false;
+    const requestedProjectSlug = normalizeProjectSlug(projectContext.linearProjectSlug);
+    if (requestedProjectSlug === null) return true;
+    return (
+      this.config.projectContexts.enabledContexts.filter((context) =>
+        sameProjectSlug(context.tracker.projectSlug, requestedProjectSlug),
+      ).length <= 1
+    );
+  }
+
   private issueHasExplicitProjectContextProof(issue: Issue): boolean {
     const candidate = issue as {
       projectContext?: { projectContextId?: unknown } | null;
@@ -1176,6 +1193,7 @@ export class Orchestrator {
     requestedProjectContext?: ProjectContextResolution,
   ): boolean {
     if (!requestedProjectContext) return true;
+    if (!this.requestedProjectContextCanProveRouting(requestedProjectContext)) return false;
     const requestedProjectContextId = this.comparableProjectContextId(requestedProjectContext);
     if (requestedProjectContextId === this.config.projectContexts.defaultContextId) {
       return tracker === this.options.tracker || Boolean(this.options.trackerResolver);
@@ -4922,4 +4940,16 @@ function liveCancelFailedForEntry(entry: RunningEntry): CancelFailedState {
     reason: null,
     source: null,
   };
+}
+
+function normalizeProjectSlug(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function sameProjectSlug(left: string | null | undefined, right: string | null | undefined): boolean {
+  const normalizedLeft = normalizeProjectSlug(left);
+  const normalizedRight = normalizeProjectSlug(right);
+  return normalizedLeft !== null && normalizedRight !== null && normalizedLeft.toLowerCase() === normalizedRight.toLowerCase();
 }
