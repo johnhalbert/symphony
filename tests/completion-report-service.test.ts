@@ -610,6 +610,53 @@ describe("CompletionReportService", () => {
     expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("Passing checks: Typecheck and test");
   });
 
+  it("evaluates service-owned PR handoff checks from the resolved project context policy", async () => {
+    const publisher = new FakePublisher(
+      {
+        action: "created",
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headBranch: "symphony/TEST-1",
+        headSha: "abc123",
+        lastPushedAt: "2026-01-01T00:00:01Z",
+        evidenceCursor: "idem-1",
+      },
+      null,
+      [{ name: "Docs Typecheck", status: "success", conclusion: "success", url: null }],
+    );
+    const { service, outbox, runStore } = fixture({
+      publisher,
+      configure(config) {
+        config.github.prHandoff.requiredChecks = [];
+        config.github.prHandoff.noCiAllowed = true;
+        config.github.prHandoff.noCiEvidence = "default no-ci";
+        const docsContext = requireDocsContext(config);
+        docsContext.tracker = { ...docsContext.tracker, handoffStates: ["Docs Human Review"] };
+        docsContext.github = {
+          ...docsContext.github,
+          prHandoff: {
+            ...docsContext.github.prHandoff,
+            enabled: true,
+            targetState: "Docs Human Review",
+            requiredChecks: ["Docs Typecheck"],
+            noCiAllowed: false,
+            noCiEvidence: null,
+          },
+        };
+      },
+    });
+    await startRun(runStore);
+
+    await service.submitCompletionReport(report(), contextWithWorkspace({ projectContext: docsProjectContext }));
+
+    expect(publisher.checkInputs).toEqual([{ headSha: "abc123", requiredChecks: ["Docs Typecheck"] }]);
+    const operations = await outbox.list();
+    const comment = operations.find((operation) => operation.kind === "comment");
+    const transition = operations.find((operation) => operation.kind === "transition");
+    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("Required checks: Docs Typecheck");
+    expect(transition).toMatchObject({ payload: { toState: "Docs Human Review" } });
+  });
+
   it("rejects service-owned PR handoff while configured required checks are not passing", async () => {
     const publisher = new FakePublisher(
       {
@@ -927,6 +974,7 @@ describe("CompletionReportService", () => {
       config.github.repo = "symphony";
       config.github.token = "github-token";
     }
+    addDocsProjectContext(config);
     options.configure?.(config);
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
@@ -1000,6 +1048,63 @@ const docsProjectContext = {
   linearProjectSlug: "DOCS",
   routingSource: "candidate_poll",
 } as const;
+
+function addDocsProjectContext(config: ReturnType<typeof testConfig>): void {
+  if (config.projectContexts.byId.has(docsProjectContext.projectContextId)) return;
+
+  const defaultContext = config.projectContexts.defaultContext;
+  const docsContext = {
+    ...defaultContext,
+    id: docsProjectContext.projectContextId,
+    label: docsProjectContext.projectContextLabel,
+    source: "explicit" as const,
+    tracker: {
+      ...defaultContext.tracker,
+      projectSlug: docsProjectContext.linearProjectSlug,
+    },
+    reviewLoop: {
+      ...config.reviewLoop,
+    },
+    issueBreakdown: {
+      ...config.issueBreakdown,
+    },
+    agent: {
+      ...config.agent,
+    },
+    publicMetadata: {
+      ...defaultContext.publicMetadata,
+      id: docsProjectContext.projectContextId,
+      label: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    },
+    publicSummary: {
+      ...defaultContext.publicSummary,
+      id: docsProjectContext.projectContextId,
+      label: docsProjectContext.projectContextLabel,
+      tracker: {
+        ...defaultContext.publicSummary.tracker,
+        projectSlug: docsProjectContext.linearProjectSlug,
+      },
+      publicMetadata: {
+        ...defaultContext.publicSummary.publicMetadata,
+        id: docsProjectContext.projectContextId,
+        label: docsProjectContext.projectContextLabel,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+      },
+    },
+  };
+
+  config.projectContexts.contexts = [...config.projectContexts.contexts, docsContext];
+  config.projectContexts.enabledContexts = [...config.projectContexts.enabledContexts, docsContext];
+  (config.projectContexts.byId as unknown as Map<string, typeof docsContext>).set(docsContext.id, docsContext);
+}
+
+function requireDocsContext(config: ReturnType<typeof testConfig>) {
+  const docsContext = config.projectContexts.byId.get(docsProjectContext.projectContextId);
+  expect(docsContext).toBeDefined();
+  if (!docsContext) throw new Error("Expected docs project context in completion report fixture");
+  return docsContext;
+}
 
 function mergeGate(overrides: Partial<IssueMergeGateState> = {}): IssueMergeGateState {
   return {

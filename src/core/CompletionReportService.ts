@@ -9,6 +9,7 @@ import {
   type ServiceConfig,
 } from "./config/Config.js";
 import { normalizeProjectContextResolution, projectContextResolutionFromIssue, type ProjectContextResolution } from "./config/ProjectContexts.js";
+import { resolveServiceConfigForProjectContext } from "./config/ProjectContextServiceConfig.js";
 import { SymphonyError } from "./errors.js";
 import type {
   CompletionReportChecklistItem,
@@ -539,20 +540,22 @@ export class CompletionReportService {
             draft: input.publication.draft ?? null,
           }
         : null;
-    const handoffChecks = await this.evaluatePullRequestHandoffChecks(verifiedPullRequest);
-    if (this.options.config.github.prHandoff.enabled && (!verifiedPullRequest || !handoffChecks)) {
+    const projectContext = resolveCompletionReportProjectContext(input.context, input.lifecycle);
+    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const handoffChecks = await this.evaluatePullRequestHandoffChecks(verifiedPullRequest, resolvedConfig);
+    if (resolvedConfig.github.prHandoff.enabled && (!verifiedPullRequest || !handoffChecks)) {
       throw new SymphonyError(
         "invalid_request",
         "Completion report handoff requires a verified pull request that satisfies the handoff policy",
       );
     }
     const lifecycle = await this.options.lifecycleStore.ensureIssue(input.context.issue, {
-      projectContext: resolveCompletionReportProjectContext(input.context, input.lifecycle),
+      projectContext,
       summaryPointers: summaryPointersFor(input.context, pullRequest, input.publication, input.lifecycle),
     });
-    const writebackContext = runWritebackContext(input.context, input.report.runId);
+    const writebackContext = runWritebackContext({ ...input.context, projectContext }, input.report.runId);
     const writebackReport = completionReportWritebackDetails(input.report, input.context.issue, pullRequest);
-    const operations = this.options.config.github.prHandoff.enabled
+    const operations = resolvedConfig.github.prHandoff.enabled
       ? verifiedPullRequest && handoffChecks
         ? planPullRequestHandoffWritebacks(writebackContext, this.options.config, {
             pullRequest: verifiedPullRequest,
@@ -564,7 +567,7 @@ export class CompletionReportService {
     if (operations.length === 0) {
       throw new SymphonyError(
         "invalid_request",
-        this.options.config.github.prHandoff.enabled
+        resolvedConfig.github.prHandoff.enabled
           ? "Completion report handoff requires a verified pull request that satisfies the handoff policy"
           : "Completion report cannot be accepted for the current issue state",
       );
@@ -724,13 +727,14 @@ export class CompletionReportService {
 
   private async evaluatePullRequestHandoffChecks(
     pullRequest: CompletionReportPullRequestRef | null,
+    config: ServiceConfig,
   ): Promise<{ requiredChecks: string[]; passedChecks: string[]; noCiEvidence: string | null } | null> {
-    if (!this.options.config.github.prHandoff.enabled) return null;
-    if (pullRequest?.draft === true && !this.options.config.github.prHandoff.allowDrafts) return null;
-    const requiredChecks = this.options.config.github.prHandoff.requiredChecks;
+    if (!config.github.prHandoff.enabled) return null;
+    if (pullRequest?.draft === true && !config.github.prHandoff.allowDrafts) return null;
+    const requiredChecks = config.github.prHandoff.requiredChecks;
     if (requiredChecks.length === 0) {
-      const noCiEvidence = this.options.config.github.prHandoff.noCiAllowed
-        ? this.options.config.github.prHandoff.noCiEvidence
+      const noCiEvidence = config.github.prHandoff.noCiAllowed
+        ? config.github.prHandoff.noCiEvidence
         : null;
       return noCiEvidence === null
         ? null
@@ -967,14 +971,16 @@ export class CompletionReportService {
     if (latestLifecycle?.phase === "blocked" && latestLifecycle.blockedReason === terminalReason) {
       return [];
     }
+    const projectContext = resolveCompletionReportProjectContext(context, latestLifecycle);
+    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
     const issue = {
       ...context.issue,
-      state: this.options.config.reviewLoop.blockedStates[0] ?? context.issue.state,
+      state: resolvedConfig.reviewLoop.blockedStates[0] ?? context.issue.state,
     };
     const enqueued: WritebackOperation[] = [];
 
     for (const operation of planCompletionReportPublicationApprovalTerminalWritebacks(
-      runWritebackContext({ ...context, issue }, report.runId),
+      runWritebackContext({ ...context, issue, projectContext }, report.runId),
       this.options.config,
       completionReportWritebackDetails(report, issue, pullRequest),
       approval.status,
@@ -983,7 +989,7 @@ export class CompletionReportService {
       enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
     }
     await this.options.lifecycleStore.updateIssue(context.issue, {
-      projectContext: resolveCompletionReportProjectContext(context),
+      projectContext,
       phase: "blocked",
       blockedReason: `publication approval ${approval.status}`,
     });

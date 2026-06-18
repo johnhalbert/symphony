@@ -3336,7 +3336,13 @@ export class Orchestrator {
       mergeConflict: nextConflict,
     });
     if (nextConflict.status === "blocked") {
-      await this.applyMergeConflictBlockedWritebacks(entry.issue, runId, nextConflict, reason);
+      await this.applyMergeConflictBlockedWritebacks(
+        entry.issue,
+        runId,
+        nextConflict,
+        reason,
+        this.resolvedProjectContext(entry) ?? undefined,
+      );
       this.clearRetry(entry.issue.id);
     }
   }
@@ -3353,12 +3359,18 @@ export class Orchestrator {
       blockedAt: conflict.blockedAt ?? new Date().toISOString(),
       blockedReason: conflict.blockedReason ?? mergeConflictBlockedReason(conflict.fixTurnCount, conflict.maxFixTurns),
     };
-    await this.options.lifecycleStore?.updateIssue(issue, {
+    const blockedLifecycle = await this.options.lifecycleStore?.updateIssue(issue, {
       phase: "blocked",
       blockedReason: blockedConflict.blockedReason,
       mergeConflict: blockedConflict,
     });
-    await this.applyMergeConflictBlockedWritebacks(issue, runId, blockedConflict, "conflict-fix attempt limit reached");
+    await this.applyMergeConflictBlockedWritebacks(
+      issue,
+      runId,
+      blockedConflict,
+      "conflict-fix attempt limit reached",
+      blockedLifecycle?.projectContext ?? this.resolvedProjectContextFromIssue(issue),
+    );
   }
 
   private async applyMergeConflictBlockedWritebacks(
@@ -3366,11 +3378,13 @@ export class Orchestrator {
     runId: string,
     conflict: IssueMergeConflictMetadata,
     reason: string,
+    projectContext?: ProjectContextResolution,
   ): Promise<void> {
     await this.applyWritebacks(
       planBlockedEscalationWritebacks(
         {
           issue,
+          projectContext,
           runId,
           reason: conflict.blockedReason ?? reason,
           requiredAction: [
@@ -3443,10 +3457,12 @@ export class Orchestrator {
           blockedReason: reason,
         })
       : lifecycle;
+    const projectContext = blockedLifecycle.projectContext ?? lifecycle.projectContext ?? this.resolvedProjectContextFromIssue(issue);
     await this.applyWritebacks(
       planBlockedEscalationWritebacks(
         {
           issue,
+          projectContext,
           runId,
           reason,
           incompleteTurnCount: blockedLifecycle.incompleteTurnCount,
