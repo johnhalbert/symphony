@@ -274,6 +274,57 @@ describe("LinearTrackerClient", () => {
     });
   });
 
+  it("does not stamp explicit project context metadata on id refresh when the fetched Linear project differs", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig(),
+      path.join("/tmp/symphony", "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+      if (!request.query.includes("SymphonyIssueStates")) {
+        throw new Error(`Unexpected query: ${request.query}`);
+      }
+      return jsonResponse({
+        data: {
+          issues: {
+            nodes: [
+              {
+                id: "linear-symphony-179",
+                identifier: "ENG-179",
+                title: "Symphony title",
+                state: { name: "In Progress" },
+                project: { id: "project-symphony", slugId: "SYMPHONY" },
+              },
+            ],
+          },
+        },
+      });
+    };
+
+    const docsContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "manual_test",
+    } as const;
+    const client = createLinearTrackerClientForCapability(config, "linear.tracker", fetchImpl, { projectContext: docsContext });
+
+    const [refreshedById] = await client.fetchIssueStatesByIds(["linear-symphony-179"]);
+
+    expect(refreshedById).toMatchObject({
+      id: "linear-symphony-179",
+      identifier: "ENG-179",
+      state: "In Progress",
+      linearProjectIdentity: { kind: "linear", slug: "SYMPHONY", id: "project-symphony" },
+    });
+    expect(refreshedById).not.toHaveProperty("projectContext");
+    expect(refreshedById).not.toHaveProperty("projectContextId");
+    expect(refreshedById).not.toHaveProperty("projectContextLabel");
+    expect(refreshedById).not.toHaveProperty("linearProjectSlug");
+    expect(refreshedById).not.toHaveProperty("routingSource");
+  });
+
   it("fetches bounded project workflow states with team identity", async () => {
     const config = testConfig("/tmp/symphony");
     const requests: unknown[] = [];

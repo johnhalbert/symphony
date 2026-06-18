@@ -365,7 +365,13 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       ids: issueIds,
     });
     return response.issues.nodes
-      .map((node) => normalizeIssue(node, assigneeFilter, this.issueProjectContextMetadata(node, "state_refresh")))
+      .map((node) =>
+        normalizeIssue(
+          node,
+          assigneeFilter,
+          this.issueProjectContextMetadata(node, "state_refresh", { requireActualProjectSlugMatch: true }),
+        ),
+      )
       .filter((issue): issue is Issue => issue !== null);
   }
 
@@ -604,12 +610,17 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
   private issueProjectContextMetadata(
     node: Pick<LinearIssueNode, "project">,
     routingSource: IssueProjectContextMetadata["routingSource"],
+    options: { requireActualProjectSlugMatch?: boolean } = {},
   ): IssueProjectContextMetadata | null {
     if (!this.projectContextMetadata) return null;
+    const actualLinearProjectSlug = asNullableString(node.project?.slugId);
+    if (options.requireActualProjectSlugMatch && !sameProjectSlug(actualLinearProjectSlug, this.projectContextMetadata.linearProjectSlug)) {
+      return null;
+    }
     return {
       projectContextId: this.projectContextMetadata.projectContextId,
       projectContextLabel: this.projectContextMetadata.projectContextLabel,
-      linearProjectSlug: asNullableString(node.project?.slugId) ?? this.projectContextMetadata.linearProjectSlug,
+      linearProjectSlug: actualLinearProjectSlug ?? this.projectContextMetadata.linearProjectSlug,
       routingSource,
     };
   }
@@ -817,6 +828,10 @@ function asNullableString(value: unknown): string | null {
 
 function sameName(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function sameProjectSlug(left: string | null, right: string | null): boolean {
+  return left !== null && right !== null && left.toLowerCase() === right.toLowerCase();
 }
 
 function formatTeam(teamKey: string, teamName: string | null): string {
