@@ -311,7 +311,7 @@ export class WorkspaceManager {
     return (
       records.find(
         (record) =>
-          isPlanningWorkspaceKey(record.workspaceKey) &&
+          isPlanningWorkspaceRecord(record) &&
           (issue.id ? record.issueId === issue.id : record.issueIdentifier === issue.identifier) &&
           matchesWorkspaceProjectContext(record.projectContext, issue.projectContext),
       ) ?? null
@@ -629,8 +629,8 @@ function workspaceKeyForPlanningIssue(issue: WorkspaceIssue): string {
   return `${workspaceKeyForIssue(issue)}-planning`;
 }
 
-function isPlanningWorkspaceKey(workspaceKey: string): boolean {
-  return workspaceKey.endsWith("-planning");
+function isPlanningWorkspaceRecord(record: WorkspaceRecord): boolean {
+  return record.sourceKind === "planning_none" || record.sourceKind === "planning_readonly";
 }
 
 function matchesWorkspaceProjectContext(
@@ -682,7 +682,7 @@ function workspaceRecordMatchesIssue(record: WorkspaceRecord, issue: WorkspaceIs
 }
 
 function workspaceRecordMatchesLookupIssue(record: WorkspaceRecord, issue: WorkspaceIssue): boolean {
-  if (isPlanningWorkspaceKey(record.workspaceKey)) return false;
+  if (isPlanningWorkspaceRecord(record)) return false;
   if (issue.id !== null && record.issueId !== issue.id) return false;
   if (issue.id === null && record.issueIdentifier !== issue.identifier) return false;
   return matchesWorkspaceProjectContext(record.projectContext, issue.projectContext);

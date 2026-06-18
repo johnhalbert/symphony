@@ -157,7 +157,7 @@ describe("WorkspaceManager", () => {
     expect(JSON.parse(await readFile(legacyMetadataPath, "utf8"))).toEqual(legacyMetadataBefore);
   });
 
-  it("prefers the implementation workspace over a newer planning sibling when resolving legacy-collision lookup paths", async () => {
+  it("prefers the implementation workspace over a newer numbered planning sibling when resolving legacy-collision lookup paths", async () => {
     const config = testConfig(root);
     const manager = new WorkspaceManager({
       workspace: config.workspace,
@@ -165,6 +165,11 @@ describe("WorkspaceManager", () => {
       logger: new StructuredLogger(() => undefined),
     });
     const legacyIssue = issue({ id: "legacy-docs-prefix-planning-1", identifier: "docs__ENG-123" });
+    const planningBaseCollisionIssue = issue({ id: "legacy-docs-planning-base-1", identifier: "docs__ENG-123-planning" });
+    const planningFallbackCollisionIssue = issue({
+      id: "legacy-docs-planning-fallback-1",
+      identifier: "docs__ENG-123__id__issue-docs-planning-lookup-1-planning",
+    });
     const docsIssue = trackerIssue({
       id: "issue-docs-planning-lookup-1",
       identifier: "ENG-123",
@@ -175,6 +180,8 @@ describe("WorkspaceManager", () => {
 
     const legacyWorkspace = await manager.createForIssue(legacyIssue);
     const docsWorkspace = await manager.createForIssue(docsIssue);
+    const planningBaseCollisionWorkspace = await manager.createForIssue(planningBaseCollisionIssue);
+    const planningFallbackCollisionWorkspace = await manager.createForIssue(planningFallbackCollisionIssue);
     const planningWorkspace = await manager.createForPlanning(docsIssue);
     const docsLookupPath = manager.getPathForIssue({
       id: null,
@@ -190,6 +197,9 @@ describe("WorkspaceManager", () => {
 
     expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-123");
     expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-lookup-1");
+    expect(planningBaseCollisionWorkspace.workspaceKey).toBe("docs__ENG-123-planning");
+    expect(planningFallbackCollisionWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-lookup-1-planning");
+    expect(planningWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-lookup-1-planning__2");
     expect(docsWorkspace.path).not.toBe(legacyWorkspace.path);
     expect(planningWorkspace.path).not.toBe(docsWorkspace.path);
     expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);

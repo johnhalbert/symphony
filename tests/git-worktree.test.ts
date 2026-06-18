@@ -182,6 +182,59 @@ describe("git worktree workspace source", () => {
     });
   });
 
+  it("prefers the implementation worktree over a newer numbered planning sibling when resolving legacy-collision lookup paths", async () => {
+    const manager = newManager(root, repo);
+    const legacyIssue = issue({
+      id: "legacy-docs-prefix-worktree-planning-1",
+      identifier: "docs__ENG-123",
+      branchName: "symphony/docs__ENG-123",
+    });
+    const planningBaseCollisionIssue = issue({
+      id: "legacy-docs-planning-base-worktree-1",
+      identifier: "docs__ENG-123-planning",
+      branchName: "symphony/docs__ENG-123-planning",
+    });
+    const planningFallbackCollisionIssue = issue({
+      id: "legacy-docs-planning-fallback-worktree-1",
+      identifier: "docs__ENG-123__id__issue-docs-planning-worktree-1-planning",
+      branchName: "symphony/docs__ENG-123__id__issue-docs-planning-worktree-1-planning",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-planning-worktree-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+
+    const legacyWorkspace = await manager.createForIssue(legacyIssue);
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const planningBaseCollisionWorkspace = await manager.createForIssue(planningBaseCollisionIssue);
+    const planningFallbackCollisionWorkspace = await manager.createForIssue(planningFallbackCollisionIssue);
+    const planningWorkspace = await manager.createForPlanning(docsIssue);
+    const docsLookupPath = manager.getPathForIssue({
+      id: null,
+      identifier: docsIssue.identifier,
+      branchName: null,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: null,
+        routingSource: "explicit",
+      },
+    });
+
+    expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-worktree-1");
+    expect(planningBaseCollisionWorkspace.workspaceKey).toBe("docs__ENG-123-planning");
+    expect(planningFallbackCollisionWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-worktree-1-planning");
+    expect(planningWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-worktree-1-planning__2");
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
+    expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);
+    expect(docsLookupPath).toBe(docsWorkspace.path);
+    expect(docsLookupPath).not.toBe(planningWorkspace.path);
+  });
+
   it("scopes identical upstream branch names by project context and cleans up only the targeted sibling", async () => {
     const manager = newManager(root, repo);
     const docsIssue = trackerIssue({
