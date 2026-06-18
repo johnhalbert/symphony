@@ -157,7 +157,7 @@ describe("WorkspaceManager", () => {
     expect(JSON.parse(await readFile(legacyMetadataPath, "utf8"))).toEqual(legacyMetadataBefore);
   });
 
-  it("prefers the implementation workspace over a newer numbered planning sibling when resolving legacy-collision lookup paths", async () => {
+  it("prefers the implementation workspace over a newer numbered planning sibling when resolving lookup and removal for legacy collisions", async () => {
     const config = testConfig(root);
     const manager = new WorkspaceManager({
       workspace: config.workspace,
@@ -205,6 +205,19 @@ describe("WorkspaceManager", () => {
     expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);
     expect(docsLookupPath).toBe(docsWorkspace.path);
     expect(docsLookupPath).not.toBe(planningWorkspace.path);
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(stat(docsWorkspace.path)).rejects.toThrow();
+    await expect(stat(planningWorkspace.path)).resolves.toBeDefined();
+    await expect(stat(legacyWorkspace.path)).resolves.toBeDefined();
+    await expect(readFile(path.join(planningWorkspace.path, ".symphony-planning.json"), "utf8")).resolves.toContain('"mode": "none"');
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    expect(await manager.getWorkspaceRecord(planningWorkspace.workspaceKey)).toMatchObject({
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      sourceKind: "planning_none",
+    });
   });
 
   it("rejects paths outside the workspace root", () => {

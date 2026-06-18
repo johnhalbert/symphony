@@ -255,7 +255,7 @@ export class WorkspaceManager {
     const persistedWorkspace = await this.findWorkspaceForRemoval(issue);
     const resolvedIssue =
       !issue.projectContext && persistedWorkspace?.projectContext ? { ...issue, projectContext: persistedWorkspace.projectContext } : issue;
-    const workspaceKey = persistedWorkspace?.workspaceKey ?? workspaceKeyForIssue(resolvedIssue);
+    const workspaceKey = persistedWorkspace?.workspaceKey ?? this.resolveWorkspaceKeyForPathLookup(resolvedIssue);
     const workspacePath = persistedWorkspace?.path ?? path.resolve(this.options.workspace.root, workspaceKey);
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
 
@@ -294,15 +294,15 @@ export class WorkspaceManager {
   }
 
   private async findWorkspaceForRemoval(issue: WorkspaceIssue): Promise<WorkspaceRecord | null> {
-    if (issue.id) {
-      return issue.projectContext
-        ? this.store.findWorkspace(issue.id, { projectContext: issue.projectContext })
-        : this.store.findWorkspace(issue.id);
-    }
-    if (issue.projectContext) {
-      return this.store.findWorkspace(issue.identifier, { projectContext: issue.projectContext });
-    }
-    return null;
+    const requestedWorkspaceKey = workspaceKeyForIssue(issue);
+    const direct = await this.store.getWorkspace(requestedWorkspaceKey);
+    if (direct && workspaceRecordMatchesLookupIssue(direct, issue)) return direct;
+    if (issue.id === null && issue.projectContext === null) return null;
+
+    const matches = (await this.store.listWorkspaces())
+      .filter((record) => workspaceRecordMatchesLookupIssue(record, issue))
+      .sort(comparePersistedWorkspaceRecencyDesc);
+    return matches[0] ?? null;
   }
 
   private async findPlanningWorkspaceForRemoval(issue: WorkspaceIssue): Promise<WorkspaceRecord | null> {

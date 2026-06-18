@@ -182,7 +182,7 @@ describe("git worktree workspace source", () => {
     });
   });
 
-  it("prefers the implementation worktree over a newer numbered planning sibling when resolving legacy-collision lookup paths", async () => {
+  it("prefers the implementation worktree over a newer numbered planning sibling when resolving lookup and removal for legacy collisions", async () => {
     const manager = newManager(root, repo);
     const legacyIssue = issue({
       id: "legacy-docs-prefix-worktree-planning-1",
@@ -233,6 +233,18 @@ describe("git worktree workspace source", () => {
     expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);
     expect(docsLookupPath).toBe(docsWorkspace.path);
     expect(docsLookupPath).not.toBe(planningWorkspace.path);
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(legacyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    await expect(readFile(path.join(planningWorkspace.path, ".symphony-planning.json"), "utf8")).resolves.toContain('"mode": "none"');
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    expect(await manager.getWorkspaceRecord(planningWorkspace.workspaceKey)).toMatchObject({
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      sourceKind: "planning_none",
+    });
   });
 
   it("scopes identical upstream branch names by project context and cleans up only the targeted sibling", async () => {
