@@ -1017,22 +1017,111 @@ export class Orchestrator {
     return this.options.trackerResolver?.(projectContext) ?? this.options.tracker;
   }
 
-  private pollingProjectContexts(): Array<ProjectContextResolution | undefined> {
-    if (!this.options.trackerResolver) return [undefined];
-    return this.config.projectContexts.enabledContexts.map((context) =>
-      normalizeProjectContextResolution({
-        projectContextId: context.id,
-        projectContextLabel: context.label,
-        linearProjectSlug: context.tracker.projectSlug ?? null,
-        routingSource: context.source === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE ? context.source : "candidate_poll",
-      }),
-    );
+  private currentProjectContext(projectContext: ProjectContextResolution | null | undefined): ProjectContextResolution | undefined {
+    if (!projectContext) return undefined;
+    const defaultContext = this.config.projectContexts.defaultContext;
+    if (
+      defaultContext.source === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE &&
+      projectContext.projectContextId === defaultContext.id &&
+      projectContext.routingSource === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE &&
+      projectContext.linearProjectSlug === null
+    ) {
+      return {
+        ...projectContext,
+        linearProjectSlug: defaultContext.tracker.projectSlug,
+      };
+    }
+    return projectContext;
+  }
+
+  private issueWithDispatchProjectContext(
+    issue: Issue,
+    projectContext: ProjectContextResolution | null | undefined,
+    force = false,
+  ): Issue {
+    const currentProjectContext = this.currentProjectContext(projectContext);
+    if (!currentProjectContext) return issue;
+    if (!force && this.issueHasExplicitProjectContextProof(issue)) return issue;
+    return { ...issue, projectContext: currentProjectContext } as Issue;
+  }
+
+  private pollingProjectContextKey(projectContext: ProjectContextResolution | null | undefined): string {
+    return this.comparableProjectContextId(projectContext) ?? "__default__";
+  }
+
+  private dispatchIssueKey(issueId: string, projectContext: ProjectContextResolution | null | undefined): string {
+    return `${this.pollingProjectContextKey(projectContext)}::${issueId}`;
+  }
+
+  private shouldPreserveLifecycleProjectContext(lifecycle: IssueLifecycleRecord): boolean {
+    return lifecycle.phase !== "terminal";
+  }
+
+  private async pollingDispatchState(): Promise<{
+    projectContexts: Array<ProjectContextResolution | undefined>;
+    inProgressIssueContexts: Map<string, ProjectContextResolution>;
+  }> {
+    if (!this.options.trackerResolver) {
+      return {
+        projectContexts: [undefined],
+        inProgressIssueContexts: new Map(),
+      };
+    }
+
+    const inProgressIssueContexts = new Map<string, ProjectContextResolution>();
+    const rememberIssueContext = (issueId: string, projectContext: ProjectContextResolution | null | undefined): void => {
+      const currentProjectContext = this.currentProjectContext(projectContext);
+      if (!currentProjectContext) return;
+      inProgressIssueContexts.set(issueId, currentProjectContext);
+    };
+
+    if (this.options.lifecycleStore) {
+      try {
+        for (const lifecycle of await this.options.lifecycleStore.list()) {
+          if (!this.shouldPreserveLifecycleProjectContext(lifecycle)) continue;
+          rememberIssueContext(lifecycle.issueId, lifecycle.projectContext);
+        }
+      } catch (error) {
+        this.options.logger.warn("polling lifecycle context scan failed", { error: errorMessage(error) });
+      }
+    }
+
+    for (const [issueId, entry] of this.running) {
+      rememberIssueContext(issueId, this.resolvedProjectContext(entry));
+    }
+    for (const retry of this.retryAttempts.values()) {
+      rememberIssueContext(retry.issueId, retry.projectContext);
+    }
+
+    const projectContextsByKey = new Map<string, ProjectContextResolution>();
+    const rememberProjectContext = (projectContext: ProjectContextResolution | null | undefined): void => {
+      const currentProjectContext = this.currentProjectContext(projectContext);
+      if (!currentProjectContext) return;
+      projectContextsByKey.set(this.pollingProjectContextKey(currentProjectContext), currentProjectContext);
+    };
+
+    for (const context of this.config.projectContexts.enabledContexts) {
+      rememberProjectContext(
+        normalizeProjectContextResolution({
+          projectContextId: context.id,
+          projectContextLabel: context.label,
+          linearProjectSlug: context.tracker.projectSlug ?? null,
+          routingSource: context.source === LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE ? context.source : "candidate_poll",
+        }),
+      );
+    }
+    for (const projectContext of inProgressIssueContexts.values()) {
+      rememberProjectContext(projectContext);
+    }
+
+    return {
+      projectContexts: [...projectContextsByKey.values()],
+      inProgressIssueContexts,
+    };
   }
 
   private issueWithRequestedProjectContext(issue: Issue, requestedProjectContext?: ProjectContextResolution): Issue {
-    const projectContext = this.requestedProjectContextForIssue(issue, requestedProjectContext);
-    if (!projectContext || this.issueHasExplicitProjectContextProof(issue)) return issue;
-    return { ...issue, projectContext } as Issue;
+    return this.issueWithDispatchProjectContext(issue, this.requestedProjectContextForIssue(issue, requestedProjectContext));
   }
 
   private async fetchCandidateIssuesForProjectContext(projectContext?: ProjectContextResolution): Promise<Issue[]> {
@@ -1057,15 +1146,19 @@ export class Orchestrator {
   }
 
   private async fetchPollingIssues(read: (projectContext?: ProjectContextResolution) => Promise<Issue[]>): Promise<Issue[]> {
-    const projectContexts = this.pollingProjectContexts();
-    if (projectContexts.length === 1) {
-      return read(projectContexts[0]);
-    }
+    const { projectContexts, inProgressIssueContexts } = await this.pollingDispatchState();
+    if (projectContexts.length === 0) return [];
 
     const issues = new Map<string, Issue>();
     for (const projectContext of projectContexts) {
       for (const issue of await read(projectContext)) {
-        issues.set(issue.id, issue);
+        const persistedProjectContext = inProgressIssueContexts.get(issue.id);
+        const dispatchIssue = this.issueWithDispatchProjectContext(
+          issue,
+          persistedProjectContext ?? this.requestedProjectContextForIssue(issue, projectContext),
+          persistedProjectContext !== undefined,
+        );
+        issues.set(this.dispatchIssueKey(issue.id, projectContextResolutionFromIssue(dispatchIssue)), dispatchIssue);
       }
     }
     return [...issues.values()];
@@ -1074,12 +1167,16 @@ export class Orchestrator {
   private async fetchIssueStatesByIdsGroupedByProjectContext(
     requests: Array<{ issueId: string; projectContext: ProjectContextResolution | undefined }>,
   ): Promise<Map<string, Issue>> {
+    if (requests.length === 0) return new Map();
     if (!this.options.trackerResolver) {
       return new Map(
         (await this.fetchIssueStatesByIdsForProjectContext(
           requests.map((request) => request.issueId),
           undefined,
-        )).map((issue) => [issue.id, issue]),
+        )).map((issue) => {
+          const dispatchIssue = this.issueWithDispatchProjectContext(issue, this.requestedProjectContextForIssue(issue));
+          return [this.dispatchIssueKey(issue.id, projectContextResolutionFromIssue(dispatchIssue)), dispatchIssue];
+        }),
       );
     }
 
@@ -1097,7 +1194,12 @@ export class Orchestrator {
     const issues = new Map<string, Issue>();
     for (const { issueIds, projectContext } of groupedRequests.values()) {
       for (const issue of await this.fetchIssueStatesByIdsForProjectContext(issueIds, projectContext)) {
-        issues.set(issue.id, issue);
+        const dispatchIssue = this.issueWithDispatchProjectContext(
+          issue,
+          this.requestedProjectContextForIssue(issue, projectContext),
+          projectContext !== undefined,
+        );
+        issues.set(this.dispatchIssueKey(issue.id, projectContextResolutionFromIssue(dispatchIssue)), dispatchIssue);
       }
     }
     return issues;
@@ -1331,8 +1433,8 @@ export class Orchestrator {
 
   async resumeApprovedPublication(request: OperatorApprovalRecord): Promise<boolean> {
     if (request.status !== "approved" || !this.options.lifecycleStore) return false;
-    const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
-    const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
+    const latestIssues = await this.fetchIssueStatesByIdsForProjectContext([request.issueId], request.projectContext);
+    const issue = this.issueWithDispatchProjectContext(latestIssues[0] ?? issueFromApprovalRequest(request), request.projectContext, true);
     const publisher =
       this.options.completionReportPublisher ??
       this.defaultGitHubPullRequestClientForCapability(
@@ -1353,8 +1455,8 @@ export class Orchestrator {
 
   async recordPublicationApprovalTerminal(request: OperatorApprovalRecord): Promise<boolean> {
     if (!this.options.lifecycleStore) return false;
-    const latestIssues = await this.options.tracker.fetchIssueStatesByIds([request.issueId]);
-    const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
+    const latestIssues = await this.fetchIssueStatesByIdsForProjectContext([request.issueId], request.projectContext);
+    const issue = this.issueWithDispatchProjectContext(latestIssues[0] ?? issueFromApprovalRequest(request), request.projectContext, true);
     const result = await new CompletionReportService({
       config: this.config,
       lifecycleStore: this.options.lifecycleStore,
@@ -1551,7 +1653,9 @@ export class Orchestrator {
 
   private async startupCleanup(): Promise<void> {
     try {
-      const terminalIssues = await this.options.tracker.fetchIssuesByStates(this.config.tracker.terminalStates);
+      const terminalIssues = await this.fetchPollingIssues((projectContext) =>
+        this.fetchIssuesByStatesForProjectContext(this.configForProjectContext(projectContext).tracker.terminalStates, projectContext),
+      );
       for (const issue of terminalIssues) {
         await this.options.workspaceManager.removeForIssue(issue);
       }
@@ -1581,15 +1685,21 @@ export class Orchestrator {
     const candidates = lifecycles.filter(hasRecoverablePendingPublicationApproval);
     if (candidates.length === 0) return;
 
-    let latestIssues: Issue[] = [];
+    let latestIssuesByScope = new Map<string, Issue>();
     try {
-      latestIssues = await this.options.tracker.fetchIssueStatesByIds(candidates.map((lifecycle) => lifecycle.issueId));
+      latestIssuesByScope = await this.fetchIssueStatesByIdsGroupedByProjectContext(
+        candidates.map((lifecycle) => ({
+          issueId: lifecycle.issueId,
+          projectContext: this.currentProjectContext(lifecycle.projectContext) ?? undefined,
+        })),
+      );
     } catch (error) {
       this.options.logger.warn("pending publication approval recovery issue refresh failed", { error: errorMessage(error) });
     }
-    const issuesById = new Map(latestIssues.map((issue) => [issue.id, issue]));
     for (const lifecycle of candidates) {
-      const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
+      const issue =
+        latestIssuesByScope.get(this.dispatchIssueKey(lifecycle.issueId, lifecycle.projectContext)) ??
+        issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
       const service = new CompletionReportService({
         config: this.config,
         lifecycleStore: this.options.lifecycleStore,
@@ -1628,9 +1738,9 @@ export class Orchestrator {
   private async reconcileRunningIssues(): Promise<void> {
     const runningIds = [...this.running.keys()];
     if (runningIds.length === 0) return;
-    let refreshedById: Map<string, Issue>;
+    let refreshedByScope: Map<string, Issue>;
     try {
-      refreshedById = await this.fetchIssueStatesByIdsGroupedByProjectContext(
+      refreshedByScope = await this.fetchIssueStatesByIdsGroupedByProjectContext(
         [...this.running.entries()].map(([issueId, entry]) => ({
           issueId,
           projectContext: this.resolvedProjectContext(entry) ?? undefined,
@@ -1642,7 +1752,7 @@ export class Orchestrator {
     }
 
     for (const [issueId, entry] of this.running) {
-      const latest = refreshedById.get(issueId);
+      const latest = refreshedByScope.get(this.dispatchIssueKey(issueId, this.resolvedProjectContext(entry)));
       if (!latest) continue;
       entry.issue = latest;
       const config = this.serviceConfigForEntry(entry);
