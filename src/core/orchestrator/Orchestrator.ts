@@ -3783,7 +3783,10 @@ export class Orchestrator {
   ): string {
     const configured = config.reviewLoop.reviewerPromptTemplate;
     if (configured !== null && configured.trim().length > 0) {
-      return [prompt, projectContextPrompt].filter((item): item is string => item !== null && item.length > 0).join("\n").trim();
+      return [prompt, projectContextPrompt, renderReviewMcpHandoffPrompt(mcpHandoff)]
+        .filter((item): item is string => item !== null && item.length > 0)
+        .join("\n")
+        .trim();
     }
     const rendered = prompt
       .replace(

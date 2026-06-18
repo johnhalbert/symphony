@@ -120,6 +120,9 @@ describe("Orchestrator project-context dispatch prompt/context threading", () =>
     expect(prompt).not.toContain("Review GLOBAL for TEST-1");
     expect(prompt).toContain("Service-resolved project context:");
     expect(prompt).toContain(`Project context id: ${docsProjectContext.projectContextId}`);
+    expect(prompt).toContain("Symphony MCP review handoff:");
+    expect(prompt).toContain("submit_pull_request_review_feedback");
+    expect(prompt).toContain("submit_review_verdict before ending the run");
   });
 
   it("passes resolved project context into merge-conflict dispatch prompts", async () => {
