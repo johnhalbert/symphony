@@ -100,8 +100,41 @@ describe("CompletionReportService", () => {
     );
   });
 
+  it("accepts same-context completion reports when only project-context metadata drifts and preserves the lifecycle context", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+      phase: "implementation",
+      projectContext: docsProjectContext,
+      summaryPointers: { lastRunId: "run-1" },
+    });
+
+    const driftedProjectContext = {
+      ...docsProjectContext,
+      projectContextLabel: "Documentation Site Drift",
+      linearProjectSlug: "DOCS-ALT",
+      routingSource: "replay",
+    } as const;
+
+    const result = await service.submitCompletionReport(
+      report({ idempotencyKey: "idem-drift-1" }),
+      context({ projectContext: driftedProjectContext }),
+    );
+
+    expect(result.report).toMatchObject({ projectContext: docsProjectContext });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+      completionReports: [expect.objectContaining({ idempotencyKey: "idem-drift-1", projectContext: docsProjectContext })],
+    });
+    expect(await outbox.list()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectContext: docsProjectContext }),
+      ]),
+    );
+  });
+
   it("supersedes an old-head merge gate on new-head completion and scrubs stale repair state", async () => {
     const { service, lifecycleStore, outbox } = fixture();
+
     await lifecycleStore.ensureIssue(context().issue, {
       phase: "implementation",
       reviewRound: 1,

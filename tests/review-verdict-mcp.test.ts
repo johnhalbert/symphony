@@ -231,7 +231,7 @@ describe("review verdict MCP handoff", () => {
     expect(await new FileWritebackOutboxStore(stateDir).list()).toHaveLength(0);
   });
 
-  it("rejects reviewer verdict submissions when any normalized project-context field is spoofed", async () => {
+  it("accepts reviewer verdict submissions when only same-context metadata drifts and preserves the service-owned context", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "review-context.json");
@@ -266,36 +266,41 @@ describe("review verdict MCP handoff", () => {
       phase: "review",
     });
 
-    await expect(
-      submitReviewVerdictFromMcp(
-        {
-          verdict: "fail",
-          acceptanceResults: [
-            {
-              text: "Review verdicts cannot change or spoof the resolved context.",
-              satisfied: false,
-              evidence: "Spoofed label, routing source, and null slug should be rejected.",
-            },
-          ],
-          findings: ["Reject normalized project-context metadata mismatches before accepting verdicts."],
-          evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-4"],
-          idempotencyKey: "review-verdict-context-mismatch-2",
-        },
-        { workflowPath, contextFile },
-      ),
-    ).rejects.toMatchObject({
-      code: "invalid_request",
-      message: "Review verdict MCP context does not match the service-owned issue project context",
+    const result = await submitReviewVerdictFromMcp(
+      {
+        verdict: "fail",
+        acceptanceResults: [
+          {
+            text: "Review verdicts tolerate same-context provenance drift while preserving service-owned context.",
+            satisfied: false,
+            evidence: "Same projectContextId with drifted metadata should still submit.",
+          },
+        ],
+        findings: ["Preserve the service-owned project context when provenance metadata drifts."],
+        evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-4"],
+        idempotencyKey: "review-verdict-context-drift-accepted-1",
+      },
+      { workflowPath, contextFile },
+    );
+
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      verdictId: "review-verdict:issue-1:review-verdict-context-drift-accepted-1",
+      verdict: "fail",
     });
 
     const lifecycle = await lifecycleStore.get("TEST-1");
     expect(lifecycle).toMatchObject({
-      phase: "review",
-      reviewRound: 0,
+      phase: "implementation",
+      reviewRound: 1,
       projectContext: symphonyProjectContext,
+      reviewVerdicts: [expect.objectContaining({ projectContext: symphonyProjectContext })],
     });
-    expect(lifecycle?.reviewVerdicts ?? []).toHaveLength(0);
-    expect(await new FileWritebackOutboxStore(stateDir).list()).toHaveLength(0);
+    expect((await new FileWritebackOutboxStore(stateDir).list()).find((operation) => operation.kind === "transition")).toMatchObject({
+      projectContext: symphonyProjectContext,
+      payload: { toState: "In Progress" },
+    });
   });
 });
 

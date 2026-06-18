@@ -241,8 +241,22 @@ export function normalizeProjectContextResolution(
   };
 }
 
+export function sameProjectContextIdentity(
+  left: Partial<ProjectContextResolution> | null | undefined,
+  right: Partial<ProjectContextResolution> | null | undefined,
+): boolean {
+  const normalizedLeft = normalizeProjectContextResolution(left);
+  const normalizedRight = normalizeProjectContextResolution(right);
+  if (normalizedLeft.projectContextId !== normalizedRight.projectContextId) return false;
+  if (normalizedLeft.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return true;
+  if (readExplicitProjectContextId(left) !== undefined || readExplicitProjectContextId(right) !== undefined) return true;
+  if (sameProjectSlug(normalizedLeft.linearProjectSlug, normalizedRight.linearProjectSlug)) return true;
+  return normalizedLeft.linearProjectSlug === null && normalizedRight.linearProjectSlug === null;
+}
+
 export function projectContextResolutionFromIssue(issue: unknown): ProjectContextResolution | null {
   if (typeof issue !== "object" || issue === null) return null;
+
   const value = issue as ProjectContextIssueLike;
   if (value.projectContext) {
     return normalizeProjectContextResolution(value.projectContext);

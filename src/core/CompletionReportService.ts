@@ -8,7 +8,12 @@ import {
   parseIssueRuntimeSourceScope,
   type ServiceConfig,
 } from "./config/Config.js";
-import { normalizeProjectContextResolution, projectContextResolutionFromIssue, type ProjectContextResolution } from "./config/ProjectContexts.js";
+import {
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  sameProjectContextIdentity,
+  type ProjectContextResolution,
+} from "./config/ProjectContexts.js";
 import { resolveServiceConfigForProjectContext } from "./config/ProjectContextServiceConfig.js";
 import { SymphonyError } from "./errors.js";
 import type {
@@ -1158,20 +1163,6 @@ function resolveCompletionReportProjectContext(
   );
 }
 
-function projectContextEquals(
-  left: ProjectContextResolution | undefined,
-  right: ProjectContextResolution | undefined,
-): boolean {
-  const normalizedLeft = normalizeProjectContextResolution(left);
-  const normalizedRight = normalizeProjectContextResolution(right);
-  return (
-    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
-    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
-    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
-    normalizedLeft.routingSource === normalizedRight.routingSource
-  );
-}
-
 function sharedWritebackProjectContext(
   operations: ReadonlyArray<Pick<NewWritebackOperation, "projectContext"> | Pick<WritebackOperation, "projectContext">>,
 ): ProjectContextResolution | undefined {
@@ -1251,7 +1242,7 @@ function validateCompletionReportProjectContext(
   existingLifecycle: ExistingIssueLifecycle,
 ): void {
   if (!context.projectContext || !existingLifecycle?.projectContext) return;
-  if (projectContextEquals(context.projectContext, existingLifecycle.projectContext)) return;
+  if (sameProjectContextIdentity(context.projectContext, existingLifecycle.projectContext)) return;
   throw new SymphonyError(
     "invalid_request",
     "Completion report issue project context does not match the lifecycle record",

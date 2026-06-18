@@ -1,6 +1,11 @@
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
-import { normalizeProjectContextResolution, projectContextResolutionFromIssue, type ProjectContextResolution } from "./config/ProjectContexts.js";
+import {
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  sameProjectContextIdentity,
+  type ProjectContextResolution,
+} from "./config/ProjectContexts.js";
 import { resolveServiceConfigForProjectContext } from "./config/ProjectContextServiceConfig.js";
 import { SymphonyError } from "./errors.js";
 import type {
@@ -357,21 +362,7 @@ function resolveReviewVerdictProjectContext(
   lifecycle: IssueLifecycleRecord | null | undefined,
 ): ProjectContextResolution {
   return normalizeProjectContextResolution(
-    context.projectContext ?? lifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
-  );
-}
-
-function projectContextEquals(
-  left: ProjectContextResolution | undefined,
-  right: ProjectContextResolution | undefined,
-): boolean {
-  const normalizedLeft = normalizeProjectContextResolution(left);
-  const normalizedRight = normalizeProjectContextResolution(right);
-  return (
-    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
-    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
-    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
-    normalizedLeft.routingSource === normalizedRight.routingSource
+    lifecycle?.projectContext ?? context.projectContext ?? projectContextResolutionFromIssue(context.issue),
   );
 }
 
@@ -380,7 +371,7 @@ function validateReviewVerdictProjectContext(
   lifecycle: IssueLifecycleRecord | null | undefined,
 ): void {
   if (!context.projectContext || !lifecycle?.projectContext) return;
-  if (projectContextEquals(context.projectContext, lifecycle.projectContext)) return;
+  if (sameProjectContextIdentity(context.projectContext, lifecycle.projectContext)) return;
   throw new SymphonyError(
     "invalid_request",
     "Review verdict issue project context does not match the lifecycle record",

@@ -8,7 +8,7 @@ import {
 } from "../CompletionReportService.js";
 import { FileIssueLifecycleStore, type IssueLifecycleRecord } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore, type RunRecord } from "../persistence/RunTranscriptStore.js";
-import { normalizeProjectContextResolution, type ProjectContextResolution } from "../config/ProjectContexts.js";
+import { sameProjectContextIdentity, type ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -311,14 +311,7 @@ function projectContextMismatches(
   context: ProjectContextResolution | undefined,
   activeRunContext: ProjectContextResolution | undefined,
 ): string[] {
-  const expected = normalizeProjectContextResolution(activeRunContext);
-  const actual = normalizeProjectContextResolution(context);
-  const mismatches: string[] = [];
-  if (actual.projectContextId !== expected.projectContextId) mismatches.push("projectContext.projectContextId");
-  if (actual.projectContextLabel !== expected.projectContextLabel) mismatches.push("projectContext.projectContextLabel");
-  if (actual.linearProjectSlug !== expected.linearProjectSlug) mismatches.push("projectContext.linearProjectSlug");
-  if (actual.routingSource !== expected.routingSource) mismatches.push("projectContext.routingSource");
-  return mismatches;
+  return sameProjectContextIdentity(context, activeRunContext) ? [] : ["projectContext.projectContextId"];
 }
 
 function completionReportInputSchema(): Record<string, unknown> {

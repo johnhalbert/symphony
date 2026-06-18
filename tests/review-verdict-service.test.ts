@@ -96,6 +96,40 @@ describe("ReviewVerdictService", () => {
     );
   });
 
+  it("accepts same-context verdicts when only project-context metadata drifts and preserves the lifecycle context", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+      projectContext: docsProjectContext,
+    });
+
+    const driftedProjectContext = {
+      ...docsProjectContext,
+      projectContextLabel: "Documentation Site Drift",
+      linearProjectSlug: "DOCS-ALT",
+      routingSource: "state_refresh",
+    } as const;
+
+    const result = await service.submitReviewVerdict(
+      failVerdict({ idempotencyKey: "verdict-drift-1" }),
+      context({
+        issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+        projectContext: driftedProjectContext,
+      }),
+    );
+
+    expect(result.verdict).toMatchObject({ projectContext: docsProjectContext });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+      reviewVerdicts: [expect.objectContaining({ projectContext: docsProjectContext })],
+    });
+    expect(await outbox.list()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectContext: docsProjectContext }),
+      ]),
+    );
+  });
+
   it("rejects verdicts whose supplied project context does not match the lifecycle record", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "Docs In Review" }), {

@@ -8,8 +8,8 @@ import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import {
-  normalizeProjectContextResolution,
   projectContextResolutionFromIssue,
+  sameProjectContextIdentity,
   type ProjectContextResolution,
 } from "../config/ProjectContexts.js";
 import type { Issue } from "../types.js";
@@ -109,13 +109,13 @@ async function readReviewVerdictContext(
     throw new SymphonyError("invalid_request", "Review verdict MCP context is invalid");
   }
   const authoritativeProjectContext = await readServiceOwnedReviewVerdictProjectContext(parsed.issue, lifecycleStore);
-  if (parsed.projectContext && authoritativeProjectContext && !projectContextEquals(parsed.projectContext, authoritativeProjectContext)) {
+  if (parsed.projectContext && authoritativeProjectContext && !sameProjectContextIdentity(parsed.projectContext, authoritativeProjectContext)) {
     throw new SymphonyError(
       "invalid_request",
       "Review verdict MCP context does not match the service-owned issue project context",
     );
   }
-  return parsed;
+  return authoritativeProjectContext ? { ...parsed, projectContext: authoritativeProjectContext } : parsed;
 }
 
 async function readServiceOwnedReviewVerdictProjectContext(
@@ -127,20 +127,6 @@ async function readServiceOwnedReviewVerdictProjectContext(
     (issue.identifier !== issue.id ? await lifecycleStore?.get(issue.identifier) : null) ??
     null;
   return lifecycle?.projectContext ?? projectContextResolutionFromIssue(issue);
-}
-
-function projectContextEquals(
-  left: ProjectContextResolution | undefined,
-  right: ProjectContextResolution | undefined,
-): boolean {
-  const normalizedLeft = normalizeProjectContextResolution(left);
-  const normalizedRight = normalizeProjectContextResolution(right);
-  return (
-    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
-    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
-    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
-    normalizedLeft.routingSource === normalizedRight.routingSource
-  );
 }
 
 function reviewVerdictInputSchema(): Record<string, unknown> {
