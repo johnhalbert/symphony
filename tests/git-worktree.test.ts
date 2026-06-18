@@ -140,10 +140,23 @@ describe("git worktree workspace source", () => {
 
     const legacyWorkspace = await manager.createForIssue(legacyIssue);
     const docsWorkspace = await manager.createForIssue(docsIssue);
+    const docsLookupPath = manager.getPathForIssue({
+      id: null,
+      identifier: docsIssue.identifier,
+      branchName: null,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: null,
+        routingSource: "explicit",
+      },
+    });
 
     expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-123");
     expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-collision-worktree-1");
     expect(docsWorkspace.path).not.toBe(legacyWorkspace.path);
+    expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);
+    expect(docsLookupPath).toBe(docsWorkspace.path);
     expect((await git(["branch", "--show-current"], legacyWorkspace.path)).trim()).toBe("symphony/docs__ENG-123");
     expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
     expect(await manager.getWorkspaceRecord(legacyWorkspace.workspaceKey)).toMatchObject({

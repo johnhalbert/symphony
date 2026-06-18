@@ -1,10 +1,11 @@
-import { constants as fsConstants, promises as fs } from "node:fs";
+import { constants as fsConstants, existsSync, promises as fs, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { Liquid } from "liquidjs";
 import type { HookConfig, WorkspaceConfig } from "../config/Config.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  normalizeProjectContextResolution,
   projectContextResolutionFromIssue,
   type ProjectContextResolution,
 } from "../config/ProjectContexts.js";
@@ -381,14 +382,74 @@ export class WorkspaceManager {
   }
 
   getPathForIssue(issueInput: WorkspaceIssueInput): string {
-    const workspaceKey = workspaceKeyForIssue(normalizeIssueInput(issueInput));
-    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+    const issue = normalizeIssueInput(issueInput);
+    const persistedWorkspace = this.findPersistedWorkspaceRecordSync(issue);
+    const workspacePath = persistedWorkspace?.path ?? path.resolve(this.options.workspace.root, this.resolveWorkspaceKeyForPathLookup(issue));
     assertPathInsideRoot(workspacePath, this.options.workspace.root);
     return workspacePath;
   }
 
   async getWorkspaceRecord(workspaceKeyOrIssue: string): Promise<WorkspaceRecord | null> {
     return this.store.findWorkspace(workspaceKeyOrIssue);
+  }
+
+  private findPersistedWorkspaceRecordSync(issue: WorkspaceIssue): WorkspaceRecord | null {
+    const requestedWorkspaceKey = workspaceKeyForIssue(issue);
+    const direct = this.readPersistedWorkspaceRecordSync(requestedWorkspaceKey);
+    if (direct && workspaceRecordMatchesLookupIssue(direct, issue)) return direct;
+    if (issue.id === null && issue.projectContext === null) return direct;
+
+    const matches = this.listPersistedWorkspaceRecordsSync()
+      .filter((record) => workspaceRecordMatchesLookupIssue(record, issue))
+      .sort(comparePersistedWorkspaceRecencyDesc);
+    return matches[0] ?? null;
+  }
+
+  private listPersistedWorkspaceRecordsSync(): WorkspaceRecord[] {
+    const workspacesDir = path.join(this.options.workspace.stateDir, "workspaces");
+    if (!existsSync(workspacesDir)) return [];
+    return readdirSync(workspacesDir)
+      .filter((entry) => entry.endsWith(".json"))
+      .map((entry) => this.readPersistedWorkspaceRecordSync(path.basename(entry, ".json")))
+      .filter((record): record is WorkspaceRecord => record !== null);
+  }
+
+  private readPersistedWorkspaceRecordSync(workspaceKey: string): WorkspaceRecord | null {
+    const workspaceRecordPath = path.join(this.options.workspace.stateDir, "workspaces", `${workspaceKey}.json`);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        const record = JSON.parse(readFileSync(workspaceRecordPath, "utf8")) as WorkspaceRecord;
+        return {
+          ...record,
+          projectContext: normalizeProjectContextResolution(record.projectContext),
+        };
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") return null;
+        const retryable = code === "EBUSY" || code === "EPERM" || error instanceof SyntaxError;
+        if (!retryable || attempt === 4) throw error;
+        sleepSync(10);
+      }
+    }
+    return null;
+  }
+
+  private resolveWorkspaceKeyForPathLookup(issue: WorkspaceIssue): string {
+    const requestedWorkspaceKeyBase = workspaceKeyForIssue(issue);
+    const fallbackWorkspaceKeys = fallbackWorkspaceKeysForIssue(issue, requestedWorkspaceKeyBase, "");
+    const numberedFallbackBase = fallbackWorkspaceKeys.at(-1) ?? `${requestedWorkspaceKeyBase}__alt`;
+    const candidateWorkspaceKeys = [requestedWorkspaceKeyBase, ...fallbackWorkspaceKeys];
+    let fallbackOrdinal = 2;
+    while (true) {
+      const workspaceKey = candidateWorkspaceKeys.shift() ?? numberedWorkspaceCollisionKey(numberedFallbackBase, fallbackOrdinal++);
+      const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+      assertPathInsideRoot(workspacePath, this.options.workspace.root);
+      const existing = this.readPersistedWorkspaceRecordSync(workspaceKey);
+      const createdNow = !existsSync(workspacePath);
+      if (!requiresWorkspaceCollisionFallback(issue) || !workspaceTargetConflictsWithIssue(existing, issue, createdNow)) {
+        return workspaceKey;
+      }
+    }
   }
 
   isInsideRoot(workspacePath: string): boolean {
@@ -618,6 +679,32 @@ function workspaceTargetConflictsWithIssue(
 function workspaceRecordMatchesIssue(record: WorkspaceRecord, issue: WorkspaceIssue): boolean {
   if (issue.id !== null) return record.issueId === issue.id;
   return record.issueIdentifier === issue.identifier && matchesWorkspaceProjectContext(record.projectContext, issue.projectContext);
+}
+
+function workspaceRecordMatchesLookupIssue(record: WorkspaceRecord, issue: WorkspaceIssue): boolean {
+  if (isPlanningWorkspaceKey(record.workspaceKey)) return false;
+  if (issue.id !== null && record.issueId !== issue.id) return false;
+  if (issue.id === null && record.issueIdentifier !== issue.identifier) return false;
+  return matchesWorkspaceProjectContext(record.projectContext, issue.projectContext);
+}
+
+function comparePersistedWorkspaceRecencyDesc(left: WorkspaceRecord, right: WorkspaceRecord): number {
+  const updatedAtDifference = Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
+  if (!Number.isNaN(updatedAtDifference) && updatedAtDifference !== 0) return updatedAtDifference;
+  if (right.updatedAt !== left.updatedAt) return right.updatedAt.localeCompare(left.updatedAt);
+
+  const createdAtDifference = Date.parse(right.createdAt) - Date.parse(left.createdAt);
+  if (!Number.isNaN(createdAtDifference) && createdAtDifference !== 0) return createdAtDifference;
+  if (right.createdAt !== left.createdAt) return right.createdAt.localeCompare(left.createdAt);
+
+  return left.workspaceKey.localeCompare(right.workspaceKey);
+}
+
+function sleepSync(milliseconds: number): void {
+  const deadline = Date.now() + milliseconds;
+  while (Date.now() < deadline) {
+    // Busy-wait intentionally so sync workspace lookup can mirror the store's transient read retries.
+  }
 }
 
 function defaultBranchNameForIssue(issue: WorkspaceIssue): string {
