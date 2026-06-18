@@ -8,6 +8,12 @@ export interface IssueAssigneeRef {
   id: string | null;
 }
 
+export interface IssueLinearProjectIdentity {
+  kind?: "linear";
+  slug?: string | null;
+  id?: string | null;
+}
+
 export interface Issue {
   id: string;
   identifier: string;
@@ -24,6 +30,8 @@ export interface Issue {
   blockedBy: IssueBlockerRef[];
   createdAt: string | null;
   updatedAt: string | null;
+  projectContextId?: string | null;
+  linearProjectIdentity?: IssueLinearProjectIdentity | null;
 }
 
 export interface IssueStatusView {
@@ -41,6 +49,8 @@ export interface IssueStatusView {
   blockedBy: IssueBlockerRef[];
   createdAt: string | null;
   updatedAt: string | null;
+  projectContextId?: string | null;
+  linearProjectIdentity?: IssueLinearProjectIdentity | null;
 }
 
 export type IssueDetailsSource = "live" | "durable" | "tracker";
@@ -219,6 +229,8 @@ export function toIssueStatusView(issue: Issue): IssueStatusView {
     blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
+    projectContextId: issue.projectContextId ?? null,
+    linearProjectIdentity: issue.linearProjectIdentity ? { ...issue.linearProjectIdentity } : null,
   };
 }
 
