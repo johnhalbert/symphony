@@ -1053,12 +1053,14 @@ export class Orchestrator {
     return `${this.pollingProjectContextKey(projectContext)}::${issueId}`;
   }
 
-  private isConfiguredProjectContext(projectContext: ProjectContextResolution | null | undefined): boolean {
+  private isEnabledProjectContext(projectContext: ProjectContextResolution | null | undefined): boolean {
     const currentProjectContext = this.currentProjectContext(projectContext);
     if (!currentProjectContext) return false;
     const projectContextId = this.comparableProjectContextId(currentProjectContext);
     if (!projectContextId) return true;
-    return this.config.projectContexts.byId.has(projectContextId);
+    return this.config.projectContexts.enabledContexts.some(
+      (context) => this.comparableProjectContextId(normalizeProjectContextResolution({ projectContextId: context.id })) === projectContextId,
+    );
   }
 
   private shouldPreserveLifecycleProjectContext(lifecycle: IssueLifecycleRecord): boolean {
@@ -1087,11 +1089,11 @@ export class Orchestrator {
     const rememberIssueContext = (
       issueId: string,
       projectContext: ProjectContextResolution | null | undefined,
-      options?: { requireConfigured?: boolean; sticky?: boolean },
+      options?: { requireEnabled?: boolean; sticky?: boolean },
     ): void => {
       const currentProjectContext = this.currentProjectContext(projectContext);
       if (!currentProjectContext) return;
-      if (options?.requireConfigured && !this.isConfiguredProjectContext(currentProjectContext)) return;
+      if (options?.requireEnabled && !this.isEnabledProjectContext(currentProjectContext)) return;
       inProgressIssueContexts.set(issueId, currentProjectContext);
       if (options?.sticky) stickyIssueIds.add(issueId);
     };
@@ -1100,7 +1102,7 @@ export class Orchestrator {
       try {
         for (const lifecycle of await this.options.lifecycleStore.list()) {
           if (!this.shouldPreserveLifecycleProjectContext(lifecycle)) continue;
-          rememberIssueContext(lifecycle.issueId, lifecycle.projectContext, { requireConfigured: true });
+          rememberIssueContext(lifecycle.issueId, lifecycle.projectContext, { requireEnabled: true });
         }
       } catch (error) {
         this.options.logger.warn("polling lifecycle context scan failed", { error: errorMessage(error) });

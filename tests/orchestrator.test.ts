@@ -2733,6 +2733,91 @@ const docsProjectContext = {
     });
   });
 
+  it("keeps disabled lifecycle contexts out of context-scoped polling", async () => {
+    const config = testConfig(root);
+    addDocsPollingProjectContext(config);
+    const disabledDocsContext = requireDocsPollingContext(config);
+    disabledDocsContext.enabled = false;
+    config.projectContexts.enabledContexts = config.projectContexts.enabledContexts.filter(
+      (context) => context.id !== disabledDocsContext.id,
+    );
+    const candidate = {
+      ...issue({
+        id: "issue-default-context-disabled-1",
+        identifier: "ENG-789-DISABLED",
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/ENG-789-DISABLED",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: legacyDefaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-disabled-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const defaultTracker = trackerClientFixture({
+      candidates: [candidate],
+      issues: [candidate],
+    });
+    const docsTracker = trackerClientFixture();
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await lifecycleStore.ensureIssue(
+      issue({
+        id: "issue-disabled-context-1",
+        identifier: "DOCS-DISABLED-1",
+        state: "In Progress",
+        branchName: "symphony/docs/DOCS-DISABLED-1",
+      }),
+      {
+        phase: "implementation",
+        projectContext: docsProjectContext,
+      },
+    );
+    const harness = new FakeHarness();
+    const resolvedProjectContextIds: string[] = [];
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        const projectContextId = projectContext?.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+        resolvedProjectContextIds.push(projectContextId);
+        return projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 1, "default dispatch after disabled lifecycle context filtering");
+    } finally {
+      await orchestrator.stop();
+      await settleOrchestratorExit();
+    }
+
+    expect(defaultTracker.candidateFetchCount).toBe(1);
+    expect(docsTracker.candidateFetchCount).toBe(0);
+    expect(resolvedProjectContextIds).toContain(LEGACY_DEFAULT_PROJECT_CONTEXT_ID);
+    expect(resolvedProjectContextIds).not.toContain(docsProjectContext.projectContextId);
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(legacyDefaultProjectContext);
+    await expect(runStore.getRun(`fake-${candidate.id}-1`)).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+  });
+
   it("prefers the freshly polled project context over a non-running persisted lifecycle context", async () => {
     const config = testConfig(root);
     addDocsPollingProjectContext(config);
