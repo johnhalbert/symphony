@@ -2646,6 +2646,160 @@ const docsProjectContext = {
     }
   });
 
+  it("skips stale removed lifecycle contexts when polling context-scoped tracker clients", async () => {
+    const config = testConfig(root);
+    addDocsPollingProjectContext(config);
+    const removedDocsContext = {
+      projectContextId: "docs-legacy",
+      projectContextLabel: "Docs Legacy",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const candidate = {
+      ...issue({
+        id: "issue-default-context-1",
+        identifier: "ENG-789",
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/ENG-789",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: legacyDefaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const defaultTracker = trackerClientFixture({
+      candidates: [candidate],
+      issues: [candidate],
+    });
+    const docsTracker = trackerClientFixture();
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await lifecycleStore.ensureIssue(
+      issue({
+        id: "issue-stale-context-1",
+        identifier: "DOCS-STALE-1",
+        state: "In Progress",
+        branchName: "symphony/docs/DOCS-STALE-1",
+      }),
+      {
+        phase: "implementation",
+        projectContext: removedDocsContext,
+      },
+    );
+    const harness = new FakeHarness();
+    const resolvedProjectContextIds: string[] = [];
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        const projectContextId = projectContext?.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+        resolvedProjectContextIds.push(projectContextId);
+        if (projectContextId === docsProjectContext.projectContextId) return docsTracker;
+        if (projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return defaultTracker;
+        throw new Error(`Unexpected project context ${projectContextId}`);
+      },
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 1, "default dispatch after stale lifecycle context filtering");
+    } finally {
+      await orchestrator.stop();
+      await settleOrchestratorExit();
+    }
+
+    expect(resolvedProjectContextIds).toContain(LEGACY_DEFAULT_PROJECT_CONTEXT_ID);
+    expect(resolvedProjectContextIds).toContain(docsProjectContext.projectContextId);
+    expect(resolvedProjectContextIds).not.toContain(removedDocsContext.projectContextId);
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(legacyDefaultProjectContext);
+    await expect(runStore.getRun(`fake-${candidate.id}-1`)).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+  });
+
+  it("prefers the freshly polled project context over a non-running persisted lifecycle context", async () => {
+    const config = testConfig(root);
+    addDocsPollingProjectContext(config);
+    const candidate = {
+      ...issue({
+        id: "issue-rerouted-context-1",
+        identifier: "ENG-790",
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/ENG-790",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: legacyDefaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-2",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const defaultTracker = trackerClientFixture({
+      candidates: [candidate],
+      issues: [candidate],
+    });
+    const docsTracker = trackerClientFixture();
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "implementation",
+      projectContext: docsProjectContext,
+    });
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 1, "rerouted default-context dispatch");
+    } finally {
+      await orchestrator.stop();
+      await settleOrchestratorExit();
+    }
+
+    expect(defaultTracker.candidateFetchCount).toBe(1);
+    expect(docsTracker.candidateFetchCount).toBe(1);
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(legacyDefaultProjectContext);
+    await expect(runStore.getRun(`fake-${candidate.id}-1`)).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+  });
+
   it("routes duplicate identifiers from distinct project contexts into distinct workspaces and persisted state", async () => {
     const config = testConfig(root);
     addDocsPollingProjectContext(config);

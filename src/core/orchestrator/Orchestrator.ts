@@ -1053,33 +1053,54 @@ export class Orchestrator {
     return `${this.pollingProjectContextKey(projectContext)}::${issueId}`;
   }
 
+  private isConfiguredProjectContext(projectContext: ProjectContextResolution | null | undefined): boolean {
+    const currentProjectContext = this.currentProjectContext(projectContext);
+    if (!currentProjectContext) return false;
+    const projectContextId = this.comparableProjectContextId(currentProjectContext);
+    if (!projectContextId) return true;
+    return this.config.projectContexts.byId.has(projectContextId);
+  }
+
   private shouldPreserveLifecycleProjectContext(lifecycle: IssueLifecycleRecord): boolean {
-    return lifecycle.phase !== "terminal";
+    return (
+      lifecycle.phase === "implementation" ||
+      lifecycle.phase === "merge_conflict_resolution" ||
+      lifecycle.phase === "review"
+    );
   }
 
   private async pollingDispatchState(): Promise<{
     projectContexts: Array<ProjectContextResolution | undefined>;
     inProgressIssueContexts: Map<string, ProjectContextResolution>;
+    stickyIssueIds: Set<string>;
   }> {
     if (!this.options.trackerResolver) {
       return {
         projectContexts: [undefined],
         inProgressIssueContexts: new Map(),
+        stickyIssueIds: new Set(),
       };
     }
 
     const inProgressIssueContexts = new Map<string, ProjectContextResolution>();
-    const rememberIssueContext = (issueId: string, projectContext: ProjectContextResolution | null | undefined): void => {
+    const stickyIssueIds = new Set<string>();
+    const rememberIssueContext = (
+      issueId: string,
+      projectContext: ProjectContextResolution | null | undefined,
+      options?: { requireConfigured?: boolean; sticky?: boolean },
+    ): void => {
       const currentProjectContext = this.currentProjectContext(projectContext);
       if (!currentProjectContext) return;
+      if (options?.requireConfigured && !this.isConfiguredProjectContext(currentProjectContext)) return;
       inProgressIssueContexts.set(issueId, currentProjectContext);
+      if (options?.sticky) stickyIssueIds.add(issueId);
     };
 
     if (this.options.lifecycleStore) {
       try {
         for (const lifecycle of await this.options.lifecycleStore.list()) {
           if (!this.shouldPreserveLifecycleProjectContext(lifecycle)) continue;
-          rememberIssueContext(lifecycle.issueId, lifecycle.projectContext);
+          rememberIssueContext(lifecycle.issueId, lifecycle.projectContext, { requireConfigured: true });
         }
       } catch (error) {
         this.options.logger.warn("polling lifecycle context scan failed", { error: errorMessage(error) });
@@ -1087,10 +1108,10 @@ export class Orchestrator {
     }
 
     for (const [issueId, entry] of this.running) {
-      rememberIssueContext(issueId, this.resolvedProjectContext(entry));
+      rememberIssueContext(issueId, this.resolvedProjectContext(entry), { sticky: true });
     }
     for (const retry of this.retryAttempts.values()) {
-      rememberIssueContext(retry.issueId, retry.projectContext);
+      rememberIssueContext(retry.issueId, retry.projectContext, { sticky: true });
     }
 
     const projectContextsByKey = new Map<string, ProjectContextResolution>();
@@ -1117,6 +1138,7 @@ export class Orchestrator {
     return {
       projectContexts: [...projectContextsByKey.values()],
       inProgressIssueContexts,
+      stickyIssueIds,
     };
   }
 
@@ -1146,17 +1168,19 @@ export class Orchestrator {
   }
 
   private async fetchPollingIssues(read: (projectContext?: ProjectContextResolution) => Promise<Issue[]>): Promise<Issue[]> {
-    const { projectContexts, inProgressIssueContexts } = await this.pollingDispatchState();
+    const { projectContexts, inProgressIssueContexts, stickyIssueIds } = await this.pollingDispatchState();
     if (projectContexts.length === 0) return [];
 
     const issues = new Map<string, Issue>();
     for (const projectContext of projectContexts) {
       for (const issue of await read(projectContext)) {
         const persistedProjectContext = inProgressIssueContexts.get(issue.id);
+        const requestedProjectContext = this.requestedProjectContextForIssue(issue, projectContext);
+        const shouldForcePersistedProjectContext = persistedProjectContext !== undefined && stickyIssueIds.has(issue.id);
         const dispatchIssue = this.issueWithDispatchProjectContext(
           issue,
-          persistedProjectContext ?? this.requestedProjectContextForIssue(issue, projectContext),
-          persistedProjectContext !== undefined,
+          shouldForcePersistedProjectContext ? persistedProjectContext : requestedProjectContext ?? persistedProjectContext,
+          shouldForcePersistedProjectContext,
         );
         issues.set(this.dispatchIssueKey(issue.id, projectContextResolutionFromIssue(dispatchIssue)), dispatchIssue);
       }
