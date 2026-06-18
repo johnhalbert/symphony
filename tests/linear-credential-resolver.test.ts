@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { normalizeProjectContextResolution } from "../src/core/config/ProjectContexts.js";
 import { SymphonyError } from "../src/core/errors.js";
-import { resolveLinearClientConfig, resolveLinearClientConfigForProjectContext } from "../src/integrations/linear/LinearCredentialResolver.js";
+import {
+  createLinearTrackerClientForProjectContext,
+  resolveLinearClientConfig,
+  resolveLinearClientConfigForProjectContext,
+} from "../src/integrations/linear/LinearCredentialResolver.js";
 
 describe("Linear credential resolver", () => {
   it("binds tracker reads to the worker linear.tracker profile", () => {
@@ -175,6 +179,8 @@ describe("Linear credential resolver", () => {
     });
 
     expect(resolved.role).toBe("service");
+    expect(resolved.projectContextId).toBe("docs");
+    expect(resolved.projectContextLabel).toBe("Documentation Site");
     expect(resolved.tracker.projectSlug).toBe("DOCS");
     expect(resolved.tracker.apiKey).toBe("docs-writeback-secret");
     expect(resolved.credential).toMatchObject({
@@ -323,17 +329,82 @@ describe("Linear credential resolver", () => {
     };
 
     expect(resolveLinearClientConfig(config, "linear.tracker", { projectContext: symphonyContext, env: contextEnv })).toMatchObject({
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
       credential: { source: "profile", profileName: "tracker", value: "symphony-linear-tracker-secret" },
-      tracker: { apiKey: "symphony-linear-tracker-secret" },
+      tracker: { apiKey: "symphony-linear-tracker-secret", projectSlug: "SYMPHONY" },
     });
     expect(resolveLinearClientConfig(config, "linear.tracker", { projectContext: docsContext, env: contextEnv })).toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
       credential: { source: "profile", profileName: "tracker", value: "docs-linear-tracker-secret" },
-      tracker: { apiKey: "docs-linear-tracker-secret" },
+      tracker: { apiKey: "docs-linear-tracker-secret", projectSlug: "DOCS" },
     });
     expect(resolveLinearClientConfig(config, "linear.writeback", { projectContext: docsContext, env: contextEnv })).toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
       credential: { source: "profile", profileName: "publication", value: "global-linear-writeback-secret" },
-      tracker: { apiKey: "global-linear-writeback-secret" },
+      tracker: { apiKey: "global-linear-writeback-secret", projectSlug: "DOCS" },
     });
+  });
+
+  it("creates tracker clients with the resolved project-context slug and scoped tracker credential", async () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LEGACY_LINEAR_TOKEN", project_slug: "TEST" },
+        workspace: { root: "/repo/workspaces", state_dir: "/repo/state" },
+        credential_profiles: {
+          profiles: {
+            tracker: { value: "$GLOBAL_LINEAR_TRACKER_TOKEN", capabilities: ["linear.tracker"] },
+          },
+          roles: {
+            worker: { "linear.tracker": "tracker" },
+          },
+        },
+        project_contexts: [
+          {
+            id: "docs",
+            tracker: { api_key: "$DOCS_LINEAR_TRACKER_TOKEN", project_slug: "DOCS" },
+            workspace: { source: { kind: "git_worktree", repository: "/repo", base_ref: "origin/main" } },
+            credential_profiles: {
+              profiles: {
+                tracker: { value: "$DOCS_LINEAR_TRACKER_TOKEN" },
+              },
+            },
+          },
+        ],
+      },
+      "/repo/WORKFLOW.md",
+      {
+        LEGACY_LINEAR_TOKEN: "legacy-linear-secret",
+        GLOBAL_LINEAR_TRACKER_TOKEN: "global-linear-tracker-secret",
+        DOCS_LINEAR_TRACKER_TOKEN: "docs-linear-tracker-secret",
+      },
+    );
+    const requests: Array<{ authorization: string; projectSlug: string | null }> = [];
+
+    await createLinearTrackerClientForProjectContext(
+      config,
+      "linear.tracker",
+      {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "explicit",
+      },
+      async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { variables?: { projectSlug?: string } };
+        requests.push({
+          authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+          projectSlug: body.variables?.projectSlug ?? null,
+        });
+        return new Response(JSON.stringify({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } }), {
+          status: 200,
+        });
+      },
+    ).fetchCandidateIssues();
+
+    expect(requests).toEqual([{ authorization: "docs-linear-tracker-secret", projectSlug: "DOCS" }]);
   });
 
   it("maps legacy-default project-context routing to the configured default context", () => {
