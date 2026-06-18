@@ -2599,6 +2599,14 @@ const docsProjectContext = {
       const initialRunning = orchestrator.snapshot().running.find((run) => run.issueId === initialCandidate.id);
       const initialRunId = initialRunning?.runId ?? "";
       expect(initialRunning?.projectContext).toMatchObject(docsProjectContext);
+      expect(initialRunning?.issueDetails).toMatchObject({
+        projectContextId: docsProjectContext.projectContextId,
+        linearProjectIdentity: {
+          kind: "linear",
+          slug: docsProjectContext.linearProjectSlug,
+          id: "linear-project-docs-1",
+        },
+      });
       expect(harness.runs[0]?.ctx.projectContext).toMatchObject(docsProjectContext);
       await waitForRunRecord(runStore, initialRunId);
       await expect(runStore.getRun(initialRunId)).resolves.toMatchObject({
@@ -2627,6 +2635,14 @@ const docsProjectContext = {
 
       expect(preservedRun?.projectContext).toMatchObject(docsProjectContext);
       expect(preservedRun?.projectContext?.routingSource).toBe("candidate_poll");
+      expect(preservedRun?.issueDetails).toMatchObject({
+        projectContextId: docsProjectContext.projectContextId,
+        linearProjectIdentity: {
+          kind: "linear",
+          slug: docsProjectContext.linearProjectSlug,
+          id: "linear-project-docs-1",
+        },
+      });
       await expect(runStore.getRun(initialRunId)).resolves.toMatchObject({
         projectContext: docsProjectContext,
       });

@@ -14,6 +14,13 @@ export interface IssueLinearProjectIdentity {
   id?: string | null;
 }
 
+export interface IssueProjectContextRef {
+  projectContextId?: string | null;
+  projectContextLabel?: string | null;
+  linearProjectSlug?: string | null;
+  routingSource?: string | null;
+}
+
 export interface Issue {
   id: string;
   identifier: string;
@@ -30,6 +37,7 @@ export interface Issue {
   blockedBy: IssueBlockerRef[];
   createdAt: string | null;
   updatedAt: string | null;
+  projectContext?: IssueProjectContextRef | null;
   projectContextId?: string | null;
   linearProjectIdentity?: IssueLinearProjectIdentity | null;
 }
@@ -213,6 +221,19 @@ export interface IssueDetailsEnvelope {
   latestRun: IssueLatestRunSummary;
 }
 
+function projectContextIdForIssueStatusView(issue: Issue): string | null {
+  return issue.projectContextId ?? issue.projectContext?.projectContextId ?? null;
+}
+
+function linearProjectIdentityForIssueStatusView(issue: Issue): IssueLinearProjectIdentity | null {
+  if (issue.linearProjectIdentity) {
+    return { ...issue.linearProjectIdentity };
+  }
+
+  const slug = issue.projectContext?.linearProjectSlug ?? null;
+  return slug === null ? null : { kind: "linear", slug };
+}
+
 export function toIssueStatusView(issue: Issue): IssueStatusView {
   return {
     id: issue.id,
@@ -229,8 +250,8 @@ export function toIssueStatusView(issue: Issue): IssueStatusView {
     blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
-    projectContextId: issue.projectContextId ?? null,
-    linearProjectIdentity: issue.linearProjectIdentity ? { ...issue.linearProjectIdentity } : null,
+    projectContextId: projectContextIdForIssueStatusView(issue),
+    linearProjectIdentity: linearProjectIdentityForIssueStatusView(issue),
   };
 }
 
