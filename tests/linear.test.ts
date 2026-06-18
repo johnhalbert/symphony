@@ -4,7 +4,7 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { projectContextResolutionFromIssue } from "../src/core/config/ProjectContexts.js";
 import { createLinearTrackerClientForCapability, resolveLinearClientConfig } from "../src/integrations/linear/LinearCredentialResolver.js";
 import { LinearTrackerClient, normalizeIssue } from "../src/integrations/linear/LinearTrackerClient.js";
-import { multiProjectWorkflowConfig, testConfig } from "./helpers.js";
+import { multiProjectWorkflowConfig, projectContextFixture, testConfig } from "./helpers.js";
 
 describe("LinearTrackerClient", () => {
   it("normalizes issue labels and blockers", () => {
@@ -116,8 +116,12 @@ describe("LinearTrackerClient", () => {
     expect(issues.map((item) => item.identifier)).toEqual(["T-1", "T-2"]);
   });
 
-  it("retains Linear project identity on direct issue lookups", async () => {
-    const config = testConfig("/tmp/symphony");
+  it("fetches issue states by id and preserves the Linear project identity", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig(),
+      path.join("/tmp/symphony", "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
     const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
     const fetchImpl: typeof fetch = async (_url, init) => {
       const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
@@ -149,6 +153,51 @@ describe("LinearTrackerClient", () => {
       identifier: "ENG-179",
       linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "project-docs" },
     });
+  });
+
+  it("does not stamp the resolved default project context on unscoped id refresh lookups", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig(),
+      path.join("/tmp/symphony", "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const client = createLinearTrackerClientForCapability(
+      config,
+      "linear.tracker",
+      async (_url, init) => {
+        const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+        expect(request.variables).toEqual({ ids: ["linear-docs-179"] });
+        return jsonResponse({
+          data: {
+            issues: {
+              nodes: [
+                {
+                  id: "linear-docs-179",
+                  identifier: "ENG-179",
+                  title: "Docs title",
+                  state: { name: "In Progress" },
+                  project: { id: "project-docs", slugId: "DOCS" },
+                },
+              ],
+            },
+          },
+        });
+      },
+    );
+
+    const [refreshedById] = await client.fetchIssueStatesByIds(["linear-docs-179"]);
+
+    expect(refreshedById).toMatchObject({
+      id: "linear-docs-179",
+      identifier: "ENG-179",
+      state: "In Progress",
+      linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "project-docs" },
+    });
+    expect(refreshedById).not.toHaveProperty("projectContext");
+    expect(refreshedById).not.toHaveProperty("projectContextId");
+    expect(refreshedById).not.toHaveProperty("projectContextLabel");
+    expect(refreshedById).not.toHaveProperty("linearProjectSlug");
+    expect(refreshedById).not.toHaveProperty("routingSource");
   });
 
   it("carries explicit project context metadata through candidate polling and state refresh", async () => {
@@ -272,6 +321,65 @@ describe("LinearTrackerClient", () => {
       linearProjectSlug: "DOCS",
       routingSource: "state_refresh",
     });
+  });
+
+  it("suppresses explicit project context metadata when multiple enabled contexts share the same Linear project slug", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+          projectContextFixture({ id: "guides", label: "Guides Site", projectSlug: "DOCS", repository: "../guides-site" }),
+        ],
+      }),
+      path.join("/tmp/symphony", "WORKFLOW.md"),
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+      if (request.query.includes("SymphonyCandidateIssues") || request.query.includes("SymphonyIssuesByStates")) {
+        return jsonResponse({
+          data: {
+            issues: {
+              nodes: [
+                {
+                  id: "linear-docs-179",
+                  identifier: "DOCS-179",
+                  title: "Docs title",
+                  state: { name: "Todo" },
+                  project: { id: "project-docs", slugId: "DOCS" },
+                },
+              ],
+              pageInfo: pageInfo(),
+            },
+          },
+        });
+      }
+      throw new Error(`Unexpected query: ${request.query}`);
+    };
+
+    const docsContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "manual_test",
+    } as const;
+    const client = createLinearTrackerClientForCapability(config, "linear.tracker", fetchImpl, { projectContext: docsContext });
+
+    const [candidate] = await client.fetchCandidateIssues();
+    const [refreshedByState] = await client.fetchIssuesByStates(["Todo"]);
+
+    for (const issue of [candidate, refreshedByState]) {
+      expect(issue).toMatchObject({
+        id: "linear-docs-179",
+        identifier: "DOCS-179",
+        linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "project-docs" },
+      });
+      expect(issue).not.toHaveProperty("projectContext");
+      expect(issue).not.toHaveProperty("projectContextId");
+      expect(issue).not.toHaveProperty("projectContextLabel");
+      expect(issue).not.toHaveProperty("linearProjectSlug");
+      expect(issue).not.toHaveProperty("routingSource");
+    }
   });
 
   it("does not stamp explicit project context metadata on id refresh when the fetched Linear project differs", async () => {
