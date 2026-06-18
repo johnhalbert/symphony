@@ -140,6 +140,25 @@ export interface ResolveProjectContextForIssueOptions {
   persistedContext?: Partial<ProjectContextResolution> | null;
 }
 
+function resolvedProjectContextRoutingResult(projectContext: ProjectContextResolution): ProjectContextRoutingResult {
+  return {
+    kind: "resolved",
+    projectContext,
+  };
+}
+
+function projectContextRoutingProblemResult(
+  reason: ProjectContextRoutingProblemReason,
+  issue: unknown,
+  candidateContextIds: ProjectContextId[],
+  safeMessage: string,
+): ProjectContextRoutingResult {
+  return {
+    kind: "problem",
+    problem: createProjectContextRoutingProblem(reason, issue, candidateContextIds, safeMessage),
+  };
+}
+
 export interface LegacyProjectContextDefaults<
   TTracker = unknown,
   TWorkspace = unknown,
@@ -412,21 +431,15 @@ export function resolveProjectContextForIssue<
   const issueRouting = readIssueRoutingFields(issue);
   if (issueRouting === null) {
     if (registry.enabledContexts.length === 1) {
-      return {
-        kind: "resolved",
-        projectContext: projectContextResolutionFromConfiguredContext(registry.defaultContext, null),
-      };
+      return resolvedProjectContextRoutingResult(projectContextResolutionFromConfiguredContext(registry.defaultContext, null));
     }
 
-    return {
-      kind: "problem",
-      problem: createProjectContextRoutingProblem(
-        "ambiguous_context",
-        issue,
-        registry.enabledContexts.map((context) => context.id),
-        `Issue ${describeIssueForRouting(issue)} does not identify a single enabled project context`,
-      ),
-    };
+    return projectContextRoutingProblemResult(
+      "ambiguous_context",
+      issue,
+      registry.enabledContexts.map((context) => context.id),
+      `Issue ${describeIssueForRouting(issue)} does not identify a single enabled project context`,
+    );
   }
 
   const routingSource = issueRouting.routingSource ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE;
@@ -724,21 +737,15 @@ function validatePersistedContextForResolution(
   persistedContext: Partial<ProjectContextResolution>,
 ): ProjectContextRoutingResult {
   if (readExplicitProjectContextId(persistedContext) === undefined) {
-    return {
-      kind: "problem",
-      problem: createProjectContextRoutingProblem(
-        "stale_context",
-        issue,
-        [],
-        `Issue ${describeIssueForRouting(issue)} has persisted project context metadata without an explicit project context id`,
-      ),
-    };
+    return projectContextRoutingProblemResult(
+      "stale_context",
+      issue,
+      [],
+      `Issue ${describeIssueForRouting(issue)} has persisted project context metadata without an explicit project context id`,
+    );
   }
 
-  return {
-    kind: "resolved",
-    projectContext: normalizeProjectContextResolution(persistedContext),
-  };
+  return resolvedProjectContextRoutingResult(normalizeProjectContextResolution(persistedContext));
 }
 
 function explicitRoutingMismatchesConfiguredSlug<
