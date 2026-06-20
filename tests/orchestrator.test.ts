@@ -5104,10 +5104,10 @@ const docsProjectContext = {
     expect(publisher.inputs).toEqual([]);
     expect(writer.comments.some((comment) => comment.body.includes("Status: rejected"))).toBe(true);
     expect(writer.comments.some((comment) => comment.dedupeKey === "report-run-1:completion-report:idem-1")).toBe(false);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked", "Canceled"]);
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
-      phase: "blocked",
-      blockedReason: "publication approval rejected",
+      phase: "terminal",
+      blockedReason: null,
       incompleteTurnCount: 0,
       completionReports: [
         {
@@ -7232,6 +7232,177 @@ const docsProjectContext = {
 
     expect(harness.stoppedRunIds).toEqual(["run-123"]);
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("retires a lifecycle-bound PR when cancelling an active issue", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    let currentState = config.writeback.dispatchState;
+    const candidate = issue({ state: currentState });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const workspacePath = path.join(config.workspace.root, candidate.identifier);
+    await runStore.startRun({
+      runId: "report-run-1",
+      sessionId: "session-report-1",
+      agentId: "agent-report-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "report",
+      workspaceKey: candidate.identifier,
+      workspacePath,
+      startedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.recordPullRequestEvent({
+      runId: "report-run-1",
+      action: "updated",
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "head-sha-1",
+      prBranch: "symphony/TEST-1",
+      lastPushedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.recordCiStatusEvent({ runId: "report-run-1", ciStatus: "success" });
+    await runStore.updateRun("report-run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:01.000Z" });
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      reviewRound: 1,
+      blockedReason: null,
+      lastCompletionReportId: "completion-report:issue-1:report-1",
+      lastReviewVerdictId: "review-verdict:issue-1:review-1",
+      summaryPointers: {
+        workspaceKey: candidate.identifier,
+        workspacePath,
+        lastRunId: "report-run-1",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "head-sha-1",
+        prBranch: "symphony/TEST-1",
+        ciStatus: "success",
+        lastPushedAt: "2026-01-01T00:00:00.000Z",
+      },
+      completionReports: [
+        {
+          id: "completion-report:issue-1:report-1",
+          idempotencyKey: "report-1",
+          runId: "report-run-1",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          summary: "Published a no-op report.",
+          validationEvidence: ["npm test"],
+          acceptanceChecklist: [{ text: "noop", satisfied: true, evidence: "tests" }],
+          changedFiles: ["src/index.ts"],
+          branchName: "symphony/TEST-1",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "head-sha-1",
+            branch: "symphony/TEST-1",
+          },
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      reviewVerdicts: [
+        {
+          id: "review-verdict:issue-1:review-1",
+          idempotencyKey: "review-1",
+          runId: "review-run-1",
+          issueId: candidate.id,
+          issueIdentifier: candidate.identifier,
+          verdict: "fail",
+          acceptanceResults: [{ text: "Retire the empty PR.", satisfied: false, evidence: "PR still open" }],
+          findings: ["Retire the empty PR."],
+          evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-1"],
+          reviewer: "reviewer-1",
+          submittedAt: "2026-01-01T00:00:02.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+    });
+    const publisher = new FakeCompletionReportPublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "head-sha-1",
+      lastPushedAt: "2026-01-01T00:00:00.000Z",
+      evidenceCursor: "report-1",
+    });
+    const harness = new BlockingHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      completionReportPublisher: publisher,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-123", "active issue dispatch before PR retirement");
+    await orchestrator.cancelIssue(candidate.id);
+    await waitFor(() => orchestrator.snapshot().running.length === 0, "cancelled run to exit");
+    await orchestrator.stop();
+
+    expect(harness.stoppedRunIds).toEqual(["run-123"]);
+    expect(publisher.closedPullRequests).toEqual([42]);
+    expect(writer.transitions.at(-1)).toMatchObject({
+      toState: "Canceled",
+      reason: "Symphony service-owned issue cancellation",
+    });
+    expect(writer.comments.some((comment) => comment.body.includes("## Symphony Issue Cancelled"))).toBe(true);
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "terminal",
+      blockedReason: null,
+      lastReviewVerdictId: null,
+      summaryPointers: {
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+        ciStatus: null,
+        lastPushedAt: null,
+      },
+    });
+    await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
+      prUrl: null,
+      prNumber: null,
+      prHeadSha: null,
+      prBranch: null,
+      ciStatus: null,
+      lastPushedAt: null,
+    });
+    expect(currentState).toBe("Canceled");
   });
 
   it("exposes live liveness and cancellation state before a cancelled run exits", async () => {
@@ -9625,6 +9796,7 @@ async function eventually(assertion: () => Promise<void> | void, timeoutMs = 100
 
 class FakeCompletionReportPublisher implements CompletionReportPullRequestPublisher {
   readonly inputs: CompletionReportPullRequestPublicationInput[] = [];
+  readonly closedPullRequests: number[] = [];
 
   constructor(private readonly publication: CompletionReportPullRequestPublication) {}
 
@@ -9633,6 +9805,10 @@ class FakeCompletionReportPublisher implements CompletionReportPullRequestPublis
   ): Promise<CompletionReportPullRequestPublication> {
     this.inputs.push(input);
     return this.publication;
+  }
+
+  async closePullRequest(input: { pullRequestNumber: number }): Promise<void> {
+    this.closedPullRequests.push(input.pullRequestNumber);
   }
 }
 

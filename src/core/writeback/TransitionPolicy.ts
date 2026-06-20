@@ -1,6 +1,7 @@
 import type { ServiceConfig } from "../config/Config.js";
 import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import type {
+  CompletionReportPullRequestRef,
   IssueCompletionReportRecord,
   IssueMergeGateMergeabilityState,
   IssueReviewVerdictRecord,
@@ -52,6 +53,16 @@ export interface MergeCompletedWritebackContext {
   mergeId: string;
   fromState: string;
   doneState: string;
+}
+
+export interface IssueCancelledWritebackContext {
+  issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
+  runId: string;
+  reason: string;
+  fromStates: string[];
+  toState: string | null;
+  pullRequest: CompletionReportPullRequestRef | null;
 }
 
 export interface MergeGateCheckEvidence {
@@ -839,6 +850,53 @@ export function planRunCancelledComment(context: RunWritebackContext, config: Se
       body: [`Symphony worker run was cancelled.`, "", `Run: ${context.runId}`, `Reason: ${error ?? "operator request"}`].join("\n"),
     },
   };
+}
+
+export function planIssueCancelledWritebacks(
+  context: IssueCancelledWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  const stateKey = safeKeySegment(context.toState ?? "terminal");
+  const eventKey = `${context.runId}:issue-cancelled:${stateKey}`;
+  const operations: NewWritebackOperation[] = [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      projectContext: context.projectContext,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Issue Cancelled",
+          "",
+          `Reason: ${context.reason}`,
+          `Run: ${context.runId}`,
+          `Next tracker state: ${context.toState ?? "unchanged"}`,
+          `Pull request: ${formatPullRequest(context.pullRequest)}`,
+          ...(context.pullRequest?.headSha ? [`PR head SHA: ${context.pullRequest.headSha}`] : []),
+          "",
+          "Symphony retired this issue from the active review and dispatch lanes.",
+        ].join("\n"),
+      },
+    },
+  ];
+  if (context.toState !== null) {
+    operations.push({
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      projectContext: context.projectContext,
+      runId: context.runId,
+      payload: {
+        fromStates: uniqueStates(context.fromStates),
+        toState: context.toState,
+        reason: "Symphony service-owned issue cancellation",
+      },
+    });
+  }
+  return operations;
 }
 
 function sameName(left: string, right: string): boolean {

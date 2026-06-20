@@ -88,6 +88,7 @@ import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
   buildWorkerHandoffPacket,
   phaseForIssueState,
+  type CompletionReportPullRequestRef,
   type IssueCompletionReportRecord,
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
@@ -117,6 +118,7 @@ import { FileWritebackOutboxStore, type WritebackProcessor } from "../writeback/
 import {
   planBlockedEscalationWritebacks,
   planDispatchWriteback,
+  planIssueCancelledWritebacks,
   planRunCancelledComment,
   planRunFailedComment,
   planRunStartedComment,
@@ -932,17 +934,106 @@ export class Orchestrator {
     this.clearRetry(issueId);
     this.claimed.delete(issueId);
     const running = this.running.get(issueId);
-    if (!running) return;
-    running.suppressRetryOnExit = true;
-    const stopRunId = this.harnessStopRunId(running);
-    this.markCancellationRequested(running, {
-      source: "operator",
-      reason: "operator request",
-      abortSignalled: true,
-      harnessStopRequested: stopRunId !== null,
+    if (running) {
+      running.suppressRetryOnExit = true;
+      const stopRunId = this.harnessStopRunId(running);
+      this.markCancellationRequested(running, {
+        source: "operator",
+        reason: "operator request",
+        abortSignalled: true,
+        harnessStopRequested: stopRunId !== null,
+      });
+      running.abortController.abort();
+      if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
+    }
+    const issue = running?.issue ?? (await this.options.tracker.fetchIssueStatesByIds([issueId]))[0] ?? null;
+    if (!issue) return;
+    await this.retireCancelledIssue(issue, running ?? null);
+  }
+
+  private async retireCancelledIssue(issue: Issue, running: RunningEntry | null): Promise<void> {
+    const lifecycleStore = this.options.lifecycleStore;
+    const runStore = this.options.runStore;
+    const lifecycle =
+      (await lifecycleStore?.get(issue.id)) ?? (issue.identifier ? await lifecycleStore?.get(issue.identifier) : null) ?? null;
+    const latestRun = runStore ? await runStore.latestRunForIssue(issue.id) : null;
+    const pullRequest = cancellationPullRequestRef(lifecycle, latestRun);
+    const toState = isStateIn(issue.state, this.config.tracker.terminalStates) ? null : preferredCancellationState(this.config);
+    const runId =
+      running?.activeRunId ??
+      running?.runId ??
+      lifecycle?.summaryPointers.lastRunId ??
+      (lifecycle ? latestCompletionReport(lifecycle)?.runId : null) ??
+      latestRun?.runId ??
+      `issue-cancel:${issue.id}`;
+    const projectContext = running?.lifecycle?.projectContext ?? lifecycle?.projectContext ?? projectContextResolutionFromIssue(issue);
+    const operations = planIssueCancelledWritebacks(
+      {
+        issue,
+        projectContext,
+        runId,
+        reason: running?.cancellationReason ?? "operator request",
+        fromStates: issueCancellationFromStates(this.config, issue.state),
+        toState,
+        pullRequest,
+      },
+      this.config,
+    );
+    if (!(await this.applyWritebacks(operations, "issue-cancel"))) {
+      throw new SymphonyError("tracker_error", `Issue cancellation writeback failed for ${issue.identifier}`);
+    }
+    if (pullRequest?.number != null) {
+      await this.resolveIssueCancellationPullRequestPublisher().closePullRequest({ pullRequestNumber: pullRequest.number });
+    }
+    await this.clearRetiredPullRequestMetadata(cancellationMetadataRunIds(running, lifecycle, latestRun));
+    if (!lifecycleStore) return;
+    const updatedLifecycle = await lifecycleStore.updateIssue(issue, {
+      projectContext,
+      phase: toState === null ? "terminal" : phaseForIssueState(toState, this.config),
+      blockedReason: null,
+      lastReviewVerdictId: null,
+      mergeGate: null,
+      mergeConflict: null,
+      summaryPointers: {
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+        ciStatus: null,
+        lastPushedAt: null,
+      },
     });
-    running.abortController.abort();
-    if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
+    if (running) {
+      running.lifecycle = updatedLifecycle;
+      if (toState !== null) {
+        running.issue = { ...running.issue, state: toState };
+      }
+    }
+  }
+
+  private resolveIssueCancellationPullRequestPublisher(): Required<Pick<CompletionReportPullRequestPublisher, "closePullRequest">> {
+    const publisher = this.options.completionReportPublisher;
+    if (publisher?.closePullRequest) {
+      return publisher as Required<Pick<CompletionReportPullRequestPublisher, "closePullRequest">>;
+    }
+    return createGitHubPullRequestClientForCapability(this.config, "github.publication");
+  }
+
+  private async clearRetiredPullRequestMetadata(runIds: string[]): Promise<void> {
+    const runStore = this.options.runStore;
+    if (!runStore || runIds.length === 0) return;
+    for (const runId of runIds) {
+      await runStore.updateRun(runId, {
+        metadata: {
+          prUrl: null,
+          prNumber: null,
+          prHeadSha: null,
+          prBranch: null,
+          ciStatus: null,
+          lastPushedAt: null,
+        },
+      });
+    }
   }
 
   async requestIssueBreakdown(
@@ -1384,7 +1475,7 @@ export class Orchestrator {
     const lifecycle =
       (await this.options.lifecycleStore.get(request.issueId)) ??
       (request.issueIdentifier ? await this.options.lifecycleStore.get(request.issueIdentifier) : null);
-    return lifecycle?.phase === "blocked" && lifecycle.blockedReason === `publication approval ${request.status}`;
+    return lifecycle?.phase === "terminal" || (lifecycle?.phase === "blocked" && lifecycle.blockedReason === `publication approval ${request.status}`);
   }
 
   async createContinuationSummary(
@@ -4321,6 +4412,71 @@ function uniqueStateNames(states: string[]): string[] {
     unique.push(state);
   }
   return unique;
+}
+
+function preferredCancellationState(config: ServiceConfig): string | null {
+  for (const preferred of ["Canceled", "Cancelled", "Duplicate"]) {
+    const match = config.tracker.terminalStates.find((state) => statesEqual(state, preferred));
+    if (match) return match;
+  }
+  return config.tracker.terminalStates.find((state) => /cancel|duplicate/i.test(state)) ?? null;
+}
+
+function issueCancellationFromStates(config: ServiceConfig, currentState: string): string[] {
+  return uniqueStateNames(
+    [
+      currentState,
+      config.writeback.dispatchState,
+      ...config.tracker.activeStates,
+      ...config.tracker.handoffStates,
+      ...config.reviewLoop.reviewStates,
+      ...config.reviewLoop.blockedStates,
+      ...(config.reviewLoop.reviewPassState ? [config.reviewLoop.reviewPassState] : []),
+      ...(config.mergePolicy.conflictsState === null ? [] : [config.mergePolicy.conflictsState]),
+    ].filter((state) => state.length > 0 && !isStateIn(state, config.tracker.terminalStates)),
+  );
+}
+
+function cancellationPullRequestRef(
+  lifecycle: IssueLifecycleRecord | null,
+  latestRun: RunRecord | null,
+): CompletionReportPullRequestRef | null {
+  const pointers = lifecycle?.summaryPointers;
+  if (pointers && (pointers.prUrl || pointers.prNumber !== null || pointers.prHeadSha || pointers.prBranch)) {
+    return {
+      url: pointers.prUrl ?? null,
+      number: pointers.prNumber ?? null,
+      headSha: pointers.prHeadSha ?? null,
+      branch: pointers.prBranch ?? null,
+    };
+  }
+  const reportPullRequest = lifecycle ? latestCompletionReport(lifecycle)?.pullRequest ?? null : null;
+  if (reportPullRequest && (reportPullRequest.url || reportPullRequest.number !== null || reportPullRequest.headSha || reportPullRequest.branch)) {
+    return reportPullRequest;
+  }
+  if (latestRun && (latestRun.prUrl || latestRun.prNumber !== null || latestRun.prHeadSha || latestRun.prBranch)) {
+    return {
+      url: latestRun.prUrl ?? null,
+      number: latestRun.prNumber ?? null,
+      headSha: latestRun.prHeadSha ?? null,
+      branch: latestRun.prBranch ?? null,
+    };
+  }
+  return null;
+}
+
+function cancellationMetadataRunIds(
+  running: RunningEntry | null,
+  lifecycle: IssueLifecycleRecord | null,
+  latestRun: RunRecord | null,
+): string[] {
+  return [...new Set([
+    running?.runId ?? null,
+    running?.activeRunId ?? null,
+    lifecycle?.summaryPointers.lastRunId ?? null,
+    lifecycle ? latestCompletionReport(lifecycle)?.runId ?? null : null,
+    latestRun?.runId ?? null,
+  ].filter((value): value is string => value !== null && value.length > 0))];
 }
 
 function isTerminalSdkRunStatus(status: AgentRunSdkStatus): boolean {

@@ -370,6 +370,23 @@ export class GitHubPullRequestClient {
     return pullRequest;
   }
 
+  async closePullRequest(input: { pullRequestNumber: number }): Promise<void> {
+    this.assertConfiguredForPublication();
+    assertPullRequestNumber(input.pullRequestNumber, "PR close");
+    const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}`), {
+      method: "PATCH",
+      headers: await this.requestHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ state: "closed" }),
+    });
+    if (!response.ok) {
+      throw new SymphonyError("tracker_error", await this.githubWriteError(response, "GitHub PR close"));
+    }
+    const pullRequest = normalizePullRequestDetails((await response.json()) as GitHubPullRequestNode);
+    if (!pullRequest || pullRequest.state?.toLowerCase() !== "closed") {
+      throw new SymphonyError("tracker_error", "GitHub PR close response is invalid");
+    }
+  }
+
   async getRequiredCheckResults(input: PullRequestChecksInput): Promise<PullRequestCheckResult[]> {
     this.assertConfiguredForMerge();
     const headSha = requireNonEmpty(input.headSha, "A pull request head SHA is required for check validation");
