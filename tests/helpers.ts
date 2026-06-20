@@ -143,8 +143,8 @@ export interface TrackerIssueFixtureOverrides extends Partial<Issue> {
 }
 
 export interface TrackerClientFixtureOptions {
-  candidates?: TrackerIssueFixture[];
-  issues?: TrackerIssueFixture[];
+  candidates?: Issue[];
+  issues?: Issue[];
 }
 
 /**
@@ -370,12 +370,12 @@ export function trackerClientFixture(options: TrackerClientFixtureOptions = {}):
   return fixture;
 }
 
-function cloneTrackerIssues(entries: readonly TrackerIssueFixture[]): TrackerIssueFixture[] {
+function cloneTrackerIssues(entries: readonly Issue[]): Issue[] {
   return entries.map((entry) => ({
     ...entry,
     labels: [...entry.labels],
     blockedBy: entry.blockedBy.map((blocker) => ({ ...blocker })),
-    linearProjectIdentity: { ...entry.linearProjectIdentity },
+    ...(entry.linearProjectIdentity === undefined ? {} : { linearProjectIdentity: { ...entry.linearProjectIdentity } }),
   }));
 }
 
