@@ -931,6 +931,7 @@ const docsProjectContext = {
     config.issueBreakdown.planningLabels = ["planning"];
     config.writeback.enabled = true;
     config.writeback.mode = "live";
+    addDocsPollingProjectContext(config);
     const candidate = trackerIssue({
       id: "issue-docs-1",
       identifier: "ENG-123",
@@ -4463,6 +4464,7 @@ const docsProjectContext = {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
+    addDocsPollingProjectContext(config);
     const candidate = trackerIssue({
       id: "issue-1",
       identifier: "TEST-1",

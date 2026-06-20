@@ -185,13 +185,11 @@ describe("project context routing contract", () => {
         linearProjectSlug: "DOCS",
         routingSource,
       };
-      expect(result.harness.runs).toHaveLength(1);
-      expect(result.harness.runs[0]?.ctx.projectContext).toEqual(expectedProjectContext);
-      await expect(result.runStore.getRun(result.harness.lastRunId()!)).resolves.toMatchObject({
-        projectContext: expectedProjectContext,
-      });
+      expect(result.harness.runs).toHaveLength(0);
+      expect(result.harness.lastRunId()).toBeNull();
       await expect(result.lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-        phase: "implementation",
+        phase: "blocked",
+        blockedReason: expect.stringContaining('Resolved project context "docs" is not configured'),
         projectContext: expectedProjectContext,
       });
     },

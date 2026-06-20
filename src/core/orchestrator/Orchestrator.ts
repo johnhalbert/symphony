@@ -1912,10 +1912,22 @@ export class Orchestrator {
     }
     let runPhase = decision.runPhase;
     if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase, latestProjectContext))) return false;
-    const dispatchWriteback =
-      runPhase === "implementation"
-        ? planDispatchWriteback(latest, this.serviceConfigForIssue(latest, latestProjectContext), latestProjectContext)
-        : null;
+    let dispatchWriteback: ReturnType<typeof planDispatchWriteback> = null;
+    if (runPhase === "implementation") {
+      try {
+        dispatchWriteback = planDispatchWriteback(
+          latest,
+          this.serviceConfigForIssue(latest, latestProjectContext),
+          latestProjectContext,
+        );
+      } catch (error) {
+        if (error instanceof SymphonyError && error.code === "config_validation_error") {
+          await this.blockDispatchConfigurationError(latest, latestProjectContext, error);
+          return false;
+        }
+        throw error;
+      }
+    }
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
     const afterWriteback = dispatchWriteback
       ? (await this.fetchIssueStatesByIdsForProjectContext([issue.id], latestProjectContext))[0]
@@ -3485,6 +3497,25 @@ export class Orchestrator {
       entry.activeRunId ?? entry.runId ?? entry.issue.id,
       reason,
     );
+  }
+
+  private async blockDispatchConfigurationError(
+    issue: Issue,
+    projectContext: ProjectContextResolution | undefined,
+    error: SymphonyError,
+  ): Promise<void> {
+    const reason = `project context dispatch configuration error: ${error.message}`;
+    this.options.logger.warn("worker dispatch blocked by project context configuration", {
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      project_context_id: projectContext?.projectContextId ?? null,
+      error: error.message,
+    });
+    await this.options.lifecycleStore?.updateIssue(issue, {
+      projectContext,
+      phase: "blocked",
+      blockedReason: reason,
+    });
   }
 
   private async escalateLifecycleBlocked(

@@ -163,6 +163,14 @@ describe("TransitionPolicy review-loop planners", () => {
     });
   });
 
+  it("fails closed before dispatch planning when an explicit project context is not configured", () => {
+    const config = contextAwareTransitionPolicyConfig();
+
+    expect(() => planDispatchWriteback(issue({ state: "Todo" }), config, staleDocsProjectContext())).toThrow(
+      'Resolved project context "docs-archive" is not configured',
+    );
+  });
+
   it("fails closed when a resolved project context does not recognize the issue state bucket", () => {
     const config = contextAwareTransitionPolicyConfig();
 
@@ -690,6 +698,15 @@ function docsProjectContext(): ProjectContextResolution {
     projectContextLabel: "Documentation Site",
     linearProjectSlug: "DOCS",
     routingSource: "candidate_poll",
+  };
+}
+
+function staleDocsProjectContext(): ProjectContextResolution {
+  return {
+    projectContextId: "docs-archive",
+    projectContextLabel: "Archived Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "explicit",
   };
 }
 

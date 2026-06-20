@@ -166,12 +166,19 @@ function resolveTransitionPolicyConfig(
   }
 }
 
+function resolveStrictTransitionPolicyConfig(
+  config: ServiceConfig,
+  projectContext?: ProjectContextResolution,
+): ServiceConfig {
+  return resolveServiceConfigForProjectContext(config, projectContext);
+}
+
 export function planDispatchWriteback(
   issue: Issue,
   config: ServiceConfig,
   projectContext?: ProjectContextResolution,
 ): NewWritebackOperation | null {
-  const resolvedConfig = resolveTransitionPolicyConfig(config, projectContext);
+  const resolvedConfig = resolveStrictTransitionPolicyConfig(config, projectContext);
   if (!resolvedConfig.writeback.enabled) return null;
   const fromStates = sameName(resolvedConfig.writeback.dispatchState, "Todo")
     ? [resolvedConfig.writeback.dispatchState]
