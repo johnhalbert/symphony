@@ -1,6 +1,7 @@
 import type { ServiceConfig } from "../config/Config.js";
 import { resolveServiceConfigForProjectContext } from "../config/ProjectContextServiceConfig.js";
 import type { ProjectContextResolution } from "../config/ProjectContexts.js";
+import { SymphonyError } from "../errors.js";
 import type {
   IssueCompletionReportRecord,
   IssueMergeGateMergeabilityState,
@@ -155,7 +156,14 @@ function resolveTransitionPolicyConfig(
   config: ServiceConfig,
   projectContext?: ProjectContextResolution,
 ): ServiceConfig {
-  return resolveServiceConfigForProjectContext(config, projectContext);
+  try {
+    return resolveServiceConfigForProjectContext(config, projectContext);
+  } catch (error) {
+    if (error instanceof SymphonyError && error.code === "config_validation_error") {
+      return config;
+    }
+    throw error;
+  }
 }
 
 export function planDispatchWriteback(

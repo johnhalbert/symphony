@@ -626,6 +626,7 @@ function contextAwareTransitionPolicyConfig(): ServiceConfig {
           pr_handoff: {
             enabled: true,
             target_state: "Human Review",
+            required_checks: ["test"],
           },
         },
       },
@@ -649,6 +650,7 @@ function contextAwareTransitionPolicyConfig(): ServiceConfig {
             pr_handoff: {
               enabled: true,
               target_state: "Human Review",
+              required_checks: ["test"],
             },
           },
         }),
@@ -671,6 +673,7 @@ function contextAwareTransitionPolicyConfig(): ServiceConfig {
             pr_handoff: {
               enabled: true,
               target_state: "Docs Human Review",
+              required_checks: ["test"],
             },
           },
         }),

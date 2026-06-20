@@ -325,6 +325,23 @@ review_loop:
 workspace:
   root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
   state_dir: "${slash(stateDir)}"
+project_contexts:
+  - id: docs
+    label: Documentation Site
+    tracker:
+      project_slug: DOCS
+    workspace:
+      source:
+        kind: copy
+        path: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  - id: symphony
+    label: Symphony
+    tracker:
+      project_slug: ENG
+    workspace:
+      source:
+        kind: copy
+        path: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
 ---
 Work on {{ issue.identifier }}.
 `;
