@@ -129,6 +129,23 @@ merge_policy:
   mode: gated
   conflicts_state: Approved with Conflicts
   max_conflict_fix_turns: 3
+project_contexts:
+  - id: default
+    label: Default
+    tracker:
+      project_slug: TEST
+    workspace:
+      source:
+        kind: copy
+        path: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  - id: docs-site
+    label: Documentation Site
+    tracker:
+      project_slug: DOCS
+    workspace:
+      source:
+        kind: copy
+        path: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
 ---
 Work on {{ issue.identifier }}.
 `;
