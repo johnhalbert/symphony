@@ -142,6 +142,7 @@ describe("Linear credential resolver", () => {
           },
           {
             id: "docs",
+            label: "Documentation Site",
             tracker: { api_key: "$DOCS_LINEAR_READ_TOKEN", project_slug: "DOCS" },
             workspace: {
               source: { kind: "git_worktree", repository: "/repo", base_ref: "origin/main" },
@@ -288,6 +289,7 @@ describe("Linear credential resolver", () => {
           },
           {
             id: "docs",
+            label: "Documentation Site",
             tracker: { project_slug: "DOCS" },
             workspace: { source: { kind: "git", repository: "../docs-site" } },
             credential_profiles: {
@@ -316,7 +318,7 @@ describe("Linear credential resolver", () => {
     } as const;
     const docsContext = {
       projectContextId: "docs",
-      projectContextLabel: "Documentation Site",
+      projectContextLabel: "docs",
       linearProjectSlug: "DOCS",
       routingSource: "test",
     } as const;

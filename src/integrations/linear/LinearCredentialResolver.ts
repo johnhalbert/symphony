@@ -23,7 +23,6 @@ export interface ResolvedLinearClientConfig {
   projectContextLabel: string;
   tracker: TrackerConfig;
   credential: ResolvedCredential | null;
-  projectContextId: string;
   projectContext: WorkflowProjectContext;
 }
 
@@ -57,13 +56,12 @@ export function resolveLinearClientConfig(
     capability,
     role,
     projectContextId: view.projectContextId,
-    projectContextLabel: options.projectContext?.projectContextLabel ?? view.projectContext.label,
+    projectContextLabel: view.projectContext.label,
     tracker: {
       ...view.tracker,
       apiKey: credential?.value ?? view.tracker.apiKey,
     },
     credential,
-    projectContextId: view.projectContextId,
     projectContext: view.projectContext,
   };
 }
