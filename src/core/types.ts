@@ -8,6 +8,19 @@ export interface IssueAssigneeRef {
   id: string | null;
 }
 
+export interface IssueLinearProjectIdentity {
+  kind: "linear";
+  slug: string;
+  id?: string | null;
+}
+
+export interface IssueProjectContextMetadata {
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
+  routingSource: string;
+}
+
 export interface Issue {
   id: string;
   identifier: string;
@@ -24,6 +37,12 @@ export interface Issue {
   blockedBy: IssueBlockerRef[];
   createdAt: string | null;
   updatedAt: string | null;
+  projectContext?: IssueProjectContextMetadata;
+  projectContextId?: string;
+  projectContextLabel?: string;
+  linearProjectSlug?: string | null;
+  linearProjectIdentity?: IssueLinearProjectIdentity;
+  routingSource?: string;
 }
 
 export interface IssueStatusView {
@@ -41,6 +60,12 @@ export interface IssueStatusView {
   blockedBy: IssueBlockerRef[];
   createdAt: string | null;
   updatedAt: string | null;
+  projectContext?: IssueProjectContextMetadata;
+  projectContextId?: string;
+  projectContextLabel?: string;
+  linearProjectSlug?: string | null;
+  linearProjectIdentity?: IssueLinearProjectIdentity;
+  routingSource?: string;
 }
 
 export type IssueDetailsSource = "live" | "durable" | "tracker";
@@ -219,6 +244,12 @@ export function toIssueStatusView(issue: Issue): IssueStatusView {
     blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
+    ...(issue.projectContext === undefined ? {} : { projectContext: { ...issue.projectContext } }),
+    ...(issue.projectContextId === undefined ? {} : { projectContextId: issue.projectContextId }),
+    ...(issue.projectContextLabel === undefined ? {} : { projectContextLabel: issue.projectContextLabel }),
+    ...(issue.linearProjectSlug === undefined ? {} : { linearProjectSlug: issue.linearProjectSlug }),
+    ...(issue.linearProjectIdentity === undefined ? {} : { linearProjectIdentity: { ...issue.linearProjectIdentity } }),
+    ...(issue.routingSource === undefined ? {} : { routingSource: issue.routingSource }),
   };
 }
 
