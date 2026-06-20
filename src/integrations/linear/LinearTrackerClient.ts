@@ -10,7 +10,7 @@ import type {
   TrackerWriteResult,
   TrackerWriter,
 } from "../../core/tracker/TrackerWriter.js";
-import type { Issue, IssueBlockerRef } from "../../core/types.js";
+import type { Issue, IssueBlockerRef, IssueProjectContextMetadata } from "../../core/types.js";
 
 type FetchLike = typeof fetch;
 
@@ -130,6 +130,12 @@ interface LinearIssueRelationContext {
       relatedIssue?: { id?: unknown } | null;
     }>;
   } | null;
+}
+
+interface LinearTrackerIssueContextMetadata {
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
 }
 
 export interface AssigneeFilter {
@@ -323,6 +329,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
   constructor(
     private readonly config: TrackerConfig,
     private readonly fetchImpl: FetchLike = fetch,
+    private readonly projectContextMetadata: LinearTrackerIssueContextMetadata | null = null,
   ) {}
 
   async fetchCandidateIssues(): Promise<Issue[]> {
@@ -334,15 +341,21 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
         activeStates: this.config.activeStates,
       },
       assigneeFilter,
+      "candidate_poll",
     );
   }
 
   async fetchIssuesByStates(stateNames: string[]): Promise<Issue[]> {
     if (stateNames.length === 0) return [];
-    return this.fetchPagedIssues(ISSUES_BY_STATES_QUERY, {
-      projectSlug: this.config.projectSlug,
-      states: stateNames,
-    });
+    return this.fetchPagedIssues(
+      ISSUES_BY_STATES_QUERY,
+      {
+        projectSlug: this.config.projectSlug,
+        states: stateNames,
+      },
+      null,
+      "state_refresh",
+    );
   }
 
   async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {
@@ -352,7 +365,13 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       ids: issueIds,
     });
     return response.issues.nodes
-      .map((node) => normalizeIssue(node, assigneeFilter))
+      .map((node) =>
+        normalizeIssue(
+          node,
+          assigneeFilter,
+          this.issueProjectContextMetadata(node, "state_refresh", { requireActualProjectSlugMatch: true }),
+        ),
+      )
       .filter((issue): issue is Issue => issue !== null);
   }
 
@@ -561,6 +580,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     query: string,
     variables: Record<string, unknown>,
     assigneeFilter: AssigneeFilter | null = null,
+    routingSource: IssueProjectContextMetadata["routingSource"] = "state_refresh",
   ): Promise<Issue[]> {
     const issues: Issue[] = [];
     let after: string | null = null;
@@ -573,7 +593,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       );
       issues.push(
         ...response.issues.nodes
-          .map((node) => normalizeIssue(node, assigneeFilter))
+          .map((node) => normalizeIssue(node, assigneeFilter, this.issueProjectContextMetadata(node, routingSource)))
           .filter((issue): issue is Issue => issue !== null),
       );
 
@@ -585,6 +605,24 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     } while (after);
 
     return issues;
+  }
+
+  private issueProjectContextMetadata(
+    node: Pick<LinearIssueNode, "project">,
+    routingSource: IssueProjectContextMetadata["routingSource"],
+    options: { requireActualProjectSlugMatch?: boolean } = {},
+  ): IssueProjectContextMetadata | null {
+    if (!this.projectContextMetadata) return null;
+    const actualLinearProjectSlug = asNullableString(node.project?.slugId);
+    if (options.requireActualProjectSlugMatch && !sameProjectSlug(actualLinearProjectSlug, this.projectContextMetadata.linearProjectSlug)) {
+      return null;
+    }
+    return {
+      projectContextId: this.projectContextMetadata.projectContextId,
+      projectContextLabel: this.projectContextMetadata.projectContextLabel,
+      linearProjectSlug: actualLinearProjectSlug ?? this.projectContextMetadata.linearProjectSlug,
+      routingSource,
+    };
   }
 
   private async routingAssigneeFilter(): Promise<AssigneeFilter | null> {
@@ -697,7 +735,11 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
   }
 }
 
-export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFilter | null = null): Issue | null {
+export function normalizeIssue(
+  node: LinearIssueNode,
+  assigneeFilter: AssigneeFilter | null = null,
+  projectContextMetadata: IssueProjectContextMetadata | null = null,
+): Issue | null {
   const id = asString(node.id);
   const identifier = asString(node.identifier);
   const title = asString(node.title);
@@ -707,6 +749,13 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
   const delegateId = asNullableString(node.delegate?.id);
   const linearProjectSlug = asNullableString(node.project?.slugId);
   const linearProjectId = asNullableString(node.project?.id);
+  const resolvedProjectContext =
+    projectContextMetadata === null
+      ? null
+      : {
+          ...projectContextMetadata,
+          linearProjectSlug: linearProjectSlug ?? projectContextMetadata.linearProjectSlug,
+        };
 
   return {
     id,
@@ -733,6 +782,15 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
           },
         }
       : {}),
+    ...(resolvedProjectContext === null
+      ? {}
+      : {
+          projectContext: resolvedProjectContext,
+          projectContextId: resolvedProjectContext.projectContextId,
+          projectContextLabel: resolvedProjectContext.projectContextLabel,
+          linearProjectSlug: resolvedProjectContext.linearProjectSlug,
+          routingSource: resolvedProjectContext.routingSource,
+        }),
   } as Issue;
 }
 
@@ -770,6 +828,10 @@ function asNullableString(value: unknown): string | null {
 
 function sameName(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function sameProjectSlug(left: string | null, right: string | null): boolean {
+  return left !== null && right !== null && left.toLowerCase() === right.toLowerCase();
 }
 
 function formatTeam(teamKey: string, teamName: string | null): string {

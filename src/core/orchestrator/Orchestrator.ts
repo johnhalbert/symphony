@@ -1031,7 +1031,13 @@ export class Orchestrator {
 
   private issueWithRequestedProjectContext(issue: Issue, requestedProjectContext?: ProjectContextResolution): Issue {
     const projectContext = this.requestedProjectContextForIssue(issue, requestedProjectContext);
-    if (!projectContext || this.issueHasExplicitProjectContextProof(issue)) return issue;
+    if (
+      !projectContext ||
+      this.issueHasExplicitProjectContextProof(issue) ||
+      !this.requestedProjectContextCanProveRouting(projectContext)
+    ) {
+      return issue;
+    }
     return { ...issue, projectContext } as Issue;
   }
 
@@ -1147,6 +1153,17 @@ export class Orchestrator {
       : normalizedProjectContextId;
   }
 
+  private requestedProjectContextCanProveRouting(projectContext?: ProjectContextResolution): boolean {
+    if (!projectContext) return false;
+    const requestedProjectSlug = normalizeProjectSlug(projectContext.linearProjectSlug);
+    if (requestedProjectSlug === null) return true;
+    return (
+      this.config.projectContexts.enabledContexts.filter((context) =>
+        sameProjectSlug(context.tracker.projectSlug, requestedProjectSlug),
+      ).length <= 1
+    );
+  }
+
   private issueHasExplicitProjectContextProof(issue: Issue): boolean {
     const candidate = issue as {
       projectContext?: { projectContextId?: unknown } | null;
@@ -1176,6 +1193,7 @@ export class Orchestrator {
     requestedProjectContext?: ProjectContextResolution,
   ): boolean {
     if (!requestedProjectContext) return true;
+    if (!this.requestedProjectContextCanProveRouting(requestedProjectContext)) return false;
     const requestedProjectContextId = this.comparableProjectContextId(requestedProjectContext);
     if (requestedProjectContextId === this.config.projectContexts.defaultContextId) {
       return tracker === this.options.tracker || Boolean(this.options.trackerResolver);
@@ -2242,10 +2260,12 @@ export class Orchestrator {
       await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
       this.requireMcpHandoff("review");
 
+      const runConfig = this.configForProjectContext(this.resolvedProjectContext(entry));
       entry.turnCount = 1;
+      const promptIssue = this.issueWithResolvedProjectContext(entry);
       const prompt = this.formatRenderedReviewerPrompt(
-        await this.promptRenderer.render(this.reviewerPromptTemplate(), {
-          issue: entry.issue,
+        await this.promptRenderer.render(this.reviewerPromptTemplate(runConfig), {
+          issue: promptIssue,
           attempt: null,
           role: "reviewer",
           completionReport: evidence.completionReport,
@@ -2253,17 +2273,19 @@ export class Orchestrator {
           workspaceEvidence: workspaceEvidenceForReview(entry.issue, workspace, evidence),
           validationEvidence: evidence.completionReport.validationEvidence,
           runDigest: evidence.runDigest,
-          reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
-          workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+          reviewerPromptExtensions: runConfig.reviewLoop.reviewerPromptExtensions,
+          workerPromptExtensions: runConfig.reviewLoop.workerPromptExtensions,
         }),
+        this.renderResolvedProjectContextPrompt(entry),
         {
-          issue: entry.issue,
+          issue: promptIssue,
           role: "reviewer",
           workspacePath: workspace.path,
           branchName: workspace.gitBranchName ?? entry.issue.branchName ?? null,
           repoPath: workspace.repoPath ?? null,
           baseRef: workspace.baseRef ?? null,
         },
+        runConfig,
       );
       await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, null, 1), prompt), {
         workspace,
@@ -2319,6 +2341,7 @@ export class Orchestrator {
           role: entry.role,
           runPhase: entry.runPhase,
           runKind: runKindForPhase(entry.runPhase),
+
           issueId: entry.issue.id,
           issueIdentifier: entry.issue.identifier,
           projectContext: this.resolvedProjectContext(entry),
@@ -3220,6 +3243,25 @@ export class Orchestrator {
     return null;
   }
 
+  private issueWithResolvedProjectContext(entry: RunningEntry): Issue {
+    return issueWithProjectContext(entry.issue, this.resolvedProjectContext(entry) ?? null);
+  }
+
+  private renderResolvedProjectContextPrompt(entry: RunningEntry): string | null {
+    const projectContext = this.resolvedProjectContext(entry);
+    if (!projectContext) return null;
+    return [
+      "",
+      "Service-resolved project context:",
+      "- This context is selected by Symphony routing before dispatch and is authoritative for this run.",
+      "- Use it when interpreting repository, workspace, and review scope, but do not alter, overwrite, or invent project-context values.",
+      `- Project context id: ${projectContext.projectContextId}`,
+      `- Label: ${projectContext.projectContextLabel}`,
+      `- Linear project slug: ${projectContext.linearProjectSlug ?? "n/a"}`,
+      `- Routing source: ${projectContext.routingSource}`,
+    ].join("\n");
+  }
+
   private buildRunContext(
     entry: RunningEntry,
     workspace: Workspace,
@@ -3229,7 +3271,7 @@ export class Orchestrator {
     const projectContext = this.resolvedProjectContext(entry);
     const config = this.configForProjectContext(projectContext);
     return {
-      issue: entry.issue,
+      issue: issueWithProjectContext(entry.issue, projectContext ?? null),
       projectContext,
       role: entry.role,
       runPhase: entry.runPhase,
@@ -3763,53 +3805,80 @@ export class Orchestrator {
     };
   }
 
-  private reviewerPromptTemplate(): string {
-    const configured = this.config.reviewLoop.reviewerPromptTemplate;
+  private reviewerPromptTemplate(config: ServiceConfig = this.config): string {
+    const configured = config.reviewLoop.reviewerPromptTemplate;
     if (configured !== null && configured.trim().length > 0) return configured;
     return DEFAULT_REVIEWER_PROMPT_TEMPLATE;
   }
 
   private formatRenderedReviewerPrompt(
     prompt: string,
+    projectContextPrompt: string | null,
     mcpHandoff: Parameters<typeof renderReviewMcpHandoffPrompt>[0],
+    config: ServiceConfig = this.config,
   ): string {
-    const configured = this.config.reviewLoop.reviewerPromptTemplate;
-    if (configured !== null && configured.trim().length > 0) return prompt;
+    const configured = config.reviewLoop.reviewerPromptTemplate;
+    if (configured !== null && configured.trim().length > 0) {
+      return [prompt, projectContextPrompt, renderReviewMcpHandoffPrompt(mcpHandoff)]
+        .filter((item): item is string => item !== null && item.length > 0)
+        .join("\n")
+        .trim();
+    }
     const rendered = prompt
       .replace(
         PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER,
-        formatPromptExtensions("Project-specific reviewer extensions:", this.config.reviewLoop.reviewerPromptExtensions) ??
-          "",
+        formatPromptExtensions("Project-specific reviewer extensions:", config.reviewLoop.reviewerPromptExtensions) ?? "",
       )
       .trim();
-    return [rendered, renderReviewMcpHandoffPrompt(mcpHandoff)].join("\n").trim();
+    return [rendered, projectContextPrompt, renderReviewMcpHandoffPrompt(mcpHandoff)]
+      .filter((item): item is string => item !== null && item.length > 0)
+      .join("\n")
+      .trim();
   }
 
   private async renderWorkerPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
     if (entry.runPhase === "merge_conflict_resolution") return this.renderMergeConflictResolutionPrompt(entry);
+    const runConfig = this.configForProjectContext(this.resolvedProjectContext(entry));
     const basePrompt = await this.promptRenderer.render(this.promptTemplate, {
-      issue: entry.issue,
+      issue: this.issueWithResolvedProjectContext(entry),
       attempt,
-      reviewerPromptExtensions: this.config.reviewLoop.reviewerPromptExtensions,
-      workerPromptExtensions: this.config.reviewLoop.workerPromptExtensions,
+      reviewerPromptExtensions: runConfig.reviewLoop.reviewerPromptExtensions,
+      workerPromptExtensions: runConfig.reviewLoop.workerPromptExtensions,
     });
+    const projectContextPrompt = this.renderResolvedProjectContextPrompt(entry);
     const issueBreakdownPlan = await this.loadIssueBreakdownPlanPrompt(entry);
     const runtimeSourceScope = this.renderRuntimeSourceScopePrompt(entry.issue);
-    const reviewHardening = this.workerReviewHardeningPrompt();
+    const reviewHardening = this.workerReviewHardeningPrompt(runConfig);
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
     const mergeGate = mergeGateResult?.text ?? null;
     const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
-    return [basePrompt, issueBreakdownPlan, runtimeSourceScope, reviewHardening, handoff, this.workerMcpPrompt(entry), mergeGate, reviewVerdict, reviewEvidence]
+    return [
+      basePrompt,
+      projectContextPrompt,
+      issueBreakdownPlan,
+      runtimeSourceScope,
+      reviewHardening,
+      handoff,
+      this.workerMcpPrompt(entry),
+      mergeGate,
+      reviewVerdict,
+      reviewEvidence,
+    ]
       .filter((item): item is string => item !== null)
       .join("\n");
   }
 
   private async renderIssueBreakdownPrompt(entry: RunningEntry, attempt: number | null): Promise<string> {
     const config = this.configForProjectContext(this.resolvedProjectContext(entry));
-    const basePrompt = await this.promptRenderer.render(config.issueBreakdown.promptTemplate, { issue: entry.issue, attempt });
-    return [basePrompt, this.issueBreakdownMcpPrompt(entry)].join("\n");
+    const basePrompt = await this.promptRenderer.render(config.issueBreakdown.promptTemplate, {
+      issue: this.issueWithResolvedProjectContext(entry),
+      attempt,
+    });
+    return [basePrompt, this.renderResolvedProjectContextPrompt(entry), this.issueBreakdownMcpPrompt(entry)]
+      .filter((item): item is string => item !== null)
+      .join("\n");
   }
 
   private async renderMergeConflictResolutionPrompt(entry: RunningEntry): Promise<string> {
@@ -3821,6 +3890,7 @@ export class Orchestrator {
       "",
       "You are a scoped Symphony conflict-fix worker. Only resolve the merge conflict on the existing lifecycle-bound pull request.",
       "Do not perform unrelated implementation work, request review, move Linear state, or call submit_completion_report.",
+      this.renderResolvedProjectContextPrompt(entry),
       "",
       "Conflict metadata:",
       `- Pull request: ${formatPullRequest(conflict?.pullRequest.number ?? null, conflict?.pullRequest.url ?? null)}`,
@@ -3839,18 +3909,22 @@ export class Orchestrator {
       `- Branch: ${workspace?.gitBranchName ?? entry.issue.branchName ?? "n/a"}`,
       `- Base ref: ${workspace?.baseRef ?? "n/a"}`,
       this.mergeConflictResolutionMcpPrompt(entry),
-    ].join("\n");
+    ]
+      .filter((item): item is string => item !== null)
+      .join("\n");
   }
 
   private issueBreakdownMcpPrompt(entry: RunningEntry): string {
     this.requireMcpHandoff("issue_breakdown");
-    return renderIssueBreakdownMcpHandoffPrompt({ issue: entry.issue });
+    return renderIssueBreakdownMcpHandoffPrompt({ issue: this.issueWithResolvedProjectContext(entry) });
   }
 
   private async renderWorkerContinuationPrompt(entry: RunningEntry): Promise<string> {
+    const runConfig = this.configForProjectContext(this.resolvedProjectContext(entry));
     const continuationBrief = await this.renderContinuationBrief(entry);
+    const projectContextPrompt = this.renderResolvedProjectContextPrompt(entry);
     const runtimeSourceScope = this.renderRuntimeSourceScopePrompt(entry.issue);
-    const reviewHardening = this.workerReviewHardeningPrompt();
+    const reviewHardening = this.workerReviewHardeningPrompt(runConfig);
     const reviewEvidence = await this.loadWorkerReviewEvidencePrompt(entry);
     const handoff = await this.loadWorkerHandoffPrompt(entry);
     const mergeGateResult = await this.loadWorkerMergeGatePromptResult(entry);
@@ -3858,6 +3932,7 @@ export class Orchestrator {
     const reviewVerdict = mergeGateResult?.kind === "repair" ? null : await this.loadWorkerReviewVerdictPrompt(entry);
     return [
       continuationBrief,
+      projectContextPrompt,
       runtimeSourceScope,
       reviewHardening,
       handoff,
@@ -3890,11 +3965,11 @@ export class Orchestrator {
     ].join("\n");
   }
 
-  private workerReviewHardeningPrompt(): string {
+  private workerReviewHardeningPrompt(config: ServiceConfig = this.config): string {
     return [
       "",
       DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE,
-      formatPromptExtensions("Project-specific worker extensions:", this.config.reviewLoop.workerPromptExtensions),
+      formatPromptExtensions("Project-specific worker extensions:", config.reviewLoop.workerPromptExtensions),
     ]
       .filter((item): item is string => item !== null)
       .join("\n");
@@ -3978,7 +4053,7 @@ export class Orchestrator {
     this.requireMcpHandoff("implementation");
     const workspace = entry.workspace;
     return renderCompletionMcpHandoffPrompt({
-      issue: entry.issue,
+      issue: this.issueWithResolvedProjectContext(entry),
       role: entry.role,
       workspacePath: workspace?.path ?? entry.workspacePath,
       branchName: workspace?.gitBranchName ?? entry.issue.branchName ?? null,
@@ -3992,7 +4067,7 @@ export class Orchestrator {
     this.requireMcpHandoff("merge_conflict_resolution");
     const workspace = entry.workspace;
     return renderMergeConflictResolutionMcpHandoffPrompt({
-      issue: entry.issue,
+      issue: this.issueWithResolvedProjectContext(entry),
       workspacePath: workspace?.path ?? entry.workspacePath,
       branchName: workspace?.gitBranchName ?? entry.issue.branchName ?? null,
       repoPath: workspace?.repoPath ?? null,
@@ -4624,9 +4699,7 @@ function projectContextLookupOptions(projectContext: ProjectContextResolution | 
 
 function issueWithProjectContext(issue: Issue, projectContext: ProjectContextResolution | null | undefined) {
   return {
-    id: issue.id,
-    identifier: issue.identifier,
-    branchName: issue.branchName,
+    ...issue,
     ...(projectContext ? { projectContext } : {}),
   };
 }
@@ -4940,4 +5013,16 @@ function liveCancelFailedForEntry(entry: RunningEntry): CancelFailedState {
     reason: null,
     source: null,
   };
+}
+
+function normalizeProjectSlug(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function sameProjectSlug(left: string | null | undefined, right: string | null | undefined): boolean {
+  const normalizedLeft = normalizeProjectSlug(left);
+  const normalizedRight = normalizeProjectSlug(right);
+  return normalizedLeft !== null && normalizedRight !== null && normalizedLeft.toLowerCase() === normalizedRight.toLowerCase();
 }
