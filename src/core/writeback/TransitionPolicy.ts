@@ -1,7 +1,6 @@
 import type { ServiceConfig } from "../config/Config.js";
 import { resolveServiceConfigForProjectContext } from "../config/ProjectContextServiceConfig.js";
 import type { ProjectContextResolution } from "../config/ProjectContexts.js";
-import { SymphonyError } from "../errors.js";
 import type {
   IssueCompletionReportRecord,
   IssueMergeGateMergeabilityState,
@@ -156,20 +155,6 @@ function resolveTransitionPolicyConfig(
   config: ServiceConfig,
   projectContext?: ProjectContextResolution,
 ): ServiceConfig {
-  try {
-    return resolveServiceConfigForProjectContext(config, projectContext);
-  } catch (error) {
-    if (error instanceof SymphonyError && error.code === "config_validation_error") {
-      return config;
-    }
-    throw error;
-  }
-}
-
-function resolveStrictTransitionPolicyConfig(
-  config: ServiceConfig,
-  projectContext?: ProjectContextResolution,
-): ServiceConfig {
   return resolveServiceConfigForProjectContext(config, projectContext);
 }
 
@@ -178,7 +163,7 @@ export function planDispatchWriteback(
   config: ServiceConfig,
   projectContext?: ProjectContextResolution,
 ): NewWritebackOperation | null {
-  const resolvedConfig = resolveStrictTransitionPolicyConfig(config, projectContext);
+  const resolvedConfig = resolveTransitionPolicyConfig(config, projectContext);
   if (!resolvedConfig.writeback.enabled) return null;
   const fromStates = sameName(resolvedConfig.writeback.dispatchState, "Todo")
     ? [resolvedConfig.writeback.dispatchState]

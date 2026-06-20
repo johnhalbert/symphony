@@ -171,6 +171,55 @@ describe("TransitionPolicy review-loop planners", () => {
     );
   });
 
+  it("fails closed before completion-report acceptance planning when an explicit project context is not configured", () => {
+    const config = contextAwareTransitionPolicyConfig();
+
+    expect(() =>
+      planCompletionReportAcceptedWritebacks(
+        {
+          issue: issue({ state: "In Progress", branchName: "symphony/DOCS-ARCHIVE-1" }),
+          projectContext: staleDocsProjectContext(),
+          runId: "run-stale-docs",
+          sessionId: "session-1",
+          workspacePath: "/tmp/docs-workspace",
+        },
+        config,
+        "Validated stale docs context routing.",
+      ),
+    ).toThrow('Resolved project context "docs-archive" is not configured');
+  });
+
+  it("fails closed before PR-handoff planning when an explicit project context is not configured", () => {
+    const config = contextAwareTransitionPolicyConfig();
+
+    expect(() =>
+      planPullRequestHandoffWritebacks(
+        {
+          issue: issue({ state: "In Progress", branchName: "symphony/DOCS-ARCHIVE-1" }),
+          projectContext: staleDocsProjectContext(),
+          runId: "run-stale-docs",
+          sessionId: "session-1",
+          workspacePath: "/tmp/docs-workspace",
+        },
+        config,
+        {
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/109",
+            number: 109,
+            headSha: "archive123",
+            branch: "symphony/DOCS-ARCHIVE-1",
+            draft: false,
+          },
+          ci: {
+            requiredChecks: ["Typecheck and test"],
+            passedChecks: ["Typecheck and test"],
+            noCiEvidence: null,
+          },
+        },
+      ),
+    ).toThrow('Resolved project context "docs-archive" is not configured');
+  });
+
   it("fails closed when a resolved project context does not recognize the issue state bucket", () => {
     const config = contextAwareTransitionPolicyConfig();
 

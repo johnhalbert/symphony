@@ -100,6 +100,18 @@ describe("CompletionReportService", () => {
     );
   });
 
+  it("fails closed when a completion report carries an explicit unconfigured project context", async () => {
+    const { service, outbox } = fixture();
+
+    await expect(
+      service.submitCompletionReport(
+        report({ idempotencyKey: "stale-context-idem" }),
+        context({ projectContext: staleDocsProjectContext }),
+      ),
+    ).rejects.toThrow('Resolved project context "docs-archive" is not configured');
+    await expect(outbox.list()).resolves.toEqual([]);
+  });
+
   it("accepts same-context completion reports when only project-context metadata drifts and preserves the lifecycle context", async () => {
     const { service, lifecycleStore, outbox } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
@@ -1081,6 +1093,13 @@ const docsProjectContext = {
   projectContextLabel: "Documentation Site",
   linearProjectSlug: "DOCS",
   routingSource: "candidate_poll",
+} as const;
+
+const staleDocsProjectContext = {
+  projectContextId: "docs-archive",
+  projectContextLabel: "Archived Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "explicit",
 } as const;
 
 function addDocsProjectContext(config: ReturnType<typeof testConfig>): void {

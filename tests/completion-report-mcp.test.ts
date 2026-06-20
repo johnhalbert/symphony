@@ -1643,6 +1643,23 @@ github:
     no_ci:
       allowed: true
       evidence: No CI configured in MCP test
+project_contexts:
+  - id: default
+    label: Default
+    tracker:
+      project_slug: TEST
+    workspace:
+      source:
+        kind: copy
+        path: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  - id: docs
+    label: Documentation Site
+    tracker:
+      project_slug: DOCS
+    workspace:
+      source:
+        kind: copy
+        path: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
 ---
 Work on {{ issue.identifier }}.
 `;

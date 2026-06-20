@@ -1240,14 +1240,7 @@ function resolveCompletionReportServiceConfig(
   config: ServiceConfig,
   projectContext?: ProjectContextResolution,
 ): ServiceConfig {
-  try {
-    return resolveServiceConfigForProjectContext(config, projectContext);
-  } catch (error) {
-    if (error instanceof SymphonyError && error.code === "config_validation_error") {
-      return config;
-    }
-    throw error;
-  }
+  return resolveServiceConfigForProjectContext(config, projectContext);
 }
 
 function validateCompletionReportProjectContext(
