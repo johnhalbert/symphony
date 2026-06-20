@@ -228,7 +228,38 @@ export interface IssueDetailsEnvelope {
   latestRun: IssueLatestRunSummary;
 }
 
+function projectContextIdForIssueStatusView(issue: Issue): string | undefined {
+  return issue.projectContext?.projectContextId ?? issue.projectContextId;
+}
+
+function projectContextLabelForIssueStatusView(issue: Issue): string | undefined {
+  return issue.projectContext?.projectContextLabel ?? issue.projectContextLabel;
+}
+
+function linearProjectSlugForIssueStatusView(issue: Issue): string | null | undefined {
+  return issue.projectContext?.linearProjectSlug ?? issue.linearProjectSlug;
+}
+
+function routingSourceForIssueStatusView(issue: Issue): string | undefined {
+  return issue.projectContext?.routingSource ?? issue.routingSource;
+}
+
+function linearProjectIdentityForIssueStatusView(issue: Issue): IssueLinearProjectIdentity | undefined {
+  if (issue.linearProjectIdentity) {
+    return { ...issue.linearProjectIdentity };
+  }
+
+  const slug = issue.projectContext?.linearProjectSlug;
+  return slug === undefined || slug === null ? undefined : { kind: "linear", slug };
+}
+
 export function toIssueStatusView(issue: Issue): IssueStatusView {
+  const projectContextId = projectContextIdForIssueStatusView(issue);
+  const projectContextLabel = projectContextLabelForIssueStatusView(issue);
+  const linearProjectSlug = linearProjectSlugForIssueStatusView(issue);
+  const linearProjectIdentity = linearProjectIdentityForIssueStatusView(issue);
+  const routingSource = routingSourceForIssueStatusView(issue);
+
   return {
     id: issue.id,
     identifier: issue.identifier,
@@ -245,11 +276,11 @@ export function toIssueStatusView(issue: Issue): IssueStatusView {
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
     ...(issue.projectContext === undefined ? {} : { projectContext: { ...issue.projectContext } }),
-    ...(issue.projectContextId === undefined ? {} : { projectContextId: issue.projectContextId }),
-    ...(issue.projectContextLabel === undefined ? {} : { projectContextLabel: issue.projectContextLabel }),
-    ...(issue.linearProjectSlug === undefined ? {} : { linearProjectSlug: issue.linearProjectSlug }),
-    ...(issue.linearProjectIdentity === undefined ? {} : { linearProjectIdentity: { ...issue.linearProjectIdentity } }),
-    ...(issue.routingSource === undefined ? {} : { routingSource: issue.routingSource }),
+    ...(projectContextId === undefined ? {} : { projectContextId }),
+    ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+    ...(linearProjectSlug === undefined ? {} : { linearProjectSlug }),
+    ...(linearProjectIdentity === undefined ? {} : { linearProjectIdentity }),
+    ...(routingSource === undefined ? {} : { routingSource }),
   };
 }
 
