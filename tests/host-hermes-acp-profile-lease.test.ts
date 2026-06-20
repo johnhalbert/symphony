@@ -242,6 +242,60 @@ describe("HostHermesAcpProfileLease", () => {
     );
   });
 
+  it("removes stale command-policy hooks for ACP lease profiles when requested without installing a new hook", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "symphony-hermes-acp-hook-disabled-"));
+    const expectedProfileName = normalizeHostHermesAcpProfileName("worker-run");
+    const profileDir = path.join(root, "profiles", expectedProfileName);
+    await fs.mkdir(profileDir, { recursive: true });
+    await fs.writeFile(
+      path.join(profileDir, "config.yaml"),
+      [
+        "hooks_auto_accept: true",
+        "hooks:",
+        "  pre_tool_call:",
+        "    - matcher: terminal|execute_code",
+        "      command: node cli.js agent-command-policy-hook --role worker",
+        "      timeout: 10",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const { calls, runner } = commandRecorder((command) => {
+      if (command.args.join(" ") === `-p ${expectedProfileName} profile`) {
+        return {
+          stdout: `\n  Profile: ${expectedProfileName}\n  Home:    ${profileDir}\n`,
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const verifier = vi.fn(async () => undefined);
+
+    const lease = await createHostHermesAcpProfileLease({
+      binaryPath: "hermes",
+      cwd: "/workspace",
+      profileName: "worker-run",
+      sourceProfile: "operator",
+      keepProfiles: "never",
+      runner,
+      removeCommandPolicyHooks: true,
+      commandPolicyHookVerifier: verifier,
+    });
+
+    expect(lease.profileDir).toBe(profileDir);
+    expect(lease.commandPolicyDecisionJournalPath).toBeNull();
+    expect(calls.map((call) => call.args)).toEqual([
+      ["-p", "operator", "acp", "--check"],
+      ["profile", "create", expectedProfileName, "--clone", "--clone-from", "operator", "--no-alias"],
+      ["-p", expectedProfileName, "profile"],
+    ]);
+    const config = await fs.readFile(path.join(profileDir, "config.yaml"), "utf8");
+    expect(config).not.toContain("agent-command-policy-hook");
+    expect(config).not.toContain("hooks_auto_accept");
+    expect(verifier).not.toHaveBeenCalled();
+  });
+
   it("defaults source profile to active host Hermes profile and preserves failed-run profiles by default", async () => {
     const { calls, runner } = commandRecorder([
       { stdout: "\nActive profile: host-default\nPath: /home/me/.hermes\n", stderr: "", exitCode: 0 },

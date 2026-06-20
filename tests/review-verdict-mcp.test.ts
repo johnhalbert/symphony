@@ -156,6 +156,75 @@ describe("review verdict MCP handoff", () => {
       payload: { toState: "Ready to Merge" },
     });
   });
+
+  it("submits a reviewer blocked verdict through ReviewVerdictService", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    await lifecycleStore.ensureIssue(issue({ state: "In Review", branchName: "symphony/TEST-1" }), {
+      phase: "review",
+      reviewRound: 1,
+      summaryPointers: { lastRunId: "review-run-3" },
+    });
+    await writeReviewVerdictMcpContext(contextFile, {
+      issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      activeRunId: "review-run-3",
+      role: "reviewer",
+      reviewer: "reviewer-agent:review-run-3",
+      phase: "review",
+    });
+
+    const result = await submitReviewVerdictFromMcp(
+      {
+        verdict: "blocked",
+        acceptanceResults: [
+          {
+            text: "Required validation evidence is available.",
+            satisfied: false,
+            evidence: "Worker/reviewer command policy blocks the required focused validation commands.",
+          },
+        ],
+        findings: ["Required validation is unavailable to worker and reviewer command surfaces."],
+        gateFindings: [],
+        discoveryFindings: [],
+        evidence: ["reviewer observed command-policy denial"],
+        idempotencyKey: "review-blocked-1",
+      },
+      { workflowPath, contextFile },
+    );
+
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      verdictId: "review-verdict:issue-1:review-run-3:review-blocked-1",
+      verdict: "blocked",
+    });
+    await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
+      phase: "blocked",
+      reviewRound: 1,
+      lastReviewVerdictId: "review-verdict:issue-1:review-run-3:review-blocked-1",
+      reviewVerdicts: [
+        {
+          idempotencyKey: "review-run-3:review-blocked-1",
+          runId: "review-run-3",
+          verdict: "blocked",
+          reviewer: "reviewer-agent:review-run-3",
+        },
+      ],
+    });
+    const outbox = await new FileWritebackOutboxStore(stateDir).list();
+    expect(outbox.find((operation) => operation.kind === "comment")).toMatchObject({
+      kind: "comment",
+      runId: "review-run-3",
+    });
+    expect(outbox.find((operation) => operation.kind === "transition")).toMatchObject({
+      kind: "transition",
+      runId: "review-run-3",
+      payload: { toState: "Blocked" },
+    });
+  });
 });
 
 function workflow(stateDir: string): string {
@@ -176,6 +245,8 @@ writeback:
 review_loop:
   review_states:
     - In Review
+  blocked_states:
+    - Blocked
   review_pass_state: Ready to Merge
 workspace:
   root: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"

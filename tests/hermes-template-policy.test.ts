@@ -7,7 +7,9 @@ import {
   buildHermesAgentCommandPolicyHookConfig,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
+  SYMPHONY_HERMES_APPROVAL_MODE,
   SYMPHONY_HERMES_AGENT_MAX_TURNS,
+  SYMPHONY_HERMES_TIRITH_ENABLED,
 } from "../hermes/src/HermesMcpConfig.js";
 import { HermesProfileManager } from "../hermes/src/HermesProfileManager.js";
 import { parseServiceConfig } from "../src/core/config/Config.js";
@@ -63,6 +65,19 @@ describe("Hermes role template policy", () => {
     expect(compressionThreshold(worker)).toBe(0.75);
     expect(compressionThreshold(reviewer)).toBe(0.75);
     expect(compressionThreshold(planner)).toBe(0.75);
+  });
+
+  it("turns off Hermes native approval prompts and Tirith scanning in all role templates", async () => {
+    const templatesDir = path.resolve("hermes", "templates");
+
+    const worker = await readTemplateConfig(path.join(templatesDir, "worker", "config.yaml"));
+    const reviewer = await readTemplateConfig(path.join(templatesDir, "reviewer", "config.yaml"));
+    const planner = await readTemplateConfig(path.join(templatesDir, "planner", "config.yaml"));
+
+    for (const config of [worker, reviewer, planner]) {
+      expect(approvalMode(config)).toBe(SYMPHONY_HERMES_APPROVAL_MODE);
+      expect(tirithEnabled(config)).toBe(SYMPHONY_HERMES_TIRITH_ENABLED);
+    }
   });
 
   it("defines generated worker/reviewer pre_tool_call hooks for command-capable profile tools", () => {
@@ -262,6 +277,20 @@ function compressionThreshold(config: Record<string, unknown>): number | null {
   if (typeof compression !== "object" || compression === null || Array.isArray(compression)) return null;
   const threshold = (compression as Record<string, unknown>).threshold;
   return typeof threshold === "number" ? threshold : null;
+}
+
+function approvalMode(config: Record<string, unknown>): string | null {
+  const approvals = config.approvals;
+  if (typeof approvals !== "object" || approvals === null || Array.isArray(approvals)) return null;
+  const mode = (approvals as Record<string, unknown>).mode;
+  return typeof mode === "string" ? mode : null;
+}
+
+function tirithEnabled(config: Record<string, unknown>): boolean | null {
+  const security = config.security;
+  if (typeof security !== "object" || security === null || Array.isArray(security)) return null;
+  const enabled = (security as Record<string, unknown>).tirith_enabled;
+  return typeof enabled === "boolean" ? enabled : null;
 }
 
 function delegationMaxIterations(config: Record<string, unknown>): number | null {

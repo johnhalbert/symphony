@@ -9,6 +9,7 @@ import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbo
 import {
   planBlockedEscalationWritebacks,
   planCompletionReportAcceptedWritebacks,
+  planCompletionReportRejectedWritebacks,
   planIssuePostMortemReportWritebacks,
   planIssueTriageReportWritebacks,
   planMergeGateBlockedWritebacks,
@@ -73,6 +74,58 @@ describe("TransitionPolicy review-loop planners", () => {
         config,
       ),
     ).toEqual([]);
+  });
+
+  it("plans completion report rejected comment without transitioning state", () => {
+    const config = reviewLoopConfig();
+    const operations = planCompletionReportRejectedWritebacks(
+      {
+        issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+        runId: "run-1",
+        sessionId: "session-1",
+        workspacePath: "/tmp/workspace",
+      },
+      config,
+      {
+        reason: "Completion report cannot be accepted with unsatisfied acceptance checklist items",
+        report: {
+          reportId: "completion-report:issue-1:idem-1",
+          idempotencyKey: "idem-1",
+          summary: "Implemented part of the contract.",
+          validationEvidence: ["npm test could not run"],
+          acceptanceChecklist: [
+            {
+              text: "REQ-1 Required validation is complete.",
+              satisfied: false,
+              evidence: "Focused validation could not run in this worker environment.",
+            },
+            {
+              text: "REQ-2 Code compiles.",
+              satisfied: true,
+              evidence: "npm run typecheck",
+            },
+          ],
+          changedFiles: ["src/core/CompletionReportService.ts"],
+          branchName: "symphony/TEST-1",
+          pullRequest: null,
+          risks: ["Validation is incomplete."],
+        },
+      },
+    );
+
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:run-1:completion-report:idem-1:rejected",
+      kind: "comment",
+      payload: {
+        dedupeKey: "run-1:completion-report:idem-1:rejected",
+      },
+    });
+    expect(commentBody(operations, 0)).toContain("## Symphony Completion Report");
+    expect(commentBody(operations, 0)).toContain("Status: rejected");
+    expect(commentBody(operations, 0)).toContain("Next state: unchanged (not ready for review)");
+    expect(commentBody(operations, 0)).toContain("Completion report cannot be accepted with unsatisfied acceptance checklist items");
+    expect(commentBody(operations, 0)).toContain("REQ-1 Required validation is complete.");
   });
 
   it("plans verified PR handoff comment and transition to the configured handoff state", () => {

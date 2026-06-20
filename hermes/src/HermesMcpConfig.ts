@@ -28,6 +28,8 @@ export const SYMPHONY_HERMES_AGENT_MAX_TURNS = 999;
 export const SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER = "terminal|execute_code";
 export const SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS = 10;
 export const SYMPHONY_AGENT_COMMAND_POLICY_DECISION_JOURNAL_BASENAME = "agent-command-policy-decisions.ndjson";
+export const SYMPHONY_HERMES_APPROVAL_MODE = "off";
+export const SYMPHONY_HERMES_TIRITH_ENABLED = false;
 
 export interface BuildHermesAgentCommandPolicyHookOptions {
   cliPath: string;
@@ -47,12 +49,14 @@ export interface WriteHermesMcpConfigOptions {
   agentMaxTurns?: number;
   hooks?: HermesShellHooksConfig;
   hooksAutoAccept?: boolean;
+  removeCommandPolicyHooks?: boolean;
 }
 
 export interface WriteHermesShellHookConfigOptions {
   profileDir: string;
   hooks?: HermesShellHooksConfig;
   hooksAutoAccept?: boolean;
+  removeCommandPolicyHooks?: boolean;
 }
 
 export interface HermesAgentCommandPolicyHookInvocation {
@@ -84,13 +88,19 @@ export async function writeHermesMcpConfig(options: WriteHermesMcpConfigOptions)
     timeoutSeconds: options.timeoutSeconds ?? 120,
     connectTimeoutSeconds: options.connectTimeoutSeconds ?? 60,
   });
+  const hooks = nextHermesShellHooks(existing.hooks, {
+    generatedHooks: options.hooks,
+    removeCommandPolicyHooks: options.removeCommandPolicyHooks === true || options.hooks !== undefined,
+  });
   const next = {
     ...existing,
     ...(options.agentMaxTurns === undefined ? {} : { agent: { ...recordValue(existing.agent), max_turns: options.agentMaxTurns } }),
-    ...(options.hooks === undefined ? {} : { hooks: mergeHermesShellHooks(existing.hooks, options.hooks) }),
+    ...symphonyHermesNonInteractiveToolGuardConfig(existing),
+    ...(hooks === undefined ? {} : { hooks }),
     ...(options.hooksAutoAccept === undefined ? {} : { hooks_auto_accept: options.hooksAutoAccept }),
     mcp_servers: mcpServers,
   };
+  deleteRemovedHermesShellHookConfig(next, hooks, existing, options);
 
   await fs.mkdir(options.profileDir, { recursive: true });
   await fs.writeFile(configPath, YAML.stringify(next), "utf8");
@@ -100,11 +110,17 @@ export async function writeHermesMcpConfig(options: WriteHermesMcpConfigOptions)
 export async function writeHermesShellHookConfig(options: WriteHermesShellHookConfigOptions): Promise<void> {
   const configPath = path.join(options.profileDir, "config.yaml");
   const existing = await readYamlObject(configPath);
+  const hooks = nextHermesShellHooks(existing.hooks, {
+    generatedHooks: options.hooks,
+    removeCommandPolicyHooks: options.removeCommandPolicyHooks === true || options.hooks !== undefined,
+  });
   const next = {
     ...existing,
-    ...(options.hooks === undefined ? {} : { hooks: mergeHermesShellHooks(existing.hooks, options.hooks) }),
+    ...symphonyHermesNonInteractiveToolGuardConfig(existing),
+    ...(hooks === undefined ? {} : { hooks }),
     ...(options.hooksAutoAccept === undefined ? {} : { hooks_auto_accept: options.hooksAutoAccept }),
   };
+  deleteRemovedHermesShellHookConfig(next, hooks, existing, options);
 
   await fs.mkdir(options.profileDir, { recursive: true });
   await fs.writeFile(configPath, YAML.stringify(next), "utf8");
@@ -350,18 +366,72 @@ function stringEnv(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
 }
 
-function mergeHermesShellHooks(existingHooks: unknown, generatedHooks: HermesShellHooksConfig): HermesShellHooksConfig {
-  const merged: HermesShellHooksConfig = {};
+function nextHermesShellHooks(
+  existingHooks: unknown,
+  options: { generatedHooks: HermesShellHooksConfig | undefined; removeCommandPolicyHooks: boolean },
+): HermesShellHooksConfig | undefined {
+  const baseHooks = options.removeCommandPolicyHooks
+    ? removeHermesAgentCommandPolicyHooks(existingHooks)
+    : normalizeHermesShellHooks(existingHooks);
+  if (options.generatedHooks === undefined) return baseHooks;
+  return mergeHermesShellHooks(baseHooks, options.generatedHooks);
+}
+
+function deleteRemovedHermesShellHookConfig(
+  next: Record<string, unknown>,
+  hooks: HermesShellHooksConfig | undefined,
+  existing: Record<string, unknown>,
+  options: { hooksAutoAccept?: boolean; removeCommandPolicyHooks?: boolean },
+): void {
+  if (hooks === undefined && options.removeCommandPolicyHooks === true) {
+    delete next.hooks;
+    if (options.hooksAutoAccept === undefined && existing.hooks_auto_accept === true) {
+      delete next.hooks_auto_accept;
+    }
+  }
+}
+
+function normalizeHermesShellHooks(existingHooks: unknown): HermesShellHooksConfig | undefined {
+  const normalized: HermesShellHooksConfig = {};
   for (const [eventName, entries] of Object.entries(recordValue(existingHooks))) {
     if (!Array.isArray(entries)) continue;
     const parsedEntries = entries.filter(isHermesShellHookConfig);
-    if (parsedEntries.length > 0) merged[eventName] = parsedEntries;
+    if (parsedEntries.length > 0) normalized[eventName] = parsedEntries;
   }
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+function removeHermesAgentCommandPolicyHooks(existingHooks: unknown): HermesShellHooksConfig | undefined {
+  const normalized = normalizeHermesShellHooks(existingHooks);
+  if (normalized === undefined) return undefined;
+  const cleaned: HermesShellHooksConfig = {};
+  for (const [eventName, entries] of Object.entries(normalized)) {
+    const retained = entries.filter((entry) => !isGeneratedHermesAgentCommandPolicyHook(entry));
+    if (retained.length > 0) cleaned[eventName] = retained;
+  }
+  return Object.keys(cleaned).length > 0 ? cleaned : undefined;
+}
+
+function mergeHermesShellHooks(existingHooks: unknown, generatedHooks: HermesShellHooksConfig): HermesShellHooksConfig {
+  const merged: HermesShellHooksConfig = normalizeHermesShellHooks(existingHooks) ?? {};
   for (const [eventName, entries] of Object.entries(generatedHooks)) {
     const existingEntries = merged[eventName] ?? [];
     merged[eventName] = dedupeHermesShellHooks([...existingEntries, ...entries.filter(isHermesShellHookConfig)]);
   }
   return merged;
+}
+
+function symphonyHermesNonInteractiveToolGuardConfig(existing: Record<string, unknown>): Record<string, unknown> {
+  return {
+    approvals: {
+      ...recordValue(existing.approvals),
+      mode: SYMPHONY_HERMES_APPROVAL_MODE,
+    },
+    security: {
+      ...recordValue(existing.security),
+      tirith_enabled: SYMPHONY_HERMES_TIRITH_ENABLED,
+    },
+  };
 }
 
 function dedupeHermesShellHooks(entries: HermesShellHookConfig[]): HermesShellHookConfig[] {
@@ -387,6 +457,10 @@ function isHermesShellHookConfig(value: unknown): value is HermesShellHookConfig
 
 function isExpectedHook(entry: HermesShellHookConfig, expected: HermesShellHookConfig): boolean {
   return entry.command === expected.command && entry.matcher === expected.matcher && entry.timeout === expected.timeout;
+}
+
+function isGeneratedHermesAgentCommandPolicyHook(entry: HermesShellHookConfig): boolean {
+  return entry.command.includes("agent-command-policy-hook");
 }
 
 function assertCommandPolicyMatcherCoversRequiredTools(entry: HermesShellHookConfig, profileDir: string): void {

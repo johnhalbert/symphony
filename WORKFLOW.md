@@ -182,6 +182,8 @@ hermes:
   worker_session_lifecycle: reuse_by_issue
   merge_conflict_session_reuse: implementation_worker
   keep_profiles: always
+  command_policy:
+    enabled: false
 
 server:
   host: 0.0.0.0

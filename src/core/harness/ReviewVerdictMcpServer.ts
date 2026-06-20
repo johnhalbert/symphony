@@ -110,9 +110,9 @@ function reviewVerdictInputSchema(): Record<string, unknown> {
     required: ["verdict", "acceptanceResults", "findings", "gateFindings", "discoveryFindings", "evidence", "idempotencyKey"],
     properties: {
       verdict: {
-        enum: ["pass", "fail"],
+        enum: ["pass", "fail", "blocked"],
         description:
-          "Use fail only when at least one contract-entitled gate finding remains; pass is allowed with discovery findings when no gate findings remain.",
+          "Use fail only when at least one worker-owned, contract-entitled gate finding remains; use blocked when review cannot complete because of a non-worker-owned blocker such as unavailable validation tooling; pass is allowed with discovery findings when no gate findings remain.",
       },
       acceptanceResults: {
         type: "array",
@@ -135,13 +135,13 @@ function reviewVerdictInputSchema(): Record<string, unknown> {
       findings: {
         type: "array",
         description:
-          "Legacy compact gate-finding summaries. For structured submissions, this should equal gateFindings[].summary; use an empty array for pass verdicts.",
+          "Compact summaries. For fail verdicts, this should equal gateFindings[].summary. For blocked verdicts, use this for non-worker-owned blocker summaries. Use an empty array for pass verdicts.",
         items: { type: "string", minLength: 1 },
       },
       gateFindings: {
         type: "array",
         description:
-          "Blocking contract defects that are allowed to gate the worker. A fail verdict requires at least one item; a pass verdict requires none.",
+          "Blocking contract defects that are allowed to gate the worker. A fail verdict requires at least one item; pass and blocked verdicts require none.",
         items: {
           type: "object",
           additionalProperties: false,

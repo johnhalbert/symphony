@@ -156,6 +156,11 @@ export interface CompletionReportWritebackDetails {
   risks: string[];
 }
 
+export interface CompletionReportRejectionWritebackDetails {
+  reason: string;
+  report: CompletionReportWritebackDetails;
+}
+
 export interface PullRequestHandoffWritebackDetails {
   pullRequest: {
     url: string | null;
@@ -312,6 +317,50 @@ export function planCompletionReportAcceptedWritebacks(
         fromStates: completionReportFromStates,
         toState: reviewState,
         reason: "Symphony completion report accepted",
+      },
+    },
+  ];
+}
+
+export function planCompletionReportRejectedWritebacks(
+  context: RunWritebackContext,
+  config: ServiceConfig,
+  details: CompletionReportRejectionWritebackDetails,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+
+  const eventKey = `${context.runId}:completion-report:${safeKeySegment(details.report.idempotencyKey)}:rejected`;
+  const unsatisfied = details.report.acceptanceChecklist.filter((item) => !item.satisfied);
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Completion Report",
+          "",
+          "Status: rejected",
+          "Symphony rejected the worker completion report before review handoff.",
+          "Next state: unchanged (not ready for review)",
+          "",
+          `Run: ${context.runId}`,
+          `Session: ${context.sessionId ?? "n/a"}`,
+          `Workspace: ${context.workspacePath ?? context.workspace?.path ?? "n/a"}`,
+          `Branch: ${context.workspace?.gitBranchName ?? context.issue.branchName ?? "n/a"}`,
+          "",
+          "Rejection reason:",
+          `- ${details.reason}`,
+          "",
+          "Rejected acceptance checklist items:",
+          ...listOrFallback(
+            unsatisfied.map((item) => `${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`),
+            "No unsatisfied acceptance checklist items supplied.",
+          ),
+          ...formatCompletionReportForComment(details.report),
+        ].join("\n"),
       },
     },
   ];
@@ -528,6 +577,62 @@ export function planReviewFailWritebacks(
       },
     },
   ];
+}
+
+export function planReviewBlockedWritebacks(
+  context: ReviewVerdictWritebackContext,
+  config: ServiceConfig,
+  summary: string[] | ReviewVerdictWritebackDetails,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
+
+  const details = reviewVerdictDetailsFromInput(summary);
+  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
+  const eventKey = `${context.runId}:review-verdict-blocked`;
+  const operations: NewWritebackOperation[] = [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Review Verdict: Blocked",
+          "",
+          "Status: blocked, human action required",
+          "Symphony review could not complete because the reviewer identified a non-worker-owned blocker.",
+          blockedState === null ? "Next state: unchanged" : `Next state: ${blockedState}`,
+          "",
+          `Run: ${context.runId}`,
+          `Reviewer: ${context.reviewer ?? "n/a"}`,
+          "",
+          "Blocked findings:",
+          ...listOrFallback(details.findings, "No blocker summary supplied."),
+          ...formatReviewBlockedDetails(details),
+          "",
+          "Required human action:",
+          "Resolve the review blocker or provide an approved service-owned validation path, then move the issue out of the blocked state when Symphony should continue.",
+        ].join("\n"),
+      },
+    },
+  ];
+
+  if (blockedState !== null) {
+    operations.push({
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        fromStates: config.reviewLoop.reviewStates,
+        toState: blockedState,
+        reason: "Symphony review blocked",
+      },
+    });
+  }
+
+  return operations;
 }
 
 export function planReviewPassWritebacks(
@@ -1288,6 +1393,25 @@ function formatReviewVerdictDetails(details: ReviewVerdictWritebackDetails): str
     "",
     "Gate findings:",
     ...formatGateFindingsForComment(reviewGateFindingsForDetails(details)),
+    "",
+    "Discovery findings (not worker-gating):",
+    ...formatDiscoveryFindingsForComment(details.discoveryFindings ?? []),
+    "",
+    "Acceptance results:",
+    ...(details.acceptanceResults.length === 0
+      ? ["- No acceptance results supplied."]
+      : details.acceptanceResults.map(
+          (item) => `- ${item.satisfied ? "[x]" : "[ ]"} ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`,
+        )),
+    "",
+    "Review evidence:",
+    ...listOrFallback(details.evidence, "No review evidence supplied."),
+    ...(details.idempotencyKey === "n/a" ? [] : ["", `Idempotency key: ${details.idempotencyKey}`]),
+  ];
+}
+
+function formatReviewBlockedDetails(details: ReviewVerdictWritebackDetails): string[] {
+  return [
     "",
     "Discovery findings (not worker-gating):",
     ...formatDiscoveryFindingsForComment(details.discoveryFindings ?? []),

@@ -20,15 +20,18 @@ import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 import {
   planBlockedEscalationWritebacks,
+  planReviewBlockedWritebacks,
   planReviewFailWritebacks,
   planReviewPassWritebacks,
 } from "./writeback/TransitionPolicy.js";
-import type { FileWritebackOutboxStore, WritebackOperation } from "./writeback/WritebackOutbox.js";
+import type { FileWritebackOutboxStore, NewWritebackOperation, WritebackOperation } from "./writeback/WritebackOutbox.js";
 
 const PASS_REQUIRES_APPROVE_MESSAGE =
   'Pass review verdict requires prior submit_pull_request_review_feedback with kind="review" and event="APPROVE" for the active reviewer run and lifecycle-bound PR.';
 const FAIL_AFTER_APPROVE_MESSAGE =
   "Fail review verdict cannot follow APPROVE review feedback in the same reviewer run; submit a pass verdict or start a fresh review run.";
+const BLOCKED_AFTER_APPROVE_MESSAGE =
+  "Blocked review verdict cannot follow APPROVE review feedback in the same reviewer run; submit a pass verdict or start a fresh review run.";
 
 const REVIEW_GATE_SCENARIO_ENTITLEMENTS = [
   "explicit_requirement",
@@ -73,7 +76,7 @@ const reviewDiscoveryFindingSchema = z.object({
 const reviewVerdictSchema = z.object({
   runId: z.string().trim().min(1),
   issueId: z.string().trim().min(1),
-  verdict: z.enum(["pass", "fail"]),
+  verdict: z.enum(["pass", "fail", "blocked"]),
   acceptanceResults: z
     .array(
       z.object({
@@ -157,7 +160,10 @@ export class ReviewVerdictService {
     this.validateVerdictPayload(verdict);
     const gateFindings = normalizeReviewGateFindings(verdict);
     const discoveryFindings = normalizeReviewDiscoveryFindings(verdict.discoveryFindings);
-    const storedFindings = gateFindings.map((finding) => finding.summary);
+    const storedFindings =
+      verdict.verdict === "blocked"
+        ? verdict.findings.map((finding) => finding.trim()).filter((finding) => finding.length > 0)
+        : gateFindings.map((finding) => finding.summary);
 
     const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, { phase: lifecyclePhase });
     this.validateReviewFeedbackAlignment(verdict, lifecycle);
@@ -192,27 +198,31 @@ export class ReviewVerdictService {
       supersededBy: null,
       supersededReason: null,
     };
-    const operations =
-      ceilingReached
-        ? planBlockedEscalationWritebacks(
-            {
-              issue: context.issue,
-              runId: verdict.runId,
-              reason: `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`,
-              incompleteTurnCount: lifecycle.incompleteTurnCount,
-              maxIncompleteTurns: this.options.config.reviewLoop.maxIncompleteTurns,
-              reviewRound,
-              maxReviewRounds: maxReviewerFailures,
-              lastCompletionReport: latestCompletionReport(lifecycle),
-              lastReviewVerdict: provisionalVerdict,
-              requiredAction:
-                "Review the requested changes, decide whether the worker should continue, and move the issue out of Blocked when it is ready for another implementation pass.",
-            },
-            this.options.config,
-          )
-        : verdict.verdict === "fail"
-        ? planReviewFailWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails)
-        : planReviewPassWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails);
+    let operations: NewWritebackOperation[];
+    if (ceilingReached) {
+      operations = planBlockedEscalationWritebacks(
+        {
+          issue: context.issue,
+          runId: verdict.runId,
+          reason: `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`,
+          incompleteTurnCount: lifecycle.incompleteTurnCount,
+          maxIncompleteTurns: this.options.config.reviewLoop.maxIncompleteTurns,
+          reviewRound,
+          maxReviewRounds: maxReviewerFailures,
+          lastCompletionReport: latestCompletionReport(lifecycle),
+          lastReviewVerdict: provisionalVerdict,
+          requiredAction:
+            "Review the requested changes, decide whether the worker should continue, and move the issue out of Blocked when it is ready for another implementation pass.",
+        },
+        this.options.config,
+      );
+    } else if (verdict.verdict === "fail") {
+      operations = planReviewFailWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails);
+    } else if (verdict.verdict === "blocked") {
+      operations = planReviewBlockedWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails);
+    } else {
+      operations = planReviewPassWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails);
+    }
     if (operations.length === 0) {
       if (context.ignoreStateGate !== true) {
         throw new SymphonyError("invalid_request", "Review verdict cannot be accepted for the current issue state");
@@ -229,12 +239,15 @@ export class ReviewVerdictService {
     }
 
     const updatedLifecycle = await this.options.lifecycleStore.updateIssue(context.issue, {
-      phase: verdict.verdict === "pass" ? "passed" : ceilingReached ? "blocked" : "implementation",
+      phase: verdict.verdict === "pass" ? "passed" : verdict.verdict === "blocked" || ceilingReached ? "blocked" : "implementation",
       ...(verdict.verdict === "fail" ? { reviewRound } : {}),
       incompleteTurnCount: verdict.verdict === "fail" ? 0 : lifecycle.incompleteTurnCount,
-      blockedReason: ceilingReached
-        ? `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`
-        : null,
+      blockedReason:
+        verdict.verdict === "blocked"
+          ? `review blocked: ${blockedReasonForVerdict(storedVerdict)}`
+          : ceilingReached
+          ? `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`
+          : null,
       lastReviewVerdictId: storedVerdict.id,
       reviewVerdicts: [...lifecycle.reviewVerdicts, storedVerdict],
     });
@@ -275,12 +288,24 @@ export class ReviewVerdictService {
     if (verdict.verdict === "pass" && gateFindings.length > 0) {
       throw new SymphonyError("invalid_request", "Pass review verdicts cannot include gate findings");
     }
+    if (verdict.verdict === "blocked" && gateFindings.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Blocked review verdicts cannot include gate findings; use findings or discoveryFindings for non-worker-owned blockers",
+      );
+    }
   }
 
   private validateReviewFeedbackAlignment(verdict: ReviewVerdictInput, lifecycle: IssueLifecycleRecord): void {
     if (verdict.verdict === "fail") {
       if (hasSameRunApprovalFeedback(lifecycle, verdict.runId)) {
         throw new SymphonyError("invalid_request", FAIL_AFTER_APPROVE_MESSAGE);
+      }
+      return;
+    }
+    if (verdict.verdict === "blocked") {
+      if (hasSameRunApprovalFeedback(lifecycle, verdict.runId)) {
+        throw new SymphonyError("invalid_request", BLOCKED_AFTER_APPROVE_MESSAGE);
       }
       return;
     }
@@ -294,10 +319,48 @@ export class ReviewVerdictService {
 
 export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord): string | null {
   const verdict = latestReviewVerdict(lifecycle);
-  if (!verdict || verdict.verdict !== "fail") return null;
+  if (!verdict || (verdict.verdict !== "fail" && verdict.verdict !== "blocked")) return null;
   if (isMergeGateVerdict(verdict)) return null;
   const pointers = lifecycle.summaryPointers;
   const latestReport = latestCompletionReport(lifecycle);
+  if (verdict.verdict === "blocked") {
+    return [
+      "",
+      "Reviewer blocked findings to resolve before submitting another completion report:",
+      "Reviewer verdict: blocked / human action required",
+      `Review run: ${verdict.runId}`,
+      "",
+      "Resume condition:",
+      "- Continue only after the blocker has been resolved or an approved validation path is available.",
+      "",
+      "Lifecycle counters:",
+      `- Reviewer failures: ${lifecycle.reviewRound}`,
+      `- Incomplete worker turns: ${lifecycle.incompleteTurnCount}`,
+      `- Lifecycle phase: ${lifecycle.phase}`,
+      `- Blocked reason: ${lifecycle.blockedReason ?? "n/a"}`,
+      "",
+      "Latest workspace/git evidence:",
+      `- Workspace path: ${pointers.workspacePath ?? "n/a"}`,
+      `- Branch: ${pointers.gitBranchName ?? pointers.branchName ?? latestReport?.branchName ?? "n/a"}`,
+      `- Repository path: ${pointers.repoPath ?? "n/a"}`,
+      `- Base ref: ${pointers.baseRef ?? "n/a"}`,
+      `- Pull request: ${formatPullRequest(pointers.prNumber, pointers.prUrl)}`,
+      "",
+      "Blocked findings:",
+      ...(verdict.findings.length === 0 ? ["- No blocked findings supplied."] : verdict.findings.map((finding) => `- ${finding}`)),
+      "",
+      "Acceptance results:",
+      ...verdict.acceptanceResults.map(
+        (item) => `- ${item.satisfied ? "[x]" : "[ ]"} ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`,
+      ),
+      "",
+      "Discovery findings (non-directed context; do not repair unless a current directive explicitly asks for them):",
+      ...formatDiscoveryFindingsForWorker(verdict.discoveryFindings),
+      "",
+      "Evidence:",
+      ...verdict.evidence.map((item) => `- ${item}`),
+    ].join("\n");
+  }
   return [
     "",
     "Reviewer gate findings to address before submitting another completion report:",
@@ -333,6 +396,14 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
     "Evidence:",
     ...verdict.evidence.map((item) => `- ${item}`),
   ].join("\n");
+}
+
+function blockedReasonForVerdict(verdict: IssueReviewVerdictRecord): string {
+  const firstFinding = verdict.findings.find((finding) => finding.trim().length > 0);
+  if (firstFinding) return firstFinding.length <= 160 ? firstFinding : `${firstFinding.slice(0, 157)}...`;
+  const firstDiscovery = verdict.discoveryFindings.find((finding) => finding.summary.trim().length > 0)?.summary;
+  if (firstDiscovery) return firstDiscovery.length <= 160 ? firstDiscovery : `${firstDiscovery.slice(0, 157)}...`;
+  return "reviewer reported a non-worker-owned blocker";
 }
 
 export function formatWorkerMergeGatePrompt(lifecycle: IssueLifecycleRecord): string | null {
@@ -419,6 +490,7 @@ function normalizeReviewGateFindings(verdict: ReviewVerdictInput): ReviewGateFin
       evidence: [...finding.evidence],
     }));
   }
+  if (verdict.verdict === "blocked") return [];
   return verdict.findings.map((finding) => ({
     summary: finding,
     requirementIds: [],

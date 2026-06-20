@@ -4,6 +4,7 @@ import { SymphonyError } from "./errors.js";
 import type {
   CompletionReportChecklistItem,
   CompletionReportPullRequestRef,
+  IssueCompletionReportRejectionRecord,
   IssueCompletionReportRecord,
   IssueLifecycleRecord,
   IssueLifecyclePhase,
@@ -21,6 +22,7 @@ import { OPERATOR_REJECTED_PUBLICATION_ERROR } from "./approval/OperatorApproval
 import type { Issue, Workspace } from "./types.js";
 import {
   planCompletionReportAcceptedWritebacks,
+  planCompletionReportRejectedWritebacks,
   planCompletionReportPublicationApprovalPendingWritebacks,
   planCompletionReportPublicationApprovalTerminalWritebacks,
   planPullRequestHandoffWritebacks,
@@ -139,6 +141,12 @@ export interface CompletionReportResult {
   writebackOperations: WritebackOperation[];
 }
 
+interface CompletionReportReadinessRejection {
+  reasonCode: "unsatisfied_acceptance_checklist";
+  reason: string;
+  unsatisfiedAcceptanceChecklist: Array<{ text: string; evidence: string | null }>;
+}
+
 export interface PublicationApprovalResumeInput {
   approval: OperatorApprovalRecord;
   issue: Issue;
@@ -188,6 +196,15 @@ export class CompletionReportService {
     const existing = existingLifecycle?.completionReports.find((item) => item.idempotencyKey === report.idempotencyKey);
     if (existing && isFinalizedCompletionReport(existing)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
+    }
+    const readinessRejection = completionReportReadinessRejection(report);
+    if (readinessRejection) {
+      await this.rejectCompletionReport({
+        report,
+        context,
+        existingLifecycle,
+        rejection: readinessRejection,
+      });
     }
     const pendingPublicationHandoff =
       existing !== undefined && this.shouldPersistBeforePublicationApproval()
@@ -598,6 +615,47 @@ export class CompletionReportService {
     return { accepted: true, replayed: false, report: storedReport, writebackOperations: enqueued };
   }
 
+  private async rejectCompletionReport(input: {
+    report: CompletionReportInput;
+    context: CompletionReportActiveContext;
+    existingLifecycle: ExistingIssueLifecycle;
+    rejection: CompletionReportReadinessRejection;
+  }): Promise<never> {
+    const inputPullRequest = normalizeInputPullRequest(input.report.pullRequest, input.report.branchName);
+    const writebackDetails = completionReportWritebackDetails(input.report, input.context.issue, inputPullRequest);
+    const operations = planCompletionReportRejectedWritebacks(runWritebackContext(input.context, input.report.runId), this.options.config, {
+      reason: input.rejection.reason,
+      report: writebackDetails,
+    });
+    const enqueued: WritebackOperation[] = [];
+    for (const operation of operations) {
+      enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
+    }
+    const rejectedReport = buildCompletionReportRejectionRecord({
+      report: input.report,
+      issue: input.context.issue,
+      pullRequest: inputPullRequest,
+      rejection: input.rejection,
+      writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
+    });
+    const lifecycle = await this.options.lifecycleStore.ensureIssue(input.context.issue, {
+      lastCompletionReportRejectionId: rejectedReport.id,
+      completionReportRejections: upsertCompletionReportRejection(
+        input.existingLifecycle?.completionReportRejections ?? [],
+        rejectedReport,
+      ),
+      summaryPointers: rejectionSummaryPointersFor(input.context, inputPullRequest, input.existingLifecycle),
+    });
+    await appendLaneMemoTelemetry(this.options.runStore, input.context.activeRunId, lifecycle, "completion_report_rejection");
+    throw new SymphonyError("invalid_request", input.rejection.reason, {
+      reasonCode: input.rejection.reasonCode,
+      rejectionId: rejectedReport.id,
+      reportId: rejectedReport.reportId,
+      unsatisfiedAcceptanceChecklist: input.rejection.unsatisfiedAcceptanceChecklist,
+      writebackOperationKeys: enqueued.map((operation) => operation.idempotencyKey),
+    });
+  }
+
   private validateCaller(report: CompletionReportInput, context: CompletionReportActiveContext): void {
     if (context.role !== "worker") {
       throw new SymphonyError("invalid_request", "Only active workers may submit completion reports");
@@ -939,8 +997,25 @@ function parseCompletionReport(input: unknown): CompletionReportInput {
   return parsed.data;
 }
 
+function completionReportReadinessRejection(report: CompletionReportInput): CompletionReportReadinessRejection | null {
+  const unsatisfied = report.acceptanceChecklist.filter((item) => !item.satisfied);
+  if (unsatisfied.length === 0) return null;
+  return {
+    reasonCode: "unsatisfied_acceptance_checklist",
+    reason: "Completion report cannot be accepted with unsatisfied acceptance checklist items",
+    unsatisfiedAcceptanceChecklist: unsatisfied.map((item) => ({
+      text: item.text,
+      evidence: item.evidence,
+    })),
+  };
+}
+
 function reportIdFor(issueId: string, idempotencyKey: string): string {
   return `completion-report:${issueId}:${idempotencyKey}`;
+}
+
+function reportRejectionIdFor(issueId: string, idempotencyKey: string): string {
+  return `completion-report-rejection:${issueId}:${idempotencyKey}`;
 }
 
 export function isFinalizedCompletionReport(report: IssueCompletionReportRecord): boolean {
@@ -1027,11 +1102,46 @@ function buildCompletionReportRecord(input: {
   };
 }
 
+function buildCompletionReportRejectionRecord(input: {
+  report: CompletionReportInput;
+  issue: Issue;
+  pullRequest: CompletionReportPullRequestRef | null;
+  rejection: CompletionReportReadinessRejection;
+  writebackOperationKeys: string[];
+}): IssueCompletionReportRejectionRecord {
+  return {
+    id: reportRejectionIdFor(input.issue.id, input.report.idempotencyKey),
+    reportId: reportIdFor(input.issue.id, input.report.idempotencyKey),
+    idempotencyKey: input.report.idempotencyKey,
+    runId: input.report.runId,
+    issueId: input.issue.id,
+    issueIdentifier: input.issue.identifier,
+    reasonCode: input.rejection.reasonCode,
+    reason: input.rejection.reason,
+    summary: input.report.summary,
+    validationEvidence: input.report.validationEvidence,
+    acceptanceChecklist: normalizeChecklist(input.report.acceptanceChecklist),
+    changedFiles: input.report.changedFiles,
+    branchName: input.report.branchName,
+    pullRequest: input.pullRequest,
+    risks: input.report.risks,
+    rejectedAt: new Date().toISOString(),
+    writebackOperationKeys: input.writebackOperationKeys,
+  };
+}
+
 function upsertCompletionReport(
   reports: IssueCompletionReportRecord[],
   report: IssueCompletionReportRecord,
 ): IssueCompletionReportRecord[] {
   return [...reports.filter((item) => item.idempotencyKey !== report.idempotencyKey), report];
+}
+
+function upsertCompletionReportRejection(
+  rejections: IssueCompletionReportRejectionRecord[],
+  rejection: IssueCompletionReportRejectionRecord,
+): IssueCompletionReportRejectionRecord[] {
+  return [...rejections.filter((item) => item.idempotencyKey !== rejection.idempotencyKey), rejection];
 }
 
 function summaryPointersFor(
@@ -1054,6 +1164,22 @@ function summaryPointersFor(
     prBranch: pullRequest?.branch ?? null,
     lastPushedAt: publication?.lastPushedAt ?? existingLifecycle?.summaryPointers.lastPushedAt ?? null,
     lastEvidenceCursor: publication?.evidenceCursor ?? existingLifecycle?.summaryPointers.lastEvidenceCursor ?? null,
+  };
+}
+
+function rejectionSummaryPointersFor(
+  context: CompletionReportActiveContext,
+  pullRequest: CompletionReportPullRequestRef | null,
+  existingLifecycle: ExistingIssueLifecycle,
+) {
+  const pointers = summaryPointersFor(context, pullRequest, null, existingLifecycle);
+  if (pullRequest !== null) return pointers;
+  return {
+    ...pointers,
+    prUrl: existingLifecycle?.summaryPointers.prUrl ?? null,
+    prNumber: existingLifecycle?.summaryPointers.prNumber ?? null,
+    prHeadSha: existingLifecycle?.summaryPointers.prHeadSha ?? null,
+    prBranch: existingLifecycle?.summaryPointers.prBranch ?? null,
   };
 }
 

@@ -154,19 +154,19 @@ function completionReportInputSchema(): Record<string, unknown> {
       summary: {
         type: "string",
         minLength: 1,
-        description: "Concise summary of the implementation completed in the active worker run.",
+        description: "Concise summary of the review-ready implementation completed in the active worker run.",
       },
       validationEvidence: {
         type: "array",
         minItems: 1,
-        description: "Commands, checks, or manual verification performed before handoff.",
+        description: "Successful commands, checks, or manual verification performed before handoff; blocked attempts alone are not review-ready evidence.",
         items: { type: "string", minLength: 1 },
       },
       acceptanceChecklist: {
         type: "array",
         minItems: 1,
         description:
-          "One item per acceptance criterion. If the issue has a fenced JSON Issue Contract, include one item per requirement id and prove each with exact durable evidence.",
+          "One satisfied item per acceptance criterion. If the issue has a fenced JSON Issue Contract, include one item per requirement id and prove each with exact durable evidence. The completion report is rejected when any item is unsatisfied.",
         items: {
           type: "object",
           additionalProperties: false,

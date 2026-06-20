@@ -319,6 +319,7 @@ export class HermesHarness implements AgentHarness {
       servers: symphonyRoleMcpServers(ctx, { cliPath, mcpCwd: ctx.workspace.path }),
       agentMaxTurns: SYMPHONY_HERMES_AGENT_MAX_TURNS,
       ...(commandPolicyHooks === undefined ? {} : { hooks: commandPolicyHooks, hooksAutoAccept: true }),
+      removeCommandPolicyHooks: commandPolicyHookOptions === undefined ? !ctx.config.hermes.commandPolicy.enabled : true,
     });
     if (commandPolicyHookOptions !== undefined) {
       await (this.options.commandPolicyHookVerifier ?? verifyHermesAgentCommandPolicyHookInstallation)({
@@ -726,6 +727,7 @@ function agentCommandPolicyHookOptionsForRun(
 }
 
 function shouldInstallAgentCommandPolicyHook(ctx: AgentRunContext, phase: AgentRunPhase): boolean {
+  if (!ctx.config.hermes.commandPolicy.enabled) return false;
   if (ctx.role === "reviewer") return true;
   if (ctx.role === "triage") return true;
   if (ctx.role === "planner") return true;

@@ -98,6 +98,7 @@ export interface HostHermesAcpProfileLeaseOptions {
   acpSessionId?: string | null;
   runner?: HostHermesAcpCommandRunner;
   commandPolicyHookOptions?: Omit<BuildHermesAgentCommandPolicyHookOptions, "decisionJournalPath"> | null;
+  removeCommandPolicyHooks?: boolean;
   commandPolicyHookVerifier?: HermesAgentCommandPolicyHookVerifier;
   upstreamRoot?: string | null;
   python?: string | null;
@@ -198,6 +199,7 @@ export async function createHostHermesAcpProfileLease(
     env,
     timeoutMs,
     hookOptions: options.commandPolicyHookOptions ?? null,
+    removeCommandPolicyHooks: options.removeCommandPolicyHooks === true,
     hookVerifier: options.commandPolicyHookVerifier,
     upstreamRoot: options.upstreamRoot,
     python: options.python,
@@ -625,14 +627,15 @@ async function installHostHermesAcpCommandPolicyHookIfRequested(input: {
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
   hookOptions: Omit<BuildHermesAgentCommandPolicyHookOptions, "decisionJournalPath"> | null;
+  removeCommandPolicyHooks: boolean;
   hookVerifier: HermesAgentCommandPolicyHookVerifier | undefined;
   upstreamRoot: string | null | undefined;
   python: string | null | undefined;
 }): Promise<{ profileDir: string | null; decisionJournalPath: string | null }> {
-  if (!input.hookOptions) return { profileDir: null, decisionJournalPath: null };
+  if (!input.hookOptions && !input.removeCommandPolicyHooks) return { profileDir: null, decisionJournalPath: null };
 
   const upstreamRoot = normalizeOptionalString(input.upstreamRoot);
-  if (!upstreamRoot) {
+  if (input.hookOptions && !upstreamRoot) {
     throw new Error("Host Hermes ACP command-policy hook installation requires hermes.upstream_root for registration validation.");
   }
 
@@ -641,6 +644,14 @@ async function installHostHermesAcpCommandPolicyHookIfRequested(input: {
     env: input.env,
     timeoutMs: input.timeoutMs,
   });
+  if (!input.hookOptions) {
+    await writeHermesShellHookConfig({
+      profileDir,
+      removeCommandPolicyHooks: true,
+    });
+    return { profileDir, decisionJournalPath: null };
+  }
+
   const decisionJournalPath = buildHermesAgentCommandPolicyDecisionJournalPath(profileDir);
   const hookOptions: BuildHermesAgentCommandPolicyHookOptions = {
     ...input.hookOptions,
@@ -650,12 +661,13 @@ async function installHostHermesAcpCommandPolicyHookIfRequested(input: {
     profileDir,
     hooks: buildHermesAgentCommandPolicyHookConfig(hookOptions),
     hooksAutoAccept: true,
+    removeCommandPolicyHooks: input.removeCommandPolicyHooks,
   });
 
   const verifierOptions: VerifyHermesAgentCommandPolicyHookInstallationOptions = {
     ...hookOptions,
     profileDir,
-    upstreamRoot,
+    upstreamRoot: upstreamRoot!,
     smokeCwd: input.cwd,
   };
   if (input.python !== undefined) verifierOptions.python = input.python;

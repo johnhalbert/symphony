@@ -83,6 +83,57 @@ describe("Hermes command policy profile hooks", () => {
 
     await harness.dispose();
   });
+
+  it("does not install command-policy hooks when disabled and removes stale generated hooks from profiles", async () => {
+    const cliPath = path.join(root, "cli.js");
+    await writeFile(
+      path.join(root, "templates", "worker", "config.yaml"),
+      YAML.stringify({
+        hooks_auto_accept: true,
+        hooks: {
+          pre_tool_call: [
+            {
+              matcher: SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
+              command: `${process.execPath} ${cliPath} agent-command-policy-hook --role worker`,
+              timeout: SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
+            },
+          ],
+        },
+      }),
+      "utf8",
+    );
+    const clients: FakeGatewayClient[] = [];
+    const verifications: unknown[] = [];
+    const harness = new HermesHarness({
+      cliPath,
+      commandPolicyHookVerifier: async (options) => {
+        verifications.push(options);
+      },
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`);
+        clients.push(client);
+        return client;
+      },
+    });
+    const config = configForHarness({ commandPolicyEnabled: false });
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+
+    await collect(harness.run(context(config, { workspacePath, role: "worker", runPhase: "implementation", turnNumber: 1 }), "worker"));
+    await collect(harness.run(context(config, { workspacePath, role: "reviewer", runPhase: "review", turnNumber: 2 }), "reviewer"));
+
+    expect(clients).toHaveLength(2);
+    const workerConfig = await readProfileConfig(clients[0]!.env.hermesHome);
+    const reviewerConfig = await readProfileConfig(clients[1]!.env.hermesHome);
+
+    expect(workerConfig.hooks).toBeUndefined();
+    expect(workerConfig.hooks_auto_accept).toBeUndefined();
+    expect(reviewerConfig.hooks).toBeUndefined();
+    expect(reviewerConfig.hooks_auto_accept).toBeUndefined();
+    expect(verifications).toHaveLength(0);
+
+    await harness.dispose();
+  });
   it("emits durable command_policy_decision activity from journaled hook decisions", async () => {
     const cliPath = path.join(root, "cli.js");
     const harness = new HermesHarness({
@@ -419,7 +470,7 @@ async function readProfileConfig(profileDir: string): Promise<Record<string, any
   return YAML.parse(await readFile(path.join(profileDir, "config.yaml"), "utf8")) as Record<string, any>;
 }
 
-function configForHarness(): ServiceConfig {
+function configForHarness(options: { commandPolicyEnabled?: boolean } = {}): ServiceConfig {
   return parseServiceConfig(
     {
       tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
@@ -430,6 +481,7 @@ function configForHarness(): ServiceConfig {
         templates_dir: path.join(root, "templates"),
         state_dir: path.join(root, "state", "hermes"),
         keep_profiles: "always",
+        ...(options.commandPolicyEnabled === undefined ? {} : { command_policy: { enabled: options.commandPolicyEnabled } }),
       },
     },
     path.join(root, "WORKFLOW.md"),

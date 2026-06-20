@@ -269,6 +269,12 @@ const rawConfigSchema = z
         startup_timeout_ms: z.number().int().positive().optional(),
         request_timeout_ms: z.number().int().positive().optional(),
         shutdown_grace_ms: z.number().int().nonnegative().optional(),
+        command_policy: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .passthrough()
+          .optional(),
         role_templates: z
           .object({
             worker: z.string().optional(),
@@ -466,6 +472,10 @@ export interface HermesRoleTemplatesConfig {
   mergeConflictResolution: string;
 }
 
+export interface HermesCommandPolicyConfig {
+  enabled: boolean;
+}
+
 export type HermesAuthMode = "managed_root";
 
 export interface HermesAuthConfig {
@@ -493,6 +503,7 @@ export interface HermesConfig {
   startupTimeoutMs: number;
   requestTimeoutMs: number;
   shutdownGraceMs: number;
+  commandPolicy: HermesCommandPolicyConfig;
   roleTemplates: HermesRoleTemplatesConfig;
 }
 
@@ -1033,6 +1044,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       startupTimeoutMs: hermesStartupTimeoutMs,
       requestTimeoutMs: hermesRequestTimeoutMs,
       shutdownGraceMs: hermesShutdownGraceMs,
+      commandPolicy: {
+        enabled: raw.hermes?.command_policy?.enabled ?? true,
+      },
       roleTemplates: {
         worker: raw.hermes?.role_templates?.worker ?? "worker",
         reviewer: raw.hermes?.role_templates?.reviewer ?? "reviewer",

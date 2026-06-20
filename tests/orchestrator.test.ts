@@ -13,6 +13,7 @@ import {
   type CompletionReportPullRequestPublicationInput,
   type CompletionReportPullRequestPublisher,
 } from "../src/core/CompletionReportService.js";
+import { SymphonyError } from "../src/core/errors.js";
 import {
   FileOperatorApprovalStore,
   OPERATOR_REJECTED_PUBLICATION_ERROR,
@@ -4759,6 +4760,66 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
+  it("surfaces rejected completion reports in Linear comments and subsequent worker prompts", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter(() => undefined);
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const harness = new RejectedCompletionReportHarness(lifecycleStore, outboxStore, runStore);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.prompts.length === 2, "worker continuation after rejected completion report");
+    await waitFor(() => writer.comments.some((comment) => comment.body.includes("Status: rejected")), "rejection comment");
+    await orchestrator.stop();
+
+    const rejectionComment = writer.comments.find((comment) => comment.body.includes("Status: rejected"));
+    expect(rejectionComment?.dedupeKey).toBe("reject-run-1:completion-report:rejected-idem-1:rejected");
+    expect(rejectionComment?.body).toContain("Completion report cannot be accepted with unsatisfied acceptance checklist items");
+    expect(rejectionComment?.body).toContain("REQ-1 Required validation is complete.");
+    expect(harness.prompts[1]).toContain(
+      "Next action: Fix the rejected completion report: satisfy every acceptance checklist item with durable evidence before submitting again.",
+    );
+    expect(harness.prompts[1]).toContain("Latest rejected completion report:");
+    expect(harness.prompts[1]).toContain("Reason: Completion report cannot be accepted with unsatisfied acceptance checklist items");
+    expect(harness.prompts[1]).toContain("REQ-1 Required validation is complete.");
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(lifecycle?.incompleteTurnCount).toBeGreaterThanOrEqual(1);
+    expect(lifecycle).toMatchObject({
+      lastCompletionReportRejectionId: "completion-report-rejection:issue-1:rejected-idem-1",
+    });
+  });
+
   it("[event-guard:failed] treats accepted completion reports as handoff when the harness fails after reporting", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 3;
@@ -7161,6 +7222,92 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("Duplicate verdicts are idempotent");
     expect(harness.runs[0]?.prompt).toContain("Add regression coverage for duplicate verdict submissions.");
     expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42#discussion_r1");
+  });
+
+  it("injects blocked reviewer verdict context into the resumed worker prompt", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const report = completionReportRecord(candidate);
+    const blockedVerdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(candidate),
+      id: "review-verdict:issue-1:blocked-1",
+      idempotencyKey: "blocked-1",
+      runId: "review-run-blocked",
+      verdict: "blocked",
+      acceptanceResults: [
+        {
+          text: "Required validation evidence is available",
+          satisfied: false,
+          evidence: "The worker and reviewer command surfaces cannot execute the required validation.",
+        },
+      ],
+      findings: ["Focused validation is unavailable to worker and reviewer command surfaces."],
+      gateFindings: [],
+      discoveryFindings: [],
+      evidence: ["reviewer observed command-policy denial"],
+      submittedAt: "2026-01-01T00:00:03Z",
+    };
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "implementation",
+      reviewRound: 1,
+      blockedReason: null,
+      lastCompletionReportId: report.id,
+      lastReviewVerdictId: blockedVerdict.id,
+      completionReports: [report],
+      reviewVerdicts: [blockedVerdict],
+      summaryPointers: {
+        workspacePath: "/tmp/old-workspace",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+      },
+    });
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await orchestrator.stop();
+
+    const prompt = harness.runs[0]?.prompt ?? "";
+    const systemPrompt = harness.runs[0]?.ctx.ephemeralSystemPrompt ?? "";
+    expect(prompt).toContain("Reviewer blocked findings to resolve before submitting another completion report:");
+    expect(prompt).toContain("Reviewer verdict: blocked / human action required");
+    expect(prompt).toContain(
+      "Next action: Resume after the blocked review: verify the human/operator blocker is resolved, then complete any remaining implementation or validation and submit a new completion report.",
+    );
+    expect(prompt).toContain("Latest blocked reviewer verdict:");
+    expect(prompt).toContain("Focused validation is unavailable to worker and reviewer command surfaces.");
+    expect(prompt).toContain("The worker and reviewer command surfaces cannot execute the required validation.");
+    expect(prompt).toContain("reviewer observed command-policy denial");
+    expect(systemPrompt).toContain("Resume after the blocked review only after the human/operator blocker has been resolved");
+    expect(systemPrompt).toContain("Latest blocked review:");
+    expect(systemPrompt).toContain("Focused validation is unavailable to worker and reviewer command surfaces.");
   });
 
   it("injects dedicated merge-gate repair context instead of reviewer-fail framing", async () => {
@@ -9735,6 +9882,66 @@ class InfraFailureHarness implements AgentHarness {
 
 type ReportingHarnessTerminal = AgentEvent | "throw";
 
+class RejectedCompletionReportHarness implements AgentHarness {
+  readonly id = "rejected-completion-report";
+  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly prompts: string[] = [];
+
+  constructor(
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly outboxStore: FileWritebackOutboxStore,
+    private readonly runStore: FileRunTranscriptStore,
+  ) {}
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    const turn = this.prompts.length + 1;
+    const runId = `reject-run-${turn}`;
+    this.prompts.push(prompt);
+    yield { type: "session_started", sessionId: `reject-session-${turn}`, runId };
+    if (turn === 1) {
+      try {
+        await new CompletionReportService({
+          config: ctx.config,
+          lifecycleStore: this.lifecycleStore,
+          writebackOutbox: this.outboxStore,
+          runStore: this.runStore,
+        }).submitCompletionReport(
+          {
+            runId,
+            issueId: ctx.issue.id,
+            summary: "Implemented part of the requested handoff.",
+            validationEvidence: ["Focused validation could not run in this worker environment."],
+            acceptanceChecklist: [
+              {
+                text: "REQ-1 Required validation is complete.",
+                satisfied: false,
+                evidence: "Focused validation could not run in this worker environment.",
+              },
+            ],
+            changedFiles: ["src/core/CompletionReportService.ts"],
+            branchName: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
+            pullRequest: null,
+            risks: ["Validation remains incomplete."],
+            idempotencyKey: "rejected-idem-1",
+          },
+          {
+            issue: ctx.issue,
+            activeRunId: runId,
+            role: "worker",
+            sessionId: `reject-session-${turn}`,
+            workspacePath: ctx.workspace.path,
+            workspace: ctx.workspace,
+            phase: "implementation",
+          },
+        );
+      } catch (error) {
+        if (!(error instanceof SymphonyError) || error.code !== "invalid_request") throw error;
+      }
+    }
+    yield { type: "completed" };
+  }
+}
+
 class ReportingHarness implements AgentHarness {
   readonly id = "reporting";
   readonly prompts: string[] = [];
@@ -9849,7 +10056,7 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
         acceptanceChecklist: [
           {
             text: "Manufactured fail/revise/pass smoke is covered.",
-            satisfied: runNumber === 2,
+            satisfied: true,
             evidence: runNumber === 1 ? "Initial manufactured implementation." : "Revision worker handled reviewer feedback.",
           },
         ],

@@ -9,7 +9,9 @@ import {
   buildHermesAgentCommandPolicyHookConfig,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_MATCHER,
   SYMPHONY_AGENT_COMMAND_POLICY_HOOK_TIMEOUT_SECONDS,
+  SYMPHONY_HERMES_APPROVAL_MODE,
   SYMPHONY_HERMES_AGENT_MAX_TURNS,
+  SYMPHONY_HERMES_TIRITH_ENABLED,
   toHermesMcpServers,
   verifyHermesAgentCommandPolicyHookCommandRunnable,
   verifyHermesAgentCommandPolicyHookRegistration,
@@ -115,6 +117,42 @@ describe("Hermes MCP config", () => {
     });
   });
 
+  it("minimizes Hermes native judgement layers in generated profile config", async () => {
+    const profileDir = path.join(root, "profile");
+    await mkdir(profileDir, { recursive: true });
+    await writeFile(
+      path.join(profileDir, "config.yaml"),
+      YAML.stringify({
+        approvals: {
+          mode: "manual",
+          timeout: 60,
+        },
+        security: {
+          redact_secrets: false,
+          tirith_enabled: true,
+          tirith_timeout: 5,
+        },
+      }),
+      "utf8",
+    );
+
+    await writeHermesMcpConfig({
+      profileDir,
+      servers: {},
+    });
+
+    const parsed = YAML.parse(await readFile(path.join(profileDir, "config.yaml"), "utf8")) as Record<string, any>;
+    expect(parsed.approvals).toMatchObject({
+      mode: SYMPHONY_HERMES_APPROVAL_MODE,
+      timeout: 60,
+    });
+    expect(parsed.security).toMatchObject({
+      redact_secrets: false,
+      tirith_enabled: SYMPHONY_HERMES_TIRITH_ENABLED,
+      tirith_timeout: 5,
+    });
+  });
+
   it("merges generated command-policy shell hooks into an existing Hermes profile config", async () => {
     const profileDir = path.join(root, "profile");
     await mkdir(profileDir, { recursive: true });
@@ -169,6 +207,74 @@ describe("Hermes MCP config", () => {
     expect(policyHook.command).toContain("--phase implementation");
     expect(policyHook.command).toContain("--issue-id issue-1");
     expect(policyHook.command).toContain("cli with spaces.js");
+  });
+
+  it("removes generated command-policy shell hooks while preserving unrelated hooks", async () => {
+    const profileDir = path.join(root, "profile");
+    await mkdir(profileDir, { recursive: true });
+    const generatedHooks = buildHermesAgentCommandPolicyHookConfig({
+      cliPath: path.join(root, "cli.js"),
+      role: "worker",
+      phase: "implementation",
+      issueId: "issue-1",
+      decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(profileDir),
+    });
+    await writeFile(
+      path.join(profileDir, "config.yaml"),
+      YAML.stringify({
+        hooks_auto_accept: true,
+        hooks: {
+          pre_tool_call: [
+            { matcher: "write_file", command: "format-hook", timeout: 3 },
+            generatedHooks.pre_tool_call![0],
+          ],
+          post_tool_call: [{ matcher: "patch", command: "post-hook", timeout: 4 }],
+        },
+      }),
+      "utf8",
+    );
+
+    await writeHermesMcpConfig({
+      profileDir,
+      servers: {},
+      removeCommandPolicyHooks: true,
+    });
+
+    const parsed = YAML.parse(await readFile(path.join(profileDir, "config.yaml"), "utf8")) as Record<string, any>;
+    expect(parsed.hooks_auto_accept).toBe(true);
+    expect(parsed.hooks.pre_tool_call).toEqual([{ matcher: "write_file", command: "format-hook", timeout: 3 }]);
+    expect(parsed.hooks.post_tool_call).toEqual([{ matcher: "patch", command: "post-hook", timeout: 4 }]);
+    expect(JSON.stringify(parsed)).not.toContain("agent-command-policy-hook");
+  });
+
+  it("removes empty command-policy-only shell hook config", async () => {
+    const profileDir = path.join(root, "profile");
+    await mkdir(profileDir, { recursive: true });
+    const generatedHooks = buildHermesAgentCommandPolicyHookConfig({
+      cliPath: path.join(root, "cli.js"),
+      role: "worker",
+      phase: "implementation",
+      issueId: "issue-1",
+      decisionJournalPath: buildHermesAgentCommandPolicyDecisionJournalPath(profileDir),
+    });
+    await writeFile(
+      path.join(profileDir, "config.yaml"),
+      YAML.stringify({
+        hooks_auto_accept: true,
+        hooks: generatedHooks,
+      }),
+      "utf8",
+    );
+
+    await writeHermesMcpConfig({
+      profileDir,
+      servers: {},
+      removeCommandPolicyHooks: true,
+    });
+
+    const parsed = YAML.parse(await readFile(path.join(profileDir, "config.yaml"), "utf8")) as Record<string, any>;
+    expect(parsed.hooks).toBeUndefined();
+    expect(parsed.hooks_auto_accept).toBeUndefined();
   });
 
   it("validates the generated command-policy hook profile config and runnable hook command", async () => {

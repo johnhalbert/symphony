@@ -76,6 +76,86 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("rejects completion reports with unsatisfied acceptance checklist items before review handoff", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+
+    await expect(
+      service.submit_completion_report(
+        report({
+          acceptanceChecklist: [
+            {
+              text: "REQ-1 Required validation is complete.",
+              satisfied: false,
+              evidence: "Focused validation could not run in this worker environment.",
+            },
+          ],
+        }),
+        context(),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Completion report cannot be accepted with unsatisfied acceptance checklist items",
+      details: {
+        reasonCode: "unsatisfied_acceptance_checklist",
+        rejectionId: "completion-report-rejection:issue-1:idem-1",
+        reportId: "completion-report:issue-1:idem-1",
+        unsatisfiedAcceptanceChecklist: [
+          {
+            text: "REQ-1 Required validation is complete.",
+            evidence: "Focused validation could not run in this worker environment.",
+          },
+        ],
+      },
+    });
+
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle).toMatchObject({
+      phase: "implementation",
+      lastCompletionReportRejectionId: "completion-report-rejection:issue-1:idem-1",
+      completionReportRejections: [
+        {
+          id: "completion-report-rejection:issue-1:idem-1",
+          reportId: "completion-report:issue-1:idem-1",
+          idempotencyKey: "idem-1",
+          runId: "run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          reasonCode: "unsatisfied_acceptance_checklist",
+          reason: "Completion report cannot be accepted with unsatisfied acceptance checklist items",
+          summary: "Implemented the service contract.",
+          acceptanceChecklist: [
+            {
+              text: "REQ-1 Required validation is complete.",
+              satisfied: false,
+              evidence: "Focused validation could not run in this worker environment.",
+            },
+          ],
+          writebackOperationKeys: ["comment:issue-1:run-1:completion-report:idem-1:rejected"],
+        },
+      ],
+    });
+    const operations = await outbox.list();
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({
+      kind: "comment",
+      idempotencyKey: "comment:issue-1:run-1:completion-report:idem-1:rejected",
+      payload: {
+        dedupeKey: "run-1:completion-report:idem-1:rejected",
+      },
+    });
+    const comment = operations[0]?.kind === "comment" ? operations[0].payload.body : "";
+    expect(comment).toContain("## Symphony Completion Report");
+    expect(comment).toContain("Status: rejected");
+    expect(comment).toContain("Rejection reason:");
+    expect(comment).toContain("Completion report cannot be accepted with unsatisfied acceptance checklist items");
+    expect(comment).toContain("REQ-1 Required validation is complete.");
+    expect(buildWorkerHandoffPacket(lifecycle!).lastCompletionReportRejection).toMatchObject({
+      id: "completion-report-rejection:issue-1:idem-1",
+      reasonCode: "unsatisfied_acceptance_checklist",
+    });
+    expect(buildWorkerHandoffPacket(lifecycle!).memo.entries.join("\n")).toContain("Latest completion report rejection");
+  });
+
   it("supersedes an old-head merge gate on new-head completion and scrubs stale repair state", async () => {
     const { service, lifecycleStore, outbox } = fixture();
     await lifecycleStore.ensureIssue(context().issue, {

@@ -162,7 +162,27 @@ export interface IssueCompletionReportRecord {
   writebackOperationKeys: string[];
 }
 
-export type IssueReviewVerdict = "pass" | "fail";
+export interface IssueCompletionReportRejectionRecord {
+  id: string;
+  reportId: string;
+  idempotencyKey: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  reasonCode: "unsatisfied_acceptance_checklist";
+  reason: string;
+  summary: string;
+  validationEvidence: string[];
+  acceptanceChecklist: CompletionReportChecklistItem[];
+  changedFiles: string[];
+  branchName: string | null;
+  pullRequest: CompletionReportPullRequestRef | null;
+  risks: string[];
+  rejectedAt: string;
+  writebackOperationKeys: string[];
+}
+
+export type IssueReviewVerdict = "pass" | "fail" | "blocked";
 
 export interface ReviewVerdictAcceptanceResult {
   text: string;
@@ -589,6 +609,7 @@ export interface WorkerHandoffPacket {
   generatedAt: string;
   memo: IssueLaneMemo;
   lastWorkerOutput: IssueWorkerOutputContract | null;
+  lastCompletionReportRejection: IssueCompletionReportRejectionRecord | null;
   lastReviewerOutput: IssueReviewerOutputContract | null;
   pointers: IssueLifecycleSummaryPointers;
 }
@@ -607,6 +628,7 @@ export interface IssueLifecycleRecord {
   lastIssueTriageReportId: string | null;
   lastPostMortemReportId: string | null;
   lastCompletionReportId: string | null;
+  lastCompletionReportRejectionId: string | null;
   lastReviewVerdictId: string | null;
   lastMergeGateResultId?: string | null;
   blockedReason: string | null;
@@ -614,6 +636,7 @@ export interface IssueLifecycleRecord {
   summaryReferences: IssueLifecycleSummaryReference[];
   issueBreakdownPlans: IssueBreakdownPlanRecord[];
   completionReports: IssueCompletionReportRecord[];
+  completionReportRejections: IssueCompletionReportRejectionRecord[];
   reviewVerdicts: IssueReviewVerdictRecord[];
   mergeGateResults?: IssueMergeGateResultRecord[];
   reviewFeedback: IssueReviewFeedbackRecord[];
@@ -641,6 +664,7 @@ export interface IssueLifecyclePatch {
   lastIssueTriageReportId?: string | null;
   lastPostMortemReportId?: string | null;
   lastCompletionReportId?: string | null;
+  lastCompletionReportRejectionId?: string | null;
   lastReviewVerdictId?: string | null;
   lastMergeGateResultId?: string | null;
   blockedReason?: string | null;
@@ -648,6 +672,7 @@ export interface IssueLifecyclePatch {
   summaryReferences?: IssueLifecycleSummaryReference[];
   issueBreakdownPlans?: IssueBreakdownPlanRecord[];
   completionReports?: IssueCompletionReportRecord[];
+  completionReportRejections?: IssueCompletionReportRejectionRecord[];
   reviewVerdicts?: IssueReviewVerdictRecord[];
   mergeGateResults?: IssueMergeGateResultRecord[];
   reviewFeedback?: IssueReviewFeedbackRecord[];
@@ -709,6 +734,11 @@ export class FileIssueLifecycleStore {
         existing?.lastPostMortemReportId ?? null,
       ),
       lastCompletionReportId: patchValue(patch, "lastCompletionReportId", existing?.lastCompletionReportId ?? null),
+      lastCompletionReportRejectionId: patchValue(
+        patch,
+        "lastCompletionReportRejectionId",
+        existing?.lastCompletionReportRejectionId ?? null,
+      ),
       lastReviewVerdictId: patchValue(patch, "lastReviewVerdictId", existing?.lastReviewVerdictId ?? null),
       lastMergeGateResultId: patchValue(patch, "lastMergeGateResultId", existing?.lastMergeGateResultId ?? null),
       blockedReason: patchValue(patch, "blockedReason", existing?.blockedReason ?? null),
@@ -720,6 +750,7 @@ export class FileIssueLifecycleStore {
       summaryReferences: patch.summaryReferences ?? existing?.summaryReferences ?? [],
       issueBreakdownPlans: patch.issueBreakdownPlans ?? existing?.issueBreakdownPlans ?? [],
       completionReports: patch.completionReports ?? existing?.completionReports ?? [],
+      completionReportRejections: patch.completionReportRejections ?? existing?.completionReportRejections ?? [],
       reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
       mergeGateResults: patch.mergeGateResults ?? existing?.mergeGateResults ?? [],
       reviewFeedback: patch.reviewFeedback ?? existing?.reviewFeedback ?? [],
@@ -831,6 +862,7 @@ export function buildWorkerHandoffPacket(
     generatedAt,
     memo: record.handoff.memo,
     lastWorkerOutput: record.handoff.lastWorkerOutput,
+    lastCompletionReportRejection: latestCompletionReportRejection(record),
     lastReviewerOutput: record.handoff.lastReviewerOutput,
     pointers: record.summaryPointers,
   };
@@ -854,6 +886,7 @@ function buildLaneMemo(
 ): IssueLaneMemo {
   const openFindings = lastReviewerOutput?.verdict === "fail" ? lastReviewerOutput.findings.slice(0, 8) : [];
   const mergeGateEntry = mergeGateMemoEntry(record);
+  const lastCompletionReportRejection = latestCompletionReportRejection(record);
   const acceptedDecisions = [
     ...(lastReviewerOutput?.verdict === "pass"
       ? lastReviewerOutput.acceptanceResults
@@ -876,6 +909,11 @@ function buildLaneMemo(
     lastWorkerOutput
       ? `Latest worker output ${lastWorkerOutput.reportId} (${lastWorkerOutput.runId}): ${clip(lastWorkerOutput.summary)}`
       : "No accepted worker output is available yet.",
+    ...(lastCompletionReportRejection === null
+      ? []
+      : [
+          `Latest completion report rejection ${lastCompletionReportRejection.id} (${lastCompletionReportRejection.runId}): ${clip(lastCompletionReportRejection.reason)}`,
+        ]),
     lastReviewerOutput
       ? `Latest reviewer output ${lastReviewerOutput.verdictId} (${lastReviewerOutput.runId}): ${lastReviewerOutput.verdict}.`
       : "No reviewer output is available yet.",
@@ -909,6 +947,15 @@ function latestCompletionReport(
     return record.completionReports.find((report) => report.id === record.lastCompletionReportId) ?? null;
   }
   return record.completionReports.at(-1) ?? null;
+}
+
+function latestCompletionReportRejection(
+  record: Pick<IssueLifecycleRecord, "completionReportRejections" | "lastCompletionReportRejectionId">,
+): IssueCompletionReportRejectionRecord | null {
+  if (record.lastCompletionReportRejectionId) {
+    return record.completionReportRejections.find((rejection) => rejection.id === record.lastCompletionReportRejectionId) ?? null;
+  }
+  return record.completionReportRejections.at(-1) ?? null;
 }
 
 export function latestCurrentApprovalPassVerdict(
@@ -1203,6 +1250,10 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
         ? null
         : nullableString(value.lastPostMortemReportId, filePath, "lastPostMortemReportId"),
     lastCompletionReportId: nullableString(value.lastCompletionReportId, filePath, "lastCompletionReportId"),
+    lastCompletionReportRejectionId:
+      value.lastCompletionReportRejectionId === undefined
+        ? null
+        : nullableString(value.lastCompletionReportRejectionId, filePath, "lastCompletionReportRejectionId"),
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
     lastMergeGateResultId:
       value.lastMergeGateResultId === undefined
@@ -1213,6 +1264,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     summaryReferences: normalizeSummaryReferences(value.summaryReferences, filePath),
     issueBreakdownPlans: normalizeIssueBreakdownPlans(value.issueBreakdownPlans, filePath),
     completionReports: normalizeCompletionReports(value.completionReports, filePath),
+    completionReportRejections: normalizeCompletionReportRejections(value.completionReportRejections, filePath),
     reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
     mergeGateResults: normalizeMergeGateResults(value.mergeGateResults, filePath),
     reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
@@ -1447,6 +1499,12 @@ function normalizeCompletionReports(value: unknown, filePath: string): IssueComp
   return value.map((item, index) => normalizeCompletionReport(item, filePath, index));
 }
 
+function normalizeCompletionReportRejections(value: unknown, filePath: string): IssueCompletionReportRejectionRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "completionReportRejections is invalid");
+  return value.map((item, index) => normalizeCompletionReportRejection(item, filePath, index));
+}
+
 function normalizeReviewVerdicts(value: unknown, filePath: string): IssueReviewVerdictRecord[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewVerdicts is invalid");
@@ -1572,7 +1630,7 @@ function normalizeReviewerOutputContract(value: unknown, filePath: string): Issu
   if (!isRecord(value)) throw corruptLifecycle(filePath, "handoff.lastReviewerOutput is invalid");
   if (value.version !== 1) throw corruptLifecycle(filePath, "handoff.lastReviewerOutput.version is invalid");
   const verdict = value.verdict;
-  if (verdict !== "pass" && verdict !== "fail") {
+  if (verdict !== "pass" && verdict !== "fail" && verdict !== "blocked") {
     throw corruptLifecycle(filePath, "handoff.lastReviewerOutput.verdict is invalid");
   }
   const findings = requiredStringArray(value.findings, filePath, "handoff.lastReviewerOutput.findings");
@@ -1663,9 +1721,47 @@ function normalizeCompletionReport(value: unknown, filePath: string, index: numb
   };
 }
 
+function normalizeCompletionReportRejection(
+  value: unknown,
+  filePath: string,
+  index: number,
+): IssueCompletionReportRejectionRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `completionReportRejections[${index}] is invalid`);
+  if (value.reasonCode !== "unsatisfied_acceptance_checklist") {
+    throw corruptLifecycle(filePath, `completionReportRejections[${index}].reasonCode is invalid`);
+  }
+  return {
+    id: requiredString(value.id, filePath, `completionReportRejections[${index}].id`),
+    reportId: requiredString(value.reportId, filePath, `completionReportRejections[${index}].reportId`),
+    idempotencyKey: requiredString(value.idempotencyKey, filePath, `completionReportRejections[${index}].idempotencyKey`),
+    runId: requiredString(value.runId, filePath, `completionReportRejections[${index}].runId`),
+    issueId: requiredString(value.issueId, filePath, `completionReportRejections[${index}].issueId`),
+    issueIdentifier: requiredString(value.issueIdentifier, filePath, `completionReportRejections[${index}].issueIdentifier`),
+    reasonCode: value.reasonCode,
+    reason: requiredString(value.reason, filePath, `completionReportRejections[${index}].reason`),
+    summary: requiredString(value.summary, filePath, `completionReportRejections[${index}].summary`),
+    validationEvidence: requiredStringArray(
+      value.validationEvidence,
+      filePath,
+      `completionReportRejections[${index}].validationEvidence`,
+    ),
+    acceptanceChecklist: normalizeChecklist(value.acceptanceChecklist, filePath, index),
+    changedFiles: requiredStringArray(value.changedFiles, filePath, `completionReportRejections[${index}].changedFiles`),
+    branchName: nullableString(value.branchName, filePath, `completionReportRejections[${index}].branchName`),
+    pullRequest: normalizePullRequest(value.pullRequest, filePath, index),
+    risks: requiredStringArray(value.risks, filePath, `completionReportRejections[${index}].risks`),
+    rejectedAt: requiredString(value.rejectedAt, filePath, `completionReportRejections[${index}].rejectedAt`),
+    writebackOperationKeys: requiredStringArray(
+      value.writebackOperationKeys,
+      filePath,
+      `completionReportRejections[${index}].writebackOperationKeys`,
+    ),
+  };
+}
+
 function normalizeReviewVerdict(value: unknown, filePath: string, index: number): IssueReviewVerdictRecord {
   if (!isRecord(value)) throw corruptLifecycle(filePath, `reviewVerdicts[${index}] is invalid`);
-  if (value.verdict !== "pass" && value.verdict !== "fail") {
+  if (value.verdict !== "pass" && value.verdict !== "fail" && value.verdict !== "blocked") {
     throw corruptLifecycle(filePath, `reviewVerdicts[${index}].verdict is invalid`);
   }
   const findings = requiredStringArray(value.findings, filePath, `reviewVerdicts[${index}].findings`);

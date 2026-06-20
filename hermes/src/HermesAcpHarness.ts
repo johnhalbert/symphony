@@ -819,8 +819,12 @@ export class HermesAcpHarness implements AgentHarness {
       },
     };
     const commandPolicyHookOptions = agentCommandPolicyHookOptionsForAcpRun(ctx, phase, this.cliPath());
+    if (commandPolicyHookOptions === undefined && !ctx.config.hermes.commandPolicy.enabled) {
+      profileLeaseOptions.removeCommandPolicyHooks = true;
+    }
     if (commandPolicyHookOptions !== undefined) {
       profileLeaseOptions.commandPolicyHookOptions = commandPolicyHookOptions;
+      profileLeaseOptions.removeCommandPolicyHooks = true;
       profileLeaseOptions.upstreamRoot = ctx.config.hermes.upstreamRoot;
       if (ctx.config.hermes.python !== undefined) profileLeaseOptions.python = ctx.config.hermes.python;
       if (this.options.commandPolicyHookVerifier !== undefined) {
@@ -1468,6 +1472,7 @@ function agentCommandPolicyHookOptionsForAcpRun(
 }
 
 function shouldInstallAgentCommandPolicyHook(ctx: AgentRunContext, phase: AgentRunPhase): boolean {
+  if (!ctx.config.hermes.commandPolicy.enabled) return false;
   if (ctx.role === "reviewer") return true;
   if (ctx.role === "triage") return true;
   if (ctx.role === "planner") return true;

@@ -105,6 +105,7 @@ import {
   isSupersededLifecycleRecord,
   latestCurrentApprovalPassVerdict,
   phaseForIssueState,
+  type IssueCompletionReportRejectionRecord,
   type IssueCompletionReportRecord,
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
@@ -112,6 +113,7 @@ import {
   type IssueLifecycleStore,
   type IssueMergeConflictMetadata,
   type IssueMergeGateState,
+  type IssueReviewerOutputContract,
   type IssueReviewVerdictRecord,
   type IssueTriageBlockerKind,
   type IssueTriageBlockerRecord,
@@ -545,7 +547,7 @@ Inspect only. Do not modify files, create commits, push branches, comment on Lin
 
 Use the linked GitHub pull request as the primary detailed review surface. Call the submit_pull_request_review_feedback MCP tool before any verdict submission to leave concrete feedback directly on the lifecycle-bound PR by submitting a GitHub PR review and/or posting PR review comments. A pass verdict requires a prior whole-PR review with kind "review" and event "APPROVE" in this reviewer run. Requested changes should use kind "review" with event "REQUEST_CHANGES" when PR feedback is submitted, and must point to the relevant files, lines, or threads on GitHub.
 
-After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence. Then call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" only for contract-entitled gate findings and "pass" when all written acceptance criteria are satisfied, even if non-gating discovery findings remain. The MCP servers supply the active run, issue, and lifecycle-bound PR context; include runId, issueId, PR number, repository, token, or commit identity only if a tool explicitly asks for it.
+After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence. Then call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" only for worker-owned, contract-entitled gate findings; use verdict "blocked" when review cannot complete because required validation, tooling, credentials, or service-owned evidence is unavailable to worker/reviewer roles; use verdict "pass" when all written acceptance criteria are satisfied, even if non-gating discovery findings remain. The MCP servers supply the active run, issue, and lifecycle-bound PR context; include runId, issueId, PR number, repository, token, or commit identity only if a tool explicitly asks for it.
 
 ${DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE}
 
@@ -555,9 +557,9 @@ ${PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER}
 
 Tool payload guidance:
 - acceptanceResults: one entry per acceptance criterion with satisfied true/false and concrete evidence.
-- gateFindings: blocking contract defects only. A fail verdict requires at least one gate finding, and every gate finding must include requirementIds, contractAnchor, scenario, scenarioEntitlement, observedFailure, currentIssueOwnership, boundedRepair, and evidence.
+- gateFindings: blocking worker-owned contract defects only. A fail verdict requires at least one gate finding, and every gate finding must include requirementIds, contractAnchor, scenario, scenarioEntitlement, observedFailure, currentIssueOwnership, boundedRepair, and evidence. Do not use gateFindings for a blocked verdict.
 - discoveryFindings: non-gating discovered scope, adjacent sibling scenarios, hidden matrix axes, sibling issue scope, future hardening, or out-of-scope concerns. A pass verdict may include discovery findings.
-- findings: legacy compact summaries equal to gateFindings[].summary; empty for pass verdicts.
+- findings: compact summaries; for fail verdicts this equals gateFindings[].summary, for blocked verdicts this names the non-worker-owned blocker, and for pass verdicts this is empty.
 - evidence: PR review/comment URLs or other durable review evidence.
 - idempotencyKey: a stable unique key for this reviewer verdict.
 
@@ -3530,6 +3532,7 @@ export class Orchestrator {
           !(await this.reconcileCompletionReportHandoff(entry)) &&
           !entry.pullRequestHandoffAccepted
         ) {
+          await this.reconcileCompletionReportRejection(entry);
           await this.recordIncompleteTurn(entry);
         }
         if (entry.role === "reviewer") {
@@ -3551,6 +3554,9 @@ export class Orchestrator {
           await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           return;
+        }
+        if (entry.role === "worker" && entry.runPhase !== "merge_conflict_resolution") {
+          await this.reconcileCompletionReportRejection(entry);
         }
         const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
           status: "failed",
@@ -3578,6 +3584,9 @@ export class Orchestrator {
           await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           return;
+        }
+        if (entry.role === "worker" && entry.runPhase !== "merge_conflict_resolution") {
+          await this.reconcileCompletionReportRejection(entry);
         }
         const terminal = await this.updateRunTerminalStateIfRunning(entry.activeRunId ?? entry.runId ?? "", {
           status: "cancelled",
@@ -3854,6 +3863,11 @@ export class Orchestrator {
       return;
     }
 
+    const rejectedCompletionReport =
+      entry.role === "worker" &&
+      entry.runPhase !== "merge_conflict_resolution" &&
+      (await this.reconcileCompletionReportRejection(entry));
+
     if (kind === "normal") {
       if (entry.runId) {
         const terminal = await this.updateRunTerminalStateIfRunning(entry.runId, {
@@ -3888,19 +3902,21 @@ export class Orchestrator {
         return;
       }
       if (this.config.writeback.enabled) {
-        await this.applyWritebacks(
-          planRunSucceededWritebacks(
-            {
-              issue: entry.issue,
-              runId: entry.runId ?? issueId,
-              sessionId: entry.sessionId,
-              workspacePath: entry.workspacePath,
-              workspace: entry.workspace,
-            },
-            this.config,
-          ),
-          "turn completed",
-        );
+        if (!rejectedCompletionReport) {
+          await this.applyWritebacks(
+            planRunSucceededWritebacks(
+              {
+                issue: entry.issue,
+                runId: entry.runId ?? issueId,
+                sessionId: entry.sessionId,
+                workspacePath: entry.workspacePath,
+                workspace: entry.workspace,
+              },
+              this.config,
+            ),
+            "turn completed",
+          );
+        }
         this.claimed.delete(issueId);
         return;
       }
@@ -3938,20 +3954,22 @@ export class Orchestrator {
           if (terminal.record?.status === "failed" && terminal.record.error === OPERATOR_REJECTED_PUBLICATION_ERROR) return;
         }
       }
-      await this.applyWriteback(
-        planRunCancelledComment(
-          {
-            issue: entry.issue,
-            runId: entry.runId ?? issueId,
-            sessionId: entry.sessionId,
-            workspacePath: entry.workspacePath,
-            workspace: entry.workspace,
-          },
-          this.config,
-          error,
-        ),
-        "run cancelled",
-      );
+      if (!rejectedCompletionReport) {
+        await this.applyWriteback(
+          planRunCancelledComment(
+            {
+              issue: entry.issue,
+              runId: entry.runId ?? issueId,
+              sessionId: entry.sessionId,
+              workspacePath: entry.workspacePath,
+              workspace: entry.workspace,
+            },
+            this.config,
+            error,
+          ),
+          "run cancelled",
+        );
+      }
       this.claimed.delete(issueId);
     } else {
       if (entry.runPhase === "merge_conflict_resolution") {
@@ -3978,20 +3996,22 @@ export class Orchestrator {
           if (terminal.record?.status === "failed" && terminal.record.error === OPERATOR_REJECTED_PUBLICATION_ERROR) return;
         }
       }
-      await this.applyWriteback(
-        planRunFailedComment(
-          {
-            issue: entry.issue,
-            runId: entry.runId ?? issueId,
-            sessionId: entry.sessionId,
-            workspacePath: entry.workspacePath,
-            workspace: entry.workspace,
-          },
-          this.config,
-          error,
-        ),
-        "run failed",
-      );
+      if (!rejectedCompletionReport) {
+        await this.applyWriteback(
+          planRunFailedComment(
+            {
+              issue: entry.issue,
+              runId: entry.runId ?? issueId,
+              sessionId: entry.sessionId,
+              workspacePath: entry.workspacePath,
+              workspace: entry.workspace,
+            },
+            this.config,
+            error,
+          ),
+          "run failed",
+        );
+      }
       const sdkErrorFailures = await this.consecutiveSdkErrorFailures(entry.issue);
       if (sdkErrorFailures >= 1 + this.config.agent.maxSdkErrorRetries) {
         await this.escalateEntryBlocked(
@@ -4824,6 +4844,31 @@ export class Orchestrator {
         issue_identifier: entry.issue.identifier,
         run_id: runId,
         report_id: report.id,
+      });
+    }
+
+    return true;
+  }
+
+  private async reconcileCompletionReportRejection(entry: RunningEntry): Promise<boolean> {
+    const store = this.options.lifecycleStore;
+    const runId = entry.activeRunId ?? entry.runId;
+    if (!store || !runId) return false;
+
+    const lifecycle = await store.get(entry.issue.id);
+    const rejection = lifecycle?.completionReportRejections.find((item) => item.runId === runId) ?? null;
+    if (!lifecycle || !rejection) return false;
+
+    entry.lifecycle = lifecycle;
+
+    if (this.options.writeback) {
+      await this.options.writeback.processDue();
+    } else if (this.config.writeback.enabled) {
+      this.options.logger.warn("completion report rejected but writeback processor is not configured", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        run_id: runId,
+        rejection_id: rejection.id,
       });
     }
 
@@ -5944,6 +5989,9 @@ export class Orchestrator {
             `- Risks: ${formatList(packet.lastWorkerOutput.risks)}`,
           ]),
       "",
+      "Latest rejected completion report:",
+      ...formatCompletionReportRejectionForPrompt(packet.lastCompletionReportRejection),
+      "",
       "Latest reviewer output:",
       ...(packet.lastReviewerOutput === null
         ? ["- None"]
@@ -5952,6 +6000,9 @@ export class Orchestrator {
             `- Findings: ${formatList(packet.lastReviewerOutput.findings)}`,
             `- Evidence: ${formatList(packet.lastReviewerOutput.evidence)}`,
           ]),
+      "",
+      "Latest blocked reviewer verdict:",
+      ...formatBlockedReviewerVerdictForPrompt(packet.lastReviewerOutput),
       "",
       "Stable pointers:",
       `- Workspace: ${packet.pointers.workspacePath ?? "n/a"}`,
@@ -6203,6 +6254,29 @@ function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletio
     if (exact) return exact;
   }
   return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
+}
+
+function latestCompletionReportRejection(lifecycle: IssueLifecycleRecord): IssueCompletionReportRejectionRecord | null {
+  if (lifecycle.lastCompletionReportRejectionId) {
+    const exact = lifecycle.completionReportRejections.find(
+      (rejection) => rejection.id === lifecycle.lastCompletionReportRejectionId,
+    );
+    if (exact) return exact;
+  }
+  return lifecycle.completionReportRejections[lifecycle.completionReportRejections.length - 1] ?? null;
+}
+
+function latestCurrentCompletionReportRejection(
+  lifecycle: IssueLifecycleRecord,
+): IssueCompletionReportRejectionRecord | null {
+  const rejection = latestCompletionReportRejection(lifecycle);
+  if (rejection === null) return null;
+  const acceptedReport = latestCompletionReport(lifecycle);
+  if (acceptedReport === null) return rejection;
+  const rejectedAt = Date.parse(rejection.rejectedAt);
+  const acceptedAt = Date.parse(acceptedReport.acceptedAt);
+  if (Number.isFinite(rejectedAt) && Number.isFinite(acceptedAt) && acceptedAt >= rejectedAt) return null;
+  return rejection;
 }
 
 function latestReviewVerdict(lifecycle: IssueLifecycleRecord): IssueReviewVerdictRecord | null {
@@ -6494,6 +6568,7 @@ function planningBackoffRemainingMs(lifecycle: IssueLifecycleRecord, config: Ser
 function hasRealHandoffContext(lifecycle: IssueLifecycleRecord, runs: RunRecord[]): boolean {
   return (
     lifecycle.handoff.lastWorkerOutput !== null ||
+    lifecycle.completionReportRejections.length > 0 ||
     lifecycle.handoff.lastReviewerOutput !== null ||
     runs.length > 0 ||
     lifecycle.reviewRound > 0 ||
@@ -6516,6 +6591,12 @@ function currentPromptLifecycle(lifecycle: IssueLifecycleRecord): IssueLifecycle
 function nextWorkerAction(lifecycle: IssueLifecycleRecord): string {
   if (lifecycle.mergeGate?.status === "repair_dispatched" || lifecycle.mergeGate?.status === "blocked") {
     return "Repair the Symphony merge-gate checks on the lifecycle-bound PR, validate, and submit a new completion report.";
+  }
+  if (latestCurrentCompletionReportRejection(lifecycle) !== null) {
+    return "Fix the rejected completion report: satisfy every acceptance checklist item with durable evidence before submitting again.";
+  }
+  if (lifecycle.handoff.lastReviewerOutput?.verdict === "blocked") {
+    return "Resume after the blocked review: verify the human/operator blocker is resolved, then complete any remaining implementation or validation and submit a new completion report.";
   }
   if (lifecycle.handoff.lastReviewerOutput?.verdict === "fail") return "Address the latest reviewer findings, validate, and submit a new completion report.";
   if (lifecycle.incompleteTurnCount > 0) return "Continue the incomplete implementation using the memo and pointers before rediscovering context.";
@@ -6591,6 +6672,44 @@ function formatPointerList(pointers: string[]): string[] {
 
 function formatList(values: string[]): string {
   return values.length === 0 ? "n/a" : values.join("; ");
+}
+
+function formatCompletionReportRejectionForPrompt(
+  rejection: IssueCompletionReportRejectionRecord | null,
+): string[] {
+  if (rejection === null) return ["- None"];
+  const unsatisfied = rejection.acceptanceChecklist.filter((item) => !item.satisfied);
+  return [
+    `- Rejection: ${rejection.id}; report: ${rejection.reportId}; run: ${rejection.runId}; rejectedAt: ${rejection.rejectedAt}`,
+    `- Reason: ${rejection.reason}`,
+    "- Unsatisfied acceptance checklist:",
+    ...(unsatisfied.length === 0
+      ? ["- n/a"]
+      : unsatisfied.map((item) => `- [ ] ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`)),
+    "- Submitted report summary:",
+    `- Summary: ${rejection.summary}`,
+    `- Changed files: ${formatList(rejection.changedFiles)}`,
+    `- Validation: ${formatList(rejection.validationEvidence)}`,
+    `- Risks: ${formatList(rejection.risks)}`,
+  ];
+}
+
+function formatBlockedReviewerVerdictForPrompt(
+  verdict: IssueReviewerOutputContract | null,
+): string[] {
+  if (verdict?.verdict !== "blocked") return ["- None"];
+  return [
+    `- Verdict: ${verdict.verdict}; record: ${verdict.verdictId}; run: ${verdict.runId}; submittedAt: ${verdict.submittedAt}`,
+    `- Blocked findings: ${formatList(verdict.findings)}`,
+    "- Acceptance results:",
+    ...(verdict.acceptanceResults.length === 0
+      ? ["- n/a"]
+      : verdict.acceptanceResults.map(
+          (item) => `- ${item.satisfied ? "[x]" : "[ ]"} ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`,
+        )),
+    `- Evidence: ${formatList(verdict.evidence)}`,
+    "- Worker instruction: continue only after the blocker has been resolved or an approved validation path is available; then validate and submit a new completion report.",
+  ];
 }
 
 function formatUserPromptPacket(title: string, sections: Array<[string, string | null]>): string {
@@ -6677,6 +6796,12 @@ function currentObjectiveDirective(
   if (lifecycle?.mergeGate?.status === "repair_dispatched" || lifecycle?.mergeGate?.status === "blocked") {
     return "Repair only the active Symphony merge-gate blocker on the lifecycle-bound pull request.";
   }
+  if (lifecycle && latestCurrentCompletionReportRejection(lifecycle) !== null) {
+    return "Fix the rejected completion report by satisfying every acceptance checklist item with durable evidence before submitting again.";
+  }
+  if (lifecycle?.handoff.lastReviewerOutput?.verdict === "blocked") {
+    return "Resume after the blocked review only after the human/operator blocker has been resolved; verify the required evidence path is now available, complete any remaining implementation or validation, and submit a completion report.";
+  }
   if (lifecycle?.handoff.lastReviewerOutput?.verdict === "fail") {
     return "Repair the latest reviewer-requested changes while preserving correct completed work.";
   }
@@ -6732,6 +6857,20 @@ function activeDirectiveForRun(
         ...formatDirectiveDiscoveryFindings(verdict),
         "Unsatisfied acceptance results:",
         ...formatDirectiveAcceptanceGaps(verdict.acceptanceResults),
+      ].join("\n"),
+    );
+  }
+  if (verdict?.verdict === "blocked") {
+    sections.push(
+      [
+        "Latest blocked review:",
+        `- Review run: ${verdict.runId}`,
+        `- Blocked findings: ${formatList(verdict.findings)}`,
+        "Unsatisfied or blocked acceptance results:",
+        ...formatDirectiveAcceptanceGaps(verdict.acceptanceResults),
+        "Discovery findings (not worker-gating):",
+        ...formatDirectiveDiscoveryFindings(verdict),
+        `- Evidence: ${formatList(verdict.evidence)}`,
       ].join("\n"),
     );
   }

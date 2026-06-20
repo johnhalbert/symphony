@@ -16,6 +16,9 @@ memory:
 security:
   # UNSAFE dogfood debug setting: capture raw tool args/results in transcripts.
   redact_secrets: false
+  tirith_enabled: false
+approvals:
+  mode: off
 display:
   show_reasoning: true
   tool_progress: verbose

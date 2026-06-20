@@ -77,6 +77,53 @@ describe("ReviewVerdictService", () => {
     });
   });
 
+  it("accepts a blocked verdict without burning reviewer failure budget", async () => {
+    const { service, lifecycleStore, outbox } = fixture((config) => {
+      config.reviewLoop.blockedStates = ["Blocked"];
+    });
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+      reviewRound: 1,
+    });
+
+    const result = await service.submit_review_verdict(
+      blockedVerdict({
+        findings: ["Focused validation is unavailable to worker and reviewer command surfaces."],
+      }),
+      context(),
+    );
+
+    expect(result.replayed).toBe(false);
+    expect(result.writebackOperations).toHaveLength(2);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "blocked",
+      reviewRound: 1,
+      blockedReason: "review blocked: Focused validation is unavailable to worker and reviewer command surfaces.",
+      lastReviewVerdictId: "review-verdict:issue-1:blocked-verdict-1",
+      reviewVerdicts: [
+        {
+          id: "review-verdict:issue-1:blocked-verdict-1",
+          idempotencyKey: "blocked-verdict-1",
+          runId: "review-run-1",
+          verdict: "blocked",
+          findings: ["Focused validation is unavailable to worker and reviewer command surfaces."],
+        },
+      ],
+    });
+
+    const operations = await outbox.list();
+    const comment = operations.find((operation) => operation.kind === "comment");
+    const transition = operations.find((operation) => operation.kind === "transition");
+    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("## Symphony Review Verdict: Blocked");
+    expect(transition).toMatchObject({
+      kind: "transition",
+      payload: {
+        fromStates: ["In Review"],
+        toState: "Blocked",
+      },
+    });
+  });
+
   it("stores structured gate and discovery findings while deriving legacy findings from gate summaries", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
@@ -511,12 +558,13 @@ describe("ReviewVerdictService", () => {
     expect(result?.text).not.toContain("## Symphony Merge Gate Repair");
   });
 
-  function fixture() {
+  function fixture(configure: (config: ReturnType<typeof testConfig>) => void = () => undefined) {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewPassState = "Ready to Merge";
+    configure(config);
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const outbox = new FileWritebackOutboxStore(root);
     const service = new ReviewVerdictService({ config, lifecycleStore, writebackOutbox: outbox });
@@ -544,6 +592,7 @@ function lifecycle(
     lastIssueTriageReportId: null,
     lastPostMortemReportId: null,
     lastCompletionReportId: null,
+    lastCompletionReportRejectionId: null,
     lastReviewVerdictId: null,
     blockedReason: null,
     summaryPointers: {
@@ -566,6 +615,7 @@ function lifecycle(
     summaryReferences: [],
     issueBreakdownPlans: [],
     completionReports: [],
+    completionReportRejections: [],
     reviewVerdicts: [],
     reviewFeedback: [],
     issueTriageReports: [],
@@ -753,6 +803,27 @@ function passVerdict(overrides: Partial<ReviewVerdictInput> = {}): ReviewVerdict
     discoveryFindings: [],
     evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-1"],
     idempotencyKey: "verdict-pass-1",
+    ...overrides,
+  };
+}
+
+function blockedVerdict(overrides: Partial<ReviewVerdictInput> = {}): ReviewVerdictInput {
+  return {
+    runId: "review-run-1",
+    issueId: "issue-1",
+    verdict: "blocked",
+    acceptanceResults: [
+      {
+        text: "Required validation evidence is available",
+        satisfied: false,
+        evidence: "The worker and reviewer command surfaces cannot execute the required validation.",
+      },
+    ],
+    findings: ["Focused validation is unavailable to worker and reviewer command surfaces."],
+    gateFindings: [],
+    discoveryFindings: [],
+    evidence: ["reviewer observed command-policy denial"],
+    idempotencyKey: "blocked-verdict-1",
     ...overrides,
   };
 }
