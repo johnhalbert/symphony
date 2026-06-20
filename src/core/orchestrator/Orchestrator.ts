@@ -2053,10 +2053,22 @@ export class Orchestrator {
     }
     let runPhase = decision.runPhase;
     if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase, latestProjectContext))) return false;
-    const dispatchWriteback =
-      runPhase === "implementation"
-        ? planDispatchWriteback(latest, this.serviceConfigForIssue(latest, latestProjectContext), latestProjectContext)
-        : null;
+    let dispatchWriteback: ReturnType<typeof planDispatchWriteback> = null;
+    if (runPhase === "implementation") {
+      try {
+        dispatchWriteback = planDispatchWriteback(
+          latest,
+          this.serviceConfigForIssue(latest, latestProjectContext),
+          latestProjectContext,
+        );
+      } catch (error) {
+        if (error instanceof SymphonyError && error.code === "config_validation_error") {
+          await this.blockDispatchConfigurationError(latest, latestProjectContext, error);
+          return false;
+        }
+        throw error;
+      }
+    }
     if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
     const afterWriteback = dispatchWriteback
       ? (await this.fetchIssueStatesByIdsForProjectContext([issue.id], latestProjectContext))[0]
@@ -3474,8 +3486,9 @@ export class Orchestrator {
       await this.recordMergeConflictAttempt(entry, "conflict-fix run ended without submit_merge_conflict_resolution");
       return;
     }
-    if (!refreshed || !this.isImplementationActive(entry.issue)) {
-      await this.updateLifecycle(entry, { phase: phaseForIssueState(entry.issue.state, this.config) });
+    const config = this.serviceConfigForEntry(entry);
+    if (!refreshed || !this.isImplementationActive(entry.issue, config)) {
+      await this.updateLifecycle(entry, { phase: phaseForIssueState(entry.issue.state, config) });
       return;
     }
 
@@ -3484,10 +3497,10 @@ export class Orchestrator {
       phase: "implementation",
       incompleteTurnCount,
     });
-    if (incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns && entry.lifecycle) {
+    if (incompleteTurnCount >= config.reviewLoop.maxIncompleteTurns && entry.lifecycle) {
       await this.escalateEntryBlocked(
         entry,
-        `max incomplete turns reached (${incompleteTurnCount}/${this.config.reviewLoop.maxIncompleteTurns})`,
+        `max incomplete turns reached (${incompleteTurnCount}/${config.reviewLoop.maxIncompleteTurns})`,
       );
     }
   }
@@ -3522,7 +3535,13 @@ export class Orchestrator {
       mergeConflict: nextConflict,
     });
     if (nextConflict.status === "blocked") {
-      await this.applyMergeConflictBlockedWritebacks(entry.issue, runId, nextConflict, reason);
+      await this.applyMergeConflictBlockedWritebacks(
+        entry.issue,
+        runId,
+        nextConflict,
+        reason,
+        this.resolvedProjectContext(entry) ?? undefined,
+      );
       this.clearRetry(entry.issue.id);
     }
   }
@@ -3539,12 +3558,18 @@ export class Orchestrator {
       blockedAt: conflict.blockedAt ?? new Date().toISOString(),
       blockedReason: conflict.blockedReason ?? mergeConflictBlockedReason(conflict.fixTurnCount, conflict.maxFixTurns),
     };
-    await this.options.lifecycleStore?.updateIssue(issue, {
+    const blockedLifecycle = await this.options.lifecycleStore?.updateIssue(issue, {
       phase: "blocked",
       blockedReason: blockedConflict.blockedReason,
       mergeConflict: blockedConflict,
     });
-    await this.applyMergeConflictBlockedWritebacks(issue, runId, blockedConflict, "conflict-fix attempt limit reached");
+    await this.applyMergeConflictBlockedWritebacks(
+      issue,
+      runId,
+      blockedConflict,
+      "conflict-fix attempt limit reached",
+      blockedLifecycle?.projectContext ?? this.resolvedProjectContextFromIssue(issue),
+    );
   }
 
   private async applyMergeConflictBlockedWritebacks(
@@ -3552,11 +3577,13 @@ export class Orchestrator {
     runId: string,
     conflict: IssueMergeConflictMetadata,
     reason: string,
+    projectContext?: ProjectContextResolution,
   ): Promise<void> {
     await this.applyWritebacks(
       planBlockedEscalationWritebacks(
         {
           issue,
+          projectContext,
           runId,
           reason: conflict.blockedReason ?? reason,
           requiredAction: [
@@ -3594,14 +3621,14 @@ export class Orchestrator {
     }
   }
 
-  private isImplementationActive(issue: Issue): boolean {
+  private isImplementationActive(issue: Issue, config: ServiceConfig): boolean {
     return (
       issue.assignedToWorker &&
-      isStateIn(issue.state, this.config.tracker.activeStates) &&
-      !isStateIn(issue.state, this.config.tracker.handoffStates) &&
-      !isStateIn(issue.state, this.config.reviewLoop.reviewStates) &&
-      !isStateIn(issue.state, this.config.reviewLoop.blockedStates) &&
-      !isStateIn(issue.state, this.config.tracker.terminalStates)
+      isStateIn(issue.state, config.tracker.activeStates) &&
+      !isStateIn(issue.state, config.tracker.handoffStates) &&
+      !isStateIn(issue.state, config.reviewLoop.reviewStates) &&
+      !isStateIn(issue.state, config.reviewLoop.blockedStates) &&
+      !isStateIn(issue.state, config.tracker.terminalStates)
     );
   }
 
@@ -3614,6 +3641,25 @@ export class Orchestrator {
       entry.activeRunId ?? entry.runId ?? entry.issue.id,
       reason,
     );
+  }
+
+  private async blockDispatchConfigurationError(
+    issue: Issue,
+    projectContext: ProjectContextResolution | undefined,
+    error: SymphonyError,
+  ): Promise<void> {
+    const reason = `project context dispatch configuration error: ${error.message}`;
+    this.options.logger.warn("worker dispatch blocked by project context configuration", {
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      project_context_id: projectContext?.projectContextId ?? null,
+      error: error.message,
+    });
+    await this.options.lifecycleStore?.updateIssue(issue, {
+      projectContext,
+      phase: "blocked",
+      blockedReason: reason,
+    });
   }
 
   private async escalateLifecycleBlocked(
@@ -3629,16 +3675,19 @@ export class Orchestrator {
           blockedReason: reason,
         })
       : lifecycle;
+    const projectContext = blockedLifecycle.projectContext ?? lifecycle.projectContext ?? this.resolvedProjectContextFromIssue(issue);
+    const config = this.configForProjectContext(projectContext);
     await this.applyWritebacks(
       planBlockedEscalationWritebacks(
         {
           issue,
+          projectContext,
           runId,
           reason,
           incompleteTurnCount: blockedLifecycle.incompleteTurnCount,
-          maxIncompleteTurns: this.config.reviewLoop.maxIncompleteTurns,
+          maxIncompleteTurns: config.reviewLoop.maxIncompleteTurns,
           reviewRound: blockedLifecycle.reviewRound,
-          maxReviewRounds: this.config.reviewLoop.maxReviewRounds,
+          maxReviewRounds: config.reviewLoop.maxReviewRounds,
           lastCompletionReport: latestCompletionReport(blockedLifecycle),
           lastReviewVerdict: latestReviewVerdict(blockedLifecycle),
           requiredAction:

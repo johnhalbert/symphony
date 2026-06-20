@@ -933,6 +933,7 @@ const docsProjectContext = {
     config.issueBreakdown.planningLabels = ["planning"];
     config.writeback.enabled = true;
     config.writeback.mode = "live";
+    addDocsPollingProjectContext(config);
     const candidate = trackerIssue({
       id: "issue-docs-1",
       identifier: "ENG-123",
@@ -4720,6 +4721,7 @@ const docsProjectContext = {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
+    addDocsPollingProjectContext(config);
     const candidate = trackerIssue({
       id: "issue-1",
       identifier: "TEST-1",
@@ -5573,6 +5575,12 @@ const docsProjectContext = {
           id: "docs",
           tracker: { project_slug: "DOCS" },
           workspace: { source: { kind: "git", repository: "../docs-site" } },
+          github: {
+            publish_pull_requests: true,
+            operator_approval: { required_for_publication: true },
+            pr_handoff: { enabled: false },
+          },
+          review_loop: { review_states: ["In Review"], blocked_states: ["Blocked"] },
           credential_profiles: {
             profiles: {
               publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN" },
@@ -5686,6 +5694,12 @@ const docsProjectContext = {
           id: "docs",
           tracker: { project_slug: "DOCS" },
           workspace: { source: { kind: "git", repository: "../docs-site" } },
+          github: {
+            publish_pull_requests: true,
+            operator_approval: { required_for_publication: true },
+            pr_handoff: { enabled: false },
+          },
+          review_loop: { review_states: ["In Review"], blocked_states: ["Blocked"] },
           credential_profiles: {
             profiles: {
               publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN" },

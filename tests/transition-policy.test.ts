@@ -1,17 +1,19 @@
 import { describe, expect, it } from "vitest";
-import type { ServiceConfig } from "../src/core/config/Config.js";
+import { parseServiceConfig, type ServiceConfig } from "../src/core/config/Config.js";
+import type { ProjectContextResolution } from "../src/core/config/ProjectContexts.js";
 import type { PullRequestReviewEvidenceItem } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import {
   planBlockedEscalationWritebacks,
   planCompletionReportAcceptedWritebacks,
+  planDispatchWriteback,
   planMergeGateBlockedWritebacks,
   planMergeGateRepairWritebacks,
   planPullRequestHandoffWritebacks,
   planReviewFailWritebacks,
   planReviewPassWritebacks,
 } from "../src/core/writeback/TransitionPolicy.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, projectContextFixture, testConfig } from "./helpers.js";
 
 type NewCommentOperation = NewWritebackOperation & {
   kind: "comment";
@@ -117,6 +119,205 @@ describe("TransitionPolicy review-loop planners", () => {
       payload: {
         fromStates: ["In Progress"],
         toState: "Human Review",
+      },
+    });
+  });
+
+  it("uses the resolved project context review buckets for completion-report acceptance", () => {
+    const config = contextAwareTransitionPolicyConfig();
+    const projectContext = docsProjectContext();
+    const operations = planCompletionReportAcceptedWritebacks(
+      {
+        issue: issue({ state: "Docs Blocked", branchName: "symphony/DOCS-1" }),
+        projectContext,
+        runId: "run-docs-1",
+        sessionId: "session-1",
+        workspacePath: "/tmp/docs-workspace",
+      },
+      config,
+      "Validated docs context routing.",
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(commentBody(operations, 0)).toContain("Next state: Docs In Review (agent review queue)");
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        fromStates: ["In Progress", "Docs Blocked"],
+        toState: "Docs In Review",
+      },
+    });
+  });
+
+  it("uses the resolved project context dispatch bucket and fails closed for the default bucket", () => {
+    const config = contextAwareTransitionPolicyConfig();
+    const projectContext = docsProjectContext();
+
+    expect(planDispatchWriteback(issue({ state: "Todo" }), config, projectContext)).toBeNull();
+    expect(planDispatchWriteback(issue({ state: "Docs Todo" }), config, projectContext)).toMatchObject({
+      projectContext,
+      payload: {
+        fromStates: ["Docs Todo"],
+        toState: "In Progress",
+      },
+    });
+  });
+
+  it("fails closed before dispatch planning when an explicit project context is not configured", () => {
+    const config = contextAwareTransitionPolicyConfig();
+
+    expect(() => planDispatchWriteback(issue({ state: "Todo" }), config, staleDocsProjectContext())).toThrow(
+      'Resolved project context "docs-archive" is not configured',
+    );
+  });
+
+  it("fails closed before completion-report acceptance planning when an explicit project context is not configured", () => {
+    const config = contextAwareTransitionPolicyConfig();
+
+    expect(() =>
+      planCompletionReportAcceptedWritebacks(
+        {
+          issue: issue({ state: "In Progress", branchName: "symphony/DOCS-ARCHIVE-1" }),
+          projectContext: staleDocsProjectContext(),
+          runId: "run-stale-docs",
+          sessionId: "session-1",
+          workspacePath: "/tmp/docs-workspace",
+        },
+        config,
+        "Validated stale docs context routing.",
+      ),
+    ).toThrow('Resolved project context "docs-archive" is not configured');
+  });
+
+  it("fails closed before PR-handoff planning when an explicit project context is not configured", () => {
+    const config = contextAwareTransitionPolicyConfig();
+
+    expect(() =>
+      planPullRequestHandoffWritebacks(
+        {
+          issue: issue({ state: "In Progress", branchName: "symphony/DOCS-ARCHIVE-1" }),
+          projectContext: staleDocsProjectContext(),
+          runId: "run-stale-docs",
+          sessionId: "session-1",
+          workspacePath: "/tmp/docs-workspace",
+        },
+        config,
+        {
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/109",
+            number: 109,
+            headSha: "archive123",
+            branch: "symphony/DOCS-ARCHIVE-1",
+            draft: false,
+          },
+          ci: {
+            requiredChecks: ["Typecheck and test"],
+            passedChecks: ["Typecheck and test"],
+            noCiEvidence: null,
+          },
+        },
+      ),
+    ).toThrow('Resolved project context "docs-archive" is not configured');
+  });
+
+  it("fails closed when a resolved project context does not recognize the issue state bucket", () => {
+    const config = contextAwareTransitionPolicyConfig();
+
+    expect(
+      planCompletionReportAcceptedWritebacks(
+        {
+          issue: issue({ state: "Blocked", branchName: "symphony/DOCS-1" }),
+          projectContext: docsProjectContext(),
+          runId: "run-docs-1",
+          sessionId: "session-1",
+          workspacePath: "/tmp/docs-workspace",
+        },
+        config,
+        "Validated docs context routing.",
+      ),
+    ).toEqual([]);
+  });
+
+  it("uses the resolved project context PR handoff target", () => {
+    const config = contextAwareTransitionPolicyConfig();
+    const operations = planPullRequestHandoffWritebacks(
+      {
+        issue: issue({ state: "In Progress", branchName: "symphony/DOCS-1" }),
+        projectContext: docsProjectContext(),
+        runId: "run-docs-2",
+        sessionId: "session-2",
+        workspacePath: "/tmp/docs-workspace",
+      },
+      config,
+      {
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/108",
+          number: 108,
+          headSha: "def456",
+          branch: "symphony/DOCS-1",
+          draft: false,
+        },
+        ci: {
+          requiredChecks: ["Typecheck and test"],
+          passedChecks: ["Typecheck and test"],
+          noCiEvidence: null,
+        },
+      },
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(commentBody(operations, 0)).toContain("Next state: Docs Human Review (PR review handoff)");
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        fromStates: ["In Progress"],
+        toState: "Docs Human Review",
+      },
+    });
+  });
+
+  it("uses the resolved project context review-pass target and blocked buckets", () => {
+    const config = contextAwareTransitionPolicyConfig();
+    const projectContext = docsProjectContext();
+
+    const reviewPassOperations = planReviewPassWritebacks(
+      {
+        issue: issue({ state: "Docs In Review" }),
+        projectContext,
+        runId: "review-run-docs",
+        reviewer: "reviewer-1",
+      },
+      config,
+      "Looks good.",
+    );
+
+    expect(reviewPassOperations).toHaveLength(2);
+    expect(commentBody(reviewPassOperations, 0)).toContain("Review pass state: Docs Ready to Merge");
+    expect(reviewPassOperations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        fromStates: ["Docs In Review"],
+        toState: "Docs Ready to Merge",
+      },
+    });
+
+    const blockedOperations = planBlockedEscalationWritebacks(
+      {
+        issue: issue({ state: "Docs Human Review" }),
+        projectContext,
+        runId: "run-blocked-docs",
+        reason: "docs review ceiling reached",
+      },
+      config,
+    );
+
+    expect(blockedOperations).toHaveLength(2);
+    expect(commentBody(blockedOperations, 0)).toContain("Transitioning to blocked state: Docs Blocked");
+    expect(blockedOperations[1]).toMatchObject({
+      kind: "transition",
+      payload: {
+        fromStates: ["Docs Todo", "In Progress", "Docs Human Review", "Docs In Review"],
+        toState: "Docs Blocked",
       },
     });
   });
@@ -455,6 +656,107 @@ function reviewLoopConfig(): ServiceConfig {
   config.reviewLoop.blockedStates = ["Blocked"];
   config.reviewLoop.reviewPassState = "Ready to Merge";
   return config;
+}
+
+function contextAwareTransitionPolicyConfig(): ServiceConfig {
+  return parseServiceConfig(
+    multiProjectWorkflowConfig({
+      topLevel: {
+        tracker: {
+          active_states: ["Todo", "In Progress"],
+          handoff_states: ["Human Review"],
+        },
+        review_loop: {
+          review_states: ["In Review"],
+          blocked_states: ["Blocked"],
+          review_pass_state: "Ready to Merge",
+        },
+        writeback: {
+          enabled: true,
+          dispatch_state: "In Progress",
+        },
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          token: "github-test-token",
+          publish_pull_requests: true,
+          pr_handoff: {
+            enabled: true,
+            target_state: "Human Review",
+            required_checks: ["test"],
+          },
+        },
+      },
+      projectContexts: [
+        projectContextFixture({
+          id: "symphony",
+          label: "Symphony",
+          projectSlug: "TEST",
+          repository: ".",
+          tracker: {
+            active_states: ["Todo", "In Progress"],
+            handoff_states: ["Human Review"],
+          },
+          review_loop: {
+            review_states: ["In Review"],
+            blocked_states: ["Blocked"],
+            review_pass_state: "Ready to Merge",
+          },
+          github: {
+            publish_pull_requests: true,
+            pr_handoff: {
+              enabled: true,
+              target_state: "Human Review",
+              required_checks: ["test"],
+            },
+          },
+        }),
+        projectContextFixture({
+          id: "docs",
+          label: "Documentation Site",
+          projectSlug: "DOCS",
+          repository: "../docs-site",
+          tracker: {
+            active_states: ["Docs Todo", "In Progress"],
+            handoff_states: ["Docs Human Review"],
+          },
+          review_loop: {
+            review_states: ["Docs In Review"],
+            blocked_states: ["Docs Blocked"],
+            review_pass_state: "Docs Ready to Merge",
+          },
+          github: {
+            publish_pull_requests: true,
+            pr_handoff: {
+              enabled: true,
+              target_state: "Docs Human Review",
+              required_checks: ["test"],
+            },
+          },
+        }),
+      ],
+    }),
+    "/tmp/symphony-transition-policy/WORKFLOW.md",
+    { LINEAR_API_KEY: "linear-test-key" },
+  );
+}
+
+function docsProjectContext(): ProjectContextResolution {
+  return {
+    projectContextId: "docs",
+    projectContextLabel: "Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "candidate_poll",
+  };
+}
+
+function staleDocsProjectContext(): ProjectContextResolution {
+  return {
+    projectContextId: "docs-archive",
+    projectContextLabel: "Archived Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "explicit",
+  };
 }
 
 function commentBody(operations: NewWritebackOperation[], index: number): string {

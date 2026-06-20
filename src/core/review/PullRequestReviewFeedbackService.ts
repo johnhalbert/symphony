@@ -9,8 +9,10 @@ import type {
 import type { ServiceConfig } from "../config/Config.js";
 import {
   normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
   type ProjectContextResolution,
 } from "../config/ProjectContexts.js";
+import { resolveServiceConfigForProjectContext } from "../config/ProjectContextServiceConfig.js";
 import { SymphonyError } from "../errors.js";
 import type {
   CompletionReportPullRequestRef,
@@ -206,11 +208,13 @@ export class PullRequestReviewFeedbackService {
     ) {
       throw new SymphonyError("invalid_request", "Review feedback issue project context does not match the lifecycle record");
     }
-    const lifecyclePhase = context.phase ?? lifecycle.phase ?? phaseForIssueState(context.issue.state, this.options.config);
+    const projectContext = resolveReviewFeedbackProjectContext(context, lifecycle);
+    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const lifecyclePhase = context.phase ?? lifecycle.phase ?? phaseForIssueState(context.issue.state, resolvedConfig);
     if (lifecyclePhase !== "review") {
       throw new SymphonyError("invalid_request", `Review feedback cannot be accepted while lifecycle phase is ${lifecyclePhase}`);
     }
-    if (!sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
+    if (!sameStateIn(context.issue.state, resolvedConfig.reviewLoop.reviewStates)) {
       throw new SymphonyError("invalid_request", "Review feedback requires the issue to be in a review state");
     }
   }
@@ -392,6 +396,15 @@ function stableJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function resolveReviewFeedbackProjectContext(
+  context: ReviewFeedbackActiveContext,
+  lifecycle: IssueLifecycleRecord | null | undefined,
+): ProjectContextResolution {
+  return normalizeProjectContextResolution(
+    context.projectContext ?? lifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
 }
 
 function projectContextEquals(

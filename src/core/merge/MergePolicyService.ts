@@ -11,6 +11,7 @@ import type {
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
 import { projectContextResolutionFromIssue, type ProjectContextResolution } from "../config/ProjectContexts.js";
+import { resolveServiceConfigForProjectContext } from "../config/ProjectContextServiceConfig.js";
 import type { ResolvedCredential } from "../config/CredentialProfiles.js";
 import { SymphonyError } from "../errors.js";
 import type { Logger } from "../logging/StructuredLogger.js";
@@ -396,7 +397,8 @@ export class MergePolicyService {
       lifecycle.phase === "passed" ||
       (approvalVerdict !== null && lifecycle.lastReviewVerdictId === approvalVerdict.id);
     const reviewRound = newRepairCycle ? lifecycle.reviewRound + 1 : lifecycle.reviewRound;
-    const blocked = reviewRound >= this.options.config.reviewLoop.maxReviewRounds;
+    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const blocked = reviewRound >= resolvedConfig.reviewLoop.maxReviewRounds;
     const operations = blocked
       ? planMergeGateBlockedWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound, projectContext), this.options.config)
       : planMergeGateRepairWritebacks(this.mergeGateWritebackContext(issue, gate, sourceState, reviewRound, projectContext), this.options.config);
@@ -404,7 +406,11 @@ export class MergePolicyService {
       throw new SymphonyError("invalid_request", "Merge gate failure could not plan service-owned writeback");
     }
 
-    await this.requireMergeGateWritebacksSucceeded(issue, operations, blocked ? this.options.config.reviewLoop.blockedStates[0] ?? null : this.options.config.writeback.dispatchState);
+    await this.requireMergeGateWritebacksSucceeded(
+      issue,
+      operations,
+      blocked ? resolvedConfig.reviewLoop.blockedStates[0] ?? null : resolvedConfig.writeback.dispatchState,
+    );
 
     const blockerKind = blocked ? "blocked" : "repair";
     const operationKeys = operations.map((operation) => operation.idempotencyKey);
@@ -434,7 +440,7 @@ export class MergePolicyService {
       reviewRound,
       incompleteTurnCount: 0,
       blockedReason: blocked
-        ? `merge gate required checks failed or mergeability blockers persisted and max review rounds reached (${reviewRound}/${this.options.config.reviewLoop.maxReviewRounds})`
+        ? `merge gate required checks failed or mergeability blockers persisted and max review rounds reached (${reviewRound}/${resolvedConfig.reviewLoop.maxReviewRounds})`
         : null,
       lastReviewVerdictId: storedVerdict.id,
       reviewVerdicts: upsertMergeGateVerdict(lifecycle.reviewVerdicts, storedVerdict),
@@ -460,6 +466,7 @@ export class MergePolicyService {
     reviewRound: number,
     projectContext?: ProjectContextResolution,
   ) {
+    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
     return {
       issue,
       projectContext,
@@ -475,7 +482,7 @@ export class MergePolicyService {
       unknownChecks: gate.unknownChecks,
       mergeability: gate.mergeability,
       reviewRound,
-      maxReviewRounds: this.options.config.reviewLoop.maxReviewRounds,
+      maxReviewRounds: resolvedConfig.reviewLoop.maxReviewRounds,
     };
   }
 
@@ -490,6 +497,7 @@ export class MergePolicyService {
     projectContext?: ProjectContextResolution,
   ): Promise<MergePolicyResult> {
     const liveHeadSha = requireValue(livePullRequest.headSha, "Live PR head SHA is required for merge gate supersession");
+    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
     const gateId = mergeGateId(issue.id, pullRequest, previousHeadSha);
     const gate = lifecycle.mergeGate?.id === gateId ? lifecycle.mergeGate : null;
     const supersededPatch = gate
@@ -512,7 +520,7 @@ export class MergePolicyService {
       { issue, projectContext, gateId, fromState: sourceState, pullRequest, liveHeadSha, reportId: report.id },
       this.options.config,
     );
-    await this.requireMergeGateWritebacksSucceeded(issue, operations, this.options.config.writeback.dispatchState);
+    await this.requireMergeGateWritebacksSucceeded(issue, operations, resolvedConfig.writeback.dispatchState);
     await this.options.lifecycleStore.updateIssue(issue, {
       ...(gate ? inactiveMergeGateLifecyclePatch(lifecycle, gate, "superseded", liveHeadSha) : { mergeGate: supersededGate }),
       phase: "implementation",

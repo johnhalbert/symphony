@@ -630,7 +630,7 @@ describe("completion report MCP handoff", () => {
     });
   });
 
-  it("rejects completion report MCP submission when service-owned project context fields drift for the same project context id", async () => {
+  it("accepts completion report MCP submission when only same-context metadata drifts and preserves the service-owned context", async () => {
     const stateDir = path.join(root, "state");
     const workflowPath = path.join(root, "WORKFLOW.md");
     const contextFile = path.join(root, "context.json");
@@ -686,15 +686,25 @@ describe("completion report MCP handoff", () => {
       phase: "implementation",
     });
 
-    await expect(
-      submitCompletionReportFromMcp(report("context-project-fields-mismatch"), mcpOptions(workflowPath, contextFile)),
-    ).rejects.toThrow("Completion report MCP context does not match the active worker run");
-    await expect(new FileWritebackOutboxStore(stateDir).list()).resolves.toEqual([]);
+    const result = await submitCompletionReportFromMcp(
+      report("context-project-fields-drift-accepted"),
+      mcpOptions(workflowPath, contextFile),
+    );
+    expect(result).toMatchObject({
+      accepted: true,
+      replayed: false,
+      reportId: "completion-report:issue-1:context-project-fields-drift-accepted",
+    });
+    const outbox = await new FileWritebackOutboxStore(stateDir).list();
+    expect(outbox.find((operation) => operation.kind === "transition")).toMatchObject({
+      projectContext: docsProjectContext,
+      payload: { toState: "In Review" },
+    });
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
-      phase: "implementation",
+      phase: "review",
       projectContext: docsProjectContext,
       summaryPointers: { lastRunId: "run-project-context-field-mismatch" },
-      completionReports: [],
+      completionReports: [expect.objectContaining({ projectContext: docsProjectContext })],
     });
   });
 
@@ -1633,6 +1643,23 @@ github:
     no_ci:
       allowed: true
       evidence: No CI configured in MCP test
+project_contexts:
+  - id: default
+    label: Default
+    tracker:
+      project_slug: TEST
+    workspace:
+      source:
+        kind: copy
+        path: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
+  - id: docs
+    label: Documentation Site
+    tracker:
+      project_slug: DOCS
+    workspace:
+      source:
+        kind: copy
+        path: "${slash(path.join(path.dirname(stateDir), "workspaces"))}"
 ---
 Work on {{ issue.identifier }}.
 `;

@@ -567,10 +567,7 @@ export class FileIssueLifecycleStore {
     const target = this.recordPath(record.issueId);
     const temp = `${target}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-    if (process.platform === "win32") {
-      await fs.rm(target, { force: true });
-    }
-    await fs.rename(temp, target);
+    await renameLifecycleRecord(temp, target);
   }
 
   private notifyProjectionChanged(): void {
@@ -583,6 +580,24 @@ export class FileIssueLifecycleStore {
 
   private recordPath(issueIdOrIdentifier: string): string {
     return path.join(this.recordsDir(), `${safeFileName(issueIdOrIdentifier)}.json`);
+  }
+}
+
+async function renameLifecycleRecord(temp: string, target: string): Promise<void> {
+  const attempts = process.platform === "win32" ? 5 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      if (process.platform === "win32") {
+        await fs.rm(target, { force: true });
+      }
+      await fs.rename(temp, target);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      const retryable = process.platform === "win32" && (code === "EPERM" || code === "EACCES") && attempt < attempts - 1;
+      if (!retryable) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)));
+    }
   }
 }
 
