@@ -446,6 +446,9 @@ export class WorkspaceManager {
       assertPathInsideRoot(workspacePath, this.options.workspace.root);
       const existing = this.readPersistedWorkspaceRecordSync(workspaceKey);
       const createdNow = !existsSync(workspacePath);
+      if (workspaceKey === requestedWorkspaceKeyBase && issue.id === null && existing === null && !createdNow) {
+        return workspaceKey;
+      }
       if (!requiresWorkspaceCollisionFallback(issue) || !workspaceTargetConflictsWithIssue(existing, issue, createdNow)) {
         return workspaceKey;
       }
