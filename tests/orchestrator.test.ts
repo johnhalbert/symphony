@@ -5316,6 +5316,12 @@ const docsProjectContext = {
           id: "docs",
           tracker: { project_slug: "DOCS" },
           workspace: { source: { kind: "git", repository: "../docs-site" } },
+          github: {
+            publish_pull_requests: true,
+            operator_approval: { required_for_publication: true },
+            pr_handoff: { enabled: false },
+          },
+          review_loop: { review_states: ["In Review"], blocked_states: ["Blocked"] },
           credential_profiles: {
             profiles: {
               publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN" },
@@ -5429,6 +5435,12 @@ const docsProjectContext = {
           id: "docs",
           tracker: { project_slug: "DOCS" },
           workspace: { source: { kind: "git", repository: "../docs-site" } },
+          github: {
+            publish_pull_requests: true,
+            operator_approval: { required_for_publication: true },
+            pr_handoff: { enabled: false },
+          },
+          review_loop: { review_states: ["In Review"], blocked_states: ["Blocked"] },
           credential_profiles: {
             profiles: {
               publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN" },

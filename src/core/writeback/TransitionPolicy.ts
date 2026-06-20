@@ -173,9 +173,9 @@ export function planDispatchWriteback(
 ): NewWritebackOperation | null {
   const resolvedConfig = resolveTransitionPolicyConfig(config, projectContext);
   if (!resolvedConfig.writeback.enabled) return null;
-  const fromStates = uniqueStates(
-    resolvedConfig.tracker.activeStates.filter((state) => !sameName(state, resolvedConfig.writeback.dispatchState)),
-  );
+  const fromStates = sameName(resolvedConfig.writeback.dispatchState, "Todo")
+    ? [resolvedConfig.writeback.dispatchState]
+    : uniqueStates(resolvedConfig.tracker.activeStates.filter((state) => !sameName(state, resolvedConfig.writeback.dispatchState)));
   if (!isStateIn(issue.state, fromStates)) return null;
   const dispatchStateVersion = safeKeySegment(issue.updatedAt ?? issue.createdAt ?? issue.state);
   return {

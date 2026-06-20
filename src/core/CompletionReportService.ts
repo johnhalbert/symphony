@@ -203,7 +203,7 @@ export class CompletionReportService {
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
     validateCompletionReportProjectContext(context, existingLifecycle);
     const projectContext = resolveCompletionReportProjectContext(context, existingLifecycle);
-    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const resolvedConfig = resolveCompletionReportServiceConfig(this.options.config, projectContext);
     const resolvedContext: CompletionReportActiveContext = { ...context, projectContext };
     const existing = existingLifecycle?.completionReports.find((item) => item.idempotencyKey === report.idempotencyKey);
     if (existing && isFinalizedCompletionReport(existing)) {
@@ -365,7 +365,7 @@ export class CompletionReportService {
     );
     if (!lifecycle || !existing) return null;
     const projectContext = existing.projectContext ?? lifecycle.projectContext ?? projectContextResolutionFromIssue(input.issue) ?? undefined;
-    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const resolvedConfig = resolveCompletionReportServiceConfig(this.options.config, projectContext);
     if (!resolvedConfig.github.publishPullRequests) return null;
     if (!this.options.pullRequestPublisher) {
       throw new SymphonyError("invalid_request", "PR publication is enabled but no GitHub publisher is configured");
@@ -458,7 +458,7 @@ export class CompletionReportService {
     const handoffLifecycle = handoff.lifecycle;
     const pendingReport = handoff.pendingReport;
     const projectContext = pendingReport.projectContext ?? handoffLifecycle.projectContext ?? projectContextResolutionFromIssue(input.issue) ?? undefined;
-    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const resolvedConfig = resolveCompletionReportServiceConfig(this.options.config, projectContext);
     if (!this.shouldPersistBeforePublicationApproval(resolvedConfig)) {
       return { recovered: false, reason: "not_applicable" };
     }
@@ -560,7 +560,7 @@ export class CompletionReportService {
           }
         : null;
     const projectContext = resolveCompletionReportProjectContext(input.context, input.lifecycle);
-    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const resolvedConfig = resolveCompletionReportServiceConfig(this.options.config, projectContext);
     const handoffChecks = await this.evaluatePullRequestHandoffChecks(verifiedPullRequest, resolvedConfig);
     if (resolvedConfig.github.prHandoff.enabled && (!verifiedPullRequest || !handoffChecks)) {
       throw new SymphonyError(
@@ -876,7 +876,7 @@ export class CompletionReportService {
     existingLifecycle: ExistingIssueLifecycle,
   ): CompletionReportPullRequestPublicationInput {
     const projectContext = resolveCompletionReportProjectContext(context, existingLifecycle);
-    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const resolvedConfig = resolveCompletionReportServiceConfig(this.options.config, projectContext);
     const workspacePath = context.workspacePath ?? context.workspace?.path ?? existingLifecycle?.summaryPointers.workspacePath ?? null;
     if (!workspacePath) {
       throw new SymphonyError("invalid_request", "PR publication requires a worktree workspace path");
@@ -995,7 +995,7 @@ export class CompletionReportService {
       return [];
     }
     const projectContext = resolveCompletionReportProjectContext(context, latestLifecycle);
-    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const resolvedConfig = resolveCompletionReportServiceConfig(this.options.config, projectContext);
     const issue = {
       ...context.issue,
       state: resolvedConfig.reviewLoop.blockedStates[0] ?? context.issue.state,
@@ -1036,7 +1036,7 @@ export class CompletionReportService {
     if (!runStore) return;
     const existing = await runStore.getRun(approval.runId);
     const completedAt = existing?.completedAt ?? new Date().toISOString();
-    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, approval.projectContext ?? undefined);
+    const resolvedConfig = resolveCompletionReportServiceConfig(this.options.config, approval.projectContext ?? undefined);
     const rejectPolicy = resolvedConfig.github.operatorApproval?.rejectPolicy ?? "cancel";
     const cancelledByPolicy = approval.status === "rejected" && rejectPolicy === "cancel";
     const failedByPolicy = approval.status === "rejected" && rejectPolicy === "fail";
@@ -1236,6 +1236,19 @@ function normalizeChecklist(items: CompletionReportInput["acceptanceChecklist"])
   }));
 }
 
+function resolveCompletionReportServiceConfig(
+  config: ServiceConfig,
+  projectContext?: ProjectContextResolution,
+): ServiceConfig {
+  try {
+    return resolveServiceConfigForProjectContext(config, projectContext);
+  } catch (error) {
+    if (error instanceof SymphonyError && error.code === "config_validation_error") {
+      return config;
+    }
+    throw error;
+  }
+}
 
 function validateCompletionReportProjectContext(
   context: CompletionReportActiveContext,
@@ -1279,7 +1292,7 @@ function recoveryContextFor(input: {
   config: ServiceConfig;
 }): CompletionReportActiveContext {
   const projectContext = input.pendingReport.projectContext ?? input.lifecycle.projectContext ?? input.run?.projectContext ?? undefined;
-  const resolvedConfig = resolveServiceConfigForProjectContext(input.config, projectContext);
+  const resolvedConfig = resolveCompletionReportServiceConfig(input.config, projectContext);
   const branchName = resolveServiceOwnedCompletionReportBranchName({
     lifecycleGitBranchName: input.lifecycle.summaryPointers.gitBranchName,
     lifecycleBranchName: input.lifecycle.summaryPointers.branchName,
