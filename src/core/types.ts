@@ -229,19 +229,19 @@ export interface IssueDetailsEnvelope {
 }
 
 function projectContextIdForIssueStatusView(issue: Issue): string | undefined {
-  return issue.projectContextId ?? issue.projectContext?.projectContextId;
+  return issue.projectContext?.projectContextId ?? issue.projectContextId;
 }
 
 function projectContextLabelForIssueStatusView(issue: Issue): string | undefined {
-  return issue.projectContextLabel ?? issue.projectContext?.projectContextLabel;
+  return issue.projectContext?.projectContextLabel ?? issue.projectContextLabel;
 }
 
 function linearProjectSlugForIssueStatusView(issue: Issue): string | null | undefined {
-  return issue.linearProjectSlug ?? issue.projectContext?.linearProjectSlug;
+  return issue.projectContext?.linearProjectSlug ?? issue.linearProjectSlug;
 }
 
 function routingSourceForIssueStatusView(issue: Issue): string | undefined {
-  return issue.routingSource ?? issue.projectContext?.routingSource;
+  return issue.projectContext?.routingSource ?? issue.routingSource;
 }
 
 function linearProjectIdentityForIssueStatusView(issue: Issue): IssueLinearProjectIdentity | undefined {

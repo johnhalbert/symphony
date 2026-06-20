@@ -1463,7 +1463,7 @@ export class Orchestrator {
           tokens: entry.tokens,
           lifecycle: entry.lifecycle,
           metadata: metadataForRunningEntry(entry),
-          issueDetails: toIssueStatusView(entry.issue),
+          issueDetails: toIssueStatusView(issueWithProjectContext(entry.issue, projectContext ?? null)),
         };
       }),
       retrying: [...this.retryAttempts.values()].map((entry) => ({
