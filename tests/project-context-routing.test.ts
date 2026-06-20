@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
+import type { ProjectContextResolution } from "../src/core/config/ProjectContexts.js";
 import type { AgentEvent, AgentHarness, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
@@ -104,6 +105,54 @@ describe("project context routing contract", () => {
     await expect(result.lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       phase: "blocked",
       blockedReason: expect.stringContaining(blockedReason),
+      incompleteTurnCount: 0,
+    });
+  });
+
+  it("fails closed when scoped polling contexts share a Linear project slug and return the same candidate", async () => {
+    const config = projectConfig(root, [
+      projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "." }),
+      projectContextFixture({ id: "guides", label: "Guides Site", projectSlug: "DOCS", repository: "." }),
+    ]);
+    const candidate = candidatePollIssue({ id: "issue-docs-shared", identifier: "DOCS-77", state: "Todo" }, "DOCS");
+    const docsTracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [structuredClone(candidate)];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [structuredClone(candidate)];
+      },
+    };
+    const guidesTracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [structuredClone(candidate)];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [structuredClone(candidate)];
+      },
+    };
+
+    const result = await runRoutingScenario({
+      candidate,
+      config,
+      runIdPrefix: "duplicate-scoped-slug",
+      tracker: docsTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === "guides" ? guidesTracker : docsTracker;
+      },
+    });
+
+    expect(result.harness.runs).toHaveLength(0);
+    expect(result.harness.lastRunId()).toBeNull();
+    await expect(result.lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: expect.stringContaining("matched multiple enabled project contexts"),
       incompleteTurnCount: 0,
     });
   });
@@ -219,23 +268,27 @@ async function runRoutingScenario(params: {
   candidate: Issue;
   runIdPrefix: string;
   refreshedIssue?: Issue;
+  tracker?: TrackerClient;
+  trackerResolver?: (projectContext?: ProjectContextResolution) => TrackerClient;
 }): Promise<{
   harness: RecordingHarness;
   lifecycleStore: FileIssueLifecycleStore;
   runStore: FileRunTranscriptStore;
 }> {
   const logger = new StructuredLogger(() => undefined);
-  const tracker: TrackerClient = {
-    async fetchCandidateIssues() {
-      return [structuredClone(params.candidate)];
-    },
-    async fetchIssuesByStates() {
-      return [];
-    },
-    async fetchIssueStatesByIds() {
-      return [structuredClone(params.refreshedIssue ?? params.candidate)];
-    },
-  };
+  const tracker: TrackerClient =
+    params.tracker ??
+    {
+      async fetchCandidateIssues() {
+        return [structuredClone(params.candidate)];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [structuredClone(params.refreshedIssue ?? params.candidate)];
+      },
+    };
   const harness = new RecordingHarness(params.runIdPrefix);
   const lifecycleStore = new FileIssueLifecycleStore(params.config.workspace.stateDir);
   const runStore = new FileRunTranscriptStore(params.config.workspace.stateDir);
@@ -247,6 +300,7 @@ async function runRoutingScenario(params: {
   const orchestrator = new Orchestrator({
     config: params.config,
     tracker,
+    ...(params.trackerResolver ? { trackerResolver: params.trackerResolver } : {}),
     workspaceManager,
     harness,
     logger,

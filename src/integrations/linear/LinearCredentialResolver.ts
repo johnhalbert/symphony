@@ -23,6 +23,8 @@ export interface ResolvedLinearClientConfig {
   projectContextLabel: string;
   tracker: TrackerConfig;
   credential: ResolvedCredential | null;
+  projectContextId: string;
+  projectContext: WorkflowProjectContext;
 }
 
 export function resolveLinearClientConfig(
@@ -61,6 +63,8 @@ export function resolveLinearClientConfig(
       apiKey: credential?.value ?? view.tracker.apiKey,
     },
     credential,
+    projectContextId: view.projectContextId,
+    projectContext: view.projectContext,
   };
 }
 
@@ -78,7 +82,40 @@ export function createLinearTrackerClientForCapability(
   fetchImpl?: FetchLike,
   options: ProjectContextCredentialResolutionOptions = {},
 ): LinearTrackerClient {
-  return new LinearTrackerClient(resolveLinearClientConfig(config, capability, options).tracker, fetchImpl);
+  const resolved = resolveLinearClientConfig(config, capability, options);
+  const projectContextMetadata = shouldStampTrackerProjectContextMetadata(config, resolved, options.projectContext)
+    ? {
+        projectContextId: resolved.projectContextId,
+        projectContextLabel: resolved.projectContext.label,
+        linearProjectSlug: resolved.projectContext.tracker.projectSlug,
+      }
+    : null;
+  return new LinearTrackerClient(resolved.tracker, fetchImpl, projectContextMetadata);
+}
+
+function shouldStampTrackerProjectContextMetadata(
+  config: ServiceConfig,
+  resolved: ResolvedLinearClientConfig,
+  requestedProjectContext: ProjectContextCredentialResolutionOptions["projectContext"],
+): boolean {
+  if (!requestedProjectContext) return false;
+  const resolvedProjectSlug = normalizeProjectSlug(resolved.projectContext.tracker.projectSlug);
+  if (resolvedProjectSlug === null) return true;
+  return (
+    config.projectContexts.enabledContexts.filter((context) => sameProjectSlug(context.tracker.projectSlug, resolvedProjectSlug)).length === 1
+  );
+}
+
+function normalizeProjectSlug(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function sameProjectSlug(left: string | null | undefined, right: string | null | undefined): boolean {
+  const normalizedLeft = normalizeProjectSlug(left);
+  const normalizedRight = normalizeProjectSlug(right);
+  return normalizedLeft !== null && normalizedRight !== null && normalizedLeft.toLowerCase() === normalizedRight.toLowerCase();
 }
 
 export function createLinearTrackerClientForProjectContext(
