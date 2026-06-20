@@ -103,6 +103,17 @@ describe("WorkspaceManager", () => {
     };
 
     const docsWorkspace = await manager.createForIssue(docsIssue);
+    const docsLookupPath = manager.getPathForIssue({
+      id: null,
+      identifier: docsIssue.identifier,
+      branchName: null,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: null,
+        routingSource: "explicit",
+      },
+    });
     const docsMetadata = JSON.parse(
       await readFile(
         path.join(config.workspace.stateDir, "workspaces", "docs__ENG-123__id__issue-docs-collision-1.json"),
@@ -122,6 +133,8 @@ describe("WorkspaceManager", () => {
     expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-123");
     expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-collision-1");
     expect(docsWorkspace.path).not.toBe(legacyWorkspace.path);
+    expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);
+    expect(docsLookupPath).toBe(docsWorkspace.path);
     expect(legacyMetadataBefore).toMatchObject({
       issueId: "legacy-docs-prefix-1",
       issueIdentifier: "docs__ENG-123",
@@ -142,6 +155,69 @@ describe("WorkspaceManager", () => {
       issueIdentifier: "docs__ENG-123",
     });
     expect(JSON.parse(await readFile(legacyMetadataPath, "utf8"))).toEqual(legacyMetadataBefore);
+  });
+
+  it("prefers the implementation workspace over a newer numbered planning sibling when resolving lookup and removal for legacy collisions", async () => {
+    const config = testConfig(root);
+    const manager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger: new StructuredLogger(() => undefined),
+    });
+    const legacyIssue = issue({ id: "legacy-docs-prefix-planning-1", identifier: "docs__ENG-123" });
+    const planningBaseCollisionIssue = issue({ id: "legacy-docs-planning-base-1", identifier: "docs__ENG-123-planning" });
+    const planningFallbackCollisionIssue = issue({
+      id: "legacy-docs-planning-fallback-1",
+      identifier: "docs__ENG-123__id__issue-docs-planning-lookup-1-planning",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-planning-lookup-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: null,
+    });
+
+    const legacyWorkspace = await manager.createForIssue(legacyIssue);
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const planningBaseCollisionWorkspace = await manager.createForIssue(planningBaseCollisionIssue);
+    const planningFallbackCollisionWorkspace = await manager.createForIssue(planningFallbackCollisionIssue);
+    const planningWorkspace = await manager.createForPlanning(docsIssue);
+    const docsLookupPath = manager.getPathForIssue({
+      id: null,
+      identifier: docsIssue.identifier,
+      branchName: null,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: null,
+        routingSource: "explicit",
+      },
+    });
+
+    expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-lookup-1");
+    expect(planningBaseCollisionWorkspace.workspaceKey).toBe("docs__ENG-123-planning");
+    expect(planningFallbackCollisionWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-lookup-1-planning");
+    expect(planningWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-lookup-1-planning__2");
+    expect(docsWorkspace.path).not.toBe(legacyWorkspace.path);
+    expect(planningWorkspace.path).not.toBe(docsWorkspace.path);
+    expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);
+    expect(docsLookupPath).toBe(docsWorkspace.path);
+    expect(docsLookupPath).not.toBe(planningWorkspace.path);
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(stat(docsWorkspace.path)).rejects.toThrow();
+    await expect(stat(planningWorkspace.path)).resolves.toBeDefined();
+    await expect(stat(legacyWorkspace.path)).resolves.toBeDefined();
+    await expect(readFile(path.join(planningWorkspace.path, ".symphony-planning.json"), "utf8")).resolves.toContain('"mode": "none"');
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    expect(await manager.getWorkspaceRecord(planningWorkspace.workspaceKey)).toMatchObject({
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      sourceKind: "planning_none",
+    });
   });
 
   it("rejects paths outside the workspace root", () => {

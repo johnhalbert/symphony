@@ -140,10 +140,23 @@ describe("git worktree workspace source", () => {
 
     const legacyWorkspace = await manager.createForIssue(legacyIssue);
     const docsWorkspace = await manager.createForIssue(docsIssue);
+    const docsLookupPath = manager.getPathForIssue({
+      id: null,
+      identifier: docsIssue.identifier,
+      branchName: null,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: null,
+        routingSource: "explicit",
+      },
+    });
 
     expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-123");
     expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-collision-worktree-1");
     expect(docsWorkspace.path).not.toBe(legacyWorkspace.path);
+    expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);
+    expect(docsLookupPath).toBe(docsWorkspace.path);
     expect((await git(["branch", "--show-current"], legacyWorkspace.path)).trim()).toBe("symphony/docs__ENG-123");
     expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
     expect(await manager.getWorkspaceRecord(legacyWorkspace.workspaceKey)).toMatchObject({
@@ -166,6 +179,71 @@ describe("git worktree workspace source", () => {
       issueId: "legacy-docs-prefix-worktree-1",
       issueIdentifier: "docs__ENG-123",
       gitBranchName: "symphony/docs__ENG-123",
+    });
+  });
+
+  it("prefers the implementation worktree over a newer numbered planning sibling when resolving lookup and removal for legacy collisions", async () => {
+    const manager = newManager(root, repo);
+    const legacyIssue = issue({
+      id: "legacy-docs-prefix-worktree-planning-1",
+      identifier: "docs__ENG-123",
+      branchName: "symphony/docs__ENG-123",
+    });
+    const planningBaseCollisionIssue = issue({
+      id: "legacy-docs-planning-base-worktree-1",
+      identifier: "docs__ENG-123-planning",
+      branchName: "symphony/docs__ENG-123-planning",
+    });
+    const planningFallbackCollisionIssue = issue({
+      id: "legacy-docs-planning-fallback-worktree-1",
+      identifier: "docs__ENG-123__id__issue-docs-planning-worktree-1-planning",
+      branchName: "symphony/docs__ENG-123__id__issue-docs-planning-worktree-1-planning",
+    });
+    const docsIssue = trackerIssue({
+      id: "issue-docs-planning-worktree-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-123",
+    });
+
+    const legacyWorkspace = await manager.createForIssue(legacyIssue);
+    const docsWorkspace = await manager.createForIssue(docsIssue);
+    const planningBaseCollisionWorkspace = await manager.createForIssue(planningBaseCollisionIssue);
+    const planningFallbackCollisionWorkspace = await manager.createForIssue(planningFallbackCollisionIssue);
+    const planningWorkspace = await manager.createForPlanning(docsIssue);
+    const docsLookupPath = manager.getPathForIssue({
+      id: null,
+      identifier: docsIssue.identifier,
+      branchName: null,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: null,
+        routingSource: "explicit",
+      },
+    });
+
+    expect(legacyWorkspace.workspaceKey).toBe("docs__ENG-123");
+    expect(docsWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-worktree-1");
+    expect(planningBaseCollisionWorkspace.workspaceKey).toBe("docs__ENG-123-planning");
+    expect(planningFallbackCollisionWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-worktree-1-planning");
+    expect(planningWorkspace.workspaceKey).toBe("docs__ENG-123__id__issue-docs-planning-worktree-1-planning__2");
+    expect((await git(["branch", "--show-current"], docsWorkspace.path)).trim()).toBe("symphony/docs/ENG-123");
+    expect(manager.getPathForIssue(docsIssue)).toBe(docsWorkspace.path);
+    expect(docsLookupPath).toBe(docsWorkspace.path);
+    expect(docsLookupPath).not.toBe(planningWorkspace.path);
+
+    await manager.removeForIssue(docsIssue);
+
+    await expect(readFile(path.join(docsWorkspace.path, "README.md"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(legacyWorkspace.path, "README.md"), "utf8")).resolves.toContain("hello");
+    await expect(readFile(path.join(planningWorkspace.path, ".symphony-planning.json"), "utf8")).resolves.toContain('"mode": "none"');
+    expect(await manager.getWorkspaceRecord(docsWorkspace.workspaceKey)).toBeNull();
+    expect(await manager.getWorkspaceRecord(planningWorkspace.workspaceKey)).toMatchObject({
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      sourceKind: "planning_none",
     });
   });
 
