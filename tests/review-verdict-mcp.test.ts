@@ -240,7 +240,6 @@ describe("review verdict MCP handoff", () => {
       ...issue({ state: "In Review", branchName: "symphony/TEST-1" }),
       projectContextId: symphonyProjectContext.projectContextId,
       projectContextLabel: "Spoofed Symphony",
-      linearProjectIdentity: { kind: "linear", slug: null, id: null },
       routingSource: "replay",
     };
     await writeFile(workflowPath, workflow(stateDir), "utf8");
