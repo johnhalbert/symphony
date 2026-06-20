@@ -42,6 +42,7 @@ import {
 } from "../src/core/IssueBreakdownPlanApplyService.js";
 import { IssueBreakdownPlanService } from "../src/core/IssueBreakdownPlanService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import type { MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
 import {
   FileIssueLifecycleStore,
@@ -77,6 +78,7 @@ import {
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import type { Issue, TokenCounts, TrackerStateLists } from "../src/core/types.js";
+import type { PullRequestCheckResult } from "../src/integrations/github/GitHubPullRequestClient.js";
 import { agentEligibleIssueContract, issue, testConfig, trackerClientFixture, trackerIssue } from "./helpers.js";
 
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
@@ -6367,6 +6369,174 @@ const docsProjectContext = {
     });
   });
 
+  it("reconciles merge-policy issues through resolved project-context tracker clients", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.sourceStates = ["Ready to Merge"];
+    config.mergePolicy.doneState = "Done";
+    config.mergePolicy.requiredChecks = ["ci"];
+    config.github.owner = "acme";
+    config.github.repo = "symphony";
+    addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.github.token = "github-secret";
+
+    const candidate = trackerIssue({
+      id: "issue-docs-merge-1",
+      identifier: "DOCS-1",
+      state: "Ready to Merge",
+      branchName: "symphony/docs/DOCS-1",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    const branchName = candidate.branchName ?? "symphony/docs/DOCS-1";
+    let docsState = "Ready to Merge";
+    const defaultTracker = trackerClientFixture();
+    const docsTracker: TrackerClient & { candidateFetchCount: number; requestedStates: string[][]; requestedIds: string[][] } = {
+      candidateFetchCount: 0,
+      requestedStates: [],
+      requestedIds: [],
+      async fetchCandidateIssues() {
+        docsTracker.candidateFetchCount += 1;
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        docsTracker.requestedStates.push([...states]);
+        return states.includes(docsState) ? [{ ...candidate, state: docsState }] : [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        docsTracker.requestedIds.push([...issueIds]);
+        return issueIds.includes(candidate.id) ? [{ ...candidate, state: docsState }] : [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      docsState = state;
+    });
+    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    await runStore.startRun({
+      runId: "worker-run-1",
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: branchName,
+      repoPath: root,
+      baseRef: "main",
+      projectContext: docsProjectContext,
+    });
+    await runStore.recordPullRequestEvent({
+      runId: "worker-run-1",
+      action: "opened",
+      prUrl: "https://github.com/acme/symphony/pull/42",
+      prNumber: 42,
+      prHeadSha: "head-sha-1",
+      prBranch: branchName,
+    });
+    const report = {
+      ...completionReportRecord(candidate),
+      id: "completion-report:issue-docs-merge-1:report-1",
+      idempotencyKey: "report-1",
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "head-sha-1",
+        branch: branchName,
+      },
+      projectContext: docsProjectContext,
+    };
+    const verdict = {
+      ...reviewVerdictRecord(candidate),
+      id: "review-verdict:issue-docs-merge-1:verdict-pass-1",
+      idempotencyKey: "verdict-pass-1",
+      verdict: "pass" as const,
+      acceptanceResults: [{ text: "Ready to merge", satisfied: true, evidence: "reviewed" }],
+      findings: [],
+      projectContext: docsProjectContext,
+    };
+    const approval = {
+      ...approvalFeedbackRecord(candidate, verdict.runId),
+      id: "review-feedback:issue-docs-merge-1:review-run-1:approve-1",
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "head-sha-1",
+        branch: branchName,
+      },
+      projectContext: docsProjectContext,
+    };
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "passed",
+      projectContext: docsProjectContext,
+      lastCompletionReportId: report.id,
+      lastReviewVerdictId: verdict.id,
+      completionReports: [report],
+      reviewVerdicts: [verdict],
+      reviewFeedback: [approval],
+      summaryPointers: {
+        prUrl: report.pullRequest.url,
+        prNumber: report.pullRequest.number,
+        prHeadSha: report.pullRequest.headSha,
+        prBranch: report.pullRequest.branch,
+      },
+    });
+    const mergeClient = new FakeMergePolicyClient();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      pullRequestMergeClient: mergeClient,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => docsState === "Done", "docs merge-policy reconciliation");
+    await orchestrator.stop();
+
+    expect(defaultTracker.requestedStates).toContainEqual(["Ready to Merge"]);
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(docsTracker.requestedStates).toContainEqual(["Ready to Merge"]);
+    expect(docsTracker.requestedIds).toEqual([[candidate.id], [candidate.id]]);
+    expect(mergeClient.mergeInput).toMatchObject({ pullRequestNumber: 42, expectedHeadSha: "head-sha-1", method: "merge" });
+    expect(writer.transitions).toEqual([
+      {
+        issueId: candidate.id,
+        fromStates: ["Ready to Merge"],
+        toState: "Done",
+        reason: "Symphony reviewer-approved merge completed",
+      },
+    ]);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "passed",
+      projectContext: docsProjectContext,
+      merge: {
+        pullRequest: { number: 42, headSha: "head-sha-1" },
+        checkStatus: { requiredChecks: ["ci"], passedChecks: ["ci"] },
+      },
+    });
+  });
+
   it("does not treat review-state issues as worker candidates", async () => {
     const config = testConfig(root);
     config.reviewLoop.reviewStates = ["In Review"];
@@ -9902,6 +10072,56 @@ class FakePullRequestReviewEvidenceClient implements PullRequestReviewEvidenceCl
   async listPullRequestReviewEvidence(input: { pullRequestNumber: number }): Promise<RemotePullRequestReviewEvidence[]> {
     this.calls.push(input.pullRequestNumber);
     return this.evidence.filter((item) => item.pullRequestNumber === input.pullRequestNumber);
+  }
+}
+
+class FakeMergePolicyClient implements MergePolicyGitHubClient {
+  mergeInput: Parameters<MergePolicyGitHubClient["mergePullRequest"]>[0] | null = null;
+
+  async getPullRequest() {
+    return {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/docs/DOCS-1",
+      headSha: "head-sha-1",
+      lastPushedAt: "2026-01-01T00:00:00Z",
+      state: "open",
+      merged: false,
+      mergeCommitSha: null,
+      mergedAt: null,
+      mergedBy: null,
+      mergeable: true,
+      mergeableState: "clean",
+      baseBranch: "main",
+      baseHeadSha: "base-sha-1",
+    };
+  }
+
+  async getRequiredCheckResults(input: { requiredChecks: string[] }): Promise<PullRequestCheckResult[]> {
+    return input.requiredChecks.map((name) => ({
+      name,
+      status: "success",
+      conclusion: "success",
+      url: `https://ci.test/${name}`,
+    }));
+  }
+
+  async mergePullRequest(input: Parameters<MergePolicyGitHubClient["mergePullRequest"]>[0]) {
+    this.mergeInput = input;
+    return {
+      merged: true,
+      mergeCommitSha: "merge-sha-1",
+      mergedAt: "2026-01-01T00:00:02.000Z",
+      mergedBy: "symphony-bot",
+    };
+  }
+
+  async getAuthenticatedLogin() {
+    return "symphony-bot";
+  }
+
+  async isAncestor() {
+    return true;
   }
 }
 

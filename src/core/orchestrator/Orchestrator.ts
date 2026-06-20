@@ -3706,7 +3706,9 @@ export class Orchestrator {
       });
     }
 
-    if (report.resolutionStatus === "resolved") await this.tryReconcileMergePolicy(entry.issue);
+    if (report.resolutionStatus === "resolved") {
+      await this.tryReconcileMergePolicy(entry.issue, this.resolvedProjectContext(entry) ?? undefined);
+    }
     return true;
   }
 
@@ -3746,19 +3748,24 @@ export class Orchestrator {
       });
     }
 
-    if (verdict.verdict === "pass") await this.tryReconcileMergePolicy(entry.issue);
+    if (verdict.verdict === "pass") {
+      await this.tryReconcileMergePolicy(entry.issue, this.resolvedProjectContext(entry) ?? undefined);
+    }
     return true;
   }
 
   private async reconcileMergePolicyIssues(): Promise<void> {
-    if (this.config.mergePolicy.mode !== "gated" || this.config.mergePolicy.sourceStates.length === 0) return;
     let candidates: Issue[];
     try {
-      const states = [
-        ...this.config.mergePolicy.sourceStates,
-        ...(this.config.mergePolicy.conflictsState === null ? [] : [this.config.mergePolicy.conflictsState]),
-      ];
-      candidates = await this.options.tracker.fetchIssuesByStates(uniqueStateNames(states));
+      candidates = await this.fetchPollingIssues((projectContext) => {
+        const config = this.configForProjectContext(projectContext);
+        if (config.mergePolicy.mode !== "gated" || config.mergePolicy.sourceStates.length === 0) return Promise.resolve([]);
+        const states = [
+          ...config.mergePolicy.sourceStates,
+          ...(config.mergePolicy.conflictsState === null ? [] : [config.mergePolicy.conflictsState]),
+        ];
+        return this.fetchIssuesByStatesForProjectContext(uniqueStateNames(states), projectContext);
+      });
     } catch (error) {
       this.options.logger.warn("merge policy issue fetch failed", { error: errorMessage(error) });
       return;
@@ -3770,19 +3777,24 @@ export class Orchestrator {
     }
   }
 
-  private async tryReconcileMergePolicy(issue: Issue): Promise<void> {
-    if (this.config.mergePolicy.mode !== "gated" || !this.options.lifecycleStore) return;
+  private async tryReconcileMergePolicy(
+    issue: Issue,
+    requestedProjectContext?: ProjectContextResolution,
+  ): Promise<void> {
+    const projectContext = this.requestedProjectContextForIssue(issue, requestedProjectContext);
+    const config = this.configForProjectContext(projectContext);
+    if (config.mergePolicy.mode !== "gated" || !this.options.lifecycleStore) return;
     try {
       const service = new MergePolicyService({
-        config: this.config,
-        tracker: this.options.tracker,
+        config,
+        tracker: this.trackerClientForProjectContext(projectContext),
         lifecycleStore: this.options.lifecycleStore,
         ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
         ...(this.options.writeback === undefined ? {} : { writeback: this.options.writeback }),
         ...(this.options.pullRequestMergeClient === undefined ? {} : { client: this.options.pullRequestMergeClient }),
         logger: this.options.logger,
       });
-      const result = await service.reconcileIssue(issue);
+      const result = await service.reconcileIssue(this.issueWithDispatchProjectContext(issue, projectContext, projectContext !== undefined));
       if (result.status === "merged" || result.status === "already_merged") {
         this.options.logger.info("merge policy reconciled issue", {
           issue_id: issue.id,
