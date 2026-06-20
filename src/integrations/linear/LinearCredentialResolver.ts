@@ -19,9 +19,10 @@ export const LINEAR_CREDENTIAL_CAPABILITY_OWNERS: Readonly<Record<LinearCredenti
 export interface ResolvedLinearClientConfig {
   capability: LinearCredentialCapability;
   role: CredentialRole;
+  projectContextId: string;
+  projectContextLabel: string;
   tracker: TrackerConfig;
   credential: ResolvedCredential | null;
-  projectContextId: string;
   projectContext: WorkflowProjectContext;
 }
 
@@ -54,12 +55,13 @@ export function resolveLinearClientConfig(
   return {
     capability,
     role,
+    projectContextId: view.projectContextId,
+    projectContextLabel: view.projectContext.label,
     tracker: {
       ...view.tracker,
       apiKey: credential?.value ?? view.tracker.apiKey,
     },
     credential,
-    projectContextId: view.projectContextId,
     projectContext: view.projectContext,
   };
 }
