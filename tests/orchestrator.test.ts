@@ -39,6 +39,7 @@ import { IssueTriageService, issueTriageTriggerFingerprint } from "../src/core/I
 import type { MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
+import { SqliteIssueStateStore } from "../src/core/orchestration/SqliteIssueStateStore.js";
 import {
   FileIssueLifecycleStore,
   type IssueCompletionReportRecord,
@@ -195,6 +196,8 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
@@ -203,7 +206,18 @@ describe("Orchestrator", () => {
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
     });
+    expect(orchestrator.registeredTransitionRulesets().map((ruleset) => ruleset.id)).toEqual(
+      expect.arrayContaining([
+        "manual.dispatch",
+        "orchestrator.dispatch.worker.implementation",
+        "orchestrator.dispatch.reviewer.review",
+        "orchestrator.handoff_repair",
+        "orchestrator.merge_policy",
+      ]),
+    );
 
     await orchestrator.refreshNow();
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -217,6 +231,35 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).not.toContain("Compact Symphony handoff packet:");
     expect(harness.runs[0]?.ctx.role).toBe("worker");
     expect(orchestrator.snapshot().counts.running).toBe(0);
+    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
+    const dispatchSnapshot = issueState?.history.find((snapshot) => snapshot.transitionKind === "dispatch_worker");
+    expect(dispatchSnapshot).toMatchObject({
+      triggerType: "orchestrator.tick",
+      candidateSource: "worker_candidates",
+      rulesetId: "orchestrator.dispatch.worker.implementation",
+      role: "worker",
+      runPhase: "implementation",
+      reason: "worker_dispatch",
+    });
+    expect(dispatchSnapshot).not.toHaveProperty("current");
+    expect(dispatchSnapshot).not.toHaveProperty("transitionRequest");
+    expect(dispatchSnapshot?.actions.map((action) => action.actionType)).toEqual(
+      expect.arrayContaining(["dispatch_agent", "render_prompt", "start_agent_run", "agent_run_exit"]),
+    );
+    const evidenceEvents = issueState?.history
+      .filter((snapshot) => snapshot.snapshotKind === "evidence")
+      .map((snapshot) => `${snapshot.evidenceKind}:${snapshot.evidenceEventType}`);
+    expect(evidenceEvents).toEqual(
+      expect.arrayContaining([
+        "workspace:workspace_created",
+        "workspace:workspace_before_run_completed",
+        "workspace:workspace_after_run_completed",
+        "harness:harness_reload_completed",
+        "lifecycle:lifecycle_updated",
+        "run:run_started",
+        "run:run_terminal_state_updated",
+      ]),
+    );
   });
 
   it("runs dashboard operator chat through the configured harness and persists assistant output", async () => {
@@ -2254,6 +2297,15 @@ describe("Orchestrator", () => {
       phase: "blocked",
       blockedReason: "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
     });
+    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
+    expect(issueState?.history.filter((snapshot) => snapshot.transitionKind === "retry_run")).toHaveLength(2);
+    const block = issueState?.history.find((snapshot) => snapshot.transitionKind === "block_issue");
+    expect(block).toMatchObject({
+      candidateSource: "block_issue",
+      rulesetId: "orchestrator.block_issue",
+      blockedReason: "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
+    });
+    expect(block?.actions.map((action) => action.actionType)).toContain("block_issue");
   });
 
   it("blocks after consecutive worker infrastructure failures reach the configured cap", async () => {
@@ -3712,6 +3764,15 @@ describe("Orchestrator", () => {
         },
       ],
     });
+    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
+    const reconciliation = issueState?.history.find((snapshot) => snapshot.transitionKind === "reconcile_report_writeback");
+    expect(reconciliation).toMatchObject({
+      candidateSource: "triage_writeback_reconciliation",
+      rulesetId: "orchestrator.reconcile_issue_triage_report_writeback",
+      reportKind: "issue_triage",
+      reason: "issue_triage_report_writeback_reconciliation",
+    });
+    expect(reconciliation?.actions.map((action) => action.actionType)).toContain("reconcile_issue_triage_report_writeback");
   });
 
   it("does not redispatch persisted fallback-blocked issues after restart", async () => {
@@ -4039,6 +4100,17 @@ describe("Orchestrator", () => {
       expect(recoveryOrchestrator.snapshot().counts.retrying).toBe(0);
       expect(harness.prompts).toHaveLength(1);
       await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(1);
+      const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
+      const recovery = issueState?.history.find((snapshot) => snapshot.transitionKind === "recover_publication_approval");
+      expect(recovery).toMatchObject({
+        candidateSource: "pending_publication_approval",
+        rulesetId: "orchestrator.recover_publication_approval",
+        runId: "report-run-1",
+        pendingPublicationApprovalReportId: expect.any(String),
+      });
+      expect(recovery?.actions.map((action) => action.actionType)).toEqual(
+        expect.arrayContaining(["start_publication_approval_recovery", "finish_publication_approval_recovery"]),
+      );
       await recoveryOrchestrator.stop();
     },
   );
@@ -4818,6 +4890,11 @@ describe("Orchestrator", () => {
     expect(lifecycle).toMatchObject({
       lastCompletionReportRejectionId: "completion-report-rejection:issue-1:rejected-idem-1",
     });
+    const issueState = await readIssueState(stateDir, candidate.id);
+    const workerSnapshots = issueState?.history.filter((snapshot) => snapshot.transitionKind === "dispatch_worker") ?? [];
+    expect(workerSnapshots.some((snapshot) => snapshot.actions.some((action) => action.actionType === "reject_completion_report"))).toBe(true);
+    expect(workerSnapshots.every((snapshot) => snapshot.rulesetId !== "legacy.dispatch_worker")).toBe(true);
+    expect(issueState?.history.some((snapshot) => snapshot.transitionKind === "handoff_repair")).toBe(false);
   });
 
   it("[event-guard:failed] treats accepted completion reports as handoff when the harness fails after reporting", async () => {
@@ -5481,6 +5558,7 @@ describe("Orchestrator", () => {
       prNumber: 42,
       prHeadSha: "abc123",
     });
+    await orchestrator.stop();
   });
 
   it.each([
@@ -5548,6 +5626,7 @@ describe("Orchestrator", () => {
         phase: "blocked",
         blockedReason: `publication approval ${status}`,
       });
+      await orchestrator.stop();
     },
   );
 
@@ -6057,6 +6136,26 @@ describe("Orchestrator", () => {
       hermesResumeSourceRunId: "review-source-run-1",
       hermesResumeReason: "handoff_repair",
     });
+    const issueState = await readIssueState(stateDir, candidate.id);
+    const repairSnapshot = issueState?.history.find((snapshot) => snapshot.transitionKind === "handoff_repair");
+    expect(repairSnapshot).toMatchObject({
+      triggerType: "orchestrator.tick",
+      rulesetId: "orchestrator.handoff_repair",
+      reason: "missing_required_mcp_handoff",
+      role: "reviewer",
+      runPhase: "review",
+      promptScenario: "handoff_repair.mcp_only",
+      handoffRepairKind: "review_verdict",
+      handoffRepairSourceRunId: "review-source-run-1",
+      handoffRepairAttempt: 1,
+      hermesResumeSourceRunId: "review-source-run-1",
+      hermesResumeReason: "handoff_repair",
+    });
+    expect(repairSnapshot).not.toHaveProperty("current");
+    expect(repairSnapshot).not.toHaveProperty("transitionRequest");
+    expect(repairSnapshot?.actions.map((action) => action.actionType)).toEqual(
+      expect.arrayContaining(["dispatch_handoff_repair", "render_prompt", "start_agent_run"]),
+    );
   });
 
   it("dispatches merge-conflict repair with the original implementation worker Hermes session", async () => {
@@ -6633,6 +6732,53 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.stoppedRunIds).toEqual(["run-123"]);
+  });
+
+  it("records state-change running termination through the transition ruleset", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new BlockingHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-123", "blocking run start");
+    currentState = config.tracker.terminalStates[0] ?? "Done";
+    await orchestrator.refreshNow();
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "state-change termination");
+    await orchestrator.stop();
+
+    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
+    const termination = issueState?.history.find((snapshot) => snapshot.transitionKind === "terminate_running");
+    expect(termination).toMatchObject({
+      triggerType: "orchestrator.tick",
+      candidateSource: "running_reconciliation",
+      rulesetId: "orchestrator.terminate_running",
+      reason: "terminal state",
+      cleanupWorkspace: true,
+      terminationReason: "terminal state",
+    });
+    expect(termination?.actions.map((action) => action.actionType)).toContain("terminate_running");
   });
 
   it("loads and exposes issue lifecycle records during dispatch", async () => {
@@ -9300,6 +9446,15 @@ async function runAcceptedIssueBreakdownHandoffScenario(
   expect(harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")).toHaveLength(1);
 
   return { runStore, planRunId, stateDir: config.workspace.stateDir };
+}
+
+async function readIssueState(stateDir: string, issueIdOrIdentifier: string) {
+  const store = new SqliteIssueStateStore(stateDir);
+  try {
+    return await store.get(issueIdOrIdentifier);
+  } finally {
+    await store.close();
+  }
 }
 
 class BlockingHarness implements AgentHarness {

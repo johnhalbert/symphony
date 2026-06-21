@@ -10,6 +10,7 @@ import { createAgentHarness } from "./core/harness/HarnessFactory.js";
 import { StructuredLogger } from "./core/logging/StructuredLogger.js";
 import {
   Orchestrator,
+  type IssueHistoryInspectionResult,
   type ManualAgentEligibilityResult,
   type ManualAgentRunResult,
   type ManualAgentRunStage,
@@ -468,6 +469,56 @@ issueCommand
   );
 
 issueCommand
+  .command("history")
+  .description("Inspect persisted Symphony issue state history and replay transition decisions")
+  .argument("<issue>", "issue id or identifier")
+  .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
+  .option("--json", "print JSON result")
+  .action(async (issue: string, workflow: string, options: { json?: boolean }) => {
+    const logger = new StructuredLogger();
+    const workflowPath = path.resolve(process.cwd(), workflow);
+    const loader = new WorkflowLoader(workflowPath);
+    const loaded = await loader.load();
+    const config = loaded.serviceConfig;
+    const tracker = createRuntimeTrackerClient(config);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+      planningWorkspaceMode: config.issueBreakdown.workspaceMode,
+    });
+    const harness = createAgentHarness(config, { runStore });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: loaded.definition.promptTemplate,
+      runStore,
+      lifecycleStore,
+      statusServerBaseUrl: () => null,
+      statusMutationToken: null,
+    });
+    try {
+      const result = await orchestrator.inspectIssueHistory(issue);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatIssueHistoryInspectionResult(result));
+      }
+      if (!result.found) process.exitCode = 2;
+      else if (!result.replayMatched) process.exitCode = 1;
+    } finally {
+      await orchestrator.stop();
+      await loader.close();
+      await harness.dispose?.();
+    }
+  });
+
+issueCommand
   .command("reconcile-lifecycle")
   .description("Preview or apply lifecycle cleanup for superseded review, triage, and merge-gate records")
   .argument("[issueOrWorkflow]", "issue id or identifier, or workflow path when --all is used")
@@ -783,6 +834,49 @@ function formatIssueInspectionResult(result: IssueInspectionResult): string {
     "Eligibility",
     ...formatEligibility(result.eligibility),
   ];
+  return lines.join("\n");
+}
+
+function formatIssueHistoryInspectionResult(result: IssueHistoryInspectionResult): string {
+  if (!result.found || result.record === null) {
+    return `No persisted issue history found for ${result.issueIdOrIdentifier}.`;
+  }
+  const record = result.record;
+  const lines = [
+    `Issue history for ${record.issueIdentifier}`,
+    `  Issue id: ${record.issueId}`,
+    `  Current state: ${record.trackerState}`,
+    `  Snapshots: ${record.history.length}`,
+    `  Replay: ${result.replayMatched ? "matched" : "mismatched"}`,
+  ];
+  if (record.history.length === 0) {
+    lines.push("  No history snapshots recorded.");
+    return lines.join("\n");
+  }
+  lines.push("", "Timeline");
+  for (const [index, snapshot] of record.history.entries()) {
+    const replay = result.replay[index];
+    const replayStatus = replay?.replayable === false ? "not replayed" : replay?.matched === true ? "matched" : "mismatched";
+    const snapshotKind = snapshot.snapshotKind ?? "transition";
+    lines.push(
+      `  ${index + 1}. ${snapshot.snapshotAt} ${snapshotKind}:${snapshot.transitionKind} via ${snapshot.rulesetId}@${snapshot.rulesetVersion} (${replayStatus})`,
+    );
+    lines.push(`     trigger=${snapshot.triggerType} source=${snapshot.candidateSource} reason=${snapshot.reason ?? "n/a"}`);
+    if (snapshotKind === "evidence") {
+      lines.push(
+        `     evidence=${snapshot.evidenceKind ?? "n/a"}/${snapshot.evidenceEventType ?? "n/a"} source=${snapshot.evidenceSourceId ?? "n/a"}`,
+      );
+    }
+    if (snapshot.role || snapshot.runPhase || snapshot.runKind) {
+      lines.push(`     run=${snapshot.role ?? "n/a"}/${snapshot.runPhase ?? "n/a"}/${snapshot.runKind ?? "n/a"}`);
+    }
+    lines.push(`     actions=${snapshot.actions.length} errors=${snapshot.errors.length}`);
+    if (replay && !replay.matched) {
+      lines.push(
+        `     replay expected ${replay.expectedTransitionKind}/${replay.expectedRulesetId}@${replay.expectedRulesetVersion}, actual ${replay.actualTransitionKind ?? "none"}/${replay.actualRulesetId ?? "none"}@${replay.actualRulesetVersion ?? "none"}`,
+      );
+    }
+  }
   return lines.join("\n");
 }
 

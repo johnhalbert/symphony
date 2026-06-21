@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
@@ -47,6 +48,9 @@ import {
   type CompletionReportPullRequestPublisher,
 } from "../CompletionReportService.js";
 import {
+  issueBreakdownConfigFingerprint,
+  issueBreakdownPlanSatisfiesCurrentValidation,
+  issueContentFingerprint,
   latestFreshIssueBreakdownPlan,
   renderIssueBreakdownPlanSummary,
 } from "../IssueBreakdownPlanService.js";
@@ -91,6 +95,26 @@ import {
 } from "../persistence/RunTranscriptStore.js";
 import type { OrchestratorConversationMessage, OrchestratorConversationStore } from "../persistence/OrchestratorConversationStore.js";
 import { FileProviderGateStore, type ProviderGateStore } from "../persistence/ProviderGateStore.js";
+import { SqliteIssueStateStore } from "../orchestration/SqliteIssueStateStore.js";
+import { IssueOrchestrationEngine, type IssueHistoryReplayResult } from "../orchestration/IssueOrchestrationEngine.js";
+import {
+  createIssueSnapshotId,
+  immutableIssueSnapshot,
+  transitionAction,
+  transitionErrorFromUnknown,
+  type IssueCurrentFields,
+  type IssueCurrentStateSnapshot,
+  type IssueEvidenceKind,
+  type IssueHistorySnapshot,
+  type IssueStateRecord,
+  type IssueStateStore,
+  type IssueTransition,
+  type IssueTransitionKind,
+  type IssueTransitionRequest,
+  type IssueTriggerType,
+  type TransitionActionRecord,
+  type TransitionRuleset,
+} from "../orchestration/IssueOrchestrationState.js";
 import {
   normalizeProviderLimitSignal,
   providerLimitDelayMs,
@@ -176,9 +200,18 @@ export interface OrchestratorOptions {
   operatorApproval?: Pick<OperatorApprovalService, "requestPublicationApproval" | "waitForPublicationApprovalRequest"> &
     Partial<Pick<OperatorApprovalService, "get" | "getByDedupe">>;
   providerGateStore?: ProviderGateStore;
+  issueStateStore?: IssueStateStore;
   orchestratorConversationStore?: OrchestratorConversationStore;
   statusServerBaseUrl?: () => string | null;
   statusMutationToken?: string | null;
+}
+
+export interface IssueHistoryInspectionResult {
+  found: boolean;
+  issueIdOrIdentifier: string;
+  record: IssueStateRecord | null;
+  replay: IssueHistoryReplayResult[];
+  replayMatched: boolean;
 }
 
 export interface PullRequestDiscoveryClient {
@@ -291,6 +324,7 @@ export interface RunningEntry {
   sessionId: string | null;
   runId: string | null;
   activeRunId: string | null;
+  issueHistorySnapshotId: string | null;
   lifecycle: IssueLifecycleRecord | null;
   worker: Promise<void>;
   abortController: AbortController;
@@ -368,6 +402,49 @@ export interface RetryEntry {
   timer: NodeJS.Timeout;
   error: string | null;
   runPhase: AgentRunPhase;
+}
+
+interface OrchestratorTransitionContext {
+  issue: Issue;
+  transition: IssueHistorySnapshot;
+  attempt: number | null;
+  allowExistingClaim: boolean;
+}
+
+interface IssueTransitionEventInput {
+  issue: Issue;
+  triggerType: IssueTriggerType;
+  candidateSource: string;
+  manualStage?: ManualAgentRunStage | null;
+  manualForceLabels?: boolean;
+  manualIgnoreState?: boolean;
+  snapshotPatch?: Partial<IssueCurrentStateSnapshot>;
+  transitionPatch?: Partial<IssueTransitionRequest>;
+  attempt?: number | null;
+  allowExistingClaim?: boolean;
+}
+
+interface IssueTransitionEventResult {
+  transition: IssueHistorySnapshot | null;
+  acted: boolean;
+}
+
+interface IssueEvidenceSnapshotInput {
+  issue: Issue;
+  evidenceKind: IssueEvidenceKind;
+  eventType: string;
+  sourceId?: string | null;
+  payload?: unknown;
+  reason?: string | null;
+}
+
+interface LifecycleEvidenceInput {
+  issue: Issue;
+  lifecycle: IssueLifecycleRecord;
+  patch: IssueLifecyclePatch;
+  sourceId?: string | null;
+  reason?: string | null;
+  eventType?: string;
 }
 
 type TerminalRunPatch = Pick<UpdateRunInput, "status" | "completedAt" | "error" | "tokens" | "metadata">;
@@ -514,6 +591,7 @@ export interface IssueRunMetadata {
 const PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER = "[[SYMPHONY_PROJECT_REVIEWER_PROMPT_EXTENSIONS]]";
 const EPHEMERAL_SYSTEM_PROMPT_MAX_CHARS = 12_000;
 const PROMPT_SUMMARY_BLOCK_MAX_CHARS = 1_600;
+const ORCHESTRATOR_RULESET_VERSION = "2026-06-21.issue-history-v1";
 
 const DEFAULT_EPHEMERAL_SYSTEM_PROMPT_TEMPLATE = `
 # Symphony Current Run Directive
@@ -635,6 +713,10 @@ export class Orchestrator {
   private readonly operatorChatRuns = new Map<string, OperatorChatQueueEntry>();
   private readonly totals: TokenCounts = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   private readonly providerGateStore: ProviderGateStore;
+  private readonly issueStateStore: IssueStateStore;
+  private readonly transitionRulesets: TransitionRuleset[];
+  private readonly transitionEngine: IssueOrchestrationEngine;
+  private readonly transitions: Map<IssueTransitionKind, IssueTransition<OrchestratorTransitionContext>>;
   private activeProviderGates: RuntimeProviderGate[] = [];
   private rateLimits: unknown = null;
 
@@ -642,6 +724,35 @@ export class Orchestrator {
     this.config = options.config;
     this.promptTemplate = options.promptTemplate;
     this.providerGateStore = options.providerGateStore ?? new FileProviderGateStore(options.config.workspace.stateDir);
+    this.issueStateStore = options.issueStateStore ?? new SqliteIssueStateStore(options.config.workspace.stateDir);
+    this.transitionRulesets = this.createTransitionRulesets();
+    this.transitionEngine = new IssueOrchestrationEngine(this.transitionRulesets);
+    this.transitions = new Map(this.createTransitions().map((transition) => [transition.kind, transition]));
+  }
+
+  registeredTransitionRulesets(): readonly TransitionRuleset[] {
+    return this.transitionEngine.registeredRulesets();
+  }
+
+  async inspectIssueHistory(issueIdOrIdentifier: string): Promise<IssueHistoryInspectionResult> {
+    const record = await this.issueStateStore.get(issueIdOrIdentifier);
+    if (record === null) {
+      return {
+        found: false,
+        issueIdOrIdentifier,
+        record: null,
+        replay: [],
+        replayMatched: false,
+      };
+    }
+    const replay = this.transitionEngine.replay(record.history);
+    return {
+      found: true,
+      issueIdOrIdentifier,
+      record,
+      replay,
+      replayMatched: replay.every((entry) => entry.matched),
+    };
   }
 
   async start(): Promise<void> {
@@ -689,6 +800,7 @@ export class Orchestrator {
       ...this.operatorChatQueues.values(),
     ]);
     await Promise.allSettled([...workers]);
+    await this.issueStateStore.close?.();
   }
 
   updateConfig(config: ServiceConfig, promptTemplate: string): void {
@@ -1138,7 +1250,19 @@ export class Orchestrator {
     if (latestFreshIssueBreakdownPlan(lifecycle, issue, this.config) !== null) {
       return { queued: false, issue, reason: "fresh_plan_exists" };
     }
-    this.dispatchIssue(issue, null, "planner", null, "issue_breakdown");
+    const transition = await this.decideIssueTransition({
+      issue,
+      triggerType: "manual.cli_agent_run",
+      candidateSource: "request_issue_breakdown",
+      manualStage: "planner",
+      manualForceLabels: false,
+      manualIgnoreState: false,
+    });
+    const issueHistorySnapshotId = transition?.transitionKind === "dispatch_planner" ? transition.historySnapshotId : null;
+    if (transition?.transitionKind === "dispatch_planner") {
+      await this.recordDispatchActionForTransition(issue, transition, null);
+    }
+    this.dispatchIssue(issue, null, "planner", null, "issue_breakdown", null, issueHistorySnapshotId);
     return { queued: true, issue, reason: "explicit_request" };
   }
 
@@ -1229,7 +1353,7 @@ export class Orchestrator {
 
     if (target.role === "worker" && target.runPhase === "implementation" && options.ignoreState !== true) {
       const dispatchWriteback = planDispatchWriteback(dispatchIssue, this.config);
-      if (!(await this.applyWriteback(dispatchWriteback, "manual dispatch"))) {
+      if (!(await this.applyWriteback(dispatchWriteback, "manual dispatch", dispatchIssue))) {
         return manualAgentNotDispatched(dispatchIssue, target, "dispatch_writeback_failed");
       }
       if (dispatchWriteback) {
@@ -1241,13 +1365,28 @@ export class Orchestrator {
       }
     }
 
+    const manualDispatch = { stage: options.stage, forceLabels: options.forceLabels === true, ignoreState: options.ignoreState === true };
+    const transition = await this.decideIssueTransition({
+      issue: dispatchIssue,
+      triggerType: "manual.cli_agent_run",
+      candidateSource: `manual.${options.stage}`,
+      manualStage: options.stage,
+      manualForceLabels: manualDispatch.forceLabels,
+      manualIgnoreState: manualDispatch.ignoreState,
+    });
+    if (transition === null || !isDispatchTransitionForTarget(transition, target)) {
+      return manualAgentNotDispatched(dispatchIssue, target, "transition_ruleset_not_matched");
+    }
+    const issueHistorySnapshotId = transition.historySnapshotId;
+    await this.recordDispatchActionForTransition(dispatchIssue, transition, null);
     const entry = this.dispatchIssue(
       dispatchIssue,
       null,
       target.role,
       reviewEvidence,
       target.runPhase,
-      { stage: options.stage, forceLabels: options.forceLabels === true, ignoreState: options.ignoreState === true },
+      manualDispatch,
+      issueHistorySnapshotId,
     );
     await entry.worker;
     const runId = entry.activeRunId ?? entry.runId;
@@ -1546,6 +1685,7 @@ export class Orchestrator {
       sessionId: null,
       runId: null,
       activeRunId: null,
+      issueHistorySnapshotId: null,
       lifecycle,
       worker: Promise.resolve(),
       abortController,
@@ -1634,6 +1774,22 @@ export class Orchestrator {
       pullRequestPublisher: publisher,
     }).resumeApprovedPublication({ approval: request, issue });
     if (!result) return false;
+    await this.recordIssueEvidenceSnapshot({
+      issue,
+      evidenceKind: "approval",
+      eventType: "publication_approval_resumed",
+      sourceId: request.requestId,
+      reason: "publication_approval_resumed",
+      payload: {
+        requestId: request.requestId,
+        issueId: request.issueId,
+        issueIdentifier: request.issueIdentifier,
+        status: request.status,
+        runId: request.runId,
+        evidenceCursor: request.evidenceCursor,
+        action: request.action,
+      },
+    });
     return true;
   }
 
@@ -1648,7 +1804,26 @@ export class Orchestrator {
       ...(this.options.runStore === undefined ? {} : { runStore: this.options.runStore }),
       ...(this.options.writeback === undefined ? {} : { writebackProcessor: this.options.writeback }),
     }).recordPublicationApprovalTerminal({ approval: request, issue });
-    if (result.length > 0) return true;
+    if (result.length > 0) {
+      await this.recordIssueEvidenceSnapshot({
+        issue,
+        evidenceKind: "approval",
+        eventType: "publication_approval_terminal_recorded",
+        sourceId: request.requestId,
+        reason: `publication_approval_${request.status}`,
+        payload: {
+          requestId: request.requestId,
+          issueId: request.issueId,
+          issueIdentifier: request.issueIdentifier,
+          status: request.status,
+          runId: request.runId,
+          evidenceCursor: request.evidenceCursor,
+          action: request.action,
+          results: result,
+        },
+      });
+      return true;
+    }
     const lifecycle =
       (await this.options.lifecycleStore.get(request.issueId)) ??
       (request.issueIdentifier ? await this.options.lifecycleStore.get(request.issueIdentifier) : null);
@@ -1787,12 +1962,12 @@ export class Orchestrator {
       const workerCandidates = await this.options.tracker.fetchCandidateIssues();
       for (const issue of sortIssuesForDispatch(workerCandidates)) {
         if (this.availableSlots() <= 0) break;
-        await this.tryDispatchWorkerIssue(issue, null);
+        await this.processIssueTransitionCandidate({ issue, candidateSource: "worker_candidates" });
       }
       const reviewerCandidates = await this.options.tracker.fetchIssuesByStates(this.config.reviewLoop.reviewStates);
       for (const issue of sortIssuesForDispatch(reviewerCandidates)) {
         if (this.availableSlots() <= 0) break;
-        await this.tryDispatchReviewerIssue(issue);
+        await this.processIssueTransitionCandidate({ issue, candidateSource: "reviewer_candidates" });
       }
       await this.reconcileIssueTriageIssues();
       await this.reconcileMergePolicyIssues();
@@ -1829,11 +2004,1067 @@ export class Orchestrator {
     return true;
   }
 
+  private createTransitions(): IssueTransition<OrchestratorTransitionContext>[] {
+    return [
+      {
+        kind: "dispatch_worker",
+        actions: [
+          {
+            id: "dispatch_agent",
+            execute: async ({ issue, transition, attempt, allowExistingClaim }) => {
+              return this.tryDispatchWorkerIssue(issue, attempt, allowExistingClaim, transition);
+            },
+          },
+        ],
+      },
+      {
+        kind: "dispatch_planner",
+        actions: [
+          {
+            id: "dispatch_agent",
+            execute: async ({ issue, transition, attempt, allowExistingClaim }) => {
+              return this.tryDispatchPlanner(issue, allowExistingClaim, attempt, transition);
+            },
+          },
+        ],
+      },
+      {
+        kind: "dispatch_reviewer",
+        actions: [
+          {
+            id: "dispatch_agent",
+            execute: async ({ issue, transition, attempt, allowExistingClaim }) => {
+              return this.tryDispatchReviewerIssue(issue, allowExistingClaim, transition);
+            },
+          },
+        ],
+      },
+      {
+        kind: "dispatch_triage",
+        actions: [
+          {
+            id: "dispatch_agent",
+            execute: async ({ issue, transition, attempt, allowExistingClaim }) => {
+              return this.tryDispatchIssueTriage(issue, allowExistingClaim, transition);
+            },
+          },
+        ],
+      },
+      {
+        kind: "dispatch_post_mortem",
+        actions: [
+          {
+            id: "dispatch_agent",
+            execute: async ({ issue, transition, attempt, allowExistingClaim }) => {
+              return this.tryDispatchIssuePostMortem(issue, allowExistingClaim, transition);
+            },
+          },
+        ],
+      },
+      {
+        kind: "merge_policy",
+        actions: [
+          {
+            id: "reconcile_merge_policy",
+            execute: async ({ issue, transition }) => {
+              await this.tryReconcileMergePolicy(issue, transition.historySnapshotId);
+              return true;
+            },
+          },
+        ],
+      },
+      {
+        kind: "reconcile_report_writeback",
+        actions: [
+          {
+            id: "reconcile_report_writeback",
+            execute: async ({ issue, transition }) => {
+              if (transition.reportKind === "issue_triage") {
+                return this.reconcileIssueTriageReportWriteback(issue, transition.historySnapshotId);
+              }
+              if (transition.reportKind === "post_mortem") {
+                return this.reconcileIssuePostMortemReportWriteback(issue, transition.historySnapshotId);
+              }
+              return false;
+            },
+          },
+        ],
+      },
+      {
+        kind: "recover_publication_approval",
+        actions: [
+          {
+            id: "recover_publication_approval",
+            execute: async ({ issue, transition }) => this.recoverPendingPublicationApprovalHandoff(issue, transition.historySnapshotId),
+          },
+        ],
+      },
+      {
+        kind: "terminate_running",
+        actions: [
+          {
+            id: "terminate_running",
+            execute: async ({ issue, transition }) =>
+              this.terminateRunningIssue(
+                issue.id,
+                transition.cleanupWorkspace === true,
+                nonEmptyString(transition.terminationReason) ?? transition.reason ?? "state changed",
+                transition.historySnapshotId,
+              ),
+          },
+        ],
+      },
+      {
+        kind: "block_issue",
+        actions: [
+          {
+            id: "block_issue",
+            execute: async ({ issue, transition }) => this.executeBlockIssueTransition(issue, transition),
+          },
+        ],
+      },
+      {
+        kind: "retry_run",
+        actions: [
+          {
+            id: "retry_run",
+            execute: async ({ issue, transition }) => this.executeRetryRunTransition(issue, transition),
+          },
+        ],
+      },
+      { kind: "handoff_repair", actions: [] },
+      { kind: "noop", actions: [] },
+    ];
+  }
+
+  private createTransitionRulesets(): TransitionRuleset[] {
+    return this.versionTransitionRulesets([
+      {
+        id: "manual.dispatch",
+        priority: 1,
+        evaluate: (snapshot) => {
+          if (snapshot.triggerType !== "manual.cli_agent_run" || !isManualAgentRunStage(snapshot.manualStage)) return null;
+          const target = manualAgentRunTarget(snapshot.manualStage);
+          return dispatchTransitionRequest({
+            role: target.role,
+            runPhase: target.runPhase,
+            reason: "manual_dispatch",
+            promptScenario: promptScenarioForDispatch(target.role, target.runPhase, true),
+            manualDispatch: true,
+          });
+        },
+      },
+      {
+        id: "orchestrator.terminate_running",
+        priority: 10,
+        evaluate: (snapshot) => this.runningTerminationRequest(snapshot),
+      },
+      {
+        id: "orchestrator.recover_publication_approval",
+        priority: 20,
+        evaluate: (snapshot) =>
+          snapshot.triggerType === "orchestrator.tick" &&
+          snapshot.candidateSource === "pending_publication_approval" &&
+          snapshot.pendingPublicationApprovalRunId !== null
+            ? {
+                transitionKind: "recover_publication_approval",
+                reason: "recover_pending_publication_approval",
+                runId: snapshot.pendingPublicationApprovalRunId,
+                pendingPublicationApprovalReportId: snapshot.pendingPublicationApprovalReportId,
+                pendingPublicationApprovalReason: snapshot.pendingPublicationApprovalReason,
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.block_issue",
+        priority: 30,
+        evaluate: (snapshot) =>
+          snapshot.triggerType === "orchestrator.tick" && snapshot.candidateSource === "block_issue"
+            ? {
+                transitionKind: "block_issue",
+                reason: nonEmptyString(snapshot.triggerReason) ?? nonEmptyString(snapshot.blockedReason) ?? "block_issue",
+                blockedReason: nonEmptyString(snapshot.triggerReason) ?? nonEmptyString(snapshot.blockedReason),
+                runId: nonEmptyString(snapshot.triggerRunId) ?? snapshot.latestRunId,
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.dispatch.merge_conflict_worker",
+        priority: 40,
+        evaluate: (snapshot) =>
+          snapshot.triggerType === "orchestrator.tick" &&
+          snapshot.candidateSource === "merge_conflict_candidates" &&
+          this.rulesetCanDispatchWorker(snapshot, "merge_conflict_resolution")
+            ? dispatchTransitionRequest({
+                role: "worker",
+                runPhase: "merge_conflict_resolution",
+                reason: "merge_conflict_resolution_required",
+                promptScenario: promptScenarioForDispatch("worker", "merge_conflict_resolution", false),
+              })
+            : null,
+      },
+      {
+        id: "orchestrator.reconcile_issue_triage_report_writeback",
+        priority: 60,
+        evaluate: (snapshot) =>
+          this.rulesetShouldReconcileIssueTriageReportWriteback(snapshot)
+            ? {
+                transitionKind: "reconcile_report_writeback",
+                reportKind: "issue_triage",
+                reason: "issue_triage_report_writeback_reconciliation",
+                reportId: snapshot.lastIssueTriageReportId,
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.reconcile_post_mortem_report_writeback",
+        priority: 65,
+        evaluate: (snapshot) =>
+          this.rulesetShouldReconcileIssuePostMortemReportWriteback(snapshot)
+            ? {
+                transitionKind: "reconcile_report_writeback",
+                reportKind: "post_mortem",
+                reason: "post_mortem_report_writeback_reconciliation",
+                reportId: snapshot.lastPostMortemReportId,
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.dispatch.planner",
+        priority: 70,
+        evaluate: (snapshot) => {
+          if (snapshot.triggerType !== "orchestrator.tick") return null;
+          if (!this.rulesetCanDispatchPlanner(snapshot)) return null;
+          if (!this.rulesetShouldDispatchPlanner(snapshot)) return null;
+          return dispatchTransitionRequest({
+            role: "planner",
+            runPhase: "issue_breakdown",
+            reason: plannerDispatchReasonForCandidateSource(snapshot.candidateSource),
+            promptScenario: promptScenarioForDispatch("planner", "issue_breakdown", false),
+          });
+        },
+      },
+      {
+        id: "orchestrator.issue_breakdown_apply_wait",
+        priority: 90,
+        evaluate: (snapshot) =>
+          this.rulesetShouldWaitForIssueBreakdownApply(snapshot)
+            ? { transitionKind: "noop", reason: "issue_breakdown_apply_required" }
+            : null,
+      },
+      {
+        id: "orchestrator.dispatch.worker.implementation",
+        priority: 100,
+        evaluate: (snapshot) =>
+          snapshot.triggerType === "orchestrator.tick" &&
+          snapshot.candidateSource === "worker_candidates" &&
+          this.rulesetCanDispatchWorker(snapshot, "implementation")
+            ? dispatchTransitionRequest({
+                role: "worker",
+                runPhase: "implementation",
+                reason: "worker_dispatch",
+                promptScenario: promptScenarioForDispatch("worker", "implementation", false),
+              })
+            : null,
+      },
+      {
+        id: "orchestrator.dispatch.reviewer.review",
+        priority: 120,
+        evaluate: (snapshot) =>
+          snapshot.triggerType === "orchestrator.tick" &&
+          snapshot.candidateSource === "reviewer_candidates" &&
+          this.rulesetCanDispatchReviewer(snapshot)
+            ? dispatchTransitionRequest({
+                role: "reviewer",
+                runPhase: "review",
+                reason: "reviewer_dispatch",
+                promptScenario: promptScenarioForDispatch("reviewer", "review", false),
+              })
+            : null,
+      },
+      {
+        id: "orchestrator.dispatch.triage.issue_triage",
+        priority: 130,
+        evaluate: (snapshot) =>
+          snapshot.triggerType === "orchestrator.tick" &&
+          snapshot.candidateSource === "triage_candidates" &&
+          this.rulesetCanDispatchIssueTriage(snapshot)
+            ? dispatchTransitionRequest({
+                role: "triage",
+                runPhase: "issue_triage",
+                reason: "issue_triage_dispatch",
+                promptScenario: promptScenarioForDispatch("triage", "issue_triage", false),
+              })
+            : null,
+      },
+      {
+        id: "orchestrator.merge_policy",
+        priority: 200,
+        evaluate: (snapshot) =>
+          snapshot.triggerType === "orchestrator.tick" &&
+          snapshot.candidateSource === "merge_policy_candidates" &&
+          this.rulesetCanReconcileMergePolicy(snapshot)
+            ? { transitionKind: "merge_policy", reason: "merge_policy_reconciliation" }
+            : null,
+      },
+      {
+        id: "orchestrator.dispatch.post_mortem.post_mortem",
+        priority: 220,
+        evaluate: (snapshot) =>
+          snapshot.triggerType === "orchestrator.tick" &&
+          snapshot.candidateSource === "post_mortem_candidates" &&
+          this.rulesetCanDispatchPostMortem(snapshot)
+            ? dispatchTransitionRequest({
+                role: "post_mortem",
+                runPhase: "post_mortem",
+                reason: "post_mortem_dispatch",
+                promptScenario: promptScenarioForDispatch("post_mortem", "post_mortem", false),
+              })
+            : null,
+      },
+      {
+        id: "orchestrator.handoff_repair",
+        priority: 300,
+        evaluate: (snapshot) =>
+          snapshot.triggerType === "orchestrator.tick" && snapshot.candidateSource === "handoff_repair"
+            ? {
+                transitionKind: "handoff_repair",
+                reason: "missing_required_mcp_handoff",
+                promptScenario: "handoff_repair.mcp_only",
+                userTemplateKey: "handoff_repair.mcp_only",
+                systemTemplateKey: "handoff_repair.mcp_only.system",
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.retry_run",
+        priority: 400,
+        evaluate: (snapshot) =>
+          snapshot.triggerType === "orchestrator.tick" && snapshot.candidateSource === "retry_schedule"
+            ? {
+                transitionKind: "retry_run",
+                reason: nonEmptyString(snapshot.retryError) ?? "retry_scheduled",
+                role: snapshot.runningRole ?? agentRunRoleFromUnknown(snapshot.latestRunRole),
+                runPhase: snapshot.runningRunPhase ?? agentRunPhaseFromUnknown(snapshot.latestRunPhase),
+                runKind: snapshot.runningRunKind ?? agentRunKindFromUnknown(snapshot.latestRunKind),
+                retryAttempt:
+                  typeof snapshot.retryAttempt === "number" && Number.isFinite(snapshot.retryAttempt)
+                    ? snapshot.retryAttempt
+                    : null,
+                retryDelayMs:
+                  typeof snapshot.retryDelayMs === "number" && Number.isFinite(snapshot.retryDelayMs)
+                    ? snapshot.retryDelayMs
+                    : null,
+                retryError: nonEmptyString(snapshot.retryError),
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.noop",
+        priority: 1_000,
+        evaluate: (snapshot) => ({ transitionKind: "noop", reason: `no_transition_for_${snapshot.candidateSource}` }),
+      },
+    ]);
+  }
+
+  private versionTransitionRulesets(rulesets: readonly TransitionRuleset[]): TransitionRuleset[] {
+    return rulesets.map((ruleset) => ({
+      ...ruleset,
+      version: ORCHESTRATOR_RULESET_VERSION,
+      fingerprint: `${ruleset.id}@${ORCHESTRATOR_RULESET_VERSION}:${ruleset.priority}`,
+    }));
+  }
+
+  private rulesetCanDispatchWorker(snapshot: IssueCurrentStateSnapshot, runPhase: AgentRunPhase): boolean {
+    if (!this.rulesetCommonDispatchGate(snapshot)) return false;
+    if (!snapshot.assignedToWorker) return false;
+    if (isStateIn(snapshot.trackerState, this.config.tracker.handoffStates)) return false;
+    if (isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates)) return false;
+    if (!this.isWorkerStateActiveForRunPhase(snapshotAsIssue(snapshot), runPhase)) return false;
+    if (snapshot.hasChildren) return false;
+    if (!this.rulesetPassesLabelGuardrails(snapshot, "worker")) return false;
+    if (
+      runPhase === "implementation" &&
+      this.config.issueBreakdown.enabled &&
+      this.rulesetHasPlanningLabel(snapshot) &&
+      !this.options.lifecycleStore
+    ) {
+      return false;
+    }
+    if (snapshot.trackerState.toLowerCase() === "todo" && hasOpenBlocker(snapshotAsIssue(snapshot), this.config.tracker.terminalStates)) {
+      return false;
+    }
+    return true;
+  }
+
+  private rulesetCanDispatchReviewer(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (!this.rulesetCommonDispatchGate(snapshot)) return false;
+    if (!isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates)) return false;
+    if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates)) return false;
+    if (!this.rulesetPassesLabelGuardrails(snapshot, "reviewer")) return false;
+    if (hasOpenBlocker(snapshotAsIssue(snapshot), this.config.tracker.terminalStates)) return false;
+    return true;
+  }
+
+  private rulesetCanDispatchIssueTriage(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (!this.config.issueTriage.enabled || !this.options.lifecycleStore) return false;
+    if (!this.rulesetCommonDispatchGate(snapshot)) return false;
+    if (!isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)) return false;
+    if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates)) return false;
+    return this.rulesetPassesLabelGuardrails(snapshot, "triage");
+  }
+
+  private rulesetCanDispatchPostMortem(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (!this.config.postMortem.enabled || !this.options.lifecycleStore) return false;
+    if (!this.rulesetCommonDispatchGate(snapshot)) return false;
+    if (!isStateIn(snapshot.trackerState, this.config.postMortem.doneStates)) return false;
+    return this.rulesetPassesLabelGuardrails(snapshot, "post_mortem");
+  }
+
+  private rulesetCanDispatchPlanner(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (!this.config.issueBreakdown.enabled || !this.options.lifecycleStore) return false;
+    if (!this.rulesetCommonDispatchGate(snapshot)) return false;
+    if (!snapshot.assignedToWorker) return false;
+    if (this.isMergeConflictState(snapshot.trackerState)) return false;
+    if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates)) return false;
+    if (!isStateIn(snapshot.trackerState, this.config.tracker.activeStates) && !isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)) {
+      return false;
+    }
+    if (snapshot.hasChildren) return false;
+    if (!this.rulesetPassesLabelGuardrails(snapshot, "planner")) return false;
+    if (snapshot.trackerState.toLowerCase() === "todo" && hasOpenBlocker(snapshotAsIssue(snapshot), this.config.tracker.terminalStates)) {
+      return false;
+    }
+    return true;
+  }
+
+  private rulesetCanReconcileMergePolicy(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (snapshot.running || snapshot.paused) return false;
+    return this.rulesetPassesLabelGuardrails(snapshot, "merge_policy");
+  }
+
+  private rulesetCommonDispatchGate(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (snapshot.availableSlots <= 0) return false;
+    if (snapshot.providerDispatchGateActive) return false;
+    if (snapshot.running) return false;
+    if (snapshot.paused) return false;
+    if (!snapshot.allowExistingClaim && snapshot.claimed) return false;
+    return snapshot.stateSlotAvailable;
+  }
+
+  private rulesetPassesLabelGuardrails(snapshot: IssueCurrentStateSnapshot, role: AgentRunRole | "merge_policy"): boolean {
+    return this.passesLabelGuardrails(snapshotAsIssue(snapshot), role);
+  }
+
+  private rulesetShouldDispatchPlanner(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (!this.config.issueBreakdown.enabled) return false;
+    if (!snapshot.assignedToWorker || snapshot.hasChildren) return false;
+    if (snapshot.candidateSource === "planner_candidates") return true;
+    if (snapshot.candidateSource === "triage_candidates") return !this.rulesetHasFreshIssueBreakdownPlan(snapshot);
+    if (snapshot.candidateSource !== "worker_candidates") return false;
+    if (!this.rulesetHasPlanningLabel(snapshot)) return false;
+    return !this.rulesetHasFreshIssueBreakdownPlan(snapshot);
+  }
+
+  private rulesetShouldWaitForIssueBreakdownApply(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick" || snapshot.candidateSource !== "worker_candidates") return false;
+    if (!this.config.issueBreakdown.enabled || !this.config.issueBreakdown.applyToLinear.enabled) return false;
+    if (!this.rulesetHasFreshIssueBreakdownPlan(snapshot)) return false;
+    return this.rulesetHasPlanningLabel(snapshot);
+  }
+
+  private rulesetHasPlanningLabel(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (this.config.issueBreakdown.planningLabels.length === 0) return false;
+    const labels = new Set(snapshot.labels.map((label) => label.toLowerCase()));
+    return this.config.issueBreakdown.planningLabels.some((label) => labels.has(label));
+  }
+
+  private rulesetHasFreshIssueBreakdownPlan(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (snapshot.lastIssueBreakdownPlanId === null) return false;
+    if (snapshot.lastIssueBreakdownPlanApplicationStatus === "stale") return false;
+    if (snapshot.lastIssueBreakdownPlanIssueContentFingerprint === null) return false;
+    if (snapshot.lastIssueBreakdownPlanIssueContentFingerprint.length === 0) return false;
+    if (snapshot.lastIssueBreakdownPlanIssueContentFingerprint !== snapshot.currentIssueContentFingerprint) return false;
+    if (snapshot.lastIssueBreakdownPlanConfigFingerprint !== snapshot.currentIssueBreakdownConfigFingerprint) return false;
+    return snapshot.lastIssueBreakdownPlanSatisfiesCurrentValidation;
+  }
+
+  private runningTerminationRequest(snapshot: IssueCurrentStateSnapshot): IssueTransitionRequest | null {
+    if (snapshot.triggerType !== "orchestrator.tick" || snapshot.candidateSource !== "running_reconciliation") return null;
+    if (!snapshot.running || snapshot.runningRole === null) return null;
+    const role = snapshot.runningRole;
+    const ignoreState = snapshot.runningManualIgnoreState;
+    const terminate = (reason: string, cleanupWorkspace = false): IssueTransitionRequest => ({
+      transitionKind: "terminate_running",
+      reason,
+      terminationReason: reason,
+      cleanupWorkspace,
+      role,
+      runPhase: snapshot.runningRunPhase,
+      runKind: snapshot.runningRunKind,
+      runId: snapshot.latestRunId,
+    });
+    if (role !== "post_mortem" && isStateIn(snapshot.trackerState, this.config.tracker.terminalStates)) {
+      return terminate("terminal state", true);
+    }
+    if (role === "worker" && snapshot.runningHasPendingPublicationApproval) {
+      return { transitionKind: "noop", reason: "awaiting_pending_publication_approval" };
+    }
+    if (role === "worker" && !ignoreState && isStateIn(snapshot.trackerState, this.config.tracker.handoffStates)) {
+      return terminate("handoff state");
+    }
+    if (role === "worker" && !snapshot.assignedToWorker) return terminate("worker route changed");
+    if (
+      role === "worker" &&
+      !ignoreState &&
+      !this.isWorkerStateActiveForRunPhase(snapshotAsIssue(snapshot), snapshot.runningRunPhase ?? "implementation")
+    ) {
+      return terminate("non-active state");
+    }
+    if (role === "reviewer" && !ignoreState && isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)) {
+      return terminate("blocked state");
+    }
+    if (role === "reviewer" && !ignoreState && !isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates)) {
+      return terminate("non-review state");
+    }
+    if (role === "triage" && !ignoreState && !isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)) {
+      return terminate("non-blocked state");
+    }
+    if (role === "post_mortem" && !ignoreState && !isStateIn(snapshot.trackerState, this.config.postMortem.doneStates)) {
+      return terminate("non-post-mortem-done state");
+    }
+    if (
+      role === "planner" &&
+      !ignoreState &&
+      !isStateIn(snapshot.trackerState, this.config.tracker.activeStates) &&
+      !isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)
+    ) {
+      return terminate("non-planning state");
+    }
+    if (role === "planner" && !snapshot.assignedToWorker) return terminate("planner route changed");
+    return null;
+  }
+
+  private rulesetShouldReconcileIssueTriageReportWriteback(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick" || snapshot.candidateSource !== "triage_writeback_reconciliation") {
+      return false;
+    }
+    if (!this.config.issueTriage.enabled || !this.options.lifecycleStore) return false;
+    if (snapshot.phase !== "blocked") return false;
+    if (snapshot.lastIssueTriageReportId === null) return false;
+    if (snapshot.lastIssueTriageReportWritebackOperationKeys === null) return false;
+    if (snapshot.lastIssueTriageReportWritebackOperationKeys.length > 0) return false;
+    return snapshot.lastIssueTriageReportTriggerFingerprint === snapshot.currentIssueTriageTriggerFingerprint;
+  }
+
+  private rulesetShouldReconcileIssuePostMortemReportWriteback(snapshot: IssueCurrentStateSnapshot): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick" || snapshot.candidateSource !== "post_mortem_writeback_reconciliation") {
+      return false;
+    }
+    if (!this.config.postMortem.enabled || !this.options.lifecycleStore) return false;
+    if (snapshot.lastPostMortemReportId === null) return false;
+    if (snapshot.lastPostMortemReportWritebackOperationKeys === null) return false;
+    if (snapshot.lastPostMortemReportWritebackOperationKeys.length > 0) return false;
+    return snapshot.lastPostMortemReportTriggerFingerprint === snapshot.currentPostMortemTriggerFingerprint;
+  }
+
+  private async decideIssueTransition(input: {
+    issue: Issue;
+    triggerType: IssueTriggerType;
+    candidateSource: string;
+    manualStage?: ManualAgentRunStage | null;
+    manualForceLabels?: boolean;
+    manualIgnoreState?: boolean;
+    allowExistingClaim?: boolean;
+    snapshotPatch?: Partial<IssueCurrentStateSnapshot>;
+    transitionPatch?: Partial<IssueTransitionRequest>;
+  }): Promise<IssueHistorySnapshot | null> {
+    try {
+      const current = await this.buildIssueCurrentFields(input.issue);
+      const record = await this.issueStateStore.ensureIssue(current);
+      const now = new Date().toISOString();
+      const snapshot = immutableIssueSnapshot({
+        ...current,
+        snapshotId: createIssueSnapshotId(),
+        snapshotAt: now,
+        triggerType: input.triggerType,
+        triggerId: `${input.triggerType}:${randomUUID()}`,
+        triggerAt: now,
+        triggerSource: input.triggerType === "manual.cli_agent_run" ? "manual_cli" : "orchestrator",
+        candidateSource: input.candidateSource,
+        availableSlots: this.availableSlots(),
+        providerDispatchGateActive: this.activeProviderGates.some((gate) => this.providerGateMatchesConfiguredRuntime(gate)),
+        stateSlotAvailable: this.hasStateSlot(input.issue.state),
+        allowExistingClaim: input.allowExistingClaim === true,
+        manualStage: input.manualStage ?? null,
+        manualForceLabels: input.manualForceLabels ?? false,
+        manualIgnoreState: input.manualIgnoreState ?? false,
+        ...(input.snapshotPatch ?? {}),
+      } satisfies IssueCurrentStateSnapshot);
+      const transition = this.transitionEngine.decide(snapshot, record.history);
+      if (transition === null) return null;
+      const patchedTransition = input.transitionPatch === undefined ? transition : { ...transition, ...input.transitionPatch };
+      await this.issueStateStore.appendSnapshot(input.issue, patchedTransition);
+      return patchedTransition;
+    } catch (error) {
+      this.options.logger.warn("issue transition decision failed", {
+        issue_id: input.issue.id,
+        issue_identifier: input.issue.identifier,
+        candidate_source: input.candidateSource,
+        error: errorMessage(error),
+      });
+      return null;
+    }
+  }
+
+  private async recordIssueTransition(input: {
+    issue: Issue;
+    triggerType: IssueTriggerType;
+    candidateSource: string;
+    request: IssueTransitionRequest;
+    rulesetId?: string;
+    rulesetPriority?: number;
+    manualStage?: ManualAgentRunStage | null;
+    manualForceLabels?: boolean;
+    manualIgnoreState?: boolean;
+    actions?: TransitionActionRecord[];
+  }): Promise<string | null> {
+    try {
+      const current = await this.buildIssueCurrentFields(input.issue);
+      const record = await this.issueStateStore.ensureIssue(current);
+      const now = new Date().toISOString();
+      const snapshot = immutableIssueSnapshot({
+        ...current,
+        snapshotId: createIssueSnapshotId(),
+        snapshotAt: now,
+        triggerType: input.triggerType,
+        triggerId: `${input.triggerType}:${randomUUID()}`,
+        triggerAt: now,
+        triggerSource: input.triggerType === "manual.cli_agent_run" ? "manual_cli" : "orchestrator",
+        candidateSource: input.candidateSource,
+        availableSlots: this.availableSlots(),
+        providerDispatchGateActive: this.activeProviderGates.some((gate) => this.providerGateMatchesConfiguredRuntime(gate)),
+        stateSlotAvailable: this.hasStateSlot(input.issue.state),
+        allowExistingClaim: false,
+        manualStage: input.manualStage ?? null,
+        manualForceLabels: input.manualForceLabels ?? false,
+        manualIgnoreState: input.manualIgnoreState ?? false,
+      } satisfies IssueCurrentStateSnapshot);
+      const rulesetId = input.rulesetId ?? `orchestrator.${input.request.transitionKind}`;
+      const rulesetPriority = input.rulesetPriority ?? issueTransitionRulesetPriority(input.request.transitionKind);
+      const ruleset: TransitionRuleset = {
+        id: rulesetId,
+        priority: rulesetPriority,
+        version: ORCHESTRATOR_RULESET_VERSION,
+        fingerprint: `${rulesetId}@${ORCHESTRATOR_RULESET_VERSION}:${rulesetPriority}`,
+        evaluate: () => input.request,
+      };
+      const decided = new IssueOrchestrationEngine([ruleset]).decide(snapshot, record.history);
+      if (!decided) return null;
+      const historySnapshot = {
+        ...decided,
+        actions: input.actions ?? [],
+      };
+      await this.issueStateStore.appendSnapshot(input.issue, historySnapshot);
+      return historySnapshot.historySnapshotId;
+    } catch (error) {
+      this.options.logger.warn("issue transition snapshot recording failed", {
+        issue_id: input.issue.id,
+        issue_identifier: input.issue.identifier,
+        transition_kind: input.request.transitionKind,
+        error: errorMessage(error),
+      });
+      return null;
+    }
+  }
+
+  private async recordIssueEvidenceSnapshot(input: IssueEvidenceSnapshotInput): Promise<string | null> {
+    return this.recordIssueTransition({
+      issue: input.issue,
+      triggerType: "orchestrator.tick",
+      candidateSource: `evidence.${input.evidenceKind}.${safeEvidenceSegment(input.eventType)}`,
+      request: {
+        transitionKind: "record_evidence",
+        reason: input.reason ?? input.eventType,
+        evidenceKind: input.evidenceKind,
+        evidenceEventType: input.eventType,
+        evidenceSourceId: input.sourceId ?? null,
+        evidencePayload: input.payload ?? null,
+      },
+      rulesetId: `orchestrator.evidence.${input.evidenceKind}`,
+      rulesetPriority: issueTransitionRulesetPriority("record_evidence"),
+    });
+  }
+
+  private async recordLifecycleEvidenceSnapshot(input: LifecycleEvidenceInput): Promise<void> {
+    await this.recordIssueEvidenceSnapshot({
+      issue: input.issue,
+      evidenceKind: "lifecycle",
+      eventType: input.eventType ?? "lifecycle_updated",
+      sourceId: input.sourceId ?? null,
+      reason: input.reason ?? input.eventType ?? "lifecycle_updated",
+      payload: {
+        patch: input.patch,
+        phase: input.lifecycle.phase,
+        blockedReason: input.lifecycle.blockedReason,
+        reviewRound: input.lifecycle.reviewRound,
+        incompleteTurnCount: input.lifecycle.incompleteTurnCount,
+        planningFailureCount: input.lifecycle.planningFailureCount,
+        planningDispatchRetryCount: input.lifecycle.planningDispatchRetryCount,
+        lastCompletionReportId: input.lifecycle.lastCompletionReportId ?? null,
+        lastReviewVerdictId: input.lifecycle.lastReviewVerdictId ?? null,
+        lastMergeGateResultId: input.lifecycle.lastMergeGateResultId ?? null,
+        mergeGate: input.lifecycle.mergeGate ?? null,
+        mergeConflict: input.lifecycle.mergeConflict ?? null,
+        summaryPointers: input.lifecycle.summaryPointers,
+      },
+    });
+  }
+
+  private async updateIssueLifecycleWithEvidence(
+    issue: Issue,
+    patch: IssueLifecyclePatch,
+    reason: string,
+    sourceId?: string | null,
+  ): Promise<IssueLifecycleRecord | null> {
+    const store = this.options.lifecycleStore;
+    if (!store) return null;
+    const lifecycle = await store.updateIssue(issue, patch);
+    await this.recordLifecycleEvidenceSnapshot({ issue, lifecycle, patch, sourceId: sourceId ?? null, reason });
+    return lifecycle;
+  }
+
+  private async buildIssueCurrentFields(issue: Issue): Promise<IssueCurrentFields> {
+    const lifecycle = (await this.options.lifecycleStore?.get(issue.id)) ?? null;
+    const runningEntry = this.running.get(issue.id) ?? null;
+    let latestRun: RunRecord | null = null;
+    let runs: RunRecord[] = [];
+    try {
+      runs = (await this.options.runStore?.listRunsForIssue(issue.id)) ?? [];
+      latestRun = [...runs].sort(compareRunChronology).at(-1) ?? null;
+    } catch (error) {
+      this.options.logger.warn("issue current-state latest run lookup failed", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        error: errorMessage(error),
+      });
+    }
+    const pointers = lifecycle?.summaryPointers ?? null;
+    const latestPrNumber = pointers?.prNumber ?? latestRun?.prNumber ?? null;
+    const lastIssueBreakdownPlan =
+      lifecycle?.lastIssueBreakdownPlanId === undefined || lifecycle.lastIssueBreakdownPlanId === null
+        ? null
+        : lifecycle.issueBreakdownPlans.find((plan) => plan.id === lifecycle.lastIssueBreakdownPlanId) ?? null;
+    const currentIssueFingerprint = issueContentFingerprint(issue);
+    const currentIssueBreakdownFingerprint = issueBreakdownConfigFingerprint(this.config);
+    const currentIssueTriageFingerprint = lifecycle === null ? null : issueTriageTriggerFingerprint(lifecycle);
+    const lastIssueTriageReport =
+      lifecycle === null || currentIssueTriageFingerprint === null
+        ? null
+        : latestIssueTriageReportForFingerprint(lifecycle, currentIssueTriageFingerprint);
+    const currentPostMortemFingerprint = lifecycle === null ? null : issuePostMortemTriggerFingerprint(lifecycle, issue);
+    const lastPostMortemReport =
+      lifecycle === null || currentPostMortemFingerprint === null
+        ? null
+        : latestIssuePostMortemReportForFingerprint(lifecycle, currentPostMortemFingerprint);
+    const runningRunId = runningEntry?.activeRunId ?? runningEntry?.runId ?? null;
+    const pendingPublication =
+      runningRunId === null
+        ? pendingPublicationHandoffForRun(lifecycle)
+        : pendingPublicationHandoffForRun(lifecycle, { runId: runningRunId }) ?? pendingPublicationHandoffForRun(lifecycle);
+    const runningRunPhase = runningEntry?.runPhase ?? null;
+    return {
+      version: 1,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      title: issue.title,
+      description: issue.description,
+      priority: issue.priority,
+      trackerState: issue.state,
+      branchName: issue.branchName,
+      trackerUrl: issue.url,
+      assigneeId: issue.assigneeId,
+      delegateId: issue.delegateId,
+      assignedToWorker: issue.assignedToWorker,
+      labels: [...issue.labels],
+      blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
+      hasChildren: issue.hasChildren === true,
+      trackerCreatedAt: issue.createdAt,
+      trackerUpdatedAt: issue.updatedAt,
+      phase: lifecycle?.phase ?? phaseForIssueState(issue.state, this.config),
+      reviewRound: lifecycle?.reviewRound ?? 0,
+      incompleteTurnCount: lifecycle?.incompleteTurnCount ?? 0,
+      planningFailureCount: lifecycle?.planningFailureCount ?? 0,
+      planningDispatchRetryCount: lifecycle?.planningDispatchRetryCount ?? 0,
+      blockedReason: lifecycle?.blockedReason ?? null,
+      lastIssueBreakdownPlanId: lifecycle?.lastIssueBreakdownPlanId ?? null,
+      lastIssueBreakdownPlanApplicationStatus: lastIssueBreakdownPlan?.applicationStatus ?? null,
+      lastIssueBreakdownPlanIssueContentFingerprint: lastIssueBreakdownPlan?.issueContentFingerprint ?? null,
+      lastIssueBreakdownPlanConfigFingerprint: lastIssueBreakdownPlan?.configFingerprint ?? null,
+      lastIssueBreakdownPlanSatisfiesCurrentValidation:
+        lastIssueBreakdownPlan === null ? false : issueBreakdownPlanSatisfiesCurrentValidation(lastIssueBreakdownPlan, this.config),
+      currentIssueContentFingerprint: currentIssueFingerprint,
+      currentIssueBreakdownConfigFingerprint: currentIssueBreakdownFingerprint,
+      lastIssueTriageReportId: lastIssueTriageReport?.id ?? lifecycle?.lastIssueTriageReportId ?? null,
+      lastIssueTriageReportTriggerFingerprint: lastIssueTriageReport?.triggerFingerprint ?? null,
+      lastIssueTriageReportWritebackOperationKeys: lastIssueTriageReport?.writebackOperationKeys ?? null,
+      currentIssueTriageTriggerFingerprint: currentIssueTriageFingerprint,
+      lastPostMortemReportId: lastPostMortemReport?.id ?? lifecycle?.lastPostMortemReportId ?? null,
+      lastPostMortemReportTriggerFingerprint: lastPostMortemReport?.triggerFingerprint ?? null,
+      lastPostMortemReportWritebackOperationKeys: lastPostMortemReport?.writebackOperationKeys ?? null,
+      currentPostMortemTriggerFingerprint: currentPostMortemFingerprint,
+      lastCompletionReportId: lifecycle?.lastCompletionReportId ?? null,
+      lastCompletionReportRejectionId: lifecycle?.lastCompletionReportRejectionId ?? null,
+      lastReviewVerdictId: lifecycle?.lastReviewVerdictId ?? null,
+      lastMergeGateResultId: lifecycle?.lastMergeGateResultId ?? null,
+      pendingPublicationApprovalRunId: pendingPublication?.pendingReport.runId ?? null,
+      pendingPublicationApprovalReportId: pendingPublication?.pendingReport.id ?? null,
+      pendingPublicationApprovalReason: pendingPublication === null ? null : lifecycle?.blockedReason ?? null,
+      latestRunId: latestRun?.runId ?? pointers?.lastRunId ?? null,
+      latestRunStatus: latestRun?.status ?? null,
+      latestRunRole: latestRun?.role ?? null,
+      latestRunPhase: latestRun?.runPhase ?? null,
+      latestRunKind: latestRun?.runKind ?? null,
+      latestRunCompletedAt: latestRun?.completedAt ?? null,
+      latestRunError: latestRun?.error ?? null,
+      latestPrUrl: pointers?.prUrl ?? latestRun?.prUrl ?? null,
+      latestPrNumber: typeof latestPrNumber === "number" ? latestPrNumber : null,
+      latestPrHeadSha: pointers?.prHeadSha ?? latestRun?.prHeadSha ?? null,
+      latestPrBranch: pointers?.prBranch ?? latestRun?.prBranch ?? null,
+      latestWorkspaceKey: pointers?.workspaceKey ?? latestRun?.workspaceKey ?? null,
+      latestWorkspacePath: pointers?.workspacePath ?? latestRun?.workspacePath ?? null,
+      latestGitBranchName: pointers?.gitBranchName ?? pointers?.branchName ?? latestRun?.gitBranchName ?? issue.branchName,
+      running: this.running.has(issue.id),
+      runningRole: runningEntry?.role ?? null,
+      runningRunPhase,
+      runningRunKind: runningRunPhase === null ? null : runKindForPhase(runningRunPhase),
+      runningManualDispatchStage: runningEntry?.manualDispatch?.stage ?? null,
+      runningManualIgnoreState: runningEntry?.manualDispatch?.ignoreState === true,
+      runningHasPendingPublicationApproval: pendingPublication !== null,
+      runningCancellationRequested: runningEntry !== null && runningEntry.cancellationRequestedAt !== null,
+      claimed: this.claimed.has(issue.id),
+      paused: this.pausedIssues.has(issue.id),
+      retrying: this.retryAttempts.has(issue.id),
+      consecutiveSdkErrorFailures: countConsecutiveWorkerRuns(runs, isCountedSdkWaitErrorFailure),
+      consecutiveInfraFailures: countConsecutiveWorkerRuns(runs, isCountedInfraFailure),
+      recordCreatedAt: new Date().toISOString(),
+      recordUpdatedAt: new Date().toISOString(),
+    };
+  }
+
+  private async recordTransitionAction(entry: RunningEntry, action: TransitionActionRecord): Promise<void> {
+    if (entry.issueHistorySnapshotId === null) return;
+    try {
+      await this.issueStateStore.appendSnapshotAction(entry.issue, entry.issueHistorySnapshotId, action);
+    } catch (error) {
+      this.options.logger.warn("issue transition action recording failed", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        history_snapshot_id: entry.issueHistorySnapshotId,
+        action_type: action.actionType,
+        error: errorMessage(error),
+      });
+    }
+  }
+
+  private async recordIssueSnapshotAction(issue: Issue, historySnapshotId: string, action: TransitionActionRecord): Promise<void> {
+    try {
+      await this.issueStateStore.appendSnapshotAction(issue, historySnapshotId, action);
+    } catch (error) {
+      this.options.logger.warn("issue transition action recording failed", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        history_snapshot_id: historySnapshotId,
+        action_type: action.actionType,
+        error: errorMessage(error),
+      });
+    }
+  }
+
+  private async recordTransitionError(entry: RunningEntry, error: unknown, actionId: string | null = null): Promise<void> {
+    if (entry.issueHistorySnapshotId === null) return;
+    try {
+      await this.issueStateStore.appendSnapshotError(
+        entry.issue,
+        entry.issueHistorySnapshotId,
+        transitionErrorFromUnknown(error, { actionId }),
+      );
+    } catch (recordError) {
+      this.options.logger.warn("issue transition error recording failed", {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        history_snapshot_id: entry.issueHistorySnapshotId,
+        error: errorMessage(recordError),
+      });
+    }
+  }
+
+  private async recordDispatchTransition(input: {
+    issue: Issue;
+    triggerType: IssueTriggerType;
+    candidateSource: string;
+    role: AgentRunRole;
+    runPhase: AgentRunPhase;
+    reason: string;
+    attempt: number | null;
+    manualDispatch?: RunningEntry["manualDispatch"];
+  }): Promise<string | null> {
+    const runKind = runKindForPhase(input.runPhase);
+    return this.recordIssueTransition({
+      issue: input.issue,
+      triggerType: input.triggerType,
+      candidateSource: input.candidateSource,
+      manualStage: input.manualDispatch?.stage ?? null,
+      manualForceLabels: input.manualDispatch?.forceLabels ?? false,
+      manualIgnoreState: input.manualDispatch?.ignoreState ?? false,
+      request: {
+        transitionKind: dispatchTransitionKindForRole(input.role),
+        reason: input.reason,
+        role: input.role,
+        runPhase: input.runPhase,
+        runKind,
+        promptScenario: promptScenarioForDispatch(input.role, input.runPhase, input.manualDispatch !== undefined),
+        attempt: input.attempt,
+        manualDispatch: input.manualDispatch !== undefined,
+      },
+      rulesetId:
+        input.triggerType === "manual.cli_agent_run"
+          ? "manual.dispatch"
+          : `orchestrator.dispatch.${input.role}.${input.runPhase}`,
+      actions: [
+        transitionAction({
+          actionType: "dispatch_agent",
+          status: "succeeded",
+          message: `Dispatched ${input.role} ${runKind} run`,
+          details: {
+            role: input.role,
+            runPhase: input.runPhase,
+            runKind,
+            attempt: input.attempt,
+          },
+        }),
+      ],
+    });
+  }
+
+  private async processIssueTransitionCandidate(input: {
+    issue: Issue;
+    candidateSource: string;
+    attempt?: number | null;
+    allowExistingClaim?: boolean;
+  }): Promise<boolean> {
+    const result = await this.processIssueTransitionEvent({
+      issue: input.issue,
+      triggerType: "orchestrator.tick",
+      candidateSource: input.candidateSource,
+      attempt: input.attempt ?? null,
+      allowExistingClaim: input.allowExistingClaim === true,
+    });
+    return result.acted;
+  }
+
+  private async processIssueTransitionEvent(input: IssueTransitionEventInput): Promise<IssueTransitionEventResult> {
+    const transition = await this.decideIssueTransition({
+      issue: input.issue,
+      triggerType: input.triggerType,
+      candidateSource: input.candidateSource,
+      ...(input.manualStage === undefined ? {} : { manualStage: input.manualStage }),
+      ...(input.manualForceLabels === undefined ? {} : { manualForceLabels: input.manualForceLabels }),
+      ...(input.manualIgnoreState === undefined ? {} : { manualIgnoreState: input.manualIgnoreState }),
+      allowExistingClaim: input.allowExistingClaim === true,
+      ...(input.snapshotPatch === undefined ? {} : { snapshotPatch: input.snapshotPatch }),
+      ...(input.transitionPatch === undefined ? {} : { transitionPatch: input.transitionPatch }),
+    });
+    if (transition === null || transition.transitionKind === "noop") return { transition, acted: false };
+    const acted = await this.executeIssueTransition(input.issue, transition, {
+      attempt: input.attempt ?? null,
+      allowExistingClaim: input.allowExistingClaim === true,
+    });
+    return { transition, acted };
+  }
+
+  private async executeIssueTransition(
+    issue: Issue,
+    transition: IssueHistorySnapshot,
+    options: { attempt: number | null; allowExistingClaim: boolean },
+  ): Promise<boolean> {
+    const definition = this.transitions.get(transition.transitionKind);
+    if (!definition || definition.actions.length === 0) return false;
+    const context: OrchestratorTransitionContext = {
+      issue,
+      transition,
+      attempt: options.attempt,
+      allowExistingClaim: options.allowExistingClaim,
+    };
+    let acted = false;
+    for (const action of definition.actions) {
+      try {
+        const result = await action.execute(context);
+        if (result === false) return acted;
+        acted = true;
+      } catch (error) {
+        await this.issueStateStore.appendSnapshotError(
+          issue,
+          transition.historySnapshotId,
+          transitionErrorFromUnknown(error, { details: { actionId: action.id } }),
+        );
+        this.options.logger.warn("issue transition action failed", {
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          transition_kind: transition.transitionKind,
+          history_snapshot_id: transition.historySnapshotId,
+          action_id: action.id,
+          error: errorMessage(error),
+        });
+        return acted;
+      }
+    }
+    return acted;
+  }
+
+  private async recordDispatchActionForTransition(
+    issue: Issue,
+    transition: IssueHistorySnapshot,
+    attempt: number | null,
+  ): Promise<void> {
+    await this.recordIssueSnapshotAction(
+      issue,
+      transition.historySnapshotId,
+      transitionAction({
+        actionType: "dispatch_agent",
+        status: "succeeded",
+        message: `Dispatched ${transition.role ?? "agent"} ${transition.runKind ?? "run"} run`,
+        details: {
+          role: transition.role ?? null,
+          runPhase: transition.runPhase ?? null,
+          runKind: transition.runKind ?? null,
+          attempt,
+          rulesetId: transition.rulesetId,
+        },
+      }),
+    );
+  }
+
   private async startupCleanup(): Promise<void> {
     try {
       const terminalIssues = await this.options.tracker.fetchIssuesByStates(this.config.tracker.terminalStates);
       for (const issue of terminalIssues) {
         await this.options.workspaceManager.removeForIssue(issue);
+        await this.recordIssueEvidenceSnapshot({
+          issue,
+          evidenceKind: "workspace",
+          eventType: "startup_terminal_workspace_removed",
+          sourceId: issue.id,
+          reason: "startup_terminal_cleanup",
+          payload: {
+            issueId: issue.id,
+            issueIdentifier: issue.identifier,
+            trackerState: issue.state,
+          },
+        });
       }
     } catch (error) {
       this.options.logger.warn("startup terminal cleanup failed", { error: errorMessage(error) });
@@ -1923,6 +3154,47 @@ export class Orchestrator {
       this.options.logger.warn("pending publication approval recovery issue refresh failed", { error: errorMessage(error) });
     }
     const issuesById = new Map(latestIssues.map((issue) => [issue.id, issue]));
+
+    for (const lifecycle of candidates) {
+      const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
+      await this.processIssueTransitionCandidate({ issue, candidateSource: "pending_publication_approval" });
+    }
+  }
+
+  private async recoverPendingPublicationApprovalHandoff(issue: Issue, historySnapshotId: string): Promise<boolean> {
+    if (
+      !this.config.github.publishPullRequests ||
+      !(this.config.github.operatorApproval?.requiredForPublication ?? false) ||
+      !this.options.lifecycleStore ||
+      !this.options.writeback ||
+      !this.options.operatorApproval
+    ) {
+      await this.recordIssueSnapshotAction(
+        issue,
+        historySnapshotId,
+        transitionAction({
+          actionType: "recover_publication_approval",
+          status: "skipped",
+          message: "Pending publication approval recovery is not configured",
+          details: null,
+        }),
+      );
+      return false;
+    }
+    const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    if (!hasRecoverablePendingPublicationApproval(lifecycle)) {
+      await this.recordIssueSnapshotAction(
+        issue,
+        historySnapshotId,
+        transitionAction({
+          actionType: "recover_publication_approval",
+          status: "skipped",
+          message: "No recoverable pending publication approval handoff exists",
+          details: null,
+        }),
+      );
+      return false;
+    }
     const service = new CompletionReportService({
       config: this.config,
       lifecycleStore: this.options.lifecycleStore,
@@ -1934,27 +3206,49 @@ export class Orchestrator {
         createGitHubPullRequestClientForCapability(this.config, "github.publication"),
       operatorApproval: this.options.operatorApproval,
     });
-
-    for (const lifecycle of candidates) {
-      const issue = issuesById.get(lifecycle.issueId) ?? issueFromPendingPublicationLifecycle(lifecycle, this.config.writeback.dispatchState);
-      try {
-        const result = await service.recoverPendingPublicationApproval({ issue, lifecycle });
-        if (result.recovered) {
-          this.options.logger.info("pending publication approval recovered", {
-            issue_id: lifecycle.issueId,
-            issue_identifier: lifecycle.issueIdentifier,
-            run_id: result.report.runId,
-            approval_request_id: result.outcome === "pending" ? result.approvalRequest.requestId : null,
-            outcome: result.outcome,
-          });
-        }
-      } catch (error) {
-        this.options.logger.warn("pending publication approval recovery failed", {
+    await this.recordIssueSnapshotAction(
+      issue,
+      historySnapshotId,
+      transitionAction({
+        actionType: "start_publication_approval_recovery",
+        status: "succeeded",
+        message: "Started pending publication approval recovery",
+        details: {
+          runId: pendingPublicationHandoffForRun(lifecycle)?.pendingReport.runId ?? null,
+          reportId: pendingPublicationHandoffForRun(lifecycle)?.pendingReport.id ?? null,
+        },
+      }),
+    );
+    try {
+      const result = await service.recoverPendingPublicationApproval({ issue, lifecycle });
+      await this.recordIssueSnapshotAction(
+        issue,
+        historySnapshotId,
+        transitionAction({
+          actionType: "finish_publication_approval_recovery",
+          status: result.recovered ? "succeeded" : "skipped",
+          message: result.recovered ? "Pending publication approval recovered" : "Pending publication approval recovery skipped",
+          details: result,
+        }),
+      );
+      if (result.recovered) {
+        this.options.logger.info("pending publication approval recovered", {
           issue_id: lifecycle.issueId,
           issue_identifier: lifecycle.issueIdentifier,
-          error: errorMessage(error),
+          run_id: result.report.runId,
+          approval_request_id: result.outcome === "pending" ? result.approvalRequest.requestId : null,
+          outcome: result.outcome,
         });
       }
+      return result.recovered;
+    } catch (error) {
+      await this.issueStateStore.appendSnapshotError(issue, historySnapshotId, transitionErrorFromUnknown(error));
+      this.options.logger.warn("pending publication approval recovery failed", {
+        issue_id: lifecycle.issueId,
+        issue_identifier: lifecycle.issueIdentifier,
+        error: errorMessage(error),
+      });
+      return false;
     }
   }
 
@@ -1974,37 +3268,11 @@ export class Orchestrator {
       const latest = byId.get(issueId);
       if (!latest) continue;
       entry.issue = latest;
-      const ignoreStateForManualRun = entry.manualDispatch?.ignoreState === true;
-      const preservePendingApprovalWorker =
-        entry.role === "worker" && (await this.hasPendingPublicationApprovalHandoff(entry));
-      if (entry.role !== "post_mortem" && isStateIn(latest.state, this.config.tracker.terminalStates)) {
-        await this.terminateRunningIssue(issueId, true, "terminal state");
-      } else if (preservePendingApprovalWorker) {
+      const preservePendingApprovalWorker = entry.role === "worker" && (await this.hasPendingPublicationApprovalHandoff(entry));
+      if (preservePendingApprovalWorker) {
         entry.lastMessage = "Awaiting operator approval for push/PR";
-      } else if (entry.role === "worker" && !ignoreStateForManualRun && isStateIn(latest.state, this.config.tracker.handoffStates)) {
-        await this.terminateRunningIssue(issueId, false, "handoff state");
-      } else if (entry.role === "worker" && !latest.assignedToWorker) {
-        await this.terminateRunningIssue(issueId, false, "worker route changed");
-      } else if (entry.role === "worker" && !ignoreStateForManualRun && !this.isWorkerStateActiveForRunPhase(latest, entry.runPhase)) {
-        await this.terminateRunningIssue(issueId, false, "non-active state");
-      } else if (entry.role === "reviewer" && !ignoreStateForManualRun && isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
-        await this.terminateRunningIssue(issueId, false, "blocked state");
-      } else if (entry.role === "reviewer" && !ignoreStateForManualRun && !isStateIn(latest.state, this.config.reviewLoop.reviewStates)) {
-        await this.terminateRunningIssue(issueId, false, "non-review state");
-      } else if (entry.role === "triage" && !ignoreStateForManualRun && !isStateIn(latest.state, this.config.reviewLoop.blockedStates)) {
-        await this.terminateRunningIssue(issueId, false, "non-blocked state");
-      } else if (entry.role === "post_mortem" && !ignoreStateForManualRun && !isStateIn(latest.state, this.config.postMortem.doneStates)) {
-        await this.terminateRunningIssue(issueId, false, "non-post-mortem-done state");
-      } else if (
-        entry.role === "planner" &&
-        !ignoreStateForManualRun &&
-        !isStateIn(latest.state, this.config.tracker.activeStates) &&
-        !isStateIn(latest.state, this.config.reviewLoop.blockedStates)
-      ) {
-        await this.terminateRunningIssue(issueId, false, "non-planning state");
-      } else if (entry.role === "planner" && !latest.assignedToWorker) {
-        await this.terminateRunningIssue(issueId, false, "planner route changed");
       }
+      await this.processIssueTransitionCandidate({ issue: latest, candidateSource: "running_reconciliation", allowExistingClaim: true });
     }
   }
 
@@ -2028,7 +3296,12 @@ export class Orchestrator {
     return true;
   }
 
-  private async terminateRunningIssue(issueId: string, cleanupWorkspace: boolean, reason: string): Promise<void> {
+  private async terminateRunningIssue(
+    issueId: string,
+    cleanupWorkspace: boolean,
+    reason: string,
+    historySnapshotId: string | null = null,
+  ): Promise<void> {
     const entry = this.running.get(issueId);
     if (!entry) return;
     entry.suppressRetryOnExit = true;
@@ -2040,6 +3313,25 @@ export class Orchestrator {
     entry.abortController.abort();
     if (cleanupWorkspace) {
       entry.cleanupWorkspaceOnExit = true;
+    }
+    const targetSnapshotId = historySnapshotId ?? entry.issueHistorySnapshotId;
+    if (targetSnapshotId !== null) {
+      await this.recordIssueSnapshotAction(
+        entry.issue,
+        targetSnapshotId,
+        transitionAction({
+          actionType: "terminate_running",
+          status: "succeeded",
+          message: `Terminated running issue: ${reason}`,
+          details: {
+            reason,
+            cleanupWorkspace,
+            role: entry.role,
+            runPhase: entry.runPhase,
+            runId: entry.activeRunId ?? entry.runId,
+          },
+        }),
+      );
     }
     this.options.logger.info("running issue terminated", {
       issue_id: issueId,
@@ -2171,11 +3463,16 @@ export class Orchestrator {
         const blockedReason =
           conflict.blockedReason ?? mergeConflictBlockedReason(conflict.fixTurnCount, conflict.maxFixTurns);
         if (lifecycle.phase !== "blocked" || lifecycle.blockedReason !== blockedReason) {
-          await store.updateIssue(issue, {
-            phase: "blocked",
-            blockedReason,
-            mergeConflict: { ...conflict, status: "blocked", resolutionStatus: "blocked", blockedReason },
-          });
+          await this.updateIssueLifecycleWithEvidence(
+            issue,
+            {
+              phase: "blocked",
+              blockedReason,
+              mergeConflict: { ...conflict, status: "blocked", resolutionStatus: "blocked", blockedReason },
+            },
+            "merge_conflict_blocked_resume_check",
+            lifecycle.summaryPointers.lastRunId ?? issue.id,
+          );
         }
         return false;
       }
@@ -2320,7 +3617,13 @@ export class Orchestrator {
       mergeGate,
       mergeConflict,
     };
-    const updated = await store.updateIssue(issue, patch);
+    const updated =
+      (await this.updateIssueLifecycleWithEvidence(
+        issue,
+        patch,
+        reason,
+        lifecycle.summaryPointers.lastRunId ?? issue.id,
+      )) ?? lifecycle;
     this.options.logger.info("operator action reset lifecycle failure budget", {
       issue_id: issue.id,
       issue_identifier: issue.identifier,
@@ -2367,13 +3670,18 @@ export class Orchestrator {
       this.config,
     );
     if (operations.length === 0) return false;
-    if (!(await this.applyWritebacks(operations, "merge gate head supersession recovery"))) return false;
-    await this.options.lifecycleStore?.updateIssue(issue, {
-      phase: "passed",
-      blockedReason: null,
-      lastReviewVerdictId: verdict.id,
-      summaryPointers: { ciStatus: null },
-    });
+    if (!(await this.applyWritebacks(operations, "merge gate head supersession recovery", issue))) return false;
+    await this.updateIssueLifecycleWithEvidence(
+      issue,
+      {
+        phase: "passed",
+        blockedReason: null,
+        lastReviewVerdictId: verdict.id,
+        summaryPointers: { ciStatus: null },
+      },
+      "merge_gate_head_supersession_rebind",
+      report.runId,
+    );
     this.options.logger.info("merge gate head supersession rebind recovered", {
       issue_id: issue.id,
       issue_identifier: issue.identifier,
@@ -2400,12 +3708,17 @@ export class Orchestrator {
       `max merge gate failures reached (${gate.reviewRound}/${this.config.reviewLoop.failureLimits.mergeGateFailures})`;
     const transition = planIssueTriageBlockedReboundWriteback({ issue, report, reason }, this.config);
     if (transition === null) return false;
-    if (!(await this.applyWriteback(transition, "issue triage blocked rebound"))) return false;
+    if (!(await this.applyWriteback(transition, "issue triage blocked rebound", issue))) return false;
 
-    await this.options.lifecycleStore?.updateIssue(issue, {
-      phase: "blocked",
-      blockedReason: reason,
-    });
+    await this.updateIssueLifecycleWithEvidence(
+      issue,
+      {
+        phase: "blocked",
+        blockedReason: reason,
+      },
+      "issue_triage_blocked_rebound",
+      lifecycle.summaryPointers.lastRunId ?? issue.id,
+    );
     this.options.logger.info("issue triage blocked rebound recovered", {
       issue_id: issue.id,
       issue_identifier: issue.identifier,
@@ -2570,10 +3883,22 @@ export class Orchestrator {
     return true;
   }
 
-  private async tryDispatchWorkerIssue(issue: Issue, attempt: number | null, allowExistingClaim = false): Promise<boolean> {
+  private async tryDispatchWorkerIssue(
+    issue: Issue,
+    attempt: number | null,
+    allowExistingClaim = false,
+    transition: IssueHistorySnapshot | null = null,
+  ): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
-    const initialRunPhase = this.isMergeConflictState(issue.state) ? "merge_conflict_resolution" : "implementation";
+    const preselectedRunPhase: AgentRunPhase | null =
+      transition?.runPhase === "merge_conflict_resolution"
+        ? "merge_conflict_resolution"
+        : transition?.runPhase === "implementation"
+          ? "implementation"
+          : null;
+    const initialRunPhase: AgentRunPhase =
+      preselectedRunPhase ?? (this.isMergeConflictState(issue.state) ? "merge_conflict_resolution" : "implementation");
     if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase)) return false;
 
     let refreshed: Issue[];
@@ -2592,10 +3917,11 @@ export class Orchestrator {
     if (!latest) return false;
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
-    const latestRunPhase = this.isMergeConflictState(latest.state) ? "merge_conflict_resolution" : "implementation";
+    const latestRunPhase: AgentRunPhase =
+      preselectedRunPhase ?? (this.isMergeConflictState(latest.state) ? "merge_conflict_resolution" : "implementation");
     if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase)) return false;
 
-    const decision = await this.resolveWorkerDispatchDecision(latest);
+    const decision = preselectedRunPhase === null ? await this.resolveWorkerDispatchDecision(latest) : { action: "dispatch" as const, runPhase: preselectedRunPhase };
     if (decision.action === "skip") {
       this.options.logger.warn("worker dispatch skipped", {
         issue_id: latest.id,
@@ -2604,20 +3930,45 @@ export class Orchestrator {
       });
       return false;
     }
-    let runPhase = decision.runPhase;
+    let runPhase: AgentRunPhase = decision.runPhase;
     if (runPhase === "issue_breakdown") {
       if (!this.shouldDispatchPlanner(latest, allowExistingClaim)) return false;
       if (!(await this.lifecycleAllowsDispatch(latest, "planner", "issue_breakdown"))) return false;
-      this.dispatchIssue(latest, null, "planner", null, "issue_breakdown");
+      const issueHistorySnapshotId = transition?.historySnapshotId ?? await this.recordDispatchTransition({
+        issue: latest,
+        triggerType: "orchestrator.tick",
+        candidateSource: "worker_candidates.issue_breakdown",
+        role: "planner",
+        runPhase: "issue_breakdown",
+        reason: "issue_breakdown_required",
+        attempt: null,
+      });
+      if (transition !== null) await this.recordDispatchActionForTransition(latest, transition, null);
+      this.dispatchIssue(latest, null, "planner", null, "issue_breakdown", null, issueHistorySnapshotId);
       return true;
     }
     if (!(await this.lifecycleAllowsDispatch(latest, "worker", runPhase))) return false;
     const dispatchWriteback = runPhase === "implementation" ? planDispatchWriteback(latest, this.config) : null;
-    if (!(await this.applyWriteback(dispatchWriteback, "dispatch"))) return false;
+    if (!(await this.applyWriteback(dispatchWriteback, "dispatch", latest))) return false;
     const afterWriteback = dispatchWriteback ? (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] : latest;
     if (!afterWriteback) return false;
     if (dispatchWriteback) {
-      const postWritebackDecision = await this.resolveWorkerDispatchDecision(afterWriteback);
+      if (transition !== null) {
+        const postWritebackTransition = await this.decideIssueTransition({
+          issue: afterWriteback,
+          triggerType: "orchestrator.tick",
+          candidateSource: "worker_candidates",
+        });
+        if (postWritebackTransition?.transitionKind === "dispatch_planner") {
+          return this.tryDispatchPlanner(afterWriteback, allowExistingClaim, null, postWritebackTransition);
+        }
+        if (postWritebackTransition?.transitionKind === "noop") return false;
+        if (postWritebackTransition?.transitionKind === "dispatch_worker") {
+          transition = postWritebackTransition;
+        }
+      }
+      const postWritebackDecision =
+        preselectedRunPhase === null ? await this.resolveWorkerDispatchDecision(afterWriteback) : { action: "dispatch" as const, runPhase };
       if (postWritebackDecision.action === "skip") {
         this.options.logger.warn("worker dispatch skipped after writeback", {
           issue_id: afterWriteback.id,
@@ -2630,14 +3981,34 @@ export class Orchestrator {
       if (runPhase === "issue_breakdown") {
         if (!this.shouldDispatchPlanner(afterWriteback, allowExistingClaim)) return false;
         if (!(await this.lifecycleAllowsDispatch(afterWriteback, "planner", "issue_breakdown"))) return false;
-        this.dispatchIssue(afterWriteback, null, "planner", null, "issue_breakdown");
+        const issueHistorySnapshotId = transition?.historySnapshotId ?? await this.recordDispatchTransition({
+          issue: afterWriteback,
+          triggerType: "orchestrator.tick",
+          candidateSource: "worker_candidates.issue_breakdown_after_writeback",
+          role: "planner",
+          runPhase: "issue_breakdown",
+          reason: "issue_breakdown_required_after_dispatch_writeback",
+          attempt: null,
+        });
+        if (transition !== null) await this.recordDispatchActionForTransition(afterWriteback, transition, null);
+        this.dispatchIssue(afterWriteback, null, "planner", null, "issue_breakdown", null, issueHistorySnapshotId);
         return true;
       }
     }
     if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim, runPhase)) return false;
     if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase))) return false;
 
-    this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase);
+    const issueHistorySnapshotId = transition?.historySnapshotId ?? await this.recordDispatchTransition({
+      issue: afterWriteback,
+      triggerType: "orchestrator.tick",
+      candidateSource: this.isMergeConflictState(afterWriteback.state) ? "merge_conflict_candidates" : "worker_candidates",
+      role: "worker",
+      runPhase,
+      reason: runPhase === "merge_conflict_resolution" ? "merge_conflict_resolution_required" : "worker_dispatch",
+      attempt,
+    });
+    if (transition !== null) await this.recordDispatchActionForTransition(afterWriteback, transition, attempt);
+    this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase, null, issueHistorySnapshotId);
     return true;
   }
 
@@ -2657,11 +4028,15 @@ export class Orchestrator {
       if (this.availableSlots() <= 0) break;
       const lifecycle = await this.options.lifecycleStore.get(issue.id);
       if (!lifecycle?.mergeConflict) continue;
-      await this.tryDispatchWorkerIssue(issue, null);
+      await this.processIssueTransitionCandidate({ issue, candidateSource: "merge_conflict_candidates" });
     }
   }
 
-  private async tryDispatchReviewerIssue(issue: Issue, allowExistingClaim = false): Promise<boolean> {
+  private async tryDispatchReviewerIssue(
+    issue: Issue,
+    allowExistingClaim = false,
+    transition: IssueHistorySnapshot | null = null,
+  ): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     if (!this.shouldDispatchReviewer(issue, allowExistingClaim)) return false;
@@ -2689,7 +4064,17 @@ export class Orchestrator {
     const reviewEvidence = await this.loadReviewerDispatchEvidence(latest);
     if (!reviewEvidence) return false;
 
-    this.dispatchIssue(latest, null, "reviewer", reviewEvidence);
+    const issueHistorySnapshotId = transition?.historySnapshotId ?? await this.recordDispatchTransition({
+      issue: latest,
+      triggerType: "orchestrator.tick",
+      candidateSource: "reviewer_candidates",
+      role: "reviewer",
+      runPhase: "review",
+      reason: "reviewer_dispatch",
+      attempt: null,
+    });
+    if (transition !== null) await this.recordDispatchActionForTransition(latest, transition, null);
+    this.dispatchIssue(latest, null, "reviewer", reviewEvidence, "review", null, issueHistorySnapshotId);
     return true;
   }
 
@@ -2705,19 +4090,18 @@ export class Orchestrator {
       return;
     }
     for (const issue of sortIssuesForDispatch(candidates)) {
-      await this.reconcileIssueTriageReportWriteback(issue);
+      await this.processIssueTransitionCandidate({ issue, candidateSource: "triage_writeback_reconciliation" });
       if (this.availableSlots() <= 0) break;
-      if (await this.tryDispatchPlanner(issue)) continue;
-      await this.tryDispatchIssueTriage(issue);
+      await this.processIssueTransitionCandidate({ issue, candidateSource: "triage_candidates" });
     }
   }
 
-  private async reconcileIssueTriageReportWriteback(issue: Issue): Promise<void> {
-    if (!this.options.lifecycleStore) return;
+  private async reconcileIssueTriageReportWriteback(issue: Issue, historySnapshotId: string | null = null): Promise<boolean> {
+    if (!this.options.lifecycleStore) return false;
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
-    if (!lifecycle || lifecycle.phase !== "blocked") return;
+    if (!lifecycle || lifecycle.phase !== "blocked") return false;
     const report = latestIssueTriageReportForFingerprint(lifecycle, issueTriageTriggerFingerprint(lifecycle));
-    if (!report || report.writebackOperationKeys.length > 0) return;
+    if (!report || report.writebackOperationKeys.length > 0) return false;
     const operations = planIssueTriageReportWritebacks(
       {
         issue,
@@ -2726,25 +4110,47 @@ export class Orchestrator {
       },
       this.config,
     );
-    if (operations.length === 0) return;
+    if (operations.length === 0) return false;
 
-    await this.applyWritebacks(operations, "issue triage report writeback reconciliation");
+    const applied = await this.applyWritebacks(operations, "issue triage report writeback reconciliation", issue);
     const operationKeys = operations.map((operation) => operation.idempotencyKey);
     const current = (await this.options.lifecycleStore.get(issue.id)) ?? lifecycle;
-    await this.options.lifecycleStore.updateIssue(issue, {
-      lastIssueTriageReportId: current.lastIssueTriageReportId ?? report.id,
-      issueTriageReports: current.issueTriageReports.map((candidate) =>
-        candidate.id === report.id
-          ? {
-              ...candidate,
-              writebackOperationKeys: operationKeys,
-            }
-          : candidate,
-      ),
-    });
+    await this.updateIssueLifecycleWithEvidence(
+      issue,
+      {
+        lastIssueTriageReportId: current.lastIssueTriageReportId ?? report.id,
+        issueTriageReports: current.issueTriageReports.map((candidate) =>
+          candidate.id === report.id
+            ? {
+                ...candidate,
+                writebackOperationKeys: operationKeys,
+              }
+            : candidate,
+        ),
+      },
+      "issue_triage_report_writeback_reconciliation",
+      report.runId,
+    );
+    if (historySnapshotId !== null) {
+      await this.recordIssueSnapshotAction(
+        issue,
+        historySnapshotId,
+        transitionAction({
+          actionType: "reconcile_issue_triage_report_writeback",
+          status: applied ? "succeeded" : "failed",
+          message: "Reconciled missing issue triage report writebacks",
+          details: { reportId: report.id, operationKeys },
+        }),
+      );
+    }
+    return applied;
   }
 
-  private async tryDispatchIssueTriage(issue: Issue, allowExistingClaim = false): Promise<boolean> {
+  private async tryDispatchIssueTriage(
+    issue: Issue,
+    allowExistingClaim = false,
+    transition: IssueHistorySnapshot | null = null,
+  ): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     if (!this.shouldDispatchIssueTriage(issue, allowExistingClaim)) return false;
@@ -2769,7 +4175,17 @@ export class Orchestrator {
     if (!this.shouldDispatchIssueTriage(latest, allowExistingClaim)) return false;
     if (!(await this.lifecycleAllowsDispatch(latest, "triage", "issue_triage"))) return false;
 
-    this.dispatchIssue(latest, null, "triage", null, "issue_triage");
+    const issueHistorySnapshotId = transition?.historySnapshotId ?? await this.recordDispatchTransition({
+      issue: latest,
+      triggerType: "orchestrator.tick",
+      candidateSource: "issue_triage_candidates",
+      role: "triage",
+      runPhase: "issue_triage",
+      reason: "issue_triage_dispatch",
+      attempt: null,
+    });
+    if (transition !== null) await this.recordDispatchActionForTransition(latest, transition, null);
+    this.dispatchIssue(latest, null, "triage", null, "issue_triage", null, issueHistorySnapshotId);
     return true;
   }
 
@@ -2785,38 +4201,60 @@ export class Orchestrator {
       return;
     }
     for (const issue of sortIssuesForDispatch(candidates)) {
-      await this.reconcileIssuePostMortemReportWriteback(issue);
+      await this.processIssueTransitionCandidate({ issue, candidateSource: "post_mortem_writeback_reconciliation" });
       if (this.availableSlots() <= 0) break;
-      await this.tryDispatchIssuePostMortem(issue);
+      await this.processIssueTransitionCandidate({ issue, candidateSource: "post_mortem_candidates" });
     }
   }
 
-  private async reconcileIssuePostMortemReportWriteback(issue: Issue): Promise<void> {
-    if (!this.options.lifecycleStore) return;
+  private async reconcileIssuePostMortemReportWriteback(issue: Issue, historySnapshotId: string | null = null): Promise<boolean> {
+    if (!this.options.lifecycleStore) return false;
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
-    if (!lifecycle) return;
+    if (!lifecycle) return false;
     const report = latestIssuePostMortemReportForFingerprint(lifecycle, issuePostMortemTriggerFingerprint(lifecycle, issue));
-    if (!report || report.writebackOperationKeys.length > 0) return;
+    if (!report || report.writebackOperationKeys.length > 0) return false;
     const operations = planIssuePostMortemReportWritebacks({ issue, report }, this.config);
-    if (operations.length === 0) return;
+    if (operations.length === 0) return false;
 
-    await this.applyWritebacks(operations, "issue post-mortem report writeback reconciliation");
+    const applied = await this.applyWritebacks(operations, "issue post-mortem report writeback reconciliation", issue);
     const operationKeys = operations.map((operation) => operation.idempotencyKey);
     const current = (await this.options.lifecycleStore.get(issue.id)) ?? lifecycle;
-    await this.options.lifecycleStore.updateIssue(issue, {
-      lastPostMortemReportId: current.lastPostMortemReportId ?? report.id,
-      postMortemReports: current.postMortemReports.map((candidate) =>
-        candidate.id === report.id
-          ? {
-              ...candidate,
-              writebackOperationKeys: operationKeys,
-            }
-          : candidate,
-      ),
-    });
+    await this.updateIssueLifecycleWithEvidence(
+      issue,
+      {
+        lastPostMortemReportId: current.lastPostMortemReportId ?? report.id,
+        postMortemReports: current.postMortemReports.map((candidate) =>
+          candidate.id === report.id
+            ? {
+                ...candidate,
+                writebackOperationKeys: operationKeys,
+              }
+            : candidate,
+        ),
+      },
+      "post_mortem_report_writeback_reconciliation",
+      report.runId,
+    );
+    if (historySnapshotId !== null) {
+      await this.recordIssueSnapshotAction(
+        issue,
+        historySnapshotId,
+        transitionAction({
+          actionType: "reconcile_post_mortem_report_writeback",
+          status: applied ? "succeeded" : "failed",
+          message: "Reconciled missing post-mortem report writebacks",
+          details: { reportId: report.id, operationKeys },
+        }),
+      );
+    }
+    return applied;
   }
 
-  private async tryDispatchIssuePostMortem(issue: Issue, allowExistingClaim = false): Promise<boolean> {
+  private async tryDispatchIssuePostMortem(
+    issue: Issue,
+    allowExistingClaim = false,
+    transition: IssueHistorySnapshot | null = null,
+  ): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     if (!this.shouldDispatchPostMortem(issue, allowExistingClaim)) return false;
@@ -2841,11 +4279,26 @@ export class Orchestrator {
     if (!this.shouldDispatchPostMortem(latest, allowExistingClaim)) return false;
     if (!(await this.lifecycleAllowsDispatch(latest, "post_mortem", "post_mortem"))) return false;
 
-    this.dispatchIssue(latest, null, "post_mortem", null, "post_mortem");
+    const issueHistorySnapshotId = transition?.historySnapshotId ?? await this.recordDispatchTransition({
+      issue: latest,
+      triggerType: "orchestrator.tick",
+      candidateSource: "post_mortem_candidates",
+      role: "post_mortem",
+      runPhase: "post_mortem",
+      reason: "post_mortem_dispatch",
+      attempt: null,
+    });
+    if (transition !== null) await this.recordDispatchActionForTransition(latest, transition, null);
+    this.dispatchIssue(latest, null, "post_mortem", null, "post_mortem", null, issueHistorySnapshotId);
     return true;
   }
 
-  private async tryDispatchPlanner(issue: Issue, allowExistingClaim = false, attempt: number | null = null): Promise<boolean> {
+  private async tryDispatchPlanner(
+    issue: Issue,
+    allowExistingClaim = false,
+    attempt: number | null = null,
+    transition: IssueHistorySnapshot | null = null,
+  ): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     if (!this.shouldDispatchPlanner(issue, allowExistingClaim)) return false;
@@ -2872,7 +4325,17 @@ export class Orchestrator {
     const lifecycle = await this.options.lifecycleStore?.get(latest.id);
     if (latestFreshIssueBreakdownPlan(lifecycle, latest, this.config) !== null) return false;
 
-    this.dispatchIssue(latest, attempt, "planner", null, "issue_breakdown");
+    const issueHistorySnapshotId = transition?.historySnapshotId ?? await this.recordDispatchTransition({
+      issue: latest,
+      triggerType: "orchestrator.tick",
+      candidateSource: "planner_candidates",
+      role: "planner",
+      runPhase: "issue_breakdown",
+      reason: "planner_dispatch",
+      attempt,
+    });
+    if (transition !== null) await this.recordDispatchActionForTransition(latest, transition, attempt);
+    this.dispatchIssue(latest, attempt, "planner", null, "issue_breakdown", null, issueHistorySnapshotId);
     return true;
   }
 
@@ -2920,6 +4383,7 @@ export class Orchestrator {
     reviewEvidence: ReviewerDispatchEvidence | null,
     runPhase: AgentRunPhase = defaultRunPhaseForRole(role),
     manualDispatch: RunningEntry["manualDispatch"] = null,
+    issueHistorySnapshotId: string | null = null,
   ): RunningEntry {
     const abortController = new AbortController();
     const retryAttempt = attempt ?? 0;
@@ -2932,6 +4396,7 @@ export class Orchestrator {
       sessionId: null,
       runId: null,
       activeRunId: null,
+      issueHistorySnapshotId,
       lifecycle: null,
       worker: Promise.resolve(),
       abortController,
@@ -3002,10 +4467,27 @@ export class Orchestrator {
     try {
       await run;
       await this.onWorkerExit(issueId, "normal", null);
+      await this.recordTransitionAction(
+        entry,
+        transitionAction({
+          actionType: "agent_run_exit",
+          status: "succeeded",
+          message: "Agent run exited normally",
+          details: {
+            runId: entry.activeRunId ?? entry.runId,
+            sessionId: entry.sessionId,
+            role: entry.role,
+            runPhase: entry.runPhase,
+            tokens: entry.tokens,
+          },
+        }),
+      );
     } catch (error) {
+      await this.recordTransitionError(entry, error);
       try {
         await this.onWorkerExit(issueId, "abnormal", errorMessage(error));
       } catch (exitError) {
+        await this.recordTransitionError(entry, exitError);
         this.options.logger.error("run exit handling failed", {
           issue_id: entry.issue.id,
           issue_identifier: entry.issue.identifier,
@@ -3030,6 +4512,9 @@ export class Orchestrator {
           : await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
+      await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_created", workspace, {
+        planningWorkspace: entry.runPhase === "issue_breakdown",
+      });
       await this.updateLifecycle(
         entry,
         entry.runPhase === "issue_breakdown"
@@ -3053,12 +4538,13 @@ export class Orchestrator {
       );
       if (entry.runPhase !== "issue_breakdown") {
         await this.options.workspaceManager.beforeRun(workspace.path);
+        await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_before_run_completed", workspace);
       }
       if (entry.runPhase === "merge_conflict_resolution" && entry.hermesResume === null) {
         entry.hermesResume = await this.resolveMergeConflictOriginalWorkerResume(entry);
       }
-      await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, 1));
-      await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, 1));
+      await this.prepareHarnessForRun(entry, workspace, attempt, 1);
+      await this.reloadHarnessForRun(entry, workspace, attempt, 1);
 
       if (entry.runPhase === "issue_breakdown") {
         entry.turnCount = 1;
@@ -3132,11 +4618,16 @@ export class Orchestrator {
       if (workspace) {
         if (entry.runPhase !== "issue_breakdown") {
           await this.options.workspaceManager.afterRun(workspace.path);
+          await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_after_run_completed", workspace);
         } else {
           await this.capturePlannerArtifacts(entry, workspace);
           await this.options.workspaceManager.removeForPlanning(entry.issue);
+          await this.recordWorkspaceEvidenceSnapshot(entry, "planning_workspace_removed", workspace);
         }
-        if (entry.cleanupWorkspaceOnExit) await this.options.workspaceManager.removeForIssue(entry.issue);
+        if (entry.cleanupWorkspaceOnExit) {
+          await this.options.workspaceManager.removeForIssue(entry.issue);
+          await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_removed", workspace, { cleanupWorkspaceOnExit: true });
+        }
       }
     }
   }
@@ -3186,6 +4677,7 @@ export class Orchestrator {
       workspace = await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
+      await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_created", workspace);
       await this.updateLifecycle(entry, {
         phase: "review",
         summaryPointers: {
@@ -3199,8 +4691,9 @@ export class Orchestrator {
         },
       });
       await this.options.workspaceManager.beforeRun(workspace.path);
-      await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, null, 1));
-      await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
+      await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_before_run_completed", workspace);
+      await this.prepareHarnessForRun(entry, workspace, null, 1);
+      await this.reloadHarnessForRun(entry, workspace, null, 1);
       this.requireMcpHandoff("review");
 
       entry.turnCount = 1;
@@ -3217,6 +4710,7 @@ export class Orchestrator {
     } finally {
       if (workspace) {
         await this.options.workspaceManager.afterRun(workspace.path);
+        await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_after_run_completed", workspace);
       }
     }
   }
@@ -3242,6 +4736,7 @@ export class Orchestrator {
       workspace = await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
+      await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_created", workspace);
       await this.updateLifecycle(entry, {
         summaryPointers: {
           workspaceKey: workspace.workspaceKey,
@@ -3253,8 +4748,9 @@ export class Orchestrator {
         },
       });
       await this.options.workspaceManager.beforeRun(workspace.path);
-      await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, null, 1));
-      await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
+      await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_before_run_completed", workspace);
+      await this.prepareHarnessForRun(entry, workspace, null, 1);
+      await this.reloadHarnessForRun(entry, workspace, null, 1);
       this.requireMcpHandoff("issue_triage");
 
       entry.turnCount = 1;
@@ -3271,6 +4767,7 @@ export class Orchestrator {
     } finally {
       if (workspace) {
         await this.options.workspaceManager.afterRun(workspace.path);
+        await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_after_run_completed", workspace);
       }
     }
   }
@@ -3297,6 +4794,7 @@ export class Orchestrator {
       workspace = await this.options.workspaceManager.createForIssue(entry.issue);
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
+      await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_created", workspace);
       await this.updateLifecycle(entry, {
         summaryPointers: {
           workspaceKey: workspace.workspaceKey,
@@ -3308,8 +4806,9 @@ export class Orchestrator {
         },
       });
       await this.options.workspaceManager.beforeRun(workspace.path);
-      await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, null, 1));
-      await this.options.harness.reload?.(this.buildRunContext(entry, workspace, null, 1));
+      await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_before_run_completed", workspace);
+      await this.prepareHarnessForRun(entry, workspace, null, 1);
+      await this.reloadHarnessForRun(entry, workspace, null, 1);
       this.requireMcpHandoff("post_mortem");
 
       entry.turnCount = 1;
@@ -3330,6 +4829,7 @@ export class Orchestrator {
     } finally {
       if (workspace) {
         await this.options.workspaceManager.afterRun(workspace.path);
+        await this.recordWorkspaceEvidenceSnapshot(entry, "workspace_after_run_completed", workspace);
       }
     }
   }
@@ -3354,6 +4854,19 @@ export class Orchestrator {
           },
         });
         await this.persistHarnessEvent(entry, rawEvent);
+        await this.recordIssueEvidenceSnapshot({
+          issue: entry.issue,
+          evidenceKind: "harness",
+          eventType: "run_status_observed",
+          sourceId: event.runId,
+          reason: "run_status_observed",
+          payload: {
+            runId: event.runId,
+            sdkStatus: event.sdkStatus,
+            observedAt: eventAt.toISOString(),
+            source: event.source,
+          },
+        });
         continue;
       }
       entry.lastEvent = event.type;
@@ -3402,6 +4915,46 @@ export class Orchestrator {
           ...(context.workspace.baseRef === undefined ? {} : { baseRef: context.workspace.baseRef }),
           ...(entry.manualDispatch === null ? {} : { metadata: manualDispatchRunMetadata(entry) }),
         });
+        await this.recordIssueEvidenceSnapshot({
+          issue: entry.issue,
+          evidenceKind: "run",
+          eventType: "run_started",
+          sourceId: entry.runId,
+          reason: "run_started",
+          payload: {
+            runId: entry.runId,
+            sessionId: entry.sessionId,
+            role: entry.role,
+            runPhase: entry.runPhase,
+            runKind: runKindForPhase(entry.runPhase),
+            attempt: context.attempt,
+            turnNumber: context.turnNumber,
+            harnessId: this.options.harness.id,
+            workspaceKey: context.workspace.workspaceKey,
+            workspacePath: context.workspace.path,
+            promptTemplateKeys: context.promptBundle?.metadata.templateKeys ?? null,
+          },
+        });
+        await this.recordTransitionAction(
+          entry,
+          transitionAction({
+            actionType: "start_agent_run",
+            status: "succeeded",
+            message: `Started ${entry.role} run ${entry.runId}`,
+            details: {
+              runId: entry.runId,
+              sessionId: entry.sessionId,
+              role: entry.role,
+              runPhase: entry.runPhase,
+              runKind: runKindForPhase(entry.runPhase),
+              turnNumber: context.turnNumber,
+              attempt: context.attempt,
+              harnessId: this.options.harness.id,
+              workspaceKey: context.workspace.workspaceKey,
+              workspacePath: context.workspace.path,
+            },
+          }),
+        );
         if (entry.runPhase !== "issue_breakdown") {
           await this.discoverPullRequestForEntry(entry, context.workspace);
         }
@@ -3418,6 +4971,7 @@ export class Orchestrator {
               this.config,
             ),
             "run start comment",
+            entry.issue,
           );
         }
       }
@@ -3433,6 +4987,18 @@ export class Orchestrator {
       if (event.type === "rate_limits") this.rateLimits = event.payload;
       if (event.type === "provider_limit") {
         const signal = await this.recordProviderLimitEvent(entry, event.signal, eventAt);
+        await this.recordIssueEvidenceSnapshot({
+          issue: entry.issue,
+          evidenceKind: "harness",
+          eventType: "provider_limit_observed",
+          sourceId: entry.activeRunId ?? entry.runId,
+          reason: "provider_limit_observed",
+          payload: {
+            runId: entry.activeRunId ?? entry.runId,
+            observedAt: eventAt.toISOString(),
+            signal,
+          },
+        });
         const runId = entry.activeRunId ?? entry.runId ?? "";
         if (runId.length > 0) {
           await this.updateRunTerminalStateIfRunning(runId, {
@@ -3441,7 +5007,7 @@ export class Orchestrator {
             error: signal.message,
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "failed"),
-          });
+          }, entry.issue);
         }
         await this.persistHarnessEvent(entry, { ...event, signal });
         throw new SymphonyError("agent_error", signal.message);
@@ -3465,7 +5031,7 @@ export class Orchestrator {
             error: TRIAGE_NO_REPORT_ERROR,
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "failed"),
-          });
+          }, entry.issue);
           await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           continue;
@@ -3485,7 +5051,7 @@ export class Orchestrator {
             error: POST_MORTEM_NO_REPORT_ERROR,
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "failed"),
-          });
+          }, entry.issue);
           await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           continue;
@@ -3506,7 +5072,7 @@ export class Orchestrator {
             error: PLANNING_NO_PLAN_ERROR,
             tokens: entry.activeRunTokens,
             metadata: terminalRunMetadata(entry, "failed"),
-          });
+          }, entry.issue);
           await this.persistHarnessEvent(entry, event);
           if (!terminal.updated) return;
           continue;
@@ -3516,7 +5082,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
-        });
+        }, entry.issue);
         await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         await this.discoverPullRequestForEntry(entry, context.workspace);
@@ -3564,7 +5130,7 @@ export class Orchestrator {
           error: event.error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "failed"),
-        });
+        }, entry.issue);
         await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         throw new SymphonyError("agent_error", event.error);
@@ -3593,7 +5159,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "cancelled"),
-        });
+        }, entry.issue);
         await this.persistHarnessEvent(entry, event);
         if (!terminal.updated) return;
         throw new SymphonyError("agent_error", "Run was cancelled");
@@ -3601,12 +5167,34 @@ export class Orchestrator {
     }
   }
 
-  private async updateRunTerminalStateIfRunning(runId: string, patch: TerminalRunPatch): Promise<TerminalUpdateResult> {
+  private async updateRunTerminalStateIfRunning(
+    runId: string,
+    patch: TerminalRunPatch,
+    issue: Issue | null = null,
+  ): Promise<TerminalUpdateResult> {
     const runStore = this.options.runStore;
     if (!runStore) return { updated: true, record: null };
     const existing = await runStore.getRun(runId);
     if (existing && existing.status !== "running") return { updated: false, record: existing };
-    return { updated: true, record: await runStore.updateRun(runId, patch) };
+    const record = await runStore.updateRun(runId, patch);
+    if (issue !== null) {
+      await this.recordIssueEvidenceSnapshot({
+        issue,
+        evidenceKind: "run",
+        eventType: "run_terminal_state_updated",
+        sourceId: runId,
+        reason: `run_${patch.status}`,
+        payload: {
+          runId,
+          status: patch.status,
+          completedAt: patch.completedAt ?? null,
+          error: patch.error ?? null,
+          tokens: patch.tokens ?? null,
+          metadata: patch.metadata ?? null,
+        },
+      });
+    }
+    return { updated: true, record };
   }
 
   private async recordProviderLimitEvent(
@@ -3720,7 +5308,7 @@ export class Orchestrator {
       completedAt,
       tokens: entry.activeRunTokens,
       metadata,
-    });
+    }, entry.issue);
     if (terminal.updated) {
       await this.options.runStore?.appendEvent({
         runId,
@@ -3789,7 +5377,7 @@ export class Orchestrator {
           error: entry.suppressRetryOnExit ? error : error ?? TRIAGE_NO_REPORT_ERROR,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
-        });
+        }, entry.issue);
       }
       this.claimed.delete(issueId);
       return;
@@ -3806,7 +5394,7 @@ export class Orchestrator {
           error: entry.suppressRetryOnExit ? error : error ?? POST_MORTEM_NO_REPORT_ERROR,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
-        });
+        }, entry.issue);
       }
       this.claimed.delete(issueId);
       return;
@@ -3816,7 +5404,7 @@ export class Orchestrator {
       const accepted = entry.issueBreakdownPlanAccepted || (await this.reconcileIssueBreakdownPlanHandoff(entry));
       if (accepted) {
         await this.terminalizeAcceptedIssueBreakdownPlan(entry);
-        await this.options.lifecycleStore?.updateIssue(entry.issue, {
+        await this.updateLifecycle(entry, {
           planningFailureCount: 0,
           planningDispatchRetryCount: 0,
           lastPlanningFailureRunId: null,
@@ -3875,7 +5463,7 @@ export class Orchestrator {
           completedAt: new Date().toISOString(),
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "succeeded"),
-        });
+        }, entry.issue);
         if (!terminal.updated && entry.runPhase !== "merge_conflict_resolution") {
           this.claimed.delete(issueId);
           return;
@@ -3895,7 +5483,7 @@ export class Orchestrator {
       }
       if (entry.runPhase === "merge_conflict_resolution") {
         if (await this.shouldScheduleContinuation(entry)) {
-          this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
+          await this.scheduleRetryTransition(entry.issue, 1, 1_000, null, entry.runPhase);
         } else {
           this.claimed.delete(issueId);
         }
@@ -3915,13 +5503,14 @@ export class Orchestrator {
               this.config,
             ),
             "turn completed",
+            entry.issue,
           );
         }
         this.claimed.delete(issueId);
         return;
       }
       if (await this.shouldScheduleContinuation(entry)) {
-        this.scheduleRetry(issueId, entry.issue.identifier, 1, 1_000, null, entry.runPhase);
+        await this.scheduleRetryTransition(entry.issue, 1, 1_000, null, entry.runPhase);
       } else {
         this.claimed.delete(issueId);
       }
@@ -3933,7 +5522,7 @@ export class Orchestrator {
           error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, entry.suppressRetryOnExit ? "cancelled" : "failed"),
-        });
+        }, entry.issue);
         if (!terminal.updated) {
           this.claimed.delete(issueId);
           return;
@@ -3948,7 +5537,7 @@ export class Orchestrator {
           error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "cancelled"),
-        });
+        }, entry.issue);
         if (!terminal.updated) {
           this.claimed.delete(issueId);
           if (terminal.record?.status === "failed" && terminal.record.error === OPERATOR_REJECTED_PUBLICATION_ERROR) return;
@@ -3968,6 +5557,7 @@ export class Orchestrator {
             error,
           ),
           "run cancelled",
+          entry.issue,
         );
       }
       this.claimed.delete(issueId);
@@ -3986,7 +5576,7 @@ export class Orchestrator {
           error,
           tokens: entry.activeRunTokens,
           metadata: terminalRunMetadata(entry, "failed"),
-        });
+        }, entry.issue);
         if (error === OPERATOR_REJECTED_PUBLICATION_ERROR) {
           this.claimed.delete(issueId);
           return;
@@ -4010,6 +5600,7 @@ export class Orchestrator {
             error,
           ),
           "run failed",
+          entry.issue,
         );
       }
       const sdkErrorFailures = await this.consecutiveSdkErrorFailures(entry.issue);
@@ -4032,7 +5623,7 @@ export class Orchestrator {
       }
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
-      this.scheduleRetry(issueId, entry.issue.identifier, nextAttempt, delayMs, error, entry.runPhase);
+      await this.scheduleRetryTransition(entry.issue, nextAttempt, delayMs, error, entry.runPhase);
     }
   }
 
@@ -4054,16 +5645,20 @@ export class Orchestrator {
       error: failureMessage,
       tokens: entry.activeRunTokens,
       metadata: terminalRunMetadata(entry, "failed"),
-    });
+    }, entry.issue);
     const current = (await store.get(issueId)) ?? entry.lifecycle;
     const nextCount = (current?.planningFailureCount ?? 0) + 1;
-    const lifecycle = await store.updateIssue(entry.issue, {
+    await this.updateLifecycle(entry, {
       planningFailureCount: nextCount,
       planningDispatchRetryCount: 0,
       lastPlanningFailureRunId: runId,
       lastPlanningFailureAt: now,
     });
-    entry.lifecycle = lifecycle;
+    const lifecycle = entry.lifecycle ?? current;
+    if (!lifecycle) {
+      this.claimed.delete(issueId);
+      return;
+    }
     await this.options.runStore?.appendEvent({
       runId,
       at: now,
@@ -4088,7 +5683,7 @@ export class Orchestrator {
     }
 
     const delayMs = planningRetryDelayMs(nextCount, this.config);
-    this.scheduleRetry(issueId, entry.issue.identifier, nextCount, delayMs, error, "issue_breakdown");
+    await this.scheduleRetryTransition(entry.issue, nextCount, delayMs, error, "issue_breakdown");
   }
 
   private async consecutiveSdkErrorFailures(issue: Issue): Promise<number> {
@@ -4122,10 +5717,11 @@ export class Orchestrator {
   private async applyWritebacks(
     operations: Array<Parameters<WritebackProcessor["enqueueAndProcess"]>[0]>,
     reason: string,
+    issue: Issue | null = null,
   ): Promise<boolean> {
     let ok = true;
     for (const operation of operations) {
-      ok = (await this.applyWriteback(operation, reason)) && ok;
+      ok = (await this.applyWriteback(operation, reason, issue)) && ok;
     }
     return ok;
   }
@@ -4133,6 +5729,7 @@ export class Orchestrator {
   private async applyWriteback(
     operation: Parameters<WritebackProcessor["enqueueAndProcess"]>[0] | null,
     reason: string,
+    issue: Issue | null = null,
   ): Promise<boolean> {
     if (!operation) return true;
     if (!this.options.writeback) {
@@ -4144,6 +5741,25 @@ export class Orchestrator {
       return !this.config.writeback.enabled;
     }
     const result = await this.options.writeback.enqueueAndProcess(operation);
+    if (issue !== null) {
+      await this.recordIssueEvidenceSnapshot({
+        issue,
+        evidenceKind: "writeback",
+        eventType: "writeback_processed",
+        sourceId: operation.idempotencyKey,
+        reason,
+        payload: {
+          idempotencyKey: operation.idempotencyKey,
+          kind: operation.kind,
+          issueId: operation.issueId,
+          runId: operation.runId ?? null,
+          status: result.status,
+          resultStatus: result.resultStatus ?? null,
+          resultMessage: result.resultMessage ?? null,
+          lastError: result.lastError ?? null,
+        },
+      });
+    }
     return result.status === "succeeded";
   }
 
@@ -4185,6 +5801,67 @@ export class Orchestrator {
     this.retryAttempts.set(issueId, { issueId, identifier, attempt, dueAtMs, timer, error, runPhase });
   }
 
+  private async scheduleRetryTransition(
+    issue: Issue,
+    attempt: number,
+    delayMs: number,
+    error: string | null,
+    runPhase: AgentRunPhase = "implementation",
+  ): Promise<void> {
+    const result = await this.processIssueTransitionEvent({
+      issue,
+      triggerType: "orchestrator.tick",
+      candidateSource: "retry_schedule",
+      snapshotPatch: {
+        retryAttempt: attempt,
+        retryDelayMs: delayMs,
+        retryError: error,
+      },
+      transitionPatch: {
+        retryAttempt: attempt,
+        retryDelayMs: delayMs,
+        retryError: error,
+        runPhase,
+        runKind: runKindForPhase(runPhase),
+      },
+      attempt,
+      allowExistingClaim: true,
+    });
+    if (result.transition?.transitionKind === "retry_run" && result.acted) {
+      return;
+    }
+    this.scheduleRetry(issue.id, issue.identifier, attempt, delayMs, error, runPhase);
+  }
+
+  private async executeRetryRunTransition(issue: Issue, transition: IssueHistorySnapshot): Promise<boolean> {
+    const attempt = typeof transition.retryAttempt === "number" && Number.isFinite(transition.retryAttempt)
+      ? transition.retryAttempt
+      : 1;
+    const delayMs = typeof transition.retryDelayMs === "number" && Number.isFinite(transition.retryDelayMs)
+      ? transition.retryDelayMs
+      : 1_000;
+    const runPhase = agentRunPhaseFromUnknown(transition.runPhase) ?? "implementation";
+    const error = typeof transition.retryError === "string" ? transition.retryError : null;
+    this.scheduleRetry(issue.id, issue.identifier, attempt, delayMs, error, runPhase);
+    await this.recordIssueSnapshotAction(
+      issue,
+      transition.historySnapshotId,
+      transitionAction({
+        actionType: "schedule_retry",
+        status: "succeeded",
+        message: `Scheduled ${runPhase} retry`,
+        details: {
+          attempt,
+          delayMs,
+          error,
+          runPhase,
+          dueAtMs: Date.now() + delayMs,
+        },
+      }),
+    );
+    return true;
+  }
+
   private async onRetryTimer(issueId: string): Promise<void> {
     const retry = this.retryAttempts.get(issueId);
     if (!retry) return;
@@ -4215,7 +5892,7 @@ export class Orchestrator {
       if (retry.runPhase === "issue_breakdown") {
         const remainingMs = await this.planningBackoffRemainingForIssue(issue);
         if (remainingMs > 0) {
-          this.scheduleRetry(issueId, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+          await this.scheduleRetryTransition(issue, retry.attempt, remainingMs, retry.error, retry.runPhase);
           return;
         }
       }
@@ -4223,14 +5900,21 @@ export class Orchestrator {
         if (retry.runPhase === "issue_breakdown") {
           await this.recordPlanningDispatchRetry(issue, retry, "no available orchestrator slots");
         } else {
-          this.scheduleRetry(issueId, retry.identifier, retry.attempt + 1, 1_000, "no available orchestrator slots", retry.runPhase);
+          await this.scheduleRetryTransition(issue, retry.attempt + 1, 1_000, "no available orchestrator slots", retry.runPhase);
         }
         return;
       }
-      const dispatched =
-        retry.runPhase === "issue_breakdown"
-          ? await this.tryDispatchPlanner(issue, true, retry.attempt)
-          : await this.tryDispatchWorkerIssue(issue, retry.attempt, true);
+      const dispatched = await this.processIssueTransitionCandidate({
+        issue,
+        candidateSource:
+          retry.runPhase === "issue_breakdown"
+            ? "planner_candidates"
+            : retry.runPhase === "merge_conflict_resolution"
+              ? "merge_conflict_candidates"
+              : "worker_candidates",
+        attempt: retry.attempt,
+        allowExistingClaim: true,
+      });
       if (!dispatched) {
         if (retry.runPhase === "issue_breakdown") {
           await this.recordPlanningDispatchRetry(issue, retry, retry.error ?? "planning dispatch retry failed");
@@ -4263,12 +5947,22 @@ export class Orchestrator {
     if (current) {
       const remainingMs = planningBackoffRemainingMs(current, this.config);
       if (remainingMs > 0) {
-        this.scheduleRetry(issue.id, retry.identifier, retry.attempt, remainingMs, retry.error, retry.runPhase);
+        await this.scheduleRetryTransition(issue, retry.attempt, remainingMs, retry.error, retry.runPhase);
         return;
       }
     }
     const nextCount = (current?.planningDispatchRetryCount ?? 0) + 1;
-    const lifecycle = await store.updateIssue(issue, { planningDispatchRetryCount: nextCount });
+    const lifecycle =
+      (await this.updateIssueLifecycleWithEvidence(
+        issue,
+        { planningDispatchRetryCount: nextCount },
+        "planning_dispatch_retry",
+        retry.identifier,
+      )) ?? current;
+    if (!lifecycle) {
+      this.claimed.delete(issue.id);
+      return;
+    }
     const maxRetries = this.config.issueBreakdown.maxPlanningDispatchRetries;
     if (nextCount >= maxRetries) {
       await this.escalateLifecycleBlocked(
@@ -4282,7 +5976,7 @@ export class Orchestrator {
       return;
     }
     const delayMs = planningRetryDelayMs(Math.max(lifecycle.planningFailureCount, 1), this.config);
-    this.scheduleRetry(issue.id, retry.identifier, retry.attempt + 1, delayMs, error, retry.runPhase);
+    await this.scheduleRetryTransition(issue, retry.attempt + 1, delayMs, error, retry.runPhase);
   }
 
   private clearRetry(issueId: string): void {
@@ -4344,6 +6038,45 @@ export class Orchestrator {
     const repairAttempt = await this.nextHandoffRepairAttempt(entry, sourceRunId, kind);
     if (repairAttempt === null) return { attempted: false, accepted: false };
 
+    const repairTransition = await this.decideIssueTransition({
+      issue: entry.issue,
+      triggerType: "orchestrator.tick",
+      candidateSource: "handoff_repair",
+      transitionPatch: {
+        role: entry.role,
+        runPhase: entry.runPhase,
+        runKind: runKindForPhase(entry.runPhase),
+        handoffRepairKind: kind,
+        handoffRepairSourceRunId: sourceRunId,
+        handoffRepairAttempt: repairAttempt,
+        hermesResumeSourceRunId: resume.sourceRunId,
+        hermesResumeReason: resume.reason,
+        hermesProfileKey: resume.profileKey,
+        hermesSessionKey: resume.sessionKey,
+      },
+    });
+    const repairHistorySnapshotId = repairTransition?.transitionKind === "handoff_repair" ? repairTransition.historySnapshotId : null;
+    if (repairHistorySnapshotId !== null) {
+      await this.issueStateStore.appendSnapshotAction(
+        entry.issue,
+        repairHistorySnapshotId,
+        transitionAction({
+          actionType: "dispatch_handoff_repair",
+          status: "succeeded",
+          message: `Dispatching MCP handoff repair for ${formatRepairableHandoffKind(kind)}`,
+          details: {
+            sourceRunId,
+            kind,
+            repairAttempt,
+            maxAttempts: this.config.handoffRepair.maxAttempts,
+          },
+        }),
+      );
+    }
+    if (repairHistorySnapshotId !== null) {
+      entry.issueHistorySnapshotId = repairHistorySnapshotId;
+    }
+
     entry.handoffRepair = { sourceRunId, kind, attempt: repairAttempt };
     entry.hermesResume = resume;
     entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
@@ -4368,8 +6101,8 @@ export class Orchestrator {
       kind,
       repair_attempt: repairAttempt,
     });
-    await this.options.harness.prepare?.(this.buildRunContext(entry, workspace, attempt, turnNumber, promptBundle));
-    await this.options.harness.reload?.(this.buildRunContext(entry, workspace, attempt, turnNumber, promptBundle));
+    await this.prepareHarnessForRun(entry, workspace, attempt, turnNumber, promptBundle);
+    await this.reloadHarnessForRun(entry, workspace, attempt, turnNumber, promptBundle);
     await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, attempt, turnNumber, promptBundle), promptBundle.userPrompt), {
       workspace,
       prompt: promptBundle.userPrompt,
@@ -4421,6 +6154,7 @@ export class Orchestrator {
         ? null
         : "merge_conflict_resolution";
     }
+    if (await this.reconcileCompletionReportRejection(entry)) return null;
     return (await this.reconcileCompletionReportHandoff(entry)) || entry.completionReportAccepted || entry.pullRequestHandoffAccepted
       ? null
       : "completion_report";
@@ -4684,7 +6418,7 @@ export class Orchestrator {
       blockedAt: fixTurnCount >= conflict.maxFixTurns ? new Date().toISOString() : conflict.blockedAt,
       blockedReason: fixTurnCount >= conflict.maxFixTurns ? mergeConflictBlockedReason(fixTurnCount, conflict.maxFixTurns) : null,
     };
-    entry.lifecycle = await store.updateIssue(entry.issue, {
+    await this.updateLifecycle(entry, {
       phase: nextConflict.status === "blocked" ? "blocked" : "merge_conflict_resolution",
       blockedReason: nextConflict.blockedReason,
       mergeConflict: nextConflict,
@@ -4707,11 +6441,16 @@ export class Orchestrator {
       blockedAt: conflict.blockedAt ?? new Date().toISOString(),
       blockedReason: conflict.blockedReason ?? mergeConflictBlockedReason(conflict.fixTurnCount, conflict.maxFixTurns),
     };
-    await this.options.lifecycleStore?.updateIssue(issue, {
-      phase: "blocked",
-      blockedReason: blockedConflict.blockedReason,
-      mergeConflict: blockedConflict,
-    });
+    await this.updateIssueLifecycleWithEvidence(
+      issue,
+      {
+        phase: "blocked",
+        blockedReason: blockedConflict.blockedReason,
+        mergeConflict: blockedConflict,
+      },
+      "merge_conflict_attempt_limit",
+      runId,
+    );
     await this.applyMergeConflictBlockedWritebacks(issue, runId, blockedConflict, "conflict-fix attempt limit reached");
   }
 
@@ -4739,6 +6478,7 @@ export class Orchestrator {
         this.config,
       ),
       "merge conflict blocked escalation",
+      issue,
     );
   }
 
@@ -4787,13 +6527,53 @@ export class Orchestrator {
     runId: string,
     reason: string,
   ): Promise<IssueLifecycleRecord> {
+    const result = await this.processIssueTransitionEvent({
+      issue,
+      triggerType: "orchestrator.tick",
+      candidateSource: "block_issue",
+      snapshotPatch: {
+        triggerRunId: runId,
+        triggerReason: reason,
+      },
+      transitionPatch: {
+        runId,
+        blockedReason: reason,
+      },
+      allowExistingClaim: true,
+    });
+    if (result.transition?.transitionKind === "block_issue" && result.acted) {
+      return (await this.options.lifecycleStore?.get(issue.id)) ?? lifecycle;
+    }
+    return this.applyLifecycleBlocked(issue, lifecycle, runId, reason, null);
+  }
+
+  private async executeBlockIssueTransition(issue: Issue, transition: IssueHistorySnapshot): Promise<boolean> {
+    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+    if (!lifecycle) return false;
+    const reason = nonEmptyString(transition.blockedReason) ?? transition.reason ?? "blocked";
+    const runId = nonEmptyString(transition.runId) ?? lifecycle.summaryPointers.lastRunId ?? issue.id;
+    await this.applyLifecycleBlocked(issue, lifecycle, runId, reason, transition.historySnapshotId);
+    return true;
+  }
+
+  private async applyLifecycleBlocked(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    runId: string,
+    reason: string,
+    historySnapshotId: string | null,
+  ): Promise<IssueLifecycleRecord> {
     const store = this.options.lifecycleStore;
-    const blockedLifecycle = store
-      ? await store.updateIssue(issue, {
+    const blockedLifecycle =
+      (await this.updateIssueLifecycleWithEvidence(
+        issue,
+        {
           phase: "blocked",
           blockedReason: reason,
-        })
-      : lifecycle;
+        },
+        "block_issue",
+        runId,
+      )) ?? lifecycle;
     await this.applyWritebacks(
       planBlockedEscalationWritebacks(
         {
@@ -4812,7 +6592,25 @@ export class Orchestrator {
         this.config,
       ),
       "blocked escalation",
+      issue,
     );
+    if (historySnapshotId !== null) {
+      await this.recordIssueSnapshotAction(
+        issue,
+        historySnapshotId,
+        transitionAction({
+          actionType: "block_issue",
+          status: "succeeded",
+          message: reason,
+          details: {
+            runId,
+            incompleteTurnCount: blockedLifecycle.incompleteTurnCount,
+            reviewRound: blockedLifecycle.reviewRound,
+            blockedReason: blockedLifecycle.blockedReason,
+          },
+        }),
+      );
+    }
     return blockedLifecycle;
   }
 
@@ -4830,11 +6628,37 @@ export class Orchestrator {
       }
       entry.lifecycle = lifecycle;
       entry.completionReportAccepted = true;
+      await this.recordTransitionAction(
+        entry,
+        transitionAction({
+          actionType: "receive_completion_report",
+          status: "succeeded",
+          message: "Completion report accepted pending publication",
+          details: {
+            reportId: report.id,
+            runId,
+            finalized: false,
+          },
+        }),
+      );
       return true;
     }
 
     entry.lifecycle = lifecycle;
     entry.completionReportAccepted = true;
+    await this.recordTransitionAction(
+      entry,
+      transitionAction({
+        actionType: "receive_completion_report",
+        status: "succeeded",
+        message: "Completion report accepted",
+        details: {
+          reportId: report.id,
+          runId,
+          finalized: isFinalizedCompletionReport(report),
+        },
+      }),
+    );
 
     if (this.options.writeback) {
       await this.options.writeback.processDue();
@@ -4860,6 +6684,20 @@ export class Orchestrator {
     if (!lifecycle || !rejection) return false;
 
     entry.lifecycle = lifecycle;
+    await this.recordTransitionAction(
+      entry,
+      transitionAction({
+        actionType: "reject_completion_report",
+        status: "succeeded",
+        message: rejection.reason,
+        details: {
+          rejectionId: rejection.id,
+          reportId: rejection.reportId,
+          runId,
+          unsatisfiedChecklistItems: rejection.acceptanceChecklist.filter((item) => !item.satisfied).map((item) => item.text),
+        },
+      }),
+    );
 
     if (this.options.writeback) {
       await this.options.writeback.processDue();
@@ -5009,12 +6847,37 @@ export class Orchestrator {
     for (const issue of sortIssuesForDispatch(candidates)) {
       if (this.running.has(issue.id) || this.pausedIssues.has(issue.id)) continue;
       if (!this.passesLabelGuardrails(issue, "merge_policy")) continue;
-      await this.tryReconcileMergePolicy(issue);
+      await this.processIssueTransitionCandidate({ issue, candidateSource: "merge_policy_candidates" });
     }
   }
 
-  private async tryReconcileMergePolicy(issue: Issue): Promise<void> {
+  private async tryReconcileMergePolicy(issue: Issue, historySnapshotId: string | null = null): Promise<void> {
     if (this.config.mergePolicy.mode !== "gated" || !this.options.lifecycleStore) return;
+    const transition =
+      historySnapshotId === null
+        ? await this.decideIssueTransition({
+            issue,
+            triggerType: "orchestrator.tick",
+            candidateSource: "merge_policy_candidates",
+          })
+        : null;
+    const issueHistorySnapshotId =
+      historySnapshotId ?? (transition?.transitionKind === "merge_policy" ? transition.historySnapshotId : null);
+    if (issueHistorySnapshotId !== null) {
+      await this.issueStateStore.appendSnapshotAction(
+        issue,
+        issueHistorySnapshotId,
+        transitionAction({
+          actionType: "start_merge_policy_reconciliation",
+          status: "succeeded",
+          message: "Started merge policy reconciliation",
+          details: {
+            mode: this.config.mergePolicy.mode,
+            state: issue.state,
+          },
+        }),
+      );
+    }
     try {
       const lifecycle = await this.options.lifecycleStore.get(issue.id);
       if (
@@ -5038,6 +6901,18 @@ export class Orchestrator {
         logger: this.options.logger,
       });
       const result = await service.reconcileIssue(issue);
+      if (issueHistorySnapshotId !== null) {
+        await this.issueStateStore.appendSnapshotAction(
+          issue,
+          issueHistorySnapshotId,
+          transitionAction({
+            actionType: "finish_merge_policy_reconciliation",
+            status: result.status === "skipped" ? "skipped" : "succeeded",
+            message: `Merge policy reconciliation ${result.status}`,
+            details: result,
+          }),
+        );
+      }
       if (result.status === "merged" || result.status === "already_merged") {
         this.options.logger.info("merge policy reconciled issue", {
           issue_id: issue.id,
@@ -5067,6 +6942,9 @@ export class Orchestrator {
         });
       }
     } catch (error) {
+      if (issueHistorySnapshotId !== null) {
+        await this.issueStateStore.appendSnapshotError(issue, issueHistorySnapshotId, transitionErrorFromUnknown(error));
+      }
       this.options.logger.warn("merge policy reconciliation failed", {
         issue_id: issue.id,
         issue_identifier: issue.identifier,
@@ -5079,7 +6957,98 @@ export class Orchestrator {
     const store = this.options.lifecycleStore;
     if (!store) return;
     entry.lifecycle = await store.updateIssue(entry.issue, patch);
+    await this.recordLifecycleEvidenceSnapshot({
+      issue: entry.issue,
+      lifecycle: entry.lifecycle,
+      patch,
+      sourceId: entry.activeRunId ?? entry.runId,
+      reason: "lifecycle_updated",
+    });
     await appendLaneMemoTelemetry(this.options.runStore, entry.activeRunId, entry.lifecycle, "orchestrator_update");
+  }
+
+  private async recordWorkspaceEvidenceSnapshot(
+    entry: RunningEntry,
+    eventType: string,
+    workspace: Workspace,
+    details: Record<string, unknown> = {},
+  ): Promise<void> {
+    await this.recordIssueEvidenceSnapshot({
+      issue: entry.issue,
+      evidenceKind: "workspace",
+      eventType,
+      sourceId: entry.activeRunId ?? entry.runId ?? workspace.workspaceKey,
+      reason: eventType,
+      payload: {
+        workspaceKey: workspace.workspaceKey,
+        workspacePath: workspace.path,
+        gitBranchName: workspace.gitBranchName ?? null,
+        repoPath: workspace.repoPath ?? null,
+        baseRef: workspace.baseRef ?? null,
+        role: entry.role,
+        runPhase: entry.runPhase,
+        runKind: runKindForPhase(entry.runPhase),
+        ...details,
+      },
+    });
+  }
+
+  private async prepareHarnessForRun(
+    entry: RunningEntry,
+    workspace: Workspace,
+    attempt: number | null,
+    turnNumber: number,
+    promptBundle?: AgentPromptBundle,
+  ): Promise<void> {
+    if (typeof this.options.harness.prepare !== "function") return;
+    await this.options.harness.prepare(this.buildRunContext(entry, workspace, attempt, turnNumber, promptBundle));
+    await this.recordIssueEvidenceSnapshot({
+      issue: entry.issue,
+      evidenceKind: "harness",
+      eventType: "harness_prepare_completed",
+      sourceId: entry.activeRunId ?? entry.runId ?? entry.issueHistorySnapshotId,
+      reason: "harness_prepare_completed",
+      payload: {
+        harnessId: this.options.harness.id,
+        role: entry.role,
+        runPhase: entry.runPhase,
+        runKind: runKindForPhase(entry.runPhase),
+        attempt,
+        turnNumber,
+        workspaceKey: workspace.workspaceKey,
+        workspacePath: workspace.path,
+        promptTemplateKeys: promptBundle?.metadata.templateKeys ?? null,
+      },
+    });
+  }
+
+  private async reloadHarnessForRun(
+    entry: RunningEntry,
+    workspace: Workspace,
+    attempt: number | null,
+    turnNumber: number,
+    promptBundle?: AgentPromptBundle,
+  ): Promise<void> {
+    if (typeof this.options.harness.reload !== "function") return;
+    await this.options.harness.reload(this.buildRunContext(entry, workspace, attempt, turnNumber, promptBundle));
+    await this.recordIssueEvidenceSnapshot({
+      issue: entry.issue,
+      evidenceKind: "harness",
+      eventType: "harness_reload_completed",
+      sourceId: entry.activeRunId ?? entry.runId ?? entry.issueHistorySnapshotId,
+      reason: "harness_reload_completed",
+      payload: {
+        harnessId: this.options.harness.id,
+        role: entry.role,
+        runPhase: entry.runPhase,
+        runKind: runKindForPhase(entry.runPhase),
+        attempt,
+        turnNumber,
+        workspaceKey: workspace.workspaceKey,
+        workspacePath: workspace.path,
+        promptTemplateKeys: promptBundle?.metadata.templateKeys ?? null,
+      },
+    });
   }
 
   private shouldDiscoverPullRequestBeforeFirstWorkerPrompt(lifecycle: IssueLifecycleRecord | null | undefined): boolean {
@@ -5226,7 +7195,7 @@ export class Orchestrator {
       lifecycle: entry.lifecycle,
       ...this.ephemeralSystemPromptInput(entry, options),
     });
-    return {
+    const bundle = {
       userPrompt,
       ephemeralSystemPrompt: system.prompt,
       metadata: {
@@ -5236,6 +7205,16 @@ export class Orchestrator {
         ephemeralSystemPromptCharCount: system.prompt.length,
       },
     };
+    await this.recordTransitionAction(
+      entry,
+      transitionAction({
+        actionType: "render_prompt",
+        status: "succeeded",
+        message: `Rendered prompt bundle ${userTemplateKey}`,
+        details: bundle.metadata,
+      }),
+    );
+    return bundle;
   }
 
   private async renderEphemeralSystemPrompt(
@@ -6158,6 +8137,154 @@ export function sortIssuesForDispatch(issues: Issue[]): Issue[] {
     if (createdA !== createdB) return createdA - createdB;
     return a.identifier.localeCompare(b.identifier);
   });
+}
+
+function issueTransitionRulesetPriority(kind: IssueTransitionKind): number {
+  switch (kind) {
+    case "terminate_running":
+      return 10;
+    case "recover_publication_approval":
+      return 20;
+    case "handoff_repair":
+      return 30;
+    case "dispatch_worker":
+    case "dispatch_planner":
+    case "dispatch_reviewer":
+    case "dispatch_triage":
+    case "dispatch_post_mortem":
+      return 100;
+    case "merge_policy":
+      return 200;
+    case "reconcile_report_writeback":
+      return 250;
+    case "block_issue":
+      return 300;
+    case "retry_run":
+      return 400;
+    case "record_evidence":
+      return 900;
+    case "noop":
+      return 1_000;
+  }
+}
+
+function dispatchTransitionKindForRole(role: AgentRunRole): IssueTransitionKind {
+  switch (role) {
+    case "planner":
+      return "dispatch_planner";
+    case "reviewer":
+      return "dispatch_reviewer";
+    case "triage":
+      return "dispatch_triage";
+    case "post_mortem":
+      return "dispatch_post_mortem";
+    case "worker":
+      return "dispatch_worker";
+  }
+}
+
+function promptScenarioForDispatch(role: AgentRunRole, runPhase: AgentRunPhase, manualDispatch: boolean): string {
+  const prefix = manualDispatch ? "manual" : "orchestrator";
+  if (role === "worker" && runPhase === "merge_conflict_resolution") return `${prefix}.worker.merge_conflict_resolution`;
+  if (role === "worker") return `${prefix}.worker.implementation`;
+  if (role === "planner") return `${prefix}.planner.issue_breakdown`;
+  if (role === "reviewer") return `${prefix}.reviewer.review`;
+  if (role === "triage") return `${prefix}.triage.issue_triage`;
+  return `${prefix}.post_mortem`;
+}
+
+function dispatchTransitionRequest(input: {
+  role: AgentRunRole;
+  runPhase: AgentRunPhase;
+  reason: string;
+  promptScenario: string;
+  manualDispatch?: boolean;
+}): IssueTransitionRequest {
+  const runKind = runKindForPhase(input.runPhase);
+  return {
+    transitionKind: dispatchTransitionKindForRole(input.role),
+    reason: input.reason,
+    role: input.role,
+    runPhase: input.runPhase,
+    runKind,
+    promptScenario: input.promptScenario,
+    manualDispatch: input.manualDispatch === true,
+  };
+}
+
+function plannerDispatchReasonForCandidateSource(candidateSource: string): string {
+  switch (candidateSource) {
+    case "worker_candidates":
+      return "issue_breakdown_required";
+    case "triage_candidates":
+      return "blocked_issue_breakdown_required";
+    case "planner_candidates":
+      return "planner_dispatch";
+    default:
+      return "issue_breakdown_required";
+  }
+}
+
+function isManualAgentRunStage(value: string | null): value is ManualAgentRunStage {
+  return (
+    value === "worker" ||
+    value === "reviewer" ||
+    value === "triage" ||
+    value === "planner" ||
+    value === "post_mortem" ||
+    value === "merge_conflict"
+  );
+}
+
+function isDispatchTransitionForTarget(
+  transition: IssueHistorySnapshot,
+  target: { role: AgentRunRole; runPhase: AgentRunPhase },
+): boolean {
+  return transition.role === target.role && transition.runPhase === target.runPhase;
+}
+
+function snapshotAsIssue(snapshot: IssueCurrentStateSnapshot): Issue {
+  return {
+    id: snapshot.issueId,
+    identifier: snapshot.issueIdentifier,
+    title: snapshot.title,
+    description: snapshot.description,
+    priority: snapshot.priority,
+    state: snapshot.trackerState,
+    branchName: snapshot.branchName,
+    url: snapshot.trackerUrl,
+    assigneeId: snapshot.assigneeId,
+    delegateId: snapshot.delegateId,
+    assignedToWorker: snapshot.assignedToWorker,
+    labels: [...snapshot.labels],
+    blockedBy: snapshot.blockedBy.map((blocker) => ({ ...blocker })),
+    hasChildren: snapshot.hasChildren,
+    createdAt: snapshot.trackerCreatedAt,
+    updatedAt: snapshot.trackerUpdatedAt,
+  };
+}
+
+function agentRunRoleFromUnknown(value: unknown): AgentRunRole | null {
+  return value === "worker" || value === "reviewer" || value === "triage" || value === "planner" || value === "post_mortem"
+    ? value
+    : null;
+}
+
+function agentRunPhaseFromUnknown(value: unknown): AgentRunPhase | null {
+  return value === "issue_breakdown" ||
+    value === "implementation" ||
+    value === "merge_conflict_resolution" ||
+    value === "review" ||
+    value === "issue_triage" ||
+    value === "post_mortem"
+    ? value
+    : null;
+}
+
+function agentRunKindFromUnknown(value: unknown): AgentRunKind | null {
+  return value === "planning" || value === "implementation" || value === "review" || value === "triage" || value === "post_mortem"
+    ? value
+    : null;
 }
 
 function isStateIn(state: string, states: string[]): boolean {
@@ -7352,6 +9479,10 @@ function safeArtifactSegment(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "unknown";
 }
 
+function safeEvidenceSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "event";
+}
+
 function workerImplementationTemplateKey(
   entry: Pick<RunningEntry, "lifecycle">,
   mergeGateResult: WorkerMergeGatePromptResult | null,
@@ -7432,6 +9563,19 @@ function failureKindForDiagnostic(code: string): string {
   return "harness_diagnostic";
 }
 
+function countConsecutiveWorkerRuns(runs: RunRecord[], predicate: (run: RunRecord) => boolean): number {
+  const seen = new Set<string>();
+  const workerRuns = runs
+    .filter((run) => run.role === "worker" && !seen.has(run.runId) && seen.add(run.runId))
+    .sort(compareRunChronology);
+  let count = 0;
+  for (const run of workerRuns.slice().reverse()) {
+    if (!predicate(run)) break;
+    count += 1;
+  }
+  return count;
+}
+
 function isCountedSdkWaitErrorFailure(run: RunRecord): boolean {
   return (
     run.role === "worker" &&
@@ -7496,7 +9640,7 @@ function issueFromApprovalRequest(request: OperatorApprovalRecord): Issue {
   };
 }
 
-function hasRecoverablePendingPublicationApproval(lifecycle: IssueLifecycleRecord): boolean {
+function hasRecoverablePendingPublicationApproval(lifecycle: IssueLifecycleRecord | null): lifecycle is IssueLifecycleRecord {
   return pendingPublicationHandoffForRun(lifecycle) !== null;
 }
 
