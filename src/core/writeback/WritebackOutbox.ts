@@ -500,7 +500,8 @@ export class WritebackProcessor {
     if (canRetrySkipped(record, operation, options)) {
       record = await this.store.requeueSkipped(record);
     }
-    await this.processDue({ idempotencyKeys: [record.idempotencyKey], projectContext: record.projectContext });
+    const executionProjectContext = resolveScopedExecutionProjectContext(record.projectContext, operation.projectContext);
+    await this.processDue({ idempotencyKeys: [record.idempotencyKey], projectContext: executionProjectContext });
     return (await this.store.get(record.idempotencyKey, record.projectContext)) ?? record;
   }
 

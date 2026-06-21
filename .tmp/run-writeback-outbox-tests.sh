@@ -5,11 +5,10 @@ log="$repo/.tmp/writeback-outbox-vitest.log"
 exit_file="$repo/.tmp/writeback-outbox-vitest.exit"
 rm -f "$log" "$exit_file"
 cd "$repo"
-echo '+ ./node_modules/.bin/vitest run tests/writeback-outbox.test.ts --no-file-parallelism' | tee "$log"
+cmd=(../../node_modules/.bin/vitest run tests/writeback-outbox.test.ts --no-file-parallelism)
+printf '+ %s\n' "${cmd[*]}" | tee "$log"
 status=0
-if ! ./node_modules/.bin/vitest run tests/writeback-outbox.test.ts --no-file-parallelism >>"$log" 2>&1; then
-  status=$?
-fi
+"${cmd[@]}" >>"$log" 2>&1 || status=$?
 printf '%s\n' "$status" > "$exit_file"
 cat "$log"
 exit "$status"

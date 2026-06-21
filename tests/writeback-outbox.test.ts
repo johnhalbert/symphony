@@ -1574,6 +1574,72 @@ describe("FileWritebackOutboxStore", () => {
     });
   });
 
+  it("uses the requested enqueueAndProcess project context to resolve the tracker writer for idempotent replays", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const defaultWriter = new FakeWriter();
+    const persistedDocsWriter = new FakeWriter();
+    const scopedDocsWriter = new FakeWriter();
+    const scopedDocsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Docs (renamed)",
+      linearProjectSlug: "DOCS-ALT",
+      routingSource: "state_refresh",
+    } as const;
+    const processor = new WritebackProcessor(
+      store,
+      defaultWriter,
+      new StructuredLogger(() => undefined),
+      300_000,
+      undefined,
+      false,
+      undefined,
+      (projectContext) => {
+        if (projectContext?.projectContextId !== docsProjectContext.projectContextId) return defaultWriter;
+        return projectContext.linearProjectSlug === scopedDocsProjectContext.linearProjectSlug
+          ? scopedDocsWriter
+          : persistedDocsWriter;
+      },
+    );
+    const operationKey = "comment:issue-docs-scoped-replay:docs";
+
+    await store.enqueueOnce({
+      idempotencyKey: operationKey,
+      kind: "comment",
+      issueId: "issue-docs-scoped-replay",
+      projectContext: docsProjectContext,
+      runId: "run-docs-scoped-replay",
+      payload: { body: "Docs scoped replay", dedupeKey: "docs-scoped-replay" },
+    });
+
+    const record = await processor.enqueueAndProcess({
+      idempotencyKey: operationKey,
+      kind: "comment",
+      issueId: "issue-docs-scoped-replay",
+      projectContext: scopedDocsProjectContext,
+      runId: "run-docs-scoped-replay-requested-context",
+      payload: { body: "Docs scoped replay", dedupeKey: "docs-scoped-replay" },
+    });
+
+    expect(scopedDocsWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-docs-scoped-replay",
+        body: "Docs scoped replay",
+        dedupeKey: "docs-scoped-replay",
+      }),
+    ]);
+    expect(persistedDocsWriter.comments).toEqual([]);
+    expect(defaultWriter.comments).toEqual([]);
+    expect(record).toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.get(operationKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.list()).resolves.toHaveLength(1);
+  });
+
   it("enqueues idempotently and processes due operations", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
