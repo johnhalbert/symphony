@@ -1520,7 +1520,59 @@ describe("FileWritebackOutboxStore", () => {
     await expect(store.get(operationKey)).resolves.toMatchObject({ status: "succeeded", projectContext: docsProjectContext });
   });
 
+  it("uses the requested processDue project context to resolve the tracker writer", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const defaultWriter = new FakeWriter();
+    const persistedDocsWriter = new FakeWriter();
+    const scopedDocsWriter = new FakeWriter();
+    const scopedDocsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Docs (renamed)",
+      linearProjectSlug: "DOCS-ALT",
+      routingSource: "state_refresh",
+    } as const;
+    const processor = new WritebackProcessor(
+      store,
+      defaultWriter,
+      new StructuredLogger(() => undefined),
+      300_000,
+      undefined,
+      false,
+      undefined,
+      (projectContext) => {
+        if (projectContext?.projectContextId !== docsProjectContext.projectContextId) return defaultWriter;
+        return projectContext.linearProjectSlug === scopedDocsProjectContext.linearProjectSlug
+          ? scopedDocsWriter
+          : persistedDocsWriter;
+      },
+    );
+    const operationKey = "comment:issue-docs-scoped-writer:docs";
 
+    await store.enqueueOnce({
+      idempotencyKey: operationKey,
+      kind: "comment",
+      issueId: "issue-docs-scoped-writer",
+      projectContext: docsProjectContext,
+      runId: "run-docs-scoped-writer",
+      payload: { body: "Docs scoped writer", dedupeKey: "docs-scoped-writer" },
+    });
+
+    await processor.processDue({ projectContext: scopedDocsProjectContext });
+
+    expect(scopedDocsWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-docs-scoped-writer",
+        body: "Docs scoped writer",
+        dedupeKey: "docs-scoped-writer",
+      }),
+    ]);
+    expect(persistedDocsWriter.comments).toEqual([]);
+    expect(defaultWriter.comments).toEqual([]);
+    await expect(store.get(operationKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+  });
 
   it("enqueues idempotently and processes due operations", async () => {
     const store = new FileWritebackOutboxStore(root);

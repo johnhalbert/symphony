@@ -510,8 +510,9 @@ export class WritebackProcessor {
       ...(options.projectContext === undefined ? {} : { projectContext: options.projectContext }),
     };
     for (const record of await this.store.claimDue(new Date(), claimOptions)) {
+      const executionProjectContext = resolveScopedExecutionProjectContext(record.projectContext, options.projectContext);
       try {
-        const guard = await this.verifyLifecycleBoundOperation(record);
+        const guard = await this.verifyLifecycleBoundOperation(record, executionProjectContext);
         if (guard.status === "blocked") {
           await this.store.markSkipped(record, guard.message);
           continue;
@@ -521,7 +522,7 @@ export class WritebackProcessor {
           await this.store.markRetry(record, guard.message, nextAttemptAt);
           continue;
         }
-        const result = await this.execute(record);
+        const result = await this.execute(record, executionProjectContext);
         if (result.status === "applied" || result.status === "verified") {
           await this.store.markSucceeded(record, result);
         } else {
@@ -541,7 +542,10 @@ export class WritebackProcessor {
     }
   }
 
-  private async verifyLifecycleBoundOperation(record: WritebackOperation): Promise<LifecycleGuardResult> {
+  private async verifyLifecycleBoundOperation(
+    record: WritebackOperation,
+    executionProjectContext: ProjectContextResolution | undefined = record.projectContext,
+  ): Promise<LifecycleGuardResult> {
     const issueBreakdownBinding = issueBreakdownPlanBindingForOperation(record);
     if (issueBreakdownBinding.status === "blocked") {
       return { status: "blocked", message: issueBreakdownBinding.message };
@@ -566,8 +570,8 @@ export class WritebackProcessor {
       if (!this.issueBreakdownFreshnessGuard) {
         return { status: "blocked", message: "issue breakdown writeback requires freshness guard" };
       }
-      const config = this.issueBreakdownFreshnessGuard.getConfig(record.projectContext);
-      const lookup = await this.issueBreakdownFreshnessGuard.resolveIssue(record.issueId, record.projectContext);
+      const config = this.issueBreakdownFreshnessGuard.getConfig(executionProjectContext);
+      const lookup = await this.issueBreakdownFreshnessGuard.resolveIssue(record.issueId, executionProjectContext);
       if (lookup.status === "transient_error") {
         return { status: "retry", message: `issue breakdown freshness lookup failed: ${lookup.message}` };
       }
@@ -592,11 +596,14 @@ export class WritebackProcessor {
     return { status: "ready" };
   }
 
-  private async execute(record: WritebackOperation) {
+  private async execute(
+    record: WritebackOperation,
+    executionProjectContext: ProjectContextResolution | undefined = record.projectContext,
+  ) {
     if (this.dryRun) {
       return dryRunResult(record);
     }
-    const writer = this.writerResolver?.(record.projectContext) ?? this.writer;
+    const writer = this.writerResolver?.(executionProjectContext) ?? this.writer;
     if (record.kind === "transition") {
       return writer.transitionIssueState({
         issueId: record.issueId,
@@ -773,6 +780,16 @@ function matchesProjectContextScope(
     normalizeProjectContextResolution(recordProjectContext).projectContextId ===
     normalizeProjectContextResolution(expectedProjectContext).projectContextId
   );
+}
+
+function resolveScopedExecutionProjectContext(
+  recordProjectContext: ProjectContextResolution | undefined,
+  requestedProjectContext: ProjectContextResolution | undefined,
+): ProjectContextResolution | undefined {
+  if (!requestedProjectContext) return recordProjectContext;
+  return matchesProjectContextScope(recordProjectContext, requestedProjectContext)
+    ? normalizeProjectContextResolution(requestedProjectContext)
+    : recordProjectContext;
 }
 
 type StoredWritebackRecord = {
