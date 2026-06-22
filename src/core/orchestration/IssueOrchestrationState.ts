@@ -1,6 +1,18 @@
 import { randomUUID } from "node:crypto";
 
 import type { AgentHandoffRepairKind } from "../harness/AgentHarness.js";
+import type { MergePolicyObservation } from "../merge/MergePolicyService.js";
+import type {
+  IssueCompletionReportRecord,
+  IssueMergeConflictMetadata,
+  IssueMergeGateResultRecord,
+  IssueMergeGateState,
+  IssueMergeMetadata,
+  IssueReviewFeedbackRecord,
+  IssueReviewVerdictRecord,
+  IssueTriageBlockerRecord,
+} from "../persistence/IssueLifecycleStore.js";
+import type { RunRecord } from "../persistence/RunTranscriptStore.js";
 import type { AgentRunPhase, AgentRunKind, AgentRunRole, Issue, TokenCounts } from "../types.js";
 
 export type IssueTriggerType = "orchestrator.tick" | "manual.cli_agent_run";
@@ -14,7 +26,30 @@ export type IssueTransitionKind =
   | "dispatch_post_mortem"
   | "handoff_repair"
   | "merge_policy"
-  | "reconcile_report_writeback"
+  | "merge_policy_observe"
+  | "merge_policy_reset_operator_resume"
+  | "merge_policy_write_done_state"
+  | "merge_policy_retire_stale_gate"
+  | "merge_policy_mark_head_superseded"
+  | "merge_policy_wait_conflict_state"
+  | "merge_policy_refresh_conflict_base"
+  | "merge_policy_wait_active_blocked_gate"
+  | "merge_policy_wait_repair_clearance"
+  | "merge_policy_refresh_same_gate_blocker"
+  | "merge_policy_observe_checks_pending"
+  | "merge_policy_auto_resolve_gate"
+  | "merge_policy_prepare_conflict"
+  | "merge_policy_dispatch_repair"
+  | "merge_policy_block_failure"
+  | "merge_policy_merge_pull_request"
+  | "merge_policy_recover_already_merged_pull_request"
+  | "reconcile_issue_triage_report_writeback"
+  | "reconcile_post_mortem_report_writeback"
+  | "reset_lifecycle_after_operator_resume"
+  | "reset_merge_conflict_after_operator_resume"
+  | "block_merge_conflict_attempt_limit"
+  | "recover_merge_gate_head_supersession"
+  | "rebound_issue_triage_blocked"
   | "recover_publication_approval"
   | "terminate_running"
   | "block_issue"
@@ -47,6 +82,8 @@ export interface IssueCurrentFields {
   incompleteTurnCount: number;
   planningFailureCount: number;
   planningDispatchRetryCount: number;
+  lastPlanningFailureAt: string | null;
+  planningRetryDueAt: string | null;
   blockedReason: string | null;
   lastIssueBreakdownPlanId: string | null;
   lastIssueBreakdownPlanApplicationStatus: string | null;
@@ -59,14 +96,41 @@ export interface IssueCurrentFields {
   lastIssueTriageReportTriggerFingerprint: string | null;
   lastIssueTriageReportWritebackOperationKeys: string[] | null;
   currentIssueTriageTriggerFingerprint: string | null;
+  issueTriageCurrentTriggerReportIds: string[];
+  latestIssueTriageReportBlockers: IssueTriageBlockerRecord[];
   lastPostMortemReportId: string | null;
   lastPostMortemReportTriggerFingerprint: string | null;
   lastPostMortemReportWritebackOperationKeys: string[] | null;
   currentPostMortemTriggerFingerprint: string | null;
+  postMortemCurrentTriggerReportIds: string[];
   lastCompletionReportId: string | null;
   lastCompletionReportRejectionId: string | null;
   lastReviewVerdictId: string | null;
   lastMergeGateResultId: string | null;
+  latestCompletionReport: IssueCompletionReportRecord | null;
+  latestApprovalPassVerdict: IssueReviewVerdictRecord | null;
+  mergeGate: IssueMergeGateState | null;
+  mergeConflict: IssueMergeConflictMetadata | null;
+  lifecycleSummaryCiStatus: string | null;
+  mergePolicyMode: string;
+  mergePolicySourceStates: string[];
+  mergePolicyDoneState: string | null;
+  mergePolicyConflictsState: string | null;
+  mergePolicyRequiredChecks: string[];
+  mergePolicyMaxMergeGateFailures: number;
+  mergePolicyConfigFingerprint: string;
+  currentMergePolicyObservationInputFingerprint: string | null;
+  lastMergePolicyObservationFingerprint: string | null;
+  lastMergePolicyObservationStatus: string | null;
+  lastMergePolicyObservation: MergePolicyObservation | null;
+  mergePolicyMerge: IssueMergeMetadata | null;
+  mergePolicyMergeGate: IssueMergeGateState | null;
+  mergePolicyMergeGateResults: IssueMergeGateResultRecord[];
+  mergePolicyMergeConflict: IssueMergeConflictMetadata | null;
+  mergePolicyLatestCompletionReport: IssueCompletionReportRecord | null;
+  mergePolicyLatestApprovalVerdict: IssueReviewVerdictRecord | null;
+  mergePolicyReviewFeedback: IssueReviewFeedbackRecord[];
+  mergePolicyLatestCompletionRun: RunRecord | null;
   pendingPublicationApprovalRunId: string | null;
   pendingPublicationApprovalReportId: string | null;
   pendingPublicationApprovalReason: string | null;
@@ -164,6 +228,16 @@ export interface TransitionActionRecord {
   details: unknown;
 }
 
+export type TransitionActionExecutionResult =
+  | boolean
+  | void
+  | {
+      status?: "succeeded" | "skipped";
+      message?: string | null;
+      details?: unknown;
+      stop?: boolean;
+    };
+
 export interface TransitionErrorRecord {
   errorId: string;
   errorType: "runtime" | "domain";
@@ -224,7 +298,8 @@ export interface TransitionRuleset {
 
 export interface IssueTransitionAction<Context> {
   id: string;
-  execute(context: Context): Promise<boolean | void>;
+  shouldExecute?(context: Context): boolean | Promise<boolean>;
+  execute(context: Context): Promise<TransitionActionExecutionResult>;
 }
 
 export interface IssueTransition<Context> {
@@ -272,6 +347,7 @@ export function createTransitionId(kind: IssueTransitionKind): string {
 }
 
 export function transitionAction(input: {
+  actionId?: string;
   actionType: string;
   status?: TransitionActionRecord["status"];
   startedAt?: string;
@@ -281,7 +357,7 @@ export function transitionAction(input: {
 }): TransitionActionRecord {
   const now = new Date().toISOString();
   return {
-    actionId: `action:${randomUUID()}`,
+    actionId: input.actionId ?? `action:${randomUUID()}`,
     actionType: input.actionType,
     status: input.status ?? "succeeded",
     startedAt: input.startedAt ?? now,

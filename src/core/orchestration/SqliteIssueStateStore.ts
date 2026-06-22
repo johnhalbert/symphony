@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import sqlite3 from "sqlite3";
 
 import type { Issue } from "../types.js";
@@ -44,32 +45,37 @@ export class SqliteIssueStateStore implements IssueStateStore {
     const database = this.database;
     this.database = null;
     this.databaseReady = null;
-    if (database) await this.closeDatabase(database);
+    if (database) {
+      await this.closeDatabase(database);
+      await delay(25);
+    }
   }
 
   async get(issueIdOrIdentifier: string): Promise<IssueStateRecord | null> {
-    const database = await this.db();
-    const row = await this.getRow<IssueStateRow>(
-      database,
-      `
-        SELECT issue_id, issue_identifier, current_json
-        FROM issue_state
-        WHERE issue_id = ? OR issue_identifier = ?
-        ORDER BY CASE WHEN issue_id = ? THEN 0 ELSE 1 END
-        LIMIT 1
-      `,
-      [issueIdOrIdentifier, issueIdOrIdentifier, issueIdOrIdentifier],
-    );
-    return row ? this.recordFromRow(database, row) : null;
+    return this.withStore(async (database) => {
+      const row = await this.getRow<IssueStateRow>(
+        database,
+        `
+          SELECT issue_id, issue_identifier, current_json
+          FROM issue_state
+          WHERE issue_id = ? OR issue_identifier = ?
+          ORDER BY CASE WHEN issue_id = ? THEN 0 ELSE 1 END
+          LIMIT 1
+        `,
+        [issueIdOrIdentifier, issueIdOrIdentifier, issueIdOrIdentifier],
+      );
+      return row ? this.recordFromRow(database, row) : null;
+    });
   }
 
   async list(): Promise<IssueStateRecord[]> {
-    const database = await this.db();
-    const rows = await this.allRows<IssueStateRow>(
-      database,
-      "SELECT issue_id, issue_identifier, current_json FROM issue_state ORDER BY issue_identifier",
-    );
-    return Promise.all(rows.map((row) => this.recordFromRow(database, row)));
+    return this.withStore(async (database) => {
+      const rows = await this.allRows<IssueStateRow>(
+        database,
+        "SELECT issue_id, issue_identifier, current_json FROM issue_state ORDER BY issue_identifier",
+      );
+      return Promise.all(rows.map((row) => this.recordFromRow(database, row)));
+    });
   }
 
   async ensureIssue(current: IssueCurrentFields): Promise<IssueStateRecord> {
@@ -285,10 +291,21 @@ export class SqliteIssueStateStore implements IssueStateStore {
     return database;
   }
 
-  private async withWrite(_key: string, operation: (database: SqliteDatabase) => Promise<void> | void): Promise<void> {
+  private async withStore<T>(operation: (database: SqliteDatabase) => Promise<T> | T): Promise<T> {
     const previous = this.writeLock;
     const current = previous.catch(() => undefined).then(async () => {
       const database = await this.db();
+      return operation(database);
+    });
+    this.writeLock = current.then(
+      () => undefined,
+      () => undefined,
+    );
+    return current;
+  }
+
+  private async withWrite(_key: string, operation: (database: SqliteDatabase) => Promise<void> | void): Promise<void> {
+    await this.withStore(async (database) => {
       await this.exec(database, "BEGIN IMMEDIATE");
       try {
         await operation(database);
@@ -298,8 +315,6 @@ export class SqliteIssueStateStore implements IssueStateStore {
         throw error;
       }
     });
-    this.writeLock = current;
-    await current;
   }
 
   private async findUnlocked(database: SqliteDatabase, issueId: string, issueIdentifier: string): Promise<IssueStateRecord | null> {
@@ -502,6 +517,8 @@ export class SqliteIssueStateStore implements IssueStateStore {
   }
 
   private async closeDatabase(database: SqliteDatabase): Promise<void> {
+    await this.exec(database, "PRAGMA wal_checkpoint(TRUNCATE)").catch(() => undefined);
+    await this.exec(database, "PRAGMA journal_mode = DELETE").catch(() => undefined);
     await new Promise<void>((resolve, reject) => {
       database.close((error) => {
         if (error) reject(error);
@@ -515,6 +532,54 @@ function normalizeIssueCurrentFields(record: IssueCurrentFields): IssueCurrentFi
   return {
     ...record,
     version: 1,
+    lastPlanningFailureAt: typeof record.lastPlanningFailureAt === "string" ? record.lastPlanningFailureAt : null,
+    planningRetryDueAt: typeof record.planningRetryDueAt === "string" ? record.planningRetryDueAt : null,
+    issueTriageCurrentTriggerReportIds: Array.isArray(record.issueTriageCurrentTriggerReportIds)
+      ? record.issueTriageCurrentTriggerReportIds.filter((item): item is string => typeof item === "string")
+      : [],
+    latestIssueTriageReportBlockers: Array.isArray(record.latestIssueTriageReportBlockers)
+      ? record.latestIssueTriageReportBlockers
+      : [],
+    postMortemCurrentTriggerReportIds: Array.isArray(record.postMortemCurrentTriggerReportIds)
+      ? record.postMortemCurrentTriggerReportIds.filter((item): item is string => typeof item === "string")
+      : [],
+    latestCompletionReport: record.latestCompletionReport ?? null,
+    latestApprovalPassVerdict: record.latestApprovalPassVerdict ?? null,
+    mergeGate: record.mergeGate ?? null,
+    mergeConflict: record.mergeConflict ?? null,
+    lifecycleSummaryCiStatus:
+      typeof record.lifecycleSummaryCiStatus === "string" ? record.lifecycleSummaryCiStatus : null,
+    mergePolicyMode: typeof record.mergePolicyMode === "string" ? record.mergePolicyMode : "manual",
+    mergePolicySourceStates: Array.isArray(record.mergePolicySourceStates) ? record.mergePolicySourceStates : [],
+    mergePolicyDoneState: typeof record.mergePolicyDoneState === "string" ? record.mergePolicyDoneState : null,
+    mergePolicyConflictsState:
+      typeof record.mergePolicyConflictsState === "string" ? record.mergePolicyConflictsState : null,
+    mergePolicyRequiredChecks: Array.isArray(record.mergePolicyRequiredChecks) ? record.mergePolicyRequiredChecks : [],
+    mergePolicyMaxMergeGateFailures:
+      typeof record.mergePolicyMaxMergeGateFailures === "number" && Number.isFinite(record.mergePolicyMaxMergeGateFailures)
+        ? record.mergePolicyMaxMergeGateFailures
+        : 0,
+    mergePolicyConfigFingerprint:
+      typeof record.mergePolicyConfigFingerprint === "string" ? record.mergePolicyConfigFingerprint : "legacy",
+    currentMergePolicyObservationInputFingerprint:
+      typeof record.currentMergePolicyObservationInputFingerprint === "string"
+        ? record.currentMergePolicyObservationInputFingerprint
+        : null,
+    lastMergePolicyObservationFingerprint:
+      typeof record.lastMergePolicyObservationFingerprint === "string" ? record.lastMergePolicyObservationFingerprint : null,
+    lastMergePolicyObservationStatus:
+      typeof record.lastMergePolicyObservationStatus === "string" ? record.lastMergePolicyObservationStatus : null,
+    lastMergePolicyObservation: record.lastMergePolicyObservation ?? null,
+    mergePolicyMerge: record.mergePolicyMerge ?? null,
+    mergePolicyMergeGate: record.mergePolicyMergeGate ?? null,
+    mergePolicyMergeGateResults: Array.isArray(record.mergePolicyMergeGateResults)
+      ? record.mergePolicyMergeGateResults
+      : [],
+    mergePolicyMergeConflict: record.mergePolicyMergeConflict ?? null,
+    mergePolicyLatestCompletionReport: record.mergePolicyLatestCompletionReport ?? null,
+    mergePolicyLatestApprovalVerdict: record.mergePolicyLatestApprovalVerdict ?? null,
+    mergePolicyReviewFeedback: Array.isArray(record.mergePolicyReviewFeedback) ? record.mergePolicyReviewFeedback : [],
+    mergePolicyLatestCompletionRun: record.mergePolicyLatestCompletionRun ?? null,
   };
 }
 

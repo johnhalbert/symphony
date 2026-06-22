@@ -215,7 +215,9 @@ describe("Orchestrator", () => {
         "orchestrator.dispatch.worker.implementation",
         "orchestrator.dispatch.reviewer.review",
         "orchestrator.handoff_repair",
-        "orchestrator.merge_policy",
+        "orchestrator.merge_policy.observe",
+        "orchestrator.merge_policy_dispatch_repair",
+        "orchestrator.merge_policy_merge_pull_request",
       ]),
     );
 
@@ -244,7 +246,16 @@ describe("Orchestrator", () => {
     expect(dispatchSnapshot).not.toHaveProperty("current");
     expect(dispatchSnapshot).not.toHaveProperty("transitionRequest");
     expect(dispatchSnapshot?.actions.map((action) => action.actionType)).toEqual(
-      expect.arrayContaining(["dispatch_agent", "render_prompt", "start_agent_run", "agent_run_exit"]),
+      expect.arrayContaining([
+        "record_agent_dispatch_started",
+        "create_running_entry",
+        "claim_issue_for_run",
+        "clear_retry_for_issue",
+        "start_agent_run_monitor",
+        "render_prompt",
+        "start_agent_run",
+        "agent_run_exit",
+      ]),
     );
     const evidenceEvents = issueState?.history
       .filter((snapshot) => snapshot.snapshotKind === "evidence")
@@ -1063,7 +1074,7 @@ describe("Orchestrator", () => {
     expect(fixture.writer.comments).toHaveLength(1);
   });
 
-  it("reroutes implementation dispatch to planning when writeback reveals stale issue content", async () => {
+  it("does not reroute implementation dispatch inside writeback execution when writeback reveals stale issue content", async () => {
     const config = testConfig(root);
     config.issueBreakdown.enabled = true;
     config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
@@ -1126,20 +1137,19 @@ describe("Orchestrator", () => {
         orchestrator
           .snapshot()
           .running.some(
-            (run) => run.issueId === candidate.id && run.role === "worker" && run.runPhase === "issue_breakdown",
+            (run) => run.issueId === candidate.id && run.role === "worker" && run.runPhase === "implementation",
           ),
-      "stale post-writeback planning reroute dispatch",
+      "stale post-writeback implementation dispatch",
       10_000,
     );
-    await waitFor(() => harness.runs.length === 2, "stale post-writeback planning harness run", 10_000);
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "stale post-writeback planning completion", 10_000);
+    await waitFor(() => harness.runs.length === 2, "stale post-writeback implementation harness run", 10_000);
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "stale post-writeback implementation completion", 10_000);
     await orchestrator.stop();
 
     const lifecycle = await lifecycleStore.get(candidate.id);
     expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
     expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
-    expect(harness.runs[1]?.ctx.runPhase).toBe("issue_breakdown");
-    expect(harness.runs.some((run) => run.ctx.runPhase === "implementation")).toBe(false);
+    expect(harness.runs[1]?.ctx.runPhase).toBe("implementation");
     expect(lifecycle?.planningFailureCount).toBe(0);
   }, 30_000);
 
@@ -2305,7 +2315,9 @@ describe("Orchestrator", () => {
       rulesetId: "orchestrator.block_issue",
       blockedReason: "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
     });
-    expect(block?.actions.map((action) => action.actionType)).toContain("block_issue");
+    expect(block?.actions.map((action) => action.actionType)).toEqual(
+      expect.arrayContaining(["update_lifecycle_blocked", "apply_blocked_escalation_writebacks", "record_block_issue"]),
+    );
   });
 
   it("blocks after consecutive worker infrastructure failures reach the configured cap", async () => {
@@ -3019,6 +3031,7 @@ describe("Orchestrator", () => {
       writeback,
     });
 
+    await orchestrator.refreshNow();
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "operator-resumed worker dispatch");
     await orchestrator.stop();
@@ -3765,14 +3778,20 @@ describe("Orchestrator", () => {
       ],
     });
     const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
-    const reconciliation = issueState?.history.find((snapshot) => snapshot.transitionKind === "reconcile_report_writeback");
+    const reconciliation = issueState?.history.find((snapshot) => snapshot.transitionKind === "reconcile_issue_triage_report_writeback");
     expect(reconciliation).toMatchObject({
       candidateSource: "triage_writeback_reconciliation",
       rulesetId: "orchestrator.reconcile_issue_triage_report_writeback",
-      reportKind: "issue_triage",
       reason: "issue_triage_report_writeback_reconciliation",
     });
-    expect(reconciliation?.actions.map((action) => action.actionType)).toContain("reconcile_issue_triage_report_writeback");
+    expect(reconciliation?.actions.map((action) => action.actionType)).toEqual(
+      expect.arrayContaining([
+        "load_issue_triage_report_writeback",
+        "plan_issue_triage_report_writebacks",
+        "apply_issue_triage_report_writebacks",
+        "mark_issue_triage_report_writeback_recorded",
+      ]),
+    );
   });
 
   it("does not redispatch persisted fallback-blocked issues after restart", async () => {
@@ -4109,7 +4128,13 @@ describe("Orchestrator", () => {
         pendingPublicationApprovalReportId: expect.any(String),
       });
       expect(recovery?.actions.map((action) => action.actionType)).toEqual(
-        expect.arrayContaining(["start_publication_approval_recovery", "finish_publication_approval_recovery"]),
+        expect.arrayContaining([
+          "verify_publication_approval_recovery_config",
+          "load_recoverable_publication_approval_lifecycle",
+          "record_publication_approval_recovery_started",
+          "recover_publication_approval_handoff",
+          "record_publication_approval_recovery_finished",
+        ]),
       );
       await recoveryOrchestrator.stop();
     },
@@ -4647,6 +4672,7 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
+    await orchestrator.refreshNow();
     await waitFor(() => orchestrator.snapshot().running[0]?.runId !== null, "blocked lifecycle worker start");
     const lifecycle = orchestrator.snapshot().running[0]?.lifecycle;
     await orchestrator.stop();
@@ -4717,6 +4743,7 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
+    await orchestrator.refreshNow();
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "worker dispatch after human Todo unblock");
     await waitFor(() => writer.transitions.length === 1, "dispatch transition writeback");
@@ -6614,7 +6641,7 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(0);
-    expect(refreshes).toBe(0);
+    expect(refreshes).toBe(1);
   });
 
   it("does not dispatch reviewers for blocked review issues", async () => {
@@ -6778,7 +6805,13 @@ describe("Orchestrator", () => {
       cleanupWorkspace: true,
       terminationReason: "terminal state",
     });
-    expect(termination?.actions.map((action) => action.actionType)).toContain("terminate_running");
+    expect(termination?.actions.map((action) => action.actionType)).toEqual(
+      expect.arrayContaining([
+        "mark_running_cancellation_requested",
+        "abort_running_agent",
+        "record_running_termination",
+      ]),
+    );
   });
 
   it("loads and exposes issue lifecycle records during dispatch", async () => {

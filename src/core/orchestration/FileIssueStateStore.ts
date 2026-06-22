@@ -183,10 +183,66 @@ export class FileIssueStateStore implements IssueStateStore {
 }
 
 function normalizeIssueStateRecord(record: IssueStateRecord): IssueStateRecord {
+  const { history: rawHistory, ...rawCurrent } = record;
+  const current = normalizeIssueCurrentFields(rawCurrent as IssueCurrentFields);
+  return {
+    ...current,
+    history: Array.isArray(rawHistory) ? rawHistory.map(normalizeIssueHistorySnapshot) : [],
+  };
+}
+
+function normalizeIssueCurrentFields(record: IssueCurrentFields): IssueCurrentFields {
   return {
     ...record,
     version: 1,
-    history: Array.isArray(record.history) ? record.history.map(normalizeIssueHistorySnapshot) : [],
+    lastPlanningFailureAt: typeof record.lastPlanningFailureAt === "string" ? record.lastPlanningFailureAt : null,
+    planningRetryDueAt: typeof record.planningRetryDueAt === "string" ? record.planningRetryDueAt : null,
+    issueTriageCurrentTriggerReportIds: Array.isArray(record.issueTriageCurrentTriggerReportIds)
+      ? record.issueTriageCurrentTriggerReportIds.filter((item): item is string => typeof item === "string")
+      : [],
+    latestIssueTriageReportBlockers: Array.isArray(record.latestIssueTriageReportBlockers)
+      ? record.latestIssueTriageReportBlockers
+      : [],
+    postMortemCurrentTriggerReportIds: Array.isArray(record.postMortemCurrentTriggerReportIds)
+      ? record.postMortemCurrentTriggerReportIds.filter((item): item is string => typeof item === "string")
+      : [],
+    latestCompletionReport: record.latestCompletionReport ?? null,
+    latestApprovalPassVerdict: record.latestApprovalPassVerdict ?? null,
+    mergeGate: record.mergeGate ?? null,
+    mergeConflict: record.mergeConflict ?? null,
+    lifecycleSummaryCiStatus:
+      typeof record.lifecycleSummaryCiStatus === "string" ? record.lifecycleSummaryCiStatus : null,
+    mergePolicyMode: typeof record.mergePolicyMode === "string" ? record.mergePolicyMode : "manual",
+    mergePolicySourceStates: Array.isArray(record.mergePolicySourceStates) ? record.mergePolicySourceStates : [],
+    mergePolicyDoneState: typeof record.mergePolicyDoneState === "string" ? record.mergePolicyDoneState : null,
+    mergePolicyConflictsState:
+      typeof record.mergePolicyConflictsState === "string" ? record.mergePolicyConflictsState : null,
+    mergePolicyRequiredChecks: Array.isArray(record.mergePolicyRequiredChecks) ? record.mergePolicyRequiredChecks : [],
+    mergePolicyMaxMergeGateFailures:
+      typeof record.mergePolicyMaxMergeGateFailures === "number" && Number.isFinite(record.mergePolicyMaxMergeGateFailures)
+        ? record.mergePolicyMaxMergeGateFailures
+        : 0,
+    mergePolicyConfigFingerprint:
+      typeof record.mergePolicyConfigFingerprint === "string" ? record.mergePolicyConfigFingerprint : "legacy",
+    currentMergePolicyObservationInputFingerprint:
+      typeof record.currentMergePolicyObservationInputFingerprint === "string"
+        ? record.currentMergePolicyObservationInputFingerprint
+        : null,
+    lastMergePolicyObservationFingerprint:
+      typeof record.lastMergePolicyObservationFingerprint === "string" ? record.lastMergePolicyObservationFingerprint : null,
+    lastMergePolicyObservationStatus:
+      typeof record.lastMergePolicyObservationStatus === "string" ? record.lastMergePolicyObservationStatus : null,
+    lastMergePolicyObservation: record.lastMergePolicyObservation ?? null,
+    mergePolicyMerge: record.mergePolicyMerge ?? null,
+    mergePolicyMergeGate: record.mergePolicyMergeGate ?? null,
+    mergePolicyMergeGateResults: Array.isArray(record.mergePolicyMergeGateResults)
+      ? record.mergePolicyMergeGateResults
+      : [],
+    mergePolicyMergeConflict: record.mergePolicyMergeConflict ?? null,
+    mergePolicyLatestCompletionReport: record.mergePolicyLatestCompletionReport ?? null,
+    mergePolicyLatestApprovalVerdict: record.mergePolicyLatestApprovalVerdict ?? null,
+    mergePolicyReviewFeedback: Array.isArray(record.mergePolicyReviewFeedback) ? record.mergePolicyReviewFeedback : [],
+    mergePolicyLatestCompletionRun: record.mergePolicyLatestCompletionRun ?? null,
   };
 }
 
