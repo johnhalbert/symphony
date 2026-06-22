@@ -132,6 +132,7 @@ import {
   isSupersededLifecycleRecord,
   latestCurrentApprovalPassVerdict,
   phaseForIssueState,
+  type IssueBreakdownPlanRecord,
   type IssueCompletionReportRejectionRecord,
   type IssueCompletionReportRecord,
   type IssueLifecyclePatch,
@@ -139,6 +140,7 @@ import {
   type IssueLifecycleSummaryReference,
   type IssueLifecycleStore,
   type IssueMergeConflictMetadata,
+  type IssueMergeConflictResolutionReportRecord,
   type IssueMergeGateState,
   type IssuePostMortemReportRecord,
   type IssueReviewerOutputContract,
@@ -444,6 +446,8 @@ interface OrchestratorTransitionContext {
   headSupersessionRecovery: HeadSupersessionRecoveryTransitionScratch;
   triageRebound: TriageReboundTransitionScratch;
   mergePolicy: MergePolicyTransitionScratch;
+  handoffRepair: HandoffRepairTransitionScratch;
+  handoffReconciliation: HandoffReconciliationTransitionScratch;
 }
 
 interface DispatchTransitionScratch {
@@ -525,6 +529,31 @@ interface MergePolicyTransitionScratch {
   conflictPreparationPlan?: MergePolicyConflictPreparationPlan;
   conflictPreparationExecution?: MergePolicyConflictPreparationExecution;
   conflictWritebackPlan?: MergePolicyConflictWritebackPlan;
+}
+
+interface HandoffRepairTransitionScratch {
+  entry?: RunningEntry;
+  workspace?: Workspace;
+  sourceRunId?: string;
+  kind?: RepairableHandoffKind;
+  repairAttempt?: number;
+  turnNumber?: number;
+  resume?: AgentHermesResumeContext;
+  promptBundle?: AgentPromptBundle;
+  accepted?: boolean;
+}
+
+interface HandoffReconciliationTransitionScratch {
+  entry?: RunningEntry;
+  runId?: string;
+  lifecycle?: IssueLifecycleRecord;
+  completionReport?: IssueCompletionReportRecord;
+  completionReportRejection?: IssueCompletionReportRejectionRecord;
+  mergeConflictResolutionReport?: IssueMergeConflictResolutionReportRecord;
+  issueBreakdownPlan?: IssueBreakdownPlanRecord;
+  issueTriageReport?: IssueTriageReportRecord;
+  postMortemReport?: IssuePostMortemReportRecord;
+  reviewVerdict?: IssueReviewVerdictRecord;
 }
 
 interface IssueTransitionEventInput {
@@ -2798,6 +2827,63 @@ export class Orchestrator {
         ],
       },
       {
+        kind: "reconcile_completion_report_handoff",
+        actions: [
+          { id: "load_completion_report_handoff", execute: (context) => this.loadCompletionReportHandoffAction(context) },
+          { id: "mark_completion_report_handoff_accepted", execute: (context) => this.markCompletionReportHandoffAcceptedAction(context) },
+          { id: "process_completion_report_handoff_writebacks", execute: (context) => this.processCompletionReportHandoffWritebacksAction(context) },
+        ],
+      },
+      {
+        kind: "reconcile_completion_report_rejection",
+        actions: [
+          { id: "load_completion_report_rejection", execute: (context) => this.loadCompletionReportRejectionAction(context) },
+          { id: "mark_completion_report_rejected", execute: (context) => this.markCompletionReportRejectedAction(context) },
+          { id: "process_completion_report_rejection_writebacks", execute: (context) => this.processCompletionReportRejectionWritebacksAction(context) },
+        ],
+      },
+      {
+        kind: "reconcile_merge_conflict_resolution_handoff",
+        actions: [
+          { id: "load_merge_conflict_resolution_handoff", execute: (context) => this.loadMergeConflictResolutionHandoffAction(context) },
+          { id: "mark_merge_conflict_resolution_handoff_accepted", execute: (context) => this.markMergeConflictResolutionHandoffAcceptedAction(context) },
+          { id: "process_merge_conflict_resolution_writebacks", execute: (context) => this.processMergeConflictResolutionWritebacksAction(context) },
+          { id: "request_merge_policy_after_resolved_conflict", execute: (context) => this.requestMergePolicyAfterResolvedConflictAction(context) },
+        ],
+      },
+      {
+        kind: "reconcile_issue_breakdown_plan_handoff",
+        actions: [
+          { id: "load_issue_breakdown_plan_handoff", execute: (context) => this.loadIssueBreakdownPlanHandoffAction(context) },
+          { id: "mark_issue_breakdown_plan_handoff_accepted", execute: (context) => this.markIssueBreakdownPlanHandoffAcceptedAction(context) },
+        ],
+      },
+      {
+        kind: "reconcile_issue_triage_report_handoff",
+        actions: [
+          { id: "load_issue_triage_report_handoff", execute: (context) => this.loadIssueTriageReportHandoffAction(context) },
+          { id: "mark_issue_triage_report_handoff_accepted", execute: (context) => this.markIssueTriageReportHandoffAcceptedAction(context) },
+          { id: "process_issue_triage_report_handoff_writebacks", execute: (context) => this.processIssueTriageReportHandoffWritebacksAction(context) },
+        ],
+      },
+      {
+        kind: "reconcile_issue_post_mortem_handoff",
+        actions: [
+          { id: "load_issue_post_mortem_handoff", execute: (context) => this.loadIssuePostMortemHandoffAction(context) },
+          { id: "mark_issue_post_mortem_handoff_accepted", execute: (context) => this.markIssuePostMortemHandoffAcceptedAction(context) },
+          { id: "process_issue_post_mortem_handoff_writebacks", execute: (context) => this.processIssuePostMortemHandoffWritebacksAction(context) },
+        ],
+      },
+      {
+        kind: "reconcile_review_verdict_handoff",
+        actions: [
+          { id: "load_review_verdict_handoff", execute: (context) => this.loadReviewVerdictHandoffAction(context) },
+          { id: "mark_review_verdict_handoff_accepted", execute: (context) => this.markReviewVerdictHandoffAcceptedAction(context) },
+          { id: "process_review_verdict_handoff_writebacks", execute: (context) => this.processReviewVerdictHandoffWritebacksAction(context) },
+          { id: "request_merge_policy_after_pass_verdict", execute: (context) => this.requestMergePolicyAfterPassVerdictAction(context) },
+        ],
+      },
+      {
         kind: "reset_lifecycle_after_operator_resume",
         actions: [{ id: "update_lifecycle_after_operator_resume", execute: (context) => this.updateLifecycleAfterOperatorResumeAction(context) }],
       },
@@ -2864,7 +2950,19 @@ export class Orchestrator {
           { id: "record_retry_scheduled", execute: (context) => this.recordRetryScheduledAction(context) },
         ],
       },
-      { kind: "handoff_repair", actions: [] },
+      {
+        kind: "handoff_repair",
+        actions: [
+          { id: "load_handoff_repair_context", execute: (context) => this.loadHandoffRepairContextAction(context) },
+          { id: "dispatch_handoff_repair", execute: (context) => this.dispatchHandoffRepairAction(context) },
+          { id: "render_handoff_repair_prompt", execute: (context) => this.renderHandoffRepairPromptAction(context) },
+          { id: "record_handoff_repair_dispatched_event", execute: (context) => this.recordHandoffRepairDispatchedEventAction(context) },
+          { id: "prepare_handoff_repair_harness", execute: (context) => this.prepareHandoffRepairHarnessAction(context) },
+          { id: "reload_handoff_repair_harness", execute: (context) => this.reloadHandoffRepairHarnessAction(context) },
+          { id: "run_handoff_repair_agent", execute: (context) => this.runHandoffRepairAgentAction(context) },
+          { id: "reconcile_handoff_repair_result", execute: (context) => this.reconcileHandoffRepairResultAction(context) },
+        ],
+      },
       { kind: "noop", actions: [] },
     ];
   }
@@ -3128,6 +3226,273 @@ export class Orchestrator {
       report.runId,
     );
     return { details: { reportId: report.id, operationKeys } };
+  }
+
+  private async loadCompletionReportHandoffAction(context: OrchestratorTransitionContext) {
+    const loaded = await this.loadHandoffReconciliationEntry(context);
+    if (!loaded) return { status: "skipped" as const, stop: true, message: "No active entry exists for completion report handoff reconciliation" };
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const report = lifecycle?.completionReports.find((item) => item.runId === loaded.runId) ?? null;
+    if (!lifecycle || !report) return { status: "skipped" as const, stop: true, message: "No completion report exists for run" };
+    if (!isFinalizedCompletionReport(report) && !pendingPublicationHandoffForRun(lifecycle, { runId: loaded.runId })) {
+      if (lifecycle.phase !== "review" || lifecycle.blockedReason !== null) {
+        return { status: "skipped" as const, stop: true, message: "Completion report is not finalized or pending publication" };
+      }
+    }
+    context.handoffReconciliation.lifecycle = lifecycle;
+    context.handoffReconciliation.completionReport = report;
+    return { details: { reportId: report.id, runId: loaded.runId, finalized: isFinalizedCompletionReport(report) } };
+  }
+
+  private async markCompletionReportHandoffAcceptedAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const lifecycle = context.handoffReconciliation.lifecycle;
+    const report = context.handoffReconciliation.completionReport;
+    if (!entry || !lifecycle || !report) return { status: "skipped" as const, stop: true, message: "Completion report handoff was not loaded" };
+    entry.lifecycle = lifecycle;
+    entry.completionReportAccepted = true;
+    return {
+      message: isFinalizedCompletionReport(report) ? "Completion report accepted" : "Completion report accepted pending publication",
+      details: { reportId: report.id, runId: context.handoffReconciliation.runId ?? report.runId, finalized: isFinalizedCompletionReport(report) },
+    };
+  }
+
+  private async processCompletionReportHandoffWritebacksAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const report = context.handoffReconciliation.completionReport;
+    if (!entry || !report) return { status: "skipped" as const, stop: true, message: "Completion report handoff was not loaded" };
+    if (!isFinalizedCompletionReport(report)) return { status: "skipped" as const, message: "Completion report is pending publication" };
+    await this.processDueWritebacksForHandoff(entry, "completion report accepted", { reportId: report.id });
+    return { details: { reportId: report.id, runId: context.handoffReconciliation.runId ?? report.runId } };
+  }
+
+  private async loadCompletionReportRejectionAction(context: OrchestratorTransitionContext) {
+    const loaded = await this.loadHandoffReconciliationEntry(context);
+    if (!loaded) return { status: "skipped" as const, stop: true, message: "No active entry exists for completion report rejection reconciliation" };
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const rejection = lifecycle?.completionReportRejections.find((item) => item.runId === loaded.runId) ?? null;
+    if (!lifecycle || !rejection) return { status: "skipped" as const, stop: true, message: "No completion report rejection exists for run" };
+    context.handoffReconciliation.lifecycle = lifecycle;
+    context.handoffReconciliation.completionReportRejection = rejection;
+    return {
+      details: {
+        rejectionId: rejection.id,
+        reportId: rejection.reportId,
+        runId: loaded.runId,
+        unsatisfiedChecklistItems: rejection.acceptanceChecklist.filter((item) => !item.satisfied).map((item) => item.text),
+      },
+    };
+  }
+
+  private async markCompletionReportRejectedAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const lifecycle = context.handoffReconciliation.lifecycle;
+    const rejection = context.handoffReconciliation.completionReportRejection;
+    if (!entry || !lifecycle || !rejection) return { status: "skipped" as const, stop: true, message: "Completion report rejection was not loaded" };
+    entry.lifecycle = lifecycle;
+    return {
+      message: rejection.reason,
+      details: {
+        rejectionId: rejection.id,
+        reportId: rejection.reportId,
+        runId: context.handoffReconciliation.runId ?? rejection.runId,
+        unsatisfiedChecklistItems: rejection.acceptanceChecklist.filter((item) => !item.satisfied).map((item) => item.text),
+      },
+    };
+  }
+
+  private async processCompletionReportRejectionWritebacksAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const rejection = context.handoffReconciliation.completionReportRejection;
+    if (!entry || !rejection) return { status: "skipped" as const, stop: true, message: "Completion report rejection was not loaded" };
+    await this.processDueWritebacksForHandoff(entry, "completion report rejected", { rejectionId: rejection.id });
+    return { details: { rejectionId: rejection.id, runId: context.handoffReconciliation.runId ?? rejection.runId } };
+  }
+
+  private async loadMergeConflictResolutionHandoffAction(context: OrchestratorTransitionContext) {
+    const loaded = await this.loadHandoffReconciliationEntry(context);
+    if (!loaded) return { status: "skipped" as const, stop: true, message: "No active entry exists for merge conflict handoff reconciliation" };
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const report = lifecycle?.mergeConflictResolutionReports.find((item) => item.runId === loaded.runId) ?? null;
+    if (!lifecycle || !report) return { status: "skipped" as const, stop: true, message: "No merge conflict resolution report exists for run" };
+    context.handoffReconciliation.lifecycle = lifecycle;
+    context.handoffReconciliation.mergeConflictResolutionReport = report;
+    return { details: { reportId: report.id, runId: loaded.runId, resolutionStatus: report.resolutionStatus } };
+  }
+
+  private async markMergeConflictResolutionHandoffAcceptedAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const lifecycle = context.handoffReconciliation.lifecycle;
+    const report = context.handoffReconciliation.mergeConflictResolutionReport;
+    if (!entry || !lifecycle || !report) return { status: "skipped" as const, stop: true, message: "Merge conflict handoff was not loaded" };
+    entry.lifecycle = lifecycle;
+    entry.mergeConflictResolutionAccepted = true;
+    return { details: { reportId: report.id, runId: context.handoffReconciliation.runId ?? report.runId, resolutionStatus: report.resolutionStatus } };
+  }
+
+  private async processMergeConflictResolutionWritebacksAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const report = context.handoffReconciliation.mergeConflictResolutionReport;
+    if (!entry || !report) return { status: "skipped" as const, stop: true, message: "Merge conflict handoff was not loaded" };
+    await this.processDueWritebacksForHandoff(entry, "merge conflict resolution accepted", { reportId: report.id });
+    return { details: { reportId: report.id, runId: context.handoffReconciliation.runId ?? report.runId } };
+  }
+
+  private async requestMergePolicyAfterResolvedConflictAction(context: OrchestratorTransitionContext) {
+    const report = context.handoffReconciliation.mergeConflictResolutionReport;
+    if (!report) return { status: "skipped" as const, stop: true, message: "Merge conflict handoff was not loaded" };
+    if (report.resolutionStatus !== "resolved") {
+      return { status: "skipped" as const, message: "Merge conflict resolution did not report resolved status" };
+    }
+    await this.processMergePolicyTransitionCandidate(context.issue);
+    return { details: { reportId: report.id, resolutionStatus: report.resolutionStatus } };
+  }
+
+  private async loadIssueBreakdownPlanHandoffAction(context: OrchestratorTransitionContext) {
+    const loaded = await this.loadHandoffReconciliationEntry(context);
+    if (!loaded) return { status: "skipped" as const, stop: true, message: "No active entry exists for issue breakdown handoff reconciliation" };
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const plan = lifecycle?.issueBreakdownPlans.find((item) => item.runId === loaded.runId) ?? null;
+    if (!lifecycle || !plan) return { status: "skipped" as const, stop: true, message: "No issue breakdown plan exists for run" };
+    context.handoffReconciliation.lifecycle = lifecycle;
+    context.handoffReconciliation.issueBreakdownPlan = plan;
+    return { details: { planId: plan.id, runId: loaded.runId } };
+  }
+
+  private async markIssueBreakdownPlanHandoffAcceptedAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const lifecycle = context.handoffReconciliation.lifecycle;
+    const plan = context.handoffReconciliation.issueBreakdownPlan;
+    if (!entry || !lifecycle || !plan) return { status: "skipped" as const, stop: true, message: "Issue breakdown handoff was not loaded" };
+    entry.lifecycle = lifecycle;
+    entry.issueBreakdownPlanAccepted = true;
+    return { details: { planId: plan.id, runId: context.handoffReconciliation.runId ?? plan.runId } };
+  }
+
+  private async loadIssueTriageReportHandoffAction(context: OrchestratorTransitionContext) {
+    const loaded = await this.loadHandoffReconciliationEntry(context);
+    if (!loaded) return { status: "skipped" as const, stop: true, message: "No active entry exists for issue triage handoff reconciliation" };
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const report = lifecycle?.issueTriageReports.find((item) => item.runId === loaded.runId) ?? null;
+    if (!lifecycle || !report) return { status: "skipped" as const, stop: true, message: "No issue triage report exists for run" };
+    context.handoffReconciliation.lifecycle = lifecycle;
+    context.handoffReconciliation.issueTriageReport = report;
+    return { details: { reportId: report.id, runId: loaded.runId } };
+  }
+
+  private async markIssueTriageReportHandoffAcceptedAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const lifecycle = context.handoffReconciliation.lifecycle;
+    const report = context.handoffReconciliation.issueTriageReport;
+    if (!entry || !lifecycle || !report) return { status: "skipped" as const, stop: true, message: "Issue triage handoff was not loaded" };
+    entry.lifecycle = lifecycle;
+    entry.issueTriageReportAccepted = true;
+    return { details: { reportId: report.id, runId: context.handoffReconciliation.runId ?? report.runId } };
+  }
+
+  private async processIssueTriageReportHandoffWritebacksAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const report = context.handoffReconciliation.issueTriageReport;
+    if (!entry || !report) return { status: "skipped" as const, stop: true, message: "Issue triage handoff was not loaded" };
+    await this.processDueWritebacksForHandoff(entry, "issue triage report accepted", { reportId: report.id });
+    return { details: { reportId: report.id, runId: context.handoffReconciliation.runId ?? report.runId } };
+  }
+
+  private async loadIssuePostMortemHandoffAction(context: OrchestratorTransitionContext) {
+    const loaded = await this.loadHandoffReconciliationEntry(context);
+    if (!loaded) return { status: "skipped" as const, stop: true, message: "No active entry exists for issue post-mortem handoff reconciliation" };
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const report = lifecycle?.postMortemReports.find((item) => item.runId === loaded.runId) ?? null;
+    if (!lifecycle || !report) return { status: "skipped" as const, stop: true, message: "No issue post-mortem report exists for run" };
+    context.handoffReconciliation.lifecycle = lifecycle;
+    context.handoffReconciliation.postMortemReport = report;
+    return { details: { reportId: report.id, runId: loaded.runId } };
+  }
+
+  private async markIssuePostMortemHandoffAcceptedAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const lifecycle = context.handoffReconciliation.lifecycle;
+    const report = context.handoffReconciliation.postMortemReport;
+    if (!entry || !lifecycle || !report) return { status: "skipped" as const, stop: true, message: "Issue post-mortem handoff was not loaded" };
+    entry.lifecycle = lifecycle;
+    entry.issuePostMortemReportAccepted = true;
+    return { details: { reportId: report.id, runId: context.handoffReconciliation.runId ?? report.runId } };
+  }
+
+  private async processIssuePostMortemHandoffWritebacksAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const report = context.handoffReconciliation.postMortemReport;
+    if (!entry || !report) return { status: "skipped" as const, stop: true, message: "Issue post-mortem handoff was not loaded" };
+    await this.processDueWritebacksForHandoff(entry, "issue post-mortem report accepted", { reportId: report.id });
+    return { details: { reportId: report.id, runId: context.handoffReconciliation.runId ?? report.runId } };
+  }
+
+  private async loadReviewVerdictHandoffAction(context: OrchestratorTransitionContext) {
+    const loaded = await this.loadHandoffReconciliationEntry(context);
+    if (!loaded) return { status: "skipped" as const, stop: true, message: "No active entry exists for review verdict handoff reconciliation" };
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const verdict = lifecycle?.reviewVerdicts.find((item) => item.runId === loaded.runId) ?? null;
+    if (!lifecycle || !verdict) return { status: "skipped" as const, stop: true, message: "No review verdict exists for run" };
+    context.handoffReconciliation.lifecycle = lifecycle;
+    context.handoffReconciliation.reviewVerdict = verdict;
+    return { details: { verdictId: verdict.id, runId: loaded.runId, verdict: verdict.verdict } };
+  }
+
+  private async markReviewVerdictHandoffAcceptedAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const lifecycle = context.handoffReconciliation.lifecycle;
+    const verdict = context.handoffReconciliation.reviewVerdict;
+    if (!entry || !lifecycle || !verdict) return { status: "skipped" as const, stop: true, message: "Review verdict handoff was not loaded" };
+    entry.lifecycle = lifecycle;
+    entry.reviewVerdictAccepted = true;
+    return { details: { verdictId: verdict.id, runId: context.handoffReconciliation.runId ?? verdict.runId, verdict: verdict.verdict } };
+  }
+
+  private async processReviewVerdictHandoffWritebacksAction(context: OrchestratorTransitionContext) {
+    const entry = context.handoffReconciliation.entry;
+    const verdict = context.handoffReconciliation.reviewVerdict;
+    if (!entry || !verdict) return { status: "skipped" as const, stop: true, message: "Review verdict handoff was not loaded" };
+    await this.processDueWritebacksForHandoff(entry, "review verdict accepted", { verdictId: verdict.id });
+    return { details: { verdictId: verdict.id, runId: context.handoffReconciliation.runId ?? verdict.runId } };
+  }
+
+  private async requestMergePolicyAfterPassVerdictAction(context: OrchestratorTransitionContext) {
+    const verdict = context.handoffReconciliation.reviewVerdict;
+    if (!verdict) return { status: "skipped" as const, stop: true, message: "Review verdict handoff was not loaded" };
+    if (verdict.verdict !== "pass") return { status: "skipped" as const, message: "Review verdict did not pass" };
+    await this.processMergePolicyTransitionCandidate(context.issue);
+    return { details: { verdictId: verdict.id, verdict: verdict.verdict } };
+  }
+
+  private async loadHandoffReconciliationEntry(
+    context: OrchestratorTransitionContext,
+  ): Promise<{ entry: RunningEntry; runId: string } | null> {
+    const runId = nonEmptyString(context.transition.runId);
+    if (runId === null) return null;
+    const entry = this.running.get(context.issue.id);
+    if (!entry) return null;
+    context.handoffReconciliation.entry = entry;
+    context.handoffReconciliation.runId = runId;
+    return { entry, runId };
+  }
+
+  private async processDueWritebacksForHandoff(
+    entry: RunningEntry,
+    eventDescription: string,
+    logDetails: Record<string, unknown>,
+  ): Promise<void> {
+    if (this.options.writeback) {
+      await this.options.writeback.processDue();
+      return;
+    }
+    if (this.config.writeback.enabled) {
+      this.options.logger.warn(`${eventDescription} but writeback processor is not configured`, {
+        issue_id: entry.issue.id,
+        issue_identifier: entry.issue.identifier,
+        run_id: entry.activeRunId ?? entry.runId,
+        ...logDetails,
+      });
+    }
   }
 
   private async updateLifecycleAfterOperatorResumeAction(context: OrchestratorTransitionContext) {
@@ -3562,6 +3927,245 @@ export class Orchestrator {
     };
   }
 
+  private async loadHandoffRepairContextAction(context: OrchestratorTransitionContext) {
+    const request = context.transition.transitionRequestContext;
+    if (request?.kind !== "handoff_repair") {
+      return { status: "skipped" as const, stop: true, message: "Handoff repair transition request context is unavailable" };
+    }
+    const { sourceRunId, kind, repairAttempt, turnNumber, role, runPhase, runKind } = request.payload;
+    if (!this.isHandoffRepairEnabled(kind)) {
+      return { status: "skipped" as const, stop: true, message: "Handoff repair is not enabled for this phase" };
+    }
+    if (repairAttempt > this.config.handoffRepair.maxAttempts) {
+      return { status: "skipped" as const, stop: true, message: "Handoff repair attempt exceeds the configured limit" };
+    }
+    const entry = this.running.get(context.issue.id);
+    if (!entry) return { status: "skipped" as const, stop: true, message: "No active running entry exists for handoff repair" };
+    if (entry.handoffRepair !== null) return { status: "skipped" as const, stop: true, message: "Running entry is already in handoff repair mode" };
+    if (entry.role !== role || entry.runPhase !== runPhase || runKindForPhase(entry.runPhase) !== runKind) {
+      return { status: "skipped" as const, stop: true, message: "Running entry no longer matches the requested handoff repair role and phase" };
+    }
+    const activeSourceRunId = entry.activeRunId ?? entry.runId;
+    if (activeSourceRunId !== sourceRunId) {
+      return { status: "skipped" as const, stop: true, message: "Running entry source run changed before handoff repair dispatch" };
+    }
+    const workspace = entry.workspace;
+    if (!workspace) return { status: "skipped" as const, stop: true, message: "Running entry workspace is unavailable for handoff repair" };
+    const resume = await this.resolveHandoffRepairHermesResume(entry, sourceRunId, kind);
+    if (resume === null) return { status: "skipped" as const, stop: true, message: "Source run is not resumable for handoff repair" };
+
+    context.handoffRepair.entry = entry;
+    context.handoffRepair.workspace = workspace;
+    context.handoffRepair.sourceRunId = sourceRunId;
+    context.handoffRepair.kind = kind;
+    context.handoffRepair.repairAttempt = repairAttempt;
+    context.handoffRepair.turnNumber = turnNumber;
+    context.handoffRepair.resume = resume;
+    return {
+      details: {
+        sourceRunId,
+        kind,
+        repairAttempt,
+        turnNumber,
+        maxAttempts: this.config.handoffRepair.maxAttempts,
+        hermesResumeSourceRunId: resume.sourceRunId,
+        hermesResumeReason: resume.reason,
+        hermesProfileKey: resume.profileKey,
+        hermesSessionKey: resume.sessionKey,
+      },
+    };
+  }
+
+  private async dispatchHandoffRepairAction(context: OrchestratorTransitionContext) {
+    const repair = this.requireLoadedHandoffRepairContext(context);
+    repair.entry.issueHistorySnapshotId = context.transition.historySnapshotId;
+    repair.entry.handoffRepair = {
+      sourceRunId: repair.sourceRunId,
+      kind: repair.kind,
+      attempt: repair.repairAttempt,
+    };
+    repair.entry.hermesResume = repair.resume;
+    repair.entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    this.options.logger.warn("dispatching MCP handoff repair", {
+      issue_id: repair.entry.issue.id,
+      issue_identifier: repair.entry.issue.identifier,
+      source_run_id: repair.sourceRunId,
+      kind: repair.kind,
+      repair_attempt: repair.repairAttempt,
+    });
+    return {
+      message: `Dispatching MCP handoff repair for ${formatRepairableHandoffKind(repair.kind)}`,
+      details: {
+        sourceRunId: repair.sourceRunId,
+        kind: repair.kind,
+        repairAttempt: repair.repairAttempt,
+        maxAttempts: this.config.handoffRepair.maxAttempts,
+      },
+    };
+  }
+
+  private async renderHandoffRepairPromptAction(context: OrchestratorTransitionContext) {
+    const repair = this.requireLoadedHandoffRepairContext(context);
+    const promptBundle = await this.renderHandoffRepairPromptBundle(
+      repair.entry,
+      repair.kind,
+      repair.sourceRunId,
+      repair.repairAttempt,
+      { recordAction: false },
+    );
+    this.assertPromptBundleSupported(promptBundle);
+    context.handoffRepair.promptBundle = promptBundle;
+    return { details: promptBundle.metadata };
+  }
+
+  private async recordHandoffRepairDispatchedEventAction(context: OrchestratorTransitionContext) {
+    const repair = this.requireLoadedHandoffRepairContext(context);
+    if (!this.options.runStore) {
+      return { status: "skipped" as const, message: "Run transcript store is unavailable" };
+    }
+    await this.options.runStore.appendEvent({
+      runId: repair.sourceRunId,
+      at: new Date().toISOString(),
+      source: "orchestrator",
+      eventType: "handoff_repair_dispatched",
+      message: `Dispatching MCP handoff repair for ${formatRepairableHandoffKind(repair.kind)}`,
+      payload: {
+        kind: repair.kind,
+        repairAttempt: repair.repairAttempt,
+        maxAttempts: this.config.handoffRepair.maxAttempts,
+      },
+    });
+    return {
+      details: {
+        sourceRunId: repair.sourceRunId,
+        kind: repair.kind,
+        repairAttempt: repair.repairAttempt,
+      },
+    };
+  }
+
+  private async prepareHandoffRepairHarnessAction(context: OrchestratorTransitionContext) {
+    const repair = this.requireLoadedHandoffRepairContext(context);
+    if (typeof this.options.harness.prepare !== "function") {
+      return { status: "skipped" as const, message: "Harness prepare hook is unavailable" };
+    }
+    await this.prepareHarnessForRun(repair.entry, repair.workspace, context.attempt, repair.turnNumber, repair.promptBundle);
+    return {
+      details: {
+        harnessId: this.options.harness.id,
+        workspaceKey: repair.workspace.workspaceKey,
+        workspacePath: repair.workspace.path,
+        turnNumber: repair.turnNumber,
+      },
+    };
+  }
+
+  private async reloadHandoffRepairHarnessAction(context: OrchestratorTransitionContext) {
+    const repair = this.requireLoadedHandoffRepairContext(context);
+    if (typeof this.options.harness.reload !== "function") {
+      return { status: "skipped" as const, message: "Harness reload hook is unavailable" };
+    }
+    await this.reloadHarnessForRun(repair.entry, repair.workspace, context.attempt, repair.turnNumber, repair.promptBundle);
+    return {
+      details: {
+        harnessId: this.options.harness.id,
+        workspaceKey: repair.workspace.workspaceKey,
+        workspacePath: repair.workspace.path,
+        turnNumber: repair.turnNumber,
+      },
+    };
+  }
+
+  private async runHandoffRepairAgentAction(context: OrchestratorTransitionContext) {
+    const repair = this.requireLoadedHandoffRepairContext(context);
+    if (!repair.promptBundle) throw new SymphonyError("invalid_request", "Handoff repair prompt bundle was not rendered");
+    await this.consumeHarnessEvents(
+      repair.entry,
+      this.options.harness.run(
+        this.buildRunContext(repair.entry, repair.workspace, context.attempt, repair.turnNumber, repair.promptBundle),
+        repair.promptBundle.userPrompt,
+      ),
+      {
+        workspace: repair.workspace,
+        prompt: repair.promptBundle.userPrompt,
+        promptBundle: repair.promptBundle,
+        attempt: context.attempt,
+        turnNumber: repair.turnNumber,
+      },
+    );
+    return {
+      details: {
+        runId: repair.entry.activeRunId ?? repair.entry.runId,
+        sessionId: repair.entry.sessionId,
+        sourceRunId: repair.sourceRunId,
+        kind: repair.kind,
+        repairAttempt: repair.repairAttempt,
+        turnNumber: repair.turnNumber,
+      },
+    };
+  }
+
+  private async reconcileHandoffRepairResultAction(context: OrchestratorTransitionContext) {
+    const repair = this.requireLoadedHandoffRepairContext(context);
+    const accepted = await this.reconcileRepairableHandoff(repair.entry, repair.kind);
+    context.handoffRepair.accepted = accepted;
+    if (!accepted) {
+      this.options.logger.warn("MCP handoff repair finished without required handoff", {
+        issue_id: repair.entry.issue.id,
+        issue_identifier: repair.entry.issue.identifier,
+        source_run_id: repair.sourceRunId,
+        repair_run_id: repair.entry.activeRunId ?? repair.entry.runId,
+        kind: repair.kind,
+        repair_attempt: repair.repairAttempt,
+      });
+      throw new SymphonyError(
+        "conflict",
+        `MCP handoff repair finished without required ${formatRepairableHandoffKind(repair.kind)} handoff`,
+        {
+          sourceRunId: repair.sourceRunId,
+          repairRunId: repair.entry.activeRunId ?? repair.entry.runId,
+          kind: repair.kind,
+          repairAttempt: repair.repairAttempt,
+        },
+      );
+    }
+    return {
+      details: {
+        accepted,
+        runId: repair.entry.activeRunId ?? repair.entry.runId,
+        sourceRunId: repair.sourceRunId,
+        kind: repair.kind,
+        repairAttempt: repair.repairAttempt,
+      },
+    };
+  }
+
+  private requireLoadedHandoffRepairContext(context: OrchestratorTransitionContext): {
+    entry: RunningEntry;
+    workspace: Workspace;
+    sourceRunId: string;
+    kind: RepairableHandoffKind;
+    repairAttempt: number;
+    turnNumber: number;
+    resume: AgentHermesResumeContext;
+    promptBundle?: AgentPromptBundle;
+  } {
+    const { entry, workspace, sourceRunId, kind, repairAttempt, turnNumber, resume, promptBundle } = context.handoffRepair;
+    if (!entry || !workspace || !sourceRunId || !kind || repairAttempt === undefined || turnNumber === undefined || !resume) {
+      throw new SymphonyError("invalid_request", "Handoff repair transition context was not loaded");
+    }
+    return {
+      entry,
+      workspace,
+      sourceRunId,
+      kind,
+      repairAttempt,
+      turnNumber,
+      resume,
+      ...(promptBundle === undefined ? {} : { promptBundle }),
+    };
+  }
+
   private createTransitionRulesets(): TransitionRuleset[] {
     return this.versionTransitionRulesets([
       {
@@ -3842,6 +4446,53 @@ export class Orchestrator {
       },
       ...this.createMergePolicyTransitionRulesets(),
       {
+        id: "orchestrator.handoff_reconciliation",
+        priority: 260,
+        evaluate: (snapshot) => {
+          const context = snapshot.transitionRequestContext;
+          if (
+            snapshot.triggerType !== "runtime.requested" ||
+            snapshot.triggerSource !== "transition" ||
+            snapshot.candidateSource !== "handoff_reconciliation" ||
+            context?.kind !== "handoff_reconciliation"
+          ) {
+            return null;
+          }
+          return {
+            transitionKind: handoffReconciliationTransitionKind(context.payload.handoffKind),
+            reason: `${context.payload.handoffKind}_handoff_reconciliation`,
+            role: context.payload.role,
+            runPhase: context.payload.runPhase,
+            runKind: context.payload.runKind,
+            runId: context.payload.runId,
+            handoffKind: context.payload.handoffKind,
+          };
+        },
+      },
+      {
+        id: "orchestrator.completion_report_rejection",
+        priority: 261,
+        evaluate: (snapshot) => {
+          const context = snapshot.transitionRequestContext;
+          if (
+            snapshot.triggerType !== "runtime.requested" ||
+            snapshot.triggerSource !== "transition" ||
+            snapshot.candidateSource !== "completion_report_rejection" ||
+            context?.kind !== "completion_report_rejection"
+          ) {
+            return null;
+          }
+          return {
+            transitionKind: "reconcile_completion_report_rejection",
+            reason: "completion_report_rejection_reconciliation",
+            role: context.payload.role,
+            runPhase: context.payload.runPhase,
+            runKind: context.payload.runKind,
+            runId: context.payload.runId,
+          };
+        },
+      },
+      {
         id: "orchestrator.dispatch.post_mortem.post_mortem",
         priority: 220,
         evaluate: (snapshot) =>
@@ -3860,7 +4511,10 @@ export class Orchestrator {
         id: "orchestrator.handoff_repair",
         priority: 300,
         evaluate: (snapshot) =>
-          snapshot.triggerType === "orchestrator.tick" && snapshot.candidateSource === "handoff_repair"
+          snapshot.triggerType === "runtime.requested" &&
+          snapshot.triggerSource === "transition" &&
+          snapshot.candidateSource === "handoff_repair" &&
+          snapshot.transitionRequestContext?.kind === "handoff_repair"
             ? {
                 transitionKind: "handoff_repair",
                 reason: "missing_required_mcp_handoff",
@@ -4698,42 +5352,13 @@ export class Orchestrator {
     };
   }
 
-  private async recordTransitionAction(entry: RunningEntry, action: TransitionActionRecord): Promise<void> {
-    if (entry.issueHistorySnapshotId === null) return;
-    try {
-      await this.issueStateStore.appendSnapshotAction(entry.issue, entry.issueHistorySnapshotId, action);
-    } catch (error) {
-      this.options.logger.warn("issue transition action recording failed", {
-        issue_id: entry.issue.id,
-        issue_identifier: entry.issue.identifier,
-        history_snapshot_id: entry.issueHistorySnapshotId,
-        action_type: action.actionType,
-        error: errorMessage(error),
-      });
-    }
-  }
-
-  private async recordIssueSnapshotAction(issue: Issue, historySnapshotId: string, action: TransitionActionRecord): Promise<void> {
-    try {
-      await this.issueStateStore.appendSnapshotAction(issue, historySnapshotId, action);
-    } catch (error) {
-      this.options.logger.warn("issue transition action recording failed", {
-        issue_id: issue.id,
-        issue_identifier: issue.identifier,
-        history_snapshot_id: historySnapshotId,
-        action_type: action.actionType,
-        error: errorMessage(error),
-      });
-    }
-  }
-
   private async recordTransitionError(entry: RunningEntry, error: unknown, actionId: string | null = null): Promise<void> {
     if (entry.issueHistorySnapshotId === null) return;
     try {
       await this.issueStateStore.appendSnapshotError(
         entry.issue,
         entry.issueHistorySnapshotId,
-        transitionErrorFromUnknown(error, { actionId }),
+        transitionErrorFromUnknown(error, { actionId, errorType: transitionErrorTypeFor(error) }),
       );
     } catch (recordError) {
       this.options.logger.warn("issue transition error recording failed", {
@@ -4840,6 +5465,8 @@ export class Orchestrator {
       headSupersessionRecovery: {},
       triageRebound: {},
       mergePolicy: {},
+      handoffRepair: {},
+      handoffReconciliation: {},
     };
     let acted = false;
     for (const action of definition.actions) {
@@ -4899,7 +5526,11 @@ export class Orchestrator {
         await this.issueStateStore.appendSnapshotError(
           issue,
           transition.historySnapshotId,
-          transitionErrorFromUnknown(error, { actionId, details: { actionType: action.id } }),
+          transitionErrorFromUnknown(error, {
+            actionId,
+            errorType: transitionErrorTypeFor(error),
+            details: { actionType: action.id },
+          }),
         );
         this.options.logger.warn("issue transition action failed", {
           issue_id: issue.id,
@@ -5583,21 +6214,21 @@ export class Orchestrator {
     try {
       await run;
       await this.onWorkerExit(issueId, "normal", null);
-      await this.recordTransitionAction(
-        entry,
-        transitionAction({
-          actionType: "agent_run_exit",
-          status: "succeeded",
-          message: "Agent run exited normally",
-          details: {
-            runId: entry.activeRunId ?? entry.runId,
-            sessionId: entry.sessionId,
-            role: entry.role,
-            runPhase: entry.runPhase,
-            tokens: entry.tokens,
-          },
-        }),
-      );
+      await this.recordIssueEvidenceSnapshot({
+        issue: entry.issue,
+        evidenceKind: "run",
+        eventType: "agent_run_exit",
+        sourceId: entry.activeRunId ?? entry.runId ?? null,
+        reason: "agent_run_exit",
+        payload: {
+          runId: entry.activeRunId ?? entry.runId,
+          sessionId: entry.sessionId,
+          role: entry.role,
+          runPhase: entry.runPhase,
+          runKind: runKindForPhase(entry.runPhase),
+          tokens: entry.tokens,
+        },
+      });
     } catch (error) {
       await this.recordTransitionError(entry, error);
       try {
@@ -5953,7 +6584,13 @@ export class Orchestrator {
   private async consumeHarnessEvents(
     entry: RunningEntry,
     events: AsyncIterable<AgentEvent>,
-    context: { workspace: Workspace; prompt: string; promptBundle?: AgentPromptBundle; attempt: number | null; turnNumber: number },
+    context: {
+      workspace: Workspace;
+      prompt: string;
+      promptBundle?: AgentPromptBundle;
+      attempt: number | null;
+      turnNumber: number;
+    },
   ): Promise<void> {
     for await (const rawEvent of events) {
       const event = sanitizeAgentEventForPublicOutput(rawEvent);
@@ -6051,26 +6688,6 @@ export class Orchestrator {
             promptTemplateKeys: context.promptBundle?.metadata.templateKeys ?? null,
           },
         });
-        await this.recordTransitionAction(
-          entry,
-          transitionAction({
-            actionType: "start_agent_run",
-            status: "succeeded",
-            message: `Started ${entry.role} run ${entry.runId}`,
-            details: {
-              runId: entry.runId,
-              sessionId: entry.sessionId,
-              role: entry.role,
-              runPhase: entry.runPhase,
-              runKind: runKindForPhase(entry.runPhase),
-              turnNumber: context.turnNumber,
-              attempt: context.attempt,
-              harnessId: this.options.harness.id,
-              workspaceKey: context.workspace.workspaceKey,
-              workspacePath: context.workspace.path,
-            },
-          }),
-        );
         if (entry.runPhase !== "issue_breakdown") {
           await this.discoverPullRequestForEntry(entry, context.workspace);
         }
@@ -6474,9 +7091,9 @@ export class Orchestrator {
   private async onWorkerExit(issueId: string, kind: "normal" | "abnormal", error: string | null): Promise<void> {
     const entry = this.running.get(issueId);
     if (!entry) return;
-    this.running.delete(issueId);
     this.endedRuntimeSeconds += (Date.now() - entry.startedAt.getTime()) / 1000;
 
+    try {
     if (entry.providerLimitSignal) {
       this.claimed.delete(issueId);
       return;
@@ -6535,6 +7152,7 @@ export class Orchestrator {
         this.claimed.delete(issueId);
         return;
       }
+      this.releaseRunningEntryForExit(issueId, entry);
       await this.recordPlanningFailure(
         entry,
         error ?? (kind === "normal" ? "Planning run completed without submit_issue_breakdown_plan" : "Planning run failed"),
@@ -6599,6 +7217,7 @@ export class Orchestrator {
       }
       if (entry.runPhase === "merge_conflict_resolution") {
         if (await this.shouldScheduleContinuation(entry)) {
+          this.releaseRunningEntryForExit(issueId, entry);
           await this.scheduleRetryTransition(entry.issue, 1, 1_000, null, entry.runPhase);
         } else {
           this.claimed.delete(issueId);
@@ -6626,6 +7245,7 @@ export class Orchestrator {
         return;
       }
       if (await this.shouldScheduleContinuation(entry)) {
+        this.releaseRunningEntryForExit(issueId, entry);
         await this.scheduleRetryTransition(entry.issue, 1, 1_000, null, entry.runPhase);
       } else {
         this.claimed.delete(issueId);
@@ -6739,7 +7359,17 @@ export class Orchestrator {
       }
       const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
       const delayMs = Math.min(10_000 * 2 ** (nextAttempt - 1), this.config.agent.maxRetryBackoffMs);
+      this.releaseRunningEntryForExit(issueId, entry);
       await this.scheduleRetryTransition(entry.issue, nextAttempt, delayMs, error, entry.runPhase);
+    }
+    } finally {
+      this.releaseRunningEntryForExit(issueId, entry);
+    }
+  }
+
+  private releaseRunningEntryForExit(issueId: string, entry: RunningEntry): void {
+    if (this.running.get(issueId) === entry) {
+      this.running.delete(issueId);
     }
   }
 
@@ -7119,6 +7749,7 @@ export class Orchestrator {
     turnNumber: number,
   ): Promise<{ attempted: boolean; accepted: boolean }> {
     if (entry.handoffRepair !== null) return { attempted: false, accepted: false };
+    if (entry.workspace !== workspace) return { attempted: false, accepted: false };
     const kind = await this.missingRepairableHandoffKind(entry);
     if (kind === null) return { attempted: false, accepted: false };
     if (!this.isHandoffRepairEnabled(kind)) return { attempted: false, accepted: false };
@@ -7129,11 +7760,27 @@ export class Orchestrator {
     const repairAttempt = await this.nextHandoffRepairAttempt(entry, sourceRunId, kind);
     if (repairAttempt === null) return { attempted: false, accepted: false };
 
-    const repairTransition = await this.decideIssueTransition({
+    const parentHistorySnapshotId = entry.issueHistorySnapshotId;
+    const parentTransitionKind = await this.transitionKindForHistorySnapshot(entry.issue, parentHistorySnapshotId);
+    const result = await this.requestTransition({
       issue: entry.issue,
-      triggerType: "orchestrator.tick",
-      triggerSource: "orchestrator",
       candidateSource: "handoff_repair",
+      context: {
+        kind: "handoff_repair",
+        requestId: `transition_request:${randomUUID()}`,
+        requestedAt: new Date().toISOString(),
+        parentHistorySnapshotId,
+        parentTransitionKind,
+        payload: {
+          sourceRunId,
+          kind,
+          repairAttempt,
+          turnNumber,
+          role: entry.role,
+          runPhase: entry.runPhase,
+          runKind: runKindForPhase(entry.runPhase),
+        },
+      },
       transitionPatch: {
         role: entry.role,
         runPhase: entry.runPhase,
@@ -7146,74 +7793,11 @@ export class Orchestrator {
         hermesProfileKey: resume.profileKey,
         hermesSessionKey: resume.sessionKey,
       },
-    });
-    const repairHistorySnapshotId = repairTransition?.transitionKind === "handoff_repair" ? repairTransition.historySnapshotId : null;
-    if (repairHistorySnapshotId !== null) {
-      await this.issueStateStore.appendSnapshotAction(
-        entry.issue,
-        repairHistorySnapshotId,
-        transitionAction({
-          actionType: "dispatch_handoff_repair",
-          status: "succeeded",
-          message: `Dispatching MCP handoff repair for ${formatRepairableHandoffKind(kind)}`,
-          details: {
-            sourceRunId,
-            kind,
-            repairAttempt,
-            maxAttempts: this.config.handoffRepair.maxAttempts,
-          },
-        }),
-      );
-    }
-    if (repairHistorySnapshotId !== null) {
-      entry.issueHistorySnapshotId = repairHistorySnapshotId;
-    }
-
-    entry.handoffRepair = { sourceRunId, kind, attempt: repairAttempt };
-    entry.hermesResume = resume;
-    entry.activeRunTokens = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-    const promptBundle = await this.renderHandoffRepairPromptBundle(entry, kind, sourceRunId, repairAttempt);
-    this.assertPromptBundleSupported(promptBundle);
-    await this.options.runStore?.appendEvent({
-      runId: sourceRunId,
-      at: new Date().toISOString(),
-      source: "orchestrator",
-      eventType: "handoff_repair_dispatched",
-      message: `Dispatching MCP handoff repair for ${formatRepairableHandoffKind(kind)}`,
-      payload: {
-        kind,
-        repairAttempt,
-        maxAttempts: this.config.handoffRepair.maxAttempts,
-      },
-    });
-    this.options.logger.warn("dispatching MCP handoff repair", {
-      issue_id: entry.issue.id,
-      issue_identifier: entry.issue.identifier,
-      source_run_id: sourceRunId,
-      kind,
-      repair_attempt: repairAttempt,
-    });
-    await this.prepareHarnessForRun(entry, workspace, attempt, turnNumber, promptBundle);
-    await this.reloadHarnessForRun(entry, workspace, attempt, turnNumber, promptBundle);
-    await this.consumeHarnessEvents(entry, this.options.harness.run(this.buildRunContext(entry, workspace, attempt, turnNumber, promptBundle), promptBundle.userPrompt), {
-      workspace,
-      prompt: promptBundle.userPrompt,
-      promptBundle,
       attempt,
-      turnNumber,
+      allowExistingClaim: true,
     });
-    const accepted = await this.reconcileRepairableHandoff(entry, kind);
-    if (!accepted) {
-      this.options.logger.warn("MCP handoff repair finished without required handoff", {
-        issue_id: entry.issue.id,
-        issue_identifier: entry.issue.identifier,
-        source_run_id: sourceRunId,
-        repair_run_id: entry.activeRunId ?? entry.runId,
-        kind,
-        repair_attempt: repairAttempt,
-      });
-    }
-    return { attempted: true, accepted };
+    const attempted = result.transition?.transitionKind === "handoff_repair" && result.acted;
+    return { attempted, accepted: attempted ? this.entryHasAcceptedRepairableHandoff(entry, kind) : false };
   }
 
   private async missingRepairableHandoffKind(entry: RunningEntry): Promise<RepairableHandoffKind | null> {
@@ -7266,6 +7850,42 @@ export class Orchestrator {
         return entry.issuePostMortemReportAccepted || (await this.reconcileIssuePostMortemHandoff(entry));
       case "merge_conflict_resolution":
         return entry.mergeConflictResolutionAccepted || (await this.reconcileMergeConflictResolutionHandoff(entry));
+    }
+  }
+
+  private entryHasAcceptedRepairableHandoff(entry: RunningEntry, kind: RepairableHandoffKind): boolean {
+    switch (kind) {
+      case "completion_report":
+        return entry.completionReportAccepted || entry.pullRequestHandoffAccepted;
+      case "review_verdict":
+        return entry.reviewVerdictAccepted;
+      case "issue_breakdown_plan":
+        return entry.issueBreakdownPlanAccepted;
+      case "issue_triage_report":
+        return entry.issueTriageReportAccepted;
+      case "issue_post_mortem_report":
+        return entry.issuePostMortemReportAccepted;
+      case "merge_conflict_resolution":
+        return entry.mergeConflictResolutionAccepted;
+    }
+  }
+
+  private async transitionKindForHistorySnapshot(
+    issue: Issue,
+    historySnapshotId: string | null,
+  ): Promise<IssueTransitionKind | null> {
+    if (historySnapshotId === null) return null;
+    try {
+      const record = await this.issueStateStore.get(issue.id);
+      return record?.history.find((snapshot) => snapshot.historySnapshotId === historySnapshotId)?.transitionKind ?? null;
+    } catch (error) {
+      this.options.logger.warn("issue transition parent lookup failed", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        history_snapshot_id: historySnapshotId,
+        error: errorMessage(error),
+      });
+      return null;
     }
   }
 
@@ -7348,6 +7968,7 @@ export class Orchestrator {
     kind: RepairableHandoffKind,
     sourceRunId: string,
     repairAttempt: number,
+    options: { recordAction?: boolean } = {},
   ): Promise<AgentPromptBundle> {
     const userPrompt = await this.renderHandoffRepairPrompt(entry, kind, sourceRunId, repairAttempt);
     return this.renderPromptBundle(
@@ -7366,7 +7987,11 @@ export class Orchestrator {
         requiredTool: repairToolName(kind),
         handoffKind: kind,
       },
-      { attempt: null, turnNumber: repairAttempt + 1 },
+      {
+        attempt: null,
+        turnNumber: repairAttempt + 1,
+        ...(options.recordAction === undefined ? {} : { recordAction: options.recordAction }),
+      },
     );
   }
 
@@ -7656,224 +8281,97 @@ export class Orchestrator {
   }
 
   private async reconcileCompletionReportHandoff(entry: RunningEntry): Promise<boolean> {
-    const store = this.options.lifecycleStore;
-    const runId = entry.activeRunId ?? entry.runId;
-    if (!store || !runId) return entry.completionReportAccepted;
-
-    const lifecycle = await store.get(entry.issue.id);
-    const report = lifecycle?.completionReports.find((item) => item.runId === runId) ?? null;
-    if (!lifecycle || !report) return entry.completionReportAccepted;
-    if (!isFinalizedCompletionReport(report)) {
-      if (!pendingPublicationHandoffForRun(lifecycle, { runId })) {
-        if (lifecycle.phase !== "review" || lifecycle.blockedReason !== null) return false;
-      }
-      entry.lifecycle = lifecycle;
-      entry.completionReportAccepted = true;
-      await this.recordTransitionAction(
-        entry,
-        transitionAction({
-          actionType: "receive_completion_report",
-          status: "succeeded",
-          message: "Completion report accepted pending publication",
-          details: {
-            reportId: report.id,
-            runId,
-            finalized: false,
-          },
-        }),
-      );
-      return true;
-    }
-
-    entry.lifecycle = lifecycle;
-    entry.completionReportAccepted = true;
-    await this.recordTransitionAction(
-      entry,
-      transitionAction({
-        actionType: "receive_completion_report",
-        status: "succeeded",
-        message: "Completion report accepted",
-        details: {
-          reportId: report.id,
-          runId,
-          finalized: isFinalizedCompletionReport(report),
-        },
-      }),
-    );
-
-    if (this.options.writeback) {
-      await this.options.writeback.processDue();
-    } else if (this.config.writeback.enabled) {
-      this.options.logger.warn("completion report accepted but writeback processor is not configured", {
-        issue_id: entry.issue.id,
-        issue_identifier: entry.issue.identifier,
-        run_id: runId,
-        report_id: report.id,
-      });
-    }
-
-    return true;
+    return this.requestHandoffReconciliationTransition(entry, "completion_report");
   }
 
   private async reconcileCompletionReportRejection(entry: RunningEntry): Promise<boolean> {
-    const store = this.options.lifecycleStore;
     const runId = entry.activeRunId ?? entry.runId;
-    if (!store || !runId) return false;
-
-    const lifecycle = await store.get(entry.issue.id);
-    const rejection = lifecycle?.completionReportRejections.find((item) => item.runId === runId) ?? null;
-    if (!lifecycle || !rejection) return false;
-
-    entry.lifecycle = lifecycle;
-    await this.recordTransitionAction(
-      entry,
-      transitionAction({
-        actionType: "reject_completion_report",
-        status: "succeeded",
-        message: rejection.reason,
-        details: {
-          rejectionId: rejection.id,
-          reportId: rejection.reportId,
+    if (!this.options.lifecycleStore || !runId) return false;
+    const parentHistorySnapshotId = entry.issueHistorySnapshotId;
+    const parentTransitionKind = await this.transitionKindForHistorySnapshot(entry.issue, parentHistorySnapshotId);
+    const result = await this.requestTransition({
+      issue: entry.issue,
+      candidateSource: "completion_report_rejection",
+      context: {
+        kind: "completion_report_rejection",
+        requestId: `transition_request:${randomUUID()}`,
+        requestedAt: new Date().toISOString(),
+        parentHistorySnapshotId,
+        parentTransitionKind,
+        payload: {
           runId,
-          unsatisfiedChecklistItems: rejection.acceptanceChecklist.filter((item) => !item.satisfied).map((item) => item.text),
+          role: entry.role,
+          runPhase: entry.runPhase,
+          runKind: runKindForPhase(entry.runPhase),
         },
-      }),
-    );
-
-    if (this.options.writeback) {
-      await this.options.writeback.processDue();
-    } else if (this.config.writeback.enabled) {
-      this.options.logger.warn("completion report rejected but writeback processor is not configured", {
-        issue_id: entry.issue.id,
-        issue_identifier: entry.issue.identifier,
-        run_id: runId,
-        rejection_id: rejection.id,
-      });
-    }
-
-    return true;
+      },
+      transitionPatch: {
+        role: entry.role,
+        runPhase: entry.runPhase,
+        runKind: runKindForPhase(entry.runPhase),
+        runId,
+      },
+      allowExistingClaim: true,
+    });
+    return result.transition?.transitionKind === "reconcile_completion_report_rejection" && result.acted;
   }
 
   private async reconcileMergeConflictResolutionHandoff(entry: RunningEntry): Promise<boolean> {
-    const store = this.options.lifecycleStore;
-    const runId = entry.activeRunId ?? entry.runId;
-    if (!store || !runId) return entry.mergeConflictResolutionAccepted;
-
-    const lifecycle = await store.get(entry.issue.id);
-    const report = lifecycle?.mergeConflictResolutionReports.find((item) => item.runId === runId) ?? null;
-    if (!lifecycle || !report) return entry.mergeConflictResolutionAccepted;
-
-    entry.lifecycle = lifecycle;
-    entry.mergeConflictResolutionAccepted = true;
-
-    if (this.options.writeback) {
-      await this.options.writeback.processDue();
-    } else if (this.config.writeback.enabled) {
-      this.options.logger.warn("merge conflict resolution accepted but writeback processor is not configured", {
-        issue_id: entry.issue.id,
-        issue_identifier: entry.issue.identifier,
-        run_id: runId,
-        report_id: report.id,
-      });
-    }
-
-    if (report.resolutionStatus === "resolved") {
-      await this.processMergePolicyTransitionCandidate(entry.issue);
-    }
-    return true;
+    return this.requestHandoffReconciliationTransition(entry, "merge_conflict_resolution");
   }
 
   private async reconcileIssueBreakdownPlanHandoff(entry: RunningEntry): Promise<boolean> {
-    const store = this.options.lifecycleStore;
-    const runId = entry.activeRunId ?? entry.runId;
-    if (!store || !runId) return entry.issueBreakdownPlanAccepted;
-    const lifecycle = await store.get(entry.issue.id);
-    const plan = lifecycle?.issueBreakdownPlans.find((item) => item.runId === runId) ?? null;
-    if (!lifecycle || !plan) return entry.issueBreakdownPlanAccepted;
-    entry.lifecycle = lifecycle;
-    entry.issueBreakdownPlanAccepted = true;
-    return true;
+    return this.requestHandoffReconciliationTransition(entry, "issue_breakdown_plan");
   }
 
   private async reconcileIssueTriageHandoff(entry: RunningEntry): Promise<boolean> {
-    const store = this.options.lifecycleStore;
-    const runId = entry.activeRunId ?? entry.runId;
-    if (!store || !runId) return entry.issueTriageReportAccepted;
-    const lifecycle = await store.get(entry.issue.id);
-    const report = lifecycle?.issueTriageReports.find((item) => item.runId === runId) ?? null;
-    if (!lifecycle || !report) return entry.issueTriageReportAccepted;
-    entry.lifecycle = lifecycle;
-    entry.issueTriageReportAccepted = true;
-
-    if (this.options.writeback) {
-      await this.options.writeback.processDue();
-    } else if (this.config.writeback.enabled) {
-      this.options.logger.warn("issue triage report accepted but writeback processor is not configured", {
-        issue_id: entry.issue.id,
-        issue_identifier: entry.issue.identifier,
-        run_id: runId,
-        report_id: report.id,
-        blockers: report.blockers.map((blocker) => ({ kind: blocker.kind, status: blocker.status, nextActor: blocker.nextActor })),
-      });
-    }
-
-    return true;
+    return this.requestHandoffReconciliationTransition(entry, "issue_triage_report");
   }
 
   private async reconcileIssuePostMortemHandoff(entry: RunningEntry): Promise<boolean> {
-    const store = this.options.lifecycleStore;
-    const runId = entry.activeRunId ?? entry.runId;
-    if (!store || !runId) return entry.issuePostMortemReportAccepted;
-    const lifecycle = await store.get(entry.issue.id);
-    const report = lifecycle?.postMortemReports.find((item) => item.runId === runId) ?? null;
-    if (!lifecycle || !report) return entry.issuePostMortemReportAccepted;
-    entry.lifecycle = lifecycle;
-    entry.issuePostMortemReportAccepted = true;
-
-    if (this.options.writeback) {
-      await this.options.writeback.processDue();
-    } else if (this.config.writeback.enabled) {
-      this.options.logger.warn("issue post-mortem report accepted but writeback processor is not configured", {
-        issue_id: entry.issue.id,
-        issue_identifier: entry.issue.identifier,
-        run_id: runId,
-        report_id: report.id,
-        completion_status: report.completionJudgment.status,
-        specification_quality: report.specificationAssessment.quality,
-      });
-    }
-
-    return true;
+    return this.requestHandoffReconciliationTransition(entry, "issue_post_mortem_report");
   }
 
   private async reconcileReviewVerdictHandoff(entry: RunningEntry): Promise<boolean> {
-    const store = this.options.lifecycleStore;
+    return this.requestHandoffReconciliationTransition(entry, "review_verdict");
+  }
+
+  private async requestHandoffReconciliationTransition(
+    entry: RunningEntry,
+    handoffKind: AgentHandoffRepairKind,
+  ): Promise<boolean> {
+    if (this.entryHasAcceptedRepairableHandoff(entry, handoffKind)) return true;
     const runId = entry.activeRunId ?? entry.runId;
-    if (!store || !runId) return entry.reviewVerdictAccepted;
-
-    const lifecycle = await store.get(entry.issue.id);
-    const verdict = lifecycle?.reviewVerdicts.find((item) => item.runId === runId) ?? null;
-    if (!lifecycle || !verdict) return entry.reviewVerdictAccepted;
-
-    entry.lifecycle = lifecycle;
-    entry.reviewVerdictAccepted = true;
-
-    if (this.options.writeback) {
-      await this.options.writeback.processDue();
-    } else if (this.config.writeback.enabled) {
-      this.options.logger.warn("review verdict accepted but writeback processor is not configured", {
-        issue_id: entry.issue.id,
-        issue_identifier: entry.issue.identifier,
-        run_id: runId,
-        verdict_id: verdict.id,
-        verdict: verdict.verdict,
-      });
-    }
-
-    if (verdict.verdict === "pass") {
-      await this.processMergePolicyTransitionCandidate(entry.issue);
-    }
-    return true;
+    if (!this.options.lifecycleStore || !runId) return false;
+    const parentHistorySnapshotId = entry.issueHistorySnapshotId;
+    const parentTransitionKind = await this.transitionKindForHistorySnapshot(entry.issue, parentHistorySnapshotId);
+    const result = await this.requestTransition({
+      issue: entry.issue,
+      candidateSource: "handoff_reconciliation",
+      context: {
+        kind: "handoff_reconciliation",
+        requestId: `transition_request:${randomUUID()}`,
+        requestedAt: new Date().toISOString(),
+        parentHistorySnapshotId,
+        parentTransitionKind,
+        payload: {
+          runId,
+          handoffKind,
+          role: entry.role,
+          runPhase: entry.runPhase,
+          runKind: runKindForPhase(entry.runPhase),
+        },
+      },
+      transitionPatch: {
+        role: entry.role,
+        runPhase: entry.runPhase,
+        runKind: runKindForPhase(entry.runPhase),
+        runId,
+        handoffKind,
+      },
+      allowExistingClaim: true,
+    });
+    return result.transition?.transitionKind === handoffReconciliationTransitionKind(handoffKind) && result.acted;
   }
 
   private async reconcileMergePolicyIssues(): Promise<void> {
@@ -8158,7 +8656,7 @@ export class Orchestrator {
     userPrompt: string,
     userTemplateKey: string,
     input: Parameters<PromptRenderer["render"]>[1],
-    options: { attempt: number | null; turnNumber: number; reviewerEvidence?: ReviewerDispatchEvidence | null } = {
+    options: { attempt: number | null; turnNumber: number; reviewerEvidence?: ReviewerDispatchEvidence | null; recordAction?: boolean } = {
       attempt: null,
       turnNumber: 1,
     },
@@ -8181,15 +8679,24 @@ export class Orchestrator {
         ephemeralSystemPromptCharCount: system.prompt.length,
       },
     };
-    await this.recordTransitionAction(
-      entry,
-      transitionAction({
-        actionType: "render_prompt",
-        status: "succeeded",
-        message: `Rendered prompt bundle ${userTemplateKey}`,
-        details: bundle.metadata,
-      }),
-    );
+    if (options.recordAction !== false && entry.issueHistorySnapshotId !== null) {
+      await this.recordIssueEvidenceSnapshot({
+        issue: entry.issue,
+        evidenceKind: "run",
+        eventType: "prompt_rendered",
+        sourceId: entry.activeRunId ?? entry.runId ?? entry.issueHistorySnapshotId,
+        reason: "prompt_rendered",
+        payload: {
+          role: entry.role,
+          runPhase: entry.runPhase,
+          runKind: runKindForPhase(entry.runPhase),
+          attempt: options.attempt,
+          turnNumber: options.turnNumber,
+          userTemplateKey,
+          metadata: bundle.metadata,
+        },
+      });
+    }
     return bundle;
   }
 
@@ -9179,6 +9686,20 @@ function issueTransitionRulesetPriority(kind: IssueTransitionKind): number {
       return 251;
     case "reconcile_post_mortem_report_writeback":
       return 252;
+    case "reconcile_completion_report_handoff":
+      return 253;
+    case "reconcile_completion_report_rejection":
+      return 254;
+    case "reconcile_merge_conflict_resolution_handoff":
+      return 255;
+    case "reconcile_issue_breakdown_plan_handoff":
+      return 256;
+    case "reconcile_issue_triage_report_handoff":
+      return 257;
+    case "reconcile_issue_post_mortem_handoff":
+      return 258;
+    case "reconcile_review_verdict_handoff":
+      return 259;
     case "block_issue":
       return 300;
     case "retry_run":
@@ -9187,6 +9708,23 @@ function issueTransitionRulesetPriority(kind: IssueTransitionKind): number {
       return 900;
     case "noop":
       return 1_000;
+  }
+}
+
+function handoffReconciliationTransitionKind(kind: AgentHandoffRepairKind): IssueTransitionKind {
+  switch (kind) {
+    case "completion_report":
+      return "reconcile_completion_report_handoff";
+    case "review_verdict":
+      return "reconcile_review_verdict_handoff";
+    case "issue_breakdown_plan":
+      return "reconcile_issue_breakdown_plan_handoff";
+    case "issue_triage_report":
+      return "reconcile_issue_triage_report_handoff";
+    case "issue_post_mortem_report":
+      return "reconcile_issue_post_mortem_handoff";
+    case "merge_conflict_resolution":
+      return "reconcile_merge_conflict_resolution_handoff";
   }
 }
 
@@ -9207,6 +9745,13 @@ function normalizeTransitionActionExecutionResult(result: unknown): {
     };
   }
   return { status: "succeeded", message: null, details: null, stop: false };
+}
+
+function transitionErrorTypeFor(error: unknown): "runtime" | "domain" {
+  if (error instanceof SymphonyError) {
+    return error.code === "agent_error" || error.code === "workspace_error" || error.code === "hook_error" ? "runtime" : "domain";
+  }
+  return "runtime";
 }
 
 function latestLifecycleCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {

@@ -46,6 +46,13 @@ export type IssueTransitionKind =
   | "merge_policy_recover_already_merged_pull_request"
   | "reconcile_issue_triage_report_writeback"
   | "reconcile_post_mortem_report_writeback"
+  | "reconcile_completion_report_handoff"
+  | "reconcile_completion_report_rejection"
+  | "reconcile_merge_conflict_resolution_handoff"
+  | "reconcile_issue_breakdown_plan_handoff"
+  | "reconcile_issue_triage_report_handoff"
+  | "reconcile_issue_post_mortem_handoff"
+  | "reconcile_review_verdict_handoff"
   | "reset_lifecycle_after_operator_resume"
   | "reset_merge_conflict_after_operator_resume"
   | "block_merge_conflict_attempt_limit"
@@ -78,7 +85,45 @@ export type MergePolicyChainTransitionRequestContext = TransitionRequestContextE
   }
 >;
 
-export type IssueTransitionRequestContext = MergePolicyChainTransitionRequestContext;
+export type HandoffRepairTransitionRequestContext = TransitionRequestContextEnvelope<
+  "handoff_repair",
+  {
+    sourceRunId: string;
+    kind: AgentHandoffRepairKind;
+    repairAttempt: number;
+    turnNumber: number;
+    role: AgentRunRole;
+    runPhase: AgentRunPhase;
+    runKind: AgentRunKind;
+  }
+>;
+
+export type HandoffReconciliationTransitionRequestContext = TransitionRequestContextEnvelope<
+  "handoff_reconciliation",
+  {
+    runId: string;
+    handoffKind: AgentHandoffRepairKind;
+    role: AgentRunRole;
+    runPhase: AgentRunPhase;
+    runKind: AgentRunKind;
+  }
+>;
+
+export type CompletionReportRejectionTransitionRequestContext = TransitionRequestContextEnvelope<
+  "completion_report_rejection",
+  {
+    runId: string;
+    role: AgentRunRole;
+    runPhase: AgentRunPhase;
+    runKind: AgentRunKind;
+  }
+>;
+
+export type IssueTransitionRequestContext =
+  | MergePolicyChainTransitionRequestContext
+  | HandoffRepairTransitionRequestContext
+  | HandoffReconciliationTransitionRequestContext
+  | CompletionReportRejectionTransitionRequestContext;
 
 export interface IssueCurrentFields {
   version: 1;

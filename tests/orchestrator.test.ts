@@ -257,9 +257,6 @@ describe("Orchestrator", () => {
         "claim_issue_for_run",
         "clear_retry_for_issue",
         "start_agent_run_monitor",
-        "render_prompt",
-        "start_agent_run",
-        "agent_run_exit",
       ]),
     );
     const evidenceEvents = issueState?.history
@@ -272,8 +269,10 @@ describe("Orchestrator", () => {
         "workspace:workspace_after_run_completed",
         "harness:harness_reload_completed",
         "lifecycle:lifecycle_updated",
+        "run:prompt_rendered",
         "run:run_started",
         "run:run_terminal_state_updated",
+        "run:agent_run_exit",
       ]),
     );
   });
@@ -3556,13 +3555,17 @@ describe("Orchestrator", () => {
       "merge_policy_dispatch_repair",
     ]);
     expect(
-      mergePolicySnapshots.map((snapshot) => ({
-        triggerType: snapshot.triggerType,
-        triggerSource: snapshot.triggerSource,
-        contextKind: snapshot.transitionRequestContext?.kind ?? null,
-        iteration: snapshot.transitionRequestContext?.payload.iteration ?? null,
-        maxIterations: snapshot.transitionRequestContext?.payload.maxIterations ?? null,
-      })),
+      mergePolicySnapshots.map((snapshot) => {
+        const context =
+          snapshot.transitionRequestContext?.kind === "merge_policy_chain" ? snapshot.transitionRequestContext : null;
+        return {
+          triggerType: snapshot.triggerType,
+          triggerSource: snapshot.triggerSource,
+          contextKind: snapshot.transitionRequestContext?.kind ?? null,
+          iteration: context?.payload.iteration ?? null,
+          maxIterations: context?.payload.maxIterations ?? null,
+        };
+      }),
     ).toEqual([
       {
         triggerType: "runtime.requested",
@@ -3586,13 +3589,17 @@ describe("Orchestrator", () => {
         maxIterations: 6,
       },
     ]);
-    const chainId = mergePolicySnapshots[0]?.transitionRequestContext?.payload.chainId;
+    const firstContext =
+      mergePolicySnapshots[0]?.transitionRequestContext?.kind === "merge_policy_chain"
+        ? mergePolicySnapshots[0].transitionRequestContext
+        : null;
+    const chainId = firstContext?.payload.chainId;
     expect(typeof chainId).toBe("string");
-    expect(mergePolicySnapshots.map((snapshot) => snapshot.transitionRequestContext?.payload.chainId)).toEqual([
-      chainId,
-      chainId,
-      chainId,
-    ]);
+    expect(
+      mergePolicySnapshots.map((snapshot) =>
+        snapshot.transitionRequestContext?.kind === "merge_policy_chain" ? snapshot.transitionRequestContext.payload.chainId : null,
+      ),
+    ).toEqual([chainId, chainId, chainId]);
     expect(mergePolicySnapshots[1]?.transitionRequestContext).toMatchObject({
       parentHistorySnapshotId: mergePolicySnapshots[0]?.historySnapshotId,
       parentTransitionKind: "merge_policy_reset_operator_resume",
@@ -5125,8 +5132,33 @@ describe("Orchestrator", () => {
     });
     const issueState = await readIssueState(stateDir, candidate.id);
     const workerSnapshots = issueState?.history.filter((snapshot) => snapshot.transitionKind === "dispatch_worker") ?? [];
-    expect(workerSnapshots.some((snapshot) => snapshot.actions.some((action) => action.actionType === "reject_completion_report"))).toBe(true);
     expect(workerSnapshots.every((snapshot) => snapshot.rulesetId !== "legacy.dispatch_worker")).toBe(true);
+    const rejectionSnapshot = issueState?.history.find((snapshot) => snapshot.transitionKind === "reconcile_completion_report_rejection");
+    expect(rejectionSnapshot).toMatchObject({
+      triggerType: "runtime.requested",
+      triggerSource: "transition",
+      candidateSource: "completion_report_rejection",
+      rulesetId: "orchestrator.completion_report_rejection",
+      runId: "reject-run-1",
+      transitionRequestContext: {
+        kind: "completion_report_rejection",
+        parentTransitionKind: "dispatch_worker",
+        payload: {
+          runId: "reject-run-1",
+          role: "worker",
+          runPhase: "implementation",
+          runKind: "implementation",
+        },
+      },
+    });
+    expect(rejectionSnapshot?.actions.map((action) => action.actionType)).toEqual(
+      expect.arrayContaining([
+        "load_completion_report_rejection",
+        "mark_completion_report_rejected",
+        "process_completion_report_rejection_writebacks",
+      ]),
+    );
+    expect(workerSnapshots.some((snapshot) => snapshot.actions.some((action) => action.actionType === "reject_completion_report"))).toBe(false);
     expect(issueState?.history.some((snapshot) => snapshot.transitionKind === "handoff_repair")).toBe(false);
   });
 
@@ -6372,7 +6404,8 @@ describe("Orchestrator", () => {
     const issueState = await readIssueState(stateDir, candidate.id);
     const repairSnapshot = issueState?.history.find((snapshot) => snapshot.transitionKind === "handoff_repair");
     expect(repairSnapshot).toMatchObject({
-      triggerType: "orchestrator.tick",
+      triggerType: "runtime.requested",
+      triggerSource: "transition",
       rulesetId: "orchestrator.handoff_repair",
       reason: "missing_required_mcp_handoff",
       role: "reviewer",
@@ -6383,12 +6416,322 @@ describe("Orchestrator", () => {
       handoffRepairAttempt: 1,
       hermesResumeSourceRunId: "review-source-run-1",
       hermesResumeReason: "handoff_repair",
+      transitionRequestContext: {
+        kind: "handoff_repair",
+        parentTransitionKind: "dispatch_reviewer",
+        payload: {
+          sourceRunId: "review-source-run-1",
+          kind: "review_verdict",
+          repairAttempt: 1,
+          turnNumber: 2,
+          role: "reviewer",
+          runPhase: "review",
+          runKind: "review",
+        },
+      },
     });
     expect(repairSnapshot).not.toHaveProperty("current");
     expect(repairSnapshot).not.toHaveProperty("transitionRequest");
     expect(repairSnapshot?.actions.map((action) => action.actionType)).toEqual(
-      expect.arrayContaining(["dispatch_handoff_repair", "render_prompt", "start_agent_run"]),
+      expect.arrayContaining([
+        "load_handoff_repair_context",
+        "dispatch_handoff_repair",
+        "render_handoff_repair_prompt",
+        "record_handoff_repair_dispatched_event",
+        "prepare_handoff_repair_harness",
+        "reload_handoff_repair_harness",
+        "run_handoff_repair_agent",
+        "reconcile_handoff_repair_result",
+      ]),
     );
+    expect(repairSnapshot?.actions.some((action) => action.actionType === "start_agent_run")).toBe(false);
+    const verdictSnapshot = issueState?.history.find(
+      (snapshot) => snapshot.transitionKind === "reconcile_review_verdict_handoff" && snapshot.runId === "review-repair-run-1",
+    );
+    expect(verdictSnapshot).toMatchObject({
+      triggerType: "runtime.requested",
+      triggerSource: "transition",
+      candidateSource: "handoff_reconciliation",
+      rulesetId: "orchestrator.handoff_reconciliation",
+      runId: "review-repair-run-1",
+      transitionRequestContext: {
+        kind: "handoff_reconciliation",
+        parentTransitionKind: "handoff_repair",
+        payload: {
+          runId: "review-repair-run-1",
+          handoffKind: "review_verdict",
+          role: "reviewer",
+          runPhase: "review",
+          runKind: "review",
+        },
+      },
+    });
+    expect(verdictSnapshot?.actions.map((action) => action.actionType)).toEqual(
+      expect.arrayContaining([
+        "load_review_verdict_handoff",
+        "mark_review_verdict_handoff_accepted",
+        "process_review_verdict_handoff_writebacks",
+        "request_merge_policy_after_pass_verdict",
+      ]),
+    );
+  });
+
+  it("skips handoff repair when the source run is not resumable", async () => {
+    const config = testConfig(root);
+    config.handoffRepair.enabled = true;
+    config.handoffRepair.phases = ["review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    config.writeback.enabled = true;
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("In Review") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    await runStore.startRun({
+      runId: report.runId,
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    const harness = new MissingReviewVerdictThenRepairHarness(lifecycleStore, outboxStore, runStore, {
+      writeSourceResumeMetadata: false,
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "non-resumable review source run");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "non-resumable review run exit");
+    await orchestrator.stop();
+
+    expect(harness.runs.map((run) => [run.runId, run.ctx.handoffRepair?.kind ?? null])).toEqual([
+      ["review-source-run-1", null],
+    ]);
+    const sourceRun = await runStore.getRun("review-source-run-1");
+    expect(sourceRun?.hermesProfileKey ?? null).toBeNull();
+    expect(sourceRun?.hermesSessionKey ?? null).toBeNull();
+    const issueState = await readIssueState(stateDir, candidate.id);
+    expect(issueState?.history.some((snapshot) => snapshot.transitionKind === "handoff_repair")).toBe(false);
+  });
+
+  it("skips handoff repair when the configured attempt budget is exhausted", async () => {
+    const config = testConfig(root);
+    config.handoffRepair.enabled = true;
+    config.handoffRepair.maxAttempts = 1;
+    config.handoffRepair.phases = ["review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    config.writeback.enabled = true;
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("In Review") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    await runStore.startRun({
+      runId: report.runId,
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    await runStore.startRun({
+      runId: "prior-review-repair-run-1",
+      sessionId: "prior-review-repair-session-1",
+      agentId: "prior-review-repair-agent-1",
+      role: "reviewer",
+      runPhase: "review",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 2,
+      prompt: "Prior repair prompt",
+      harnessId: "hermes",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+      metadata: {
+        handoffRepairSourceRunId: "review-source-run-1",
+        handoffRepairKind: "review_verdict",
+        handoffRepairAttempt: 1,
+      },
+    });
+    const harness = new MissingReviewVerdictThenRepairHarness(lifecycleStore, outboxStore, runStore);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "review source run with exhausted repair budget");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "exhausted-budget review run exit");
+    await orchestrator.stop();
+
+    expect(harness.runs.map((run) => [run.runId, run.ctx.handoffRepair?.kind ?? null])).toEqual([
+      ["review-source-run-1", null],
+    ]);
+    const issueState = await readIssueState(stateDir, candidate.id);
+    expect(issueState?.history.some((snapshot) => snapshot.transitionKind === "handoff_repair")).toBe(false);
+  });
+
+  it("records a domain transition error when handoff repair completes without the required handoff", async () => {
+    const config = testConfig(root);
+    config.handoffRepair.enabled = true;
+    config.handoffRepair.phases = ["review"];
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    config.writeback.enabled = true;
+    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("In Review") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const report = completionReportRecord(candidate);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+    });
+    await runStore.startRun({
+      runId: report.runId,
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, candidate.identifier),
+      gitBranchName: "symphony/TEST-1",
+      repoPath: root,
+      baseRef: "main",
+    });
+    const harness = new MissingReviewVerdictThenRepairHarness(lifecycleStore, outboxStore, runStore, {
+      submitRepairVerdict: false,
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 2, "review handoff repair without handoff dispatch");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "failed repair run exit");
+    await orchestrator.stop();
+
+    const issueState = await readIssueState(stateDir, candidate.id);
+    const repairSnapshot = issueState?.history.find((snapshot) => snapshot.transitionKind === "handoff_repair");
+    const failedAction = repairSnapshot?.actions.find((action) => action.actionType === "reconcile_handoff_repair_result");
+    expect(failedAction).toMatchObject({
+      status: "failed",
+      message: "MCP handoff repair finished without required review verdict handoff",
+    });
+    expect(repairSnapshot?.errors).toEqual([
+      expect.objectContaining({
+        errorType: "domain",
+        actionId: failedAction?.actionId,
+        code: "conflict",
+        message: "MCP handoff repair finished without required review verdict handoff",
+      }),
+    ]);
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      lastReviewVerdictId: null,
+      reviewVerdicts: [],
+    });
   });
 
   it("dispatches merge-conflict repair with the original implementation worker Hermes session", async () => {
@@ -10793,6 +11136,7 @@ class MissingReviewVerdictThenRepairHarness implements AgentHarness {
     private readonly lifecycleStore: FileIssueLifecycleStore,
     private readonly outboxStore: FileWritebackOutboxStore,
     private readonly runStore: FileRunTranscriptStore,
+    private readonly options: { submitRepairVerdict?: boolean; writeSourceResumeMetadata?: boolean } = {},
   ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
@@ -10800,19 +11144,21 @@ class MissingReviewVerdictThenRepairHarness implements AgentHarness {
     const runId = isRepair ? "review-repair-run-1" : "review-source-run-1";
     this.runs.push({ ctx, prompt, runId });
     yield { type: "session_started", sessionId: `${runId}-session`, runId };
-    await this.runStore.updateRun(runId, {
-      metadata: {
-        hermesProfileKey: isRepair ? "review-source-profile" : "review-source-profile",
-        hermesProfileDir: path.join(ctx.config.hermes.stateDir, "profiles", "review-source-profile"),
-        hermesSessionKey: isRepair ? "review-repair-session-key" : "review-source-session-key",
-        hermesResumeSourceRunId: ctx.hermesResume?.sourceRunId ?? null,
-        hermesResumeReason: ctx.hermesResume?.reason ?? null,
-        handoffRepairSourceRunId: ctx.handoffRepair?.sourceRunId ?? null,
-        handoffRepairKind: ctx.handoffRepair?.kind ?? null,
-        handoffRepairAttempt: ctx.handoffRepair?.attempt ?? null,
-      },
-    });
-    if (isRepair) {
+    if (isRepair || this.options.writeSourceResumeMetadata !== false) {
+      await this.runStore.updateRun(runId, {
+        metadata: {
+          hermesProfileKey: "review-source-profile",
+          hermesProfileDir: path.join(ctx.config.hermes.stateDir, "profiles", "review-source-profile"),
+          hermesSessionKey: isRepair ? "review-repair-session-key" : "review-source-session-key",
+          hermesResumeSourceRunId: ctx.hermesResume?.sourceRunId ?? null,
+          hermesResumeReason: ctx.hermesResume?.reason ?? null,
+          handoffRepairSourceRunId: ctx.handoffRepair?.sourceRunId ?? null,
+          handoffRepairKind: ctx.handoffRepair?.kind ?? null,
+          handoffRepairAttempt: ctx.handoffRepair?.attempt ?? null,
+        },
+      });
+    }
+    if (isRepair && this.options.submitRepairVerdict !== false) {
       await new ReviewVerdictService({
         config: ctx.config,
         lifecycleStore: this.lifecycleStore,
