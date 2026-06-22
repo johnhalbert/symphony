@@ -39,6 +39,7 @@ import { IssueTriageService, issueTriageTriggerFingerprint } from "../src/core/I
 import type { MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
+import type { IssueCurrentStateSnapshot, IssueHistorySnapshot } from "../src/core/orchestration/IssueOrchestrationState.js";
 import { SqliteIssueStateStore } from "../src/core/orchestration/SqliteIssueStateStore.js";
 import {
   FileIssueLifecycleStore,
@@ -80,6 +81,10 @@ import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
 type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
 type CommentWriteback = Extract<NewWritebackOperation, { kind: "comment" }>;
+type RequestedTransitionCall = {
+  candidateSource: string;
+  context: ReturnType<typeof mergePolicyChainContext>;
+};
 
 describe("Orchestrator", () => {
   let root: string;
@@ -3542,6 +3547,207 @@ describe("Orchestrator", () => {
       "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_abc123:repair:abc123_test_failure:r1",
       "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_abc123:repair:abc123_test_failure:r1:In Progress",
     ]);
+    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
+    const mergePolicySnapshots =
+      issueState?.history.filter((snapshot) => snapshot.candidateSource === "merge_policy_candidates") ?? [];
+    expect(mergePolicySnapshots.map((snapshot) => snapshot.transitionKind)).toEqual([
+      "merge_policy_reset_operator_resume",
+      "merge_policy_observe",
+      "merge_policy_dispatch_repair",
+    ]);
+    expect(
+      mergePolicySnapshots.map((snapshot) => ({
+        triggerType: snapshot.triggerType,
+        triggerSource: snapshot.triggerSource,
+        contextKind: snapshot.transitionRequestContext?.kind ?? null,
+        iteration: snapshot.transitionRequestContext?.payload.iteration ?? null,
+        maxIterations: snapshot.transitionRequestContext?.payload.maxIterations ?? null,
+      })),
+    ).toEqual([
+      {
+        triggerType: "runtime.requested",
+        triggerSource: "transition",
+        contextKind: "merge_policy_chain",
+        iteration: 0,
+        maxIterations: 6,
+      },
+      {
+        triggerType: "runtime.requested",
+        triggerSource: "transition",
+        contextKind: "merge_policy_chain",
+        iteration: 1,
+        maxIterations: 6,
+      },
+      {
+        triggerType: "runtime.requested",
+        triggerSource: "transition",
+        contextKind: "merge_policy_chain",
+        iteration: 2,
+        maxIterations: 6,
+      },
+    ]);
+    const chainId = mergePolicySnapshots[0]?.transitionRequestContext?.payload.chainId;
+    expect(typeof chainId).toBe("string");
+    expect(mergePolicySnapshots.map((snapshot) => snapshot.transitionRequestContext?.payload.chainId)).toEqual([
+      chainId,
+      chainId,
+      chainId,
+    ]);
+    expect(mergePolicySnapshots[1]?.transitionRequestContext).toMatchObject({
+      parentHistorySnapshotId: mergePolicySnapshots[0]?.historySnapshotId,
+      parentTransitionKind: "merge_policy_reset_operator_resume",
+    });
+    expect(mergePolicySnapshots[2]?.transitionRequestContext).toMatchObject({
+      parentHistorySnapshotId: mergePolicySnapshots[1]?.historySnapshotId,
+      parentTransitionKind: "merge_policy_observe",
+    });
+  });
+
+  it("merge-policy rulesets require requested-transition provenance and candidate source", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const observeRuleset = orchestrator
+      .registeredTransitionRulesets()
+      .find((ruleset) => ruleset.id === "orchestrator.merge_policy.observe");
+    expect(observeRuleset).toBeDefined();
+    const base = mergePolicyRulesetSnapshot();
+
+    expect(observeRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "merge_policy_observe",
+      mergePolicyObservationInputFingerprint: "merge-policy-input",
+    });
+    expect(
+      observeRuleset?.evaluate(
+        {
+          ...base,
+          triggerType: "runtime.requested",
+          triggerSource: "transition",
+          transitionRequestContext: mergePolicyChainContext(0),
+        },
+        [],
+      ),
+    ).toMatchObject({
+      transitionKind: "merge_policy_observe",
+      mergePolicyObservationInputFingerprint: "merge-policy-input",
+    });
+    expect(observeRuleset?.evaluate({ ...base, candidateSource: "worker_candidates" }, [])).toBeNull();
+    expect(
+      observeRuleset?.evaluate(
+        {
+          ...base,
+          triggerType: "runtime.requested",
+          triggerSource: "transition",
+          candidateSource: "worker_candidates",
+          transitionRequestContext: mergePolicyChainContext(0),
+        },
+        [],
+      ),
+    ).toBeNull();
+    expect(
+      observeRuleset?.evaluate(
+        {
+          ...base,
+          triggerType: "runtime.requested",
+          triggerSource: "transition",
+          transitionRequestContext: null,
+        },
+        [],
+      ),
+    ).toBeNull();
+    expect(
+      observeRuleset?.evaluate(
+        {
+          ...base,
+          triggerType: "runtime.requested",
+          triggerSource: "transition",
+          transitionRequestContext: {
+            ...mergePolicyChainContext(0),
+            kind: "other_requested_transition",
+          } as never,
+        },
+        [],
+      ),
+    ).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it.each([
+    {
+      name: "null transition",
+      response: { transition: null, acted: false },
+    },
+    {
+      name: "noop transition",
+      response: { transition: transitionSnapshot("noop", "noop-1"), acted: false },
+    },
+    {
+      name: "unacted transition",
+      response: { transition: transitionSnapshot("merge_policy_observe", "observe-1"), acted: false },
+    },
+    {
+      name: "non-continuable transition",
+      response: { transition: transitionSnapshot("merge_policy_dispatch_repair", "dispatch-repair-1"), acted: true },
+    },
+  ])("merge-policy requested transition chain stops on $name", async ({ response }) => {
+    const { candidate, orchestrator, requester } = mergePolicyLoopHarness(root, [response]);
+
+    await requester.processMergePolicyTransitionCandidate(candidate);
+    await orchestrator.stop();
+
+    expect(requester.requestTransition).toHaveBeenCalledTimes(1);
+    const requestCalls = requester.requestTransition.mock.calls as Array<[RequestedTransitionCall]>;
+    expect(requestCalls[0]?.[0]).toMatchObject({
+      candidateSource: "merge_policy_candidates",
+      context: {
+        kind: "merge_policy_chain",
+        parentHistorySnapshotId: null,
+        parentTransitionKind: null,
+        payload: {
+          iteration: 0,
+          maxIterations: 6,
+        },
+      },
+    });
+  });
+
+  it("merge-policy requested transition chain increments context and logs when the cap is reached", async () => {
+    const logs: string[] = [];
+    const responses = Array.from({ length: 6 }, (_, index) => ({
+      transition: transitionSnapshot("merge_policy_observe", `observe-${index}`),
+      acted: true,
+    }));
+    const { candidate, orchestrator, requester } = mergePolicyLoopHarness(root, responses, logs);
+
+    await requester.processMergePolicyTransitionCandidate(candidate);
+    await orchestrator.stop();
+
+    expect(requester.requestTransition).toHaveBeenCalledTimes(6);
+    const requestCalls = requester.requestTransition.mock.calls as Array<[RequestedTransitionCall]>;
+    const contexts = requestCalls.map((call) => call[0].context);
+    expect(contexts.map((context) => context.payload.iteration)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(contexts.map((context) => context.payload.maxIterations)).toEqual([6, 6, 6, 6, 6, 6]);
+    expect(new Set(contexts.map((context) => context.payload.chainId)).size).toBe(1);
+    expect(contexts[0]).toMatchObject({
+      parentHistorySnapshotId: null,
+      parentTransitionKind: null,
+    });
+    expect(contexts[1]).toMatchObject({
+      parentHistorySnapshotId: "observe-0",
+      parentTransitionKind: "merge_policy_observe",
+    });
+    expect(contexts[5]).toMatchObject({
+      parentHistorySnapshotId: "observe-4",
+      parentTransitionKind: "merge_policy_observe",
+    });
+    expect(logs.some((line) => line.includes('message="merge policy transition chain reached iteration cap"'))).toBe(true);
   });
 
   it("manual worker dispatch does not auto-route planning-labeled issues to planner", async () => {
@@ -9488,6 +9694,196 @@ async function readIssueState(stateDir: string, issueIdOrIdentifier: string) {
   } finally {
     await store.close();
   }
+}
+
+function emptyTracker(): TrackerClient {
+  return {
+    async fetchCandidateIssues() {
+      return [];
+    },
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssueStatesByIds() {
+      return [];
+    },
+  };
+}
+
+function mergePolicyChainContext(iteration: number, parent: IssueHistorySnapshot | null = null) {
+  return {
+    kind: "merge_policy_chain" as const,
+    requestId: `transition-request-${iteration}`,
+    requestedAt: "2026-01-01T00:00:01.000Z",
+    parentHistorySnapshotId: parent?.historySnapshotId ?? null,
+    parentTransitionKind: parent?.transitionKind ?? null,
+    payload: {
+      chainId: "merge-policy-chain-1",
+      iteration,
+      maxIterations: 6,
+    },
+  };
+}
+
+function mergePolicyRulesetSnapshot(overrides: Partial<IssueCurrentStateSnapshot> = {}): IssueCurrentStateSnapshot {
+  const now = "2026-01-01T00:00:00.000Z";
+  const candidate = issue({ state: "Ready to Merge", branchName: "symphony/TEST-1" });
+  return {
+    version: 1,
+    issueId: candidate.id,
+    issueIdentifier: candidate.identifier,
+    title: candidate.title,
+    description: candidate.description,
+    priority: candidate.priority,
+    trackerState: candidate.state,
+    branchName: candidate.branchName,
+    trackerUrl: candidate.url,
+    assigneeId: candidate.assigneeId,
+    delegateId: candidate.delegateId,
+    assignedToWorker: candidate.assignedToWorker,
+    labels: candidate.labels,
+    blockedBy: candidate.blockedBy,
+    hasChildren: candidate.hasChildren === true,
+    trackerCreatedAt: candidate.createdAt,
+    trackerUpdatedAt: candidate.updatedAt,
+    phase: "passed",
+    reviewRound: 0,
+    incompleteTurnCount: 0,
+    planningFailureCount: 0,
+    planningDispatchRetryCount: 0,
+    lastPlanningFailureAt: null,
+    planningRetryDueAt: null,
+    blockedReason: null,
+    lastIssueBreakdownPlanId: null,
+    lastIssueBreakdownPlanApplicationStatus: null,
+    lastIssueBreakdownPlanIssueContentFingerprint: null,
+    lastIssueBreakdownPlanConfigFingerprint: null,
+    lastIssueBreakdownPlanSatisfiesCurrentValidation: false,
+    currentIssueContentFingerprint: "issue-fingerprint",
+    currentIssueBreakdownConfigFingerprint: "breakdown-config",
+    lastIssueTriageReportId: null,
+    lastIssueTriageReportTriggerFingerprint: null,
+    lastIssueTriageReportWritebackOperationKeys: null,
+    currentIssueTriageTriggerFingerprint: null,
+    issueTriageCurrentTriggerReportIds: [],
+    latestIssueTriageReportBlockers: [],
+    lastPostMortemReportId: null,
+    lastPostMortemReportTriggerFingerprint: null,
+    lastPostMortemReportWritebackOperationKeys: null,
+    currentPostMortemTriggerFingerprint: null,
+    postMortemCurrentTriggerReportIds: [],
+    lastCompletionReportId: null,
+    lastCompletionReportRejectionId: null,
+    lastReviewVerdictId: null,
+    lastMergeGateResultId: null,
+    latestCompletionReport: null,
+    latestApprovalPassVerdict: null,
+    mergeGate: null,
+    mergeConflict: null,
+    lifecycleSummaryCiStatus: null,
+    mergePolicyMode: "gated",
+    mergePolicySourceStates: ["Ready to Merge"],
+    mergePolicyDoneState: "Done",
+    mergePolicyConflictsState: "Merge Conflict",
+    mergePolicyRequiredChecks: ["test"],
+    mergePolicyMaxMergeGateFailures: 3,
+    mergePolicyConfigFingerprint: "merge-policy-config",
+    currentMergePolicyObservationInputFingerprint: "merge-policy-input",
+    lastMergePolicyObservationFingerprint: null,
+    lastMergePolicyObservationStatus: null,
+    lastMergePolicyObservation: null,
+    mergePolicyMerge: null,
+    mergePolicyMergeGate: null,
+    mergePolicyMergeGateResults: [],
+    mergePolicyMergeConflict: null,
+    mergePolicyLatestCompletionReport: null,
+    mergePolicyLatestApprovalVerdict: null,
+    mergePolicyReviewFeedback: [],
+    mergePolicyLatestCompletionRun: null,
+    pendingPublicationApprovalRunId: null,
+    pendingPublicationApprovalReportId: null,
+    pendingPublicationApprovalReason: null,
+    latestRunId: null,
+    latestRunStatus: null,
+    latestRunRole: null,
+    latestRunPhase: null,
+    latestRunKind: null,
+    latestRunCompletedAt: null,
+    latestRunError: null,
+    latestPrUrl: null,
+    latestPrNumber: 42,
+    latestPrHeadSha: "abc123",
+    latestPrBranch: "symphony/TEST-1",
+    latestWorkspaceKey: null,
+    latestWorkspacePath: null,
+    latestGitBranchName: "symphony/TEST-1",
+    running: false,
+    runningRole: null,
+    runningRunPhase: null,
+    runningRunKind: null,
+    runningManualDispatchStage: null,
+    runningManualIgnoreState: false,
+    runningHasPendingPublicationApproval: false,
+    runningCancellationRequested: false,
+    claimed: false,
+    paused: false,
+    retrying: false,
+    consecutiveSdkErrorFailures: 0,
+    consecutiveInfraFailures: 0,
+    recordCreatedAt: now,
+    recordUpdatedAt: now,
+    snapshotId: "snapshot-1",
+    snapshotAt: now,
+    triggerType: "orchestrator.tick",
+    triggerId: "tick-1",
+    triggerAt: now,
+    triggerSource: "orchestrator",
+    candidateSource: "merge_policy_candidates",
+    transitionRequestContext: null,
+    availableSlots: 1,
+    providerDispatchGateActive: false,
+    stateSlotAvailable: true,
+    allowExistingClaim: false,
+    manualStage: null,
+    manualForceLabels: false,
+    manualIgnoreState: false,
+    ...overrides,
+  };
+}
+
+function transitionSnapshot(
+  transitionKind: IssueHistorySnapshot["transitionKind"],
+  historySnapshotId: string,
+): IssueHistorySnapshot {
+  return {
+    transitionKind,
+    historySnapshotId,
+  } as IssueHistorySnapshot;
+}
+
+function mergePolicyLoopHarness(
+  root: string,
+  responses: Array<{ transition: IssueHistorySnapshot | null; acted: boolean }>,
+  logs: string[] = [],
+) {
+  const config = mergePolicyOrchestratorConfig(root);
+  const logger = new StructuredLogger((line) => logs.push(line));
+  const candidate = issue({ state: "Ready to Merge", branchName: "symphony/TEST-1" });
+  const orchestrator = new Orchestrator({
+    config,
+    tracker: emptyTracker(),
+    workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+    harness: new FakeHarness(),
+    logger,
+    promptTemplate: "Work on {{ issue.identifier }}",
+  });
+  const requester = orchestrator as unknown as {
+    requestTransition: ReturnType<typeof vi.fn>;
+    processMergePolicyTransitionCandidate(issue: Issue): Promise<void>;
+  };
+  let responseIndex = 0;
+  requester.requestTransition = vi.fn(async () => responses[Math.min(responseIndex++, responses.length - 1)]);
+  return { candidate, orchestrator, requester };
 }
 
 class BlockingHarness implements AgentHarness {

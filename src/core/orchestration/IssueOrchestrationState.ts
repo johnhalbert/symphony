@@ -15,7 +15,8 @@ import type {
 import type { RunRecord } from "../persistence/RunTranscriptStore.js";
 import type { AgentRunPhase, AgentRunKind, AgentRunRole, Issue, TokenCounts } from "../types.js";
 
-export type IssueTriggerType = "orchestrator.tick" | "manual.cli_agent_run";
+export type IssueTriggerType = "orchestrator.tick" | "manual.cli_agent_run" | "runtime.requested";
+export type IssueTriggerSource = "orchestrator" | "manual_cli" | "transition";
 
 export type IssueTransitionKind =
   | "record_evidence"
@@ -58,6 +59,26 @@ export type IssueTransitionKind =
 
 export type IssueHistorySnapshotKind = "transition" | "evidence";
 export type IssueEvidenceKind = "run" | "lifecycle" | "writeback" | "approval" | "workspace" | "tracker" | "harness";
+
+export interface TransitionRequestContextEnvelope<K extends string, P> {
+  kind: K;
+  requestId: string;
+  requestedAt: string;
+  parentHistorySnapshotId: string | null;
+  parentTransitionKind: IssueTransitionKind | null;
+  payload: P;
+}
+
+export type MergePolicyChainTransitionRequestContext = TransitionRequestContextEnvelope<
+  "merge_policy_chain",
+  {
+    chainId: string;
+    iteration: number;
+    maxIterations: number;
+  }
+>;
+
+export type IssueTransitionRequestContext = MergePolicyChainTransitionRequestContext;
 
 export interface IssueCurrentFields {
   version: 1;
@@ -175,8 +196,9 @@ export interface IssueCurrentStateSnapshot extends IssueCurrentFields {
   triggerType: IssueTriggerType;
   triggerId: string;
   triggerAt: string;
-  triggerSource: "orchestrator" | "manual_cli";
+  triggerSource: IssueTriggerSource;
   candidateSource: string;
+  transitionRequestContext: IssueTransitionRequestContext | null;
   availableSlots: number;
   providerDispatchGateActive: boolean;
   stateSlotAvailable: boolean;

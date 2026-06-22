@@ -112,6 +112,8 @@ import {
   type IssueTransition,
   type IssueTransitionKind,
   type IssueTransitionRequest,
+  type IssueTransitionRequestContext,
+  type IssueTriggerSource,
   type IssueTriggerType,
   type TransitionActionRecord,
   type TransitionRuleset,
@@ -528,10 +530,21 @@ interface MergePolicyTransitionScratch {
 interface IssueTransitionEventInput {
   issue: Issue;
   triggerType: IssueTriggerType;
+  triggerSource: IssueTriggerSource;
   candidateSource: string;
   manualStage?: ManualAgentRunStage | null;
   manualForceLabels?: boolean;
   manualIgnoreState?: boolean;
+  snapshotPatch?: Partial<IssueCurrentStateSnapshot>;
+  transitionPatch?: Partial<IssueTransitionRequest>;
+  attempt?: number | null;
+  allowExistingClaim?: boolean;
+}
+
+interface RequestedIssueTransitionInput {
+  issue: Issue;
+  candidateSource: string;
+  context: IssueTransitionRequestContext;
   snapshotPatch?: Partial<IssueCurrentStateSnapshot>;
   transitionPatch?: Partial<IssueTransitionRequest>;
   attempt?: number | null;
@@ -1370,6 +1383,7 @@ export class Orchestrator {
     let transition = await this.decideIssueTransition({
       issue,
       triggerType: "manual.cli_agent_run",
+      triggerSource: "manual_cli",
       candidateSource: "request_issue_breakdown",
       manualStage: "planner",
       manualForceLabels: false,
@@ -1380,6 +1394,7 @@ export class Orchestrator {
       transition = await this.decideIssueTransition({
         issue,
         triggerType: "manual.cli_agent_run",
+        triggerSource: "manual_cli",
         candidateSource: "request_issue_breakdown",
         manualStage: "planner",
         manualForceLabels: false,
@@ -1496,6 +1511,7 @@ export class Orchestrator {
     let transition = await this.decideIssueTransition({
       issue: dispatchIssue,
       triggerType: "manual.cli_agent_run",
+      triggerSource: "manual_cli",
       candidateSource: `manual.${options.stage}`,
       manualStage: options.stage,
       manualForceLabels: manualDispatch.forceLabels,
@@ -1506,6 +1522,7 @@ export class Orchestrator {
       transition = await this.decideIssueTransition({
         issue: dispatchIssue,
         triggerType: "manual.cli_agent_run",
+        triggerSource: "manual_cli",
         candidateSource: `manual.${options.stage}`,
         manualStage: options.stage,
         manualForceLabels: manualDispatch.forceLabels,
@@ -4165,8 +4182,13 @@ export class Orchestrator {
   }
 
   private rulesetCanReconcileMergePolicy(snapshot: IssueCurrentStateSnapshot): boolean {
-    if (snapshot.triggerType !== "orchestrator.tick") return false;
     if (snapshot.candidateSource !== "merge_policy_candidates") return false;
+    const triggerAllowed =
+      snapshot.triggerType === "orchestrator.tick" ||
+      (snapshot.triggerType === "runtime.requested" &&
+        snapshot.triggerSource === "transition" &&
+        snapshot.transitionRequestContext?.kind === "merge_policy_chain");
+    if (!triggerAllowed) return false;
     if (snapshot.mergePolicyMode !== "gated") return false;
     if (snapshot.running || snapshot.paused) return false;
     return this.rulesetPassesLabelGuardrails(snapshot, "merge_policy");
@@ -4327,6 +4349,7 @@ export class Orchestrator {
   private async decideIssueTransition(input: {
     issue: Issue;
     triggerType: IssueTriggerType;
+    triggerSource: IssueTriggerSource;
     candidateSource: string;
     manualStage?: ManualAgentRunStage | null;
     manualForceLabels?: boolean;
@@ -4346,8 +4369,9 @@ export class Orchestrator {
         triggerType: input.triggerType,
         triggerId: `${input.triggerType}:${randomUUID()}`,
         triggerAt: now,
-        triggerSource: input.triggerType === "manual.cli_agent_run" ? "manual_cli" : "orchestrator",
+        triggerSource: input.triggerSource,
         candidateSource: input.candidateSource,
+        transitionRequestContext: null,
         availableSlots: this.availableSlots(),
         providerDispatchGateActive: this.activeProviderGates.some((gate) => this.providerGateMatchesConfiguredRuntime(gate)),
         stateSlotAvailable: this.hasStateSlot(input.issue.state),
@@ -4376,6 +4400,7 @@ export class Orchestrator {
   private async recordIssueTransition(input: {
     issue: Issue;
     triggerType: IssueTriggerType;
+    triggerSource?: IssueTriggerSource;
     candidateSource: string;
     request: IssueTransitionRequest;
     rulesetId?: string;
@@ -4396,8 +4421,9 @@ export class Orchestrator {
         triggerType: input.triggerType,
         triggerId: `${input.triggerType}:${randomUUID()}`,
         triggerAt: now,
-        triggerSource: input.triggerType === "manual.cli_agent_run" ? "manual_cli" : "orchestrator",
+        triggerSource: input.triggerSource ?? (input.triggerType === "manual.cli_agent_run" ? "manual_cli" : "orchestrator"),
         candidateSource: input.candidateSource,
+        transitionRequestContext: null,
         availableSlots: this.availableSlots(),
         providerDispatchGateActive: this.activeProviderGates.some((gate) => this.providerGateMatchesConfiguredRuntime(gate)),
         stateSlotAvailable: this.hasStateSlot(input.issue.state),
@@ -4730,6 +4756,7 @@ export class Orchestrator {
     const result = await this.processIssueTransitionEvent({
       issue,
       triggerType: "orchestrator.tick",
+      triggerSource: "orchestrator",
       candidateSource: input.candidateSource,
       attempt: input.attempt ?? null,
       allowExistingClaim: input.allowExistingClaim === true,
@@ -4753,10 +4780,27 @@ export class Orchestrator {
     }
   }
 
+  private async requestTransition(input: RequestedIssueTransitionInput): Promise<IssueTransitionEventResult> {
+    return this.processIssueTransitionEvent({
+      issue: input.issue,
+      triggerType: "runtime.requested",
+      triggerSource: "transition",
+      candidateSource: input.candidateSource,
+      snapshotPatch: {
+        ...(input.snapshotPatch ?? {}),
+        transitionRequestContext: input.context,
+      },
+      ...(input.transitionPatch === undefined ? {} : { transitionPatch: input.transitionPatch }),
+      attempt: input.attempt ?? null,
+      allowExistingClaim: input.allowExistingClaim === true,
+    });
+  }
+
   private async processIssueTransitionEvent(input: IssueTransitionEventInput): Promise<IssueTransitionEventResult> {
     const transition = await this.decideIssueTransition({
       issue: input.issue,
       triggerType: input.triggerType,
+      triggerSource: input.triggerSource,
       candidateSource: input.candidateSource,
       ...(input.manualStage === undefined ? {} : { manualStage: input.manualStage }),
       ...(input.manualForceLabels === undefined ? {} : { manualForceLabels: input.manualForceLabels }),
@@ -6886,6 +6930,7 @@ export class Orchestrator {
     const result = await this.processIssueTransitionEvent({
       issue,
       triggerType: "orchestrator.tick",
+      triggerSource: "orchestrator",
       candidateSource: "retry_schedule",
       snapshotPatch: {
         retryAttempt: attempt,
@@ -7087,6 +7132,7 @@ export class Orchestrator {
     const repairTransition = await this.decideIssueTransition({
       issue: entry.issue,
       triggerType: "orchestrator.tick",
+      triggerSource: "orchestrator",
       candidateSource: "handoff_repair",
       transitionPatch: {
         role: entry.role,
@@ -7551,6 +7597,7 @@ export class Orchestrator {
     const result = await this.processIssueTransitionEvent({
       issue,
       triggerType: "orchestrator.tick",
+      triggerSource: "orchestrator",
       candidateSource: "block_issue",
       snapshotPatch: {
         triggerRunId: runId,
@@ -7850,18 +7897,35 @@ export class Orchestrator {
   }
 
   private async processMergePolicyTransitionCandidate(issue: Issue): Promise<void> {
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      const result = await this.processIssueTransitionEvent({
+    const chainId = `merge_policy_chain:${randomUUID()}`;
+    const maxIterations = 6;
+    let previousTransition: IssueHistorySnapshot | null = null;
+    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+      const result = await this.requestTransition({
         issue,
-        triggerType: "orchestrator.tick",
         candidateSource: "merge_policy_candidates",
+        context: {
+          kind: "merge_policy_chain",
+          requestId: `transition_request:${randomUUID()}`,
+          requestedAt: new Date().toISOString(),
+          parentHistorySnapshotId: previousTransition?.historySnapshotId ?? null,
+          parentTransitionKind: previousTransition?.transitionKind ?? null,
+          payload: {
+            chainId,
+            iteration,
+            maxIterations,
+          },
+        },
       });
       if (result.transition === null || result.transition.transitionKind === "noop" || !result.acted) return;
+      previousTransition = result.transition;
       if (!mergePolicyTransitionShouldContinue(result.transition.transitionKind)) return;
     }
     this.options.logger.warn("merge policy transition chain reached iteration cap", {
       issue_id: issue.id,
       issue_identifier: issue.identifier,
+      chain_id: chainId,
+      max_iterations: maxIterations,
     });
   }
 

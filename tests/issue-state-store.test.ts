@@ -143,6 +143,62 @@ describe("SqliteIssueStateStore", () => {
       ],
     });
   });
+
+  it("round-trips runtime requested transition context in snapshot json", async () => {
+    const store = new SqliteIssueStateStore(root);
+    stores.push(store);
+    const current = currentFields();
+    await store.ensureIssue(current);
+    const snapshot = new IssueOrchestrationEngine([
+      {
+        id: "orchestrator.merge_policy.observe",
+        priority: 150,
+        evaluate: () => ({ transitionKind: "merge_policy_observe", reason: "merge_policy_live_observation_required" }),
+      },
+    ]).decide(
+      currentSnapshot(current, {
+        triggerType: "runtime.requested",
+        triggerSource: "transition",
+        candidateSource: "merge_policy_candidates",
+        transitionRequestContext: {
+          kind: "merge_policy_chain",
+          requestId: "transition-request-1",
+          requestedAt: "2026-01-01T00:00:01.000Z",
+          parentHistorySnapshotId: null,
+          parentTransitionKind: null,
+          payload: {
+            chainId: "merge-policy-chain-1",
+            iteration: 0,
+            maxIterations: 6,
+          },
+        },
+      }),
+      [],
+    );
+    expect(snapshot).not.toBeNull();
+
+    await store.appendSnapshot({ id: current.issueId, identifier: current.issueIdentifier }, snapshot!);
+    const reloaded = new SqliteIssueStateStore(root);
+    stores.push(reloaded);
+
+    await expect(reloaded.get(current.issueIdentifier)).resolves.toMatchObject({
+      history: [
+        {
+          triggerType: "runtime.requested",
+          triggerSource: "transition",
+          candidateSource: "merge_policy_candidates",
+          transitionRequestContext: {
+            kind: "merge_policy_chain",
+            payload: {
+              chainId: "merge-policy-chain-1",
+              iteration: 0,
+              maxIterations: 6,
+            },
+          },
+        },
+      ],
+    });
+  });
 });
 
 function currentFields(): IssueCurrentFields {
@@ -254,7 +310,7 @@ function currentFields(): IssueCurrentFields {
   };
 }
 
-function currentSnapshot(current: IssueCurrentFields): IssueCurrentStateSnapshot {
+function currentSnapshot(current: IssueCurrentFields, overrides: Partial<IssueCurrentStateSnapshot> = {}): IssueCurrentStateSnapshot {
   const now = "2026-01-01T00:00:01.000Z";
   return {
     ...current,
@@ -265,6 +321,7 @@ function currentSnapshot(current: IssueCurrentFields): IssueCurrentStateSnapshot
     triggerAt: now,
     triggerSource: "orchestrator",
     candidateSource: "test",
+    transitionRequestContext: null,
     availableSlots: 1,
     providerDispatchGateActive: false,
     stateSlotAvailable: true,
@@ -272,5 +329,6 @@ function currentSnapshot(current: IssueCurrentFields): IssueCurrentStateSnapshot
     manualStage: null,
     manualForceLabels: false,
     manualIgnoreState: false,
+    ...overrides,
   };
 }

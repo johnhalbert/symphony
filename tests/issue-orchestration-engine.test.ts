@@ -243,6 +243,7 @@ function snapshot(): IssueCurrentStateSnapshot {
     triggerAt: now,
     triggerSource: "orchestrator",
     candidateSource: "test",
+    transitionRequestContext: null,
     availableSlots: 1,
     providerDispatchGateActive: false,
     stateSlotAvailable: true,

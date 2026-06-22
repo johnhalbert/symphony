@@ -587,6 +587,11 @@ function normalizeIssueHistorySnapshot(snapshot: IssueHistorySnapshot): IssueHis
   return {
     ...snapshot,
     snapshotKind: snapshot.snapshotKind === "evidence" || snapshot.transitionKind === "record_evidence" ? "evidence" : "transition",
+    triggerSource:
+      snapshot.triggerSource === "manual_cli" || snapshot.triggerSource === "transition"
+        ? snapshot.triggerSource
+        : "orchestrator",
+    transitionRequestContext: snapshot.transitionRequestContext ?? null,
     rulesetVersion: typeof snapshot.rulesetVersion === "string" && snapshot.rulesetVersion.length > 0 ? snapshot.rulesetVersion : "legacy",
     rulesetFingerprint:
       typeof snapshot.rulesetFingerprint === "string" && snapshot.rulesetFingerprint.length > 0
