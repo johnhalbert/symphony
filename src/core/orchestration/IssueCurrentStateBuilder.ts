@@ -100,7 +100,10 @@ export interface IssueCurrentStateBuilderOptions {
   compareHistoryBackedFieldGroups?: readonly IssueCurrentStateHistoryFieldGroup[];
 }
 
-export type IssueCurrentStateHistoryFieldGroup = "tracker" | "runSummary";
+export type IssueCurrentStateHistoryFieldGroup =
+  | "tracker"
+  | "runSummary"
+  | "lifecycleCore";
 
 type IssueBreakdownPlan = IssueLifecycleRecord["issueBreakdownPlans"][number];
 type IssueTriageReport = IssueLifecycleRecord["issueTriageReports"][number];
@@ -175,6 +178,22 @@ type LifecycleFields = Pick<
   | "pendingPublicationApprovalRunId"
   | "pendingPublicationApprovalReportId"
   | "pendingPublicationApprovalReason"
+>;
+
+type LifecycleCoreFields = Pick<
+  LifecycleFields,
+  | "phase"
+  | "reviewRound"
+  | "incompleteTurnCount"
+  | "planningFailureCount"
+  | "planningDispatchRetryCount"
+  | "lastPlanningFailureAt"
+  | "planningRetryDueAt"
+  | "blockedReason"
+  | "lastCompletionReportId"
+  | "lastReviewVerdictId"
+  | "lastMergeGateResultId"
+  | "lifecycleSummaryCiStatus"
 >;
 
 type ConfigFields = Pick<
@@ -269,6 +288,7 @@ interface IssueCurrentStateBuildContext {
 interface HistoryBackedGroupFields {
   tracker?: TrackerFields;
   runSummary?: RunSummaryFields;
+  lifecycleCore?: LifecycleCoreFields;
 }
 
 interface HistoryBackedGroupResult {
@@ -340,20 +360,28 @@ export class IssueCurrentStateBuilder {
   ): HistoryBackedGroupResult {
     const tracker = this.buildTrackerFieldsFromHistory(context);
     const runSummary = this.buildRunSummaryFieldsFromHistory(context);
+    const lifecycleCore = this.buildLifecycleCoreFieldsFromHistory(context);
     return {
       fields: {
         ...(tracker.fields === null ? {} : { tracker: tracker.fields }),
         ...(runSummary.fields === null
           ? {}
           : { runSummary: runSummary.fields }),
+        ...(lifecycleCore.fields === null
+          ? {}
+          : { lifecycleCore: lifecycleCore.fields }),
       },
       incompleteGroups: [
         ...(tracker.complete ? [] : (["tracker"] as const)),
         ...(runSummary.complete ? [] : (["runSummary"] as const)),
+        ...(lifecycleCore.complete ? [] : (["lifecycleCore"] as const)),
       ],
       sourceSnapshotIds: [
         ...(tracker.sourceSnapshotId ? [tracker.sourceSnapshotId] : []),
         ...runSummary.sourceSnapshotIds,
+        ...(lifecycleCore.sourceSnapshotId
+          ? [lifecycleCore.sourceSnapshotId]
+          : []),
       ],
     };
   }
@@ -506,6 +534,89 @@ export class IssueCurrentStateBuilder {
         consecutiveInfraFailures: countConsecutiveHistoryWorkerRuns(
           runs,
           isCountedHistoryInfraFailure,
+        ),
+      },
+    };
+  }
+
+  private buildLifecycleCoreFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | {
+        complete: true;
+        fields: LifecycleCoreFields;
+        sourceSnapshotId: string;
+      }
+    | { complete: false; fields: null; sourceSnapshotId: string | null } {
+    const snapshot = latestLifecycleMutationSnapshot(context.history);
+    if (snapshot === null) {
+      return { complete: false, fields: null, sourceSnapshotId: null };
+    }
+    if (
+      context.lifecycle === null ||
+      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
+        context.lifecycle.updatedAt
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const phase = stringFromUnknown(snapshot.lifecyclePhase);
+    const reviewRound = numberFromUnknown(snapshot.lifecycleReviewRound);
+    const incompleteTurnCount = numberFromUnknown(
+      snapshot.lifecycleIncompleteTurnCount,
+    );
+    const planningFailureCount = numberFromUnknown(
+      snapshot.lifecyclePlanningFailureCount,
+    );
+    const planningDispatchRetryCount = numberFromUnknown(
+      snapshot.lifecyclePlanningDispatchRetryCount,
+    );
+    if (
+      phase === null ||
+      reviewRound === null ||
+      incompleteTurnCount === null ||
+      planningFailureCount === null ||
+      planningDispatchRetryCount === null
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const lastPlanningFailureAt = stringFromUnknown(
+      snapshot.lifecycleLastPlanningFailureAt,
+    );
+    return {
+      complete: true,
+      sourceSnapshotId: snapshot.historySnapshotId,
+      fields: {
+        phase,
+        reviewRound,
+        incompleteTurnCount,
+        planningFailureCount,
+        planningDispatchRetryCount,
+        lastPlanningFailureAt,
+        planningRetryDueAt: planningRetryDueAtIsoForValues(
+          planningFailureCount,
+          lastPlanningFailureAt,
+          this.options.config,
+        ),
+        blockedReason: stringFromUnknown(snapshot.lifecycleBlockedReason),
+        lastCompletionReportId: stringFromUnknown(
+          snapshot.lifecycleLastCompletionReportId,
+        ),
+        lastReviewVerdictId: stringFromUnknown(
+          snapshot.lifecycleLastReviewVerdictId,
+        ),
+        lastMergeGateResultId: stringFromUnknown(
+          snapshot.lifecycleLastMergeGateResultId,
+        ),
+        lifecycleSummaryCiStatus: stringFromUnknown(
+          snapshot.lifecycleSummaryCiStatus,
         ),
       },
     };
@@ -963,6 +1074,20 @@ function latestTrackerObservationSnapshot(
   return null;
 }
 
+function latestLifecycleMutationSnapshot(
+  history: readonly IssueHistorySnapshot[],
+): IssueHistorySnapshot | null {
+  for (const snapshot of history.slice().reverse()) {
+    if (
+      snapshot.snapshotKind === "evidence" &&
+      snapshot.evidenceKind === "lifecycle"
+    ) {
+      return snapshot;
+    }
+  }
+  return null;
+}
+
 function stringArrayFromUnknown(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((item) => typeof item === "string")
     ? [...value]
@@ -1347,15 +1472,23 @@ function planningRetryDueAtIso(
   lifecycle: IssueLifecycleRecord,
   config: ServiceConfig,
 ): string | null {
-  if (
-    lifecycle.planningFailureCount <= 0 ||
-    lifecycle.lastPlanningFailureAt === null
-  )
-    return null;
-  const failedAtMs = Date.parse(lifecycle.lastPlanningFailureAt);
+  return planningRetryDueAtIsoForValues(
+    lifecycle.planningFailureCount,
+    lifecycle.lastPlanningFailureAt,
+    config,
+  );
+}
+
+function planningRetryDueAtIsoForValues(
+  planningFailureCount: number,
+  lastPlanningFailureAt: string | null,
+  config: ServiceConfig,
+): string | null {
+  if (planningFailureCount <= 0 || lastPlanningFailureAt === null) return null;
+  const failedAtMs = Date.parse(lastPlanningFailureAt);
   if (!Number.isFinite(failedAtMs)) return null;
   return new Date(
-    failedAtMs + planningRetryDelayMs(lifecycle.planningFailureCount, config),
+    failedAtMs + planningRetryDelayMs(planningFailureCount, config),
   ).toISOString();
 }
 

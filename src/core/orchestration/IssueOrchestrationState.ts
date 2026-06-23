@@ -410,15 +410,18 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   string
 > {
   lifecyclePatch: IssueLifecyclePatch | Record<string, unknown> | null;
+  lifecycleUpdatedAt: string | null;
   lifecyclePhase: string | null;
   lifecycleBlockedReason: string | null;
   lifecycleReviewRound: number | null;
   lifecycleIncompleteTurnCount: number | null;
   lifecyclePlanningFailureCount: number | null;
   lifecyclePlanningDispatchRetryCount: number | null;
+  lifecycleLastPlanningFailureAt: string | null;
   lifecycleLastCompletionReportId: string | null;
   lifecycleLastReviewVerdictId: string | null;
   lifecycleLastMergeGateResultId: string | null;
+  lifecycleSummaryCiStatus: string | null;
   lifecycleSummaryPointers: unknown;
 }
 
@@ -552,6 +555,7 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
     case "lifecycle":
       return copyMissingEvidenceFields(snapshot, {
         lifecyclePatch: payload?.patch ?? null,
+        lifecycleUpdatedAt: stringField(payload, "updatedAt"),
         lifecyclePhase: stringField(payload, "phase"),
         lifecycleBlockedReason: stringField(payload, "blockedReason"),
         lifecycleReviewRound: numberField(payload, "reviewRound"),
@@ -567,6 +571,10 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
           payload,
           "planningDispatchRetryCount",
         ),
+        lifecycleLastPlanningFailureAt: stringField(
+          payload,
+          "lastPlanningFailureAt",
+        ),
         lifecycleLastCompletionReportId: stringField(
           payload,
           "lastCompletionReportId",
@@ -578,6 +586,10 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
         lifecycleLastMergeGateResultId: stringField(
           payload,
           "lastMergeGateResultId",
+        ),
+        lifecycleSummaryCiStatus: stringField(
+          recordPayload(payload?.summaryPointers),
+          "ciStatus",
         ),
         lifecycleSummaryPointers: payload?.summaryPointers ?? null,
       });

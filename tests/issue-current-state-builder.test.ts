@@ -17,7 +17,10 @@ import {
   type IssueStateRecord,
   type IssueStateStore,
 } from "../src/core/orchestration/IssueOrchestrationState.js";
-import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  FileIssueLifecycleStore,
+  type IssueLifecycleRecord,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import type { Issue } from "../src/core/types.js";
 
@@ -493,6 +496,75 @@ describe("IssueCurrentStateBuilder", () => {
       consecutiveInfraFailures: 0,
     });
   });
+
+  it("can build lifecycle core fields from typed history evidence", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture({ state: "Blocked" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const lifecycle = await lifecycleStore.ensureIssue(issue, {
+      phase: "blocked",
+      reviewRound: 2,
+      incompleteTurnCount: 3,
+      planningFailureCount: 1,
+      planningDispatchRetryCount: 2,
+      lastPlanningFailureAt: "2026-01-01T00:00:00.000Z",
+      blockedReason: "max incomplete turns reached (3/3)",
+      lastCompletionReportId: "completion-1",
+      lastReviewVerdictId: "verdict-1",
+      lastMergeGateResultId: "merge-gate-1",
+      summaryPointers: {
+        ciStatus: "pending",
+      },
+    });
+    const historyStore = new MemoryIssueStateStore();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+    const historyLifecycle: IssueLifecycleRecord = {
+      ...lifecycle,
+      reviewRound: 4,
+      blockedReason: "history-backed blocked reason",
+      lastCompletionReportId: "completion-from-history",
+      summaryPointers: {
+        ...lifecycle.summaryPointers,
+        ciStatus: "success",
+      },
+    };
+    historyStore.record = {
+      ...storeCurrent,
+      history: [lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle)],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["lifecycleCore"],
+    });
+
+    const current = await historyBackedBuilder.build(issue, emptyRuntime());
+
+    expect(current).toMatchObject({
+      phase: "blocked",
+      reviewRound: 4,
+      incompleteTurnCount: 3,
+      planningFailureCount: 1,
+      planningDispatchRetryCount: 2,
+      lastPlanningFailureAt: "2026-01-01T00:00:00.000Z",
+      planningRetryDueAt: "2026-01-01T00:00:05.000Z",
+      blockedReason: "history-backed blocked reason",
+      lastCompletionReportId: "completion-from-history",
+      lastReviewVerdictId: "verdict-1",
+      lastMergeGateResultId: "merge-gate-1",
+      lifecycleSummaryCiStatus: "success",
+    });
+  });
 });
 
 function builderConfig(root: string): ServiceConfig {
@@ -645,6 +717,73 @@ function trackerEvidenceSnapshot(
     observedHasChildren: observed.hasChildren === true,
     observedTrackerCreatedAt: observed.createdAt,
     observedTrackerUpdatedAt: observed.updatedAt,
+  };
+}
+
+function lifecycleEvidenceSnapshot(
+  current: IssueCurrentFields,
+  lifecycle: IssueLifecycleRecord,
+): IssueHistorySnapshot {
+  const at = "2026-01-01T00:00:04.000Z";
+  return {
+    ...current,
+    snapshotId: "issue-snapshot:lifecycle-evidence",
+    snapshotAt: at,
+    triggerType: "orchestrator.tick",
+    triggerId: "orchestrator.tick:lifecycle-evidence",
+    triggerAt: at,
+    triggerSource: "orchestrator",
+    candidateSource: "evidence.lifecycle.lifecycle_updated",
+    transitionRequestContext: null,
+    availableSlots: 1,
+    providerDispatchGateActive: false,
+    stateSlotAvailable: true,
+    allowExistingClaim: false,
+    manualStage: null,
+    manualForceLabels: false,
+    manualIgnoreState: false,
+    snapshotKind: "evidence",
+    historySnapshotId: "issue-history:lifecycle-evidence",
+    transitionKind: "record_evidence",
+    transitionId: "transition:record_evidence:lifecycle-evidence",
+    rulesetId: "orchestrator.evidence.lifecycle",
+    rulesetVersion: "test",
+    rulesetFingerprint: "orchestrator.evidence.lifecycle@test:900",
+    rulesetPriority: 900,
+    reason: "lifecycle_updated",
+    actions: [],
+    errors: [],
+    evidenceKind: "lifecycle",
+    evidenceEventType: "lifecycle_updated",
+    evidenceSourceId: lifecycle.issueId,
+    evidencePayload: {
+      updatedAt: lifecycle.updatedAt,
+      phase: lifecycle.phase,
+      blockedReason: lifecycle.blockedReason,
+      reviewRound: lifecycle.reviewRound,
+      incompleteTurnCount: lifecycle.incompleteTurnCount,
+      planningFailureCount: lifecycle.planningFailureCount,
+      planningDispatchRetryCount: lifecycle.planningDispatchRetryCount,
+      lastPlanningFailureAt: lifecycle.lastPlanningFailureAt,
+      lastCompletionReportId: lifecycle.lastCompletionReportId,
+      lastReviewVerdictId: lifecycle.lastReviewVerdictId,
+      lastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
+      summaryPointers: lifecycle.summaryPointers,
+    },
+    lifecyclePatch: null,
+    lifecycleUpdatedAt: lifecycle.updatedAt,
+    lifecyclePhase: lifecycle.phase,
+    lifecycleBlockedReason: lifecycle.blockedReason,
+    lifecycleReviewRound: lifecycle.reviewRound,
+    lifecycleIncompleteTurnCount: lifecycle.incompleteTurnCount,
+    lifecyclePlanningFailureCount: lifecycle.planningFailureCount,
+    lifecyclePlanningDispatchRetryCount: lifecycle.planningDispatchRetryCount,
+    lifecycleLastPlanningFailureAt: lifecycle.lastPlanningFailureAt,
+    lifecycleLastCompletionReportId: lifecycle.lastCompletionReportId,
+    lifecycleLastReviewVerdictId: lifecycle.lastReviewVerdictId,
+    lifecycleLastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
+    lifecycleSummaryCiStatus: lifecycle.summaryPointers.ciStatus,
+    lifecycleSummaryPointers: lifecycle.summaryPointers,
   };
 }
 

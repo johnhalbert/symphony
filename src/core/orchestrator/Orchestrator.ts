@@ -951,7 +951,7 @@ export class Orchestrator {
       runStore: options.runStore,
       issueStateStore: this.issueStateStore,
       logger: options.logger,
-      historyBackedFieldGroups: ["tracker", "runSummary"],
+      historyBackedFieldGroups: ["tracker", "runSummary", "lifecycleCore"],
     });
     this.transitionRulesets = this.createTransitionRulesets();
     this.transitionEngine = new IssueOrchestrationEngine(
@@ -8122,12 +8122,14 @@ export class Orchestrator {
       reason: input.reason ?? input.eventType ?? "lifecycle_updated",
       payload: {
         patch: input.patch,
+        updatedAt: input.lifecycle.updatedAt,
         phase: input.lifecycle.phase,
         blockedReason: input.lifecycle.blockedReason,
         reviewRound: input.lifecycle.reviewRound,
         incompleteTurnCount: input.lifecycle.incompleteTurnCount,
         planningFailureCount: input.lifecycle.planningFailureCount,
         planningDispatchRetryCount: input.lifecycle.planningDispatchRetryCount,
+        lastPlanningFailureAt: input.lifecycle.lastPlanningFailureAt ?? null,
         lastCompletionReportId: input.lifecycle.lastCompletionReportId ?? null,
         lastReviewVerdictId: input.lifecycle.lastReviewVerdictId ?? null,
         lastMergeGateResultId: input.lifecycle.lastMergeGateResultId ?? null,
