@@ -2271,6 +2271,119 @@ describe("FileWritebackOutboxStore", () => {
     expect(writer.issueCreates).toHaveLength(1);
   });
 
+  it("uses the requested processDue project context for issue breakdown freshness lookups", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const config = testConfig(root);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const operationKey = "issue-create:issue-1:plan-1:0:hash";
+    const scopedDocsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Docs (renamed)",
+      linearProjectSlug: "DOCS-ALT",
+      routingSource: "state_refresh",
+    } as const;
+    const configContexts: Array<typeof scopedDocsProjectContext | undefined> = [];
+    const lookupRequests: Array<{ issueId: string; projectContext: typeof scopedDocsProjectContext | undefined }> = [];
+    const lifecycleStore = {
+      get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey], issue: parentIssue, config }),
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      {
+        getConfig: (projectContext) => {
+          configContexts.push(projectContext as typeof scopedDocsProjectContext | undefined);
+          return config;
+        },
+        resolveIssue: async (issueId, projectContext) => {
+          lookupRequests.push({
+            issueId,
+            projectContext: projectContext as typeof scopedDocsProjectContext | undefined,
+          });
+          return { status: "ok", issue: parentIssue };
+        },
+      },
+    );
+
+    await store.enqueueOnce({ ...issueCreateOperation(operationKey), projectContext: docsProjectContext });
+
+    await processor.processDue({ projectContext: scopedDocsProjectContext });
+
+    expect(configContexts).toEqual([scopedDocsProjectContext]);
+    expect(lookupRequests).toEqual([{ issueId: "issue-1", projectContext: scopedDocsProjectContext }]);
+    expect(writer.issueCreates).toHaveLength(1);
+    await expect(store.get(operationKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+  });
+
+  it("uses the requested enqueueAndProcess project context for issue breakdown freshness lookups during idempotent replays", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const config = testConfig(root);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const operationKey = "issue-create:issue-1:plan-1:0:hash";
+    const scopedDocsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Docs (renamed)",
+      linearProjectSlug: "DOCS-ALT",
+      routingSource: "state_refresh",
+    } as const;
+    const configContexts: Array<typeof scopedDocsProjectContext | undefined> = [];
+    const lookupRequests: Array<{ issueId: string; projectContext: typeof scopedDocsProjectContext | undefined }> = [];
+    const lifecycleStore = {
+      get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey], issue: parentIssue, config }),
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      {
+        getConfig: (projectContext) => {
+          configContexts.push(projectContext as typeof scopedDocsProjectContext | undefined);
+          return config;
+        },
+        resolveIssue: async (issueId, projectContext) => {
+          lookupRequests.push({
+            issueId,
+            projectContext: projectContext as typeof scopedDocsProjectContext | undefined,
+          });
+          return { status: "ok", issue: parentIssue };
+        },
+      },
+    );
+
+    await store.enqueueOnce({ ...issueCreateOperation(operationKey), projectContext: docsProjectContext });
+
+    const record = await processor.enqueueAndProcess({
+      ...issueCreateOperation(operationKey),
+      projectContext: scopedDocsProjectContext,
+      runId: "run-plan-1-renamed-context",
+    });
+
+    expect(configContexts).toEqual([scopedDocsProjectContext]);
+    expect(lookupRequests).toEqual([{ issueId: "issue-1", projectContext: scopedDocsProjectContext }]);
+    expect(writer.issueCreates).toHaveLength(1);
+    expect(record).toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.get(operationKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.list()).resolves.toHaveLength(1);
+  });
+
   it("skips issue breakdown writebacks that are not registered on the current plan", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
