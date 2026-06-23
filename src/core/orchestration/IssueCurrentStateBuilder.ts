@@ -40,9 +40,11 @@ import {
 } from "../persistence/RunTranscriptStore.js";
 import {
   runKindForPhase,
+  type AgentRunKind,
   type AgentRunPhase,
   type AgentRunRole,
   type Issue,
+  type TokenCounts,
 } from "../types.js";
 import type {
   IssueCurrentStateSnapshot,
@@ -110,10 +112,12 @@ export type IssueCurrentStateHistoryFieldGroup =
   | "runSummary"
   | "lifecycleCore"
   | "lifecycleReports"
+  | "lifecyclePublication"
   | "lifecycleMergePolicy"
   | "lifecycleBreakdown"
   | "lifecycleTriage"
-  | "lifecyclePostMortem";
+  | "lifecyclePostMortem"
+  | "mergePolicyCompletionRun";
 
 type IssueBreakdownPlan = IssueLifecycleRecord["issueBreakdownPlans"][number];
 type IssueTriageReport = IssueLifecycleRecord["issueTriageReports"][number];
@@ -215,6 +219,13 @@ type LifecycleReportFields = Pick<
   | "mergePolicyLatestApprovalVerdict"
 >;
 
+type LifecyclePublicationFields = Pick<
+  LifecycleFields,
+  | "pendingPublicationApprovalRunId"
+  | "pendingPublicationApprovalReportId"
+  | "pendingPublicationApprovalReason"
+>;
+
 type LifecycleMergePolicyFields = Pick<
   LifecycleFields,
   | "mergeGate"
@@ -296,6 +307,10 @@ type RunFields = Pick<
   | "consecutiveInfraFailures"
 >;
 type RunSummaryFields = Omit<RunFields, "mergePolicyLatestCompletionRun">;
+type MergePolicyCompletionRunFields = Pick<
+  RunFields,
+  "mergePolicyLatestCompletionRun"
+>;
 
 type RuntimeFields = Pick<
   IssueCurrentFields,
@@ -348,10 +363,12 @@ interface HistoryBackedGroupFields {
   runSummary?: RunSummaryFields;
   lifecycleCore?: LifecycleCoreFields;
   lifecycleReports?: LifecycleReportFields;
+  lifecyclePublication?: LifecyclePublicationFields;
   lifecycleMergePolicy?: LifecycleMergePolicyFields;
   lifecycleBreakdown?: LifecycleBreakdownFields;
   lifecycleTriage?: LifecycleTriageFields;
   lifecyclePostMortem?: LifecyclePostMortemFields;
+  mergePolicyCompletionRun?: MergePolicyCompletionRunFields;
 }
 
 interface HistoryBackedGroupResult {
@@ -387,6 +404,17 @@ interface HistoryRunSummary {
   cancelFailed: boolean;
   failureKind: string | null;
   failureDiagnosticCode: string | null;
+  sessionId: string | null;
+  agentId: string | null;
+  prompt: string | null;
+  promptCharCount: number | null;
+  startedAt: string | null;
+  updatedAt: string | null;
+  tokens: TokenCounts | null;
+  attempt: number | null;
+  turnNumber: number | null;
+  harnessId: string | null;
+  promptTemplateKeys: string[] | null;
 }
 
 export class IssueCurrentStateBuilder {
@@ -426,9 +454,13 @@ export class IssueCurrentStateBuilder {
   ): HistoryBackedGroupResult {
     const tracker = this.buildTrackerFieldsFromHistory(context);
     const runSummary = this.buildRunSummaryFieldsFromHistory(context);
+    const mergePolicyCompletionRun =
+      this.buildMergePolicyCompletionRunFieldsFromHistory(context);
     const lifecycleCore = this.buildLifecycleCoreFieldsFromHistory(context);
     const lifecycleReports =
       this.buildLifecycleReportFieldsFromHistory(context);
+    const lifecyclePublication =
+      this.buildLifecyclePublicationFieldsFromHistory(context);
     const lifecycleMergePolicy =
       this.buildLifecycleMergePolicyFieldsFromHistory(context);
     const lifecycleBreakdown =
@@ -438,6 +470,8 @@ export class IssueCurrentStateBuilder {
       this.buildLifecyclePostMortemFieldsFromHistory(context);
     const trackerSourceSnapshotIds =
       tracker.sourceSnapshotId === null ? [] : [tracker.sourceSnapshotId];
+    const mergePolicyCompletionRunSourceSnapshotIds =
+      mergePolicyCompletionRun.sourceSnapshotIds;
     const lifecycleCoreSourceSnapshotIds =
       lifecycleCore.sourceSnapshotId === null
         ? []
@@ -446,6 +480,10 @@ export class IssueCurrentStateBuilder {
       lifecycleReports.sourceSnapshotId === null
         ? []
         : [lifecycleReports.sourceSnapshotId];
+    const lifecyclePublicationSourceSnapshotIds =
+      lifecyclePublication.sourceSnapshotId === null
+        ? []
+        : [lifecyclePublication.sourceSnapshotId];
     const lifecycleMergePolicySourceSnapshotIds =
       lifecycleMergePolicy.sourceSnapshotId === null
         ? []
@@ -468,12 +506,18 @@ export class IssueCurrentStateBuilder {
         ...(runSummary.fields === null
           ? {}
           : { runSummary: runSummary.fields }),
+        ...(mergePolicyCompletionRun.fields === null
+          ? {}
+          : { mergePolicyCompletionRun: mergePolicyCompletionRun.fields }),
         ...(lifecycleCore.fields === null
           ? {}
           : { lifecycleCore: lifecycleCore.fields }),
         ...(lifecycleReports.fields === null
           ? {}
           : { lifecycleReports: lifecycleReports.fields }),
+        ...(lifecyclePublication.fields === null
+          ? {}
+          : { lifecyclePublication: lifecyclePublication.fields }),
         ...(lifecycleMergePolicy.fields === null
           ? {}
           : { lifecycleMergePolicy: lifecycleMergePolicy.fields }),
@@ -490,8 +534,14 @@ export class IssueCurrentStateBuilder {
       incompleteGroups: [
         ...(tracker.complete ? [] : (["tracker"] as const)),
         ...(runSummary.complete ? [] : (["runSummary"] as const)),
+        ...(mergePolicyCompletionRun.complete
+          ? []
+          : (["mergePolicyCompletionRun"] as const)),
         ...(lifecycleCore.complete ? [] : (["lifecycleCore"] as const)),
         ...(lifecycleReports.complete ? [] : (["lifecycleReports"] as const)),
+        ...(lifecyclePublication.complete
+          ? []
+          : (["lifecyclePublication"] as const)),
         ...(lifecycleMergePolicy.complete
           ? []
           : (["lifecycleMergePolicy"] as const)),
@@ -506,8 +556,10 @@ export class IssueCurrentStateBuilder {
       sourceSnapshotIds: [
         ...trackerSourceSnapshotIds,
         ...runSummary.sourceSnapshotIds,
+        ...mergePolicyCompletionRunSourceSnapshotIds,
         ...lifecycleCoreSourceSnapshotIds,
         ...lifecycleReportSourceSnapshotIds,
+        ...lifecyclePublicationSourceSnapshotIds,
         ...lifecycleMergePolicySourceSnapshotIds,
         ...lifecycleBreakdownSourceSnapshotIds,
         ...lifecycleTriageSourceSnapshotIds,
@@ -516,8 +568,10 @@ export class IssueCurrentStateBuilder {
       sourceSnapshotIdsByGroup: {
         tracker: trackerSourceSnapshotIds,
         runSummary: runSummary.sourceSnapshotIds,
+        mergePolicyCompletionRun: mergePolicyCompletionRunSourceSnapshotIds,
         lifecycleCore: lifecycleCoreSourceSnapshotIds,
         lifecycleReports: lifecycleReportSourceSnapshotIds,
+        lifecyclePublication: lifecyclePublicationSourceSnapshotIds,
         lifecycleMergePolicy: lifecycleMergePolicySourceSnapshotIds,
         lifecycleBreakdown: lifecycleBreakdownSourceSnapshotIds,
         lifecycleTriage: lifecycleTriageSourceSnapshotIds,
@@ -687,6 +741,55 @@ export class IssueCurrentStateBuilder {
     };
   }
 
+  private buildMergePolicyCompletionRunFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | {
+        complete: true;
+        fields: MergePolicyCompletionRunFields;
+        sourceSnapshotIds: string[];
+      }
+    | { complete: false; fields: null; sourceSnapshotIds: string[] } {
+    const report = context.mergePolicyLatestCompletionReport;
+    if (report === null) {
+      return {
+        complete: true,
+        fields: { mergePolicyLatestCompletionRun: null },
+        sourceSnapshotIds: [],
+      };
+    }
+    const runs = buildRunSummariesFromHistory(context.history);
+    const run = runs.find((candidate) => candidate.runId === report.runId);
+    if (run === undefined) {
+      return { complete: false, fields: null, sourceSnapshotIds: [] };
+    }
+    if (
+      !historyRunSummaryMatchesKnownRun(
+        run,
+        context.mergePolicyLatestCompletionRun,
+      )
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotIds: run.sourceSnapshotIds,
+      };
+    }
+    const record = runRecordFromHistorySummary(context, run);
+    if (record === null) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotIds: run.sourceSnapshotIds,
+      };
+    }
+    return {
+      complete: true,
+      sourceSnapshotIds: run.sourceSnapshotIds,
+      fields: { mergePolicyLatestCompletionRun: record },
+    };
+  }
+
   private buildLifecycleCoreFieldsFromHistory(
     context: IssueCurrentStateBuildContext,
   ):
@@ -850,6 +953,69 @@ export class IssueCurrentStateBuilder {
         latestApprovalPassVerdict,
         mergePolicyLatestCompletionReport: latestCompletionReport,
         mergePolicyLatestApprovalVerdict: latestApprovalPassVerdict,
+      },
+    };
+  }
+
+  private buildLifecyclePublicationFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | {
+        complete: true;
+        fields: LifecyclePublicationFields;
+        sourceSnapshotId: string;
+      }
+    | { complete: false; fields: null; sourceSnapshotId: string | null } {
+    const snapshot = latestLifecycleMutationSnapshot(context.history);
+    if (snapshot === null) {
+      return { complete: false, fields: null, sourceSnapshotId: null };
+    }
+    if (
+      context.lifecycle === null ||
+      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
+        context.lifecycle.updatedAt
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const pendingPublicationApprovalRunId = stringFromUnknown(
+      snapshot.lifecyclePendingPublicationApprovalRunId,
+    );
+    const pendingPublicationApprovalReportId = stringFromUnknown(
+      snapshot.lifecyclePendingPublicationApprovalReportId,
+    );
+    const pendingPublicationApprovalReason = stringFromUnknown(
+      snapshot.lifecyclePendingPublicationApprovalReason,
+    );
+    const expectedRunId =
+      context.pendingPublication?.pendingReport.runId ?? null;
+    const expectedReportId =
+      context.pendingPublication?.pendingReport.id ?? null;
+    const expectedReason =
+      context.pendingPublication === null
+        ? null
+        : (context.lifecycle.blockedReason ?? null);
+    if (
+      pendingPublicationApprovalRunId !== expectedRunId ||
+      pendingPublicationApprovalReportId !== expectedReportId ||
+      pendingPublicationApprovalReason !== expectedReason
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    return {
+      complete: true,
+      sourceSnapshotId: snapshot.historySnapshotId,
+      fields: {
+        pendingPublicationApprovalRunId,
+        pendingPublicationApprovalReportId,
+        pendingPublicationApprovalReason,
       },
     };
   }
@@ -1752,9 +1918,20 @@ function buildRunSummariesFromHistory(
     summary.sequence = index;
     summary.sourceSnapshotIds.push(snapshot.historySnapshotId);
 
+    summary.sessionId =
+      stringFromUnknown(snapshot.runSessionId) ?? summary.sessionId;
+    summary.agentId = stringFromUnknown(snapshot.runAgentId) ?? summary.agentId;
     summary.role = stringFromUnknown(snapshot.role) ?? summary.role;
     summary.runPhase = stringFromUnknown(snapshot.runPhase) ?? summary.runPhase;
     summary.runKind = stringFromUnknown(snapshot.runKind) ?? summary.runKind;
+    summary.attempt = numberFromUnknown(snapshot.runAttempt) ?? summary.attempt;
+    summary.turnNumber =
+      numberFromUnknown(snapshot.runTurnNumber) ?? summary.turnNumber;
+    summary.harnessId =
+      stringFromUnknown(snapshot.runHarnessId) ?? summary.harnessId;
+    summary.promptTemplateKeys =
+      stringArrayFromUnknown(snapshot.runPromptTemplateKeys) ??
+      summary.promptTemplateKeys;
     summary.workspaceKey =
       stringFromUnknown(snapshot.runWorkspaceKey) ?? summary.workspaceKey;
     summary.workspacePath =
@@ -1764,13 +1941,27 @@ function buildRunSummariesFromHistory(
 
     if (snapshot.evidenceEventType === "run_started") {
       summary.status = stringFromUnknown(snapshot.runStatus) ?? "running";
+      summary.prompt = stringFromUnknown(snapshot.runPrompt) ?? summary.prompt;
+      summary.promptCharCount =
+        numberFromUnknown(snapshot.runPromptCharCount) ??
+        summary.promptCharCount;
+      summary.startedAt =
+        stringFromUnknown(snapshot.runStartedAt) ?? summary.startedAt;
+      summary.updatedAt =
+        stringFromUnknown(snapshot.runUpdatedAt) ?? summary.updatedAt;
+      summary.tokens =
+        tokenCountsFromUnknown(snapshot.runTokens) ?? summary.tokens;
     }
 
     if (snapshot.evidenceEventType === "run_terminal_state_updated") {
       summary.status = stringFromUnknown(snapshot.runStatus) ?? summary.status;
+      summary.updatedAt =
+        stringFromUnknown(snapshot.runUpdatedAt) ?? summary.updatedAt;
       summary.completedAt =
         stringFromUnknown(snapshot.runCompletedAt) ?? summary.completedAt;
       summary.error = stringFromUnknown(snapshot.runError) ?? summary.error;
+      summary.tokens =
+        tokenCountsFromUnknown(snapshot.runTokens) ?? summary.tokens;
       summary.sdkRunStatus =
         stringFromUnknown(snapshot.runSdkStatus) ?? summary.sdkRunStatus;
       summary.sdkRunStatusSource =
@@ -1838,6 +2029,17 @@ function ensureHistoryRunSummary(
     cancelFailed: false,
     failureKind: null,
     failureDiagnosticCode: null,
+    sessionId: null,
+    agentId: null,
+    prompt: null,
+    promptCharCount: null,
+    startedAt: null,
+    updatedAt: null,
+    tokens: null,
+    attempt: null,
+    turnNumber: null,
+    harnessId: null,
+    promptTemplateKeys: null,
   };
   runs.set(runId, summary);
   return summary;
@@ -1915,6 +2117,115 @@ function historyRunSummaryMatchesKnownStoreState(
   )
     return false;
   return true;
+}
+
+function historyRunSummaryMatchesKnownRun(
+  run: HistoryRunSummary,
+  known: RunRecord | null,
+): boolean {
+  if (known === null) return true;
+  if (run.runId !== known.runId) return false;
+  if (!historyStringMatchesKnown(run.status, known.status)) return false;
+  if (!historyStringMatchesKnown(run.role, known.role)) return false;
+  if (!historyStringMatchesKnown(run.runPhase, known.runPhase)) return false;
+  if (!historyStringMatchesKnown(run.runKind, known.runKind)) return false;
+  if (!historyStringMatchesKnown(run.completedAt, known.completedAt))
+    return false;
+  if (!historyStringMatchesKnown(run.error, known.error)) return false;
+  if (!historyStringMatchesKnown(run.workspaceKey, known.workspaceKey))
+    return false;
+  if (!historyStringMatchesKnown(run.workspacePath, known.workspacePath))
+    return false;
+  if (!historyStringMatchesKnown(run.prompt, known.prompt)) return false;
+  if (!historyNumberMatchesKnown(run.promptCharCount, known.promptCharCount))
+    return false;
+  if (!historyNumberMatchesKnown(run.attempt, known.attempt)) return false;
+  if (!historyNumberMatchesKnown(run.turnNumber, known.turnNumber))
+    return false;
+  return true;
+}
+
+function runRecordFromHistorySummary(
+  context: IssueCurrentStateBuildContext,
+  run: HistoryRunSummary,
+): RunRecord | null {
+  if (
+    run.status === null ||
+    run.role === null ||
+    run.prompt === null ||
+    run.startedAt === null ||
+    run.updatedAt === null ||
+    run.tokens === null ||
+    run.workspaceKey === null ||
+    run.workspacePath === null ||
+    run.turnNumber === null
+  ) {
+    return null;
+  }
+  return {
+    runId: run.runId,
+    sessionId: run.sessionId,
+    agentId: run.agentId,
+    role: run.role as RunRecord["role"],
+    ...(run.runPhase === null
+      ? {}
+      : { runPhase: run.runPhase as AgentRunPhase }),
+    ...(run.runKind === null ? {} : { runKind: run.runKind as AgentRunKind }),
+    issueId: context.issue.id,
+    issueIdentifier: context.issue.identifier,
+    attempt: run.attempt,
+    turnNumber: run.turnNumber,
+    prompt: run.prompt,
+    ...(run.promptCharCount === null
+      ? {}
+      : { promptCharCount: run.promptCharCount }),
+    ...(run.promptTemplateKeys === null
+      ? {}
+      : { promptTemplateKeys: [...run.promptTemplateKeys] }),
+    ...(run.harnessId === null ? {} : { harnessId: run.harnessId }),
+    workspaceKey: run.workspaceKey,
+    workspacePath: run.workspacePath,
+    ...(run.gitBranchName === null ? {} : { gitBranchName: run.gitBranchName }),
+    status: run.status as RunRecord["status"],
+    startedAt: run.startedAt,
+    updatedAt: run.updatedAt,
+    completedAt: run.completedAt,
+    error: run.error,
+    tokens: run.tokens,
+    ...(run.prUrl === null ? {} : { prUrl: run.prUrl }),
+    ...(run.prNumber === null ? {} : { prNumber: run.prNumber }),
+    ...(run.prHeadSha === null ? {} : { prHeadSha: run.prHeadSha }),
+    ...(run.prBranch === null ? {} : { prBranch: run.prBranch }),
+    ...(run.sdkRunStatus === null
+      ? {}
+      : {
+          sdkRunStatus: run.sdkRunStatus as NonNullable<
+            RunRecord["sdkRunStatus"]
+          >,
+        }),
+    ...(run.sdkRunStatusSource === null
+      ? {}
+      : {
+          sdkRunStatusSource: run.sdkRunStatusSource as NonNullable<
+            RunRecord["sdkRunStatusSource"]
+          >,
+        }),
+    ...(run.cancellationRequestedAt === null
+      ? {}
+      : { cancellationRequestedAt: run.cancellationRequestedAt }),
+    ...(run.cancellationOutcome === null
+      ? {}
+      : {
+          cancellationOutcome: run.cancellationOutcome as NonNullable<
+            RunRecord["cancellationOutcome"]
+          >,
+        }),
+    cancelFailed: run.cancelFailed,
+    ...(run.failureKind === null ? {} : { failureKind: run.failureKind }),
+    ...(run.failureDiagnosticCode === null
+      ? {}
+      : { failureDiagnosticCode: run.failureDiagnosticCode }),
+  };
 }
 
 function historyStringMatchesKnown(
@@ -1996,6 +2307,23 @@ function numberFromUnknown(value: unknown): number | null {
 
 function booleanFromUnknown(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
+}
+
+function tokenCountsFromUnknown(value: unknown): TokenCounts | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Partial<TokenCounts>;
+  return typeof record.inputTokens === "number" &&
+    Number.isFinite(record.inputTokens) &&
+    typeof record.outputTokens === "number" &&
+    Number.isFinite(record.outputTokens) &&
+    typeof record.totalTokens === "number" &&
+    Number.isFinite(record.totalTokens)
+    ? {
+        inputTokens: record.inputTokens,
+        outputTokens: record.outputTokens,
+        totalTokens: record.totalTokens,
+      }
+    : null;
 }
 
 function recordFromUnknown<T extends { id: string }>(value: unknown): T | null {

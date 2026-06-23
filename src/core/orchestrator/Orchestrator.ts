@@ -956,10 +956,12 @@ export class Orchestrator {
         "runSummary",
         "lifecycleCore",
         "lifecycleReports",
+        "lifecyclePublication",
         "lifecycleMergePolicy",
         "lifecycleBreakdown",
         "lifecycleTriage",
         "lifecyclePostMortem",
+        "mergePolicyCompletionRun",
       ],
     });
     this.transitionRulesets = this.createTransitionRulesets();
@@ -8123,6 +8125,7 @@ export class Orchestrator {
   private async recordLifecycleEvidenceSnapshot(
     input: LifecycleEvidenceInput,
   ): Promise<void> {
+    const pendingPublication = pendingPublicationHandoffForRun(input.lifecycle);
     await this.recordIssueEvidenceSnapshot({
       issue: input.issue,
       evidenceKind: "lifecycle",
@@ -8152,6 +8155,14 @@ export class Orchestrator {
           input.lifecycle.lastCompletionReportRejectionId ?? null,
         lastReviewVerdictId: input.lifecycle.lastReviewVerdictId ?? null,
         lastMergeGateResultId: input.lifecycle.lastMergeGateResultId ?? null,
+        pendingPublicationApprovalRunId:
+          pendingPublication?.pendingReport.runId ?? null,
+        pendingPublicationApprovalReportId:
+          pendingPublication?.pendingReport.id ?? null,
+        pendingPublicationApprovalReason:
+          pendingPublication === null
+            ? null
+            : (input.lifecycle.blockedReason ?? null),
         latestCompletionReport: latestCompletionReport(input.lifecycle),
         latestApprovalPassVerdict: latestCurrentApprovalPassVerdict(
           input.lifecycle,
@@ -9876,7 +9887,7 @@ export class Orchestrator {
         await this.updateLifecycle(entry, {
           summaryPointers: { lastRunId: entry.runId },
         });
-        await this.options.runStore?.startRun({
+        const startedRun = await this.options.runStore?.startRun({
           runId: entry.runId,
           sessionId: event.sessionId,
           agentId: event.threadId ?? null,
@@ -9927,13 +9938,20 @@ export class Orchestrator {
           reason: "run_started",
           payload: {
             runId: entry.runId,
-            sessionId: entry.sessionId,
+            sessionId: startedRun?.sessionId ?? entry.sessionId,
+            agentId: startedRun?.agentId ?? event.threadId ?? null,
             role: entry.role,
             runPhase: entry.runPhase,
             runKind: runKindForPhase(entry.runPhase),
+            status: startedRun?.status ?? "running",
             attempt: context.attempt,
             turnNumber: context.turnNumber,
             harnessId: this.options.harness.id,
+            prompt: startedRun?.prompt ?? null,
+            promptCharCount: startedRun?.promptCharCount ?? null,
+            startedAt: startedRun?.startedAt ?? null,
+            updatedAt: startedRun?.updatedAt ?? null,
+            tokens: startedRun?.tokens ?? null,
             workspaceKey: context.workspace.workspaceKey,
             workspacePath: context.workspace.path,
             gitBranchName: context.workspace.gitBranchName ?? null,
@@ -10237,10 +10255,13 @@ export class Orchestrator {
         reason: `run_${patch.status}`,
         payload: {
           runId,
+          sessionId: record?.sessionId ?? null,
+          agentId: record?.agentId ?? null,
           status: patch.status,
-          completedAt: patch.completedAt ?? null,
-          error: patch.error ?? null,
-          tokens: patch.tokens ?? null,
+          updatedAt: record?.updatedAt ?? null,
+          completedAt: record?.completedAt ?? patch.completedAt ?? null,
+          error: record?.error ?? patch.error ?? null,
+          tokens: record?.tokens ?? patch.tokens ?? null,
           metadata: patch.metadata ?? null,
           sdkRunStatus:
             (patch.metadata as Record<string, unknown> | undefined)

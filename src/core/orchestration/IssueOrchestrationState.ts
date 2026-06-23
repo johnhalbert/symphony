@@ -431,6 +431,9 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   lifecycleLastCompletionReportRejectionId: string | null;
   lifecycleLastReviewVerdictId: string | null;
   lifecycleLastMergeGateResultId: string | null;
+  lifecyclePendingPublicationApprovalRunId: string | null;
+  lifecyclePendingPublicationApprovalReportId: string | null;
+  lifecyclePendingPublicationApprovalReason: string | null;
   lifecycleLatestCompletionReport: IssueCompletionReportRecord | null;
   lifecycleLatestApprovalPassVerdict: IssueReviewVerdictRecord | null;
   lifecycleMerge: IssueMergeMetadata | null;
@@ -447,11 +450,16 @@ export interface RunEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
   string
 > {
   runId: string | null;
+  runAgentId: string | null;
   role: AgentRunRole | null;
   runPhase: AgentRunPhase | null;
   runKind: AgentRunKind | null;
   runStatus: string | null;
   runSessionId: string | null;
+  runPrompt: string | null;
+  runPromptCharCount: number | null;
+  runStartedAt: string | null;
+  runUpdatedAt: string | null;
   runCompletedAt: string | null;
   runError: string | null;
   runTokens: TokenCounts | null;
@@ -634,6 +642,18 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
           payload,
           "lastMergeGateResultId",
         ),
+        lifecyclePendingPublicationApprovalRunId: stringField(
+          payload,
+          "pendingPublicationApprovalRunId",
+        ),
+        lifecyclePendingPublicationApprovalReportId: stringField(
+          payload,
+          "pendingPublicationApprovalReportId",
+        ),
+        lifecyclePendingPublicationApprovalReason: stringField(
+          payload,
+          "pendingPublicationApprovalReason",
+        ),
         lifecycleLatestCompletionReport:
           recordField<IssueCompletionReportRecord>(
             payload,
@@ -670,11 +690,16 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
     case "run":
       return copyMissingEvidenceFields(snapshot, {
         runId: stringField(payload, "runId") ?? snapshot.runId ?? null,
+        runAgentId: stringField(payload, "agentId"),
         role: stringField(payload, "role") ?? snapshot.role ?? null,
         runPhase: stringField(payload, "runPhase") ?? snapshot.runPhase ?? null,
         runKind: stringField(payload, "runKind") ?? snapshot.runKind ?? null,
         runStatus: stringField(payload, "status"),
         runSessionId: stringField(payload, "sessionId"),
+        runPrompt: stringField(payload, "prompt"),
+        runPromptCharCount: numberField(payload, "promptCharCount"),
+        runStartedAt: stringField(payload, "startedAt"),
+        runUpdatedAt: stringField(payload, "updatedAt"),
         runCompletedAt: stringField(payload, "completedAt"),
         runError: stringField(payload, "error"),
         runTokens: tokenCountsField(payload, "tokens"),

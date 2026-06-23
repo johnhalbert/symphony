@@ -3,6 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+  pendingPublicationHandoffForRun,
+} from "../src/core/CompletionReportService.js";
+import {
   parseServiceConfig,
   type ServiceConfig,
 } from "../src/core/config/Config.js";
@@ -22,7 +26,7 @@ import {
   type IssueLifecycleRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
-import type { Issue } from "../src/core/types.js";
+import type { Issue, TokenCounts } from "../src/core/types.js";
 
 describe("IssueCurrentStateBuilder", () => {
   let root: string;
@@ -551,6 +555,139 @@ describe("IssueCurrentStateBuilder", () => {
     });
   });
 
+  it("can build merge-policy completion run from typed history evidence", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture({ state: "Ready to Merge" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const runStore = new FileRunTranscriptStore(root);
+    const completionReport = {
+      id: "completion-1",
+      idempotencyKey: "completion-1",
+      runId: "run-completion",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      summary: "Done",
+      validationEvidence: ["validated"],
+      acceptanceChecklist: [],
+      changedFiles: ["src/app.ts"],
+      branchName: "feature/test-1",
+      pullRequest: {
+        url: "https://github.test/acme/repo/pull/7",
+        number: 7,
+        headSha: "abc123",
+        branch: "feature/test-1",
+      },
+      risks: [],
+      acceptedAt: "2026-01-01T00:00:03.000Z",
+      writebackOperationKeys: [],
+    };
+    await lifecycleStore.ensureIssue(issue, {
+      phase: "passed",
+      lastCompletionReportId: completionReport.id,
+      completionReports: [completionReport],
+    });
+    await runStore.startRun({
+      runId: "run-completion",
+      sessionId: "session-store",
+      agentId: "agent-store",
+      role: "worker",
+      runPhase: "implementation",
+      runKind: "implementation",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      attempt: 1,
+      turnNumber: 2,
+      prompt: "History prompt",
+      promptTemplateKeys: ["store-template"],
+      harnessId: "store-harness",
+      workspaceKey: "workspace-run-completion",
+      workspacePath: "/tmp/run-completion",
+      gitBranchName: "feature/test-1",
+    });
+    await runStore.updateRun("run-completion", {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:04.000Z",
+      tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+    });
+    const historyStore = new MemoryIssueStateStore();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+    historyStore.record = {
+      ...storeCurrent,
+      history: [
+        runEvidenceSnapshot(storeCurrent, {
+          historySnapshotId: "issue-history:run-completion:started",
+          snapshotAt: "2026-01-01T00:00:01.000Z",
+          eventType: "run_started",
+          runId: "run-completion",
+          sessionId: "session-history",
+          agentId: "agent-history",
+          status: "running",
+          role: "worker",
+          runPhase: "implementation",
+          runKind: "implementation",
+          prompt: "History prompt",
+          promptCharCount: "History prompt".length,
+          startedAt: "2026-01-01T00:00:01.000Z",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+          tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          attempt: 1,
+          turnNumber: 2,
+          harnessId: "history-harness",
+          promptTemplateKeys: ["history-template"],
+          workspaceKey: "workspace-run-completion",
+          workspacePath: "/tmp/run-completion",
+          gitBranchName: "feature/test-1",
+        }),
+        runEvidenceSnapshot(storeCurrent, {
+          historySnapshotId: "issue-history:run-completion:terminal",
+          snapshotAt: "2026-01-01T00:00:04.000Z",
+          eventType: "run_terminal_state_updated",
+          runId: "run-completion",
+          sessionId: "session-history",
+          agentId: "agent-history",
+          status: "succeeded",
+          role: "worker",
+          runPhase: "implementation",
+          runKind: "implementation",
+          updatedAt: "2026-01-01T00:00:04.000Z",
+          completedAt: "2026-01-01T00:00:04.000Z",
+          tokens: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          workspaceKey: "workspace-run-completion",
+          workspacePath: "/tmp/run-completion",
+          gitBranchName: "feature/test-1",
+        }),
+      ],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["mergePolicyCompletionRun"],
+    });
+
+    const current = await historyBackedBuilder.build(issue, emptyRuntime());
+
+    expect(current.mergePolicyLatestCompletionRun).toMatchObject({
+      runId: "run-completion",
+      sessionId: "session-history",
+      agentId: "agent-history",
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:04.000Z",
+      promptTemplateKeys: ["history-template"],
+      harnessId: "history-harness",
+      tokens: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+    });
+  });
+
   it("can build lifecycle core fields from typed history evidence", async () => {
     const config = builderConfig(root);
     const issue = issueFixture({ state: "Blocked" });
@@ -727,6 +864,72 @@ describe("IssueCurrentStateBuilder", () => {
       id: "verdict-1",
       reviewer: "history-reviewer",
     });
+  });
+
+  it("can build lifecycle publication approval fields from typed history evidence", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture({ state: "Blocked" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const completionReport = {
+      id: "completion-approval-1",
+      idempotencyKey: "completion-approval-1",
+      runId: "worker-run-approval-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      summary: "Ready for publication approval",
+      validationEvidence: ["validated"],
+      acceptanceChecklist: [],
+      changedFiles: ["src/app.ts"],
+      branchName: "feature/test-1",
+      pullRequest: {
+        url: "https://github.test/acme/repo/pull/7",
+        number: 7,
+        headSha: "abc123",
+        branch: "feature/test-1",
+      },
+      risks: [],
+      acceptedAt: "2026-01-01T00:00:01.000Z",
+      writebackOperationKeys: [],
+    };
+    const lifecycle = await lifecycleStore.ensureIssue(issue, {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      lastCompletionReportId: completionReport.id,
+      completionReports: [completionReport],
+    });
+    const historyStore = new MemoryIssueStateStore();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+    historyStore.record = {
+      ...storeCurrent,
+      history: [lifecycleEvidenceSnapshot(storeCurrent, lifecycle)],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["lifecyclePublication"],
+    });
+
+    const current = await historyBackedBuilder.build(issue, emptyRuntime());
+
+    expect(current.pendingPublicationApprovalRunId).toBe(
+      "worker-run-approval-1",
+    );
+    expect(current.pendingPublicationApprovalReportId).toBe(
+      "completion-approval-1",
+    );
+    expect(current.pendingPublicationApprovalReason).toBe(
+      PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+    );
   });
 
   it("can build lifecycle merge-policy fields from typed history evidence", async () => {
@@ -1377,6 +1580,7 @@ function lifecycleEvidenceSnapshot(
     latestCompletionReportForTestLifecycle(lifecycle);
   const latestApprovalPassVerdict =
     latestApprovalPassVerdictForTestLifecycle(lifecycle);
+  const pendingPublication = pendingPublicationHandoffForRun(lifecycle);
   return {
     ...current,
     snapshotId: "issue-snapshot:lifecycle-evidence",
@@ -1428,6 +1632,12 @@ function lifecycleEvidenceSnapshot(
         lifecycle.lastCompletionReportRejectionId,
       lastReviewVerdictId: lifecycle.lastReviewVerdictId,
       lastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
+      pendingPublicationApprovalRunId:
+        pendingPublication?.pendingReport.runId ?? null,
+      pendingPublicationApprovalReportId:
+        pendingPublication?.pendingReport.id ?? null,
+      pendingPublicationApprovalReason:
+        pendingPublication === null ? null : lifecycle.blockedReason,
       latestCompletionReport,
       latestApprovalPassVerdict,
       merge: lifecycle.merge,
@@ -1457,6 +1667,12 @@ function lifecycleEvidenceSnapshot(
       lifecycle.lastCompletionReportRejectionId,
     lifecycleLastReviewVerdictId: lifecycle.lastReviewVerdictId,
     lifecycleLastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
+    lifecyclePendingPublicationApprovalRunId:
+      pendingPublication?.pendingReport.runId ?? null,
+    lifecyclePendingPublicationApprovalReportId:
+      pendingPublication?.pendingReport.id ?? null,
+    lifecyclePendingPublicationApprovalReason:
+      pendingPublication === null ? null : lifecycle.blockedReason,
     lifecycleLatestCompletionReport: latestCompletionReport,
     lifecycleLatestApprovalPassVerdict: latestApprovalPassVerdict,
     lifecycleMerge: lifecycle.merge,
@@ -1544,18 +1760,34 @@ function runEvidenceSnapshot(
     snapshotAt: string;
     eventType: string;
     runId: string;
+    sessionId?: string | null;
+    agentId?: string | null;
     status: string;
     role: "worker";
     runPhase: "implementation";
     runKind: "implementation";
+    prompt?: string | null;
+    promptCharCount?: number | null;
+    startedAt?: string | null;
+    updatedAt?: string | null;
     completedAt?: string;
     error?: string;
+    tokens?: TokenCounts | null;
+    attempt?: number | null;
+    turnNumber?: number | null;
+    harnessId?: string | null;
     workspaceKey: string;
     workspacePath: string;
+    gitBranchName?: string | null;
+    prUrl?: string | null;
+    prNumber?: number | null;
+    prHeadSha?: string | null;
+    prBranch?: string | null;
     sdkRunStatus?: string;
     sdkRunStatusSource?: string;
     cancellationOutcome?: string;
     cancelFailed?: boolean;
+    promptTemplateKeys?: string[] | null;
   },
 ): IssueHistorySnapshot {
   return {
@@ -1591,14 +1823,29 @@ function runEvidenceSnapshot(
     evidenceSourceId: input.runId,
     evidencePayload: null,
     runId: input.runId,
+    runSessionId: input.sessionId ?? null,
+    runAgentId: input.agentId ?? null,
     role: input.role,
     runPhase: input.runPhase,
     runKind: input.runKind,
     runStatus: input.status,
+    runPrompt: input.prompt ?? null,
+    runPromptCharCount: input.promptCharCount ?? null,
+    runStartedAt: input.startedAt ?? null,
+    runUpdatedAt: input.updatedAt ?? null,
     runCompletedAt: input.completedAt ?? null,
     runError: input.error ?? null,
+    runTokens: input.tokens ?? null,
+    runAttempt: input.attempt ?? null,
+    runTurnNumber: input.turnNumber ?? null,
+    runHarnessId: input.harnessId ?? null,
     runWorkspaceKey: input.workspaceKey,
     runWorkspacePath: input.workspacePath,
+    runGitBranchName: input.gitBranchName ?? null,
+    runPrUrl: input.prUrl ?? null,
+    runPrNumber: input.prNumber ?? null,
+    runPrHeadSha: input.prHeadSha ?? null,
+    runPrBranch: input.prBranch ?? null,
     runSdkStatus: input.sdkRunStatus ?? null,
     runSdkStatusSource: input.sdkRunStatusSource ?? null,
     runCancellationRequestedAt: null,
@@ -1606,6 +1853,7 @@ function runEvidenceSnapshot(
     runCancelFailed: input.cancelFailed ?? null,
     runFailureKind: null,
     runFailureDiagnosticCode: null,
+    runPromptTemplateKeys: input.promptTemplateKeys ?? null,
   };
 }
 
