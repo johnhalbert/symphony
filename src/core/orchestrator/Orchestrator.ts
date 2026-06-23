@@ -957,6 +957,7 @@ export class Orchestrator {
         "lifecycleCore",
         "lifecycleReports",
         "lifecycleMergePolicy",
+        "lifecycleBreakdown",
       ],
     });
     this.transitionRulesets = this.createTransitionRulesets();
@@ -8136,6 +8137,9 @@ export class Orchestrator {
         planningFailureCount: input.lifecycle.planningFailureCount,
         planningDispatchRetryCount: input.lifecycle.planningDispatchRetryCount,
         lastPlanningFailureAt: input.lifecycle.lastPlanningFailureAt ?? null,
+        lastIssueBreakdownPlanId:
+          input.lifecycle.lastIssueBreakdownPlanId ?? null,
+        issueBreakdownPlans: input.lifecycle.issueBreakdownPlans,
         lastCompletionReportId: input.lifecycle.lastCompletionReportId ?? null,
         lastCompletionReportRejectionId:
           input.lifecycle.lastCompletionReportRejectionId ?? null,

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentHandoffRepairKind } from "../harness/AgentHarness.js";
 import type { MergePolicyObservation } from "../merge/MergePolicyService.js";
 import type {
+  IssueBreakdownPlanRecord,
   IssueCompletionReportRecord,
   IssueLifecyclePatch,
   IssueMergeConflictMetadata,
@@ -418,6 +419,8 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   lifecyclePlanningFailureCount: number | null;
   lifecyclePlanningDispatchRetryCount: number | null;
   lifecycleLastPlanningFailureAt: string | null;
+  lifecycleLastIssueBreakdownPlanId: string | null;
+  lifecycleIssueBreakdownPlans: IssueBreakdownPlanRecord[] | null;
   lifecycleLastCompletionReportId: string | null;
   lifecycleLastCompletionReportRejectionId: string | null;
   lifecycleLastReviewVerdictId: string | null;
@@ -583,6 +586,15 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
           payload,
           "lastPlanningFailureAt",
         ),
+        lifecycleLastIssueBreakdownPlanId: stringField(
+          payload,
+          "lastIssueBreakdownPlanId",
+        ),
+        lifecycleIssueBreakdownPlans:
+          recordArrayField<IssueBreakdownPlanRecord>(
+            payload,
+            "issueBreakdownPlans",
+          ),
         lifecycleLastCompletionReportId: stringField(
           payload,
           "lastCompletionReportId",

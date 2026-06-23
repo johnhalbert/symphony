@@ -110,7 +110,8 @@ export type IssueCurrentStateHistoryFieldGroup =
   | "runSummary"
   | "lifecycleCore"
   | "lifecycleReports"
-  | "lifecycleMergePolicy";
+  | "lifecycleMergePolicy"
+  | "lifecycleBreakdown";
 
 type IssueBreakdownPlan = IssueLifecycleRecord["issueBreakdownPlans"][number];
 type IssueTriageReport = IssueLifecycleRecord["issueTriageReports"][number];
@@ -223,6 +224,15 @@ type LifecycleMergePolicyFields = Pick<
   | "mergePolicyReviewFeedback"
 >;
 
+type LifecycleBreakdownFields = Pick<
+  LifecycleFields,
+  | "lastIssueBreakdownPlanId"
+  | "lastIssueBreakdownPlanApplicationStatus"
+  | "lastIssueBreakdownPlanIssueContentFingerprint"
+  | "lastIssueBreakdownPlanConfigFingerprint"
+  | "lastIssueBreakdownPlanSatisfiesCurrentValidation"
+>;
+
 type ConfigFields = Pick<
   IssueCurrentFields,
   | "currentIssueBreakdownConfigFingerprint"
@@ -318,6 +328,7 @@ interface HistoryBackedGroupFields {
   lifecycleCore?: LifecycleCoreFields;
   lifecycleReports?: LifecycleReportFields;
   lifecycleMergePolicy?: LifecycleMergePolicyFields;
+  lifecycleBreakdown?: LifecycleBreakdownFields;
 }
 
 interface HistoryBackedGroupResult {
@@ -397,6 +408,8 @@ export class IssueCurrentStateBuilder {
       this.buildLifecycleReportFieldsFromHistory(context);
     const lifecycleMergePolicy =
       this.buildLifecycleMergePolicyFieldsFromHistory(context);
+    const lifecycleBreakdown =
+      this.buildLifecycleBreakdownFieldsFromHistory(context);
     const trackerSourceSnapshotIds =
       tracker.sourceSnapshotId === null ? [] : [tracker.sourceSnapshotId];
     const lifecycleCoreSourceSnapshotIds =
@@ -411,6 +424,10 @@ export class IssueCurrentStateBuilder {
       lifecycleMergePolicy.sourceSnapshotId === null
         ? []
         : [lifecycleMergePolicy.sourceSnapshotId];
+    const lifecycleBreakdownSourceSnapshotIds =
+      lifecycleBreakdown.sourceSnapshotId === null
+        ? []
+        : [lifecycleBreakdown.sourceSnapshotId];
     return {
       fields: {
         ...(tracker.fields === null ? {} : { tracker: tracker.fields }),
@@ -426,6 +443,9 @@ export class IssueCurrentStateBuilder {
         ...(lifecycleMergePolicy.fields === null
           ? {}
           : { lifecycleMergePolicy: lifecycleMergePolicy.fields }),
+        ...(lifecycleBreakdown.fields === null
+          ? {}
+          : { lifecycleBreakdown: lifecycleBreakdown.fields }),
       },
       incompleteGroups: [
         ...(tracker.complete ? [] : (["tracker"] as const)),
@@ -435,6 +455,9 @@ export class IssueCurrentStateBuilder {
         ...(lifecycleMergePolicy.complete
           ? []
           : (["lifecycleMergePolicy"] as const)),
+        ...(lifecycleBreakdown.complete
+          ? []
+          : (["lifecycleBreakdown"] as const)),
       ],
       sourceSnapshotIds: [
         ...trackerSourceSnapshotIds,
@@ -442,6 +465,7 @@ export class IssueCurrentStateBuilder {
         ...lifecycleCoreSourceSnapshotIds,
         ...lifecycleReportSourceSnapshotIds,
         ...lifecycleMergePolicySourceSnapshotIds,
+        ...lifecycleBreakdownSourceSnapshotIds,
       ],
       sourceSnapshotIdsByGroup: {
         tracker: trackerSourceSnapshotIds,
@@ -449,6 +473,7 @@ export class IssueCurrentStateBuilder {
         lifecycleCore: lifecycleCoreSourceSnapshotIds,
         lifecycleReports: lifecycleReportSourceSnapshotIds,
         lifecycleMergePolicy: lifecycleMergePolicySourceSnapshotIds,
+        lifecycleBreakdown: lifecycleBreakdownSourceSnapshotIds,
       },
     };
   }
@@ -856,6 +881,87 @@ export class IssueCurrentStateBuilder {
         mergePolicyMergeGateResults: mergeGateResults,
         mergePolicyMergeConflict: mergeConflict,
         mergePolicyReviewFeedback: reviewFeedback,
+      },
+    };
+  }
+
+  private buildLifecycleBreakdownFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | {
+        complete: true;
+        fields: LifecycleBreakdownFields;
+        sourceSnapshotId: string;
+      }
+    | { complete: false; fields: null; sourceSnapshotId: string | null } {
+    const snapshot = latestLifecycleMutationSnapshot(context.history);
+    if (snapshot === null) {
+      return { complete: false, fields: null, sourceSnapshotId: null };
+    }
+    if (
+      context.lifecycle === null ||
+      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
+        context.lifecycle.updatedAt
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const lastIssueBreakdownPlanId = stringFromUnknown(
+      snapshot.lifecycleLastIssueBreakdownPlanId,
+    );
+    const issueBreakdownPlans = recordArrayFromUnknown<IssueBreakdownPlan>(
+      snapshot.lifecycleIssueBreakdownPlans,
+    );
+    if (
+      !historyStringMatchesKnown(
+        lastIssueBreakdownPlanId,
+        context.lifecycle.lastIssueBreakdownPlanId,
+      ) ||
+      !historyRecordArrayMatchesKnown(
+        issueBreakdownPlans,
+        context.lifecycle.issueBreakdownPlans,
+      )
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const lastIssueBreakdownPlan =
+      lastIssueBreakdownPlanId === null
+        ? null
+        : (issueBreakdownPlans.find(
+            (plan) => plan.id === lastIssueBreakdownPlanId,
+          ) ?? null);
+    if (lastIssueBreakdownPlanId !== null && lastIssueBreakdownPlan === null) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    return {
+      complete: true,
+      sourceSnapshotId: snapshot.historySnapshotId,
+      fields: {
+        lastIssueBreakdownPlanId,
+        lastIssueBreakdownPlanApplicationStatus:
+          lastIssueBreakdownPlan?.applicationStatus ?? null,
+        lastIssueBreakdownPlanIssueContentFingerprint:
+          lastIssueBreakdownPlan?.issueContentFingerprint ?? null,
+        lastIssueBreakdownPlanConfigFingerprint:
+          lastIssueBreakdownPlan?.configFingerprint ?? null,
+        lastIssueBreakdownPlanSatisfiesCurrentValidation:
+          lastIssueBreakdownPlan === null
+            ? false
+            : issueBreakdownPlanSatisfiesCurrentValidation(
+                lastIssueBreakdownPlan,
+                this.options.config,
+              ),
       },
     };
   }

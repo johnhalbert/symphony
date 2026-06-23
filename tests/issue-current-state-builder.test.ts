@@ -896,6 +896,92 @@ describe("IssueCurrentStateBuilder", () => {
       },
     ]);
   });
+
+  it("can build lifecycle breakdown fields from typed history evidence", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture({ labels: ["planning"] });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const plan = {
+      id: "breakdown-plan-1",
+      idempotencyKey: "breakdown-plan-1",
+      requestHash: "request-hash-1",
+      runId: "planner-run-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      summary: "Split the work",
+      proposedIssues: [
+        {
+          title: "Child issue",
+          description: "Child body",
+          acceptanceCriteria: ["Works"],
+          dependencies: [],
+          labels: ["child"],
+        },
+      ],
+      transcriptPointers: [],
+      statusApiPointers: [],
+      issueUpdatedAt: issue.updatedAt,
+      issueContentFingerprint: "store-issue-fingerprint",
+      configFingerprint: "store-config-fingerprint",
+      cursorMode: "none",
+      acceptedAt: "2026-01-01T00:00:01.000Z",
+      applicationStatus: "not_requested" as const,
+      applicationOperationKeys: [],
+      createdIssueRefs: [],
+      appliedAt: null,
+      applicationBlockedReason: null,
+    };
+    const lifecycle = await lifecycleStore.ensureIssue(issue, {
+      phase: "implementation",
+      lastIssueBreakdownPlanId: plan.id,
+      issueBreakdownPlans: [plan],
+    });
+    const historyStore = new MemoryIssueStateStore();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+    const historyLifecycle: IssueLifecycleRecord = {
+      ...lifecycle,
+      issueBreakdownPlans: [
+        {
+          ...plan,
+          issueContentFingerprint: "history-issue-fingerprint",
+          configFingerprint: "history-config-fingerprint",
+          applicationStatus: "applied" as const,
+          applicationOperationKeys: ["history-apply-op"],
+          appliedAt: "2026-01-01T00:00:02.000Z",
+        },
+      ],
+    };
+    historyStore.record = {
+      ...storeCurrent,
+      history: [lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle)],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["lifecycleBreakdown"],
+    });
+
+    const current = await historyBackedBuilder.build(issue, emptyRuntime());
+
+    expect(current).toMatchObject({
+      lastIssueBreakdownPlanId: "breakdown-plan-1",
+      lastIssueBreakdownPlanApplicationStatus: "applied",
+      lastIssueBreakdownPlanIssueContentFingerprint:
+        "history-issue-fingerprint",
+      lastIssueBreakdownPlanConfigFingerprint: "history-config-fingerprint",
+      lastIssueBreakdownPlanSatisfiesCurrentValidation: false,
+    });
+  });
 });
 
 function builderConfig(root: string): ServiceConfig {
@@ -1100,6 +1186,8 @@ function lifecycleEvidenceSnapshot(
       planningFailureCount: lifecycle.planningFailureCount,
       planningDispatchRetryCount: lifecycle.planningDispatchRetryCount,
       lastPlanningFailureAt: lifecycle.lastPlanningFailureAt,
+      lastIssueBreakdownPlanId: lifecycle.lastIssueBreakdownPlanId,
+      issueBreakdownPlans: lifecycle.issueBreakdownPlans,
       lastCompletionReportId: lifecycle.lastCompletionReportId,
       lastCompletionReportRejectionId:
         lifecycle.lastCompletionReportRejectionId,
@@ -1123,6 +1211,8 @@ function lifecycleEvidenceSnapshot(
     lifecyclePlanningFailureCount: lifecycle.planningFailureCount,
     lifecyclePlanningDispatchRetryCount: lifecycle.planningDispatchRetryCount,
     lifecycleLastPlanningFailureAt: lifecycle.lastPlanningFailureAt,
+    lifecycleLastIssueBreakdownPlanId: lifecycle.lastIssueBreakdownPlanId,
+    lifecycleIssueBreakdownPlans: lifecycle.issueBreakdownPlans,
     lifecycleLastCompletionReportId: lifecycle.lastCompletionReportId,
     lifecycleLastCompletionReportRejectionId:
       lifecycle.lastCompletionReportRejectionId,
