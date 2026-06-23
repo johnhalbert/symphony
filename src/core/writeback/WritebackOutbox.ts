@@ -1,6 +1,8 @@
 import { promises as fs } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import sqlite3 from "sqlite3";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { ServiceConfig } from "../config/Config.js";
 import { latestFreshIssueBreakdownPlan } from "../IssueBreakdownPlanService.js";
@@ -140,12 +142,25 @@ export type EnqueueWritebackOptions = {
   retrySkippedMessages?: readonly string[];
 };
 
+export interface WritebackOutboxStore {
+  close?(): Promise<void>;
+  enqueueOnce(operation: NewWritebackOperation): Promise<WritebackOperation>;
+  claimDue(now?: Date, options?: { idempotencyKeys?: readonly string[] }): Promise<WritebackOperation[]>;
+  markSucceeded(record: WritebackOperation, result?: TrackerWriteResult): Promise<WritebackOperation>;
+  markSkipped(record: WritebackOperation, message: string, result?: TrackerWriteResult): Promise<WritebackOperation>;
+  requeueSkipped(record: WritebackOperation): Promise<WritebackOperation>;
+  markRetry(record: WritebackOperation, error: string, nextAttemptAt: string): Promise<WritebackOperation>;
+  markDeadLetter(record: WritebackOperation, error: string): Promise<WritebackOperation>;
+  get(idempotencyKey: string): Promise<WritebackOperation | null>;
+  list(): Promise<WritebackOperation[]>;
+}
+
 type LifecycleGuardResult =
   | { status: "ready" }
   | { status: "blocked"; message: string }
   | { status: "retry"; message: string };
 
-export class FileWritebackOutboxStore {
+export class FileWritebackOutboxStore implements WritebackOutboxStore {
   private readonly claimLocks = new Set<string>();
   private readonly writeLocks = new Map<string, Promise<void>>();
   private readonly projectionNotifier = new ProjectionRevisionNotifier();
@@ -325,9 +340,456 @@ export class FileWritebackOutboxStore {
   }
 }
 
+type SqliteDatabase = InstanceType<typeof sqlite3.Database>;
+
+interface WritebackOperationRow {
+  idempotency_key: string;
+  kind: WritebackOperation["kind"];
+  issue_id: string;
+  run_id: string | null;
+  status: WritebackStatus;
+  attempt: number;
+  created_at: string;
+  updated_at: string;
+  next_attempt_at: string;
+  last_error: string | null;
+  result_status: TrackerWriteResult["status"] | null;
+  result_message: string | null;
+  result_evidence_json: string | null;
+  payload_json: string;
+}
+
+export class SqliteWritebackOutboxStore implements WritebackOutboxStore {
+  private writeLock: Promise<void> = Promise.resolve();
+  private database: SqliteDatabase | null = null;
+  private databaseReady: Promise<SqliteDatabase> | null = null;
+  private readonly projectionNotifier = new ProjectionRevisionNotifier();
+
+  constructor(
+    private readonly stateDir: string,
+    private readonly databaseFileName = "writeback.sqlite",
+  ) {}
+
+  async close(): Promise<void> {
+    await this.writeLock.catch(() => undefined);
+    const database = this.database;
+    this.database = null;
+    this.databaseReady = null;
+    if (database) {
+      await this.closeDatabase(database);
+      await delay(25);
+    }
+  }
+
+  projectionRevision(): number {
+    return this.projectionNotifier.currentRevision();
+  }
+
+  onProjectionChanged(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe {
+    return this.projectionNotifier.subscribe(listener);
+  }
+
+  async enqueueOnce(operation: NewWritebackOperation): Promise<WritebackOperation> {
+    let changed = false;
+    const record = await this.withWrite(async (database) => {
+      const existing = await this.getUnlocked(database, operation.idempotencyKey);
+      if (existing) return existing;
+      const now = new Date().toISOString();
+      const next = {
+        ...operation,
+        status: "pending",
+        attempt: 0,
+        createdAt: now,
+        updatedAt: now,
+        nextAttemptAt: now,
+        lastError: null,
+        resultStatus: null,
+        resultMessage: null,
+        resultEvidence: null,
+      } as WritebackOperation;
+      await this.upsertRecordUnlocked(database, next);
+      changed = true;
+      return next;
+    });
+    if (changed) this.notifyProjectionChanged();
+    return record;
+  }
+
+  async claimDue(now = new Date(), options: { idempotencyKeys?: readonly string[] } = {}): Promise<WritebackOperation[]> {
+    const idempotencyKeys = options.idempotencyKeys === undefined ? null : Array.from(new Set(options.idempotencyKeys));
+    if (idempotencyKeys !== null && idempotencyKeys.length === 0) return [];
+    let changed = false;
+    const claimed = await this.withWrite(async (database) => {
+      const allowedClause = idempotencyKeys === null ? "" : ` AND idempotency_key IN (${idempotencyKeys.map(() => "?").join(", ")})`;
+      const rows = await this.allRows<WritebackOperationRow>(
+        database,
+        `
+          SELECT *
+          FROM writeback_operations
+          WHERE status IN ('pending', 'retrying')
+            AND next_attempt_at <= ?
+            ${allowedClause}
+          ORDER BY created_at, idempotency_key
+        `,
+        [now.toISOString(), ...(idempotencyKeys ?? [])],
+      );
+      const updates: WritebackOperation[] = [];
+      for (const row of rows) {
+        const updatedAt = new Date().toISOString();
+        const result = await this.run(
+          database,
+          `
+            UPDATE writeback_operations
+            SET status = 'in_flight',
+                updated_at = ?
+            WHERE idempotency_key = ?
+              AND status IN ('pending', 'retrying')
+              AND next_attempt_at <= ?
+          `,
+          [updatedAt, row.idempotency_key, now.toISOString()],
+        );
+        if (result.changes !== 1) continue;
+        changed = true;
+        updates.push(
+          this.recordFromRow({
+            ...row,
+            status: "in_flight",
+            updated_at: updatedAt,
+          }),
+        );
+      }
+      return updates;
+    });
+    if (changed) this.notifyProjectionChanged();
+    return claimed;
+  }
+
+  async markSucceeded(record: WritebackOperation, result?: TrackerWriteResult): Promise<WritebackOperation> {
+    return this.update(record, {
+      status: "succeeded",
+      lastError: null,
+      resultStatus: result?.status ?? null,
+      resultMessage: result?.message ?? null,
+      resultEvidence: result?.evidence ?? null,
+    });
+  }
+
+  async markSkipped(record: WritebackOperation, message: string, result?: TrackerWriteResult): Promise<WritebackOperation> {
+    return this.update(record, {
+      status: "skipped",
+      lastError: message,
+      resultStatus: result?.status ?? null,
+      resultMessage: result?.message ?? message,
+      resultEvidence: result?.evidence ?? null,
+    });
+  }
+
+  async requeueSkipped(record: WritebackOperation): Promise<WritebackOperation> {
+    if (record.status !== "skipped") return record;
+    return this.update(record, {
+      status: "pending",
+      nextAttemptAt: new Date().toISOString(),
+      lastError: null,
+    });
+  }
+
+  async markRetry(record: WritebackOperation, error: string, nextAttemptAt: string): Promise<WritebackOperation> {
+    return this.update(record, {
+      status: "retrying",
+      attempt: record.attempt + 1,
+      lastError: error,
+      nextAttemptAt,
+    });
+  }
+
+  async markDeadLetter(record: WritebackOperation, error: string): Promise<WritebackOperation> {
+    return this.update(record, { status: "dead_letter", attempt: record.attempt + 1, lastError: error });
+  }
+
+  async get(idempotencyKey: string): Promise<WritebackOperation | null> {
+    return this.withStore((database) => this.getUnlocked(database, idempotencyKey));
+  }
+
+  async list(): Promise<WritebackOperation[]> {
+    return this.withStore(async (database) => {
+      const rows = await this.allRows<WritebackOperationRow>(
+        database,
+        "SELECT * FROM writeback_operations ORDER BY created_at, idempotency_key",
+      );
+      return rows.map((row) => this.recordFromRow(row));
+    });
+  }
+
+  private async update(record: WritebackOperation, patch: Partial<WritebackOperation>): Promise<WritebackOperation> {
+    const updated = { ...record, ...patch, updatedAt: new Date().toISOString() } as WritebackOperation;
+    await this.withWrite((database) => this.upsertRecordUnlocked(database, updated));
+    this.notifyProjectionChanged();
+    return updated;
+  }
+
+  private notifyProjectionChanged(): void {
+    this.projectionNotifier.notify("writeback");
+  }
+
+  private async db(): Promise<SqliteDatabase> {
+    if (this.database) return this.database;
+    this.databaseReady ??= this.open();
+    return this.databaseReady;
+  }
+
+  private async open(): Promise<SqliteDatabase> {
+    await fs.mkdir(this.stateDir, { recursive: true });
+    const databasePath = path.join(this.stateDir, this.databaseFileName);
+    const database = await new Promise<SqliteDatabase>((resolve, reject) => {
+      let created: SqliteDatabase | null = null;
+      created = new sqlite3.Database(
+        databasePath,
+        sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE | sqlite3.OPEN_FULLMUTEX,
+        (error) => {
+          if (error) {
+            created?.close(() => undefined);
+            reject(error);
+            return;
+          }
+          if (created === null) {
+            reject(new Error("SQLite database open callback fired before database assignment"));
+            return;
+          }
+          resolve(created);
+        },
+      );
+    });
+    database.configure("busyTimeout", 5000);
+    try {
+      await this.exec(
+        database,
+        `
+          PRAGMA journal_mode = WAL;
+
+          CREATE TABLE IF NOT EXISTS writeback_operations (
+            idempotency_key TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            issue_id TEXT NOT NULL,
+            run_id TEXT NULL,
+            status TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            next_attempt_at TEXT NOT NULL,
+            last_error TEXT NULL,
+            result_status TEXT NULL,
+            result_message TEXT NULL,
+            result_evidence_json TEXT NULL,
+            payload_json TEXT NOT NULL
+          );
+
+          CREATE INDEX IF NOT EXISTS writeback_operations_due_idx
+            ON writeback_operations(status, next_attempt_at, created_at);
+
+          CREATE INDEX IF NOT EXISTS writeback_operations_issue_idx
+            ON writeback_operations(issue_id);
+
+          CREATE INDEX IF NOT EXISTS writeback_operations_run_idx
+            ON writeback_operations(run_id);
+        `,
+      );
+      await this.importLegacyRecords(database);
+    } catch (error) {
+      await this.closeDatabase(database).catch(() => undefined);
+      throw error;
+    }
+    this.database = database;
+    return database;
+  }
+
+  private async withStore<T>(operation: (database: SqliteDatabase) => Promise<T> | T): Promise<T> {
+    const previous = this.writeLock;
+    const current = previous.catch(() => undefined).then(async () => {
+      const database = await this.db();
+      return operation(database);
+    });
+    this.writeLock = current.then(
+      () => undefined,
+      () => undefined,
+    );
+    return current;
+  }
+
+  private async withWrite<T>(operation: (database: SqliteDatabase) => Promise<T> | T): Promise<T> {
+    return this.withStore(async (database) => {
+      await this.exec(database, "BEGIN IMMEDIATE");
+      try {
+        const result = await operation(database);
+        await this.exec(database, "COMMIT");
+        return result;
+      } catch (error) {
+        await this.exec(database, "ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    });
+  }
+
+  private async importLegacyRecords(database: SqliteDatabase): Promise<void> {
+    const legacyStore = new FileWritebackOutboxStore(this.stateDir);
+    const records = await legacyStore.list();
+    if (records.length === 0) return;
+
+    await this.exec(database, "BEGIN IMMEDIATE");
+    try {
+      for (const record of records) {
+        const existing = await this.getUnlocked(database, record.idempotencyKey);
+        if (existing && Date.parse(existing.updatedAt) > Date.parse(record.updatedAt)) continue;
+        await this.upsertRecordUnlocked(database, record);
+      }
+      await this.exec(database, "COMMIT");
+    } catch (error) {
+      await this.exec(database, "ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async getUnlocked(database: SqliteDatabase, idempotencyKey: string): Promise<WritebackOperation | null> {
+    const row = await this.getRow<WritebackOperationRow>(
+      database,
+      "SELECT * FROM writeback_operations WHERE idempotency_key = ?",
+      [idempotencyKey],
+    );
+    return row ? this.recordFromRow(row) : null;
+  }
+
+  private async upsertRecordUnlocked(database: SqliteDatabase, record: WritebackOperation): Promise<void> {
+    await this.run(
+      database,
+      `
+        INSERT INTO writeback_operations (
+          idempotency_key,
+          kind,
+          issue_id,
+          run_id,
+          status,
+          attempt,
+          created_at,
+          updated_at,
+          next_attempt_at,
+          last_error,
+          result_status,
+          result_message,
+          result_evidence_json,
+          payload_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(idempotency_key) DO UPDATE SET
+          kind = excluded.kind,
+          issue_id = excluded.issue_id,
+          run_id = excluded.run_id,
+          status = excluded.status,
+          attempt = excluded.attempt,
+          created_at = excluded.created_at,
+          updated_at = excluded.updated_at,
+          next_attempt_at = excluded.next_attempt_at,
+          last_error = excluded.last_error,
+          result_status = excluded.result_status,
+          result_message = excluded.result_message,
+          result_evidence_json = excluded.result_evidence_json,
+          payload_json = excluded.payload_json
+      `,
+      this.paramsForRecord(record),
+    );
+  }
+
+  private paramsForRecord(record: WritebackOperation): readonly unknown[] {
+    return [
+      record.idempotencyKey,
+      record.kind,
+      record.issueId,
+      record.runId ?? null,
+      record.status,
+      record.attempt,
+      record.createdAt,
+      record.updatedAt,
+      record.nextAttemptAt,
+      record.lastError,
+      record.resultStatus,
+      record.resultMessage,
+      record.resultEvidence === null ? null : JSON.stringify(record.resultEvidence),
+      JSON.stringify(record.payload),
+    ];
+  }
+
+  private recordFromRow(row: WritebackOperationRow): WritebackOperation {
+    return {
+      idempotencyKey: row.idempotency_key,
+      kind: row.kind,
+      issueId: row.issue_id,
+      ...(row.run_id === null ? {} : { runId: row.run_id }),
+      status: row.status,
+      attempt: row.attempt,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      nextAttemptAt: row.next_attempt_at,
+      lastError: row.last_error,
+      resultStatus: row.result_status,
+      resultMessage: row.result_message,
+      resultEvidence: row.result_evidence_json === null ? null : (JSON.parse(row.result_evidence_json) as TrackerWriteEvidence),
+      payload: JSON.parse(row.payload_json) as WritebackOperation["payload"],
+    } as WritebackOperation;
+  }
+
+  private async exec(database: SqliteDatabase, sql: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      database.exec(sql, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+
+  private async run(
+    database: SqliteDatabase,
+    sql: string,
+    params: readonly unknown[] = [],
+  ): Promise<{ changes: number; lastID: number }> {
+    return new Promise<{ changes: number; lastID: number }>((resolve, reject) => {
+      database.run(sql, [...params], function (this: sqlite3.RunResult, error) {
+        if (error) reject(error);
+        else resolve({ changes: this.changes, lastID: this.lastID });
+      });
+    });
+  }
+
+  private async getRow<T>(database: SqliteDatabase, sql: string, params: readonly unknown[] = []): Promise<T | undefined> {
+    return new Promise<T | undefined>((resolve, reject) => {
+      database.get<T>(sql, [...params], (error, row) => {
+        if (error) reject(error);
+        else resolve(row);
+      });
+    });
+  }
+
+  private async allRows<T>(database: SqliteDatabase, sql: string, params: readonly unknown[] = []): Promise<T[]> {
+    return new Promise<T[]>((resolve, reject) => {
+      database.all<T>(sql, [...params], (error, rows) => {
+        if (error) reject(error);
+        else resolve(rows);
+      });
+    });
+  }
+
+  private async closeDatabase(database: SqliteDatabase): Promise<void> {
+    await this.exec(database, "PRAGMA wal_checkpoint(TRUNCATE)").catch(() => undefined);
+    await this.exec(database, "PRAGMA journal_mode = DELETE").catch(() => undefined);
+    await new Promise<void>((resolve, reject) => {
+      database.close((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+}
+
 export class WritebackProcessor {
   constructor(
-    private readonly store: FileWritebackOutboxStore,
+    private readonly store: WritebackOutboxStore,
     private readonly writer: TrackerWriter,
     private readonly logger: Logger,
     private readonly maxBackoffMs: number,
@@ -335,6 +797,10 @@ export class WritebackProcessor {
     private readonly dryRun = false,
     private readonly issueBreakdownFreshnessGuard?: IssueBreakdownFreshnessGuard,
   ) {}
+
+  async close(): Promise<void> {
+    await this.store.close?.();
+  }
 
   async enqueueAndProcess(operation: NewWritebackOperation, options: EnqueueWritebackOptions = {}): Promise<WritebackOperation> {
     let record = await this.store.enqueueOnce(operation);

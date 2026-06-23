@@ -17,7 +17,7 @@ import {
 } from "../src/core/harness/CompletionReportMcpServer.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
-import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
+import { SqliteWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import { issue } from "./helpers.js";
 
 describe("completion report MCP handoff", () => {
@@ -109,7 +109,7 @@ describe("completion report MCP handoff", () => {
       baseBranch: "main",
       evidenceCursor: "idem-1",
     });
-    const outbox = await new FileWritebackOutboxStore(stateDir).list();
+    const outbox = await listWritebacks(stateDir);
     const comment = outbox.find((operation) => operation.kind === "comment");
     const transition = outbox.find((operation) => operation.kind === "transition");
     expect(comment?.kind === "comment" ? comment.payload.body : "").toContain(
@@ -344,6 +344,15 @@ describe("completion report MCP handoff", () => {
     });
   });
 });
+
+async function listWritebacks(stateDir: string) {
+  const store = new SqliteWritebackOutboxStore(stateDir);
+  try {
+    return await store.list();
+  } finally {
+    await store.close();
+  }
+}
 
 function workflow(stateDir: string, publishPullRequests = true): string {
   return `---

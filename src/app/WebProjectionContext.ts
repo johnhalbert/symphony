@@ -4,7 +4,7 @@ import { errorMessage } from "../core/errors.js";
 import type { IssueLifecycleRecord, IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
 import { compareRunChronology, type RunRecord, type RunTranscriptStore, type WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
-import type { FileWritebackOutboxStore, WritebackOperation } from "../core/writeback/WritebackOutbox.js";
+import type { WritebackOutboxStore, WritebackOperation } from "../core/writeback/WritebackOutbox.js";
 
 export type WebProjectionClock = () => Date;
 export type WebProjectionRefreshParam = string | boolean | number | null | undefined;
@@ -192,7 +192,7 @@ export interface WebProjectionSourceIndexBuildOptions {
   forceRefresh?: boolean;
   runStore?: (Pick<RunTranscriptStore, "listRuns"> & Partial<Pick<RunTranscriptStore, "listWorkspaces">>) | null;
   lifecycleStore?: Pick<IssueLifecycleStore, "list"> | null;
-  writebackOutbox?: Pick<FileWritebackOutboxStore, "list"> | null;
+  writebackOutbox?: Pick<WritebackOutboxStore, "list"> | null;
   clock?: WebProjectionClock;
   durableSourceRevisions?: readonly WebProjectionSourceRevision[];
 }

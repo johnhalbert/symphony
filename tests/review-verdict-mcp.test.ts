@@ -11,7 +11,7 @@ import {
   type IssueCompletionReportRecord,
   type IssueReviewFeedbackRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
-import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
+import { SqliteWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import { issue } from "./helpers.js";
 
 describe("review verdict MCP handoff", () => {
@@ -82,7 +82,7 @@ describe("review verdict MCP handoff", () => {
         },
       ],
     });
-    const outbox = await new FileWritebackOutboxStore(stateDir).list();
+    const outbox = await listWritebacks(stateDir);
     expect(outbox.find((operation) => operation.kind === "comment")).toMatchObject({
       kind: "comment",
       runId: "review-run-1",
@@ -151,7 +151,7 @@ describe("review verdict MCP handoff", () => {
         },
       ],
     });
-    expect((await new FileWritebackOutboxStore(stateDir).list()).find((operation) => operation.kind === "transition")).toMatchObject({
+    expect((await listWritebacks(stateDir)).find((operation) => operation.kind === "transition")).toMatchObject({
       kind: "transition",
       payload: { toState: "Ready to Merge" },
     });
@@ -214,7 +214,7 @@ describe("review verdict MCP handoff", () => {
         },
       ],
     });
-    const outbox = await new FileWritebackOutboxStore(stateDir).list();
+    const outbox = await listWritebacks(stateDir);
     expect(outbox.find((operation) => operation.kind === "comment")).toMatchObject({
       kind: "comment",
       runId: "review-run-3",
@@ -226,6 +226,15 @@ describe("review verdict MCP handoff", () => {
     });
   });
 });
+
+async function listWritebacks(stateDir: string) {
+  const store = new SqliteWritebackOutboxStore(stateDir);
+  try {
+    return await store.list();
+  } finally {
+    await store.close();
+  }
+}
 
 function workflow(stateDir: string): string {
   return `---

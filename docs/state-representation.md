@@ -1,6 +1,6 @@
 # Symphony State Representation
 
-This document is a code-inspected map of the state Symphony needs in order to run. It separates authoritative state from projections, describes every durable file family Symphony writes, and gives TypeScript-shaped structures for each state source.
+This document is a code-inspected map of the state Symphony needs in order to run. It separates authoritative state from read models, describes every durable file family Symphony writes, and gives TypeScript-shaped structures for each state source.
 
 For the database/external-system/memory/disk placement decision, see `docs/state-ownership-and-durability.md`.
 
@@ -16,8 +16,8 @@ Scope note: `hermes/upstream-src` is vendored runtime code. Symphony treats most
 - Workspaces and git: `src/core/workspace/WorkspaceManager.ts`, `src/core/workspace/GitWorktreeManager.ts`
 - External systems: `src/integrations/linear/LinearTrackerClient.ts`, `src/core/tracker/TrackerClient.ts`, `src/core/tracker/TrackerWriter.ts`, `src/integrations/github/GitHubPullRequestClient.ts`, `src/integrations/github/GitHubCredentialResolver.ts`, `src/integrations/github/GitHubAppInstallationTokenProvider.ts`
 - MCP handoff: `src/core/harness/HandoffMcp.ts`, `src/core/harness/*McpServer.ts`, `src/core/harness/McpSubprocessEnvironment.ts`, `src/core/harness/McpToolExposureProbe.ts`
-- Web/API projections: `src/app/http.ts`, `src/app/webProjection.ts`, `src/app/WebHistoryProjection.ts`, `src/app/WebTranscriptProjection.ts`, `web/src/types/symphony.ts`, `web/src/data/*`
-- Cursor extension projections: `extension/src/settings.ts`, `extension/src/connectionState.ts`, `extension/src/dashboardTypes.ts`, `extension/src/statusApiTypes.ts`, `extension/src/webviewModel.ts`, `extension/src/webviewMessages.ts`, `extension/src/webviewProvider.ts`
+- Web/API read-model code: `src/app/http.ts`, `src/app/webProjection.ts`, `src/app/WebHistoryProjection.ts`, `src/app/WebTranscriptProjection.ts`, `web/src/types/symphony.ts`, `web/src/data/*`
+- Cursor extension read-model code: `extension/src/settings.ts`, `extension/src/connectionState.ts`, `extension/src/dashboardTypes.ts`, `extension/src/statusApiTypes.ts`, `extension/src/webviewModel.ts`, `extension/src/webviewMessages.ts`, `extension/src/webviewProvider.ts`
 
 ## State Layers
 
@@ -26,7 +26,7 @@ Scope note: `hermes/upstream-src` is vendored runtime code. Symphony treats most
 3. Local durable state lives under `ServiceConfig.workspace.stateDir` and is the recovery source for workspaces, runs, transcripts, lifecycle, writeback, approvals, provider gates, diagnostics, and MCP context.
 4. Local workspace state lives under `ServiceConfig.workspace.root` plus git bare repo caches and branch locks under `stateDir`.
 5. In-memory runtime state lives in the orchestrator, harnesses, stores, token providers, HTTP server, and extension panel.
-6. Projection state is derived for HTTP, React web UI, and the VS Code/Cursor extension. It is useful to clients but is not the source of truth.
+6. Read-model state is derived for HTTP, React web UI, and the VS Code/Cursor extension. It is useful to clients but is not the source of truth.
 
 ## Common Aliases
 
@@ -744,7 +744,8 @@ workspaces/<workspaceKey>.json
 runs/<runId>/meta.json
 runs/<runId>/events.jsonl
 issue-lifecycle/<issueId>.json
-writeback/<safeIdempotencyKey>.json
+writeback.sqlite
+writeback/<safeIdempotencyKey>.json          # legacy import source; retained after import
 approval-requests/<requestId>.json
 provider-gates/<gateId>.json
 diagnostics/mcp-tool-exposure/latest.json
@@ -1243,6 +1244,12 @@ Lifecycle relationships:
 
 Source: `src/core/writeback/WritebackOutbox.ts`.
 
+The active runtime store is `writeback.sqlite` under `workspace.stateDir`.
+Existing `writeback/*.json` records are a compatibility import source for
+older state directories. SQLite import is idempotent by `idempotencyKey` and
+does not delete or rewrite the JSON records; those files remain a rollback and
+audit aid until an explicit cleanup command exists.
+
 ```ts
 type WritebackStatus = "pending" | "in_flight" | "succeeded" | "skipped" | "retrying" | "dead_letter";
 
@@ -1559,21 +1566,21 @@ interface RuntimeSnapshot {
 }
 ```
 
-In-memory fields not written directly to durable records:
+Process-local fields not stored as live objects:
 
 - `pollTimer`, `ticking`, `stopped`, and `endedRuntimeSeconds`
-- `running: Map<IssueId, RunningEntry>`
-- `claimed: Set<IssueId>` to prevent duplicate dispatch
+- `running: Map<IssueId, RunningEntry>`; running/released facts are durable runtime evidence in issue history
+- `claimed: Set<IssueId>` to prevent duplicate dispatch; claim acquired/released facts are durable runtime evidence in issue history
 - `completed: Set<IssueId>` for current-process completion tracking
-- `pausedIssues: Set<IssueId>`
-- `retryAttempts: Map<IssueId, RetryEntry>`
+- `pausedIssues: Set<IssueId>`; pause requested/cleared facts are durable runtime evidence in issue history and are restored on startup
+- `retryAttempts: Map<IssueId, RetryEntry>`; retry scheduled/fired/cleared facts and due time are durable runtime evidence in issue history
 - `activeProviderGates: RuntimeProviderGate[]`
 - `rateLimits` and `totals`
 
 Durability boundary:
 
-- The orchestrator persists meaningful run, transcript, lifecycle, writeback, approval, and provider-gate events.
-- Dispatch locks, active abort controllers, timers, and live liveness timestamps are in-memory and are reconstructed or dropped on restart.
+- The orchestrator persists meaningful run, transcript, lifecycle, writeback, approval, provider-gate, and issue runtime-control events.
+- Dispatch locks, active abort controllers, timers, and live liveness timestamps are in-memory and are reconstructed, closed, or dropped on restart.
 
 ## Harness State
 
@@ -2094,15 +2101,15 @@ interface ContinuationSummary {
 
 Only lifecycle summary references and transcript recall events are currently tied into normal orchestration.
 
-## HTTP API And Projection State
+## HTTP API And Read-Model State
 
 Source: `src/app/http.ts`, `src/app/webProjection.ts`, `src/app/WebHistoryProjection.ts`, `src/app/WebTranscriptProjection.ts`.
 
 The API merges live orchestrator state, Linear tracker state, and durable local state. Key routes:
 
 - `GET /api/v1/state`: runtime snapshot plus operator controls and liveness contract
-- `GET /api/v1/board` and `GET /api/v1/issue-board`: issue board projection
-- `GET /api/v1/board/issues/:id`: board issue detail projection
+- `GET /api/v1/board` and `GET /api/v1/issue-board`: issue board read model
+- `GET /api/v1/board/issues/:id`: board issue detail read model
 - `GET /api/v1/activity`: run, transcript, and writeback activity feed
 - `GET /api/v1/workspaces`, `GET /api/v1/workspaces/:key`
 - `POST /api/v1/issues/:id/open-workspace`
@@ -2113,7 +2120,7 @@ The API merges live orchestrator state, Linear tracker state, and durable local 
 - `GET/POST /api/v1/approval-requests/:id`
 - `POST /api/v1/issues/:id/continuation-summary`
 - `POST /api/v1/issues/:id/issue-breakdown`, `/apply`
-- `GET /api/v1/web/*`: React web UI projection endpoints
+- `GET /api/v1/web/*`: React web UI read-model endpoints
 
 Board and activity structures:
 
@@ -2370,7 +2377,7 @@ interface SidebarModel {
 }
 ```
 
-Transcript projection:
+Transcript read model:
 
 ```ts
 type TranscriptMessage =
@@ -2384,11 +2391,11 @@ type TranscriptMessage =
   | { kind: "request"; ts: string; reason: string; q: string; actions: string[] };
 ```
 
-Projection relationships:
+Read-model relationships:
 
-- Projection state is recomputable from tracker, runtime snapshot, run store, lifecycle store, workspace store, and writeback outbox.
-- Projection intentionally redacts unbounded prompt, transcript, writeback body, secrets, and raw payload data.
-- Web chat endpoints are currently local projection stubs, not a persisted conversation.
+- Read-model state is recomputable from tracker, runtime snapshot, run store, lifecycle store, workspace store, and writeback outbox.
+- Read-model output intentionally redacts unbounded prompt, transcript, writeback body, secrets, and raw payload data.
+- Web chat endpoints are currently local read-model stubs, not a persisted conversation.
 
 ## Web Client State
 
@@ -2580,7 +2587,7 @@ Linear Issue
   -> IssueLifecycleRecord
   -> WritebackOperation
   -> IssueDetailsEnvelope
-  -> Board/API/Web/Extension projections
+  -> Board/API/Web/Extension read models
 
 WorkspaceRecord
   -> actual workspace path under workspace.root
@@ -2646,7 +2653,7 @@ Authoritative:
 
 Derived:
 
-- `IssueDetailsEnvelope`, board cards, activity feed, web dashboard, web history, web sidebar, extension dashboard sections, and transcript projections.
+- `IssueDetailsEnvelope`, board cards, activity feed, web dashboard, web history, web sidebar, extension dashboard sections, and transcript read models.
 - `RuntimeSnapshot` is live current-process state plus selected durable pointers.
 - `IssueLifecycleSummaryPointers` is denormalized convenience state, but it is persisted and used as a recovery pointer.
 

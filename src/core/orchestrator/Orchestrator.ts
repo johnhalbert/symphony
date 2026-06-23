@@ -195,7 +195,7 @@ import {
   type ContinuationSummarizer,
 } from "../summarization/ContinuationSummarizer.js";
 import {
-  FileWritebackOutboxStore,
+  SqliteWritebackOutboxStore,
   type WritebackProcessor,
 } from "../writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../writeback/WritebackOutbox.js";
@@ -493,6 +493,7 @@ interface ReportWritebackTransitionScratch {
 
 interface PublicationApprovalTransitionScratch {
   lifecycle?: IssueLifecycleRecord;
+  writebackOutbox?: SqliteWritebackOutboxStore;
   service?: CompletionReportService;
   result?: unknown;
 }
@@ -999,6 +1000,7 @@ export class Orchestrator {
     await this.options.writeback?.processDue();
     await this.startupCleanup();
     await this.cleanupOrphanedRunningRuns();
+    await this.restoreRuntimeControlFromIssueHistory();
     this.scheduleTick(0);
   }
 
@@ -1534,13 +1536,19 @@ export class Orchestrator {
     ].join("\n");
   }
 
-  pauseIssue(issueId: string): void {
+  async pauseIssue(issueId: string): Promise<void> {
     this.pausedIssues.add(issueId);
-    this.clearRetry(issueId);
+    await this.recordRuntimeControlEvidenceForIssueId(issueId, "pause_requested", {
+      paused: true,
+    });
+    await this.clearIssueRetryById(issueId, "pause_cleared_retry");
   }
 
-  resumeIssue(issueId: string): void {
+  async resumeIssue(issueId: string): Promise<void> {
     this.pausedIssues.delete(issueId);
+    await this.recordRuntimeControlEvidenceForIssueId(issueId, "pause_cleared", {
+      paused: false,
+    });
     this.scheduleTick(0);
   }
 
@@ -1552,8 +1560,8 @@ export class Orchestrator {
   }
 
   async cancelIssue(issueId: string): Promise<void> {
-    this.clearRetry(issueId);
-    this.claimed.delete(issueId);
+    await this.clearIssueRetryById(issueId, "cancel_cleared_retry");
+    await this.releaseIssueClaimById(issueId, "cancel_released_claim");
     const running = this.running.get(issueId);
     if (!running) return;
     running.suppressRetryOnExit = true;
@@ -1563,6 +1571,13 @@ export class Orchestrator {
       reason: "operator request",
       abortSignalled: true,
       harnessStopRequested: stopRunId !== null,
+    });
+    await this.recordRuntimeControlEvidenceSnapshot({
+      issue: running.issue,
+      eventType: "cancellation_requested",
+      sourceId: stopRunId ?? running.activeRunId ?? running.runId ?? issueId,
+      reason: "operator_cancel_requested",
+      entry: running,
     });
     running.abortController.abort();
     if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
@@ -2562,20 +2577,20 @@ export class Orchestrator {
         this.config,
         "github.publication",
       );
-    const result = await new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(
-        this.config.workspace.stateDir,
-      ),
-      ...(this.options.runStore === undefined
-        ? {}
-        : { runStore: this.options.runStore }),
-      ...(this.options.writeback === undefined
-        ? {}
-        : { writebackProcessor: this.options.writeback }),
-      pullRequestPublisher: publisher,
-    }).resumeApprovedPublication({ approval: request, issue });
+    const result = await this.withTemporaryWritebackOutbox((writebackOutbox) =>
+      new CompletionReportService({
+        config: this.config,
+        lifecycleStore: this.options.lifecycleStore!,
+        writebackOutbox,
+        ...(this.options.runStore === undefined
+          ? {}
+          : { runStore: this.options.runStore }),
+        ...(this.options.writeback === undefined
+          ? {}
+          : { writebackProcessor: this.options.writeback }),
+        pullRequestPublisher: publisher,
+      }).resumeApprovedPublication({ approval: request, issue }),
+    );
     if (!result) return false;
     await this.recordIssueEvidenceSnapshot({
       issue,
@@ -2604,19 +2619,19 @@ export class Orchestrator {
       request.issueId,
     ]);
     const issue = latestIssues[0] ?? issueFromApprovalRequest(request);
-    const result = await new CompletionReportService({
-      config: this.config,
-      lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(
-        this.config.workspace.stateDir,
-      ),
-      ...(this.options.runStore === undefined
-        ? {}
-        : { runStore: this.options.runStore }),
-      ...(this.options.writeback === undefined
-        ? {}
-        : { writebackProcessor: this.options.writeback }),
-    }).recordPublicationApprovalTerminal({ approval: request, issue });
+    const result = await this.withTemporaryWritebackOutbox((writebackOutbox) =>
+      new CompletionReportService({
+        config: this.config,
+        lifecycleStore: this.options.lifecycleStore!,
+        writebackOutbox,
+        ...(this.options.runStore === undefined
+          ? {}
+          : { runStore: this.options.runStore }),
+        ...(this.options.writeback === undefined
+          ? {}
+          : { writebackProcessor: this.options.writeback }),
+      }).recordPublicationApprovalTerminal({ approval: request, issue }),
+    );
     if (result.length > 0) {
       await this.recordIssueEvidenceSnapshot({
         issue,
@@ -2646,6 +2661,19 @@ export class Orchestrator {
       lifecycle?.phase === "blocked" &&
       lifecycle.blockedReason === `publication approval ${request.status}`
     );
+  }
+
+  private async withTemporaryWritebackOutbox<T>(
+    operation: (writebackOutbox: SqliteWritebackOutboxStore) => Promise<T>,
+  ): Promise<T> {
+    const writebackOutbox = new SqliteWritebackOutboxStore(
+      this.config.workspace.stateDir,
+    );
+    try {
+      return await operation(writebackOutbox);
+    } finally {
+      await writebackOutbox.close();
+    }
   }
 
   async createContinuationSummary(
@@ -4617,6 +4645,13 @@ export class Orchestrator {
     );
     context.dispatch.entry = entry;
     this.running.set(issue.id, entry);
+    await this.recordRuntimeControlEvidenceSnapshot({
+      issue,
+      eventType: "running_entry_created",
+      sourceId: entry.activeRunId ?? entry.runId ?? issue.id,
+      reason: "running_entry_created",
+      entry,
+    });
     return {
       details: {
         role,
@@ -4636,6 +4671,14 @@ export class Orchestrator {
         message: "No running entry was created",
       };
     this.claimed.add(entry.issue.id);
+    await this.recordRuntimeControlEvidenceSnapshot({
+      issue: entry.issue,
+      eventType: "claim_acquired",
+      sourceId: entry.activeRunId ?? entry.runId ?? entry.issue.id,
+      reason: "claim_acquired",
+      entry,
+      claimed: true,
+    });
     return {
       details: {
         issueId: entry.issue.id,
@@ -4654,7 +4697,11 @@ export class Orchestrator {
         stop: true,
         message: "No running entry was created",
       };
-    this.clearRetry(entry.issue.id);
+    await this.clearIssueRetry(
+      entry.issue,
+      "dispatch_cleared_retry",
+      entry.activeRunId ?? entry.runId ?? entry.issue.id,
+    );
     return { details: { issueId: entry.issue.id } };
   }
 
@@ -5917,12 +5964,14 @@ export class Orchestrator {
         message: "Pending publication approval recovery is not configured",
       };
     }
+    const writebackOutbox = new SqliteWritebackOutboxStore(
+      this.config.workspace.stateDir,
+    );
+    context.publicationApproval.writebackOutbox = writebackOutbox;
     context.publicationApproval.service = new CompletionReportService({
       config: this.config,
       lifecycleStore: this.options.lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(
-        this.config.workspace.stateDir,
-      ),
+      writebackOutbox,
       writebackProcessor: this.options.writeback,
       ...(this.options.runStore === undefined
         ? {}
@@ -6039,6 +6088,13 @@ export class Orchestrator {
     context.termination.entry = entry;
     context.termination.reason = reason;
     context.termination.cleanupWorkspace = cleanupWorkspace;
+    await this.recordRuntimeControlEvidenceSnapshot({
+      issue: entry.issue,
+      eventType: "cancellation_requested",
+      sourceId: entry.activeRunId ?? entry.runId ?? entry.issue.id,
+      reason,
+      entry,
+    });
     return {
       details: {
         reason,
@@ -6255,7 +6311,7 @@ export class Orchestrator {
         ? context.transition.retryError
         : null;
     const dueAtMs = Date.now() + delayMs;
-    this.scheduleRetry(
+    const retry = await this.scheduleRetry(
       context.issue.id,
       context.issue.identifier,
       attempt,
@@ -6265,7 +6321,7 @@ export class Orchestrator {
     );
     context.retry.attempt = attempt;
     context.retry.delayMs = delayMs;
-    context.retry.dueAtMs = dueAtMs;
+    context.retry.dueAtMs = retry?.dueAtMs ?? dueAtMs;
     context.retry.error = error;
     context.retry.runPhase = runPhase;
     return {
@@ -7715,8 +7771,22 @@ export class Orchestrator {
     if (snapshot.providerDispatchGateActive) return false;
     if (snapshot.running) return false;
     if (snapshot.paused) return false;
+    if (this.rulesetRetryBackoffActive(snapshot)) return false;
     if (!snapshot.allowExistingClaim && snapshot.claimed) return false;
     return snapshot.stateSlotAvailable;
+  }
+
+  private rulesetRetryBackoffActive(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (!snapshot.retrying) return false;
+    const dueAt = snapshot.planningRetryDueAt ?? snapshot.runtimeRetryDueAt;
+    if (dueAt === null) return true;
+    const dueAtMs = Date.parse(dueAt);
+    const snapshotAtMs = Date.parse(snapshot.snapshotAt);
+    if (!Number.isFinite(dueAtMs) || !Number.isFinite(snapshotAtMs))
+      return true;
+    return dueAtMs > snapshotAtMs;
   }
 
   private rulesetPassesLabelGuardrails(
@@ -8112,6 +8182,168 @@ export class Orchestrator {
     });
   }
 
+  private async recordRuntimeControlEvidenceForIssueId(
+    issueId: string,
+    eventType: string,
+    input: {
+      sourceId?: string | null;
+      reason?: string | null;
+      retry?: RetryEntry | null;
+      claimed?: boolean | null;
+      paused?: boolean | null;
+      retrying?: boolean | null;
+    } = {},
+  ): Promise<void> {
+    const issue = await this.issueForRuntimeEvidence(issueId);
+    if (issue === null) return;
+    await this.recordRuntimeControlEvidenceSnapshot({
+      issue,
+      eventType,
+      sourceId: input.sourceId ?? issueId,
+      reason: input.reason ?? eventType,
+      retry: input.retry ?? null,
+      claimed: input.claimed ?? null,
+      paused: input.paused ?? null,
+      retrying: input.retrying ?? null,
+    });
+  }
+
+  private async recordRuntimeControlEvidenceSnapshot(input: {
+    issue: Issue;
+    eventType: string;
+    sourceId?: string | null;
+    reason?: string | null;
+    entry?: RunningEntry | null;
+    retry?: RetryEntry | null;
+    claimed?: boolean | null;
+    paused?: boolean | null;
+    retrying?: boolean | null;
+  }): Promise<void> {
+    const entry = input.entry ?? this.running.get(input.issue.id) ?? null;
+    const retry = input.retry ?? this.retryAttempts.get(input.issue.id) ?? null;
+    await this.recordIssueEvidenceSnapshot({
+      issue: input.issue,
+      evidenceKind: "runtime",
+      eventType: input.eventType,
+      sourceId:
+        input.sourceId ??
+        entry?.activeRunId ??
+        entry?.runId ??
+        retry?.issueId ??
+        input.issue.id,
+      reason: input.reason ?? input.eventType,
+      payload: {
+        running: this.running.has(input.issue.id),
+        role: entry?.role ?? null,
+        runPhase: entry?.runPhase ?? null,
+        runKind: entry ? runKindForPhase(entry.runPhase) : null,
+        runId: entry?.runId ?? null,
+        activeRunId: entry?.activeRunId ?? null,
+        manualDispatchStage: entry?.manualDispatch?.stage ?? null,
+        manualIgnoreState: entry?.manualDispatch?.ignoreState ?? null,
+        cancellationRequestedAt:
+          entry?.cancellationRequestedAt?.toISOString() ?? null,
+        claimed: input.claimed ?? this.claimed.has(input.issue.id),
+        paused: input.paused ?? this.pausedIssues.has(input.issue.id),
+        retrying: input.retrying ?? this.retryAttempts.has(input.issue.id),
+        attempt: retry?.attempt ?? null,
+        delayMs: retry?.delayMs ?? null,
+        dueAt: retry ? new Date(retry.dueAtMs).toISOString() : null,
+        error: retry?.error ?? null,
+      },
+    });
+  }
+
+  private async issueForRuntimeEvidence(issueId: string): Promise<Issue | null> {
+    try {
+      const [issue] = await this.options.tracker.fetchIssueStatesByIds([
+        issueId,
+      ]);
+      if (issue) return issue;
+    } catch (error) {
+      this.options.logger.warn("runtime evidence issue lookup failed", {
+        issue_id: issueId,
+        error: errorMessage(error),
+      });
+    }
+    try {
+      const record = await this.issueStateStore.get(issueId);
+      return record === null ? null : currentFieldsAsIssue(record);
+    } catch (error) {
+      this.options.logger.warn("runtime evidence durable issue lookup failed", {
+        issue_id: issueId,
+        error: errorMessage(error),
+      });
+      return null;
+    }
+  }
+
+  private async releaseIssueClaim(
+    issue: Issue,
+    reason: string,
+    sourceId: string | null = null,
+  ): Promise<boolean> {
+    const released = this.claimed.delete(issue.id);
+    if (!released) return false;
+    await this.recordRuntimeControlEvidenceSnapshot({
+      issue,
+      eventType: "claim_released",
+      sourceId: sourceId ?? issue.id,
+      reason,
+      claimed: false,
+    });
+    return true;
+  }
+
+  private async releaseIssueClaimById(
+    issueId: string,
+    reason: string,
+    sourceId: string | null = null,
+  ): Promise<boolean> {
+    const released = this.claimed.delete(issueId);
+    if (!released) return false;
+    await this.recordRuntimeControlEvidenceForIssueId(issueId, "claim_released", {
+      sourceId: sourceId ?? issueId,
+      reason,
+      claimed: false,
+    });
+    return true;
+  }
+
+  private async clearIssueRetry(
+    issue: Issue,
+    reason: string,
+    sourceId: string | null = null,
+  ): Promise<RetryEntry | null> {
+    const cleared = this.clearRetry(issue.id);
+    if (!cleared) return null;
+    await this.recordRuntimeControlEvidenceSnapshot({
+      issue,
+      eventType: "retry_cleared",
+      sourceId: sourceId ?? issue.id,
+      reason,
+      retry: cleared,
+      retrying: false,
+    });
+    return cleared;
+  }
+
+  private async clearIssueRetryById(
+    issueId: string,
+    reason: string,
+    sourceId: string | null = null,
+  ): Promise<RetryEntry | null> {
+    const cleared = this.clearRetry(issueId);
+    if (!cleared) return null;
+    await this.recordRuntimeControlEvidenceForIssueId(issueId, "retry_cleared", {
+      sourceId: sourceId ?? issueId,
+      reason,
+      retry: cleared,
+      retrying: false,
+    });
+    return cleared;
+  }
+
   private async recordLifecycleEvidenceSnapshot(
     input: LifecycleEvidenceInput,
   ): Promise<void> {
@@ -8188,6 +8420,7 @@ export class Orchestrator {
 
   private issueRuntimeState(issueId: string): IssueCurrentStateRuntimeState {
     const entry = this.running.get(issueId);
+    const retry = this.retryAttempts.get(issueId);
     return {
       runningEntry: entry
         ? {
@@ -8203,6 +8436,7 @@ export class Orchestrator {
       claimed: this.claimed.has(issueId),
       paused: this.pausedIssues.has(issueId),
       retrying: this.retryAttempts.has(issueId),
+      retryDueAt: retry ? new Date(retry.dueAtMs).toISOString() : null,
     };
   }
 
@@ -8380,85 +8614,106 @@ export class Orchestrator {
       handoffReconciliation: {},
     };
     let acted = false;
-    for (const action of definition.actions) {
-      const actionId = `action:${randomUUID()}`;
-      const startedAt = new Date().toISOString();
-      const pendingAction = transitionAction({
-        actionId,
-        actionType: action.id,
-        status: "pending",
-        startedAt,
-        completedAt: null,
-      });
-      await this.issueStateStore.appendSnapshotAction(
-        issue,
-        transition.historySnapshotId,
-        pendingAction,
-      );
-      try {
-        if (action.shouldExecute && !(await action.shouldExecute(context))) {
+    try {
+      for (const action of definition.actions) {
+        const actionId = `action:${randomUUID()}`;
+        const startedAt = new Date().toISOString();
+        const pendingAction = transitionAction({
+          actionId,
+          actionType: action.id,
+          status: "pending",
+          startedAt,
+          completedAt: null,
+        });
+        await this.issueStateStore.appendSnapshotAction(
+          issue,
+          transition.historySnapshotId,
+          pendingAction,
+        );
+        try {
+          if (action.shouldExecute && !(await action.shouldExecute(context))) {
+            await this.replaceIssueSnapshotAction(
+              issue,
+              transition.historySnapshotId,
+              transitionAction({
+                actionId,
+                actionType: action.id,
+                status: "skipped",
+                startedAt,
+                message: "Action condition did not match",
+              }),
+            );
+            continue;
+          }
+          const result = await action.execute(context);
+          const normalized = normalizeTransitionActionExecutionResult(result);
           await this.replaceIssueSnapshotAction(
             issue,
             transition.historySnapshotId,
             transitionAction({
               actionId,
               actionType: action.id,
-              status: "skipped",
+              status: normalized.status,
               startedAt,
-              message: "Action condition did not match",
+              message: normalized.message,
+              details: normalized.details,
             }),
           );
-          continue;
+          if (result === false || normalized.stop) return acted;
+          if (normalized.status === "succeeded") acted = true;
+        } catch (error) {
+          await this.replaceIssueSnapshotAction(
+            issue,
+            transition.historySnapshotId,
+            transitionAction({
+              actionId,
+              actionType: action.id,
+              status: "failed",
+              startedAt,
+              message: errorMessage(error),
+            }),
+          );
+          await this.issueStateStore.appendSnapshotError(
+            issue,
+            transition.historySnapshotId,
+            transitionErrorFromUnknown(error, {
+              actionId,
+              errorType: transitionErrorTypeFor(error),
+              details: { actionType: action.id },
+            }),
+          );
+          this.options.logger.warn("issue transition action failed", {
+            issue_id: issue.id,
+            issue_identifier: issue.identifier,
+            transition_kind: transition.transitionKind,
+            history_snapshot_id: transition.historySnapshotId,
+            action_id: action.id,
+            error: errorMessage(error),
+          });
+          return acted;
         }
-        const result = await action.execute(context);
-        const normalized = normalizeTransitionActionExecutionResult(result);
-        await this.replaceIssueSnapshotAction(
-          issue,
-          transition.historySnapshotId,
-          transitionAction({
-            actionId,
-            actionType: action.id,
-            status: normalized.status,
-            startedAt,
-            message: normalized.message,
-            details: normalized.details,
-          }),
-        );
-        if (result === false || normalized.stop) return acted;
-        if (normalized.status === "succeeded") acted = true;
-      } catch (error) {
-        await this.replaceIssueSnapshotAction(
-          issue,
-          transition.historySnapshotId,
-          transitionAction({
-            actionId,
-            actionType: action.id,
-            status: "failed",
-            startedAt,
-            message: errorMessage(error),
-          }),
-        );
-        await this.issueStateStore.appendSnapshotError(
-          issue,
-          transition.historySnapshotId,
-          transitionErrorFromUnknown(error, {
-            actionId,
-            errorType: transitionErrorTypeFor(error),
-            details: { actionType: action.id },
-          }),
-        );
-        this.options.logger.warn("issue transition action failed", {
-          issue_id: issue.id,
-          issue_identifier: issue.identifier,
-          transition_kind: transition.transitionKind,
-          history_snapshot_id: transition.historySnapshotId,
-          action_id: action.id,
-          error: errorMessage(error),
-        });
-        return acted;
       }
+      return acted;
+    } finally {
+      await this.cleanupIssueTransitionContext(context);
     }
-    return acted;
+  }
+
+  private async cleanupIssueTransitionContext(
+    context: OrchestratorTransitionContext,
+  ): Promise<void> {
+    const writebackOutbox = context.publicationApproval.writebackOutbox;
+    if (!writebackOutbox) return;
+    delete context.publicationApproval.writebackOutbox;
+    await writebackOutbox.close().catch((error) => {
+      this.options.logger.warn("issue transition resource cleanup failed", {
+        issue_id: context.issue.id,
+        issue_identifier: context.issue.identifier,
+        transition_kind: context.transition.transitionKind,
+        resource: "publication_approval_writeback_outbox",
+        error: errorMessage(error),
+      });
+    });
   }
 
   private async replaceIssueSnapshotAction(
@@ -8569,6 +8824,57 @@ export class Orchestrator {
     this.options.logger.info("startup orphan running runs cancelled", {
       count: cancelled,
     });
+  }
+
+  private async restoreRuntimeControlFromIssueHistory(): Promise<void> {
+    let records: IssueStateRecord[];
+    try {
+      records = await this.issueStateStore.list();
+    } catch (error) {
+      this.options.logger.warn("startup issue runtime restore failed", {
+        error: errorMessage(error),
+      });
+      return;
+    }
+
+    let restoredPauses = 0;
+    let releasedRunning = 0;
+    let releasedClaims = 0;
+    for (const record of records) {
+      const issue = currentFieldsAsIssue(record);
+      if (record.paused) {
+        this.pausedIssues.add(record.issueId);
+        restoredPauses += 1;
+      }
+      if (record.running && !this.running.has(record.issueId)) {
+        await this.recordRuntimeControlEvidenceSnapshot({
+          issue,
+          eventType: "running_entry_released",
+          sourceId: record.latestRunId ?? record.issueId,
+          reason: "startup_reconciled_stale_running",
+          claimed: false,
+        });
+        releasedRunning += 1;
+      }
+      if (record.claimed && !this.running.has(record.issueId)) {
+        await this.recordRuntimeControlEvidenceSnapshot({
+          issue,
+          eventType: "claim_released",
+          sourceId: record.latestRunId ?? record.issueId,
+          reason: "startup_reconciled_stale_claim",
+          claimed: false,
+        });
+        releasedClaims += 1;
+      }
+    }
+
+    if (restoredPauses > 0 || releasedRunning > 0 || releasedClaims > 0) {
+      this.options.logger.info("startup issue runtime restored", {
+        restored_pauses: restoredPauses,
+        stale_running_released: releasedRunning,
+        stale_claims_released: releasedClaims,
+      });
+    }
   }
 
   private async recoverPendingPublicationApprovalHandoffs(): Promise<void> {
@@ -9138,31 +9444,6 @@ export class Orchestrator {
       : false;
   }
 
-  private dispatchIssue(
-    issue: Issue,
-    attempt: number | null,
-    role: AgentRunRole,
-    reviewEvidence: ReviewerDispatchEvidence | null,
-    runPhase: AgentRunPhase = defaultRunPhaseForRole(role),
-    manualDispatch: RunningEntry["manualDispatch"] = null,
-    issueHistorySnapshotId: string | null = null,
-  ): RunningEntry {
-    const entry = this.createRunningEntry(
-      issue,
-      attempt,
-      role,
-      reviewEvidence,
-      runPhase,
-      manualDispatch,
-      issueHistorySnapshotId,
-    );
-    this.running.set(issue.id, entry);
-    this.claimed.add(issue.id);
-    this.clearRetry(issue.id);
-    this.startRunMonitor(entry, attempt);
-    return entry;
-  }
-
   private createRunningEntry(
     issue: Issue,
     attempt: number | null,
@@ -9286,8 +9567,12 @@ export class Orchestrator {
           error: errorMessage(exitError),
           original_error: errorMessage(error),
         });
-        this.running.delete(issueId);
-        this.claimed.delete(issueId);
+        await this.releaseRunningEntryForExit(issueId, entry);
+        await this.releaseIssueClaim(
+          entry.issue,
+          "run_exit_handling_failed_released_claim",
+          entry.activeRunId ?? entry.runId ?? issueId,
+        );
       }
     }
   }
@@ -10488,7 +10773,11 @@ export class Orchestrator {
 
     try {
       if (entry.providerLimitSignal) {
-        this.claimed.delete(issueId);
+        await this.releaseIssueClaim(
+          entry.issue,
+          "worker_exit_released_claim",
+          entry.activeRunId ?? entry.runId ?? issueId,
+        );
         return;
       }
 
@@ -10516,7 +10805,11 @@ export class Orchestrator {
             entry.issue,
           );
         }
-        this.claimed.delete(issueId);
+        await this.releaseIssueClaim(
+          entry.issue,
+          "worker_exit_released_claim",
+          entry.activeRunId ?? entry.runId ?? issueId,
+        );
         return;
       }
 
@@ -10547,7 +10840,11 @@ export class Orchestrator {
             entry.issue,
           );
         }
-        this.claimed.delete(issueId);
+        await this.releaseIssueClaim(
+          entry.issue,
+          "worker_exit_released_claim",
+          entry.activeRunId ?? entry.runId ?? issueId,
+        );
         return;
       }
 
@@ -10563,16 +10860,28 @@ export class Orchestrator {
             lastPlanningFailureRunId: null,
             lastPlanningFailureAt: null,
           });
-          this.clearRetry(issueId);
+          await this.clearIssueRetry(
+            entry.issue,
+            "issue_breakdown_accepted_cleared_retry",
+            entry.activeRunId ?? entry.runId ?? issueId,
+          );
           this.completed.add(issueId);
-          this.claimed.delete(issueId);
+          await this.releaseIssueClaim(
+            entry.issue,
+            "worker_exit_released_claim",
+            entry.activeRunId ?? entry.runId ?? issueId,
+          );
           return;
         }
         if (entry.suppressRetryOnExit) {
-          this.claimed.delete(issueId);
+          await this.releaseIssueClaim(
+            entry.issue,
+            "worker_exit_released_claim",
+            entry.activeRunId ?? entry.runId ?? issueId,
+          );
           return;
         }
-        this.releaseRunningEntryForExit(issueId, entry);
+        await this.releaseRunningEntryForExit(issueId, entry);
         await this.recordPlanningFailure(
           entry,
           error ??
@@ -10600,7 +10909,11 @@ export class Orchestrator {
           );
           if (!terminal.updated) {
             if (entry.runPhase !== "merge_conflict_resolution") {
-              this.claimed.delete(issueId);
+              await this.releaseIssueClaim(
+                entry.issue,
+                "worker_exit_released_claim",
+                entry.activeRunId ?? entry.runId ?? issueId,
+              );
               return;
             }
           }
@@ -10608,7 +10921,11 @@ export class Orchestrator {
         if (entry.runPhase !== "merge_conflict_resolution") {
           this.completed.add(issueId);
         }
-        this.claimed.delete(issueId);
+        await this.releaseIssueClaim(
+          entry.issue,
+          "worker_exit_released_claim",
+          entry.activeRunId ?? entry.runId ?? issueId,
+        );
         return;
       }
 
@@ -10633,7 +10950,11 @@ export class Orchestrator {
             !terminal.updated &&
             entry.runPhase !== "merge_conflict_resolution"
           ) {
-            this.claimed.delete(issueId);
+            await this.releaseIssueClaim(
+              entry.issue,
+              "worker_exit_released_claim",
+              entry.activeRunId ?? entry.runId ?? issueId,
+            );
             return;
           }
         }
@@ -10642,19 +10963,27 @@ export class Orchestrator {
         }
         if (entry.role === "reviewer") {
           await this.reconcileReviewVerdictHandoff(entry);
-          this.claimed.delete(issueId);
+          await this.releaseIssueClaim(
+            entry.issue,
+            "worker_exit_released_claim",
+            entry.activeRunId ?? entry.runId ?? issueId,
+          );
           return;
         }
         if (
           entry.lifecycle?.phase === "blocked" ||
           entry.lifecycle?.blockedReason !== null
         ) {
-          this.claimed.delete(issueId);
+          await this.releaseIssueClaim(
+            entry.issue,
+            "worker_exit_released_claim",
+            entry.activeRunId ?? entry.runId ?? issueId,
+          );
           return;
         }
         if (entry.runPhase === "merge_conflict_resolution") {
           if (await this.shouldScheduleContinuation(entry)) {
-            this.releaseRunningEntryForExit(issueId, entry);
+            await this.releaseRunningEntryForExit(issueId, entry);
             await this.scheduleRetryTransition(
               entry.issue,
               1,
@@ -10663,7 +10992,11 @@ export class Orchestrator {
               entry.runPhase,
             );
           } else {
-            this.claimed.delete(issueId);
+            await this.releaseIssueClaim(
+              entry.issue,
+              "worker_exit_released_claim",
+              entry.activeRunId ?? entry.runId ?? issueId,
+            );
           }
           return;
         }
@@ -10684,11 +11017,15 @@ export class Orchestrator {
               entry.issue,
             );
           }
-          this.claimed.delete(issueId);
+          await this.releaseIssueClaim(
+            entry.issue,
+            "worker_exit_released_claim",
+            entry.activeRunId ?? entry.runId ?? issueId,
+          );
           return;
         }
         if (await this.shouldScheduleContinuation(entry)) {
-          this.releaseRunningEntryForExit(issueId, entry);
+          await this.releaseRunningEntryForExit(issueId, entry);
           await this.scheduleRetryTransition(
             entry.issue,
             1,
@@ -10697,7 +11034,11 @@ export class Orchestrator {
             entry.runPhase,
           );
         } else {
-          this.claimed.delete(issueId);
+          await this.releaseIssueClaim(
+            entry.issue,
+            "worker_exit_released_claim",
+            entry.activeRunId ?? entry.runId ?? issueId,
+          );
         }
       } else if (entry.role === "reviewer") {
         if (entry.runId) {
@@ -10716,11 +11057,19 @@ export class Orchestrator {
             entry.issue,
           );
           if (!terminal.updated) {
-            this.claimed.delete(issueId);
+            await this.releaseIssueClaim(
+              entry.issue,
+              "worker_exit_released_claim",
+              entry.activeRunId ?? entry.runId ?? issueId,
+            );
             return;
           }
         }
-        this.claimed.delete(issueId);
+        await this.releaseIssueClaim(
+          entry.issue,
+          "worker_exit_released_claim",
+          entry.activeRunId ?? entry.runId ?? issueId,
+        );
       } else if (entry.suppressRetryOnExit) {
         if (entry.runId) {
           const terminal = await this.updateRunTerminalStateIfRunning(
@@ -10735,7 +11084,11 @@ export class Orchestrator {
             entry.issue,
           );
           if (!terminal.updated) {
-            this.claimed.delete(issueId);
+            await this.releaseIssueClaim(
+              entry.issue,
+              "worker_exit_released_claim",
+              entry.activeRunId ?? entry.runId ?? issueId,
+            );
             if (
               terminal.record?.status === "failed" &&
               terminal.record.error === OPERATOR_REJECTED_PUBLICATION_ERROR
@@ -10760,7 +11113,11 @@ export class Orchestrator {
             entry.issue,
           );
         }
-        this.claimed.delete(issueId);
+        await this.releaseIssueClaim(
+          entry.issue,
+          "worker_exit_released_claim",
+          entry.activeRunId ?? entry.runId ?? issueId,
+        );
       } else {
         if (entry.runPhase === "merge_conflict_resolution") {
           await this.recordMergeConflictAttempt(
@@ -10771,7 +11128,11 @@ export class Orchestrator {
             entry.lifecycle?.phase === "blocked" ||
             entry.lifecycle?.blockedReason !== null
           ) {
-            this.claimed.delete(issueId);
+            await this.releaseIssueClaim(
+              entry.issue,
+              "worker_exit_released_claim",
+              entry.activeRunId ?? entry.runId ?? issueId,
+            );
             return;
           }
         }
@@ -10788,11 +11149,19 @@ export class Orchestrator {
             entry.issue,
           );
           if (error === OPERATOR_REJECTED_PUBLICATION_ERROR) {
-            this.claimed.delete(issueId);
+            await this.releaseIssueClaim(
+              entry.issue,
+              "worker_exit_released_claim",
+              entry.activeRunId ?? entry.runId ?? issueId,
+            );
             return;
           }
           if (!terminal.updated) {
-            this.claimed.delete(issueId);
+            await this.releaseIssueClaim(
+              entry.issue,
+              "worker_exit_released_claim",
+              entry.activeRunId ?? entry.runId ?? issueId,
+            );
             if (
               terminal.record?.status === "failed" &&
               terminal.record.error === OPERATOR_REJECTED_PUBLICATION_ERROR
@@ -10825,7 +11194,11 @@ export class Orchestrator {
             entry,
             `consecutive Cursor SDK wait errors reached limit (${sdkErrorFailures} failures; max_sdk_error_retries=${this.config.agent.maxSdkErrorRetries})`,
           );
-          this.claimed.delete(issueId);
+          await this.releaseIssueClaim(
+            entry.issue,
+            "worker_exit_released_claim",
+            entry.activeRunId ?? entry.runId ?? issueId,
+          );
           return;
         }
         const infraFailures = await this.consecutiveInfraFailures(entry.issue);
@@ -10834,7 +11207,11 @@ export class Orchestrator {
             entry,
             `consecutive harness infrastructure failures reached limit (${infraFailures} failures; max_infra_failures=${this.config.agent.maxInfraFailures})`,
           );
-          this.claimed.delete(issueId);
+          await this.releaseIssueClaim(
+            entry.issue,
+            "worker_exit_released_claim",
+            entry.activeRunId ?? entry.runId ?? issueId,
+          );
           return;
         }
         const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
@@ -10842,7 +11219,7 @@ export class Orchestrator {
           10_000 * 2 ** (nextAttempt - 1),
           this.config.agent.maxRetryBackoffMs,
         );
-        this.releaseRunningEntryForExit(issueId, entry);
+        await this.releaseRunningEntryForExit(issueId, entry);
         await this.scheduleRetryTransition(
           entry.issue,
           nextAttempt,
@@ -10852,16 +11229,23 @@ export class Orchestrator {
         );
       }
     } finally {
-      this.releaseRunningEntryForExit(issueId, entry);
+      await this.releaseRunningEntryForExit(issueId, entry);
     }
   }
 
-  private releaseRunningEntryForExit(
+  private async releaseRunningEntryForExit(
     issueId: string,
     entry: RunningEntry,
-  ): void {
+  ): Promise<void> {
     if (this.running.get(issueId) === entry) {
       this.running.delete(issueId);
+      await this.recordRuntimeControlEvidenceSnapshot({
+        issue: entry.issue,
+        eventType: "running_entry_released",
+        sourceId: entry.activeRunId ?? entry.runId ?? issueId,
+        reason: "running_entry_released",
+        entry,
+      });
     }
   }
 
@@ -10872,7 +11256,11 @@ export class Orchestrator {
     const issueId = entry.issue.id;
     const store = this.options.lifecycleStore;
     if (!store) {
-      this.claimed.delete(issueId);
+      await this.releaseIssueClaim(
+        entry.issue,
+        "planning_failure_missing_store_released_claim",
+        entry.activeRunId ?? entry.runId ?? issueId,
+      );
       return;
     }
 
@@ -10901,7 +11289,11 @@ export class Orchestrator {
     });
     const lifecycle = entry.lifecycle ?? current;
     if (!lifecycle) {
-      this.claimed.delete(issueId);
+      await this.releaseIssueClaim(
+        entry.issue,
+        "planning_failure_missing_lifecycle_released_claim",
+        runId,
+      );
       return;
     }
     await this.options.runStore?.appendEvent({
@@ -10927,8 +11319,16 @@ export class Orchestrator {
         runId,
         maxPlanningFailuresReason(nextCount, maxFailures),
       );
-      this.clearRetry(issueId);
-      this.claimed.delete(issueId);
+      await this.clearIssueRetry(
+        entry.issue,
+        "planning_failure_max_failures_cleared_retry",
+        runId,
+      );
+      await this.releaseIssueClaim(
+        entry.issue,
+        "planning_failure_max_failures_released_claim",
+        runId,
+      );
       return;
     }
 
@@ -11052,18 +11452,21 @@ export class Orchestrator {
     return this.shouldDispatchWorker(latest, true, entry.runPhase);
   }
 
-  private scheduleRetry(
+  private async scheduleRetry(
     issueId: string,
     identifier: string,
     attempt: number,
     delayMs: number,
     error: string | null,
     runPhase: AgentRunPhase = "implementation",
-  ): void {
-    this.clearRetry(issueId);
+  ): Promise<RetryEntry | null> {
+    await this.clearIssueRetryById(issueId, "retry_reschedule_cleared_existing");
     if (this.stopped) {
-      this.claimed.delete(issueId);
-      return;
+      await this.releaseIssueClaimById(
+        issueId,
+        "retry_schedule_stopped_released_claim",
+      );
+      return null;
     }
     const dueAtMs = Date.now() + delayMs;
     const timer = setTimeout(() => {
@@ -11072,7 +11475,7 @@ export class Orchestrator {
       worker.finally(() => this.activeRetryWorkers.delete(worker));
       void worker;
     }, delayMs);
-    this.retryAttempts.set(issueId, {
+    const retry = {
       issueId,
       identifier,
       attempt,
@@ -11081,7 +11484,9 @@ export class Orchestrator {
       timer,
       error,
       runPhase,
-    });
+    };
+    this.retryAttempts.set(issueId, retry);
+    return retry;
   }
 
   private async scheduleRetryTransition(
@@ -11114,7 +11519,7 @@ export class Orchestrator {
     if (result.transition?.transitionKind === "retry_run" && result.acted) {
       return;
     }
-    this.scheduleRetry(
+    await this.scheduleRetry(
       issue.id,
       issue.identifier,
       attempt,
@@ -11149,7 +11554,7 @@ export class Orchestrator {
       if (providerGate) {
         const delayMs =
           providerLimitDelayMs(providerGate) ?? this.config.polling.intervalMs;
-        this.scheduleRetry(
+        await this.scheduleRetry(
           issueId,
           retry.identifier,
           retry.attempt,
@@ -11157,6 +11562,11 @@ export class Orchestrator {
           retry.error ?? providerGateDispatchBlockedMessage(providerGate),
           retry.runPhase,
         );
+        await this.recordRuntimeControlEvidenceForIssueId(issueId, "retry_scheduled", {
+          retry: this.retryAttempts.get(issueId) ?? null,
+          retrying: true,
+          reason: "provider_gate_retry_rescheduled",
+        });
         return;
       }
       const candidates = await this.options.tracker.fetchIssueStatesByIds([
@@ -11164,9 +11574,20 @@ export class Orchestrator {
       ]);
       const issue = candidates.find((candidate) => candidate.id === issueId);
       if (!issue) {
-        this.claimed.delete(issueId);
+        await this.releaseIssueClaimById(
+          issueId,
+          "retry_timer_issue_missing_released_claim",
+        );
         return;
       }
+      await this.recordRuntimeControlEvidenceSnapshot({
+        issue,
+        eventType: "retry_fired",
+        sourceId: issue.id,
+        reason: "retry_timer_fired",
+        retry,
+        retrying: false,
+      });
       await this.recordIssueEvidenceSnapshot({
         issue,
         evidenceKind: "harness",
@@ -11180,6 +11601,14 @@ export class Orchestrator {
           error: retry.error,
           runPhase: retry.runPhase,
         },
+      });
+      await this.recordRuntimeControlEvidenceSnapshot({
+        issue,
+        eventType: "retry_cleared",
+        sourceId: issue.id,
+        reason: "retry_timer_consumed",
+        retry,
+        retrying: false,
       });
       await this.recordIssueEvidenceSnapshot({
         issue,
@@ -11240,7 +11669,11 @@ export class Orchestrator {
             retry.error ?? "planning dispatch retry failed",
           );
         } else {
-          this.claimed.delete(issueId);
+          await this.releaseIssueClaim(
+            issue,
+            "retry_timer_dispatch_failed_released_claim",
+            issueId,
+          );
         }
       }
     } catch (error) {
@@ -11248,10 +11681,13 @@ export class Orchestrator {
         retry.runPhase === "issue_breakdown" &&
         retry.attempt >= this.config.issueBreakdown.maxPlanningDispatchRetries
       ) {
-        this.claimed.delete(issueId);
+        await this.releaseIssueClaimById(
+          issueId,
+          "retry_timer_max_planning_retries_released_claim",
+        );
         return;
       }
-      this.scheduleRetry(
+      await this.scheduleRetry(
         issueId,
         retry.identifier,
         retry.attempt + 1,
@@ -11259,6 +11695,11 @@ export class Orchestrator {
         errorMessage(error),
         retry.runPhase,
       );
+      await this.recordRuntimeControlEvidenceForIssueId(issueId, "retry_scheduled", {
+        retry: this.retryAttempts.get(issueId) ?? null,
+        retrying: true,
+        reason: "retry_timer_error_rescheduled",
+      });
     }
   }
 
@@ -11277,7 +11718,11 @@ export class Orchestrator {
   ): Promise<void> {
     const store = this.options.lifecycleStore;
     if (!store) {
-      this.claimed.delete(issue.id);
+      await this.releaseIssueClaim(
+        issue,
+        "planning_dispatch_retry_missing_store_released_claim",
+        retry.identifier,
+      );
       return;
     }
     const current = await store.get(issue.id);
@@ -11303,7 +11748,11 @@ export class Orchestrator {
         retry.identifier,
       )) ?? current;
     if (!lifecycle) {
-      this.claimed.delete(issue.id);
+      await this.releaseIssueClaim(
+        issue,
+        "planning_dispatch_retry_missing_lifecycle_released_claim",
+        retry.identifier,
+      );
       return;
     }
     const maxRetries = this.config.issueBreakdown.maxPlanningDispatchRetries;
@@ -11314,8 +11763,16 @@ export class Orchestrator {
         lifecycle.summaryPointers.lastRunId ?? retry.identifier,
         maxPlanningDispatchRetriesReason(nextCount, maxRetries),
       );
-      this.clearRetry(issue.id);
-      this.claimed.delete(issue.id);
+      await this.clearIssueRetry(
+        issue,
+        "planning_dispatch_retry_max_retries_cleared_retry",
+        retry.identifier,
+      );
+      await this.releaseIssueClaim(
+        issue,
+        "planning_dispatch_retry_max_retries_released_claim",
+        retry.identifier,
+      );
       return;
     }
     const delayMs = planningRetryDelayMs(
@@ -11331,11 +11788,12 @@ export class Orchestrator {
     );
   }
 
-  private clearRetry(issueId: string): void {
+  private clearRetry(issueId: string): RetryEntry | null {
     const existing = this.retryAttempts.get(issueId);
-    if (!existing) return;
+    if (!existing) return null;
     clearTimeout(existing.timer);
     this.retryAttempts.delete(issueId);
+    return existing;
   }
 
   private buildRunContext(
@@ -11947,7 +12405,11 @@ export class Orchestrator {
         nextConflict,
         reason,
       );
-      this.clearRetry(entry.issue.id);
+      await this.clearIssueRetry(
+        entry.issue,
+        "merge_conflict_blocked_cleared_retry",
+        runId,
+      );
     }
   }
 
@@ -14048,23 +14510,31 @@ function isManualPreDispatchResetTransition(
 }
 
 function snapshotAsIssue(snapshot: IssueCurrentStateSnapshot): Issue {
+  return currentFieldsAsIssue(snapshot);
+}
+
+function currentFieldsAsIssue(current: IssueStateRecord): Issue;
+function currentFieldsAsIssue(current: IssueCurrentStateSnapshot): Issue;
+function currentFieldsAsIssue(
+  current: IssueStateRecord | IssueCurrentStateSnapshot,
+): Issue {
   return {
-    id: snapshot.issueId,
-    identifier: snapshot.issueIdentifier,
-    title: snapshot.title,
-    description: snapshot.description,
-    priority: snapshot.priority,
-    state: snapshot.trackerState,
-    branchName: snapshot.branchName,
-    url: snapshot.trackerUrl,
-    assigneeId: snapshot.assigneeId,
-    delegateId: snapshot.delegateId,
-    assignedToWorker: snapshot.assignedToWorker,
-    labels: [...snapshot.labels],
-    blockedBy: snapshot.blockedBy.map((blocker) => ({ ...blocker })),
-    hasChildren: snapshot.hasChildren,
-    createdAt: snapshot.trackerCreatedAt,
-    updatedAt: snapshot.trackerUpdatedAt,
+    id: current.issueId,
+    identifier: current.issueIdentifier,
+    title: current.title,
+    description: current.description,
+    priority: current.priority,
+    state: current.trackerState,
+    branchName: current.branchName,
+    url: current.trackerUrl,
+    assigneeId: current.assigneeId,
+    delegateId: current.delegateId,
+    assignedToWorker: current.assignedToWorker,
+    labels: [...current.labels],
+    blockedBy: current.blockedBy.map((blocker) => ({ ...blocker })),
+    hasChildren: current.hasChildren,
+    createdAt: current.trackerCreatedAt,
+    updatedAt: current.trackerUpdatedAt,
   };
 }
 

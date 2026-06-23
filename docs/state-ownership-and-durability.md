@@ -30,20 +30,29 @@ interface SymphonyDatabaseCore {
   writebackOperations: WritebackOperation[];
   operatorApprovals: OperatorApprovalRecord[];
   providerGates: RuntimeProviderGate[];
-  operatorPauses: OperatorPauseRecord[];
+  issueStates: IssueStateRecord[];
 }
 
-interface OperatorPauseRecord {
+interface IssueRuntimeControlEvidence {
   issueId: IssueId;
   issueIdentifier: IssueIdentifier | null;
-  pausedAt: IsoDateTime;
-  pausedBy: "operator" | "system";
+  eventType:
+    | "running_entry_created"
+    | "running_entry_released"
+    | "claim_acquired"
+    | "claim_released"
+    | "pause_requested"
+    | "pause_cleared"
+    | "cancellation_requested"
+    | "retry_scheduled"
+    | "retry_fired"
+    | "retry_cleared";
+  recordedAt: IsoDateTime;
   reason: string | null;
-  resumedAt: IsoDateTime | null;
 }
 ```
 
-`OperatorPauseRecord` does not exist today; pause state is currently process memory in `Orchestrator.pausedIssues`. If pausing is an operator control rather than a temporary UI convenience, Symphony owns it and it should be durable.
+Issue-owned runtime control facts are written through `IssueStateRecord.history` as runtime evidence snapshots. The live sets and timers remain process-local execution aids, but pause, claim, running, cancellation, and retry facts that affect transition decisions must have durable evidence.
 
 For implementation, `IssueLifecycleRecord` can begin as a JSON document column plus indexed scalar columns for `issueId`, `issueIdentifier`, `phase`, last ids, PR number/url, branch, and updated time. The nested arrays can be normalized later when reporting or concurrency pressure requires it.
 
@@ -75,8 +84,8 @@ For implementation, `IssueLifecycleRecord` can begin as a JSON document column p
 | `PullRequestReviewEvidenceState` | Symphony snapshot of GitHub | Nested in lifecycle | Database records or lifecycle document | Yes | Yes | GitHub owns the comments; Symphony owns the cursoring, stale/fresh classification, and evidence consumed by workers. |
 | `IssueMergeGateState`, `IssueMergeMetadata`, `IssueMergeConflictMetadata` | Symphony snapshot/decision state over GitHub | Nested in lifecycle | Database records or lifecycle document | Yes | Yes | GitHub owns checks and merges; Symphony owns its gate decisions, conflict reports, and final automation evidence. |
 | `IssueHandoffState` and handoff memo | Symphony | Nested in lifecycle | Database record/document | Yes | Yes | This is compact cross-run memory and should survive restarts. |
-| `WritebackOperation` | Symphony | `writeback/<safeIdempotencyKey>.json` | Database-backed durable outbox | Yes | Yes, high priority | It needs idempotency, due-time queries, retries, dead-lettering, and atomic claim/update behavior. |
-| Writeback in-flight claim locks | Symphony runtime coordination | `FileWritebackOutboxStore` memory locks and file updates | Database transaction/lease, or memory in single process | While processing only | Yes if multi-process | Single-process memory is sufficient today; DB claims are the right boundary for multiple workers. |
+| `WritebackOperation` | Symphony | `writeback.sqlite`; legacy `writeback/<safeIdempotencyKey>.json` files are imported and retained | SQLite-backed durable outbox | Yes | Yes | It needs idempotency, due-time queries, retries, dead-lettering, and atomic claim/update behavior. |
+| Writeback in-flight claim locks | Symphony runtime coordination | SQLite transaction updates; legacy file store keeps process-local locks for compatibility tests | Database transaction/lease, or memory in single process | While processing only | Yes if multi-process | Single-process memory is sufficient today; DB claims are the right boundary for multiple workers. |
 | `OperatorApprovalRecord` | Symphony | `approval-requests/<requestId>.json` | Database table | Yes | Yes | Pending approvals are operator intent/control-plane state and must survive restart. |
 | `RuntimeProviderGate` and `ProviderLimitSignal` | Symphony over provider/runtime signals | `provider-gates/<gateId>.json`, run metadata | Database table | Yes | Yes | Gates throttle dispatch across issues and should be queryable, clearable, and restart-safe. |
 | `McpToolExposureReport` | Symphony diagnostics | `diagnostics/mcp-tool-exposure/latest.json` | Disk diagnostics; optional database history | Optional | Usually no | It is health/diagnostic evidence, not core workflow state. Keep latest on disk unless historical reporting is required. |
@@ -88,11 +97,11 @@ For implementation, `IssueLifecycleRecord` can begin as a JSON document column p
 | Hermes auth JSON and provider session state | Hermes/provider/operator | `HermesAuthManager`, managed auth home | Disk or provider auth store | Yes, outside Symphony DB | No | Treat as secrets/runtime auth state. Do not copy into Symphony DB. |
 | Hermes gateway process/session objects | Hermes runtime | `GatewayFacade`, `HermesHarness` memory | Memory | No | No | Restart creates or reconnects through durable run/profile pointers. |
 | `RunningEntry` | Symphony runtime | `Orchestrator.running` | Memory | No as object | No | Live promises, abort controllers, activity timestamps, and harness leases are process-local. Durable facts inside it already flow to run/lifecycle records. |
-| `RetryEntry` and retry timers | Symphony runtime | `Orchestrator.retryAttempts` | Memory today; optional durable scheduled-job table | Not required for correctness today | Usually no | Retry can be recomputed from issue/run/lifecycle state. If exact backoff recovery becomes a requirement, add a DB retry schedule. |
-| `claimed` and `completed` issue sets | Symphony runtime | `Orchestrator` memory | Memory or DB lease in multi-process | No in single process | Only as lease if multi-process | These prevent duplicate dispatch inside one process. A multi-process service should replace them with durable leases/unique constraints. |
-| `pausedIssues` | Symphony operator intent | `Orchestrator.pausedIssues` memory | Database `operatorPauses` or external Linear label/state | Yes, if pause is user-facing control | Yes, unless deliberately externalized | Current memory placement means pause is lost on restart. Durable pause should be stored by Symphony or represented in Linear by product choice. |
+| `RetryEntry` and retry timers | Symphony runtime plus issue evidence | `Orchestrator.retryAttempts`; runtime evidence in `IssueStateRecord.history` | Timer handles in memory; retry scheduled/fired/cleared facts in issue state | Retry facts yes; timer handles no | Yes for facts, no for handles | The timer object is process-local. The retry decision input and due time are durable issue facts, so restart can rebuild eligibility even though it does not resurrect the original timer. |
+| `claimed` and `completed` issue sets | Symphony runtime plus issue evidence | `Orchestrator` memory; claim evidence in `IssueStateRecord.history` | Memory or DB lease in multi-process; claim acquired/released facts in issue state | Claim facts yes; process locks no | Yes for facts, lease table only for multi-process | These prevent duplicate dispatch inside one process. Startup closes stale durable claims when no live process owns them. A multi-process service should replace the set with durable leases/unique constraints. |
+| `pausedIssues` | Symphony operator intent plus runtime cache | Runtime evidence in `IssueStateRecord.history`; `Orchestrator.pausedIssues` restored from it | Issue state history, with live set as cache | Yes | Yes | Pause/resume is a user-facing operator control and survives restart through issue-state runtime evidence. |
 | Loaded workflow watcher last-good state | Symphony runtime | `WorkflowLoader` memory | Memory | No | No | Last-good config is useful process state; source remains workflow/env on disk. |
-| HTTP status/detail/history/activity/dashboard models | Derived projection | `http.ts`, `webProjection.ts`, web types | Derived on request; optional cache | No | No | These merge Linear, live runtime, and local durable state. Store their inputs, not the rendered projection. |
+| HTTP status/detail/history/activity/dashboard models | Derived read model | `http.ts`, `webProjection.ts`, web types | Derived on request; optional cache | No | No | These merge Linear, live runtime, and local durable state. Store their inputs, not the rendered read model. |
 | Web React state and extension panel state | Client runtime | `web/src/*`, `extension/src/*` | Browser/extension memory or local client settings | No for panel state | No | It is UI selection, pagination, filters, and connection state. |
 | Extension settings | Operator/client | VS Code/Cursor configuration | Client settings storage | Yes, externally | No | These are client preferences, not orchestration state. |
 | Structured logs | Symphony/observability pipeline | `StructuredLogger` output | Log stream/files/observability backend | Yes per retention policy | No core DB | Logs are append-only operational evidence; do not make the app DB the log sink unless deliberately building audit tables. |
@@ -108,13 +117,13 @@ This table maps the remaining named types from `docs/state-representation.md` to
 | `LoadedWorkflow`, `WorkflowReloadEvent`, `DotEnv` | Workflow loading state. Source is disk/env; loaded values stay in memory. No DB. |
 | `TrackerConfig`, `WorkspaceConfig`, `WorkspaceSourceConfig`, `HookConfig`, `AgentConfig`, `CursorConfig`, `HermesConfig`, `HermesAuthConfig`, `ServerConfig`, `WritebackConfig`, `GitHubConfig`, `GitHubAppConfig`, `ReviewLoopConfig`, `MergePolicyConfig`, `ContinuationContextConfig`, `IssueBreakdownConfig`, `IssueBoardConfig` | Subsections of `ServiceConfig`. Keep source in workflow/env config and loaded form in memory. No DB. |
 | `CredentialCapability`, `CredentialRole`, `CredentialLegacyFallbacks`, `StaticTokenCredentialProfileDefinition`, `GitHubAppCredentialProfileDefinition`, `CredentialProfileDefinition`, `ResolvedCredential` | Credential profile configuration and resolved secret handles. Keep config outside DB and secret values in env/secret/auth stores. No DB for secrets. |
-| `IssueBlockerRef`, `IssueTrackerMetadata`, `IssueBlockerSummary`, `IssueWorkspaceSummary`, `IssuePullRequestSummary`, `IssueLatestRunSummary`, `IssueDetailsSource`, `IssueDetailsCompleteness`, `IssueStateClassification`, `RunTerminalReason`, `IssueDetailsEnvelope` | Derived issue detail/projection types. Rebuild from Linear plus local durable Symphony records. No canonical DB row. |
-| `Workspace`, `AgentRunRole`, `AgentRunPhase`, `AgentRunKind`, `TokenCounts`, `RuntimeTotals` | Value objects nested in runtime, run, transcript, lifecycle, and projection state. Store only through their parent records. |
+| `IssueBlockerRef`, `IssueTrackerMetadata`, `IssueBlockerSummary`, `IssueWorkspaceSummary`, `IssuePullRequestSummary`, `IssueLatestRunSummary`, `IssueDetailsSource`, `IssueDetailsCompleteness`, `IssueStateClassification`, `RunTerminalReason`, `IssueDetailsEnvelope` | Derived issue detail/read-model types. Rebuild from Linear plus local durable Symphony records. No canonical DB row. |
+| `Workspace`, `AgentRunRole`, `AgentRunPhase`, `AgentRunKind`, `TokenCounts`, `RuntimeTotals` | Value objects nested in runtime, run, transcript, lifecycle, and read-model state. Store only through their parent records. |
 | `TrackerClient`, `LinearIssueNode`, `LinearRelationNode`, `LinearWorkflowTeamStates`, `TrackerTransitionInput`, `TrackerCommentInput`, `TrackerIssueCreateInput`, `TrackerIssueRelationInput`, `TrackerWriteEvidence`, `TrackerWriteResult` | Linear client/input/result shapes. Linear remains authoritative; Symphony persists generated operation metadata and result evidence in `WritebackOperation`. |
 | `PullRequestMetadata`, `PullRequestDetails`, `PullRequestCheckResult`, `PullRequestPublicationInput`, `PullRequestPublicationResult`, `GitHubPullRequestReviewEvidence`, `PullRequestReviewEvidenceItem`, `PullRequestMergeInput`, `PullRequestMergeResult` | GitHub client/input/result shapes. GitHub remains authoritative; Symphony persists pointers/evidence in run and lifecycle records. |
 | `CachedInstallationToken` | Runtime credential cache. Memory only. No DB. |
 | `WorktreeResult`, `PlanningCheckoutResult`, `WorkspaceMetadata`, `PlanningWorkspaceMarker` | Workspace creation result/metadata. Store workspace index in DB, actual checkout and marker files on disk. |
-| `RunStatus`, `PersistedRunCancellationSource`, `PersistedCancelFailedSource`, `PersistedCancellationOutcome`, `PersistedSdkRunStatus`, `PersistedSdkRunStatusSource`, `RunActivitySnapshot`, `TranscriptPage` | Run/transcript value types. Persist through `RunRecord` and `TranscriptEvent`; `TranscriptPage` is a read projection. |
+| `RunStatus`, `PersistedRunCancellationSource`, `PersistedCancelFailedSource`, `PersistedCancellationOutcome`, `PersistedSdkRunStatus`, `PersistedSdkRunStatusSource`, `RunActivitySnapshot`, `TranscriptPage` | Run/transcript value types. Persist through `RunRecord` and `TranscriptEvent`; `TranscriptPage` is a read model. |
 | `IssueLifecyclePhase`, `CompletionReportPullRequestRef`, `IssueMergeConflictResolutionReportRecord`, `IssueLaneMemo` | Lifecycle value/subrecord types. Persist through `IssueLifecycleRecord`; index high-use fields if reporting needs them. |
 | `WritebackStatus`, `WritebackCommon`, `WritebackTransitionOperation`, `WritebackCommentOperation`, `WritebackIssueCreateOperation`, `WritebackIssueRelationOperation` | Writeback outbox variants. Persist as database-backed `WritebackOperation` rows with kind-specific payloads. |
 | `OperatorApprovalDecision`, `OperatorApprovalStatus`, `OperatorApprovalAction` | Approval value/subrecord types. Persist through `OperatorApprovalRecord`. |
@@ -124,17 +133,17 @@ This table maps the remaining named types from `docs/state-representation.md` to
 | `HermesProfileRequest`, `HermesProfile`, `HermesProfileMarker`, `HermesMcpServerConfig`, `HermesMcpServersConfig`, `HermesAuthPreparation`, `HermesAuthStore` | Hermes runtime profile/auth state. Keep profile/config/auth files on disk under the Hermes-managed locations. No DB for auth contents. |
 | `McpSubprocessCommand`, `McpSubprocessServerConfig`, `CompletionReportMcpContextFile`, `MergeConflictResolutionMcpContextFile`, `IssueBreakdownPlanMcpContextFile`, `ReviewVerdictMcpContextFile`, `ReviewFeedbackMcpContextFile`, `TranscriptRecallMcpContextFile`, `CompletionReportActiveContext`, `ReviewVerdictActiveContext`, `ReviewFeedbackActiveContext`, `IssueBreakdownPlanActiveContext`, `MergeConflictResolutionActiveContext` | MCP subprocess and scoped active context state. Keep active handoff files on disk; reconstruct canonical data from DB/durable records. |
 | `ContinuationSummarizationInput`, `TranscriptRecallSearchResult`, `TranscriptRecallRunResult`, `TranscriptRecallTelemetryPayload`, `PromptSource`, `KnownPromptTokenCount`, `StreamAccumulatorSnapshot`, `GovernorDecision`, `ContinuationSummary` | Continuation/recall/context-governor state. Persist summary references and recall telemetry through lifecycle/transcript records; keep accumulators and decisions in memory unless productized. |
-| `RuntimeSnapshot`, `IssueBoardCard`, `IssueBoardColumn`, `IssueBoardResponse`, `BoardIssueDetailResponse`, `ActivityItem`, `ActivityFeedResponse`, `RunLivenessStatus`, `RunIdleAlertState`, `RunLivenessState`, `RunCancellationSource`, `CancelFailedState`, `RunCancellationState`, `RunActivityState`, `IssueRunMetadata`, `OperatorLivenessStatus`, `OperatorControls`, `OperatorAffordances`, `PausedOperatorView` | HTTP/API projection state. Derive from Linear, local durable records, and live runtime. No DB except durable pause intent if implemented. |
+| `RuntimeSnapshot`, `IssueBoardCard`, `IssueBoardColumn`, `IssueBoardResponse`, `BoardIssueDetailResponse`, `ActivityItem`, `ActivityFeedResponse`, `RunLivenessStatus`, `RunIdleAlertState`, `RunLivenessState`, `RunCancellationSource`, `CancelFailedState`, `RunCancellationState`, `RunActivityState`, `IssueRunMetadata`, `OperatorLivenessStatus`, `OperatorControls`, `OperatorAffordances`, `PausedOperatorView` | HTTP/API read-model state. Derive from Linear, local durable records, and live runtime. No separate DB row. |
 | `WebIssueStatus`, `IssuePriority`, `ReferenceData`, `IssueModel`, `DashboardModel`, `HistoryModel`, `SidebarModel`, `TranscriptMessage`, `SymphonyDataSource`, `DataSourceConfig`, `Loadable` | Web client models. Derive client-side from API responses. No server DB. |
 | `SymphonySettings`, `StateSummary`, `ConnectionState`, `ProbeResult`, `DashboardState`, `SymphonyPanelProviderMemory`, `WebviewMessage`, `ExtensionMessage` | Extension settings, connection, and webview state. Settings stay in client configuration; other values stay in extension memory or API responses. No DB. |
 | `LogLevel`, `LogRecord` | Structured logging. Send to logs/files/observability retention, not the core application DB. |
 
 ## Database Versus External Authority
 
-Symphony should not create a canonical `issues` table that competes with Linear. If a database needs issue rows for joins, make them local projections:
+Symphony should not create a canonical `issues` table that competes with Linear. If a database needs issue rows for joins, make them local read caches:
 
 ```ts
-interface IssueProjectionCache {
+interface IssueReadCache {
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
   title: string;
@@ -152,7 +161,7 @@ This cache is disposable. The durable Symphony-owned issue state is `IssueLifecy
 The same applies to GitHub:
 
 ```ts
-interface PullRequestProjectionCache {
+interface PullRequestReadCache {
   prUrl: UrlString;
   prNumber: number;
   headBranch: string;
@@ -194,18 +203,18 @@ If multiple Symphony processes can dispatch the same issues, these in-memory loc
 
 ## Migration Priority
 
-1. Move `WritebackOperation` to a database first. It is already an outbox and benefits most from transactional claim, due-time indexes, idempotency uniqueness, and dead-letter queries.
+1. Keep `WritebackOperation` database-backed. It is already an outbox and benefits most from transactional claim, due-time indexes, idempotency uniqueness, and dead-letter queries.
 2. Move `RunRecord` and `TranscriptEvent` next. They are high-volume history and power API/history/recall behavior.
 3. Move `IssueLifecycleRecord` with indexed scalar columns and a JSON document body. This preserves flexibility while making issue state queryable and recoverable.
 4. Move `OperatorApprovalRecord` and `RuntimeProviderGate`. These are control-plane records that must survive restarts and be visible to operators.
 5. Move `WorkspaceRecord`. Keep the actual worktree on disk; make the database the index.
-6. Add durable `OperatorPauseRecord` if pause/resume is intended to survive process restart.
+6. Keep issue-owned runtime control evidence in `IssueStateRecord.history`; add a separate lease table only if Symphony becomes multi-process.
 7. Leave config, secrets, worktrees, Hermes profile/auth, and external authority state outside the database.
 
 ## Current Gaps
 
-- Pause state is memory-only. A paused issue silently resumes eligibility after service restart.
-- Writeback claim safety is process-local. It is appropriate for one process but not for multi-process workers.
+- Retry timers are not restored as timer handles after restart. Retry due time is durable issue state, so the next tick can rebuild eligibility, but exact timer identity remains process-local.
+- Writeback claim safety is SQLite-backed for the active outbox. It is appropriate for one process and local concurrent store instances, but a multi-node service would still need a stronger lease/coordination design.
 - Run transcript storage is append-only file JSONL. That is simple and useful, but database indexing would make recall, UI pagination, and cross-run querying more reliable.
 - `IssueLifecycleRecord` is a single file document. This keeps updates simple, but concurrent service actions would need transaction or version checks in a database-backed store.
 - MCP handoff context files are durable files, but their canonical content should be reconstructable from run, lifecycle, workspace, and config state.

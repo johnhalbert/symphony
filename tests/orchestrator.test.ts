@@ -47,6 +47,7 @@ import {
   type PullRequestDiscoveryClient,
 } from "../src/core/orchestrator/Orchestrator.js";
 import type {
+  IssueCurrentFields,
   IssueCurrentStateSnapshot,
   IssueHistorySnapshot,
 } from "../src/core/orchestration/IssueOrchestrationState.js";
@@ -211,6 +212,177 @@ describe("Orchestrator", () => {
           eventType: "cancelled",
           message: "Run cancelled during Symphony startup",
         }),
+      ]),
+    );
+  });
+
+  it("restores paused issues from durable runtime history on startup", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Todo" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const first = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await first.pauseIssue(candidate.id);
+    await first.stop();
+
+    const harness = new FakeHarness();
+    const second = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await (
+      second as unknown as {
+        restoreRuntimeControlFromIssueHistory(): Promise<void>;
+      }
+    ).restoreRuntimeControlFromIssueHistory();
+
+    expect(second.snapshot().paused).toEqual([candidate.id]);
+    expect(harness.runs).toHaveLength(0);
+    await second.stop();
+    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
+    expect(issueState?.paused).toBe(true);
+    expect(
+      issueState?.history.some(
+        (snapshot) =>
+          snapshot.snapshotKind === "evidence" &&
+          snapshot.evidenceKind === "runtime" &&
+          snapshot.evidenceEventType === "pause_requested" &&
+          snapshot.runtimePaused === true,
+      ),
+    ).toBe(true);
+  });
+
+  it("closes stale runtime running and claim facts on startup", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Done" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateStore = new SqliteIssueStateStore(config.workspace.stateDir);
+    const current = issueCurrentSnapshotForTest(candidate, {
+      trackerState: candidate.state,
+      phase: "passed",
+      latestRunId: "stale-run-1",
+      latestRunStatus: "running",
+      latestRunRole: "worker",
+      latestRunPhase: "implementation",
+      latestRunKind: "implementation",
+      running: true,
+      runningRole: "worker",
+      runningRunPhase: "implementation",
+      runningRunKind: "implementation",
+      claimed: true,
+    });
+    try {
+      await stateStore.ensureIssue(current);
+      await stateStore.appendSnapshot(
+        candidate,
+        runtimeControlEvidenceSnapshotForTest(current, {
+          historySnapshotId: "issue-history:runtime-running",
+          eventType: "running_entry_created",
+          runId: "stale-run-1",
+          running: true,
+          role: "worker",
+          runPhase: "implementation",
+          runKind: "implementation",
+          claimed: true,
+        }),
+      );
+    } finally {
+      await stateStore.close();
+    }
+
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await (
+      orchestrator as unknown as {
+        restoreRuntimeControlFromIssueHistory(): Promise<void>;
+      }
+    ).restoreRuntimeControlFromIssueHistory();
+    await orchestrator.stop();
+
+    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
+    expect(issueState).toMatchObject({
+      running: false,
+      claimed: false,
+    });
+    const runtimeEvents = issueState?.history.filter(
+      (snapshot) =>
+        snapshot.snapshotKind === "evidence" &&
+        snapshot.evidenceKind === "runtime",
+    );
+    expect(
+      runtimeEvents?.map((snapshot) => ({
+        eventType: snapshot.evidenceEventType,
+        reason: snapshot.reason,
+        running: snapshot.runtimeRunning,
+        claimed: snapshot.runtimeClaimed,
+      })),
+    ).toEqual(
+      expect.arrayContaining([
+        {
+          eventType: "running_entry_released",
+          reason: "startup_reconciled_stale_running",
+          running: false,
+          claimed: false,
+        },
+        {
+          eventType: "claim_released",
+          reason: "startup_reconciled_stale_claim",
+          running: false,
+          claimed: false,
+        },
       ]),
     );
   });
@@ -9682,17 +9854,35 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
     });
 
-    orchestrator.pauseIssue(candidate.id);
+    await orchestrator.pauseIssue(candidate.id);
     await orchestrator.refreshNow();
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(harness.runs).toHaveLength(0);
 
-    orchestrator.resumeIssue(candidate.id);
+    await orchestrator.resumeIssue(candidate.id);
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "resumed issue dispatch");
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(1);
+    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
+    expect(
+      issueState?.history
+        .filter(
+          (snapshot) =>
+            snapshot.snapshotKind === "evidence" &&
+            snapshot.evidenceKind === "runtime",
+        )
+        .map((snapshot) => ({
+          eventType: snapshot.evidenceEventType,
+          paused: snapshot.runtimePaused,
+        })),
+    ).toEqual(
+      expect.arrayContaining([
+        { eventType: "pause_requested", paused: true },
+        { eventType: "pause_cleared", paused: false },
+      ]),
+    );
   });
 
   it("passes emitted run ids to harness stop", async () => {
@@ -9726,7 +9916,10 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.runId === "run-123",
+      "blocking harness run id",
+    );
     await orchestrator.stop();
 
     expect(harness.stoppedRunIds).toEqual(["run-123"]);
@@ -13164,6 +13357,7 @@ function mergePolicyRulesetSnapshot(
     claimed: false,
     paused: false,
     retrying: false,
+    runtimeRetryDueAt: null,
     consecutiveSdkErrorFailures: 0,
     consecutiveInfraFailures: 0,
     recordCreatedAt: now,
@@ -13184,6 +13378,101 @@ function mergePolicyRulesetSnapshot(
     manualForceLabels: false,
     manualIgnoreState: false,
     ...overrides,
+  };
+}
+
+function issueCurrentSnapshotForTest(
+  candidate: Issue,
+  overrides: Partial<IssueCurrentStateSnapshot> = {},
+): IssueCurrentStateSnapshot {
+  return mergePolicyRulesetSnapshot({
+    issueId: candidate.id,
+    issueIdentifier: candidate.identifier,
+    title: candidate.title,
+    description: candidate.description,
+    priority: candidate.priority,
+    trackerState: candidate.state,
+    branchName: candidate.branchName,
+    trackerUrl: candidate.url,
+    assigneeId: candidate.assigneeId,
+    delegateId: candidate.delegateId,
+    assignedToWorker: candidate.assignedToWorker,
+    labels: candidate.labels,
+    blockedBy: candidate.blockedBy,
+    hasChildren: candidate.hasChildren === true,
+    trackerCreatedAt: candidate.createdAt,
+    trackerUpdatedAt: candidate.updatedAt,
+    latestPrUrl: null,
+    latestPrNumber: null,
+    latestPrHeadSha: null,
+    latestPrBranch: null,
+    latestGitBranchName: null,
+    ...overrides,
+  });
+}
+
+function runtimeControlEvidenceSnapshotForTest(
+  current: IssueCurrentFields,
+  input: {
+    historySnapshotId: string;
+    eventType: string;
+    runId?: string | null;
+    running?: boolean | null;
+    role?: IssueHistorySnapshot["role"];
+    runPhase?: IssueHistorySnapshot["runPhase"];
+    runKind?: IssueHistorySnapshot["runKind"];
+    claimed?: boolean | null;
+    paused?: boolean | null;
+    retrying?: boolean | null;
+    dueAt?: string | null;
+  },
+): IssueHistorySnapshot {
+  const at = "2026-01-01T00:00:05.000Z";
+  return {
+    ...current,
+    snapshotId: `issue-snapshot:${input.historySnapshotId}`,
+    snapshotAt: at,
+    triggerType: "orchestrator.tick",
+    triggerId: `orchestrator.tick:${input.historySnapshotId}`,
+    triggerAt: at,
+    triggerSource: "orchestrator",
+    candidateSource: `evidence.runtime.${input.eventType}`,
+    transitionRequestContext: null,
+    availableSlots: 1,
+    providerDispatchGateActive: false,
+    stateSlotAvailable: true,
+    allowExistingClaim: false,
+    manualStage: null,
+    manualForceLabels: false,
+    manualIgnoreState: false,
+    snapshotKind: "evidence",
+    historySnapshotId: input.historySnapshotId,
+    transitionKind: "record_evidence",
+    transitionId: `transition:record_evidence:${input.historySnapshotId}`,
+    rulesetId: "orchestrator.evidence.runtime",
+    rulesetVersion: "test",
+    rulesetFingerprint: "orchestrator.evidence.runtime@test:900",
+    rulesetPriority: 900,
+    reason: input.eventType,
+    actions: [],
+    errors: [],
+    evidenceKind: "runtime",
+    evidenceEventType: input.eventType,
+    evidenceSourceId: input.runId ?? current.issueId,
+    evidencePayload: null,
+    runtimeRunning: input.running ?? null,
+    runtimeRole: input.role ?? null,
+    runtimeRunPhase: input.runPhase ?? null,
+    runtimeRunKind: input.runKind ?? null,
+    runtimeRunId: input.runId ?? null,
+    runtimeActiveRunId: input.runId ?? null,
+    runtimeManualDispatchStage: null,
+    runtimeManualIgnoreState: null,
+    runtimeCancellationRequestedAt: null,
+    runtimeClaimed: input.claimed ?? null,
+    runtimePaused: input.paused ?? null,
+    runtimeRetrying: input.retrying ?? null,
+    retryDueAt: input.dueAt ?? null,
   };
 }
 

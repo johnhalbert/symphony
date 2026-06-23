@@ -9,7 +9,7 @@ import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
-import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
+import { SqliteWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
 import { StructuredLogger } from "../logging/StructuredLogger.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
 import { SymphonyError } from "../errors.js";
@@ -51,13 +51,14 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
   }
 
   const loader = new WorkflowLoader(options.workflowPath);
+  let writebackOutbox: SqliteWritebackOutboxStore | null = null;
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    writebackOutbox = new SqliteWritebackOutboxStore(config.workspace.stateDir);
     const writebackProcessor =
       config.writeback.enabled && (config.github.operatorApproval?.requiredForPublication ?? false)
         ? createRuntimeWritebackProcessor(() => config, logger, undefined, { outboxStore: writebackOutbox, lifecycleStore })
@@ -103,6 +104,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       writebackOperationKeys: result.report.writebackOperationKeys,
     };
   } finally {
+    await writebackOutbox?.close();
     await loader.close();
   }
 }

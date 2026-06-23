@@ -6,8 +6,9 @@ Status: complete for durable decision-state fields. Tracker, run-summary,
 lifecycle-core, lifecycle-report, lifecycle publication-approval, lifecycle
 merge-policy, lifecycle breakdown, lifecycle triage, lifecycle post-mortem, and
 merge-policy completion-run history capture plus history-backed current-state
-building are implemented. Runtime-local fields and generic writeback operation
-details remain intentionally outside `IssueCurrentFields`.
+building are implemented. Issue-owned runtime-control facts are durable
+current-state inputs. Generic writeback operation details remain intentionally
+outside `IssueCurrentFields`.
 
 This planning record captures the intended path from the current store-backed
 builder to a history-backed current-state builder. It is not a Spec Kit artifact
@@ -50,8 +51,8 @@ succeeded, skipped, and failed action records, plus runtime/domain errors.
   fields and action/outbox-owned operational details.
 - Issue history is complete enough to rebuild the durable field groups listed in
   `HISTORY_BACKED_FIELD_GROUPS`.
-- Some runtime facts still exist only in in-memory runtime maps because they are
-  intentionally process-local.
+- Live runtime objects still exist only in in-memory runtime maps because they
+  are intentionally process-local.
 - Some non-current-state operational facts, such as detailed writeback operation
   lifecycle, remain action/outbox-owned rather than `IssueCurrentFields`.
 
@@ -151,7 +152,7 @@ Validation:
   - writeback queued/applied/failed
   - approval requested/approved/rejected
   - workspace created/removed/updated
-  - runtime retry scheduled/fired/cleared
+  - runtime running/claim/pause/cancellation/retry control events
 - Keep `evidencePayload` temporarily for compatibility.
 - Move important facts to top-level typed fields.
 - Update normalization so legacy snapshots remain readable.
@@ -195,8 +196,13 @@ Runtime-only trigger facts stay outside durable history:
 - available slots
 - provider gate active flag
 - manual flags
-- active in-memory running, claimed, and paused state where it is genuinely
-  process-local
+
+Issue-owned runtime control facts are durable transition inputs:
+
+- active running role/phase/manual-dispatch/cancellation state
+- claim acquired/released state
+- pause requested/cleared state
+- retry scheduled/fired/cleared state and retry due time
 
 ### Phase 6: Parity Tests
 
@@ -243,15 +249,17 @@ Acceptance:
   lanes, typed evidence normalization, tracker observation capture, lifecycle
   core/report/publication-approval/merge-policy/breakdown/triage/post-mortem
   evidence, run start, terminal, and pull request evidence, retry
-  scheduled/fired/cleared evidence, and tracker/run-summary/
+  scheduled/fired/cleared evidence, runtime control evidence, and tracker/run-summary/
   merge-policy-completion-run/lifecycle-core/lifecycle-report/
   lifecycle-publication/lifecycle-merge-policy/lifecycle-breakdown/
-  lifecycle-triage/lifecycle-post-mortem history-backed builder support.
+  lifecycle-triage/lifecycle-post-mortem/runtime-control history-backed builder
+  support.
 - Implemented: tracker, run-summary, merge-policy-completion-run,
   lifecycle-core, lifecycle-report, lifecycle-publication,
   lifecycle-merge-policy, lifecycle-breakdown, lifecycle-triage, and
-  lifecycle-post-mortem field authority can be enabled in the builder and are
-  enabled for orchestrator decisions with freshness/completeness guards.
+  lifecycle-post-mortem/runtime-control field authority can be enabled in the
+  builder and is enabled for orchestrator decisions with
+  freshness/completeness guards.
 - Implemented: `current_json` remains written for compatibility and fast reads,
   but is treated as cached current state for field groups that can be rebuilt
   from history.
@@ -269,17 +277,16 @@ Acceptance:
   metadata.
 - Implemented: cache-bypass coverage verifies stale `current_json` does not
   drive history-backed fields when typed history is complete.
-- Intentionally not history-backed: runtime-local fields for active in-memory
-  running, claimed, paused, retrying, provider gate, slot availability, and
-  manual trigger flags. These remain snapshot-local/process-local inputs unless
-  a future transition needs durable behavior from them.
+- Implemented: issue-owned runtime fields for active running, claimed, paused,
+  retrying, and retry due time are rebuilt from typed runtime/harness evidence.
+- Intentionally not history-backed: provider gate, slot availability, and
+  manual trigger flags. These remain trigger-local inputs recorded on decision
+  snapshots.
 - Not a builder field group: generic writeback operation details. They remain
   typed evidence/action/outbox records for audit and execution, not flattened
   `IssueCurrentFields` decision state.
 
 ## Review Questions
 
-- Are any runtime-local facts currently listed above expected to become durable
-  transition inputs?
 - What mismatch reporting format should parity tests use for the dashboard or
   logs, if any?

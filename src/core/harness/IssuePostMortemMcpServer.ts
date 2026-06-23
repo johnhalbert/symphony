@@ -14,7 +14,7 @@ import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { Issue, Workspace } from "../types.js";
-import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
+import { SqliteWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
 
@@ -48,6 +48,7 @@ export async function submitIssuePostMortemReportFromMcp(
   }
 
   const loader = new WorkflowLoader(options.workflowPath);
+  let writebackOutbox: SqliteWritebackOutboxStore | null = null;
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
@@ -56,10 +57,11 @@ export async function submitIssuePostMortemReportFromMcp(
     if (!lifecycle) {
       throw new SymphonyError("invalid_request", "Issue post-mortem requires an existing lifecycle record");
     }
+    writebackOutbox = new SqliteWritebackOutboxStore(config.workspace.stateDir);
     const service = new IssuePostMortemService({
       config,
       lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      writebackOutbox,
       runStore: new FileRunTranscriptStore(config.workspace.stateDir),
     });
     const context: IssuePostMortemActiveContext = {
@@ -82,6 +84,7 @@ export async function submitIssuePostMortemReportFromMcp(
       followUpCandidateCount: result.report.followUpCandidates.length,
     };
   } finally {
+    await writebackOutbox?.close();
     await loader.close();
   }
 }

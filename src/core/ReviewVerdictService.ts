@@ -24,7 +24,7 @@ import {
   planReviewFailWritebacks,
   planReviewPassWritebacks,
 } from "./writeback/TransitionPolicy.js";
-import type { FileWritebackOutboxStore, NewWritebackOperation, WritebackOperation } from "./writeback/WritebackOutbox.js";
+import type { NewWritebackOperation, WritebackOperation, WritebackOutboxStore } from "./writeback/WritebackOutbox.js";
 
 const PASS_REQUIRES_APPROVE_MESSAGE =
   'Pass review verdict requires prior submit_pull_request_review_feedback with kind="review" and event="APPROVE" for the active reviewer run and lifecycle-bound PR.';
@@ -110,7 +110,7 @@ export interface ReviewVerdictActiveContext {
 export interface ReviewVerdictServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
-  writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
+  writebackOutbox: Pick<WritebackOutboxStore, "enqueueOnce">;
   runStore?: Pick<RunTranscriptStore, "appendEvent">;
 }
 

@@ -80,6 +80,7 @@ export interface IssueCurrentStateRuntimeState {
   claimed: boolean;
   paused: boolean;
   retrying: boolean;
+  retryDueAt?: string | null;
 }
 
 export interface IssueCurrentStateSnapshotBuildInput {
@@ -117,7 +118,8 @@ export type IssueCurrentStateHistoryFieldGroup =
   | "lifecycleBreakdown"
   | "lifecycleTriage"
   | "lifecyclePostMortem"
-  | "mergePolicyCompletionRun";
+  | "mergePolicyCompletionRun"
+  | "runtimeControl";
 
 export const HISTORY_BACKED_FIELD_GROUPS: readonly IssueCurrentStateHistoryFieldGroup[] =
   [
@@ -131,6 +133,7 @@ export const HISTORY_BACKED_FIELD_GROUPS: readonly IssueCurrentStateHistoryField
     "lifecycleBreakdown",
     "lifecycleTriage",
     "lifecyclePostMortem",
+    "runtimeControl",
   ];
 
 export interface IssueCurrentStateHistoryRebuildResult {
@@ -348,6 +351,7 @@ type RuntimeFields = Pick<
   | "claimed"
   | "paused"
   | "retrying"
+  | "runtimeRetryDueAt"
 >;
 
 type TriggerFields = Omit<IssueCurrentStateSnapshot, keyof IssueCurrentFields>;
@@ -392,6 +396,7 @@ interface HistoryBackedGroupFields {
   lifecycleTriage?: LifecycleTriageFields;
   lifecyclePostMortem?: LifecyclePostMortemFields;
   mergePolicyCompletionRun?: MergePolicyCompletionRunFields;
+  runtimeControl?: RuntimeFields;
 }
 
 interface HistoryBackedGroupResult {
@@ -438,6 +443,20 @@ interface HistoryRunSummary {
   turnNumber: number | null;
   harnessId: string | null;
   promptTemplateKeys: string[] | null;
+}
+
+interface HistoryRuntimeControlSummary {
+  sourceSnapshotIds: string[];
+  running: boolean;
+  runningRole: AgentRunRole | null;
+  runningRunPhase: AgentRunPhase | null;
+  runningManualDispatchStage: string | null;
+  runningManualIgnoreState: boolean;
+  runningCancellationRequested: boolean;
+  claimed: boolean;
+  paused: boolean;
+  retrying: boolean;
+  runtimeRetryDueAt: string | null;
 }
 
 export class IssueCurrentStateBuilder {
@@ -501,6 +520,7 @@ export class IssueCurrentStateBuilder {
     const lifecycleTriage = this.buildLifecycleTriageFieldsFromHistory(context);
     const lifecyclePostMortem =
       this.buildLifecyclePostMortemFieldsFromHistory(context);
+    const runtimeControl = this.buildRuntimeControlFieldsFromHistory(context);
     const trackerSourceSnapshotIds =
       tracker.sourceSnapshotId === null ? [] : [tracker.sourceSnapshotId];
     const mergePolicyCompletionRunSourceSnapshotIds =
@@ -533,6 +553,7 @@ export class IssueCurrentStateBuilder {
       lifecyclePostMortem.sourceSnapshotId === null
         ? []
         : [lifecyclePostMortem.sourceSnapshotId];
+    const runtimeControlSourceSnapshotIds = runtimeControl.sourceSnapshotIds;
     return {
       fields: {
         ...(tracker.fields === null ? {} : { tracker: tracker.fields }),
@@ -563,6 +584,9 @@ export class IssueCurrentStateBuilder {
         ...(lifecyclePostMortem.fields === null
           ? {}
           : { lifecyclePostMortem: lifecyclePostMortem.fields }),
+        ...(runtimeControl.fields === null
+          ? {}
+          : { runtimeControl: runtimeControl.fields }),
       },
       incompleteGroups: [
         ...(tracker.complete ? [] : (["tracker"] as const)),
@@ -585,6 +609,7 @@ export class IssueCurrentStateBuilder {
         ...(lifecyclePostMortem.complete
           ? []
           : (["lifecyclePostMortem"] as const)),
+        ...(runtimeControl.complete ? [] : (["runtimeControl"] as const)),
       ],
       sourceSnapshotIds: [
         ...trackerSourceSnapshotIds,
@@ -597,6 +622,7 @@ export class IssueCurrentStateBuilder {
         ...lifecycleBreakdownSourceSnapshotIds,
         ...lifecycleTriageSourceSnapshotIds,
         ...lifecyclePostMortemSourceSnapshotIds,
+        ...runtimeControlSourceSnapshotIds,
       ],
       sourceSnapshotIdsByGroup: {
         tracker: trackerSourceSnapshotIds,
@@ -609,6 +635,7 @@ export class IssueCurrentStateBuilder {
         lifecycleBreakdown: lifecycleBreakdownSourceSnapshotIds,
         lifecycleTriage: lifecycleTriageSourceSnapshotIds,
         lifecyclePostMortem: lifecyclePostMortemSourceSnapshotIds,
+        runtimeControl: runtimeControlSourceSnapshotIds,
       },
     };
   }
@@ -1813,6 +1840,70 @@ export class IssueCurrentStateBuilder {
       claimed: context.runtime.claimed,
       paused: context.runtime.paused,
       retrying: context.runtime.retrying,
+      runtimeRetryDueAt: context.runtime.retryDueAt ?? null,
+    };
+  }
+
+  private buildRuntimeControlFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | {
+        complete: true;
+        fields: RuntimeFields;
+        sourceSnapshotIds: string[];
+      }
+    | { complete: false; fields: null; sourceSnapshotIds: string[] } {
+    const summary = buildRuntimeControlSummaryFromHistory(context.history);
+    if (summary.sourceSnapshotIds.length === 0) {
+      if (
+        context.runtime.running ||
+        context.runtime.claimed ||
+        context.runtime.paused ||
+        context.runtime.retrying ||
+        context.runningEntry !== null
+      ) {
+        return { complete: false, fields: null, sourceSnapshotIds: [] };
+      }
+      return {
+        complete: true,
+        sourceSnapshotIds: [],
+        fields: {
+          running: false,
+          runningRole: null,
+          runningRunPhase: null,
+          runningRunKind: null,
+          runningManualDispatchStage: null,
+          runningManualIgnoreState: false,
+          runningHasPendingPublicationApproval:
+            context.pendingPublication !== null,
+          runningCancellationRequested: false,
+          claimed: false,
+          paused: false,
+          retrying: false,
+          runtimeRetryDueAt: null,
+        },
+      };
+    }
+    return {
+      complete: true,
+      sourceSnapshotIds: summary.sourceSnapshotIds,
+      fields: {
+        running: summary.running,
+        runningRole: summary.runningRole,
+        runningRunPhase: summary.runningRunPhase,
+        runningRunKind:
+          summary.runningRunPhase === null
+            ? null
+            : runKindForPhase(summary.runningRunPhase),
+        runningManualDispatchStage: summary.runningManualDispatchStage,
+        runningManualIgnoreState: summary.runningManualIgnoreState,
+        runningHasPendingPublicationApproval: context.pendingPublication !== null,
+        runningCancellationRequested: summary.runningCancellationRequested,
+        claimed: summary.claimed,
+        paused: summary.paused,
+        retrying: summary.retrying,
+        runtimeRetryDueAt: summary.runtimeRetryDueAt,
+      },
     };
   }
 
@@ -1853,6 +1944,132 @@ function latestTrackerObservationSnapshot(
     }
   }
   return null;
+}
+
+function buildRuntimeControlSummaryFromHistory(
+  history: readonly IssueHistorySnapshot[],
+): HistoryRuntimeControlSummary {
+  const summary: HistoryRuntimeControlSummary = {
+    sourceSnapshotIds: [],
+    running: false,
+    runningRole: null,
+    runningRunPhase: null,
+    runningManualDispatchStage: null,
+    runningManualIgnoreState: false,
+    runningCancellationRequested: false,
+    claimed: false,
+    paused: false,
+    retrying: false,
+    runtimeRetryDueAt: null,
+  };
+  for (const snapshot of history) {
+    if (snapshot.snapshotKind !== "evidence") continue;
+    if (snapshot.evidenceKind === "runtime") {
+      summary.sourceSnapshotIds.push(snapshot.historySnapshotId);
+      applyRuntimeControlEvidenceSnapshot(summary, snapshot);
+      continue;
+    }
+    if (
+      snapshot.evidenceKind === "harness" &&
+      (snapshot.evidenceEventType === "retry_scheduled" ||
+        snapshot.evidenceEventType === "retry_fired" ||
+        snapshot.evidenceEventType === "retry_cleared")
+    ) {
+      summary.sourceSnapshotIds.push(snapshot.historySnapshotId);
+      applyRuntimeRetryEvent(
+        summary,
+        snapshot.evidenceEventType,
+        stringFromUnknown(snapshot.retryDueAt),
+      );
+    }
+  }
+  return summary;
+}
+
+function applyRuntimeControlEvidenceSnapshot(
+  summary: HistoryRuntimeControlSummary,
+  snapshot: IssueHistorySnapshot,
+): void {
+  const eventType = stringFromUnknown(snapshot.evidenceEventType);
+  switch (eventType) {
+    case "running_entry_created":
+      summary.running = booleanFromUnknown(snapshot.runtimeRunning) ?? true;
+      summary.runningRole =
+        agentRunRoleFromUnknown(snapshot.runtimeRole) ??
+        agentRunRoleFromUnknown(snapshot.role) ??
+        summary.runningRole;
+      summary.runningRunPhase =
+        agentRunPhaseFromUnknown(snapshot.runtimeRunPhase) ??
+        agentRunPhaseFromUnknown(snapshot.runPhase) ??
+        summary.runningRunPhase;
+      summary.runningManualDispatchStage =
+        stringFromUnknown(snapshot.runtimeManualDispatchStage) ??
+        summary.runningManualDispatchStage;
+      summary.runningManualIgnoreState =
+        booleanFromUnknown(snapshot.runtimeManualIgnoreState) ??
+        summary.runningManualIgnoreState;
+      summary.runningCancellationRequested =
+        stringFromUnknown(snapshot.runtimeCancellationRequestedAt) !== null;
+      break;
+    case "running_entry_released":
+      summary.running = false;
+      summary.runningRole = null;
+      summary.runningRunPhase = null;
+      summary.runningManualDispatchStage = null;
+      summary.runningManualIgnoreState = false;
+      summary.runningCancellationRequested = false;
+      break;
+    case "claim_acquired":
+      summary.claimed = booleanFromUnknown(snapshot.runtimeClaimed) ?? true;
+      break;
+    case "claim_released":
+      summary.claimed = booleanFromUnknown(snapshot.runtimeClaimed) ?? false;
+      break;
+    case "pause_requested":
+      summary.paused = booleanFromUnknown(snapshot.runtimePaused) ?? true;
+      break;
+    case "pause_cleared":
+      summary.paused = booleanFromUnknown(snapshot.runtimePaused) ?? false;
+      break;
+    case "cancellation_requested":
+      summary.runningCancellationRequested = true;
+      break;
+    case "retry_scheduled":
+    case "retry_fired":
+    case "retry_cleared":
+      applyRuntimeRetryEvent(
+        summary,
+        eventType,
+        stringFromUnknown(snapshot.retryDueAt),
+      );
+      break;
+  }
+  summary.running =
+    booleanFromUnknown(snapshot.runtimeRunning) ?? summary.running;
+  summary.claimed =
+    booleanFromUnknown(snapshot.runtimeClaimed) ?? summary.claimed;
+  summary.paused = booleanFromUnknown(snapshot.runtimePaused) ?? summary.paused;
+  const explicitRetrying = booleanFromUnknown(snapshot.runtimeRetrying);
+  if (explicitRetrying !== null) {
+    summary.retrying = explicitRetrying;
+    if (!explicitRetrying) summary.runtimeRetryDueAt = null;
+  }
+}
+
+function applyRuntimeRetryEvent(
+  summary: HistoryRuntimeControlSummary,
+  eventType: string,
+  retryDueAt: string | null = null,
+): void {
+  if (eventType === "retry_scheduled") {
+    summary.retrying = true;
+    summary.runtimeRetryDueAt = retryDueAt;
+    return;
+  }
+  if (eventType === "retry_fired" || eventType === "retry_cleared") {
+    summary.retrying = false;
+    summary.runtimeRetryDueAt = null;
+  }
 }
 
 function selectHistoryBackedGroups(
@@ -2370,6 +2587,27 @@ function numberFromUnknown(value: unknown): number | null {
 
 function booleanFromUnknown(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
+}
+
+function agentRunRoleFromUnknown(value: unknown): AgentRunRole | null {
+  return value === "worker" ||
+    value === "reviewer" ||
+    value === "triage" ||
+    value === "planner" ||
+    value === "post_mortem"
+    ? value
+    : null;
+}
+
+function agentRunPhaseFromUnknown(value: unknown): AgentRunPhase | null {
+  return value === "issue_breakdown" ||
+    value === "implementation" ||
+    value === "merge_conflict_resolution" ||
+    value === "review" ||
+    value === "issue_triage" ||
+    value === "post_mortem"
+    ? value
+    : null;
 }
 
 function tokenCountsFromUnknown(value: unknown): TokenCounts | null {

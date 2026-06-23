@@ -29,8 +29,8 @@ import {
 } from "./writeback/TransitionPolicy.js";
 import { shouldSilentlyRetireMergeGate, supersededMergeGateLifecyclePatch } from "./merge/MergeGateLifecycle.js";
 import type {
-  FileWritebackOutboxStore,
   NewWritebackOperation,
+  WritebackOutboxStore,
   WritebackOperation,
   WritebackProcessor,
   WritebackStatus,
@@ -90,8 +90,8 @@ export interface CompletionReportActiveContext {
 export interface CompletionReportServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
-  writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce" | "get">;
-  writebackProcessor?: Pick<WritebackProcessor, "processDue">;
+  writebackOutbox: Pick<WritebackOutboxStore, "enqueueOnce" | "get">;
+  writebackProcessor?: Pick<WritebackProcessor, "processDue"> & Partial<Pick<WritebackProcessor, "enqueueAndProcess">>;
   runStore?: Pick<RunTranscriptStore, "appendEvent" | "getRun" | "recordPullRequestEvent" | "updateRun">;
   pullRequestPublisher?: CompletionReportPullRequestPublisher;
   operatorApproval?: Pick<OperatorApprovalService, "requestPublicationApproval" | "waitForPublicationApprovalRequest"> &
@@ -482,9 +482,6 @@ export class CompletionReportService {
       },
     );
 
-    for (const operation of pendingOperations) {
-      await this.options.writebackOutbox.enqueueOnce(operation);
-    }
     try {
       await this.processAndVerifyPendingPublicationApprovalWritebacks(pendingOperations);
     } catch (error) {
@@ -866,6 +863,27 @@ export class CompletionReportService {
         "Publication approval requires a writeback processor to apply pending Linear audit before waiting",
       );
     }
+    if (processor.enqueueAndProcess) {
+      const unsettled: Array<{ operation: NewWritebackOperation; record: WritebackOperation }> = [];
+      for (const operation of operations) {
+        const record = await processor.enqueueAndProcess(operation);
+        if (!SETTLED_WRITEBACK_STATUSES.has(record.status)) {
+          unsettled.push({ operation, record });
+        }
+      }
+      const firstUnsettled = unsettled[0];
+      if (firstUnsettled) {
+        throw new SymphonyError("tracker_error", "Pending publication approval writeback did not complete", {
+          idempotencyKey: firstUnsettled.operation.idempotencyKey,
+          status: firstUnsettled.record.status,
+          lastError: firstUnsettled.record.lastError,
+        });
+      }
+      return;
+    }
+    for (const operation of operations) {
+      await this.options.writebackOutbox.enqueueOnce(operation);
+    }
     await processor.processDue({ idempotencyKeys: operations.map((operation) => operation.idempotencyKey) });
     for (const operation of operations) {
       const record = await this.options.writebackOutbox.get(operation.idempotencyKey);
@@ -940,6 +958,7 @@ export class CompletionReportService {
       state: this.options.config.reviewLoop.blockedStates[0] ?? context.issue.state,
     };
     const enqueued: WritebackOperation[] = [];
+    const processedOnEnqueue = this.options.writebackProcessor?.enqueueAndProcess !== undefined;
 
     for (const operation of planCompletionReportPublicationApprovalTerminalWritebacks(
       runWritebackContext({ ...context, issue }, report.runId),
@@ -948,19 +967,35 @@ export class CompletionReportService {
       approval.status,
       approval.staleReason,
     )) {
-      enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
+      enqueued.push(await this.enqueueWritebackForImmediateProcessing(operation));
     }
     await this.options.lifecycleStore.updateIssue(context.issue, {
       phase: "blocked",
       blockedReason: `publication approval ${approval.status}`,
     });
-    await this.processDueForOperations(enqueued);
+    if (!processedOnEnqueue) await this.processDueForOperations(enqueued);
     return enqueued;
   }
 
-  private async processDueForOperations(operations: ReadonlyArray<Pick<WritebackOperation, "idempotencyKey">>): Promise<void> {
+  private async enqueueWritebackForImmediateProcessing(operation: NewWritebackOperation): Promise<WritebackOperation> {
+    const processor = this.options.writebackProcessor;
+    if (processor?.enqueueAndProcess) {
+      return processor.enqueueAndProcess(operation);
+    }
+    return this.options.writebackOutbox.enqueueOnce(operation);
+  }
+
+  private async processDueForOperations(operations: ReadonlyArray<WritebackOperation>): Promise<void> {
     if (operations.length === 0) return;
-    await this.options.writebackProcessor?.processDue({
+    const processor = this.options.writebackProcessor;
+    if (!processor) return;
+    if (processor.enqueueAndProcess) {
+      for (const operation of operations) {
+        await processor.enqueueAndProcess(operation);
+      }
+      return;
+    }
+    await processor.processDue({
       idempotencyKeys: operations.map((operation) => operation.idempotencyKey),
     });
   }

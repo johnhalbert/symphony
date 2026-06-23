@@ -245,6 +245,7 @@ function snapshot(): IssueCurrentStateSnapshot {
     claimed: false,
     paused: false,
     retrying: false,
+    runtimeRetryDueAt: null,
     consecutiveSdkErrorFailures: 0,
     consecutiveInfraFailures: 0,
     recordCreatedAt: now,

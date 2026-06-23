@@ -33,6 +33,7 @@ import type { IssueBreakdownFreshnessGuard } from "../src/core/writeback/Writeba
 import {
   FileWritebackOutboxStore,
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
+  SqliteWritebackOutboxStore,
   WritebackProcessor,
 } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
@@ -934,6 +935,102 @@ describe("FileWritebackOutboxStore", () => {
     expect(result.status).toBe("skipped");
     expect(result.lastError).toContain("ambiguous");
     expect(writer.comments).toHaveLength(0);
+  });
+});
+
+describe("SqliteWritebackOutboxStore", () => {
+  let root: string;
+  let stores: SqliteWritebackOutboxStore[];
+
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "symphony-writeback-sqlite-"));
+    stores = [];
+  });
+
+  afterEach(async () => {
+    await Promise.all(stores.map((store) => store.close()));
+    await rm(root, { recursive: true, force: true });
+  });
+
+  function track(store: SqliteWritebackOutboxStore): SqliteWritebackOutboxStore {
+    stores.push(store);
+    return store;
+  }
+
+  it("persists processed operations across store instances", async () => {
+    const operation: NewWritebackOperation = {
+      idempotencyKey: "transition:issue-1:done",
+      kind: "transition",
+      issueId: "issue-1",
+      payload: { fromStates: ["Ready to Merge"], toState: "Done" },
+    };
+    const firstStore = track(new SqliteWritebackOutboxStore(root));
+    const writer = new FakeWriter();
+    const firstProcessor = new WritebackProcessor(firstStore, writer, new StructuredLogger(() => undefined), 300_000);
+
+    await expect(firstProcessor.enqueueAndProcess(operation)).resolves.toMatchObject({ status: "succeeded" });
+    expect(writer.transitions).toHaveLength(1);
+    await firstStore.close();
+
+    const secondStore = track(new SqliteWritebackOutboxStore(root));
+    await expect(secondStore.get(operation.idempotencyKey)).resolves.toMatchObject({ status: "succeeded" });
+    const secondWriter = new FakeWriter();
+    const secondProcessor = new WritebackProcessor(secondStore, secondWriter, new StructuredLogger(() => undefined), 300_000);
+
+    await expect(secondProcessor.enqueueAndProcess(operation)).resolves.toMatchObject({ status: "succeeded" });
+    expect(secondWriter.transitions).toHaveLength(0);
+  });
+
+  it("imports legacy file outbox records on first open", async () => {
+    const legacyStore = new FileWritebackOutboxStore(root);
+    const operation: NewWritebackOperation = {
+      idempotencyKey: "comment:issue-1:legacy",
+      kind: "comment",
+      issueId: "issue-1",
+      payload: { body: "Legacy writeback", dedupeKey: "legacy" },
+    };
+    await legacyStore.enqueueOnce(operation);
+
+    const store = track(new SqliteWritebackOutboxStore(root));
+
+    await expect(store.get(operation.idempotencyKey)).resolves.toMatchObject({
+      idempotencyKey: operation.idempotencyKey,
+      status: "pending",
+    });
+    await expect(store.claimDue(new Date("9999-01-01T00:00:00.000Z"))).resolves.toMatchObject([
+      { idempotencyKey: operation.idempotencyKey, status: "in_flight" },
+    ]);
+    await expect(readdir(path.join(root, "writeback"))).resolves.toHaveLength(1);
+  });
+
+  it("claims one due record once across concurrent store instances", async () => {
+    const operation: NewWritebackOperation = {
+      idempotencyKey: "comment:issue-1:concurrent",
+      kind: "comment",
+      issueId: "issue-1",
+      payload: { body: "Concurrent writeback", dedupeKey: "concurrent" },
+    };
+    const seedStore = track(new SqliteWritebackOutboxStore(root));
+    await seedStore.enqueueOnce(operation);
+    const storeA = track(new SqliteWritebackOutboxStore(root));
+    const storeB = track(new SqliteWritebackOutboxStore(root));
+
+    const claims = await Promise.all([
+      storeA.claimDue(new Date("9999-01-01T00:00:00.000Z")),
+      storeB.claimDue(new Date("9999-01-01T00:00:00.000Z")),
+    ]);
+
+    expect(claims.flat()).toHaveLength(1);
+    expect(claims.flat()[0]).toMatchObject({ idempotencyKey: operation.idempotencyKey, status: "in_flight" });
+    await expect(seedStore.get(operation.idempotencyKey)).resolves.toMatchObject({ status: "in_flight" });
+  });
+
+  it("closes the backing store through WritebackProcessor", async () => {
+    const store = track(new SqliteWritebackOutboxStore(root));
+    const processor = new WritebackProcessor(store, new FakeWriter(), new StructuredLogger(() => undefined), 300_000);
+
+    await processor.close();
+    await expect(store.list()).resolves.toEqual([]);
   });
 });
 

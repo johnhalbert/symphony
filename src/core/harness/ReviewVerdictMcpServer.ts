@@ -9,7 +9,7 @@ import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { Issue } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
-import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
+import { SqliteWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
 
 export const REVIEW_VERDICT_TOOL_NAME = "submit_review_verdict";
@@ -43,13 +43,15 @@ export async function submitReviewVerdictFromMcp(input: unknown, options: {
   }
 
   const loader = new WorkflowLoader(options.workflowPath);
+  let writebackOutbox: SqliteWritebackOutboxStore | null = null;
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
+    writebackOutbox = new SqliteWritebackOutboxStore(config.workspace.stateDir);
     const service = new ReviewVerdictService({
       config,
       lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
-      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      writebackOutbox,
       runStore: new FileRunTranscriptStore(config.workspace.stateDir),
     });
     const context: ReviewVerdictActiveContext = {
@@ -71,6 +73,7 @@ export async function submitReviewVerdictFromMcp(input: unknown, options: {
       writebackOperationKeys: result.verdict.writebackOperationKeys,
     };
   } finally {
+    await writebackOutbox?.close();
     await loader.close();
   }
 }

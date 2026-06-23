@@ -19,8 +19,8 @@ import type {
 import type { Issue, Workspace } from "./types.js";
 import { planBlockedEscalationWritebacks } from "./writeback/TransitionPolicy.js";
 import type {
-  FileWritebackOutboxStore,
   WritebackOperation,
+  WritebackOutboxStore,
   WritebackProcessor,
 } from "./writeback/WritebackOutbox.js";
 
@@ -78,7 +78,7 @@ export interface MergeConflictResolutionActiveContext {
 export interface MergeConflictResolutionServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
-  writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
+  writebackOutbox: Pick<WritebackOutboxStore, "enqueueOnce">;
   writebackProcessor?: Pick<WritebackProcessor, "processDue">;
   finalizer?: MergeConflictResolutionFinalizer;
   gitAuthHeaderProvider?: () => Promise<string>;

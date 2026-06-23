@@ -85,6 +85,7 @@ export type IssueEvidenceKind =
   | "approval"
   | "workspace"
   | "tracker"
+  | "runtime"
   | "harness";
 
 export interface TransitionRequestContextEnvelope<K extends string, P> {
@@ -250,6 +251,7 @@ export interface IssueCurrentFields {
   claimed: boolean;
   paused: boolean;
   retrying: boolean;
+  runtimeRetryDueAt: string | null;
   consecutiveSdkErrorFailures: number;
   consecutiveInfraFailures: number;
   recordCreatedAt: string;
@@ -524,6 +526,40 @@ export interface WorkspaceEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
   runKind: AgentRunKind | null;
 }
 
+export type RuntimeControlEvidenceEventType =
+  | "running_entry_created"
+  | "running_entry_released"
+  | "claim_acquired"
+  | "claim_released"
+  | "pause_requested"
+  | "pause_cleared"
+  | "cancellation_requested"
+  | "retry_scheduled"
+  | "retry_fired"
+  | "retry_cleared";
+
+export interface RuntimeControlEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
+  "runtime",
+  RuntimeControlEvidenceEventType
+> {
+  runtimeRunning: boolean | null;
+  runtimeRole: AgentRunRole | null;
+  runtimeRunPhase: AgentRunPhase | null;
+  runtimeRunKind: AgentRunKind | null;
+  runtimeRunId: string | null;
+  runtimeActiveRunId: string | null;
+  runtimeManualDispatchStage: string | null;
+  runtimeManualIgnoreState: boolean | null;
+  runtimeCancellationRequestedAt: string | null;
+  runtimeClaimed: boolean | null;
+  runtimePaused: boolean | null;
+  runtimeRetrying: boolean | null;
+  retryAttempt: number | null;
+  retryDelayMs: number | null;
+  retryError: string | null;
+  retryDueAt: string | null;
+}
+
 export interface RuntimeRetryEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
   "harness",
   "retry_scheduled" | "retry_fired" | "retry_cleared"
@@ -541,6 +577,7 @@ export type IssueTypedEvidenceSnapshot =
   | WritebackEvidenceSnapshot
   | ApprovalEvidenceSnapshot
   | WorkspaceEvidenceSnapshot
+  | RuntimeControlEvidenceSnapshot
   | RuntimeRetryEvidenceSnapshot;
 
 export function normalizeIssueHistorySnapshotEvidenceFields(
@@ -773,6 +810,42 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
         role: stringField(payload, "role") ?? snapshot.role ?? null,
         runPhase: stringField(payload, "runPhase") ?? snapshot.runPhase ?? null,
         runKind: stringField(payload, "runKind") ?? snapshot.runKind ?? null,
+      });
+    case "runtime":
+      return copyMissingEvidenceFields(snapshot, {
+        runtimeRunning: booleanField(payload, "running"),
+        runtimeRole:
+          stringField(payload, "role") ?? stringField(payload, "runtimeRole"),
+        runtimeRunPhase:
+          stringField(payload, "runPhase") ??
+          stringField(payload, "runtimeRunPhase"),
+        runtimeRunKind:
+          stringField(payload, "runKind") ??
+          stringField(payload, "runtimeRunKind"),
+        runtimeRunId:
+          stringField(payload, "runId") ?? stringField(payload, "runtimeRunId"),
+        runtimeActiveRunId:
+          stringField(payload, "activeRunId") ??
+          stringField(payload, "runtimeActiveRunId"),
+        runtimeManualDispatchStage:
+          stringField(payload, "manualDispatchStage") ??
+          stringField(payload, "runtimeManualDispatchStage"),
+        runtimeManualIgnoreState:
+          booleanField(payload, "manualIgnoreState") ??
+          booleanField(payload, "runtimeManualIgnoreState"),
+        runtimeCancellationRequestedAt:
+          stringField(payload, "cancellationRequestedAt") ??
+          stringField(payload, "runtimeCancellationRequestedAt"),
+        runtimeClaimed: booleanField(payload, "claimed"),
+        runtimePaused: booleanField(payload, "paused"),
+        runtimeRetrying: booleanField(payload, "retrying"),
+        retryAttempt:
+          numberField(payload, "attempt") ?? snapshot.retryAttempt ?? null,
+        retryDelayMs:
+          numberField(payload, "delayMs") ?? snapshot.retryDelayMs ?? null,
+        retryError:
+          stringField(payload, "error") ?? snapshot.retryError ?? null,
+        retryDueAt: stringField(payload, "dueAt"),
       });
     case "harness":
       if (

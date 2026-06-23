@@ -4,8 +4,8 @@ import type { ServiceConfig } from "../core/config/Config.js";
 import type { CredentialCapability, CredentialRole, ResolvedCredential } from "../core/config/CredentialProfiles.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import { FileIssueLifecycleStore, type IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
-import type { IssueBreakdownIssueLookupResult } from "../core/writeback/WritebackOutbox.js";
-import { FileWritebackOutboxStore, WritebackProcessor } from "../core/writeback/WritebackOutbox.js";
+import type { IssueBreakdownIssueLookupResult, WritebackOutboxStore } from "../core/writeback/WritebackOutbox.js";
+import { SqliteWritebackOutboxStore, WritebackProcessor } from "../core/writeback/WritebackOutbox.js";
 import { createLinearTrackerClientForCapability } from "../integrations/linear/LinearCredentialResolver.js";
 
 type FetchLike = typeof fetch;
@@ -19,7 +19,7 @@ export function createRuntimeWritebackProcessor(
   logger: Logger,
   fetchImpl?: FetchLike,
   stores: {
-    outboxStore?: FileWritebackOutboxStore;
+    outboxStore?: WritebackOutboxStore;
     lifecycleStore?: Pick<IssueLifecycleStore, "get">;
   } = {},
 ): WritebackProcessor | undefined {
@@ -27,7 +27,7 @@ export function createRuntimeWritebackProcessor(
   const config = getConfig();
   if (!config.writeback.enabled) return undefined;
   return new WritebackProcessor(
-    stores.outboxStore ?? new FileWritebackOutboxStore(config.workspace.stateDir),
+    stores.outboxStore ?? new SqliteWritebackOutboxStore(config.workspace.stateDir),
     createLinearTrackerClientForCapability(config, "linear.writeback", fetchImpl),
     logger,
     config.writeback.maxBackoffMs,

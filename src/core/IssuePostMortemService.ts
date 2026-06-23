@@ -18,7 +18,7 @@ import { latestCurrentApprovalPassVerdict } from "./persistence/IssueLifecycleSt
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 import { planIssuePostMortemReportWritebacks } from "./writeback/TransitionPolicy.js";
-import type { FileWritebackOutboxStore } from "./writeback/WritebackOutbox.js";
+import type { WritebackOutboxStore } from "./writeback/WritebackOutbox.js";
 
 export const ISSUE_POST_MORTEM_COMPLETION_STATUSES = [
   "valid_done",
@@ -128,7 +128,7 @@ export interface IssuePostMortemActiveContext {
 export interface IssuePostMortemServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
-  writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
+  writebackOutbox: Pick<WritebackOutboxStore, "enqueueOnce">;
   runStore?: Pick<RunTranscriptStore, "appendEvent">;
 }
 

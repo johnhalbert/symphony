@@ -7,7 +7,7 @@ import {
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
-import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
+import { SqliteWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
 import { SymphonyError } from "../errors.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
 
@@ -44,13 +44,15 @@ export async function submitMergeConflictResolutionFromMcp(input: unknown, optio
   }
 
   const loader = new WorkflowLoader(options.workflowPath);
+  let writebackOutbox: SqliteWritebackOutboxStore | null = null;
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
+    writebackOutbox = new SqliteWritebackOutboxStore(config.workspace.stateDir);
     const service = new MergeConflictResolutionService({
       config,
       lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
-      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      writebackOutbox,
     });
     const context: MergeConflictResolutionActiveContext = {
       issue: loadedContext.issue,
@@ -77,6 +79,7 @@ export async function submitMergeConflictResolutionFromMcp(input: unknown, optio
       writebackOperationKeys: result.writebackOperations.map((operation) => operation.idempotencyKey),
     };
   } finally {
+    await writebackOutbox?.close();
     await loader.close();
   }
 }

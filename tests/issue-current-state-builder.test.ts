@@ -177,6 +177,7 @@ describe("IssueCurrentStateBuilder", () => {
       claimed: true,
       paused: true,
       retrying: true,
+      retryDueAt: "2026-01-01T00:00:06.000Z",
     });
 
     expect(current).toMatchObject({
@@ -215,6 +216,7 @@ describe("IssueCurrentStateBuilder", () => {
       claimed: true,
       paused: true,
       retrying: true,
+      runtimeRetryDueAt: "2026-01-01T00:00:06.000Z",
       consecutiveSdkErrorFailures: 2,
     });
     expect(current.planningRetryDueAt).toBe("2026-01-01T00:00:05.000Z");
@@ -1520,6 +1522,162 @@ describe("IssueCurrentStateBuilder", () => {
     }
   });
 
+  it("rebuilds active runtime control fields from durable runtime evidence", async () => {
+    const config = builderConfig(root);
+    const stateStore = new MemoryIssueStateStore();
+    const issue = issueFixture();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore: undefined,
+      runStore: undefined,
+      issueStateStore: stateStore,
+      logger: silentLogger(),
+    });
+    const baseCurrent = await storeBuilder.build(issue, emptyRuntime());
+    stateStore.record = {
+      ...baseCurrent,
+      history: [
+        runtimeEvidenceSnapshot(baseCurrent, {
+          historySnapshotId: "issue-history:runtime-running",
+          eventType: "running_entry_created",
+          running: true,
+          role: "worker",
+          runPhase: "implementation",
+          runId: "run-runtime",
+          manualDispatchStage: "worker",
+          manualIgnoreState: true,
+        }),
+        runtimeEvidenceSnapshot(baseCurrent, {
+          historySnapshotId: "issue-history:runtime-claim",
+          eventType: "claim_acquired",
+          claimed: true,
+        }),
+        runtimeEvidenceSnapshot(baseCurrent, {
+          historySnapshotId: "issue-history:runtime-pause",
+          eventType: "pause_requested",
+          paused: true,
+        }),
+        runtimeEvidenceSnapshot(baseCurrent, {
+          historySnapshotId: "issue-history:runtime-cancel",
+          eventType: "cancellation_requested",
+          cancellationRequestedAt: "2026-01-01T00:00:05.000Z",
+        }),
+        runtimeEvidenceSnapshot(baseCurrent, {
+          historySnapshotId: "issue-history:runtime-retry",
+          eventType: "retry_scheduled",
+          retrying: true,
+          attempt: 2,
+          delayMs: 1000,
+          dueAt: "2026-01-01T00:00:06.000Z",
+          error: "temporary failure",
+        }),
+      ],
+    };
+    const historyBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore: undefined,
+      runStore: undefined,
+      issueStateStore: stateStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["runtimeControl"],
+    });
+
+    const current = await historyBuilder.build(issue, emptyRuntime());
+    const rebuilt = await historyBuilder.rebuildHistoryBackedFields(
+      issue,
+      emptyRuntime(),
+      ["runtimeControl"],
+    );
+
+    expect(current).toMatchObject({
+      running: true,
+      runningRole: "worker",
+      runningRunPhase: "implementation",
+      runningRunKind: "implementation",
+      runningManualDispatchStage: "worker",
+      runningManualIgnoreState: true,
+      runningCancellationRequested: true,
+      claimed: true,
+      paused: true,
+      retrying: true,
+    });
+    expectHistoryRebuildMatchesCurrent(current, rebuilt);
+  });
+
+  it("rebuilds cleared runtime control fields from release evidence", async () => {
+    const config = builderConfig(root);
+    const stateStore = new MemoryIssueStateStore();
+    const issue = issueFixture();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore: undefined,
+      runStore: undefined,
+      issueStateStore: stateStore,
+      logger: silentLogger(),
+    });
+    const baseCurrent = await storeBuilder.build(issue, emptyRuntime());
+    stateStore.record = {
+      ...baseCurrent,
+      history: [
+        runtimeEvidenceSnapshot(baseCurrent, {
+          historySnapshotId: "issue-history:runtime-running",
+          eventType: "running_entry_created",
+          running: true,
+          role: "worker",
+          runPhase: "implementation",
+        }),
+        runtimeEvidenceSnapshot(baseCurrent, {
+          historySnapshotId: "issue-history:runtime-claim",
+          eventType: "claim_acquired",
+          claimed: true,
+        }),
+        runtimeEvidenceSnapshot(baseCurrent, {
+          historySnapshotId: "issue-history:runtime-retry",
+          eventType: "retry_scheduled",
+          retrying: true,
+        }),
+        runtimeEvidenceSnapshot(baseCurrent, {
+          historySnapshotId: "issue-history:runtime-release",
+          eventType: "running_entry_released",
+          running: false,
+          claimed: false,
+        }),
+        runtimeEvidenceSnapshot(baseCurrent, {
+          historySnapshotId: "issue-history:runtime-retry-cleared",
+          eventType: "retry_cleared",
+          retrying: false,
+        }),
+      ],
+    };
+    const historyBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore: undefined,
+      runStore: undefined,
+      issueStateStore: stateStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["runtimeControl"],
+    });
+
+    const current = await historyBuilder.build(issue, emptyRuntime());
+    const rebuilt = await historyBuilder.rebuildHistoryBackedFields(
+      issue,
+      emptyRuntime(),
+      ["runtimeControl"],
+    );
+
+    expect(current).toMatchObject({
+      running: false,
+      runningRole: null,
+      runningRunPhase: null,
+      runningRunKind: null,
+      runningCancellationRequested: false,
+      claimed: false,
+      retrying: false,
+      runtimeRetryDueAt: null,
+    });
+    expectHistoryRebuildMatchesCurrent(current, rebuilt);
+  });
+
   it("rebuilds history-backed fields for planned timeline scenarios", async () => {
     const scenarios: Array<{
       name: string;
@@ -2413,6 +2571,84 @@ function lifecycleEvidenceSnapshot(
     lifecycleReviewFeedback: lifecycle.reviewFeedback,
     lifecycleSummaryCiStatus: lifecycle.summaryPointers.ciStatus,
     lifecycleSummaryPointers: lifecycle.summaryPointers,
+  };
+}
+
+function runtimeEvidenceSnapshot(
+  current: IssueCurrentFields,
+  input: {
+    historySnapshotId: string;
+    eventType: string;
+    running?: boolean | null;
+    role?: AgentRunRole | null;
+    runPhase?: AgentRunPhase | null;
+    runId?: string | null;
+    activeRunId?: string | null;
+    manualDispatchStage?: string | null;
+    manualIgnoreState?: boolean | null;
+    cancellationRequestedAt?: string | null;
+    claimed?: boolean | null;
+    paused?: boolean | null;
+    retrying?: boolean | null;
+    attempt?: number | null;
+    delayMs?: number | null;
+    dueAt?: string | null;
+    error?: string | null;
+  },
+): IssueHistorySnapshot {
+  const at = "2026-01-01T00:00:05.000Z";
+  const runKind =
+    input.runPhase === undefined || input.runPhase === null
+      ? null
+      : runKindForPhase(input.runPhase);
+  return {
+    ...current,
+    snapshotId: `issue-snapshot:${input.historySnapshotId}`,
+    snapshotAt: at,
+    triggerType: "orchestrator.tick",
+    triggerId: `orchestrator.tick:${input.historySnapshotId}`,
+    triggerAt: at,
+    triggerSource: "orchestrator",
+    candidateSource: `evidence.runtime.${input.eventType}`,
+    transitionRequestContext: null,
+    availableSlots: 1,
+    providerDispatchGateActive: false,
+    stateSlotAvailable: true,
+    allowExistingClaim: false,
+    manualStage: null,
+    manualForceLabels: false,
+    manualIgnoreState: false,
+    snapshotKind: "evidence",
+    historySnapshotId: input.historySnapshotId,
+    transitionKind: "record_evidence",
+    transitionId: `transition:record_evidence:${input.historySnapshotId}`,
+    rulesetId: "orchestrator.evidence.runtime",
+    rulesetVersion: "test",
+    rulesetFingerprint: "orchestrator.evidence.runtime@test:900",
+    rulesetPriority: 900,
+    reason: input.eventType,
+    actions: [],
+    errors: [],
+    evidenceKind: "runtime",
+    evidenceEventType: input.eventType,
+    evidenceSourceId: input.runId ?? current.issueId,
+    evidencePayload: null,
+    runtimeRunning: input.running ?? null,
+    runtimeRole: input.role ?? null,
+    runtimeRunPhase: input.runPhase ?? null,
+    runtimeRunKind: runKind,
+    runtimeRunId: input.runId ?? null,
+    runtimeActiveRunId: input.activeRunId ?? null,
+    runtimeManualDispatchStage: input.manualDispatchStage ?? null,
+    runtimeManualIgnoreState: input.manualIgnoreState ?? null,
+    runtimeCancellationRequestedAt: input.cancellationRequestedAt ?? null,
+    runtimeClaimed: input.claimed ?? null,
+    runtimePaused: input.paused ?? null,
+    runtimeRetrying: input.retrying ?? null,
+    retryAttempt: input.attempt ?? null,
+    retryDelayMs: input.delayMs ?? null,
+    retryError: input.error ?? null,
+    retryDueAt: input.dueAt ?? null,
   };
 }
 

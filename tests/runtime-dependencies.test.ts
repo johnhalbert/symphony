@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -61,14 +61,19 @@ describe("runtime dependency credential wiring", () => {
       },
     );
 
-    await processor?.enqueueAndProcess({
-      kind: "transition",
-      idempotencyKey: "transition:issue-1:Done",
-      issueId: "issue-1",
-      payload: { toState: "Done", fromStates: ["Ready to Merge"] },
-    });
+    try {
+      await processor?.enqueueAndProcess({
+        kind: "transition",
+        idempotencyKey: "transition:issue-1:Done",
+        issueId: "issue-1",
+        payload: { toState: "Done", fromStates: ["Ready to Merge"] },
+      });
 
-    expect(authorizations).toEqual(["linear-writeback-secret", "linear-writeback-secret"]);
+      await access(path.join(config.workspace.stateDir, "writeback.sqlite"));
+      expect(authorizations).toEqual(["linear-writeback-secret", "linear-writeback-secret"]);
+    } finally {
+      await processor?.close();
+    }
   });
 
   it("rejects wrong-role-only service writeback assignments in runtime writeback construction", () => {

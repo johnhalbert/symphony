@@ -39,7 +39,7 @@ import {
   PostgresRunActivityAppendStore,
   type PostgresRunActivityAppendClient,
 } from "./core/persistence/RunActivityAppendStore.js";
-import { FileWritebackOutboxStore } from "./core/writeback/WritebackOutbox.js";
+import { SqliteWritebackOutboxStore } from "./core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "./core/workspace/WorkspaceManager.js";
 import {
   loadWorkflowEnvironment,
@@ -315,6 +315,7 @@ agentCommand
       }
     } finally {
       await orchestrator.stop();
+      await writeback?.close();
       await loader.close();
       await harness.dispose?.();
     }
@@ -417,7 +418,7 @@ issueCommand
       const tracker = createRuntimeTrackerClient(config);
       const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
       const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-      const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+      const writebackOutbox = new SqliteWritebackOutboxStore(config.workspace.stateDir);
       const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
       const workspaceManager = new WorkspaceManager({
         workspace: config.workspace,
@@ -462,6 +463,7 @@ issueCommand
         if (!result.found) process.exitCode = 2;
       } finally {
         await orchestrator.stop();
+        await writebackOutbox.close();
         await loader.close();
         await harness.dispose?.();
       }
@@ -596,12 +598,15 @@ program
     const orchestratorConversationStore = new FileOrchestratorConversationStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const mcpExposureDiagnosticsStore = new FileMcpExposureDiagnosticsStore(config.workspace.stateDir);
-    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writebackOutbox = new SqliteWritebackOutboxStore(config.workspace.stateDir);
     const projectionPersistence =
       config.server.port === null || !config.server.enableStatusServer ? null : await createRuntimeProjectionPersistence(config);
     const operatorApprovalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
     const operatorApproval = new OperatorApprovalService({ config, store: operatorApprovalStore, runStore });
-    const writeback = createRuntimeWritebackProcessor(() => configRef.value, logger);
+    const writeback = createRuntimeWritebackProcessor(() => configRef.value, logger, undefined, {
+      outboxStore: writebackOutbox,
+      lifecycleStore,
+    });
     const statusMutationToken = resolveStatusMutationToken(config);
     let statusServerBaseUrl: string | null = null;
     const workspaceManager = new WorkspaceManager({
@@ -685,6 +690,8 @@ program
     const shutdown = async () => {
       logger.info("symphony shutting down");
       await orchestrator.stop();
+      await writeback?.close();
+      await writebackOutbox.close();
       await statusServer?.stop();
       await projectionPersistence?.close();
       await loader.close();

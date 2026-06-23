@@ -81,7 +81,7 @@ import {
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
   ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
   issueBreakdownPlanIdForOperation,
-  type FileWritebackOutboxStore,
+  type WritebackOutboxStore,
   type WritebackOperation,
 } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
@@ -185,8 +185,8 @@ const LIVE_TRANSCRIPT_TAIL_LIMIT = 500;
 
 export type StatusServerWebProjectionContext = WebProjectionContext<BuiltWebProjectionSourceIndex, Record<string, unknown>>;
 
-type StatusServerWritebackOutbox = Pick<FileWritebackOutboxStore, "list"> &
-  Partial<Pick<FileWritebackOutboxStore, "projectionRevision" | "onProjectionChanged">>;
+type StatusServerWritebackOutbox = Pick<WritebackOutboxStore, "list"> &
+  Partial<StatusServerProjectionRevisionStore>;
 
 interface StatusServerProjectionRevisionStore {
   projectionRevision(): number;
@@ -1167,7 +1167,7 @@ export class StatusServer {
       if (request.method === "POST" && pauseMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(pauseMatch[1] ?? "");
-        this.options.orchestrator.pauseIssue(issueId);
+        await this.options.orchestrator.pauseIssue(issueId);
         sendJson(response, 202, { paused: true, issue: issueId });
         return;
       }
@@ -1176,7 +1176,7 @@ export class StatusServer {
       if (request.method === "POST" && resumeMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(resumeMatch[1] ?? "");
-        this.options.orchestrator.resumeIssue(issueId);
+        await this.options.orchestrator.resumeIssue(issueId);
         sendJson(response, 202, { paused: false, issue: issueId });
         return;
       }
@@ -5235,7 +5235,7 @@ async function buildActivityFeed(input: {
   runs?: readonly RunRecord[];
   lifecycleStore: IssueLifecycleStore | undefined;
   lifecycleRecords?: readonly IssueLifecycleRecord[];
-  writebackOutbox: Pick<FileWritebackOutboxStore, "list"> | undefined;
+  writebackOutbox: Pick<WritebackOutboxStore, "list"> | undefined;
   writebackOperations?: readonly WritebackOperation[];
   query: ActivityQuery;
   includeTranscriptEvents?: boolean;

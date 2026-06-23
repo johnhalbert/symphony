@@ -24,7 +24,7 @@ import type {
   Orchestrator,
 } from "./orchestrator/Orchestrator.js";
 import type { FileOperatorApprovalStore, OperatorApprovalRecord } from "./approval/OperatorApprovalService.js";
-import type { FileWritebackOutboxStore, WritebackOperation } from "./writeback/WritebackOutbox.js";
+import type { WritebackOperation, WritebackOutboxStore } from "./writeback/WritebackOutbox.js";
 
 export const DEFAULT_ISSUE_INSPECTION_STAGES: readonly ManualAgentRunStage[] = [
   "worker",
@@ -272,7 +272,7 @@ export class IssueInspectionService {
       tracker: TrackerClient;
       lifecycleStore: Pick<IssueLifecycleStore, "get">;
       runStore: Pick<RunTranscriptStore, "findWorkspace" | "listRunsForIssue" | "latestRunForIssue">;
-      writebackOutbox?: Pick<FileWritebackOutboxStore, "list">;
+      writebackOutbox?: Pick<WritebackOutboxStore, "list">;
       approvalStore?: Pick<FileOperatorApprovalStore, "findPendingForIssue">;
       orchestrator: Pick<Orchestrator, "inspectManualAgentEligibilityForIssue">;
     },

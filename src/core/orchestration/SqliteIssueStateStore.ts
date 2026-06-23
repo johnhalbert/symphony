@@ -709,6 +709,10 @@ function normalizeIssueCurrentFields(
       typeof record.planningRetryDueAt === "string"
         ? record.planningRetryDueAt
         : null,
+    runtimeRetryDueAt:
+      typeof record.runtimeRetryDueAt === "string"
+        ? record.runtimeRetryDueAt
+        : null,
     issueTriageCurrentTriggerReportIds: Array.isArray(
       record.issueTriageCurrentTriggerReportIds,
     )

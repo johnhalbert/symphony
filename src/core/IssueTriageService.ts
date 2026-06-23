@@ -17,7 +17,7 @@ import { isSupersededLifecycleRecord } from "./persistence/IssueLifecycleStore.j
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 import { planIssueTriageReportWritebacks } from "./writeback/TransitionPolicy.js";
-import type { FileWritebackOutboxStore } from "./writeback/WritebackOutbox.js";
+import type { WritebackOutboxStore } from "./writeback/WritebackOutbox.js";
 
 export const ISSUE_TRIAGE_DISPOSITIONS = [
   "decompose_issue",
@@ -137,7 +137,7 @@ export interface IssueTriageActiveContext {
 export interface IssueTriageServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
-  writebackOutbox: Pick<FileWritebackOutboxStore, "enqueueOnce">;
+  writebackOutbox: Pick<WritebackOutboxStore, "enqueueOnce">;
   runStore?: Pick<RunTranscriptStore, "appendEvent">;
 }
 

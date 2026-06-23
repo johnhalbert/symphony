@@ -12,7 +12,7 @@ import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { Issue, Workspace } from "../types.js";
-import { FileWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
+import { SqliteWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
 
@@ -43,6 +43,7 @@ export async function submitIssueTriageReportFromMcp(
   }
 
   const loader = new WorkflowLoader(options.workflowPath);
+  let writebackOutbox: SqliteWritebackOutboxStore | null = null;
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
@@ -51,10 +52,11 @@ export async function submitIssueTriageReportFromMcp(
     if (!lifecycle) {
       throw new SymphonyError("invalid_request", "Issue triage requires an existing lifecycle record");
     }
+    writebackOutbox = new SqliteWritebackOutboxStore(config.workspace.stateDir);
     const service = new IssueTriageService({
       config,
       lifecycleStore,
-      writebackOutbox: new FileWritebackOutboxStore(config.workspace.stateDir),
+      writebackOutbox,
       runStore: new FileRunTranscriptStore(config.workspace.stateDir),
     });
     const context: IssueTriageActiveContext = {
@@ -79,6 +81,7 @@ export async function submitIssueTriageReportFromMcp(
       })),
     };
   } finally {
+    await writebackOutbox?.close();
     await loader.close();
   }
 }
