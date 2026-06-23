@@ -119,6 +119,29 @@ export type IssueCurrentStateHistoryFieldGroup =
   | "lifecyclePostMortem"
   | "mergePolicyCompletionRun";
 
+export const HISTORY_BACKED_FIELD_GROUPS: readonly IssueCurrentStateHistoryFieldGroup[] =
+  [
+    "tracker",
+    "runSummary",
+    "mergePolicyCompletionRun",
+    "lifecycleCore",
+    "lifecycleReports",
+    "lifecyclePublication",
+    "lifecycleMergePolicy",
+    "lifecycleBreakdown",
+    "lifecycleTriage",
+    "lifecyclePostMortem",
+  ];
+
+export interface IssueCurrentStateHistoryRebuildResult {
+  fields: Partial<IssueCurrentFields>;
+  incompleteGroups: IssueCurrentStateHistoryFieldGroup[];
+  sourceSnapshotIds: string[];
+  sourceSnapshotIdsByGroup: Partial<
+    Record<IssueCurrentStateHistoryFieldGroup, string[]>
+  >;
+}
+
 type IssueBreakdownPlan = IssueLifecycleRecord["issueBreakdownPlans"][number];
 type IssueTriageReport = IssueLifecycleRecord["issueTriageReports"][number];
 type IssuePostMortemReport = IssueLifecycleRecord["postMortemReports"][number];
@@ -430,6 +453,16 @@ export class IssueCurrentStateBuilder {
     const historyBuilt = this.buildFromHistory(context);
     this.compareHistoryBackedFields(storeBuilt, historyBuilt);
     return this.applyHistoryBackedFields(storeBuilt, historyBuilt);
+  }
+
+  async rebuildHistoryBackedFields(
+    issue: Issue,
+    runtime: IssueCurrentStateRuntimeState,
+    groups: readonly IssueCurrentStateHistoryFieldGroup[] = HISTORY_BACKED_FIELD_GROUPS,
+  ): Promise<IssueCurrentStateHistoryRebuildResult> {
+    const context = await this.loadBuildContext(issue, runtime);
+    const historyBuilt = this.buildFromHistory(context);
+    return selectHistoryBackedGroups(historyBuilt, groups);
   }
 
   private buildFromStores(
@@ -1820,6 +1853,36 @@ function latestTrackerObservationSnapshot(
     }
   }
   return null;
+}
+
+function selectHistoryBackedGroups(
+  historyBuilt: HistoryBackedGroupResult,
+  groups: readonly IssueCurrentStateHistoryFieldGroup[],
+): IssueCurrentStateHistoryRebuildResult {
+  const fields: Partial<IssueCurrentFields> = {};
+  const incompleteGroups: IssueCurrentStateHistoryFieldGroup[] = [];
+  const sourceSnapshotIds: string[] = [];
+  const sourceSnapshotIdsByGroup: Partial<
+    Record<IssueCurrentStateHistoryFieldGroup, string[]>
+  > = {};
+  for (const group of groups) {
+    const groupSourceSnapshotIds =
+      historyBuilt.sourceSnapshotIdsByGroup[group] ?? [];
+    sourceSnapshotIdsByGroup[group] = groupSourceSnapshotIds;
+    sourceSnapshotIds.push(...groupSourceSnapshotIds);
+    const groupFields = historyBuilt.fields[group];
+    if (groupFields === undefined) {
+      incompleteGroups.push(group);
+      continue;
+    }
+    Object.assign(fields, groupFields);
+  }
+  return {
+    fields,
+    incompleteGroups,
+    sourceSnapshotIds: [...new Set(sourceSnapshotIds)],
+    sourceSnapshotIdsByGroup,
+  };
 }
 
 function latestLifecycleMutationSnapshot(

@@ -101,6 +101,7 @@ import {
 } from "../persistence/ProviderGateStore.js";
 import { SqliteIssueStateStore } from "../orchestration/SqliteIssueStateStore.js";
 import {
+  HISTORY_BACKED_FIELD_GROUPS,
   IssueCurrentStateBuilder,
   type IssueCurrentStateRuntimeState,
 } from "../orchestration/IssueCurrentStateBuilder.js";
@@ -951,18 +952,7 @@ export class Orchestrator {
       runStore: options.runStore,
       issueStateStore: this.issueStateStore,
       logger: options.logger,
-      historyBackedFieldGroups: [
-        "tracker",
-        "runSummary",
-        "lifecycleCore",
-        "lifecycleReports",
-        "lifecyclePublication",
-        "lifecycleMergePolicy",
-        "lifecycleBreakdown",
-        "lifecycleTriage",
-        "lifecyclePostMortem",
-        "mergePolicyCompletionRun",
-      ],
+      historyBackedFieldGroups: HISTORY_BACKED_FIELD_GROUPS,
     });
     this.transitionRulesets = this.createTransitionRulesets();
     this.transitionEngine = new IssueOrchestrationEngine(

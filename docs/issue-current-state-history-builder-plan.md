@@ -2,12 +2,12 @@
 
 Date: 2026-06-23
 
-Status: In progress. Phases 0-3 are implemented; tracker, run-summary,
+Status: complete for durable decision-state fields. Tracker, run-summary,
 lifecycle-core, lifecycle-report, lifecycle publication-approval, lifecycle
 merge-policy, lifecycle breakdown, lifecycle triage, lifecycle post-mortem, and
 merge-policy completion-run history capture plus history-backed current-state
-building are implemented. Remaining history authority work is staged by field
-group.
+building are implemented. Runtime-local fields and generic writeback operation
+details remain intentionally outside `IssueCurrentFields`.
 
 This planning record captures the intended path from the current store-backed
 builder to a history-backed current-state builder. It is not a Spec Kit artifact
@@ -44,12 +44,12 @@ succeeded, skipped, and failed action records, plus runtime/domain errors.
 ## Current Gaps
 
 - `SqliteIssueStateStore` stores `current_json` and separate history rows.
-- `current_json` is now documented as cached current state. Most durable
+- `current_json` is documented and tested as cached current state. Durable
   decision-state field groups can be rebuilt from typed history when fresh
-  enough evidence is available; remaining gaps are limited to runtime-local
-  fields and broader timeline coverage.
-- Issue history is useful for audit but is not yet complete enough to rebuild
-  all current fields.
+  enough evidence is available; remaining gaps are intentional runtime-local
+  fields and action/outbox-owned operational details.
+- Issue history is complete enough to rebuild the durable field groups listed in
+  `HISTORY_BACKED_FIELD_GROUPS`.
 - Some runtime facts still exist only in in-memory runtime maps because they are
   intentionally process-local.
 - Some non-current-state operational facts, such as detailed writeback operation
@@ -257,11 +257,18 @@ Acceptance:
   from history.
 - Implemented: configured history-backed field groups emit fallback warnings
   when candidate history snapshots exist but fail freshness/completeness checks.
-- Partially implemented: parity coverage exists for tracker, run-summary,
+- Implemented: parity coverage exists for tracker, run-summary,
   merge-policy-completion-run, lifecycle-core, lifecycle-report,
   lifecycle-publication, lifecycle-merge-policy, lifecycle-breakdown,
-  lifecycle-triage, and lifecycle-post-mortem fields. The larger timeline
-  matrix still needs expansion beyond focused field-group tests.
+  lifecycle-triage, and lifecycle-post-mortem fields, including the planned
+  timeline scenarios for worker completion, reviewer pass/fail, rejected
+  completion, issue triage rebound, merge completion, merge conflict repair,
+  publication approval rejection recovery, and retry scheduling.
+- Implemented: `IssueCurrentStateBuilder.rebuildHistoryBackedFields(...)`
+  rebuilds flattened history-backed fields with completeness and source-snapshot
+  metadata.
+- Implemented: cache-bypass coverage verifies stale `current_json` does not
+  drive history-backed fields when typed history is complete.
 - Intentionally not history-backed: runtime-local fields for active in-memory
   running, claimed, paused, retrying, provider gate, slot availability, and
   manual trigger flags. These remain snapshot-local/process-local inputs unless
@@ -272,11 +279,7 @@ Acceptance:
 
 ## Review Questions
 
-- Which field groups should be history-backed first after tracker/run basics?
 - Are any runtime-local facts currently listed above expected to become durable
   transition inputs?
-- Should typed history variants be represented as TypeScript discriminated
-  unions immediately, or introduced first through normalized top-level fields
-  with compatibility tests?
 - What mismatch reporting format should parity tests use for the dashboard or
   logs, if any?

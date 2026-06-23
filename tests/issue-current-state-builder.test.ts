@@ -11,9 +11,12 @@ import {
   type ServiceConfig,
 } from "../src/core/config/Config.js";
 import {
+  HISTORY_BACKED_FIELD_GROUPS,
   IssueCurrentStateBuilder,
+  type IssueCurrentStateHistoryRebuildResult,
   type IssueCurrentStateRuntimeState,
 } from "../src/core/orchestration/IssueCurrentStateBuilder.js";
+import { SqliteIssueStateStore } from "../src/core/orchestration/SqliteIssueStateStore.js";
 import {
   transitionAction,
   type IssueCurrentFields,
@@ -26,7 +29,15 @@ import {
   type IssueLifecycleRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
-import type { Issue, TokenCounts } from "../src/core/types.js";
+import { issueTriageTriggerFingerprint } from "../src/core/IssueTriageService.js";
+import {
+  runKindForPhase,
+  type AgentRunKind,
+  type AgentRunPhase,
+  type AgentRunRole,
+  type Issue,
+  type TokenCounts,
+} from "../src/core/types.js";
 
 describe("IssueCurrentStateBuilder", () => {
   let root: string;
@@ -1416,6 +1427,579 @@ describe("IssueCurrentStateBuilder", () => {
       postMortemCurrentTriggerReportIds: ["post-mortem-1"],
     });
   });
+
+  it("rebuilds history-backed fields from issue history when cached current state is stale", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture({
+      state: "Ready to Merge",
+      updatedAt: "2026-01-01T00:00:10.000Z",
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const runStore = new FileRunTranscriptStore(root);
+    const completionReport = {
+      id: "completion-cache-1",
+      idempotencyKey: "completion-cache-1",
+      runId: "run-cache-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      summary: "Done",
+      validationEvidence: ["validated"],
+      acceptanceChecklist: [],
+      changedFiles: ["src/cache.ts"],
+      branchName: "feature/cache",
+      pullRequest: null,
+      risks: [],
+      acceptedAt: "2026-01-01T00:00:03.000Z",
+      writebackOperationKeys: [],
+    };
+    const lifecycle = await lifecycleStore.ensureIssue(issue, {
+      phase: "passed",
+      lastCompletionReportId: completionReport.id,
+      completionReports: [completionReport],
+    });
+    await startStoredRun(runStore, issue, {
+      runId: "run-cache-1",
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:04.000Z",
+      gitBranchName: "feature/cache",
+    });
+    const stateStore = new SqliteIssueStateStore(root);
+    try {
+      const storeBuilder = new IssueCurrentStateBuilder({
+        config,
+        lifecycleStore,
+        runStore,
+        issueStateStore: stateStore,
+        logger: silentLogger(),
+      });
+      const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+      await stateStore.ensureIssue(storeCurrent);
+      for (const snapshot of [
+        trackerEvidenceSnapshot(storeCurrent, issue),
+        lifecycleEvidenceSnapshot(storeCurrent, lifecycle),
+        ...runEvidenceSnapshots(storeCurrent, {
+          runId: "run-cache-1",
+          status: "succeeded",
+          completedAt: "2026-01-01T00:00:04.000Z",
+          gitBranchName: "feature/cache",
+        }),
+      ]) {
+        await stateStore.appendSnapshot(issue, snapshot);
+      }
+      await stateStore.updateCurrent(issue, {
+        title: "stale cached title",
+        phase: "blocked",
+        latestRunStatus: "failed",
+        latestCompletionReport: null,
+        mergePolicyLatestCompletionReport: null,
+      });
+      const historyBuilder = new IssueCurrentStateBuilder({
+        config,
+        lifecycleStore,
+        runStore,
+        issueStateStore: stateStore,
+        logger: silentLogger(),
+        historyBackedFieldGroups: HISTORY_BACKED_FIELD_GROUPS,
+      });
+
+      const current = await historyBuilder.build(issue, emptyRuntime());
+      const rebuilt = await historyBuilder.rebuildHistoryBackedFields(
+        issue,
+        emptyRuntime(),
+      );
+
+      expect(current.title).toBe("Implement builder");
+      expect(current.phase).toBe("passed");
+      expect(current.latestRunStatus).toBe("succeeded");
+      expect(current.latestCompletionReport).toMatchObject({
+        id: "completion-cache-1",
+      });
+      expectHistoryRebuildMatchesCurrent(current, rebuilt);
+    } finally {
+      await stateStore.close();
+    }
+  });
+
+  it("rebuilds history-backed fields for planned timeline scenarios", async () => {
+    const scenarios: Array<{
+      name: string;
+      issue: Issue;
+      runs: StoredRunInput[];
+      arrangeLifecycle: (input: {
+        issue: Issue;
+        lifecycleStore: FileIssueLifecycleStore;
+      }) => Promise<IssueLifecycleRecord>;
+      assertCurrent: (current: IssueCurrentFields) => void;
+    }> = [
+      {
+        name: "normal worker dispatch and completion",
+        issue: issueFixture({
+          id: "issue-worker-complete",
+          identifier: "TEST-WORKER",
+          state: "In Review",
+        }),
+        runs: [
+          {
+            runId: "worker-complete-run",
+            status: "succeeded",
+            completedAt: "2026-01-01T00:00:04.000Z",
+          },
+        ],
+        arrangeLifecycle: async ({ issue, lifecycleStore }) => {
+          const report = completionReportFixture(issue, "worker-complete-run", {
+            id: "completion-worker-complete",
+            summary: "Worker completed the issue",
+          });
+          return lifecycleStore.ensureIssue(issue, {
+            phase: "review",
+            lastCompletionReportId: report.id,
+            completionReports: [report],
+          });
+        },
+        assertCurrent: (current) => {
+          expect(current.phase).toBe("review");
+          expect(current.latestRunId).toBe("worker-complete-run");
+          expect(current.latestCompletionReport).toMatchObject({
+            id: "completion-worker-complete",
+          });
+        },
+      },
+      {
+        name: "reviewer pass",
+        issue: issueFixture({
+          id: "issue-review-pass",
+          identifier: "TEST-REVIEW-PASS",
+          state: "Ready to Merge",
+        }),
+        runs: [
+          {
+            runId: "worker-reviewed-run",
+            status: "succeeded",
+            completedAt: "2026-01-01T00:00:04.000Z",
+          },
+          {
+            runId: "review-pass-run",
+            role: "reviewer",
+            runPhase: "review",
+            status: "succeeded",
+            completedAt: "2026-01-01T00:00:05.000Z",
+          },
+        ],
+        arrangeLifecycle: async ({ issue, lifecycleStore }) => {
+          const report = completionReportFixture(issue, "worker-reviewed-run", {
+            id: "completion-review-pass",
+          });
+          const verdict = reviewVerdictFixture(issue, "review-pass-run", {
+            id: "verdict-review-pass",
+            verdict: "pass",
+          });
+          return lifecycleStore.ensureIssue(issue, {
+            phase: "passed",
+            lastCompletionReportId: report.id,
+            lastReviewVerdictId: verdict.id,
+            completionReports: [report],
+            reviewVerdicts: [verdict],
+          });
+        },
+        assertCurrent: (current) => {
+          expect(current.phase).toBe("passed");
+          expect(current.latestRunId).toBe("review-pass-run");
+          expect(current.latestApprovalPassVerdict).toMatchObject({
+            id: "verdict-review-pass",
+          });
+        },
+      },
+      {
+        name: "reviewer fail",
+        issue: issueFixture({
+          id: "issue-review-fail",
+          identifier: "TEST-REVIEW-FAIL",
+          state: "Todo",
+        }),
+        runs: [
+          {
+            runId: "worker-failed-review-run",
+            status: "succeeded",
+            completedAt: "2026-01-01T00:00:04.000Z",
+          },
+          {
+            runId: "review-fail-run",
+            role: "reviewer",
+            runPhase: "review",
+            status: "succeeded",
+            completedAt: "2026-01-01T00:00:05.000Z",
+          },
+        ],
+        arrangeLifecycle: async ({ issue, lifecycleStore }) => {
+          const report = completionReportFixture(
+            issue,
+            "worker-failed-review-run",
+            { id: "completion-review-fail" },
+          );
+          const verdict = reviewVerdictFixture(issue, "review-fail-run", {
+            id: "verdict-review-fail",
+            verdict: "fail",
+            findings: ["Missing validation"],
+          });
+          return lifecycleStore.ensureIssue(issue, {
+            phase: "implementation",
+            reviewRound: 1,
+            lastCompletionReportId: report.id,
+            lastReviewVerdictId: verdict.id,
+            completionReports: [report],
+            reviewVerdicts: [verdict],
+          });
+        },
+        assertCurrent: (current) => {
+          expect(current.phase).toBe("implementation");
+          expect(current.reviewRound).toBe(1);
+          expect(current.latestApprovalPassVerdict).toBeNull();
+          expect(current.lastReviewVerdictId).toBe("verdict-review-fail");
+        },
+      },
+      {
+        name: "rejected completion report",
+        issue: issueFixture({
+          id: "issue-rejected-completion",
+          identifier: "TEST-REJECTED",
+          state: "Todo",
+        }),
+        runs: [
+          {
+            runId: "worker-rejected-run",
+            status: "succeeded",
+            completedAt: "2026-01-01T00:00:04.000Z",
+          },
+        ],
+        arrangeLifecycle: async ({ issue, lifecycleStore }) => {
+          const rejection = {
+            id: "completion-rejection-1",
+            idempotencyKey: "completion-rejection-1",
+            reportId: "completion-report-rejected-1",
+            runId: "worker-rejected-run",
+            issueId: issue.id,
+            issueIdentifier: issue.identifier,
+            reasonCode: "unsatisfied_acceptance_checklist" as const,
+            reason: "missing_required_items",
+            summary: "Substantially incomplete",
+            validationEvidence: [],
+            acceptanceChecklist: [],
+            changedFiles: [],
+            branchName: null,
+            pullRequest: null,
+            risks: [],
+            rejectedAt: "2026-01-01T00:00:05.000Z",
+            writebackOperationKeys: [],
+          };
+          return lifecycleStore.ensureIssue(issue, {
+            phase: "implementation",
+            incompleteTurnCount: 1,
+            lastCompletionReportRejectionId: rejection.id,
+            completionReportRejections: [rejection],
+          });
+        },
+        assertCurrent: (current) => {
+          expect(current.phase).toBe("implementation");
+          expect(current.incompleteTurnCount).toBe(1);
+          expect(current.lastCompletionReportRejectionId).toBe(
+            "completion-rejection-1",
+          );
+          expect(current.latestCompletionReport).toBeNull();
+        },
+      },
+      {
+        name: "issue triage blocked rebound",
+        issue: issueFixture({
+          id: "issue-triage-rebound",
+          identifier: "TEST-TRIAGE",
+          state: "Blocked",
+        }),
+        runs: [
+          {
+            runId: "triage-rebound-run",
+            role: "triage",
+            runPhase: "issue_triage",
+            status: "succeeded",
+            completedAt: "2026-01-01T00:00:04.000Z",
+          },
+        ],
+        arrangeLifecycle: async ({ issue, lifecycleStore }) => {
+          const base = await lifecycleStore.ensureIssue(issue, {
+            phase: "blocked",
+            blockedReason: "max incomplete turns reached",
+            incompleteTurnCount: 3,
+          });
+          const fingerprint = issueTriageTriggerFingerprint(base);
+          const report = {
+            id: "triage-rebound-report",
+            idempotencyKey: "triage-rebound-report",
+            requestHash: "triage-rebound-hash",
+            runId: "triage-rebound-run",
+            issueId: issue.id,
+            issueIdentifier: issue.identifier,
+            triggerFingerprint: fingerprint,
+            disposition: "implementation_repair" as const,
+            confidence: "high" as const,
+            summary: "Worker should repair",
+            evidence: ["Triage evidence"],
+            recommendedAction: "Run worker repair",
+            blockers: [
+              {
+                kind: "implementation_unsatisfied_requirements" as const,
+                status: "active" as const,
+                nextActor: "worker" as const,
+                confidence: "high" as const,
+                summary: "Missing requirement",
+                evidence: ["Requirement missing"],
+                recommendedAction: "Implement requirement",
+              },
+            ],
+            submittedAt: "2026-01-01T00:00:05.000Z",
+            writebackOperationKeys: [],
+          };
+          return lifecycleStore.updateIssue(issue, {
+            lastIssueTriageReportId: report.id,
+            issueTriageReports: [report],
+          });
+        },
+        assertCurrent: (current) => {
+          expect(current.lastIssueTriageReportId).toBe("triage-rebound-report");
+          expect(current.latestIssueTriageReportBlockers).toMatchObject([
+            { summary: "Missing requirement", nextActor: "worker" },
+          ]);
+        },
+      },
+      {
+        name: "merge policy pass to done",
+        issue: issueFixture({
+          id: "issue-merge-done",
+          identifier: "TEST-MERGE",
+          state: "Done",
+        }),
+        runs: [
+          {
+            runId: "merge-worker-run",
+            status: "succeeded",
+            completedAt: "2026-01-01T00:00:04.000Z",
+          },
+        ],
+        arrangeLifecycle: async ({ issue, lifecycleStore }) => {
+          const pullRequest = pullRequestFixture();
+          const report = completionReportFixture(issue, "merge-worker-run", {
+            id: "completion-merge-done",
+            pullRequest,
+          });
+          return lifecycleStore.ensureIssue(issue, {
+            phase: "terminal",
+            lastCompletionReportId: report.id,
+            completionReports: [report],
+            merge: {
+              id: "merge-done-1",
+              pullRequest,
+              headSha: "abc123",
+              mergeCommitSha: "merge-sha-1",
+              mergedAt: "2026-01-01T00:00:06.000Z",
+              mergedBy: {
+                login: null,
+                profile: null,
+                capability: "github.merge",
+              },
+              checkStatus: {
+                requiredChecks: ["ci/test"],
+                passedChecks: ["ci/test"],
+                noCiEvidence: null,
+              },
+              mergeOperationKey: "merge-op-1",
+              doneTransitionOperationKey: "done-op-1",
+            },
+          });
+        },
+        assertCurrent: (current) => {
+          expect(current.phase).toBe("terminal");
+          expect(current.mergePolicyMerge).toMatchObject({
+            mergeCommitSha: "merge-sha-1",
+          });
+        },
+      },
+      {
+        name: "merge conflict repair",
+        issue: issueFixture({
+          id: "issue-merge-conflict",
+          identifier: "TEST-CONFLICT",
+          state: "Merge Conflict",
+        }),
+        runs: [
+          {
+            runId: "merge-conflict-run",
+            runPhase: "merge_conflict_resolution",
+            status: "succeeded",
+            completedAt: "2026-01-01T00:00:04.000Z",
+          },
+        ],
+        arrangeLifecycle: async ({ issue, lifecycleStore }) => {
+          return lifecycleStore.ensureIssue(issue, {
+            phase: "merge_conflict_resolution",
+            mergeConflict: {
+              id: "merge-conflict-1",
+              status: "open",
+              resolutionStatus: "still_conflicted",
+              pullRequest: pullRequestFixture(),
+              approvedHeadSha: "abc123",
+              currentHeadSha: "def456",
+              resolvedHeadSha: null,
+              baseBranch: "main",
+              baseHeadSha: "base123",
+              sourceState: "Ready to Merge",
+              conflictsState: "Merge Conflict",
+              reason: "merge conflicts",
+              mergeableState: "dirty",
+              servicePreparation: null,
+              detectedAt: "2026-01-01T00:00:03.000Z",
+              updatedAt: "2026-01-01T00:00:04.000Z",
+              fixTurnCount: 1,
+              maxFixTurns: 3,
+              lastConflictFixRunId: "merge-conflict-run",
+              lastConflictResolutionReportId: "merge-conflict-report-1",
+              attemptRunIds: ["merge-conflict-run"],
+              writebackOperationKeys: [],
+              blockedAt: null,
+              blockedReason: null,
+            },
+          });
+        },
+        assertCurrent: (current) => {
+          expect(current.phase).toBe("merge_conflict_resolution");
+          expect(current.mergePolicyMergeConflict).toMatchObject({
+            id: "merge-conflict-1",
+            lastConflictFixRunId: "merge-conflict-run",
+          });
+        },
+      },
+      {
+        name: "publication approval rejection recovery",
+        issue: issueFixture({
+          id: "issue-publication-rejected",
+          identifier: "TEST-PUBLICATION",
+          state: "Blocked",
+        }),
+        runs: [
+          {
+            runId: "publication-run",
+            status: "succeeded",
+            completedAt: "2026-01-01T00:00:04.000Z",
+          },
+        ],
+        arrangeLifecycle: async ({ issue, lifecycleStore }) => {
+          return lifecycleStore.ensureIssue(issue, {
+            phase: "blocked",
+            blockedReason: "publication approval rejected",
+            lastCompletionReportRejectionId: "publication-rejection-1",
+          });
+        },
+        assertCurrent: (current) => {
+          expect(current.blockedReason).toBe("publication approval rejected");
+          expect(current.pendingPublicationApprovalRunId).toBeNull();
+          expect(current.lastCompletionReportRejectionId).toBe(
+            "publication-rejection-1",
+          );
+        },
+      },
+      {
+        name: "retry scheduling and firing",
+        issue: issueFixture({
+          id: "issue-retry",
+          identifier: "TEST-RETRY",
+          state: "Todo",
+        }),
+        runs: [
+          {
+            runId: "retry-planning-run",
+            role: "planner",
+            runPhase: "issue_breakdown",
+            runKind: "planning",
+            status: "failed",
+            completedAt: "2026-01-01T00:00:04.000Z",
+            error: "planning failed",
+          },
+        ],
+        arrangeLifecycle: async ({ issue, lifecycleStore }) => {
+          return lifecycleStore.ensureIssue(issue, {
+            phase: "implementation",
+            planningFailureCount: 1,
+            planningDispatchRetryCount: 1,
+            lastPlanningFailureAt: "2026-01-01T00:00:04.000Z",
+          });
+        },
+        assertCurrent: (current) => {
+          expect(current.planningFailureCount).toBe(1);
+          expect(current.planningDispatchRetryCount).toBe(1);
+          expect(current.planningRetryDueAt).toBe("2026-01-01T00:00:09.000Z");
+        },
+      },
+    ];
+
+    for (const [index, scenario] of scenarios.entries()) {
+      const scenarioRoot = path.join(root, `timeline-${index}`);
+      const config = builderConfig(scenarioRoot);
+      const lifecycleStore = new FileIssueLifecycleStore(scenarioRoot);
+      const runStore = new FileRunTranscriptStore(scenarioRoot);
+      const historyStore = new MemoryIssueStateStore();
+      for (const run of scenario.runs) {
+        await startStoredRun(runStore, scenario.issue, run);
+      }
+      const lifecycle = await scenario.arrangeLifecycle({
+        issue: scenario.issue,
+        lifecycleStore,
+      });
+      const storeBuilder = new IssueCurrentStateBuilder({
+        config,
+        lifecycleStore,
+        runStore,
+        issueStateStore: historyStore,
+        logger: silentLogger(),
+      });
+      const storeCurrent = await storeBuilder.build(
+        scenario.issue,
+        emptyRuntime(),
+      );
+      historyStore.record = {
+        ...storeCurrent,
+        history: [
+          trackerEvidenceSnapshot(storeCurrent, scenario.issue),
+          lifecycleEvidenceSnapshot(storeCurrent, lifecycle),
+          ...scenario.runs.flatMap((run) =>
+            runEvidenceSnapshots(storeCurrent, run),
+          ),
+        ],
+      };
+      const historyBuilder = new IssueCurrentStateBuilder({
+        config,
+        lifecycleStore,
+        runStore,
+        issueStateStore: historyStore,
+        logger: silentLogger(),
+        historyBackedFieldGroups: HISTORY_BACKED_FIELD_GROUPS,
+      });
+
+      const current = await historyBuilder.build(
+        scenario.issue,
+        emptyRuntime(),
+      );
+      const rebuilt = await historyBuilder.rebuildHistoryBackedFields(
+        scenario.issue,
+        emptyRuntime(),
+      );
+
+      try {
+        scenario.assertCurrent(current);
+        expectHistoryRebuildMatchesCurrent(current, rebuilt);
+      } catch (error) {
+        throw new Error(`Timeline scenario failed: ${scenario.name}`, {
+          cause: error,
+        });
+      }
+    }
+  });
 });
 
 function builderConfig(root: string): ServiceConfig {
@@ -1473,6 +2057,74 @@ function issueFixture(overrides: Partial<Issue> = {}): Issue {
   };
 }
 
+function pullRequestFixture(
+  overrides: Partial<
+    NonNullable<
+      IssueLifecycleRecord["completionReports"][number]["pullRequest"]
+    >
+  > = {},
+): NonNullable<
+  IssueLifecycleRecord["completionReports"][number]["pullRequest"]
+> {
+  return {
+    url: "https://github.test/acme/repo/pull/7",
+    number: 7,
+    headSha: "abc123",
+    branch: "feature/test-1",
+    ...overrides,
+  };
+}
+
+function completionReportFixture(
+  issue: Issue,
+  runId: string,
+  overrides: Partial<IssueLifecycleRecord["completionReports"][number]> = {},
+): IssueLifecycleRecord["completionReports"][number] {
+  const id = overrides.id ?? `completion-${runId}`;
+  return {
+    id,
+    idempotencyKey: overrides.idempotencyKey ?? id,
+    runId,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    summary: "Implemented the requested work",
+    validationEvidence: ["validated"],
+    acceptanceChecklist: [],
+    changedFiles: ["src/app.ts"],
+    branchName: "feature/test-1",
+    pullRequest: null,
+    risks: [],
+    acceptedAt: "2026-01-01T00:00:03.000Z",
+    writebackOperationKeys: [],
+    ...overrides,
+  };
+}
+
+function reviewVerdictFixture(
+  issue: Issue,
+  runId: string,
+  overrides: Partial<IssueLifecycleRecord["reviewVerdicts"][number]> = {},
+): IssueLifecycleRecord["reviewVerdicts"][number] {
+  const id = overrides.id ?? `verdict-${runId}`;
+  return {
+    id,
+    idempotencyKey: overrides.idempotencyKey ?? id,
+    runId,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    verdict: "pass",
+    acceptanceResults: [],
+    findings: [],
+    gateFindings: [],
+    discoveryFindings: [],
+    evidence: ["reviewed"],
+    reviewer: null,
+    submittedAt: "2026-01-01T00:00:05.000Z",
+    writebackOperationKeys: [],
+    ...overrides,
+  };
+}
+
 function emptyRuntime(): IssueCurrentStateRuntimeState {
   return {
     runningEntry: null,
@@ -1485,6 +2137,85 @@ function emptyRuntime(): IssueCurrentStateRuntimeState {
 
 function silentLogger() {
   return { warn: () => undefined };
+}
+
+type StoredRunInput = {
+  runId: string;
+  role?: AgentRunRole;
+  runPhase?: AgentRunPhase;
+  runKind?: AgentRunKind;
+  status?: "succeeded" | "failed" | "cancelled";
+  completedAt: string;
+  error?: string | null;
+  prompt?: string;
+  attempt?: number | null;
+  turnNumber?: number;
+  tokens?: TokenCounts;
+  workspaceKey?: string;
+  workspacePath?: string;
+  gitBranchName?: string | null;
+  prUrl?: string | null;
+  prNumber?: number | null;
+  prHeadSha?: string | null;
+  prBranch?: string | null;
+};
+
+async function startStoredRun(
+  runStore: FileRunTranscriptStore,
+  issue: Issue,
+  input: StoredRunInput,
+): Promise<void> {
+  const role = input.role ?? "worker";
+  const runPhase = input.runPhase ?? "implementation";
+  const runKind = input.runKind ?? runKindForPhase(runPhase);
+  const prompt = input.prompt ?? "Work";
+  await runStore.startRun({
+    runId: input.runId,
+    sessionId: `session-${input.runId}`,
+    agentId: `agent-${input.runId}`,
+    role,
+    runPhase,
+    runKind,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    attempt: input.attempt ?? null,
+    turnNumber: input.turnNumber ?? 1,
+    prompt,
+    promptTemplateKeys: [`template-${input.runId}`],
+    harnessId: "test-harness",
+    workspaceKey: input.workspaceKey ?? `workspace-${input.runId}`,
+    workspacePath: input.workspacePath ?? `/tmp/${input.runId}`,
+    ...(input.gitBranchName == null
+      ? {}
+      : { gitBranchName: input.gitBranchName }),
+  });
+  const status = input.status ?? "succeeded";
+  await runStore.updateRun(input.runId, {
+    status,
+    completedAt: input.completedAt,
+    error:
+      input.error === undefined
+        ? status === "failed"
+          ? "run failed"
+          : null
+        : input.error,
+    tokens: input.tokens ?? { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+    metadata: {
+      ...(input.prUrl === undefined ? {} : { prUrl: input.prUrl }),
+      ...(input.prNumber === undefined ? {} : { prNumber: input.prNumber }),
+      ...(input.prHeadSha === undefined ? {} : { prHeadSha: input.prHeadSha }),
+      ...(input.prBranch === undefined ? {} : { prBranch: input.prBranch }),
+      sdkRunStatus:
+        status === "succeeded"
+          ? "finished"
+          : status === "cancelled"
+            ? "cancelled"
+            : "error",
+      sdkRunStatusSource: "wait",
+      cancellationOutcome: status === "cancelled" ? "cancelled" : "none",
+      cancelFailed: false,
+    },
+  });
 }
 
 async function startFailedWorkerRun(
@@ -1716,41 +2447,108 @@ function latestApprovalPassVerdictForTestLifecycle(
 
 function runEvidenceSnapshots(
   current: IssueCurrentFields,
-  input: { runId: string; completedAt: string },
+  input: StoredRunInput,
 ): IssueHistorySnapshot[] {
   const startedAt = "2026-01-01T00:00:00.000Z";
-  return [
+  const role = input.role ?? "worker";
+  const runPhase = input.runPhase ?? "implementation";
+  const runKind = input.runKind ?? runKindForPhase(runPhase);
+  const status = input.status ?? "failed";
+  const prompt = input.prompt ?? "Work";
+  const tokens = input.tokens ?? {
+    inputTokens: 1,
+    outputTokens: 2,
+    totalTokens: 3,
+  };
+  const error =
+    input.error === undefined
+      ? status === "failed"
+        ? "sdk failed"
+        : null
+      : input.error;
+  const snapshots = [
     runEvidenceSnapshot(current, {
       historySnapshotId: `issue-history:${input.runId}:started`,
       snapshotAt: startedAt,
       eventType: "run_started",
       runId: input.runId,
+      sessionId: `session-${input.runId}`,
+      agentId: `agent-${input.runId}`,
       status: "running",
-      role: "worker",
-      runPhase: "implementation",
-      runKind: "implementation",
-      workspaceKey: `workspace-${input.runId}`,
-      workspacePath: `/tmp/${input.runId}`,
+      role,
+      runPhase,
+      runKind,
+      prompt,
+      promptCharCount: prompt.length,
+      startedAt,
+      updatedAt: startedAt,
+      tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      attempt: input.attempt ?? null,
+      turnNumber: input.turnNumber ?? 1,
+      harnessId: "test-harness",
+      promptTemplateKeys: [`template-${input.runId}`],
+      workspaceKey: input.workspaceKey ?? `workspace-${input.runId}`,
+      workspacePath: input.workspacePath ?? `/tmp/${input.runId}`,
+      gitBranchName: input.gitBranchName ?? null,
     }),
     runEvidenceSnapshot(current, {
       historySnapshotId: `issue-history:${input.runId}:terminal`,
       snapshotAt: input.completedAt,
       eventType: "run_terminal_state_updated",
       runId: input.runId,
-      status: "failed",
-      role: "worker",
-      runPhase: "implementation",
-      runKind: "implementation",
+      sessionId: `session-${input.runId}`,
+      agentId: `agent-${input.runId}`,
+      status,
+      role,
+      runPhase,
+      runKind,
+      updatedAt: input.completedAt,
       completedAt: input.completedAt,
-      error: "sdk failed",
-      workspaceKey: `workspace-${input.runId}`,
-      workspacePath: `/tmp/${input.runId}`,
-      sdkRunStatus: "error",
+      ...(error === null ? {} : { error }),
+      tokens,
+      workspaceKey: input.workspaceKey ?? `workspace-${input.runId}`,
+      workspacePath: input.workspacePath ?? `/tmp/${input.runId}`,
+      gitBranchName: input.gitBranchName ?? null,
+      sdkRunStatus:
+        status === "succeeded"
+          ? "finished"
+          : status === "cancelled"
+            ? "cancelled"
+            : "error",
       sdkRunStatusSource: "wait",
-      cancellationOutcome: "none",
+      cancellationOutcome: status === "cancelled" ? "cancelled" : "none",
       cancelFailed: false,
     }),
   ];
+  if (
+    input.prUrl !== undefined ||
+    input.prNumber !== undefined ||
+    input.prHeadSha !== undefined ||
+    input.prBranch !== undefined
+  ) {
+    snapshots.push(
+      runEvidenceSnapshot(current, {
+        historySnapshotId: `issue-history:${input.runId}:pull-request`,
+        snapshotAt: input.completedAt,
+        eventType: "run_pull_request_updated",
+        runId: input.runId,
+        sessionId: `session-${input.runId}`,
+        agentId: `agent-${input.runId}`,
+        status,
+        role,
+        runPhase,
+        runKind,
+        workspaceKey: input.workspaceKey ?? `workspace-${input.runId}`,
+        workspacePath: input.workspacePath ?? `/tmp/${input.runId}`,
+        gitBranchName: input.gitBranchName ?? null,
+        prUrl: input.prUrl ?? null,
+        prNumber: input.prNumber ?? null,
+        prHeadSha: input.prHeadSha ?? null,
+        prBranch: input.prBranch ?? null,
+      }),
+    );
+  }
+  return snapshots;
 }
 
 function runEvidenceSnapshot(
@@ -1763,9 +2561,9 @@ function runEvidenceSnapshot(
     sessionId?: string | null;
     agentId?: string | null;
     status: string;
-    role: "worker";
-    runPhase: "implementation";
-    runKind: "implementation";
+    role: AgentRunRole;
+    runPhase: AgentRunPhase;
+    runKind: AgentRunKind;
     prompt?: string | null;
     promptCharCount?: number | null;
     startedAt?: string | null;
@@ -1855,6 +2653,29 @@ function runEvidenceSnapshot(
     runFailureDiagnosticCode: null,
     runPromptTemplateKeys: input.promptTemplateKeys ?? null,
   };
+}
+
+function expectHistoryRebuildMatchesCurrent(
+  current: IssueCurrentFields,
+  rebuilt: IssueCurrentStateHistoryRebuildResult,
+): void {
+  expect(rebuilt.incompleteGroups).toEqual([]);
+  expect(rebuilt.sourceSnapshotIds.length).toBeGreaterThan(0);
+  expect(pickCurrentFields(current, Object.keys(rebuilt.fields))).toEqual(
+    rebuilt.fields,
+  );
+}
+
+function pickCurrentFields(
+  current: IssueCurrentFields,
+  fieldNames: string[],
+): Partial<IssueCurrentFields> {
+  const picked: Partial<IssueCurrentFields> = {};
+  for (const fieldName of fieldNames) {
+    const key = fieldName as keyof IssueCurrentFields;
+    Object.assign(picked, { [key]: current[key] });
+  }
+  return picked;
 }
 
 class MemoryIssueStateStore implements IssueStateStore {
