@@ -951,7 +951,7 @@ export class Orchestrator {
       runStore: options.runStore,
       issueStateStore: this.issueStateStore,
       logger: options.logger,
-      historyBackedFieldGroups: ["tracker"],
+      historyBackedFieldGroups: ["tracker", "runSummary"],
     });
     this.transitionRulesets = this.createTransitionRulesets();
     this.transitionEngine = new IssueOrchestrationEngine(
@@ -9908,6 +9908,7 @@ export class Orchestrator {
             harnessId: this.options.harness.id,
             workspaceKey: context.workspace.workspaceKey,
             workspacePath: context.workspace.path,
+            gitBranchName: context.workspace.gitBranchName ?? null,
             promptTemplateKeys:
               context.promptBundle?.metadata.templateKeys ?? null,
           },
@@ -10213,6 +10214,27 @@ export class Orchestrator {
           error: patch.error ?? null,
           tokens: patch.tokens ?? null,
           metadata: patch.metadata ?? null,
+          sdkRunStatus:
+            (patch.metadata as Record<string, unknown> | undefined)
+              ?.sdkRunStatus ?? null,
+          sdkRunStatusSource:
+            (patch.metadata as Record<string, unknown> | undefined)
+              ?.sdkRunStatusSource ?? null,
+          cancellationRequestedAt:
+            (patch.metadata as Record<string, unknown> | undefined)
+              ?.cancellationRequestedAt ?? null,
+          cancellationOutcome:
+            (patch.metadata as Record<string, unknown> | undefined)
+              ?.cancellationOutcome ?? null,
+          cancelFailed:
+            (patch.metadata as Record<string, unknown> | undefined)
+              ?.cancelFailed ?? null,
+          failureKind:
+            (patch.metadata as Record<string, unknown> | undefined)
+              ?.failureKind ?? null,
+          failureDiagnosticCode:
+            (patch.metadata as Record<string, unknown> | undefined)
+              ?.failureDiagnosticCode ?? null,
         },
       });
     }
@@ -12435,6 +12457,25 @@ export class Orchestrator {
       gitBranchName: metadata.gitBranchName,
       repoPath: metadata.repoPath,
       baseRef: metadata.baseRef,
+    });
+    await this.recordIssueEvidenceSnapshot({
+      issue: entry.issue,
+      evidenceKind: "run",
+      eventType: "run_pull_request_updated",
+      sourceId: runId,
+      reason: existing?.prUrl
+        ? "run_pull_request_updated"
+        : "run_pull_request_opened",
+      payload: {
+        runId,
+        prUrl: metadata.prUrl,
+        prNumber: metadata.prNumber,
+        prHeadSha: metadata.prHeadSha,
+        prBranch: metadata.prBranch,
+        gitBranchName: metadata.gitBranchName,
+        repoPath: metadata.repoPath,
+        baseRef: metadata.baseRef,
+      },
     });
   }
 

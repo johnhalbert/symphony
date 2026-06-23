@@ -2,9 +2,10 @@
 
 Date: 2026-06-23
 
-Status: In progress. Phases 0-3 are implemented; tracker history capture,
-tracker history-backed current-state building, and retry evidence capture are
-implemented. Remaining history authority work is staged by field group.
+Status: In progress. Phases 0-3 are implemented; tracker and run-summary
+history capture, history-backed current-state building, and retry evidence
+capture are implemented. Remaining history authority work is staged by field
+group.
 
 This planning record captures the intended path from the current store-backed
 builder to a history-backed current-state builder. It is not a Spec Kit artifact
@@ -41,9 +42,9 @@ succeeded, skipped, and failed action records, plus runtime/domain errors.
 ## Current Gaps
 
 - `SqliteIssueStateStore` stores `current_json` and separate history rows.
-- `current_json` is now documented as cached current state. The tracker field
-  group can be rebuilt from typed history when a fresh tracker observation is
-  available, but most field groups still use store-backed assembly.
+- `current_json` is now documented as cached current state. The tracker and run
+  summary field groups can be rebuilt from typed history when fresh enough
+  evidence is available, but most field groups still use store-backed assembly.
 - Issue history is useful for audit but is not yet complete enough to rebuild
   all current fields.
 - Some current-state facts still exist only in lifecycle records, run records,
@@ -236,19 +237,21 @@ Acceptance:
 ## Implementation Status
 
 - Implemented: field-group builder structure, ruleset isolation from candidate
-  lanes, typed evidence normalization, tracker observation capture, retry
-  scheduled/fired/cleared evidence, and tracker history-backed builder support.
-- Implemented: tracker field authority can be enabled in the builder and is
-  enabled for orchestrator decisions with a freshness guard on tracker
-  `updatedAt`.
+  lanes, typed evidence normalization, tracker observation capture, run start,
+  terminal, and pull request evidence, retry scheduled/fired/cleared evidence,
+  and tracker/run-summary history-backed builder support.
+- Implemented: tracker and run-summary field authority can be enabled in the
+  builder and are enabled for orchestrator decisions with freshness/completeness
+  guards.
 - Implemented: `current_json` remains written for compatibility and fast reads,
   but is treated as cached current state for field groups that can be rebuilt
   from history.
-- Partially implemented: parity coverage exists for tracker fields. The larger
-  timeline matrix still needs expansion as each additional field group becomes
-  history-backed.
+- Partially implemented: parity coverage exists for tracker and run-summary
+  fields. The larger timeline matrix still needs expansion as each additional
+  field group becomes history-backed.
 - Still store-backed: lifecycle report/verdict fields, merge policy fields,
-  run failure counters, writeback/approval summaries, and runtime-local fields.
+  merge-policy latest completion-run object, writeback/approval summaries, and
+  runtime-local fields.
 
 ## Review Questions
 

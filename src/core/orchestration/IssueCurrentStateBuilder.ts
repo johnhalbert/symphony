@@ -100,7 +100,7 @@ export interface IssueCurrentStateBuilderOptions {
   compareHistoryBackedFieldGroups?: readonly IssueCurrentStateHistoryFieldGroup[];
 }
 
-export type IssueCurrentStateHistoryFieldGroup = "tracker";
+export type IssueCurrentStateHistoryFieldGroup = "tracker" | "runSummary";
 
 type IssueBreakdownPlan = IssueLifecycleRecord["issueBreakdownPlans"][number];
 type IssueTriageReport = IssueLifecycleRecord["issueTriageReports"][number];
@@ -218,6 +218,7 @@ type RunFields = Pick<
   | "consecutiveSdkErrorFailures"
   | "consecutiveInfraFailures"
 >;
+type RunSummaryFields = Omit<RunFields, "mergePolicyLatestCompletionRun">;
 
 type RuntimeFields = Pick<
   IssueCurrentFields,
@@ -267,12 +268,39 @@ interface IssueCurrentStateBuildContext {
 
 interface HistoryBackedGroupFields {
   tracker?: TrackerFields;
+  runSummary?: RunSummaryFields;
 }
 
 interface HistoryBackedGroupResult {
   fields: HistoryBackedGroupFields;
   incompleteGroups: IssueCurrentStateHistoryFieldGroup[];
   sourceSnapshotIds: string[];
+}
+
+interface HistoryRunSummary {
+  runId: string;
+  sequence: number;
+  sourceSnapshotIds: string[];
+  status: string | null;
+  role: string | null;
+  runPhase: string | null;
+  runKind: string | null;
+  completedAt: string | null;
+  error: string | null;
+  prUrl: string | null;
+  prNumber: number | null;
+  prHeadSha: string | null;
+  prBranch: string | null;
+  workspaceKey: string | null;
+  workspacePath: string | null;
+  gitBranchName: string | null;
+  sdkRunStatus: string | null;
+  sdkRunStatusSource: string | null;
+  cancellationRequestedAt: string | null;
+  cancellationOutcome: string | null;
+  cancelFailed: boolean;
+  failureKind: string | null;
+  failureDiagnosticCode: string | null;
 }
 
 export class IssueCurrentStateBuilder {
@@ -311,14 +339,22 @@ export class IssueCurrentStateBuilder {
     context: IssueCurrentStateBuildContext,
   ): HistoryBackedGroupResult {
     const tracker = this.buildTrackerFieldsFromHistory(context);
+    const runSummary = this.buildRunSummaryFieldsFromHistory(context);
     return {
       fields: {
         ...(tracker.fields === null ? {} : { tracker: tracker.fields }),
+        ...(runSummary.fields === null
+          ? {}
+          : { runSummary: runSummary.fields }),
       },
-      incompleteGroups: tracker.complete ? [] : ["tracker"],
-      sourceSnapshotIds: tracker.sourceSnapshotId
-        ? [tracker.sourceSnapshotId]
-        : [],
+      incompleteGroups: [
+        ...(tracker.complete ? [] : (["tracker"] as const)),
+        ...(runSummary.complete ? [] : (["runSummary"] as const)),
+      ],
+      sourceSnapshotIds: [
+        ...(tracker.sourceSnapshotId ? [tracker.sourceSnapshotId] : []),
+        ...runSummary.sourceSnapshotIds,
+      ],
     };
   }
 
@@ -417,6 +453,60 @@ export class IssueCurrentStateBuilder {
         trackerCreatedAt: issue.createdAt,
         trackerUpdatedAt: issue.updatedAt,
         currentIssueContentFingerprint: issueContentFingerprint(issue),
+      },
+    };
+  }
+
+  private buildRunSummaryFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | {
+        complete: true;
+        fields: RunSummaryFields;
+        sourceSnapshotIds: string[];
+      }
+    | { complete: false; fields: null; sourceSnapshotIds: string[] } {
+    const runs = buildRunSummariesFromHistory(context.history);
+    const latestRun = runs.at(-1) ?? null;
+    if (latestRun === null) {
+      return { complete: false, fields: null, sourceSnapshotIds: [] };
+    }
+    if (!historyRunSummaryMatchesKnownStoreState(context, latestRun)) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotIds: latestRun.sourceSnapshotIds,
+      };
+    }
+    return {
+      complete: true,
+      sourceSnapshotIds: latestRun.sourceSnapshotIds,
+      fields: {
+        latestRunId: latestRun.runId,
+        latestRunStatus: latestRun.status,
+        latestRunRole: latestRun.role,
+        latestRunPhase: latestRun.runPhase,
+        latestRunKind: latestRun.runKind,
+        latestRunCompletedAt: latestRun.completedAt,
+        latestRunError: latestRun.error,
+        latestPrUrl: latestRun.prUrl,
+        latestPrNumber: latestRun.prNumber,
+        latestPrHeadSha: latestRun.prHeadSha,
+        latestPrBranch: latestRun.prBranch,
+        latestWorkspaceKey: latestRun.workspaceKey,
+        latestWorkspacePath: latestRun.workspacePath,
+        latestGitBranchName:
+          latestRun.gitBranchName ??
+          latestRun.prBranch ??
+          context.issue.branchName,
+        consecutiveSdkErrorFailures: countConsecutiveHistoryWorkerRuns(
+          runs,
+          isCountedHistorySdkWaitErrorFailure,
+        ),
+        consecutiveInfraFailures: countConsecutiveHistoryWorkerRuns(
+          runs,
+          isCountedHistoryInfraFailure,
+        ),
       },
     };
   }
@@ -893,6 +983,244 @@ function issueBlockersFromUnknown(value: unknown): Issue["blockedBy"] | null {
     });
   }
   return blockers;
+}
+
+function buildRunSummariesFromHistory(
+  history: readonly IssueHistorySnapshot[],
+): HistoryRunSummary[] {
+  const runs = new Map<string, HistoryRunSummary>();
+  history.forEach((snapshot, index) => {
+    if (
+      snapshot.snapshotKind !== "evidence" ||
+      snapshot.evidenceKind !== "run"
+    ) {
+      return;
+    }
+    const runId =
+      stringFromUnknown(snapshot.runId) ??
+      stringFromUnknown(snapshot.evidenceSourceId);
+    if (runId === null) return;
+    const summary = ensureHistoryRunSummary(runs, runId);
+    summary.sequence = index;
+    summary.sourceSnapshotIds.push(snapshot.historySnapshotId);
+
+    summary.role = stringFromUnknown(snapshot.role) ?? summary.role;
+    summary.runPhase = stringFromUnknown(snapshot.runPhase) ?? summary.runPhase;
+    summary.runKind = stringFromUnknown(snapshot.runKind) ?? summary.runKind;
+    summary.workspaceKey =
+      stringFromUnknown(snapshot.runWorkspaceKey) ?? summary.workspaceKey;
+    summary.workspacePath =
+      stringFromUnknown(snapshot.runWorkspacePath) ?? summary.workspacePath;
+    summary.gitBranchName =
+      stringFromUnknown(snapshot.runGitBranchName) ?? summary.gitBranchName;
+
+    if (snapshot.evidenceEventType === "run_started") {
+      summary.status = stringFromUnknown(snapshot.runStatus) ?? "running";
+    }
+
+    if (snapshot.evidenceEventType === "run_terminal_state_updated") {
+      summary.status = stringFromUnknown(snapshot.runStatus) ?? summary.status;
+      summary.completedAt =
+        stringFromUnknown(snapshot.runCompletedAt) ?? summary.completedAt;
+      summary.error = stringFromUnknown(snapshot.runError) ?? summary.error;
+      summary.sdkRunStatus =
+        stringFromUnknown(snapshot.runSdkStatus) ?? summary.sdkRunStatus;
+      summary.sdkRunStatusSource =
+        stringFromUnknown(snapshot.runSdkStatusSource) ??
+        summary.sdkRunStatusSource;
+      summary.cancellationRequestedAt =
+        stringFromUnknown(snapshot.runCancellationRequestedAt) ??
+        summary.cancellationRequestedAt;
+      summary.cancellationOutcome =
+        stringFromUnknown(snapshot.runCancellationOutcome) ??
+        summary.cancellationOutcome;
+      summary.cancelFailed =
+        booleanFromUnknown(snapshot.runCancelFailed) ?? summary.cancelFailed;
+      summary.failureKind =
+        stringFromUnknown(snapshot.runFailureKind) ?? summary.failureKind;
+      summary.failureDiagnosticCode =
+        stringFromUnknown(snapshot.runFailureDiagnosticCode) ??
+        summary.failureDiagnosticCode;
+    }
+
+    if (snapshot.evidenceEventType === "run_pull_request_updated") {
+      summary.prUrl = stringFromUnknown(snapshot.runPrUrl) ?? summary.prUrl;
+      summary.prNumber =
+        numberFromUnknown(snapshot.runPrNumber) ?? summary.prNumber;
+      summary.prHeadSha =
+        stringFromUnknown(snapshot.runPrHeadSha) ?? summary.prHeadSha;
+      summary.prBranch =
+        stringFromUnknown(snapshot.runPrBranch) ?? summary.prBranch;
+      summary.gitBranchName =
+        stringFromUnknown(snapshot.runGitBranchName) ?? summary.gitBranchName;
+    }
+  });
+  return [...runs.values()].sort(
+    (left, right) => left.sequence - right.sequence,
+  );
+}
+
+function ensureHistoryRunSummary(
+  runs: Map<string, HistoryRunSummary>,
+  runId: string,
+): HistoryRunSummary {
+  const existing = runs.get(runId);
+  if (existing) return existing;
+  const summary: HistoryRunSummary = {
+    runId,
+    sequence: -1,
+    sourceSnapshotIds: [],
+    status: null,
+    role: null,
+    runPhase: null,
+    runKind: null,
+    completedAt: null,
+    error: null,
+    prUrl: null,
+    prNumber: null,
+    prHeadSha: null,
+    prBranch: null,
+    workspaceKey: null,
+    workspacePath: null,
+    gitBranchName: null,
+    sdkRunStatus: null,
+    sdkRunStatusSource: null,
+    cancellationRequestedAt: null,
+    cancellationOutcome: null,
+    cancelFailed: false,
+    failureKind: null,
+    failureDiagnosticCode: null,
+  };
+  runs.set(runId, summary);
+  return summary;
+}
+
+function countConsecutiveHistoryWorkerRuns(
+  runs: HistoryRunSummary[],
+  predicate: (run: HistoryRunSummary) => boolean,
+): number {
+  let count = 0;
+  for (const run of runs.slice().reverse()) {
+    if (run.role !== "worker") continue;
+    if (!predicate(run)) break;
+    count += 1;
+  }
+  return count;
+}
+
+function historyRunSummaryMatchesKnownStoreState(
+  context: IssueCurrentStateBuildContext,
+  latestRun: HistoryRunSummary,
+): boolean {
+  const expectedRunId = context.latestRun?.runId ?? context.pointers?.lastRunId;
+  if (expectedRunId && latestRun.runId !== expectedRunId) return false;
+  if (!historyStringMatchesKnown(latestRun.prUrl, context.pointers?.prUrl))
+    return false;
+  if (
+    !historyNumberMatchesKnown(latestRun.prNumber, context.pointers?.prNumber)
+  )
+    return false;
+  if (
+    !historyStringMatchesKnown(latestRun.prHeadSha, context.pointers?.prHeadSha)
+  )
+    return false;
+  if (
+    !historyStringMatchesKnown(latestRun.prBranch, context.pointers?.prBranch)
+  )
+    return false;
+  if (
+    !historyStringMatchesKnown(
+      latestRun.workspaceKey,
+      context.pointers?.workspaceKey,
+    )
+  )
+    return false;
+  if (
+    !historyStringMatchesKnown(
+      latestRun.workspacePath,
+      context.pointers?.workspacePath,
+    )
+  )
+    return false;
+  if (
+    !historyStringMatchesKnown(
+      latestRun.gitBranchName,
+      context.pointers?.gitBranchName ?? context.pointers?.branchName,
+    )
+  )
+    return false;
+  if (!historyStringMatchesKnown(latestRun.prUrl, context.latestRun?.prUrl))
+    return false;
+  if (
+    !historyNumberMatchesKnown(latestRun.prNumber, context.latestRun?.prNumber)
+  )
+    return false;
+  if (
+    !historyStringMatchesKnown(
+      latestRun.prHeadSha,
+      context.latestRun?.prHeadSha,
+    )
+  )
+    return false;
+  if (
+    !historyStringMatchesKnown(latestRun.prBranch, context.latestRun?.prBranch)
+  )
+    return false;
+  return true;
+}
+
+function historyStringMatchesKnown(
+  historyValue: string | null,
+  knownValue: string | null | undefined,
+): boolean {
+  return knownValue == null || historyValue === knownValue;
+}
+
+function historyNumberMatchesKnown(
+  historyValue: number | null,
+  knownValue: number | null | undefined,
+): boolean {
+  return knownValue == null || historyValue === knownValue;
+}
+
+function isCountedHistorySdkWaitErrorFailure(run: HistoryRunSummary): boolean {
+  return (
+    run.role === "worker" &&
+    run.status === "failed" &&
+    run.completedAt !== null &&
+    run.sdkRunStatus === "error" &&
+    run.sdkRunStatusSource === "wait" &&
+    run.cancellationRequestedAt == null &&
+    (run.cancellationOutcome ?? "none") === "none" &&
+    run.cancelFailed !== true &&
+    run.error !== OPERATOR_REJECTED_PUBLICATION_ERROR
+  );
+}
+
+function isCountedHistoryInfraFailure(run: HistoryRunSummary): boolean {
+  return (
+    run.role === "worker" &&
+    run.status === "failed" &&
+    run.completedAt !== null &&
+    run.cancellationRequestedAt == null &&
+    (run.cancellationOutcome ?? "none") === "none" &&
+    run.cancelFailed !== true &&
+    run.error !== OPERATOR_REJECTED_PUBLICATION_ERROR &&
+    run.failureKind === "harness_diagnostic" &&
+    isInfraFailureDiagnosticCode(run.failureDiagnosticCode)
+  );
+}
+
+function stringFromUnknown(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function numberFromUnknown(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function booleanFromUnknown(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
 }
 
 function compareFieldGroup(

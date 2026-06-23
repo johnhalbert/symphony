@@ -428,6 +428,71 @@ describe("IssueCurrentStateBuilder", () => {
       liveCurrent.currentIssueContentFingerprint,
     );
   });
+
+  it("can build latest run summary fields from typed history evidence", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture();
+    const historyStore = new MemoryIssueStateStore();
+    const runStore = new FileRunTranscriptStore(root);
+    await startFailedWorkerRun(
+      runStore,
+      issue,
+      "run-old",
+      "2026-01-01T00:00:00.000Z",
+    );
+    await startFailedWorkerRun(
+      runStore,
+      issue,
+      "run-latest",
+      "2026-01-01T00:01:00.000Z",
+    );
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore: undefined,
+      runStore,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+    historyStore.record = {
+      ...storeCurrent,
+      history: [
+        ...runEvidenceSnapshots(storeCurrent, {
+          runId: "run-old",
+          completedAt: "2026-01-01T00:00:00.000Z",
+        }),
+        ...runEvidenceSnapshots(storeCurrent, {
+          runId: "run-latest",
+          completedAt: "2026-01-01T00:01:00.000Z",
+        }),
+      ],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore: undefined,
+      runStore,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["runSummary"],
+      compareHistoryBackedFieldGroups: ["runSummary"],
+    });
+
+    const current = await historyBackedBuilder.build(issue, emptyRuntime());
+
+    expect(current).toMatchObject({
+      latestRunId: "run-latest",
+      latestRunStatus: "failed",
+      latestRunRole: "worker",
+      latestRunPhase: "implementation",
+      latestRunKind: "implementation",
+      latestRunCompletedAt: "2026-01-01T00:01:00.000Z",
+      latestRunError: "sdk failed",
+      latestWorkspaceKey: "workspace-run-latest",
+      latestWorkspacePath: "/tmp/run-latest",
+      consecutiveSdkErrorFailures: 2,
+      consecutiveInfraFailures: 0,
+    });
+  });
 });
 
 function builderConfig(root: string): ServiceConfig {
@@ -580,6 +645,117 @@ function trackerEvidenceSnapshot(
     observedHasChildren: observed.hasChildren === true,
     observedTrackerCreatedAt: observed.createdAt,
     observedTrackerUpdatedAt: observed.updatedAt,
+  };
+}
+
+function runEvidenceSnapshots(
+  current: IssueCurrentFields,
+  input: { runId: string; completedAt: string },
+): IssueHistorySnapshot[] {
+  const startedAt = "2026-01-01T00:00:00.000Z";
+  return [
+    runEvidenceSnapshot(current, {
+      historySnapshotId: `issue-history:${input.runId}:started`,
+      snapshotAt: startedAt,
+      eventType: "run_started",
+      runId: input.runId,
+      status: "running",
+      role: "worker",
+      runPhase: "implementation",
+      runKind: "implementation",
+      workspaceKey: `workspace-${input.runId}`,
+      workspacePath: `/tmp/${input.runId}`,
+    }),
+    runEvidenceSnapshot(current, {
+      historySnapshotId: `issue-history:${input.runId}:terminal`,
+      snapshotAt: input.completedAt,
+      eventType: "run_terminal_state_updated",
+      runId: input.runId,
+      status: "failed",
+      role: "worker",
+      runPhase: "implementation",
+      runKind: "implementation",
+      completedAt: input.completedAt,
+      error: "sdk failed",
+      workspaceKey: `workspace-${input.runId}`,
+      workspacePath: `/tmp/${input.runId}`,
+      sdkRunStatus: "error",
+      sdkRunStatusSource: "wait",
+      cancellationOutcome: "none",
+      cancelFailed: false,
+    }),
+  ];
+}
+
+function runEvidenceSnapshot(
+  current: IssueCurrentFields,
+  input: {
+    historySnapshotId: string;
+    snapshotAt: string;
+    eventType: string;
+    runId: string;
+    status: string;
+    role: "worker";
+    runPhase: "implementation";
+    runKind: "implementation";
+    completedAt?: string;
+    error?: string;
+    workspaceKey: string;
+    workspacePath: string;
+    sdkRunStatus?: string;
+    sdkRunStatusSource?: string;
+    cancellationOutcome?: string;
+    cancelFailed?: boolean;
+  },
+): IssueHistorySnapshot {
+  return {
+    ...current,
+    snapshotId: `issue-snapshot:${input.historySnapshotId}`,
+    snapshotAt: input.snapshotAt,
+    triggerType: "orchestrator.tick",
+    triggerId: `orchestrator.tick:${input.historySnapshotId}`,
+    triggerAt: input.snapshotAt,
+    triggerSource: "orchestrator",
+    candidateSource: `evidence.run.${input.eventType}`,
+    transitionRequestContext: null,
+    availableSlots: 1,
+    providerDispatchGateActive: false,
+    stateSlotAvailable: true,
+    allowExistingClaim: false,
+    manualStage: null,
+    manualForceLabels: false,
+    manualIgnoreState: false,
+    snapshotKind: "evidence",
+    historySnapshotId: input.historySnapshotId,
+    transitionKind: "record_evidence",
+    transitionId: `transition:record_evidence:${input.historySnapshotId}`,
+    rulesetId: "orchestrator.evidence.run",
+    rulesetVersion: "test",
+    rulesetFingerprint: "orchestrator.evidence.run@test:900",
+    rulesetPriority: 900,
+    reason: input.eventType,
+    actions: [],
+    errors: [],
+    evidenceKind: "run",
+    evidenceEventType: input.eventType,
+    evidenceSourceId: input.runId,
+    evidencePayload: null,
+    runId: input.runId,
+    role: input.role,
+    runPhase: input.runPhase,
+    runKind: input.runKind,
+    runStatus: input.status,
+    runCompletedAt: input.completedAt ?? null,
+    runError: input.error ?? null,
+    runWorkspaceKey: input.workspaceKey,
+    runWorkspacePath: input.workspacePath,
+    runSdkStatus: input.sdkRunStatus ?? null,
+    runSdkStatusSource: input.sdkRunStatusSource ?? null,
+    runCancellationRequestedAt: null,
+    runCancellationOutcome: input.cancellationOutcome ?? null,
+    runCancelFailed: input.cancelFailed ?? null,
+    runFailureKind: null,
+    runFailureDiagnosticCode: null,
   };
 }
 

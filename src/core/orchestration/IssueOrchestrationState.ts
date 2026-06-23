@@ -440,6 +440,18 @@ export interface RunEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
   runHarnessId: string | null;
   runWorkspaceKey: string | null;
   runWorkspacePath: string | null;
+  runGitBranchName: string | null;
+  runPrUrl: string | null;
+  runPrNumber: number | null;
+  runPrHeadSha: string | null;
+  runPrBranch: string | null;
+  runSdkStatus: string | null;
+  runSdkStatusSource: string | null;
+  runCancellationRequestedAt: string | null;
+  runCancellationOutcome: string | null;
+  runCancelFailed: boolean | null;
+  runFailureKind: string | null;
+  runFailureDiagnosticCode: string | null;
   runPromptTemplateKeys: string[] | null;
 }
 
@@ -585,6 +597,38 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
         runHarnessId: stringField(payload, "harnessId"),
         runWorkspaceKey: stringField(payload, "workspaceKey"),
         runWorkspacePath: stringField(payload, "workspacePath"),
+        runGitBranchName: stringField(payload, "gitBranchName"),
+        runPrUrl: stringField(payload, "prUrl"),
+        runPrNumber: numberField(payload, "prNumber"),
+        runPrHeadSha: stringField(payload, "prHeadSha"),
+        runPrBranch: stringField(payload, "prBranch"),
+        runSdkStatus:
+          stringField(payload, "sdkRunStatus") ??
+          stringField(recordPayload(payload?.metadata), "sdkRunStatus"),
+        runSdkStatusSource:
+          stringField(payload, "sdkRunStatusSource") ??
+          stringField(recordPayload(payload?.metadata), "sdkRunStatusSource"),
+        runCancellationRequestedAt:
+          stringField(payload, "cancellationRequestedAt") ??
+          stringField(
+            recordPayload(payload?.metadata),
+            "cancellationRequestedAt",
+          ),
+        runCancellationOutcome:
+          stringField(payload, "cancellationOutcome") ??
+          stringField(recordPayload(payload?.metadata), "cancellationOutcome"),
+        runCancelFailed:
+          booleanField(payload, "cancelFailed") ??
+          booleanField(recordPayload(payload?.metadata), "cancelFailed"),
+        runFailureKind:
+          stringField(payload, "failureKind") ??
+          stringField(recordPayload(payload?.metadata), "failureKind"),
+        runFailureDiagnosticCode:
+          stringField(payload, "failureDiagnosticCode") ??
+          stringField(
+            recordPayload(payload?.metadata),
+            "failureDiagnosticCode",
+          ),
         runPromptTemplateKeys: stringArrayField(payload, "promptTemplateKeys"),
       });
     case "writeback":
