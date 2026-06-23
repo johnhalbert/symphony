@@ -956,6 +956,7 @@ export class Orchestrator {
         "runSummary",
         "lifecycleCore",
         "lifecycleReports",
+        "lifecycleMergePolicy",
       ],
     });
     this.transitionRulesets = this.createTransitionRulesets();
@@ -8144,8 +8145,11 @@ export class Orchestrator {
         latestApprovalPassVerdict: latestCurrentApprovalPassVerdict(
           input.lifecycle,
         ),
+        merge: input.lifecycle.merge ?? null,
         mergeGate: input.lifecycle.mergeGate ?? null,
+        mergeGateResults: input.lifecycle.mergeGateResults ?? [],
         mergeConflict: input.lifecycle.mergeConflict ?? null,
+        reviewFeedback: input.lifecycle.reviewFeedback,
         summaryPointers: input.lifecycle.summaryPointers,
       },
     });

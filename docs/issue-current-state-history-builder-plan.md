@@ -3,9 +3,9 @@
 Date: 2026-06-23
 
 Status: In progress. Phases 0-3 are implemented; tracker, run-summary,
-lifecycle-core, and lifecycle-report history capture plus history-backed
-current-state building are implemented. Remaining history authority work is
-staged by field group.
+lifecycle-core, lifecycle-report, and lifecycle merge-policy history capture
+plus history-backed current-state building are implemented. Remaining history
+authority work is staged by field group.
 
 This planning record captures the intended path from the current store-backed
 builder to a history-backed current-state builder. It is not a Spec Kit artifact
@@ -238,21 +238,22 @@ Acceptance:
 
 - Implemented: field-group builder structure, ruleset isolation from candidate
   lanes, typed evidence normalization, tracker observation capture, lifecycle
-  core/report evidence, run start, terminal, and pull request evidence, retry
-  scheduled/fired/cleared evidence, and tracker/run-summary/lifecycle-core/
-  lifecycle-report history-backed builder support.
-- Implemented: tracker, run-summary, lifecycle-core, and lifecycle-report field
-  authority can be enabled in the builder and are enabled for orchestrator
-  decisions with freshness/completeness guards.
+  core/report/merge-policy evidence, run start, terminal, and pull request
+  evidence, retry scheduled/fired/cleared evidence, and tracker/run-summary/
+  lifecycle-core/lifecycle-report/lifecycle-merge-policy history-backed builder
+  support.
+- Implemented: tracker, run-summary, lifecycle-core, lifecycle-report, and
+  lifecycle-merge-policy field authority can be enabled in the builder and are
+  enabled for orchestrator decisions with freshness/completeness guards.
 - Implemented: `current_json` remains written for compatibility and fast reads,
   but is treated as cached current state for field groups that can be rebuilt
   from history.
 - Partially implemented: parity coverage exists for tracker, run-summary,
-  lifecycle-core, and lifecycle-report fields. The larger timeline matrix still
-  needs expansion as each additional field group becomes history-backed.
-- Still store-backed: issue breakdown, triage, post-mortem, merge policy
-  fields, merge-policy latest completion-run object, writeback/approval
-  summaries, and runtime-local fields.
+  lifecycle-core, lifecycle-report, and lifecycle-merge-policy fields. The
+  larger timeline matrix still needs expansion as each additional field group
+  becomes history-backed.
+- Still store-backed: issue breakdown, triage, post-mortem, merge-policy latest
+  completion-run object, writeback/approval summaries, and runtime-local fields.
 
 ## Review Questions
 

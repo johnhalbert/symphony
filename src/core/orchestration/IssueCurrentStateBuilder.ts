@@ -26,6 +26,11 @@ import {
   type IssueCompletionReportRecord,
   type IssueLifecycleRecord,
   type IssueLifecycleStore,
+  type IssueMergeConflictMetadata,
+  type IssueMergeGateResultRecord,
+  type IssueMergeGateState,
+  type IssueMergeMetadata,
+  type IssueReviewFeedbackRecord,
   type IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import {
@@ -104,7 +109,8 @@ export type IssueCurrentStateHistoryFieldGroup =
   | "tracker"
   | "runSummary"
   | "lifecycleCore"
-  | "lifecycleReports";
+  | "lifecycleReports"
+  | "lifecycleMergePolicy";
 
 type IssueBreakdownPlan = IssueLifecycleRecord["issueBreakdownPlans"][number];
 type IssueTriageReport = IssueLifecycleRecord["issueTriageReports"][number];
@@ -206,6 +212,17 @@ type LifecycleReportFields = Pick<
   | "mergePolicyLatestApprovalVerdict"
 >;
 
+type LifecycleMergePolicyFields = Pick<
+  LifecycleFields,
+  | "mergeGate"
+  | "mergeConflict"
+  | "mergePolicyMerge"
+  | "mergePolicyMergeGate"
+  | "mergePolicyMergeGateResults"
+  | "mergePolicyMergeConflict"
+  | "mergePolicyReviewFeedback"
+>;
+
 type ConfigFields = Pick<
   IssueCurrentFields,
   | "currentIssueBreakdownConfigFingerprint"
@@ -300,6 +317,7 @@ interface HistoryBackedGroupFields {
   runSummary?: RunSummaryFields;
   lifecycleCore?: LifecycleCoreFields;
   lifecycleReports?: LifecycleReportFields;
+  lifecycleMergePolicy?: LifecycleMergePolicyFields;
 }
 
 interface HistoryBackedGroupResult {
@@ -374,6 +392,8 @@ export class IssueCurrentStateBuilder {
     const lifecycleCore = this.buildLifecycleCoreFieldsFromHistory(context);
     const lifecycleReports =
       this.buildLifecycleReportFieldsFromHistory(context);
+    const lifecycleMergePolicy =
+      this.buildLifecycleMergePolicyFieldsFromHistory(context);
     return {
       fields: {
         ...(tracker.fields === null ? {} : { tracker: tracker.fields }),
@@ -386,12 +406,18 @@ export class IssueCurrentStateBuilder {
         ...(lifecycleReports.fields === null
           ? {}
           : { lifecycleReports: lifecycleReports.fields }),
+        ...(lifecycleMergePolicy.fields === null
+          ? {}
+          : { lifecycleMergePolicy: lifecycleMergePolicy.fields }),
       },
       incompleteGroups: [
         ...(tracker.complete ? [] : (["tracker"] as const)),
         ...(runSummary.complete ? [] : (["runSummary"] as const)),
         ...(lifecycleCore.complete ? [] : (["lifecycleCore"] as const)),
         ...(lifecycleReports.complete ? [] : (["lifecycleReports"] as const)),
+        ...(lifecycleMergePolicy.complete
+          ? []
+          : (["lifecycleMergePolicy"] as const)),
       ],
       sourceSnapshotIds: [
         ...(tracker.sourceSnapshotId ? [tracker.sourceSnapshotId] : []),
@@ -401,6 +427,9 @@ export class IssueCurrentStateBuilder {
           : []),
         ...(lifecycleReports.sourceSnapshotId
           ? [lifecycleReports.sourceSnapshotId]
+          : []),
+        ...(lifecycleMergePolicy.sourceSnapshotId
+          ? [lifecycleMergePolicy.sourceSnapshotId]
           : []),
       ],
     };
@@ -722,6 +751,85 @@ export class IssueCurrentStateBuilder {
         latestApprovalPassVerdict,
         mergePolicyLatestCompletionReport: latestCompletionReport,
         mergePolicyLatestApprovalVerdict: latestApprovalPassVerdict,
+      },
+    };
+  }
+
+  private buildLifecycleMergePolicyFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | {
+        complete: true;
+        fields: LifecycleMergePolicyFields;
+        sourceSnapshotId: string;
+      }
+    | { complete: false; fields: null; sourceSnapshotId: string | null } {
+    const snapshot = latestLifecycleMutationSnapshot(context.history);
+    if (snapshot === null) {
+      return { complete: false, fields: null, sourceSnapshotId: null };
+    }
+    if (
+      context.lifecycle === null ||
+      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
+        context.lifecycle.updatedAt
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const merge = recordFromUnknown<IssueMergeMetadata>(
+      snapshot.lifecycleMerge,
+    );
+    const mergeGate = recordFromUnknown<IssueMergeGateState>(
+      snapshot.lifecycleMergeGate,
+    );
+    const mergeGateResults = recordArrayFromUnknown<IssueMergeGateResultRecord>(
+      snapshot.lifecycleMergeGateResults,
+    );
+    const mergeConflict = recordFromUnknown<IssueMergeConflictMetadata>(
+      snapshot.lifecycleMergeConflict,
+    );
+    const reviewFeedback = recordArrayFromUnknown<IssueReviewFeedbackRecord>(
+      snapshot.lifecycleReviewFeedback,
+    );
+    if (
+      !historyNullableRecordMatchesKnown(merge, context.lifecycle.merge) ||
+      !historyNullableRecordMatchesKnown(
+        mergeGate,
+        context.lifecycle.mergeGate,
+      ) ||
+      !historyRecordArrayMatchesKnown(
+        mergeGateResults,
+        context.lifecycle.mergeGateResults ?? [],
+      ) ||
+      !historyNullableRecordMatchesKnown(
+        mergeConflict,
+        context.lifecycle.mergeConflict,
+      ) ||
+      !historyRecordArrayMatchesKnown(
+        reviewFeedback,
+        context.lifecycle.reviewFeedback,
+      )
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    return {
+      complete: true,
+      sourceSnapshotId: snapshot.historySnapshotId,
+      fields: {
+        mergeGate,
+        mergeConflict,
+        mergePolicyMerge: merge,
+        mergePolicyMergeGate: mergeGate,
+        mergePolicyMergeGateResults: mergeGateResults,
+        mergePolicyMergeConflict: mergeConflict,
+        mergePolicyReviewFeedback: reviewFeedback,
       },
     };
   }
@@ -1419,6 +1527,26 @@ function historyRecordIdMatchesKnown(
   return knownId == null || historyRecord?.id === knownId;
 }
 
+function historyNullableRecordMatchesKnown(
+  historyRecord: { id: string } | null,
+  knownRecord: { id: string } | null | undefined,
+): boolean {
+  return knownRecord == null
+    ? historyRecord === null
+    : historyRecord?.id === knownRecord.id;
+}
+
+function historyRecordArrayMatchesKnown<T extends { id: string }>(
+  historyRecords: T[] | null,
+  knownRecords: readonly { id: string }[],
+): historyRecords is T[] {
+  if (historyRecords === null) return false;
+  if (historyRecords.length !== knownRecords.length) return false;
+  return historyRecords.every(
+    (record, index) => record.id === knownRecords[index]?.id,
+  );
+}
+
 function isCountedHistorySdkWaitErrorFailure(run: HistoryRunSummary): boolean {
   return (
     run.role === "worker" &&
@@ -1463,6 +1591,19 @@ function recordFromUnknown<T extends { id: string }>(value: unknown): T | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Partial<T>;
   return typeof record.id === "string" ? (record as T) : null;
+}
+
+function recordArrayFromUnknown<T extends { id: string }>(
+  value: unknown,
+): T[] | null {
+  if (!Array.isArray(value)) return null;
+  const records: T[] = [];
+  for (const item of value) {
+    const record = recordFromUnknown<T>(item);
+    if (record === null) return null;
+    records.push(record);
+  }
+  return records;
 }
 
 function compareFieldGroup(

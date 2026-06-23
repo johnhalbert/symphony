@@ -674,6 +674,174 @@ describe("IssueCurrentStateBuilder", () => {
       reviewer: "history-reviewer",
     });
   });
+
+  it("can build lifecycle merge-policy fields from typed history evidence", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture({ state: "Ready to Merge" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const pullRequest = {
+      url: "https://github.test/acme/repo/pull/7",
+      number: 7,
+      headSha: "abc123",
+      branch: "feature/test-1",
+    };
+    const mergeGate = {
+      id: "merge-gate-1",
+      status: "observing" as const,
+      headSha: "abc123",
+      pullRequest,
+      requiredChecks: ["ci/test"],
+      checks: [],
+      mergeability: null,
+      reviewRound: 2,
+      gateRunId: null,
+      gateReportId: null,
+      repairRunId: null,
+      repairReportId: null,
+      blockerFingerprint: null,
+      writebackOperationKeys: [],
+      supersededByHeadSha: null,
+      updatedAt: "2026-01-01T00:00:03.000Z",
+    };
+    const mergeGateResult = {
+      id: "merge-gate-result-1",
+      idempotencyKey: "merge-gate-result-1",
+      runId: "gate-run-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      status: "blocked" as const,
+      headSha: "abc123",
+      pullRequest,
+      requiredChecks: ["ci/test"],
+      checks: [],
+      mergeability: null,
+      reviewRound: 2,
+      blockerFingerprint: "blocker-1",
+      findings: ["store finding"],
+      evidence: ["store evidence"],
+      submittedAt: "2026-01-01T00:00:04.000Z",
+      writebackOperationKeys: [],
+    };
+    const merge = {
+      id: "merge-1",
+      pullRequest,
+      headSha: "abc123",
+      mergeCommitSha: "store-merge-sha",
+      mergedAt: "2026-01-01T00:00:05.000Z",
+      mergedBy: {
+        login: null,
+        profile: null,
+        capability: "github.merge" as const,
+      },
+      checkStatus: {
+        requiredChecks: ["ci/test"],
+        passedChecks: ["ci/test"],
+        noCiEvidence: null,
+      },
+      mergeOperationKey: "merge-op-1",
+      doneTransitionOperationKey: "done-op-1",
+    };
+    const reviewFeedback = {
+      id: "feedback-1",
+      idempotencyKey: "feedback-1",
+      requestHash: "feedback-hash",
+      runId: "review-run-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      kind: "review" as const,
+      event: "APPROVE" as const,
+      body: "Store feedback",
+      pullRequest,
+      reviewer: "store-reviewer",
+      reviewUrl: null,
+      commentUrls: [],
+      submittedAt: "2026-01-01T00:00:06.000Z",
+    };
+    const lifecycle = await lifecycleStore.ensureIssue(issue, {
+      phase: "passed",
+      mergeGate,
+      mergeGateResults: [mergeGateResult],
+      merge,
+      reviewFeedback: [reviewFeedback],
+    });
+    const historyStore = new MemoryIssueStateStore();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+    const historyLifecycle: IssueLifecycleRecord = {
+      ...lifecycle,
+      mergeGate: {
+        ...mergeGate,
+        status: "blocked" as const,
+        blockerFingerprint: "history-blocker",
+      },
+      mergeGateResults: [
+        {
+          ...mergeGateResult,
+          findings: ["history finding"],
+          evidence: ["history evidence"],
+        },
+      ],
+      merge: {
+        ...merge,
+        mergeCommitSha: "history-merge-sha",
+      },
+      reviewFeedback: [
+        {
+          ...reviewFeedback,
+          body: "History feedback",
+          reviewer: "history-reviewer",
+        },
+      ],
+    };
+    historyStore.record = {
+      ...storeCurrent,
+      history: [lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle)],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["lifecycleMergePolicy"],
+    });
+
+    const current = await historyBackedBuilder.build(issue, emptyRuntime());
+
+    expect(current.mergeGate).toMatchObject({
+      id: "merge-gate-1",
+      status: "blocked",
+      blockerFingerprint: "history-blocker",
+    });
+    expect(current.mergePolicyMergeGate).toMatchObject({
+      id: "merge-gate-1",
+      status: "blocked",
+    });
+    expect(current.mergePolicyMergeGateResults).toMatchObject([
+      {
+        id: "merge-gate-result-1",
+        findings: ["history finding"],
+        evidence: ["history evidence"],
+      },
+    ]);
+    expect(current.mergePolicyMerge).toMatchObject({
+      id: "merge-1",
+      mergeCommitSha: "history-merge-sha",
+    });
+    expect(current.mergePolicyReviewFeedback).toMatchObject([
+      {
+        id: "feedback-1",
+        body: "History feedback",
+        reviewer: "history-reviewer",
+      },
+    ]);
+  });
 });
 
 function builderConfig(root: string): ServiceConfig {
@@ -885,6 +1053,11 @@ function lifecycleEvidenceSnapshot(
       lastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
       latestCompletionReport,
       latestApprovalPassVerdict,
+      merge: lifecycle.merge,
+      mergeGate: lifecycle.mergeGate,
+      mergeGateResults: lifecycle.mergeGateResults ?? [],
+      mergeConflict: lifecycle.mergeConflict,
+      reviewFeedback: lifecycle.reviewFeedback,
       summaryPointers: lifecycle.summaryPointers,
     },
     lifecyclePatch: null,
@@ -903,6 +1076,11 @@ function lifecycleEvidenceSnapshot(
     lifecycleLastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
     lifecycleLatestCompletionReport: latestCompletionReport,
     lifecycleLatestApprovalPassVerdict: latestApprovalPassVerdict,
+    lifecycleMerge: lifecycle.merge,
+    lifecycleMergeGate: lifecycle.mergeGate,
+    lifecycleMergeGateResults: lifecycle.mergeGateResults ?? [],
+    lifecycleMergeConflict: lifecycle.mergeConflict,
+    lifecycleReviewFeedback: lifecycle.reviewFeedback,
     lifecycleSummaryCiStatus: lifecycle.summaryPointers.ciStatus,
     lifecycleSummaryPointers: lifecycle.summaryPointers,
   };

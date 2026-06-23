@@ -424,6 +424,11 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   lifecycleLastMergeGateResultId: string | null;
   lifecycleLatestCompletionReport: IssueCompletionReportRecord | null;
   lifecycleLatestApprovalPassVerdict: IssueReviewVerdictRecord | null;
+  lifecycleMerge: IssueMergeMetadata | null;
+  lifecycleMergeGate: IssueMergeGateState | null;
+  lifecycleMergeGateResults: IssueMergeGateResultRecord[] | null;
+  lifecycleMergeConflict: IssueMergeConflictMetadata | null;
+  lifecycleReviewFeedback: IssueReviewFeedbackRecord[] | null;
   lifecycleSummaryCiStatus: string | null;
   lifecycleSummaryPointers: unknown;
 }
@@ -604,6 +609,23 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
             payload,
             "latestApprovalPassVerdict",
           ),
+        lifecycleMerge: recordField<IssueMergeMetadata>(payload, "merge"),
+        lifecycleMergeGate: recordField<IssueMergeGateState>(
+          payload,
+          "mergeGate",
+        ),
+        lifecycleMergeGateResults: recordArrayField<IssueMergeGateResultRecord>(
+          payload,
+          "mergeGateResults",
+        ),
+        lifecycleMergeConflict: recordField<IssueMergeConflictMetadata>(
+          payload,
+          "mergeConflict",
+        ),
+        lifecycleReviewFeedback: recordArrayField<IssueReviewFeedbackRecord>(
+          payload,
+          "reviewFeedback",
+        ),
         lifecycleSummaryCiStatus: stringField(
           recordPayload(payload?.summaryPointers),
           "ciStatus",
@@ -738,6 +760,17 @@ function recordField<T extends object>(
   const value = payload?.[key];
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as T)
+    : null;
+}
+
+function recordArrayField<T extends object>(
+  payload: Record<string, unknown> | null,
+  key: string,
+): T[] | null {
+  const value = payload?.[key];
+  return Array.isArray(value) &&
+    value.every((item) => item && typeof item === "object")
+    ? (value as T[])
     : null;
 }
 
