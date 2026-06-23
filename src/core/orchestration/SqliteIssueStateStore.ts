@@ -25,6 +25,11 @@ interface IssueStateRow {
   current_json: string;
 }
 
+interface IssueIdentityRow {
+  issue_id: string;
+  issue_identifier: string;
+}
+
 interface IssueHistoryRow {
   snapshot_json: string;
 }
@@ -68,6 +73,25 @@ export class SqliteIssueStateStore implements IssueStateStore {
         [issueIdOrIdentifier, issueIdOrIdentifier, issueIdOrIdentifier],
       );
       return row ? this.recordFromRow(database, row) : null;
+    });
+  }
+
+  async getHistory(
+    issueIdOrIdentifier: string,
+  ): Promise<IssueHistorySnapshot[] | null> {
+    return this.withStore(async (database) => {
+      const row = await this.getRow<IssueIdentityRow>(
+        database,
+        `
+          SELECT issue_id, issue_identifier
+          FROM issue_state
+          WHERE issue_id = ? OR issue_identifier = ?
+          ORDER BY CASE WHEN issue_id = ? THEN 0 ELSE 1 END
+          LIMIT 1
+        `,
+        [issueIdOrIdentifier, issueIdOrIdentifier, issueIdOrIdentifier],
+      );
+      return row ? this.historyFromIssueIdUnlocked(database, row.issue_id) : null;
     });
   }
 
@@ -616,19 +640,30 @@ export class SqliteIssueStateStore implements IssueStateStore {
     const current = normalizeIssueCurrentFields(
       JSON.parse(row.current_json) as IssueCurrentFields,
     );
-    const historyRows = await this.allRows<IssueHistoryRow>(
+    const history = await this.historyFromIssueIdUnlocked(
       database,
-      "SELECT snapshot_json FROM issue_history WHERE issue_id = ? ORDER BY sequence",
-      [row.issue_id],
+      row.issue_id,
     );
     return {
       ...current,
-      history: historyRows.map((historyRow) =>
-        normalizeIssueHistorySnapshot(
-          JSON.parse(historyRow.snapshot_json) as IssueHistorySnapshot,
-        ),
-      ),
+      history,
     };
+  }
+
+  private async historyFromIssueIdUnlocked(
+    database: SqliteDatabase,
+    issueId: string,
+  ): Promise<IssueHistorySnapshot[]> {
+    const historyRows = await this.allRows<IssueHistoryRow>(
+      database,
+      "SELECT snapshot_json FROM issue_history WHERE issue_id = ? ORDER BY sequence",
+      [issueId],
+    );
+    return historyRows.map((historyRow) =>
+      normalizeIssueHistorySnapshot(
+        JSON.parse(historyRow.snapshot_json) as IssueHistorySnapshot,
+      ),
+    );
   }
 
   private async exec(database: SqliteDatabase, sql: string): Promise<void> {

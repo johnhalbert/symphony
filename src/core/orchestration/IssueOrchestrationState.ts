@@ -989,6 +989,7 @@ export interface IssueTransition<Context> {
 export interface IssueStateStore {
   close?(): Promise<void>;
   get(issueIdOrIdentifier: string): Promise<IssueStateRecord | null>;
+  getHistory(issueIdOrIdentifier: string): Promise<IssueHistorySnapshot[] | null>;
   list(): Promise<IssueStateRecord[]>;
   ensureIssue(current: IssueCurrentFields): Promise<IssueStateRecord>;
   updateCurrent(

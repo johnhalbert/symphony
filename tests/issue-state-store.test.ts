@@ -1,6 +1,7 @@
 import { access, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import sqlite3 from "sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FileIssueStateStore } from "../src/core/orchestration/FileIssueStateStore.js";
 import { SqliteIssueStateStore } from "../src/core/orchestration/SqliteIssueStateStore.js";
@@ -218,6 +219,58 @@ describe("SqliteIssueStateStore", () => {
     });
   });
 
+  it("reads ordered issue history without parsing cached current_json", async () => {
+    const store = new SqliteIssueStateStore(root);
+    stores.push(store);
+    const current = currentFields();
+    await store.ensureIssue(current);
+    const snapshot = new IssueOrchestrationEngine([
+      {
+        id: "orchestrator.evidence.run",
+        priority: 900,
+        evaluate: () => ({
+          transitionKind: "record_evidence",
+          reason: "run_started",
+          evidenceKind: "run",
+          evidenceEventType: "run_started",
+          evidenceSourceId: "run-1",
+          evidencePayload: {
+            runId: "run-1",
+            role: "worker",
+            runPhase: "implementation",
+            runKind: "implementation",
+            status: "running",
+          },
+        }),
+      },
+    ]).decide(currentSnapshot(current), []);
+    expect(snapshot).not.toBeNull();
+    await store.appendSnapshot(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!,
+    );
+    await store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    await updateSqliteCurrentJson(
+      path.join(root, "issue-state.sqlite"),
+      current.issueId,
+      "{not valid json",
+    );
+    const reloaded = new SqliteIssueStateStore(root);
+    stores.push(reloaded);
+
+    await expect(reloaded.getHistory(current.issueIdentifier)).resolves.toMatchObject([
+      {
+        snapshotKind: "evidence",
+        transitionKind: "record_evidence",
+        evidenceKind: "run",
+        evidenceEventType: "run_started",
+        runId: "run-1",
+      },
+    ]);
+  });
+
   it("round-trips runtime requested transition context in snapshot json", async () => {
     const store = new SqliteIssueStateStore(root);
     stores.push(store);
@@ -280,6 +333,38 @@ describe("SqliteIssueStateStore", () => {
     });
   });
 });
+
+async function updateSqliteCurrentJson(
+  databasePath: string,
+  issueId: string,
+  currentJson: string,
+): Promise<void> {
+  const database = await new Promise<sqlite3.Database>((resolve, reject) => {
+    const opened = new sqlite3.Database(databasePath, (error) => {
+      if (error) reject(error);
+      else resolve(opened);
+    });
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      database.run(
+        "UPDATE issue_state SET current_json = ? WHERE issue_id = ?",
+        [currentJson, issueId],
+        (error) => {
+          if (error) reject(error);
+          else resolve();
+        },
+      );
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      database.close((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+}
 
 function currentFields(): IssueCurrentFields {
   const now = "2026-01-01T00:00:00.000Z";

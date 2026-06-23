@@ -385,6 +385,28 @@ interface IssueCurrentStateBuildContext {
   history: IssueHistorySnapshot[];
 }
 
+interface IssueHistoryEvidenceBuildContext {
+  history: IssueHistorySnapshot[];
+  issue: Issue | null;
+  lifecycle: IssueLifecycleRecord | null;
+  freshness: IssueHistoryEvidenceFreshnessContext;
+  runtime: IssueCurrentStateRuntimeState | null;
+  runningEntry: IssueCurrentStateRuntimeEntry | null;
+  mergePolicyLatestCompletionReport: IssueCompletionReportRecord | null;
+  mergePolicyLatestApprovalVerdict: IssueReviewVerdictRecord | null;
+  pendingPublication: PendingPublicationHandoff;
+  currentIssueTriageFingerprint: string | null;
+  currentPostMortemFingerprint: string | null;
+}
+
+interface IssueHistoryEvidenceFreshnessContext {
+  issueId: string | null;
+  issueUpdatedAt: string | null;
+  lifecycleUpdatedAt: string | null;
+  latestRunId: string | null;
+  runningHasPendingPublicationApproval: boolean | null;
+}
+
 interface HistoryBackedGroupFields {
   tracker?: TrackerFields;
   runSummary?: RunSummaryFields;
@@ -484,6 +506,20 @@ export class IssueCurrentStateBuilder {
     return selectHistoryBackedGroups(historyBuilt, groups);
   }
 
+  async rebuildHistoryBackedFieldsFromStoredHistory(
+    issueIdOrIdentifier: string,
+    groups: readonly IssueCurrentStateHistoryFieldGroup[] = HISTORY_BACKED_FIELD_GROUPS,
+  ): Promise<IssueCurrentStateHistoryRebuildResult> {
+    const history =
+      (await this.options.issueStateStore
+        .getHistory(issueIdOrIdentifier)
+        .catch(() => null)) ?? [];
+    const historyBuilt = this.buildFromHistoryEvidence(
+      buildHistoryEvidenceContext(history),
+    );
+    return selectHistoryBackedGroups(historyBuilt, groups);
+  }
+
   private buildFromStores(
     context: IssueCurrentStateBuildContext,
     now: string,
@@ -503,6 +539,23 @@ export class IssueCurrentStateBuilder {
 
   private buildFromHistory(
     context: IssueCurrentStateBuildContext,
+  ): HistoryBackedGroupResult {
+    return this.buildFromHistoryEvidence(
+      buildHistoryEvidenceContext(context.history, {
+        issue: context.issue,
+        lifecycle: context.lifecycle,
+        latestRunId:
+          context.latestRun?.runId ?? context.pointers?.lastRunId ?? null,
+        runningHasPendingPublicationApproval:
+          context.pendingPublication !== null,
+        runtime: context.runtime,
+        runningEntry: context.runningEntry,
+      }),
+    );
+  }
+
+  private buildFromHistoryEvidence(
+    context: IssueHistoryEvidenceBuildContext,
   ): HistoryBackedGroupResult {
     const tracker = this.buildTrackerFieldsFromHistory(context);
     const runSummary = this.buildRunSummaryFieldsFromHistory(context);
@@ -641,7 +694,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildTrackerFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | { complete: true; fields: TrackerFields; sourceSnapshotId: string }
     | { complete: false; fields: null; sourceSnapshotId: string | null } {
@@ -649,79 +702,21 @@ export class IssueCurrentStateBuilder {
     if (snapshot === null) {
       return { complete: false, fields: null, sourceSnapshotId: null };
     }
-    if (
-      snapshot.issueId !== context.issue.id ||
-      snapshot.observedTrackerUpdatedAt !== context.issue.updatedAt
-    ) {
+    if (!historyTrackerObservationFresh(context, snapshot)) {
       return {
         complete: false,
         fields: null,
         sourceSnapshotId: snapshot.historySnapshotId,
       };
     }
-    const title =
-      typeof snapshot.observedTitle === "string"
-        ? snapshot.observedTitle
-        : null;
-    const state =
-      typeof snapshot.observedTrackerState === "string"
-        ? snapshot.observedTrackerState
-        : null;
-    const labels = stringArrayFromUnknown(snapshot.observedLabels);
-    const blockedBy = issueBlockersFromUnknown(snapshot.observedBlockedBy);
-    if (
-      title === null ||
-      state === null ||
-      labels === null ||
-      blockedBy === null
-    )
+    const issue = issueFromTrackerObservationSnapshot(snapshot);
+    if (issue === null) {
       return {
         complete: false,
         fields: null,
         sourceSnapshotId: snapshot.historySnapshotId,
       };
-    const issue: Issue = {
-      id: snapshot.issueId,
-      identifier: snapshot.issueIdentifier,
-      title,
-      description:
-        typeof snapshot.observedDescription === "string"
-          ? snapshot.observedDescription
-          : null,
-      priority:
-        typeof snapshot.observedPriority === "number"
-          ? snapshot.observedPriority
-          : null,
-      state,
-      branchName:
-        typeof snapshot.observedBranchName === "string"
-          ? snapshot.observedBranchName
-          : null,
-      url:
-        typeof snapshot.observedTrackerUrl === "string"
-          ? snapshot.observedTrackerUrl
-          : null,
-      assigneeId:
-        typeof snapshot.observedAssigneeId === "string"
-          ? snapshot.observedAssigneeId
-          : null,
-      delegateId:
-        typeof snapshot.observedDelegateId === "string"
-          ? snapshot.observedDelegateId
-          : null,
-      assignedToWorker: snapshot.observedAssignedToWorker === true,
-      labels,
-      blockedBy,
-      hasChildren: snapshot.observedHasChildren === true,
-      createdAt:
-        typeof snapshot.observedTrackerCreatedAt === "string"
-          ? snapshot.observedTrackerCreatedAt
-          : null,
-      updatedAt:
-        typeof snapshot.observedTrackerUpdatedAt === "string"
-          ? snapshot.observedTrackerUpdatedAt
-          : null,
-    };
+    }
     return {
       complete: true,
       sourceSnapshotId: snapshot.historySnapshotId,
@@ -748,7 +743,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildRunSummaryFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | {
         complete: true;
@@ -761,7 +756,10 @@ export class IssueCurrentStateBuilder {
     if (latestRun === null) {
       return { complete: false, fields: null, sourceSnapshotIds: [] };
     }
-    if (!historyRunSummaryMatchesKnownStoreState(context, latestRun)) {
+    if (
+      context.freshness.latestRunId !== null &&
+      latestRun.runId !== context.freshness.latestRunId
+    ) {
       return {
         complete: false,
         fields: null,
@@ -788,7 +786,8 @@ export class IssueCurrentStateBuilder {
         latestGitBranchName:
           latestRun.gitBranchName ??
           latestRun.prBranch ??
-          context.issue.branchName,
+          context.issue?.branchName ??
+          null,
         consecutiveSdkErrorFailures: countConsecutiveHistoryWorkerRuns(
           runs,
           isCountedHistorySdkWaitErrorFailure,
@@ -802,7 +801,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildMergePolicyCompletionRunFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | {
         complete: true;
@@ -810,6 +809,17 @@ export class IssueCurrentStateBuilder {
         sourceSnapshotIds: string[];
       }
     | { complete: false; fields: null; sourceSnapshotIds: string[] } {
+    const lifecycleSnapshot = latestLifecycleMutationSnapshot(context.history);
+    if (!historyLifecycleMutationFresh(context, lifecycleSnapshot)) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotIds:
+          lifecycleSnapshot === null
+            ? []
+            : [lifecycleSnapshot.historySnapshotId],
+      };
+    }
     const report = context.mergePolicyLatestCompletionReport;
     if (report === null) {
       return {
@@ -823,19 +833,13 @@ export class IssueCurrentStateBuilder {
     if (run === undefined) {
       return { complete: false, fields: null, sourceSnapshotIds: [] };
     }
-    if (
-      !historyRunSummaryMatchesKnownRun(
-        run,
-        context.mergePolicyLatestCompletionRun,
-      )
-    ) {
-      return {
-        complete: false,
-        fields: null,
-        sourceSnapshotIds: run.sourceSnapshotIds,
-      };
-    }
-    const record = runRecordFromHistorySummary(context, run);
+    const record = runRecordFromHistorySummary(
+      context.issue ?? {
+        id: report.issueId,
+        identifier: report.issueIdentifier,
+      },
+      run,
+    );
     if (record === null) {
       return {
         complete: false,
@@ -851,7 +855,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildLifecycleCoreFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | {
         complete: true;
@@ -863,11 +867,7 @@ export class IssueCurrentStateBuilder {
     if (snapshot === null) {
       return { complete: false, fields: null, sourceSnapshotId: null };
     }
-    if (
-      context.lifecycle === null ||
-      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
-        context.lifecycle.updatedAt
-    ) {
+    if (!historyLifecycleMutationFresh(context, snapshot)) {
       return {
         complete: false,
         fields: null,
@@ -934,7 +934,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildLifecycleReportFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | {
         complete: true;
@@ -946,11 +946,7 @@ export class IssueCurrentStateBuilder {
     if (snapshot === null) {
       return { complete: false, fields: null, sourceSnapshotId: null };
     }
-    if (
-      context.lifecycle === null ||
-      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
-        context.lifecycle.updatedAt
-    ) {
+    if (!historyLifecycleMutationFresh(context, snapshot)) {
       return {
         complete: false,
         fields: null,
@@ -960,50 +956,14 @@ export class IssueCurrentStateBuilder {
     const lastCompletionReportRejectionId = stringFromUnknown(
       snapshot.lifecycleLastCompletionReportRejectionId,
     );
-    if (
-      !historyStringMatchesKnown(
-        lastCompletionReportRejectionId,
-        context.lifecycle.lastCompletionReportRejectionId,
-      )
-    ) {
-      return {
-        complete: false,
-        fields: null,
-        sourceSnapshotId: snapshot.historySnapshotId,
-      };
-    }
     const latestCompletionReport =
       recordFromUnknown<IssueCompletionReportRecord>(
         snapshot.lifecycleLatestCompletionReport,
       );
-    if (
-      !historyRecordIdMatchesKnown(
-        latestCompletionReport,
-        context.mergePolicyLatestCompletionReport?.id,
-      )
-    ) {
-      return {
-        complete: false,
-        fields: null,
-        sourceSnapshotId: snapshot.historySnapshotId,
-      };
-    }
     const latestApprovalPassVerdict =
       recordFromUnknown<IssueReviewVerdictRecord>(
         snapshot.lifecycleLatestApprovalPassVerdict,
       );
-    if (
-      !historyRecordIdMatchesKnown(
-        latestApprovalPassVerdict,
-        context.mergePolicyLatestApprovalVerdict?.id,
-      )
-    ) {
-      return {
-        complete: false,
-        fields: null,
-        sourceSnapshotId: snapshot.historySnapshotId,
-      };
-    }
     return {
       complete: true,
       sourceSnapshotId: snapshot.historySnapshotId,
@@ -1018,7 +978,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildLifecyclePublicationFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | {
         complete: true;
@@ -1030,11 +990,7 @@ export class IssueCurrentStateBuilder {
     if (snapshot === null) {
       return { complete: false, fields: null, sourceSnapshotId: null };
     }
-    if (
-      context.lifecycle === null ||
-      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
-        context.lifecycle.updatedAt
-    ) {
+    if (!historyLifecycleMutationFresh(context, snapshot)) {
       return {
         complete: false,
         fields: null,
@@ -1050,25 +1006,6 @@ export class IssueCurrentStateBuilder {
     const pendingPublicationApprovalReason = stringFromUnknown(
       snapshot.lifecyclePendingPublicationApprovalReason,
     );
-    const expectedRunId =
-      context.pendingPublication?.pendingReport.runId ?? null;
-    const expectedReportId =
-      context.pendingPublication?.pendingReport.id ?? null;
-    const expectedReason =
-      context.pendingPublication === null
-        ? null
-        : (context.lifecycle.blockedReason ?? null);
-    if (
-      pendingPublicationApprovalRunId !== expectedRunId ||
-      pendingPublicationApprovalReportId !== expectedReportId ||
-      pendingPublicationApprovalReason !== expectedReason
-    ) {
-      return {
-        complete: false,
-        fields: null,
-        sourceSnapshotId: snapshot.historySnapshotId,
-      };
-    }
     return {
       complete: true,
       sourceSnapshotId: snapshot.historySnapshotId,
@@ -1081,7 +1018,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildLifecycleMergePolicyFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | {
         complete: true;
@@ -1093,11 +1030,7 @@ export class IssueCurrentStateBuilder {
     if (snapshot === null) {
       return { complete: false, fields: null, sourceSnapshotId: null };
     }
-    if (
-      context.lifecycle === null ||
-      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
-        context.lifecycle.updatedAt
-    ) {
+    if (!historyLifecycleMutationFresh(context, snapshot)) {
       return {
         complete: false,
         fields: null,
@@ -1119,25 +1052,7 @@ export class IssueCurrentStateBuilder {
     const reviewFeedback = recordArrayFromUnknown<IssueReviewFeedbackRecord>(
       snapshot.lifecycleReviewFeedback,
     );
-    if (
-      !historyNullableRecordMatchesKnown(merge, context.lifecycle.merge) ||
-      !historyNullableRecordMatchesKnown(
-        mergeGate,
-        context.lifecycle.mergeGate,
-      ) ||
-      !historyRecordArrayMatchesKnown(
-        mergeGateResults,
-        context.lifecycle.mergeGateResults ?? [],
-      ) ||
-      !historyNullableRecordMatchesKnown(
-        mergeConflict,
-        context.lifecycle.mergeConflict,
-      ) ||
-      !historyRecordArrayMatchesKnown(
-        reviewFeedback,
-        context.lifecycle.reviewFeedback,
-      )
-    ) {
+    if (mergeGateResults === null || reviewFeedback === null) {
       return {
         complete: false,
         fields: null,
@@ -1160,7 +1075,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildLifecycleBreakdownFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | {
         complete: true;
@@ -1172,11 +1087,7 @@ export class IssueCurrentStateBuilder {
     if (snapshot === null) {
       return { complete: false, fields: null, sourceSnapshotId: null };
     }
-    if (
-      context.lifecycle === null ||
-      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
-        context.lifecycle.updatedAt
-    ) {
+    if (!historyLifecycleMutationFresh(context, snapshot)) {
       return {
         complete: false,
         fields: null,
@@ -1189,16 +1100,7 @@ export class IssueCurrentStateBuilder {
     const issueBreakdownPlans = recordArrayFromUnknown<IssueBreakdownPlan>(
       snapshot.lifecycleIssueBreakdownPlans,
     );
-    if (
-      !historyStringMatchesKnown(
-        lastIssueBreakdownPlanId,
-        context.lifecycle.lastIssueBreakdownPlanId,
-      ) ||
-      !historyRecordArrayMatchesKnown(
-        issueBreakdownPlans,
-        context.lifecycle.issueBreakdownPlans,
-      )
-    ) {
+    if (issueBreakdownPlans === null) {
       return {
         complete: false,
         fields: null,
@@ -1241,7 +1143,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildLifecycleTriageFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | {
         complete: true;
@@ -1253,11 +1155,7 @@ export class IssueCurrentStateBuilder {
     if (snapshot === null) {
       return { complete: false, fields: null, sourceSnapshotId: null };
     }
-    if (
-      context.lifecycle === null ||
-      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
-        context.lifecycle.updatedAt
-    ) {
+    if (!historyLifecycleMutationFresh(context, snapshot)) {
       return {
         complete: false,
         fields: null,
@@ -1270,16 +1168,7 @@ export class IssueCurrentStateBuilder {
     const issueTriageReports = recordArrayFromUnknown<IssueTriageReport>(
       snapshot.lifecycleIssueTriageReports,
     );
-    if (
-      !historyStringMatchesKnown(
-        lastIssueTriageReportId,
-        context.lifecycle.lastIssueTriageReportId,
-      ) ||
-      !historyRecordArrayMatchesKnown(
-        issueTriageReports,
-        context.lifecycle.issueTriageReports,
-      )
-    ) {
+    if (issueTriageReports === null) {
       return {
         complete: false,
         fields: null,
@@ -1331,7 +1220,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildLifecyclePostMortemFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | {
         complete: true;
@@ -1344,9 +1233,8 @@ export class IssueCurrentStateBuilder {
       return { complete: false, fields: null, sourceSnapshotId: null };
     }
     if (
-      context.lifecycle === null ||
-      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
-        context.lifecycle.updatedAt
+      !historyLifecycleMutationFresh(context, snapshot) ||
+      !historyIssueEvidenceFresh(context)
     ) {
       return {
         complete: false,
@@ -1360,16 +1248,7 @@ export class IssueCurrentStateBuilder {
     const postMortemReports = recordArrayFromUnknown<IssuePostMortemReport>(
       snapshot.lifecyclePostMortemReports,
     );
-    if (
-      !historyStringMatchesKnown(
-        lastPostMortemReportId,
-        context.lifecycle.lastPostMortemReportId,
-      ) ||
-      !historyRecordArrayMatchesKnown(
-        postMortemReports,
-        context.lifecycle.postMortemReports,
-      )
-    ) {
+    if (postMortemReports === null) {
       return {
         complete: false,
         fields: null,
@@ -1571,10 +1450,10 @@ export class IssueCurrentStateBuilder {
         verdict: mergePolicyLatestApprovalVerdict,
         configFingerprint: mergePolicyConfigHash,
       });
-    const existingIssueState = await this.options.issueStateStore
-      .get(issue.id)
-      .catch(() => null);
-    const history = existingIssueState?.history ?? [];
+    const history =
+      (await this.options.issueStateStore
+        .getHistory(issue.id)
+        .catch(() => null)) ?? [];
     const lastMergePolicyObservation =
       latestMergePolicyObservationForFingerprint(
         history,
@@ -1845,7 +1724,7 @@ export class IssueCurrentStateBuilder {
   }
 
   private buildRuntimeControlFieldsFromHistory(
-    context: IssueCurrentStateBuildContext,
+    context: IssueHistoryEvidenceBuildContext,
   ):
     | {
         complete: true;
@@ -1854,12 +1733,19 @@ export class IssueCurrentStateBuilder {
       }
     | { complete: false; fields: null; sourceSnapshotIds: string[] } {
     const summary = buildRuntimeControlSummaryFromHistory(context.history);
+    if (!historyPendingPublicationStateFresh(context)) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotIds: summary.sourceSnapshotIds,
+      };
+    }
     if (summary.sourceSnapshotIds.length === 0) {
       if (
-        context.runtime.running ||
-        context.runtime.claimed ||
-        context.runtime.paused ||
-        context.runtime.retrying ||
+        context.runtime?.running ||
+        context.runtime?.claimed ||
+        context.runtime?.paused ||
+        context.runtime?.retrying ||
         context.runningEntry !== null
       ) {
         return { complete: false, fields: null, sourceSnapshotIds: [] };
@@ -1944,6 +1830,341 @@ function latestTrackerObservationSnapshot(
     }
   }
   return null;
+}
+
+function historyTrackerObservationFresh(
+  context: IssueHistoryEvidenceBuildContext,
+  snapshot: IssueHistorySnapshot | null,
+): boolean {
+  if (
+    context.freshness.issueId === null &&
+    context.freshness.issueUpdatedAt === null
+  ) {
+    return true;
+  }
+  return (
+    snapshot !== null &&
+    snapshot.issueId === context.freshness.issueId &&
+    stringFromUnknown(snapshot.observedTrackerUpdatedAt) ===
+      context.freshness.issueUpdatedAt
+  );
+}
+
+function historyIssueEvidenceFresh(
+  context: IssueHistoryEvidenceBuildContext,
+): boolean {
+  return historyTrackerObservationFresh(
+    context,
+    latestTrackerObservationSnapshot(context.history),
+  );
+}
+
+function historyLifecycleMutationFresh(
+  context: IssueHistoryEvidenceBuildContext,
+  snapshot: IssueHistorySnapshot | null,
+): boolean {
+  if (context.freshness.lifecycleUpdatedAt === null) return true;
+  return (
+    snapshot !== null &&
+    stringFromUnknown(snapshot.lifecycleUpdatedAt) ===
+      context.freshness.lifecycleUpdatedAt
+  );
+}
+
+function historyPendingPublicationStateFresh(
+  context: IssueHistoryEvidenceBuildContext,
+): boolean {
+  return (
+    context.freshness.runningHasPendingPublicationApproval === null ||
+    context.freshness.runningHasPendingPublicationApproval ===
+      (context.pendingPublication !== null)
+  );
+}
+
+function buildHistoryEvidenceContext(
+  history: readonly IssueHistorySnapshot[],
+  live: {
+    issue?: Issue | null;
+    lifecycle?: IssueLifecycleRecord | null;
+    latestRunId?: string | null;
+    runningHasPendingPublicationApproval?: boolean | null;
+    runtime?: IssueCurrentStateRuntimeState | null;
+    runningEntry?: IssueCurrentStateRuntimeEntry | null;
+  } = {},
+): IssueHistoryEvidenceBuildContext {
+  const trackerSnapshot = latestTrackerObservationSnapshot(history);
+  const lifecycleSnapshot = latestLifecycleMutationSnapshot(history);
+  const issue =
+    trackerSnapshot === null
+      ? null
+      : issueFromTrackerObservationSnapshot(trackerSnapshot);
+  const lifecycle =
+    lifecycleSnapshot === null
+      ? null
+      : lifecycleRecordFromHistorySnapshot(lifecycleSnapshot);
+  const mergePolicyLatestCompletionReport =
+    lifecycleSnapshot === null
+      ? null
+      : recordFromUnknown<IssueCompletionReportRecord>(
+          lifecycleSnapshot.lifecycleLatestCompletionReport,
+        );
+  const mergePolicyLatestApprovalVerdict =
+    lifecycleSnapshot === null
+      ? null
+      : recordFromUnknown<IssueReviewVerdictRecord>(
+          lifecycleSnapshot.lifecycleLatestApprovalPassVerdict,
+        );
+  const pendingPublication = pendingPublicationHandoffForRun(lifecycle);
+  const currentIssueTriageFingerprint =
+    lifecycle === null ? null : issueTriageTriggerFingerprint(lifecycle);
+  const currentPostMortemFingerprint =
+    lifecycle === null || issue === null
+      ? null
+      : issuePostMortemTriggerFingerprint(lifecycle, issue);
+  return {
+    history: [...history],
+    issue,
+    lifecycle,
+    freshness: {
+      issueId: live.issue?.id ?? null,
+      issueUpdatedAt: live.issue?.updatedAt ?? null,
+      lifecycleUpdatedAt: live.lifecycle?.updatedAt ?? null,
+      latestRunId: live.latestRunId ?? null,
+      runningHasPendingPublicationApproval:
+        live.runningHasPendingPublicationApproval ?? null,
+    },
+    runtime: live.runtime ?? null,
+    runningEntry: live.runningEntry ?? null,
+    mergePolicyLatestCompletionReport,
+    mergePolicyLatestApprovalVerdict,
+    pendingPublication,
+    currentIssueTriageFingerprint,
+    currentPostMortemFingerprint,
+  };
+}
+
+function issueFromTrackerObservationSnapshot(
+  snapshot: IssueHistorySnapshot,
+): Issue | null {
+  if (
+    snapshot.snapshotKind !== "evidence" ||
+    snapshot.evidenceKind !== "tracker" ||
+    snapshot.evidenceEventType !== "tracker_issue_observed"
+  ) {
+    return null;
+  }
+  const title = stringFromUnknown(snapshot.observedTitle);
+  const state = stringFromUnknown(snapshot.observedTrackerState);
+  const labels = stringArrayFromUnknown(snapshot.observedLabels);
+  const blockedBy = issueBlockersFromUnknown(snapshot.observedBlockedBy);
+  if (title === null || state === null || labels === null || blockedBy === null)
+    return null;
+  return {
+    id: snapshot.issueId,
+    identifier: snapshot.issueIdentifier,
+    title,
+    description: stringFromUnknown(snapshot.observedDescription),
+    priority: numberFromUnknown(snapshot.observedPriority),
+    state,
+    branchName: stringFromUnknown(snapshot.observedBranchName),
+    url: stringFromUnknown(snapshot.observedTrackerUrl),
+    assigneeId: stringFromUnknown(snapshot.observedAssigneeId),
+    delegateId: stringFromUnknown(snapshot.observedDelegateId),
+    assignedToWorker: snapshot.observedAssignedToWorker === true,
+    labels,
+    blockedBy,
+    hasChildren: snapshot.observedHasChildren === true,
+    createdAt: stringFromUnknown(snapshot.observedTrackerCreatedAt),
+    updatedAt: stringFromUnknown(snapshot.observedTrackerUpdatedAt),
+  };
+}
+
+function lifecycleRecordFromHistorySnapshot(
+  snapshot: IssueHistorySnapshot,
+): IssueLifecycleRecord | null {
+  if (
+    snapshot.snapshotKind !== "evidence" ||
+    snapshot.evidenceKind !== "lifecycle"
+  ) {
+    return null;
+  }
+  const phase = stringFromUnknown(snapshot.lifecyclePhase);
+  const reviewRound = numberFromUnknown(snapshot.lifecycleReviewRound);
+  const incompleteTurnCount = numberFromUnknown(
+    snapshot.lifecycleIncompleteTurnCount,
+  );
+  const planningFailureCount = numberFromUnknown(
+    snapshot.lifecyclePlanningFailureCount,
+  );
+  const planningDispatchRetryCount = numberFromUnknown(
+    snapshot.lifecyclePlanningDispatchRetryCount,
+  );
+  if (
+    phase === null ||
+    reviewRound === null ||
+    incompleteTurnCount === null ||
+    planningFailureCount === null ||
+    planningDispatchRetryCount === null
+  ) {
+    return null;
+  }
+  const summaryPointers = lifecycleSummaryPointersFromUnknown(
+    snapshot.lifecycleSummaryPointers,
+  );
+  const latestCompletionReport =
+    recordFromUnknown<IssueCompletionReportRecord>(
+      snapshot.lifecycleLatestCompletionReport,
+    );
+  const latestApprovalPassVerdict =
+    recordFromUnknown<IssueReviewVerdictRecord>(
+      snapshot.lifecycleLatestApprovalPassVerdict,
+    );
+  const issueBreakdownPlans =
+    recordArrayFromUnknown<IssueBreakdownPlan>(
+      snapshot.lifecycleIssueBreakdownPlans,
+    ) ?? [];
+  const issueTriageReports =
+    recordArrayFromUnknown<IssueTriageReport>(
+      snapshot.lifecycleIssueTriageReports,
+    ) ?? [];
+  const postMortemReports =
+    recordArrayFromUnknown<IssuePostMortemReport>(
+      snapshot.lifecyclePostMortemReports,
+    ) ?? [];
+  const mergeGateResults =
+    recordArrayFromUnknown<IssueMergeGateResultRecord>(
+      snapshot.lifecycleMergeGateResults,
+    ) ?? [];
+  const reviewFeedback =
+    recordArrayFromUnknown<IssueReviewFeedbackRecord>(
+      snapshot.lifecycleReviewFeedback,
+    ) ?? [];
+  const lifecycle: Omit<IssueLifecycleRecord, "handoff"> = {
+    issueId: snapshot.issueId,
+    issueIdentifier: snapshot.issueIdentifier,
+    phase: phase as IssueLifecycleRecord["phase"],
+    reviewRound,
+    incompleteTurnCount,
+    lastIssueBreakdownPlanId: stringFromUnknown(
+      snapshot.lifecycleLastIssueBreakdownPlanId,
+    ),
+    planningFailureCount,
+    planningDispatchRetryCount,
+    lastPlanningFailureRunId: null,
+    lastPlanningFailureAt: stringFromUnknown(
+      snapshot.lifecycleLastPlanningFailureAt,
+    ),
+    lastIssueTriageReportId: stringFromUnknown(
+      snapshot.lifecycleLastIssueTriageReportId,
+    ),
+    lastPostMortemReportId: stringFromUnknown(
+      snapshot.lifecycleLastPostMortemReportId,
+    ),
+    lastCompletionReportId: stringFromUnknown(
+      snapshot.lifecycleLastCompletionReportId,
+    ),
+    lastCompletionReportRejectionId: stringFromUnknown(
+      snapshot.lifecycleLastCompletionReportRejectionId,
+    ),
+    lastReviewVerdictId: stringFromUnknown(
+      snapshot.lifecycleLastReviewVerdictId,
+    ),
+    lastMergeGateResultId: stringFromUnknown(
+      snapshot.lifecycleLastMergeGateResultId,
+    ),
+    blockedReason: stringFromUnknown(snapshot.lifecycleBlockedReason),
+    summaryPointers,
+    summaryReferences: [],
+    issueBreakdownPlans,
+    completionReports:
+      latestCompletionReport === null ? [] : [latestCompletionReport],
+    completionReportRejections: [],
+    reviewVerdicts:
+      latestApprovalPassVerdict === null ? [] : [latestApprovalPassVerdict],
+    mergeGateResults,
+    reviewFeedback,
+    issueTriageReports,
+    postMortemReports,
+    reviewEvidence: emptyHistoryReviewEvidence(),
+    mergeGate: recordFromUnknown<IssueMergeGateState>(
+      snapshot.lifecycleMergeGate,
+    ),
+    merge: recordFromUnknown<IssueMergeMetadata>(snapshot.lifecycleMerge),
+    mergeConflict: recordFromUnknown<IssueMergeConflictMetadata>(
+      snapshot.lifecycleMergeConflict,
+    ),
+    mergeConflictResolutionReports: [],
+    createdAt: snapshot.snapshotAt,
+    updatedAt:
+      stringFromUnknown(snapshot.lifecycleUpdatedAt) ?? snapshot.snapshotAt,
+  };
+  return {
+    ...lifecycle,
+    handoff: emptyHistoryHandoff(lifecycle),
+  };
+}
+
+function lifecycleSummaryPointersFromUnknown(
+  value: unknown,
+): IssueLifecycleRecord["summaryPointers"] {
+  const record =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  return {
+    workspaceKey: stringFromUnknown(record.workspaceKey),
+    workspacePath: stringFromUnknown(record.workspacePath),
+    branchName: stringFromUnknown(record.branchName),
+    gitBranchName: stringFromUnknown(record.gitBranchName),
+    repoPath: stringFromUnknown(record.repoPath),
+    baseRef: stringFromUnknown(record.baseRef),
+    lastRunId: stringFromUnknown(record.lastRunId),
+    prUrl: stringFromUnknown(record.prUrl),
+    prNumber: numberFromUnknown(record.prNumber),
+    prHeadSha: stringFromUnknown(record.prHeadSha),
+    prBranch: stringFromUnknown(record.prBranch),
+    ciStatus: stringFromUnknown(record.ciStatus),
+    lastPushedAt: stringFromUnknown(record.lastPushedAt),
+    lastEvidenceCursor: stringFromUnknown(record.lastEvidenceCursor),
+  };
+}
+
+function emptyHistoryReviewEvidence(): IssueLifecycleRecord["reviewEvidence"] {
+  return {
+    pullRequest: null,
+    lastIngestedCursor: null,
+    lastWorkerEvidenceCursor: null,
+    items: [],
+    updatedAt: null,
+  };
+}
+
+function emptyHistoryHandoff(
+  lifecycle: Omit<IssueLifecycleRecord, "handoff">,
+): IssueLifecycleRecord["handoff"] {
+  const memo: IssueLifecycleRecord["handoff"]["memo"] = {
+    version: 1,
+    issueId: lifecycle.issueId,
+    issueIdentifier: lifecycle.issueIdentifier,
+    updatedAt: lifecycle.updatedAt,
+    reviewRound: lifecycle.reviewRound,
+    incompleteTurnCount: lifecycle.incompleteTurnCount,
+    sizeChars: 0,
+    entries: [],
+    openFindings: [],
+    pointers: lifecycle.summaryPointers,
+    lastWorkerRunId: null,
+    lastReviewerRunId: null,
+  };
+  return {
+    version: 1,
+    memo: {
+      ...memo,
+      sizeChars: JSON.stringify(memo).length,
+    },
+    lastWorkerOutput: null,
+    lastReviewerOutput: null,
+  };
 }
 
 function buildRuntimeControlSummaryFromHistory(
@@ -2338,95 +2559,8 @@ function countConsecutiveHistoryWorkerRuns(
   return count;
 }
 
-function historyRunSummaryMatchesKnownStoreState(
-  context: IssueCurrentStateBuildContext,
-  latestRun: HistoryRunSummary,
-): boolean {
-  const expectedRunId = context.latestRun?.runId ?? context.pointers?.lastRunId;
-  if (expectedRunId && latestRun.runId !== expectedRunId) return false;
-  if (!historyStringMatchesKnown(latestRun.prUrl, context.pointers?.prUrl))
-    return false;
-  if (
-    !historyNumberMatchesKnown(latestRun.prNumber, context.pointers?.prNumber)
-  )
-    return false;
-  if (
-    !historyStringMatchesKnown(latestRun.prHeadSha, context.pointers?.prHeadSha)
-  )
-    return false;
-  if (
-    !historyStringMatchesKnown(latestRun.prBranch, context.pointers?.prBranch)
-  )
-    return false;
-  if (
-    !historyStringMatchesKnown(
-      latestRun.workspaceKey,
-      context.pointers?.workspaceKey,
-    )
-  )
-    return false;
-  if (
-    !historyStringMatchesKnown(
-      latestRun.workspacePath,
-      context.pointers?.workspacePath,
-    )
-  )
-    return false;
-  if (
-    !historyStringMatchesKnown(
-      latestRun.gitBranchName,
-      context.pointers?.gitBranchName ?? context.pointers?.branchName,
-    )
-  )
-    return false;
-  if (!historyStringMatchesKnown(latestRun.prUrl, context.latestRun?.prUrl))
-    return false;
-  if (
-    !historyNumberMatchesKnown(latestRun.prNumber, context.latestRun?.prNumber)
-  )
-    return false;
-  if (
-    !historyStringMatchesKnown(
-      latestRun.prHeadSha,
-      context.latestRun?.prHeadSha,
-    )
-  )
-    return false;
-  if (
-    !historyStringMatchesKnown(latestRun.prBranch, context.latestRun?.prBranch)
-  )
-    return false;
-  return true;
-}
-
-function historyRunSummaryMatchesKnownRun(
-  run: HistoryRunSummary,
-  known: RunRecord | null,
-): boolean {
-  if (known === null) return true;
-  if (run.runId !== known.runId) return false;
-  if (!historyStringMatchesKnown(run.status, known.status)) return false;
-  if (!historyStringMatchesKnown(run.role, known.role)) return false;
-  if (!historyStringMatchesKnown(run.runPhase, known.runPhase)) return false;
-  if (!historyStringMatchesKnown(run.runKind, known.runKind)) return false;
-  if (!historyStringMatchesKnown(run.completedAt, known.completedAt))
-    return false;
-  if (!historyStringMatchesKnown(run.error, known.error)) return false;
-  if (!historyStringMatchesKnown(run.workspaceKey, known.workspaceKey))
-    return false;
-  if (!historyStringMatchesKnown(run.workspacePath, known.workspacePath))
-    return false;
-  if (!historyStringMatchesKnown(run.prompt, known.prompt)) return false;
-  if (!historyNumberMatchesKnown(run.promptCharCount, known.promptCharCount))
-    return false;
-  if (!historyNumberMatchesKnown(run.attempt, known.attempt)) return false;
-  if (!historyNumberMatchesKnown(run.turnNumber, known.turnNumber))
-    return false;
-  return true;
-}
-
 function runRecordFromHistorySummary(
-  context: IssueCurrentStateBuildContext,
+  issue: Pick<Issue, "id" | "identifier">,
   run: HistoryRunSummary,
 ): RunRecord | null {
   if (
@@ -2451,8 +2585,8 @@ function runRecordFromHistorySummary(
       ? {}
       : { runPhase: run.runPhase as AgentRunPhase }),
     ...(run.runKind === null ? {} : { runKind: run.runKind as AgentRunKind }),
-    issueId: context.issue.id,
-    issueIdentifier: context.issue.identifier,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
     attempt: run.attempt,
     turnNumber: run.turnNumber,
     prompt: run.prompt,
@@ -2506,47 +2640,6 @@ function runRecordFromHistorySummary(
       ? {}
       : { failureDiagnosticCode: run.failureDiagnosticCode }),
   };
-}
-
-function historyStringMatchesKnown(
-  historyValue: string | null,
-  knownValue: string | null | undefined,
-): boolean {
-  return knownValue == null || historyValue === knownValue;
-}
-
-function historyNumberMatchesKnown(
-  historyValue: number | null,
-  knownValue: number | null | undefined,
-): boolean {
-  return knownValue == null || historyValue === knownValue;
-}
-
-function historyRecordIdMatchesKnown(
-  historyRecord: { id: string } | null,
-  knownId: string | null | undefined,
-): boolean {
-  return knownId == null || historyRecord?.id === knownId;
-}
-
-function historyNullableRecordMatchesKnown(
-  historyRecord: { id: string } | null,
-  knownRecord: { id: string } | null | undefined,
-): boolean {
-  return knownRecord == null
-    ? historyRecord === null
-    : historyRecord?.id === knownRecord.id;
-}
-
-function historyRecordArrayMatchesKnown<T extends { id: string }>(
-  historyRecords: T[] | null,
-  knownRecords: readonly { id: string }[],
-): historyRecords is T[] {
-  if (historyRecords === null) return false;
-  if (historyRecords.length !== knownRecords.length) return false;
-  return historyRecords.every(
-    (record, index) => record.id === knownRecords[index]?.id,
-  );
 }
 
 function isCountedHistorySdkWaitErrorFailure(run: HistoryRunSummary): boolean {

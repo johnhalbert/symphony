@@ -33,6 +33,13 @@ export class FileIssueStateStore implements IssueStateStore {
     );
   }
 
+  async getHistory(
+    issueIdOrIdentifier: string,
+  ): Promise<IssueHistorySnapshot[] | null> {
+    const record = await this.get(issueIdOrIdentifier);
+    return record === null ? null : record.history;
+  }
+
   async list(): Promise<IssueStateRecord[]> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
     const entries = await fs.readdir(this.recordsDir());

@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import sqlite3 from "sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
@@ -449,7 +450,7 @@ describe("IssueCurrentStateBuilder", () => {
     );
   });
 
-  it("logs a fallback when configured history-backed fields have stale evidence", async () => {
+  it("logs a fallback when configured history-backed fields have malformed evidence", async () => {
     const config = builderConfig(root);
     const historyStore = new MemoryIssueStateStore();
     const warnings: Array<{
@@ -466,14 +467,15 @@ describe("IssueCurrentStateBuilder", () => {
     const liveIssue = issueFixture({
       updatedAt: "2026-01-01T00:00:02.000Z",
     });
-    const staleObservedIssue = issueFixture({
-      title: "Stale title",
-      updatedAt: "2026-01-01T00:00:01.000Z",
-    });
+    const malformedObservedIssue = issueFixture({ title: "Malformed title" });
     const liveCurrent = await storeBuilder.build(liveIssue, emptyRuntime());
+    const malformedSnapshot = {
+      ...trackerEvidenceSnapshot(liveCurrent, malformedObservedIssue),
+      observedLabels: null,
+    } as IssueHistorySnapshot;
     historyStore.record = {
       ...liveCurrent,
-      history: [trackerEvidenceSnapshot(liveCurrent, staleObservedIssue)],
+      history: [malformedSnapshot],
     };
     const historyBackedBuilder = new IssueCurrentStateBuilder({
       config,
@@ -594,7 +596,7 @@ describe("IssueCurrentStateBuilder", () => {
       acceptedAt: "2026-01-01T00:00:03.000Z",
       writebackOperationKeys: [],
     };
-    await lifecycleStore.ensureIssue(issue, {
+    const lifecycle = await lifecycleStore.ensureIssue(issue, {
       phase: "passed",
       lastCompletionReportId: completionReport.id,
       completionReports: [completionReport],
@@ -634,6 +636,7 @@ describe("IssueCurrentStateBuilder", () => {
     historyStore.record = {
       ...storeCurrent,
       history: [
+        lifecycleEvidenceSnapshot(storeCurrent, lifecycle),
         runEvidenceSnapshot(storeCurrent, {
           historySnapshotId: "issue-history:run-completion:started",
           snapshotAt: "2026-01-01T00:00:01.000Z",
@@ -741,7 +744,10 @@ describe("IssueCurrentStateBuilder", () => {
     };
     historyStore.record = {
       ...storeCurrent,
-      history: [lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle)],
+      history: [
+        trackerEvidenceSnapshot(storeCurrent, issue),
+        lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle),
+      ],
     };
     const historyBackedBuilder = new IssueCurrentStateBuilder({
       config,
@@ -845,7 +851,10 @@ describe("IssueCurrentStateBuilder", () => {
     };
     historyStore.record = {
       ...storeCurrent,
-      history: [lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle)],
+      history: [
+        trackerEvidenceSnapshot(storeCurrent, issue),
+        lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle),
+      ],
     };
     const historyBackedBuilder = new IssueCurrentStateBuilder({
       config,
@@ -1406,7 +1415,10 @@ describe("IssueCurrentStateBuilder", () => {
     };
     historyStore.record = {
       ...storeCurrent,
-      history: [lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle)],
+      history: [
+        trackerEvidenceSnapshot(storeCurrent, issue),
+        lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle),
+      ],
     };
     const historyBackedBuilder = new IssueCurrentStateBuilder({
       config,
@@ -1519,6 +1531,116 @@ describe("IssueCurrentStateBuilder", () => {
       expectHistoryRebuildMatchesCurrent(current, rebuilt);
     } finally {
       await stateStore.close();
+    }
+  });
+
+  it("rebuilds history-backed fields without parsing cached sqlite current_json", async () => {
+    const config = builderConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const runStore = new FileRunTranscriptStore(root);
+    const issue = issueFixture({
+      title: "Implement history rebuild",
+      state: "In Review",
+      branchName: "feature/history-rebuild",
+      updatedAt: "2026-01-01T00:00:02.000Z",
+    });
+    const completionReport = completionReportFixture(
+      issue,
+      "run-history-rebuild",
+      {
+        id: "completion-history-rebuild",
+        branchName: "feature/history-rebuild",
+        acceptedAt: "2026-01-01T00:00:03.000Z",
+      },
+    );
+    const lifecycle = await lifecycleStore.ensureIssue(issue, {
+      phase: "passed",
+      lastCompletionReportId: completionReport.id,
+      completionReports: [completionReport],
+    });
+    await startStoredRun(runStore, issue, {
+      runId: "run-history-rebuild",
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:04.000Z",
+      gitBranchName: "feature/history-rebuild",
+    });
+    const stateStore = new SqliteIssueStateStore(root);
+    try {
+      const storeBuilder = new IssueCurrentStateBuilder({
+        config,
+        lifecycleStore,
+        runStore,
+        issueStateStore: stateStore,
+        logger: silentLogger(),
+      });
+      const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+      await stateStore.ensureIssue(storeCurrent);
+      for (const snapshot of [
+        trackerEvidenceSnapshot(storeCurrent, issue),
+        lifecycleEvidenceSnapshot(storeCurrent, lifecycle),
+        ...runEvidenceSnapshots(storeCurrent, {
+          runId: "run-history-rebuild",
+          status: "succeeded",
+          completedAt: "2026-01-01T00:00:04.000Z",
+          gitBranchName: "feature/history-rebuild",
+        }),
+      ]) {
+        await stateStore.appendSnapshot(issue, snapshot);
+      }
+    } finally {
+      await stateStore.close();
+    }
+
+    await updateSqliteCurrentJson(
+      path.join(root, "issue-state.sqlite"),
+      issue.id,
+      "{not valid json",
+    );
+    const historyStore = new SqliteIssueStateStore(root);
+    try {
+      const historyBuilder = new IssueCurrentStateBuilder({
+        config,
+        lifecycleStore,
+        runStore,
+        issueStateStore: historyStore,
+        logger: silentLogger(),
+        historyBackedFieldGroups: HISTORY_BACKED_FIELD_GROUPS,
+      });
+
+      const current = await historyBuilder.build(issue, emptyRuntime());
+      const rebuilt = await historyBuilder.rebuildHistoryBackedFields(
+        issue,
+        emptyRuntime(),
+      );
+      const directRebuilt =
+        await historyBuilder.rebuildHistoryBackedFieldsFromStoredHistory(
+          issue.id,
+          [
+            "tracker",
+            "lifecycleCore",
+            "lifecycleReports",
+            "runSummary",
+            "mergePolicyCompletionRun",
+          ],
+        );
+
+      expect(current).toMatchObject({
+        title: "Implement history rebuild",
+        phase: "passed",
+        latestRunStatus: "succeeded",
+        latestCompletionReport: { id: "completion-history-rebuild" },
+      });
+      expectHistoryRebuildMatchesCurrent(current, rebuilt);
+      expect(directRebuilt.incompleteGroups).toEqual([]);
+      expect(directRebuilt.fields).toMatchObject({
+        title: "Implement history rebuild",
+        phase: "passed",
+        latestRunStatus: "succeeded",
+        latestCompletionReport: { id: "completion-history-rebuild" },
+        mergePolicyLatestCompletionRun: { runId: "run-history-rebuild" },
+      });
+    } finally {
+      await historyStore.close();
     }
   });
 
@@ -2914,11 +3036,47 @@ function pickCurrentFields(
   return picked;
 }
 
+async function updateSqliteCurrentJson(
+  databasePath: string,
+  issueId: string,
+  currentJson: string,
+): Promise<void> {
+  const database = await new Promise<sqlite3.Database>((resolve, reject) => {
+    const opened = new sqlite3.Database(databasePath, (error) => {
+      if (error) reject(error);
+      else resolve(opened);
+    });
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      database.run(
+        "UPDATE issue_state SET current_json = ? WHERE issue_id = ?",
+        [currentJson, issueId],
+        (error) => {
+          if (error) reject(error);
+          else resolve();
+        },
+      );
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      database.close((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+}
+
 class MemoryIssueStateStore implements IssueStateStore {
   record: IssueStateRecord | null = null;
 
   async get(): Promise<IssueStateRecord | null> {
     return this.record;
+  }
+
+  async getHistory(): Promise<IssueHistorySnapshot[] | null> {
+    return this.record?.history ?? null;
   }
 
   async list(): Promise<IssueStateRecord[]> {
