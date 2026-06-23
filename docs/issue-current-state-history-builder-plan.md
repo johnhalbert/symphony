@@ -3,9 +3,10 @@
 Date: 2026-06-23
 
 Status: In progress. Phases 0-3 are implemented; tracker, run-summary,
-lifecycle-core, lifecycle-report, lifecycle merge-policy, and lifecycle
-breakdown history capture plus history-backed current-state building are
-implemented. Remaining history authority work is staged by field group.
+lifecycle-core, lifecycle-report, lifecycle merge-policy, lifecycle breakdown,
+lifecycle triage, and lifecycle post-mortem history capture plus history-backed
+current-state building are implemented. Remaining history authority work is
+staged by field group.
 
 This planning record captures the intended path from the current store-backed
 builder to a history-backed current-state builder. It is not a Spec Kit artifact
@@ -238,14 +239,15 @@ Acceptance:
 
 - Implemented: field-group builder structure, ruleset isolation from candidate
   lanes, typed evidence normalization, tracker observation capture, lifecycle
-  core/report/merge-policy/breakdown evidence, run start, terminal, and pull
-  request evidence, retry scheduled/fired/cleared evidence, and tracker/
-  run-summary/lifecycle-core/lifecycle-report/lifecycle-merge-policy/
-  lifecycle-breakdown history-backed builder support.
+  core/report/merge-policy/breakdown/triage/post-mortem evidence, run start,
+  terminal, and pull request evidence, retry scheduled/fired/cleared evidence,
+  and tracker/run-summary/lifecycle-core/lifecycle-report/
+  lifecycle-merge-policy/lifecycle-breakdown/lifecycle-triage/
+  lifecycle-post-mortem history-backed builder support.
 - Implemented: tracker, run-summary, lifecycle-core, lifecycle-report,
-  lifecycle-merge-policy, and lifecycle-breakdown field authority can be
-  enabled in the builder and are enabled for orchestrator decisions with
-  freshness/completeness guards.
+  lifecycle-merge-policy, lifecycle-breakdown, lifecycle-triage, and
+  lifecycle-post-mortem field authority can be enabled in the builder and are
+  enabled for orchestrator decisions with freshness/completeness guards.
 - Implemented: `current_json` remains written for compatibility and fast reads,
   but is treated as cached current state for field groups that can be rebuilt
   from history.
@@ -253,10 +255,11 @@ Acceptance:
   when candidate history snapshots exist but fail freshness/completeness checks.
 - Partially implemented: parity coverage exists for tracker, run-summary,
   lifecycle-core, lifecycle-report, lifecycle-merge-policy, and
-  lifecycle-breakdown fields. The larger timeline matrix still needs expansion
-  as each additional field group becomes history-backed.
-- Still store-backed: triage, post-mortem, merge-policy latest completion-run
-  object, writeback/approval summaries, and runtime-local fields.
+  lifecycle-breakdown, lifecycle-triage, and lifecycle-post-mortem fields. The
+  larger timeline matrix still needs expansion as each additional field group
+  becomes history-backed.
+- Still store-backed: merge-policy latest completion-run object,
+  writeback/approval summaries, and runtime-local fields.
 
 ## Review Questions
 

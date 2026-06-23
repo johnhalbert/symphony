@@ -10,8 +10,10 @@ import type {
   IssueMergeGateResultRecord,
   IssueMergeGateState,
   IssueMergeMetadata,
+  IssuePostMortemReportRecord,
   IssueReviewFeedbackRecord,
   IssueReviewVerdictRecord,
+  IssueTriageReportRecord,
   IssueTriageBlockerRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import type { RunRecord } from "../persistence/RunTranscriptStore.js";
@@ -421,6 +423,10 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   lifecycleLastPlanningFailureAt: string | null;
   lifecycleLastIssueBreakdownPlanId: string | null;
   lifecycleIssueBreakdownPlans: IssueBreakdownPlanRecord[] | null;
+  lifecycleLastIssueTriageReportId: string | null;
+  lifecycleIssueTriageReports: IssueTriageReportRecord[] | null;
+  lifecycleLastPostMortemReportId: string | null;
+  lifecyclePostMortemReports: IssuePostMortemReportRecord[] | null;
   lifecycleLastCompletionReportId: string | null;
   lifecycleLastCompletionReportRejectionId: string | null;
   lifecycleLastReviewVerdictId: string | null;
@@ -594,6 +600,23 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
           recordArrayField<IssueBreakdownPlanRecord>(
             payload,
             "issueBreakdownPlans",
+          ),
+        lifecycleLastIssueTriageReportId: stringField(
+          payload,
+          "lastIssueTriageReportId",
+        ),
+        lifecycleIssueTriageReports: recordArrayField<IssueTriageReportRecord>(
+          payload,
+          "issueTriageReports",
+        ),
+        lifecycleLastPostMortemReportId: stringField(
+          payload,
+          "lastPostMortemReportId",
+        ),
+        lifecyclePostMortemReports:
+          recordArrayField<IssuePostMortemReportRecord>(
+            payload,
+            "postMortemReports",
           ),
         lifecycleLastCompletionReportId: stringField(
           payload,

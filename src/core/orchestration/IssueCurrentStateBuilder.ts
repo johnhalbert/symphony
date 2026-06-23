@@ -111,7 +111,9 @@ export type IssueCurrentStateHistoryFieldGroup =
   | "lifecycleCore"
   | "lifecycleReports"
   | "lifecycleMergePolicy"
-  | "lifecycleBreakdown";
+  | "lifecycleBreakdown"
+  | "lifecycleTriage"
+  | "lifecyclePostMortem";
 
 type IssueBreakdownPlan = IssueLifecycleRecord["issueBreakdownPlans"][number];
 type IssueTriageReport = IssueLifecycleRecord["issueTriageReports"][number];
@@ -233,6 +235,25 @@ type LifecycleBreakdownFields = Pick<
   | "lastIssueBreakdownPlanSatisfiesCurrentValidation"
 >;
 
+type LifecycleTriageFields = Pick<
+  LifecycleFields,
+  | "lastIssueTriageReportId"
+  | "lastIssueTriageReportTriggerFingerprint"
+  | "lastIssueTriageReportWritebackOperationKeys"
+  | "currentIssueTriageTriggerFingerprint"
+  | "issueTriageCurrentTriggerReportIds"
+  | "latestIssueTriageReportBlockers"
+>;
+
+type LifecyclePostMortemFields = Pick<
+  LifecycleFields,
+  | "lastPostMortemReportId"
+  | "lastPostMortemReportTriggerFingerprint"
+  | "lastPostMortemReportWritebackOperationKeys"
+  | "currentPostMortemTriggerFingerprint"
+  | "postMortemCurrentTriggerReportIds"
+>;
+
 type ConfigFields = Pick<
   IssueCurrentFields,
   | "currentIssueBreakdownConfigFingerprint"
@@ -329,6 +350,8 @@ interface HistoryBackedGroupFields {
   lifecycleReports?: LifecycleReportFields;
   lifecycleMergePolicy?: LifecycleMergePolicyFields;
   lifecycleBreakdown?: LifecycleBreakdownFields;
+  lifecycleTriage?: LifecycleTriageFields;
+  lifecyclePostMortem?: LifecyclePostMortemFields;
 }
 
 interface HistoryBackedGroupResult {
@@ -410,6 +433,9 @@ export class IssueCurrentStateBuilder {
       this.buildLifecycleMergePolicyFieldsFromHistory(context);
     const lifecycleBreakdown =
       this.buildLifecycleBreakdownFieldsFromHistory(context);
+    const lifecycleTriage = this.buildLifecycleTriageFieldsFromHistory(context);
+    const lifecyclePostMortem =
+      this.buildLifecyclePostMortemFieldsFromHistory(context);
     const trackerSourceSnapshotIds =
       tracker.sourceSnapshotId === null ? [] : [tracker.sourceSnapshotId];
     const lifecycleCoreSourceSnapshotIds =
@@ -428,6 +454,14 @@ export class IssueCurrentStateBuilder {
       lifecycleBreakdown.sourceSnapshotId === null
         ? []
         : [lifecycleBreakdown.sourceSnapshotId];
+    const lifecycleTriageSourceSnapshotIds =
+      lifecycleTriage.sourceSnapshotId === null
+        ? []
+        : [lifecycleTriage.sourceSnapshotId];
+    const lifecyclePostMortemSourceSnapshotIds =
+      lifecyclePostMortem.sourceSnapshotId === null
+        ? []
+        : [lifecyclePostMortem.sourceSnapshotId];
     return {
       fields: {
         ...(tracker.fields === null ? {} : { tracker: tracker.fields }),
@@ -446,6 +480,12 @@ export class IssueCurrentStateBuilder {
         ...(lifecycleBreakdown.fields === null
           ? {}
           : { lifecycleBreakdown: lifecycleBreakdown.fields }),
+        ...(lifecycleTriage.fields === null
+          ? {}
+          : { lifecycleTriage: lifecycleTriage.fields }),
+        ...(lifecyclePostMortem.fields === null
+          ? {}
+          : { lifecyclePostMortem: lifecyclePostMortem.fields }),
       },
       incompleteGroups: [
         ...(tracker.complete ? [] : (["tracker"] as const)),
@@ -458,6 +498,10 @@ export class IssueCurrentStateBuilder {
         ...(lifecycleBreakdown.complete
           ? []
           : (["lifecycleBreakdown"] as const)),
+        ...(lifecycleTriage.complete ? [] : (["lifecycleTriage"] as const)),
+        ...(lifecyclePostMortem.complete
+          ? []
+          : (["lifecyclePostMortem"] as const)),
       ],
       sourceSnapshotIds: [
         ...trackerSourceSnapshotIds,
@@ -466,6 +510,8 @@ export class IssueCurrentStateBuilder {
         ...lifecycleReportSourceSnapshotIds,
         ...lifecycleMergePolicySourceSnapshotIds,
         ...lifecycleBreakdownSourceSnapshotIds,
+        ...lifecycleTriageSourceSnapshotIds,
+        ...lifecyclePostMortemSourceSnapshotIds,
       ],
       sourceSnapshotIdsByGroup: {
         tracker: trackerSourceSnapshotIds,
@@ -474,6 +520,8 @@ export class IssueCurrentStateBuilder {
         lifecycleReports: lifecycleReportSourceSnapshotIds,
         lifecycleMergePolicy: lifecycleMergePolicySourceSnapshotIds,
         lifecycleBreakdown: lifecycleBreakdownSourceSnapshotIds,
+        lifecycleTriage: lifecycleTriageSourceSnapshotIds,
+        lifecyclePostMortem: lifecyclePostMortemSourceSnapshotIds,
       },
     };
   }
@@ -966,6 +1014,173 @@ export class IssueCurrentStateBuilder {
     };
   }
 
+  private buildLifecycleTriageFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | {
+        complete: true;
+        fields: LifecycleTriageFields;
+        sourceSnapshotId: string;
+      }
+    | { complete: false; fields: null; sourceSnapshotId: string | null } {
+    const snapshot = latestLifecycleMutationSnapshot(context.history);
+    if (snapshot === null) {
+      return { complete: false, fields: null, sourceSnapshotId: null };
+    }
+    if (
+      context.lifecycle === null ||
+      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
+        context.lifecycle.updatedAt
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const lastIssueTriageReportId = stringFromUnknown(
+      snapshot.lifecycleLastIssueTriageReportId,
+    );
+    const issueTriageReports = recordArrayFromUnknown<IssueTriageReport>(
+      snapshot.lifecycleIssueTriageReports,
+    );
+    if (
+      !historyStringMatchesKnown(
+        lastIssueTriageReportId,
+        context.lifecycle.lastIssueTriageReportId,
+      ) ||
+      !historyRecordArrayMatchesKnown(
+        issueTriageReports,
+        context.lifecycle.issueTriageReports,
+      )
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const currentFingerprint = context.currentIssueTriageFingerprint;
+    const currentTriggerReports =
+      currentFingerprint === null
+        ? []
+        : issueTriageReports.filter(
+            (report) =>
+              report.triggerFingerprint === currentFingerprint &&
+              !isSupersededLifecycleRecord(report),
+          );
+    const lastReport =
+      currentFingerprint === null
+        ? null
+        : latestIssueTriageReportForFingerprintFromReports(
+            issueTriageReports,
+            currentFingerprint,
+          );
+    const latestAnyReport = latestIssueTriageReportFromReports(
+      issueTriageReports,
+      lastIssueTriageReportId,
+    );
+    return {
+      complete: true,
+      sourceSnapshotId: snapshot.historySnapshotId,
+      fields: {
+        lastIssueTriageReportId:
+          lastReport?.id ?? lastIssueTriageReportId ?? null,
+        lastIssueTriageReportTriggerFingerprint:
+          lastReport?.triggerFingerprint ?? null,
+        lastIssueTriageReportWritebackOperationKeys:
+          lastReport?.writebackOperationKeys ?? null,
+        currentIssueTriageTriggerFingerprint: currentFingerprint,
+        issueTriageCurrentTriggerReportIds: currentTriggerReports.map(
+          (report) => report.id,
+        ),
+        latestIssueTriageReportBlockers: activeIssueTriageBlockers(
+          latestAnyReport,
+        ).map((blocker) => ({
+          ...blocker,
+          evidence: [...blocker.evidence],
+        })),
+      },
+    };
+  }
+
+  private buildLifecyclePostMortemFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | {
+        complete: true;
+        fields: LifecyclePostMortemFields;
+        sourceSnapshotId: string;
+      }
+    | { complete: false; fields: null; sourceSnapshotId: string | null } {
+    const snapshot = latestLifecycleMutationSnapshot(context.history);
+    if (snapshot === null) {
+      return { complete: false, fields: null, sourceSnapshotId: null };
+    }
+    if (
+      context.lifecycle === null ||
+      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
+        context.lifecycle.updatedAt
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const lastPostMortemReportId = stringFromUnknown(
+      snapshot.lifecycleLastPostMortemReportId,
+    );
+    const postMortemReports = recordArrayFromUnknown<IssuePostMortemReport>(
+      snapshot.lifecyclePostMortemReports,
+    );
+    if (
+      !historyStringMatchesKnown(
+        lastPostMortemReportId,
+        context.lifecycle.lastPostMortemReportId,
+      ) ||
+      !historyRecordArrayMatchesKnown(
+        postMortemReports,
+        context.lifecycle.postMortemReports,
+      )
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const currentFingerprint = context.currentPostMortemFingerprint;
+    const currentTriggerReports =
+      currentFingerprint === null
+        ? []
+        : postMortemReports.filter(
+            (report) => report.triggerFingerprint === currentFingerprint,
+          );
+    const lastReport =
+      currentFingerprint === null
+        ? null
+        : latestIssuePostMortemReportForFingerprintFromReports(
+            postMortemReports,
+            currentFingerprint,
+          );
+    return {
+      complete: true,
+      sourceSnapshotId: snapshot.historySnapshotId,
+      fields: {
+        lastPostMortemReportId: lastReport?.id ?? lastPostMortemReportId,
+        lastPostMortemReportTriggerFingerprint:
+          lastReport?.triggerFingerprint ?? null,
+        lastPostMortemReportWritebackOperationKeys:
+          lastReport?.writebackOperationKeys ?? null,
+        currentPostMortemTriggerFingerprint: currentFingerprint,
+        postMortemCurrentTriggerReportIds: currentTriggerReports.map(
+          (report) => report.id,
+        ),
+      },
+    };
+  }
+
   private compareHistoryBackedFields(
     storeBuilt: IssueCurrentFields,
     historyBuilt: HistoryBackedGroupResult,
@@ -1451,6 +1666,47 @@ function latestLifecycleMutationSnapshot(
     ) {
       return snapshot;
     }
+  }
+  return null;
+}
+
+function latestIssueTriageReportForFingerprintFromReports(
+  reports: readonly IssueTriageReport[],
+  triggerFingerprint: string,
+): IssueTriageReport | null {
+  for (let index = reports.length - 1; index >= 0; index -= 1) {
+    const report = reports[index];
+    if (
+      report?.triggerFingerprint === triggerFingerprint &&
+      !isSupersededLifecycleRecord(report)
+    ) {
+      return report;
+    }
+  }
+  return null;
+}
+
+function latestIssueTriageReportFromReports(
+  reports: readonly IssueTriageReport[],
+  lastReportId: string | null,
+): IssueTriageReport | null {
+  if (lastReportId !== null) {
+    const exact = reports.find((report) => report.id === lastReportId);
+    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
+  }
+  for (const report of reports.slice().reverse()) {
+    if (!isSupersededLifecycleRecord(report)) return report;
+  }
+  return null;
+}
+
+function latestIssuePostMortemReportForFingerprintFromReports(
+  reports: readonly IssuePostMortemReport[],
+  triggerFingerprint: string,
+): IssuePostMortemReport | null {
+  for (let index = reports.length - 1; index >= 0; index -= 1) {
+    const report = reports[index];
+    if (report?.triggerFingerprint === triggerFingerprint) return report;
   }
   return null;
 }

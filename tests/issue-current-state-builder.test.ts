@@ -982,6 +982,237 @@ describe("IssueCurrentStateBuilder", () => {
       lastIssueBreakdownPlanSatisfiesCurrentValidation: false,
     });
   });
+
+  it("can build lifecycle triage fields from typed history evidence", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture({ state: "Blocked" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    await lifecycleStore.ensureIssue(issue, {
+      phase: "blocked",
+      blockedReason: "max review rounds reached",
+      reviewRound: 4,
+      incompleteTurnCount: 2,
+    });
+    const historyStore = new MemoryIssueStateStore();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const baseCurrent = await storeBuilder.build(issue, emptyRuntime());
+    const triageFingerprint = baseCurrent.currentIssueTriageTriggerFingerprint;
+    if (triageFingerprint === null) {
+      throw new Error("missing triage fingerprint");
+    }
+    const triageBlocker = {
+      kind: "implementation_unsatisfied_requirements" as const,
+      status: "active" as const,
+      nextActor: "worker" as const,
+      confidence: "high" as const,
+      summary: "Store blocker",
+      evidence: ["store blocker evidence"],
+      recommendedAction: "Store blocker action",
+    };
+    const report = {
+      id: "triage-report-1",
+      idempotencyKey: "triage-report-1",
+      requestHash: "triage-hash-1",
+      runId: "triage-run-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      triggerFingerprint: triageFingerprint,
+      disposition: "implementation_repair" as const,
+      confidence: "high" as const,
+      summary: "Store triage summary",
+      evidence: ["store evidence"],
+      recommendedAction: "Store action",
+      blockers: [triageBlocker],
+      submittedAt: "2026-01-01T00:00:01.000Z",
+      writebackOperationKeys: ["store-triage-writeback"],
+    };
+    const lifecycle = await lifecycleStore.updateIssue(issue, {
+      lastIssueTriageReportId: report.id,
+      issueTriageReports: [report],
+    });
+    const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+    const historyLifecycle: IssueLifecycleRecord = {
+      ...lifecycle,
+      issueTriageReports: [
+        {
+          ...report,
+          blockers: [
+            {
+              ...triageBlocker,
+              summary: "History blocker",
+              evidence: ["history blocker evidence"],
+              recommendedAction: "History blocker action",
+            },
+          ],
+          writebackOperationKeys: ["history-triage-writeback"],
+        },
+      ],
+    };
+    historyStore.record = {
+      ...storeCurrent,
+      history: [lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle)],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["lifecycleTriage"],
+    });
+
+    const current = await historyBackedBuilder.build(issue, emptyRuntime());
+
+    expect(current).toMatchObject({
+      lastIssueTriageReportId: "triage-report-1",
+      lastIssueTriageReportTriggerFingerprint: triageFingerprint,
+      lastIssueTriageReportWritebackOperationKeys: ["history-triage-writeback"],
+      currentIssueTriageTriggerFingerprint: triageFingerprint,
+      issueTriageCurrentTriggerReportIds: ["triage-report-1"],
+      latestIssueTriageReportBlockers: [
+        {
+          summary: "History blocker",
+          evidence: ["history blocker evidence"],
+          recommendedAction: "History blocker action",
+        },
+      ],
+    });
+  });
+
+  it("can build lifecycle post-mortem fields from typed history evidence", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture({ state: "Done" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const completionReport = {
+      id: "completion-1",
+      idempotencyKey: "completion-1",
+      runId: "worker-run-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      summary: "Done",
+      validationEvidence: ["validated"],
+      acceptanceChecklist: [],
+      changedFiles: ["src/app.ts"],
+      branchName: "feature/test-1",
+      pullRequest: null,
+      risks: [],
+      acceptedAt: "2026-01-01T00:00:01.000Z",
+      writebackOperationKeys: [],
+    };
+    const passVerdict = {
+      id: "verdict-1",
+      idempotencyKey: "verdict-1",
+      runId: "review-run-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      verdict: "pass" as const,
+      acceptanceResults: [],
+      findings: [],
+      gateFindings: [],
+      discoveryFindings: [],
+      evidence: ["approved"],
+      reviewer: null,
+      submittedAt: "2026-01-01T00:00:02.000Z",
+      writebackOperationKeys: [],
+    };
+    await lifecycleStore.ensureIssue(issue, {
+      phase: "terminal",
+      lastCompletionReportId: completionReport.id,
+      lastReviewVerdictId: passVerdict.id,
+      completionReports: [completionReport],
+      reviewVerdicts: [passVerdict],
+    });
+    const historyStore = new MemoryIssueStateStore();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const baseCurrent = await storeBuilder.build(issue, emptyRuntime());
+    const postMortemFingerprint =
+      baseCurrent.currentPostMortemTriggerFingerprint;
+    if (postMortemFingerprint === null) {
+      throw new Error("missing post-mortem fingerprint");
+    }
+    const report = {
+      id: "post-mortem-1",
+      idempotencyKey: "post-mortem-1",
+      requestHash: "post-mortem-hash-1",
+      runId: "post-mortem-run-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      triggerFingerprint: postMortemFingerprint,
+      summary: "Store post-mortem summary",
+      completionJudgment: {
+        status: "valid_done" as const,
+        rationale: "Done cleanly",
+      },
+      specificationAssessment: {
+        quality: "adequate" as const,
+        classifications: ["well_scoped" as const],
+        missingContractAreas: [],
+        speckitRecommended: false,
+        speckitRationale: "No follow-up needed",
+      },
+      reviewAssessment: {
+        gateDecisionLooksValid: true,
+        missedGateFindings: [],
+        missedDiscoveryFindings: [],
+      },
+      followUpCandidates: [],
+      processLessons: ["store lesson"],
+      submittedAt: "2026-01-01T00:00:03.000Z",
+      writebackOperationKeys: ["store-post-mortem-writeback"],
+    };
+    const lifecycle = await lifecycleStore.updateIssue(issue, {
+      lastPostMortemReportId: report.id,
+      postMortemReports: [report],
+    });
+    const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+    const historyLifecycle: IssueLifecycleRecord = {
+      ...lifecycle,
+      postMortemReports: [
+        {
+          ...report,
+          summary: "History post-mortem summary",
+          processLessons: ["history lesson"],
+          writebackOperationKeys: ["history-post-mortem-writeback"],
+        },
+      ],
+    };
+    historyStore.record = {
+      ...storeCurrent,
+      history: [lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle)],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["lifecyclePostMortem"],
+    });
+
+    const current = await historyBackedBuilder.build(issue, emptyRuntime());
+
+    expect(current).toMatchObject({
+      lastPostMortemReportId: "post-mortem-1",
+      lastPostMortemReportTriggerFingerprint: postMortemFingerprint,
+      lastPostMortemReportWritebackOperationKeys: [
+        "history-post-mortem-writeback",
+      ],
+      currentPostMortemTriggerFingerprint: postMortemFingerprint,
+      postMortemCurrentTriggerReportIds: ["post-mortem-1"],
+    });
+  });
 });
 
 function builderConfig(root: string): ServiceConfig {
@@ -1188,6 +1419,10 @@ function lifecycleEvidenceSnapshot(
       lastPlanningFailureAt: lifecycle.lastPlanningFailureAt,
       lastIssueBreakdownPlanId: lifecycle.lastIssueBreakdownPlanId,
       issueBreakdownPlans: lifecycle.issueBreakdownPlans,
+      lastIssueTriageReportId: lifecycle.lastIssueTriageReportId,
+      issueTriageReports: lifecycle.issueTriageReports,
+      lastPostMortemReportId: lifecycle.lastPostMortemReportId,
+      postMortemReports: lifecycle.postMortemReports,
       lastCompletionReportId: lifecycle.lastCompletionReportId,
       lastCompletionReportRejectionId:
         lifecycle.lastCompletionReportRejectionId,
@@ -1213,6 +1448,10 @@ function lifecycleEvidenceSnapshot(
     lifecycleLastPlanningFailureAt: lifecycle.lastPlanningFailureAt,
     lifecycleLastIssueBreakdownPlanId: lifecycle.lastIssueBreakdownPlanId,
     lifecycleIssueBreakdownPlans: lifecycle.issueBreakdownPlans,
+    lifecycleLastIssueTriageReportId: lifecycle.lastIssueTriageReportId,
+    lifecycleIssueTriageReports: lifecycle.issueTriageReports,
+    lifecycleLastPostMortemReportId: lifecycle.lastPostMortemReportId,
+    lifecyclePostMortemReports: lifecycle.postMortemReports,
     lifecycleLastCompletionReportId: lifecycle.lastCompletionReportId,
     lifecycleLastCompletionReportRejectionId:
       lifecycle.lastCompletionReportRejectionId,

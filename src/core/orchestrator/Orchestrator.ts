@@ -958,6 +958,8 @@ export class Orchestrator {
         "lifecycleReports",
         "lifecycleMergePolicy",
         "lifecycleBreakdown",
+        "lifecycleTriage",
+        "lifecyclePostMortem",
       ],
     });
     this.transitionRulesets = this.createTransitionRulesets();
@@ -8140,6 +8142,11 @@ export class Orchestrator {
         lastIssueBreakdownPlanId:
           input.lifecycle.lastIssueBreakdownPlanId ?? null,
         issueBreakdownPlans: input.lifecycle.issueBreakdownPlans,
+        lastIssueTriageReportId:
+          input.lifecycle.lastIssueTriageReportId ?? null,
+        issueTriageReports: input.lifecycle.issueTriageReports,
+        lastPostMortemReportId: input.lifecycle.lastPostMortemReportId ?? null,
+        postMortemReports: input.lifecycle.postMortemReports,
         lastCompletionReportId: input.lifecycle.lastCompletionReportId ?? null,
         lastCompletionReportRejectionId:
           input.lifecycle.lastCompletionReportRejectionId ?? null,
