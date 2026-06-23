@@ -432,6 +432,60 @@ describe("IssueCurrentStateBuilder", () => {
     );
   });
 
+  it("logs a fallback when configured history-backed fields have stale evidence", async () => {
+    const config = builderConfig(root);
+    const historyStore = new MemoryIssueStateStore();
+    const warnings: Array<{
+      message: string;
+      fields: Record<string, unknown> | undefined;
+    }> = [];
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore: undefined,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const liveIssue = issueFixture({
+      updatedAt: "2026-01-01T00:00:02.000Z",
+    });
+    const staleObservedIssue = issueFixture({
+      title: "Stale title",
+      updatedAt: "2026-01-01T00:00:01.000Z",
+    });
+    const liveCurrent = await storeBuilder.build(liveIssue, emptyRuntime());
+    historyStore.record = {
+      ...liveCurrent,
+      history: [trackerEvidenceSnapshot(liveCurrent, staleObservedIssue)],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore: undefined,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: {
+        warn: (message, fields) => warnings.push({ message, fields }),
+      },
+      historyBackedFieldGroups: ["tracker"],
+    });
+
+    const current = await historyBackedBuilder.build(liveIssue, emptyRuntime());
+
+    expect(current.title).toBe("Implement builder");
+    expect(warnings).toEqual([
+      {
+        message: "issue current-state history-backed field group fallback",
+        fields: {
+          issue_id: "issue-1",
+          issue_identifier: "TEST-1",
+          field_group: "tracker",
+          incomplete_groups: expect.arrayContaining(["tracker"]),
+          source_snapshot_ids: ["issue-history:tracker-evidence"],
+        },
+      },
+    ]);
+  });
+
   it("can build latest run summary fields from typed history evidence", async () => {
     const config = builderConfig(root);
     const issue = issueFixture();

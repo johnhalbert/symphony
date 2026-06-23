@@ -248,6 +248,8 @@ Acceptance:
 - Implemented: `current_json` remains written for compatibility and fast reads,
   but is treated as cached current state for field groups that can be rebuilt
   from history.
+- Implemented: configured history-backed field groups emit fallback warnings
+  when candidate history snapshots exist but fail freshness/completeness checks.
 - Partially implemented: parity coverage exists for tracker, run-summary,
   lifecycle-core, lifecycle-report, and lifecycle-merge-policy fields. The
   larger timeline matrix still needs expansion as each additional field group

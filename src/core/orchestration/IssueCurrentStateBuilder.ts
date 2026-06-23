@@ -324,6 +324,9 @@ interface HistoryBackedGroupResult {
   fields: HistoryBackedGroupFields;
   incompleteGroups: IssueCurrentStateHistoryFieldGroup[];
   sourceSnapshotIds: string[];
+  sourceSnapshotIdsByGroup: Partial<
+    Record<IssueCurrentStateHistoryFieldGroup, string[]>
+  >;
 }
 
 interface HistoryRunSummary {
@@ -394,6 +397,20 @@ export class IssueCurrentStateBuilder {
       this.buildLifecycleReportFieldsFromHistory(context);
     const lifecycleMergePolicy =
       this.buildLifecycleMergePolicyFieldsFromHistory(context);
+    const trackerSourceSnapshotIds =
+      tracker.sourceSnapshotId === null ? [] : [tracker.sourceSnapshotId];
+    const lifecycleCoreSourceSnapshotIds =
+      lifecycleCore.sourceSnapshotId === null
+        ? []
+        : [lifecycleCore.sourceSnapshotId];
+    const lifecycleReportSourceSnapshotIds =
+      lifecycleReports.sourceSnapshotId === null
+        ? []
+        : [lifecycleReports.sourceSnapshotId];
+    const lifecycleMergePolicySourceSnapshotIds =
+      lifecycleMergePolicy.sourceSnapshotId === null
+        ? []
+        : [lifecycleMergePolicy.sourceSnapshotId];
     return {
       fields: {
         ...(tracker.fields === null ? {} : { tracker: tracker.fields }),
@@ -420,18 +437,19 @@ export class IssueCurrentStateBuilder {
           : (["lifecycleMergePolicy"] as const)),
       ],
       sourceSnapshotIds: [
-        ...(tracker.sourceSnapshotId ? [tracker.sourceSnapshotId] : []),
+        ...trackerSourceSnapshotIds,
         ...runSummary.sourceSnapshotIds,
-        ...(lifecycleCore.sourceSnapshotId
-          ? [lifecycleCore.sourceSnapshotId]
-          : []),
-        ...(lifecycleReports.sourceSnapshotId
-          ? [lifecycleReports.sourceSnapshotId]
-          : []),
-        ...(lifecycleMergePolicy.sourceSnapshotId
-          ? [lifecycleMergePolicy.sourceSnapshotId]
-          : []),
+        ...lifecycleCoreSourceSnapshotIds,
+        ...lifecycleReportSourceSnapshotIds,
+        ...lifecycleMergePolicySourceSnapshotIds,
       ],
+      sourceSnapshotIdsByGroup: {
+        tracker: trackerSourceSnapshotIds,
+        runSummary: runSummary.sourceSnapshotIds,
+        lifecycleCore: lifecycleCoreSourceSnapshotIds,
+        lifecycleReports: lifecycleReportSourceSnapshotIds,
+        lifecycleMergePolicy: lifecycleMergePolicySourceSnapshotIds,
+      },
     };
   }
 
@@ -439,7 +457,7 @@ export class IssueCurrentStateBuilder {
     context: IssueCurrentStateBuildContext,
   ):
     | { complete: true; fields: TrackerFields; sourceSnapshotId: string }
-    | { complete: false; fields: null; sourceSnapshotId: null } {
+    | { complete: false; fields: null; sourceSnapshotId: string | null } {
     const snapshot = latestTrackerObservationSnapshot(context.history);
     if (snapshot === null) {
       return { complete: false, fields: null, sourceSnapshotId: null };
@@ -448,7 +466,11 @@ export class IssueCurrentStateBuilder {
       snapshot.issueId !== context.issue.id ||
       snapshot.observedTrackerUpdatedAt !== context.issue.updatedAt
     ) {
-      return { complete: false, fields: null, sourceSnapshotId: null };
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
     }
     const title =
       typeof snapshot.observedTitle === "string"
@@ -466,7 +488,11 @@ export class IssueCurrentStateBuilder {
       labels === null ||
       blockedBy === null
     )
-      return { complete: false, fields: null, sourceSnapshotId: null };
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
     const issue: Issue = {
       id: snapshot.issueId,
       identifier: snapshot.issueIdentifier,
@@ -860,7 +886,7 @@ export class IssueCurrentStateBuilder {
         issue_identifier: storeBuilt.issueIdentifier,
         field_group: group,
         mismatches,
-        source_snapshot_ids: historyBuilt.sourceSnapshotIds,
+        source_snapshot_ids: historyBuilt.sourceSnapshotIdsByGroup[group] ?? [],
       });
     }
   }
@@ -872,10 +898,33 @@ export class IssueCurrentStateBuilder {
     let next = storeBuilt;
     for (const group of this.options.historyBackedFieldGroups ?? []) {
       const fields = historyBuilt.fields[group];
-      if (fields === undefined) continue;
+      if (fields === undefined) {
+        this.warnHistoryBackedFallback(storeBuilt, group, historyBuilt);
+        continue;
+      }
       next = { ...next, ...fields };
     }
     return next;
+  }
+
+  private warnHistoryBackedFallback(
+    storeBuilt: IssueCurrentFields,
+    group: IssueCurrentStateHistoryFieldGroup,
+    historyBuilt: HistoryBackedGroupResult,
+  ): void {
+    const sourceSnapshotIds =
+      historyBuilt.sourceSnapshotIdsByGroup[group] ?? [];
+    if (sourceSnapshotIds.length === 0) return;
+    this.options.logger.warn(
+      "issue current-state history-backed field group fallback",
+      {
+        issue_id: storeBuilt.issueId,
+        issue_identifier: storeBuilt.issueIdentifier,
+        field_group: group,
+        incomplete_groups: historyBuilt.incompleteGroups,
+        source_snapshot_ids: sourceSnapshotIds,
+      },
+    );
   }
 
   async buildSnapshot(
