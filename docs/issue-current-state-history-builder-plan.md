@@ -2,7 +2,9 @@
 
 Date: 2026-06-23
 
-Status: Proposed, pending review.
+Status: In progress. Phases 0-3 are implemented; tracker history capture,
+tracker history-backed current-state building, and retry evidence capture are
+implemented. Remaining history authority work is staged by field group.
 
 This planning record captures the intended path from the current store-backed
 builder to a history-backed current-state builder. It is not a Spec Kit artifact
@@ -39,8 +41,9 @@ succeeded, skipped, and failed action records, plus runtime/domain errors.
 ## Current Gaps
 
 - `SqliteIssueStateStore` stores `current_json` and separate history rows.
-- `current_json` is still treated as persisted current state rather than a
-  rebuildable cache.
+- `current_json` is now documented as cached current state. The tracker field
+  group can be rebuilt from typed history when a fresh tracker observation is
+  available, but most field groups still use store-backed assembly.
 - Issue history is useful for audit but is not yet complete enough to rebuild
   all current fields.
 - Some current-state facts still exist only in lifecycle records, run records,
@@ -229,6 +232,23 @@ Acceptance:
 - Add a rebuild utility/test helper for issue state from history.
 - Keep SQLite schema compatible; avoid destructive migration.
 - Add operational logging for history-incomplete fallback cases.
+
+## Implementation Status
+
+- Implemented: field-group builder structure, ruleset isolation from candidate
+  lanes, typed evidence normalization, tracker observation capture, retry
+  scheduled/fired/cleared evidence, and tracker history-backed builder support.
+- Implemented: tracker field authority can be enabled in the builder and is
+  enabled for orchestrator decisions with a freshness guard on tracker
+  `updatedAt`.
+- Implemented: `current_json` remains written for compatibility and fast reads,
+  but is treated as cached current state for field groups that can be rebuilt
+  from history.
+- Partially implemented: parity coverage exists for tracker fields. The larger
+  timeline matrix still needs expansion as each additional field group becomes
+  history-backed.
+- Still store-backed: lifecycle report/verdict fields, merge policy fields,
+  run failure counters, writeback/approval summaries, and runtime-local fields.
 
 ## Review Questions
 

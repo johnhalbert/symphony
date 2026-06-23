@@ -3,13 +3,14 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { Issue } from "../types.js";
-import type {
-  IssueCurrentFields,
-  IssueHistorySnapshot,
-  IssueStateRecord,
-  IssueStateStore,
-  TransitionActionRecord,
-  TransitionErrorRecord,
+import {
+  normalizeIssueHistorySnapshotEvidenceFields,
+  type IssueCurrentFields,
+  type IssueHistorySnapshot,
+  type IssueStateRecord,
+  type IssueStateStore,
+  type TransitionActionRecord,
+  type TransitionErrorRecord,
 } from "./IssueOrchestrationState.js";
 
 export class FileIssueStateStore implements IssueStateStore {
@@ -18,12 +19,16 @@ export class FileIssueStateStore implements IssueStateStore {
   constructor(private readonly stateDir: string) {}
 
   async get(issueIdOrIdentifier: string): Promise<IssueStateRecord | null> {
-    const direct = await readJsonIfExists<IssueStateRecord>(this.recordPath(issueIdOrIdentifier));
+    const direct = await readJsonIfExists<IssueStateRecord>(
+      this.recordPath(issueIdOrIdentifier),
+    );
     if (direct) return normalizeIssueStateRecord(direct);
     const records = await this.list();
     return (
       records.find(
-        (record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier,
+        (record) =>
+          record.issueId === issueIdOrIdentifier ||
+          record.issueIdentifier === issueIdOrIdentifier,
       ) ?? null
     );
   }
@@ -34,7 +39,11 @@ export class FileIssueStateStore implements IssueStateStore {
     const records = await Promise.all(
       entries
         .filter((entry) => entry.endsWith(".json"))
-        .map((entry) => readJsonIfExists<IssueStateRecord>(path.join(this.recordsDir(), entry))),
+        .map((entry) =>
+          readJsonIfExists<IssueStateRecord>(
+            path.join(this.recordsDir(), entry),
+          ),
+        ),
     );
     return records
       .filter((record): record is IssueStateRecord => record !== null)
@@ -48,7 +57,8 @@ export class FileIssueStateStore implements IssueStateStore {
       ...(existing ?? {}),
       ...current,
       version: 1,
-      recordCreatedAt: existing?.recordCreatedAt ?? current.recordCreatedAt ?? now,
+      recordCreatedAt:
+        existing?.recordCreatedAt ?? current.recordCreatedAt ?? now,
       recordUpdatedAt: now,
       history: existing?.history ?? [],
     };
@@ -56,7 +66,10 @@ export class FileIssueStateStore implements IssueStateStore {
     return record;
   }
 
-  async updateCurrent(issue: Pick<Issue, "id" | "identifier">, patch: Partial<IssueCurrentFields>): Promise<IssueStateRecord> {
+  async updateCurrent(
+    issue: Pick<Issue, "id" | "identifier">,
+    patch: Partial<IssueCurrentFields>,
+  ): Promise<IssueStateRecord> {
     const existing = await this.find(issue.id, issue.identifier);
     if (!existing) {
       throw new Error(`Issue state does not exist for ${issue.identifier}`);
@@ -74,7 +87,10 @@ export class FileIssueStateStore implements IssueStateStore {
     return record;
   }
 
-  async appendSnapshot(issue: Pick<Issue, "id" | "identifier">, snapshot: IssueHistorySnapshot): Promise<IssueStateRecord> {
+  async appendSnapshot(
+    issue: Pick<Issue, "id" | "identifier">,
+    snapshot: IssueHistorySnapshot,
+  ): Promise<IssueStateRecord> {
     const existing = await this.find(issue.id, issue.identifier);
     if (!existing) {
       throw new Error(`Issue state does not exist for ${issue.identifier}`);
@@ -104,8 +120,10 @@ export class FileIssueStateStore implements IssueStateStore {
       found = true;
       return {
         ...snapshot,
-        actions: patch.actions === undefined ? snapshot.actions : [...patch.actions],
-        errors: patch.errors === undefined ? snapshot.errors : [...patch.errors],
+        actions:
+          patch.actions === undefined ? snapshot.actions : [...patch.actions],
+        errors:
+          patch.errors === undefined ? snapshot.errors : [...patch.errors],
       };
     });
     if (!found) return existing;
@@ -125,9 +143,13 @@ export class FileIssueStateStore implements IssueStateStore {
   ): Promise<IssueStateRecord | null> {
     const existing = await this.find(issue.id, issue.identifier);
     if (!existing) return null;
-    const snapshot = existing.history.find((candidate) => candidate.historySnapshotId === historySnapshotId);
+    const snapshot = existing.history.find(
+      (candidate) => candidate.historySnapshotId === historySnapshotId,
+    );
     if (!snapshot) return existing;
-    return this.updateSnapshotActions(issue, historySnapshotId, { actions: [...snapshot.actions, action] });
+    return this.updateSnapshotActions(issue, historySnapshotId, {
+      actions: [...snapshot.actions, action],
+    });
   }
 
   async appendSnapshotError(
@@ -137,12 +159,19 @@ export class FileIssueStateStore implements IssueStateStore {
   ): Promise<IssueStateRecord | null> {
     const existing = await this.find(issue.id, issue.identifier);
     if (!existing) return null;
-    const snapshot = existing.history.find((candidate) => candidate.historySnapshotId === historySnapshotId);
+    const snapshot = existing.history.find(
+      (candidate) => candidate.historySnapshotId === historySnapshotId,
+    );
     if (!snapshot) return existing;
-    return this.updateSnapshotActions(issue, historySnapshotId, { errors: [...snapshot.errors, error] });
+    return this.updateSnapshotActions(issue, historySnapshotId, {
+      errors: [...snapshot.errors, error],
+    });
   }
 
-  private async find(issueId: string, issueIdentifier: string): Promise<IssueStateRecord | null> {
+  private async find(
+    issueId: string,
+    issueIdentifier: string,
+  ): Promise<IssueStateRecord | null> {
     const direct = await this.get(issueId);
     if (direct) return direct;
     return this.get(issueIdentifier);
@@ -151,13 +180,15 @@ export class FileIssueStateStore implements IssueStateStore {
   private async write(record: IssueStateRecord): Promise<void> {
     const key = record.issueId;
     const previous = this.writeLocks.get(key) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(async () => {
-      try {
-        await this.writeUnlocked(record);
-      } finally {
-        if (this.writeLocks.get(key) === current) this.writeLocks.delete(key);
-      }
-    });
+    const current = previous
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          await this.writeUnlocked(record);
+        } finally {
+          if (this.writeLocks.get(key) === current) this.writeLocks.delete(key);
+        }
+      });
     this.writeLocks.set(key, current);
     await current;
   }
@@ -165,7 +196,10 @@ export class FileIssueStateStore implements IssueStateStore {
   private async writeUnlocked(record: IssueStateRecord): Promise<void> {
     await fs.mkdir(this.recordsDir(), { recursive: true });
     const target = this.recordPath(record.issueId);
-    const temp = path.join(this.recordsDir(), `${path.basename(target)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
+    const temp = path.join(
+      this.recordsDir(),
+      `${path.basename(target)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`,
+    );
     await fs.writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, "utf8");
     if (process.platform === "win32") {
       await fs.rm(target, { force: true });
@@ -178,7 +212,10 @@ export class FileIssueStateStore implements IssueStateStore {
   }
 
   private recordPath(issueIdOrIdentifier: string): string {
-    return path.join(this.recordsDir(), `${safeFileName(issueIdOrIdentifier)}.json`);
+    return path.join(
+      this.recordsDir(),
+      `${safeFileName(issueIdOrIdentifier)}.json`,
+    );
   }
 }
 
@@ -187,82 +224,144 @@ function normalizeIssueStateRecord(record: IssueStateRecord): IssueStateRecord {
   const current = normalizeIssueCurrentFields(rawCurrent as IssueCurrentFields);
   return {
     ...current,
-    history: Array.isArray(rawHistory) ? rawHistory.map(normalizeIssueHistorySnapshot) : [],
+    history: Array.isArray(rawHistory)
+      ? rawHistory.map(normalizeIssueHistorySnapshot)
+      : [],
   };
 }
 
-function normalizeIssueCurrentFields(record: IssueCurrentFields): IssueCurrentFields {
+function normalizeIssueCurrentFields(
+  record: IssueCurrentFields,
+): IssueCurrentFields {
   return {
     ...record,
     version: 1,
-    lastPlanningFailureAt: typeof record.lastPlanningFailureAt === "string" ? record.lastPlanningFailureAt : null,
-    planningRetryDueAt: typeof record.planningRetryDueAt === "string" ? record.planningRetryDueAt : null,
-    issueTriageCurrentTriggerReportIds: Array.isArray(record.issueTriageCurrentTriggerReportIds)
-      ? record.issueTriageCurrentTriggerReportIds.filter((item): item is string => typeof item === "string")
+    lastPlanningFailureAt:
+      typeof record.lastPlanningFailureAt === "string"
+        ? record.lastPlanningFailureAt
+        : null,
+    planningRetryDueAt:
+      typeof record.planningRetryDueAt === "string"
+        ? record.planningRetryDueAt
+        : null,
+    issueTriageCurrentTriggerReportIds: Array.isArray(
+      record.issueTriageCurrentTriggerReportIds,
+    )
+      ? record.issueTriageCurrentTriggerReportIds.filter(
+          (item): item is string => typeof item === "string",
+        )
       : [],
-    latestIssueTriageReportBlockers: Array.isArray(record.latestIssueTriageReportBlockers)
+    latestIssueTriageReportBlockers: Array.isArray(
+      record.latestIssueTriageReportBlockers,
+    )
       ? record.latestIssueTriageReportBlockers
       : [],
-    postMortemCurrentTriggerReportIds: Array.isArray(record.postMortemCurrentTriggerReportIds)
-      ? record.postMortemCurrentTriggerReportIds.filter((item): item is string => typeof item === "string")
+    postMortemCurrentTriggerReportIds: Array.isArray(
+      record.postMortemCurrentTriggerReportIds,
+    )
+      ? record.postMortemCurrentTriggerReportIds.filter(
+          (item): item is string => typeof item === "string",
+        )
       : [],
     latestCompletionReport: record.latestCompletionReport ?? null,
     latestApprovalPassVerdict: record.latestApprovalPassVerdict ?? null,
     mergeGate: record.mergeGate ?? null,
     mergeConflict: record.mergeConflict ?? null,
     lifecycleSummaryCiStatus:
-      typeof record.lifecycleSummaryCiStatus === "string" ? record.lifecycleSummaryCiStatus : null,
-    mergePolicyMode: typeof record.mergePolicyMode === "string" ? record.mergePolicyMode : "manual",
-    mergePolicySourceStates: Array.isArray(record.mergePolicySourceStates) ? record.mergePolicySourceStates : [],
-    mergePolicyDoneState: typeof record.mergePolicyDoneState === "string" ? record.mergePolicyDoneState : null,
+      typeof record.lifecycleSummaryCiStatus === "string"
+        ? record.lifecycleSummaryCiStatus
+        : null,
+    lifecyclePersistenceAvailable:
+      record.lifecyclePersistenceAvailable === true,
+    mergePolicyMode:
+      typeof record.mergePolicyMode === "string"
+        ? record.mergePolicyMode
+        : "manual",
+    mergePolicySourceStates: Array.isArray(record.mergePolicySourceStates)
+      ? record.mergePolicySourceStates
+      : [],
+    mergePolicyDoneState:
+      typeof record.mergePolicyDoneState === "string"
+        ? record.mergePolicyDoneState
+        : null,
     mergePolicyConflictsState:
-      typeof record.mergePolicyConflictsState === "string" ? record.mergePolicyConflictsState : null,
-    mergePolicyRequiredChecks: Array.isArray(record.mergePolicyRequiredChecks) ? record.mergePolicyRequiredChecks : [],
+      typeof record.mergePolicyConflictsState === "string"
+        ? record.mergePolicyConflictsState
+        : null,
+    mergePolicyRequiredChecks: Array.isArray(record.mergePolicyRequiredChecks)
+      ? record.mergePolicyRequiredChecks
+      : [],
     mergePolicyMaxMergeGateFailures:
-      typeof record.mergePolicyMaxMergeGateFailures === "number" && Number.isFinite(record.mergePolicyMaxMergeGateFailures)
+      typeof record.mergePolicyMaxMergeGateFailures === "number" &&
+      Number.isFinite(record.mergePolicyMaxMergeGateFailures)
         ? record.mergePolicyMaxMergeGateFailures
         : 0,
     mergePolicyConfigFingerprint:
-      typeof record.mergePolicyConfigFingerprint === "string" ? record.mergePolicyConfigFingerprint : "legacy",
+      typeof record.mergePolicyConfigFingerprint === "string"
+        ? record.mergePolicyConfigFingerprint
+        : "legacy",
     currentMergePolicyObservationInputFingerprint:
       typeof record.currentMergePolicyObservationInputFingerprint === "string"
         ? record.currentMergePolicyObservationInputFingerprint
         : null,
     lastMergePolicyObservationFingerprint:
-      typeof record.lastMergePolicyObservationFingerprint === "string" ? record.lastMergePolicyObservationFingerprint : null,
+      typeof record.lastMergePolicyObservationFingerprint === "string"
+        ? record.lastMergePolicyObservationFingerprint
+        : null,
     lastMergePolicyObservationStatus:
-      typeof record.lastMergePolicyObservationStatus === "string" ? record.lastMergePolicyObservationStatus : null,
+      typeof record.lastMergePolicyObservationStatus === "string"
+        ? record.lastMergePolicyObservationStatus
+        : null,
     lastMergePolicyObservation: record.lastMergePolicyObservation ?? null,
     mergePolicyMerge: record.mergePolicyMerge ?? null,
     mergePolicyMergeGate: record.mergePolicyMergeGate ?? null,
-    mergePolicyMergeGateResults: Array.isArray(record.mergePolicyMergeGateResults)
+    mergePolicyMergeGateResults: Array.isArray(
+      record.mergePolicyMergeGateResults,
+    )
       ? record.mergePolicyMergeGateResults
       : [],
     mergePolicyMergeConflict: record.mergePolicyMergeConflict ?? null,
-    mergePolicyLatestCompletionReport: record.mergePolicyLatestCompletionReport ?? null,
-    mergePolicyLatestApprovalVerdict: record.mergePolicyLatestApprovalVerdict ?? null,
-    mergePolicyReviewFeedback: Array.isArray(record.mergePolicyReviewFeedback) ? record.mergePolicyReviewFeedback : [],
-    mergePolicyLatestCompletionRun: record.mergePolicyLatestCompletionRun ?? null,
+    mergePolicyLatestCompletionReport:
+      record.mergePolicyLatestCompletionReport ?? null,
+    mergePolicyLatestApprovalVerdict:
+      record.mergePolicyLatestApprovalVerdict ?? null,
+    mergePolicyReviewFeedback: Array.isArray(record.mergePolicyReviewFeedback)
+      ? record.mergePolicyReviewFeedback
+      : [],
+    mergePolicyLatestCompletionRun:
+      record.mergePolicyLatestCompletionRun ?? null,
   };
 }
 
-function normalizeIssueHistorySnapshot(snapshot: IssueHistorySnapshot): IssueHistorySnapshot {
-  return {
+function normalizeIssueHistorySnapshot(
+  snapshot: IssueHistorySnapshot,
+): IssueHistorySnapshot {
+  return normalizeIssueHistorySnapshotEvidenceFields({
     ...snapshot,
-    snapshotKind: snapshot.snapshotKind === "evidence" || snapshot.transitionKind === "record_evidence" ? "evidence" : "transition",
+    snapshotKind:
+      snapshot.snapshotKind === "evidence" ||
+      snapshot.transitionKind === "record_evidence"
+        ? "evidence"
+        : "transition",
     triggerSource:
-      snapshot.triggerSource === "manual_cli" || snapshot.triggerSource === "transition"
+      snapshot.triggerSource === "manual_cli" ||
+      snapshot.triggerSource === "transition"
         ? snapshot.triggerSource
         : "orchestrator",
     transitionRequestContext: snapshot.transitionRequestContext ?? null,
-    rulesetVersion: typeof snapshot.rulesetVersion === "string" && snapshot.rulesetVersion.length > 0 ? snapshot.rulesetVersion : "legacy",
+    rulesetVersion:
+      typeof snapshot.rulesetVersion === "string" &&
+      snapshot.rulesetVersion.length > 0
+        ? snapshot.rulesetVersion
+        : "legacy",
     rulesetFingerprint:
-      typeof snapshot.rulesetFingerprint === "string" && snapshot.rulesetFingerprint.length > 0
+      typeof snapshot.rulesetFingerprint === "string" &&
+      snapshot.rulesetFingerprint.length > 0
         ? snapshot.rulesetFingerprint
         : `${snapshot.rulesetId}@legacy:${snapshot.rulesetPriority}`,
     actions: Array.isArray(snapshot.actions) ? snapshot.actions : [],
     errors: Array.isArray(snapshot.errors) ? snapshot.errors : [],
-  };
+  });
 }
 
 async function readJsonIfExists<T>(filePath: string): Promise<T | null> {

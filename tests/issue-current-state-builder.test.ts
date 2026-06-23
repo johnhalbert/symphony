@@ -2,7 +2,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { parseServiceConfig, type ServiceConfig } from "../src/core/config/Config.js";
+import {
+  parseServiceConfig,
+  type ServiceConfig,
+} from "../src/core/config/Config.js";
 import {
   IssueCurrentStateBuilder,
   type IssueCurrentStateRuntimeState,
@@ -22,11 +25,73 @@ describe("IssueCurrentStateBuilder", () => {
   let root: string;
 
   beforeEach(async () => {
-    root = await mkdtemp(path.join(os.tmpdir(), "symphony-current-state-builder-"));
+    root = await mkdtemp(
+      path.join(os.tmpdir(), "symphony-current-state-builder-"),
+    );
   });
 
   afterEach(async () => {
-    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    await rm(root, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 25,
+    });
+  });
+
+  it("builds tracker, config, run, and runtime defaults without optional stores", async () => {
+    const builder = new IssueCurrentStateBuilder({
+      config: builderConfig(root),
+      lifecycleStore: undefined,
+      runStore: undefined,
+      issueStateStore: new MemoryIssueStateStore(),
+      logger: silentLogger(),
+    });
+    const issue = issueFixture({
+      priority: 1,
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "feature/defaults",
+      assigneeId: null,
+      delegateId: "delegate-1",
+      assignedToWorker: false,
+      createdAt: "2026-01-01T00:00:01.000Z",
+      updatedAt: "2026-01-01T00:00:02.000Z",
+    });
+
+    const current = await builder.build(issue, emptyRuntime());
+
+    expect(current).toMatchObject({
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      priority: 1,
+      trackerState: "Todo",
+      branchName: "feature/defaults",
+      assigneeId: null,
+      delegateId: "delegate-1",
+      assignedToWorker: false,
+      labels: ["dogfood-ready"],
+      trackerCreatedAt: "2026-01-01T00:00:01.000Z",
+      trackerUpdatedAt: "2026-01-01T00:00:02.000Z",
+      lifecyclePersistenceAvailable: false,
+      mergePolicyMode: "gated",
+      mergePolicySourceStates: ["Ready to Merge"],
+      mergePolicyDoneState: "Done",
+      mergePolicyConflictsState: "Merge Conflict",
+      mergePolicyRequiredChecks: ["ci/test"],
+      latestRunId: null,
+      latestRunStatus: null,
+      running: false,
+      runningRole: null,
+      claimed: false,
+      paused: false,
+      retrying: false,
+    });
+    expect(current.currentIssueContentFingerprint).toMatch(/^[a-f0-9]+$/);
+    expect(current.currentIssueBreakdownConfigFingerprint).toMatch(
+      /^[a-f0-9]+$/,
+    );
+    expect(current.mergePolicyConfigFingerprint).toMatch(/^[a-f0-9]+$/);
   });
 
   it("builds tracker, lifecycle, run, and runtime fields from explicit inputs", async () => {
@@ -61,8 +126,18 @@ describe("IssueCurrentStateBuilder", () => {
         gitBranchName: "feature/test-1",
       },
     });
-    await startFailedWorkerRun(runStore, issue, "run-old", "2026-01-01T00:00:00.000Z");
-    await startFailedWorkerRun(runStore, issue, "run-latest", "2026-01-01T00:01:00.000Z");
+    await startFailedWorkerRun(
+      runStore,
+      issue,
+      "run-old",
+      "2026-01-01T00:00:00.000Z",
+    );
+    await startFailedWorkerRun(
+      runStore,
+      issue,
+      "run-latest",
+      "2026-01-01T00:01:00.000Z",
+    );
 
     const builder = new IssueCurrentStateBuilder({
       config,
@@ -111,6 +186,7 @@ describe("IssueCurrentStateBuilder", () => {
       latestPrHeadSha: "abc123",
       latestWorkspaceKey: "wk-1",
       latestGitBranchName: "feature/test-1",
+      lifecyclePersistenceAvailable: true,
       running: true,
       runningRole: "worker",
       runningRunPhase: "implementation",
@@ -134,23 +210,27 @@ describe("IssueCurrentStateBuilder", () => {
       issueStateStore: new MemoryIssueStateStore(),
       logger: silentLogger(),
     });
-    const snapshot = await builder.buildSnapshot(issueFixture(), emptyRuntime(), {
-      triggerType: "orchestrator.tick",
-      triggerSource: "orchestrator",
-      candidateSource: "worker_candidates",
-      transitionRequestContext: null,
-      availableSlots: 3,
-      providerDispatchGateActive: false,
-      stateSlotAvailable: true,
-      allowExistingClaim: true,
-      manualStage: null,
-      manualForceLabels: false,
-      manualIgnoreState: false,
-      snapshotPatch: {
-        manualStage: "worker",
-        manualForceLabels: true,
+    const snapshot = await builder.buildSnapshot(
+      issueFixture(),
+      emptyRuntime(),
+      {
+        triggerType: "orchestrator.tick",
+        triggerSource: "orchestrator",
+        candidateSource: "worker_candidates",
+        transitionRequestContext: null,
+        availableSlots: 3,
+        providerDispatchGateActive: false,
+        stateSlotAvailable: true,
+        allowExistingClaim: true,
+        manualStage: null,
+        manualForceLabels: false,
+        manualIgnoreState: false,
+        snapshotPatch: {
+          manualStage: "worker",
+          manualForceLabels: true,
+        },
       },
-    });
+    );
 
     expect(snapshot).toMatchObject({
       triggerType: "orchestrator.tick",
@@ -167,11 +247,16 @@ describe("IssueCurrentStateBuilder", () => {
     expect(snapshot.snapshotId).toMatch(/^issue-snapshot:/);
     expect(snapshot.triggerId).toMatch(/^orchestrator\.tick:/);
     expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.labels)).toBe(true);
+    expect("current" in snapshot).toBe(false);
   });
 
   it("reuses a fresh merge policy observation from issue history", async () => {
     const config = builderConfig(root);
-    const issue = issueFixture({ state: "Ready to Merge", updatedAt: "2026-01-01T00:00:00.000Z" });
+    const issue = issueFixture({
+      state: "Ready to Merge",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const lifecycle = await lifecycleStore.ensureIssue(issue, {
       phase: "passed",
@@ -190,7 +275,12 @@ describe("IssueCurrentStateBuilder", () => {
           changedFiles: [],
           branchName: "feature/test-1",
           risks: [],
-          pullRequest: { url: "https://github.test/acme/repo/pull/7", number: 7, headSha: "abc123", branch: "feature/test-1" },
+          pullRequest: {
+            url: "https://github.test/acme/repo/pull/7",
+            number: 7,
+            headSha: "abc123",
+            branch: "feature/test-1",
+          },
           acceptedAt: "2026-01-01T00:00:01.000Z",
           writebackOperationKeys: [],
         },
@@ -222,11 +312,15 @@ describe("IssueCurrentStateBuilder", () => {
       issueStateStore: historyStore,
       logger: silentLogger(),
     });
-    const withoutObservation = await builderWithoutHistory.build(issue, emptyRuntime());
+    const withoutObservation = await builderWithoutHistory.build(
+      issue,
+      emptyRuntime(),
+    );
     const observation = {
       version: 1,
       status: "ready",
-      inputFingerprint: withoutObservation.currentMergePolicyObservationInputFingerprint,
+      inputFingerprint:
+        withoutObservation.currentMergePolicyObservationInputFingerprint,
       observedAt: "2026-01-01T00:00:03.000Z",
       observationKind: "checks_pending",
       nextTransitionKind: "merge_policy_observe_checks_pending",
@@ -252,14 +346,87 @@ describe("IssueCurrentStateBuilder", () => {
       ],
     };
 
-    const withObservation = await builderWithoutHistory.build(issue, emptyRuntime());
+    const withObservation = await builderWithoutHistory.build(
+      issue,
+      emptyRuntime(),
+    );
 
-    expect(withObservation.lastMergePolicyObservationFingerprint).toBe(withoutObservation.currentMergePolicyObservationInputFingerprint);
+    expect(withObservation.lastMergePolicyObservationFingerprint).toBe(
+      withoutObservation.currentMergePolicyObservationInputFingerprint,
+    );
     expect(withObservation.lastMergePolicyObservationStatus).toBe("ready");
     expect(withObservation.lastMergePolicyObservation).toMatchObject({
-      inputFingerprint: withoutObservation.currentMergePolicyObservationInputFingerprint,
+      inputFingerprint:
+        withoutObservation.currentMergePolicyObservationInputFingerprint,
       observationKind: "checks_pending",
     });
+  });
+
+  it("can build tracker fields from typed history evidence", async () => {
+    const config = builderConfig(root);
+    const historyStore = new MemoryIssueStateStore();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore: undefined,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const liveIssue = issueFixture({
+      title: "Live title",
+      state: "In Progress",
+      labels: ["live"],
+      priority: 1,
+      updatedAt: "2026-01-01T00:00:01.000Z",
+    });
+    const observedIssue = issueFixture({
+      title: "Observed title",
+      description: "Observed body",
+      state: "Todo",
+      labels: ["observed"],
+      priority: 2,
+      branchName: "feature/observed",
+      assigneeId: "worker-2",
+      delegateId: "delegate-1",
+      assignedToWorker: false,
+      blockedBy: [{ id: "dep-1", identifier: "TEST-0", state: "Todo" }],
+      hasChildren: true,
+      updatedAt: "2026-01-01T00:00:01.000Z",
+    });
+    const liveCurrent = await storeBuilder.build(liveIssue, emptyRuntime());
+    historyStore.record = {
+      ...liveCurrent,
+      history: [trackerEvidenceSnapshot(liveCurrent, observedIssue)],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore: undefined,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["tracker"],
+      compareHistoryBackedFieldGroups: ["tracker"],
+    });
+
+    const current = await historyBackedBuilder.build(liveIssue, emptyRuntime());
+
+    expect(current).toMatchObject({
+      title: "Observed title",
+      description: "Observed body",
+      trackerState: "Todo",
+      labels: ["observed"],
+      priority: 2,
+      branchName: "feature/observed",
+      assigneeId: "worker-2",
+      delegateId: "delegate-1",
+      assignedToWorker: false,
+      blockedBy: [{ id: "dep-1", identifier: "TEST-0", state: "Todo" }],
+      hasChildren: true,
+      trackerUpdatedAt: "2026-01-01T00:00:01.000Z",
+    });
+    expect(current.currentIssueContentFingerprint).not.toBe(
+      liveCurrent.currentIssueContentFingerprint,
+    );
   });
 });
 
@@ -362,6 +529,60 @@ async function startFailedWorkerRun(
   });
 }
 
+function trackerEvidenceSnapshot(
+  current: IssueCurrentFields,
+  observed: Issue,
+): IssueHistorySnapshot {
+  const at = "2026-01-01T00:00:03.000Z";
+  return {
+    ...current,
+    snapshotId: "issue-snapshot:tracker-evidence",
+    snapshotAt: at,
+    triggerType: "orchestrator.tick",
+    triggerId: "orchestrator.tick:tracker-evidence",
+    triggerAt: at,
+    triggerSource: "orchestrator",
+    candidateSource: "evidence.tracker.tracker_issue_observed",
+    transitionRequestContext: null,
+    availableSlots: 1,
+    providerDispatchGateActive: false,
+    stateSlotAvailable: true,
+    allowExistingClaim: false,
+    manualStage: null,
+    manualForceLabels: false,
+    manualIgnoreState: false,
+    snapshotKind: "evidence",
+    historySnapshotId: "issue-history:tracker-evidence",
+    transitionKind: "record_evidence",
+    transitionId: "transition:record_evidence:tracker-evidence",
+    rulesetId: "orchestrator.evidence.tracker",
+    rulesetVersion: "test",
+    rulesetFingerprint: "orchestrator.evidence.tracker@test:900",
+    rulesetPriority: 900,
+    reason: "tracker_issue_observed",
+    actions: [],
+    errors: [],
+    evidenceKind: "tracker",
+    evidenceEventType: "tracker_issue_observed",
+    evidenceSourceId: observed.id,
+    evidencePayload: null,
+    observedTitle: observed.title,
+    observedDescription: observed.description,
+    observedTrackerState: observed.state,
+    observedLabels: observed.labels,
+    observedBranchName: observed.branchName,
+    observedTrackerUrl: observed.url,
+    observedPriority: observed.priority,
+    observedAssigneeId: observed.assigneeId,
+    observedDelegateId: observed.delegateId,
+    observedAssignedToWorker: observed.assignedToWorker,
+    observedBlockedBy: observed.blockedBy,
+    observedHasChildren: observed.hasChildren === true,
+    observedTrackerCreatedAt: observed.createdAt,
+    observedTrackerUpdatedAt: observed.updatedAt,
+  };
+}
+
 class MemoryIssueStateStore implements IssueStateStore {
   record: IssueStateRecord | null = null;
 
@@ -378,15 +599,24 @@ class MemoryIssueStateStore implements IssueStateStore {
     return this.record;
   }
 
-  async updateCurrent(_issue: Pick<Issue, "id" | "identifier">, patch: Partial<IssueCurrentFields>): Promise<IssueStateRecord> {
+  async updateCurrent(
+    _issue: Pick<Issue, "id" | "identifier">,
+    patch: Partial<IssueCurrentFields>,
+  ): Promise<IssueStateRecord> {
     if (!this.record) throw new Error("missing record");
     this.record = { ...this.record, ...patch };
     return this.record;
   }
 
-  async appendSnapshot(_issue: Pick<Issue, "id" | "identifier">, snapshot: IssueHistorySnapshot): Promise<IssueStateRecord> {
+  async appendSnapshot(
+    _issue: Pick<Issue, "id" | "identifier">,
+    snapshot: IssueHistorySnapshot,
+  ): Promise<IssueStateRecord> {
     if (!this.record) throw new Error("missing record");
-    this.record = { ...this.record, history: [...this.record.history, snapshot] };
+    this.record = {
+      ...this.record,
+      history: [...this.record.history, snapshot],
+    };
     return this.record;
   }
 

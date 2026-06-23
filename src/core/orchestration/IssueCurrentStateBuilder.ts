@@ -2,9 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { ServiceConfig } from "../config/Config.js";
 import { errorMessage } from "../errors.js";
 import type { Logger } from "../logging/StructuredLogger.js";
-import {
-  pendingPublicationHandoffForRun,
-} from "../CompletionReportService.js";
+import { pendingPublicationHandoffForRun } from "../CompletionReportService.js";
 import { OPERATOR_REJECTED_PUBLICATION_ERROR } from "../approval/OperatorApprovalService.js";
 import {
   issueBreakdownConfigFingerprint,
@@ -35,7 +33,12 @@ import {
   type RunRecord,
   type RunTranscriptStore,
 } from "../persistence/RunTranscriptStore.js";
-import { runKindForPhase, type AgentRunPhase, type AgentRunRole, type Issue } from "../types.js";
+import {
+  runKindForPhase,
+  type AgentRunPhase,
+  type AgentRunRole,
+  type Issue,
+} from "../types.js";
 import type {
   IssueCurrentStateSnapshot,
   IssueCurrentFields,
@@ -93,13 +96,395 @@ export interface IssueCurrentStateBuilderOptions {
   runStore: RunTranscriptStore | undefined;
   issueStateStore: IssueStateStore;
   logger: Pick<Logger, "warn">;
+  historyBackedFieldGroups?: readonly IssueCurrentStateHistoryFieldGroup[];
+  compareHistoryBackedFieldGroups?: readonly IssueCurrentStateHistoryFieldGroup[];
+}
+
+export type IssueCurrentStateHistoryFieldGroup = "tracker";
+
+type IssueBreakdownPlan = IssueLifecycleRecord["issueBreakdownPlans"][number];
+type IssueTriageReport = IssueLifecycleRecord["issueTriageReports"][number];
+type IssuePostMortemReport = IssueLifecycleRecord["postMortemReports"][number];
+type PendingPublicationHandoff = ReturnType<
+  typeof pendingPublicationHandoffForRun
+>;
+
+type TrackerFields = Pick<
+  IssueCurrentFields,
+  | "issueId"
+  | "issueIdentifier"
+  | "title"
+  | "description"
+  | "priority"
+  | "trackerState"
+  | "branchName"
+  | "trackerUrl"
+  | "assigneeId"
+  | "delegateId"
+  | "assignedToWorker"
+  | "labels"
+  | "blockedBy"
+  | "hasChildren"
+  | "trackerCreatedAt"
+  | "trackerUpdatedAt"
+  | "currentIssueContentFingerprint"
+>;
+
+type LifecycleFields = Pick<
+  IssueCurrentFields,
+  | "phase"
+  | "reviewRound"
+  | "incompleteTurnCount"
+  | "planningFailureCount"
+  | "planningDispatchRetryCount"
+  | "lastPlanningFailureAt"
+  | "planningRetryDueAt"
+  | "blockedReason"
+  | "lastIssueBreakdownPlanId"
+  | "lastIssueBreakdownPlanApplicationStatus"
+  | "lastIssueBreakdownPlanIssueContentFingerprint"
+  | "lastIssueBreakdownPlanConfigFingerprint"
+  | "lastIssueBreakdownPlanSatisfiesCurrentValidation"
+  | "lastIssueTriageReportId"
+  | "lastIssueTriageReportTriggerFingerprint"
+  | "lastIssueTriageReportWritebackOperationKeys"
+  | "currentIssueTriageTriggerFingerprint"
+  | "issueTriageCurrentTriggerReportIds"
+  | "latestIssueTriageReportBlockers"
+  | "lastPostMortemReportId"
+  | "lastPostMortemReportTriggerFingerprint"
+  | "lastPostMortemReportWritebackOperationKeys"
+  | "currentPostMortemTriggerFingerprint"
+  | "postMortemCurrentTriggerReportIds"
+  | "lastCompletionReportId"
+  | "lastCompletionReportRejectionId"
+  | "lastReviewVerdictId"
+  | "lastMergeGateResultId"
+  | "latestCompletionReport"
+  | "latestApprovalPassVerdict"
+  | "mergeGate"
+  | "mergeConflict"
+  | "lifecycleSummaryCiStatus"
+  | "mergePolicyMerge"
+  | "mergePolicyMergeGate"
+  | "mergePolicyMergeGateResults"
+  | "mergePolicyMergeConflict"
+  | "mergePolicyLatestCompletionReport"
+  | "mergePolicyLatestApprovalVerdict"
+  | "mergePolicyReviewFeedback"
+  | "pendingPublicationApprovalRunId"
+  | "pendingPublicationApprovalReportId"
+  | "pendingPublicationApprovalReason"
+>;
+
+type ConfigFields = Pick<
+  IssueCurrentFields,
+  | "currentIssueBreakdownConfigFingerprint"
+  | "lifecyclePersistenceAvailable"
+  | "mergePolicyMode"
+  | "mergePolicySourceStates"
+  | "mergePolicyDoneState"
+  | "mergePolicyConflictsState"
+  | "mergePolicyRequiredChecks"
+  | "mergePolicyMaxMergeGateFailures"
+  | "mergePolicyConfigFingerprint"
+>;
+
+type HistoryFields = Pick<
+  IssueCurrentFields,
+  | "currentMergePolicyObservationInputFingerprint"
+  | "lastMergePolicyObservationFingerprint"
+  | "lastMergePolicyObservationStatus"
+  | "lastMergePolicyObservation"
+>;
+
+type RunFields = Pick<
+  IssueCurrentFields,
+  | "mergePolicyLatestCompletionRun"
+  | "latestRunId"
+  | "latestRunStatus"
+  | "latestRunRole"
+  | "latestRunPhase"
+  | "latestRunKind"
+  | "latestRunCompletedAt"
+  | "latestRunError"
+  | "latestPrUrl"
+  | "latestPrNumber"
+  | "latestPrHeadSha"
+  | "latestPrBranch"
+  | "latestWorkspaceKey"
+  | "latestWorkspacePath"
+  | "latestGitBranchName"
+  | "consecutiveSdkErrorFailures"
+  | "consecutiveInfraFailures"
+>;
+
+type RuntimeFields = Pick<
+  IssueCurrentFields,
+  | "running"
+  | "runningRole"
+  | "runningRunPhase"
+  | "runningRunKind"
+  | "runningManualDispatchStage"
+  | "runningManualIgnoreState"
+  | "runningHasPendingPublicationApproval"
+  | "runningCancellationRequested"
+  | "claimed"
+  | "paused"
+  | "retrying"
+>;
+
+type TriggerFields = Omit<IssueCurrentStateSnapshot, keyof IssueCurrentFields>;
+
+interface IssueCurrentStateBuildContext {
+  issue: Issue;
+  runtime: IssueCurrentStateRuntimeState;
+  lifecycle: IssueLifecycleRecord | null;
+  runs: RunRecord[];
+  latestRun: RunRecord | null;
+  pointers: IssueLifecycleRecord["summaryPointers"] | null;
+  lastIssueBreakdownPlan: IssueBreakdownPlan | null;
+  currentIssueFingerprint: string;
+  currentIssueBreakdownFingerprint: string;
+  currentIssueTriageFingerprint: string | null;
+  issueTriageCurrentTriggerReports: IssueTriageReport[];
+  lastIssueTriageReport: IssueTriageReport | null;
+  latestAnyIssueTriageReport: IssueTriageReport | null;
+  currentPostMortemFingerprint: string | null;
+  postMortemCurrentTriggerReports: IssuePostMortemReport[];
+  lastPostMortemReport: IssuePostMortemReport | null;
+  mergePolicyConfigHash: string;
+  mergePolicyLatestCompletionReport: IssueCompletionReportRecord | null;
+  mergePolicyLatestApprovalVerdict: IssueReviewVerdictRecord | null;
+  mergePolicyObservationFingerprint: string | null;
+  lastMergePolicyObservation: MergePolicyObservation | null;
+  mergePolicyLatestCompletionRun: RunRecord | null;
+  pendingPublication: PendingPublicationHandoff;
+  runningEntry: IssueCurrentStateRuntimeEntry | null;
+  runningRunPhase: AgentRunPhase | null;
+  history: IssueHistorySnapshot[];
+}
+
+interface HistoryBackedGroupFields {
+  tracker?: TrackerFields;
+}
+
+interface HistoryBackedGroupResult {
+  fields: HistoryBackedGroupFields;
+  incompleteGroups: IssueCurrentStateHistoryFieldGroup[];
+  sourceSnapshotIds: string[];
 }
 
 export class IssueCurrentStateBuilder {
   constructor(private readonly options: IssueCurrentStateBuilderOptions) {}
 
-  async build(issue: Issue, runtime: IssueCurrentStateRuntimeState): Promise<IssueCurrentFields> {
-    const lifecycle = (await this.options.lifecycleStore?.get(issue.id)) ?? null;
+  async build(
+    issue: Issue,
+    runtime: IssueCurrentStateRuntimeState,
+  ): Promise<IssueCurrentFields> {
+    const context = await this.loadBuildContext(issue, runtime);
+    const now = new Date().toISOString();
+    const storeBuilt = this.buildFromStores(context, now);
+    const historyBuilt = this.buildFromHistory(context);
+    this.compareHistoryBackedFields(storeBuilt, historyBuilt);
+    return this.applyHistoryBackedFields(storeBuilt, historyBuilt);
+  }
+
+  private buildFromStores(
+    context: IssueCurrentStateBuildContext,
+    now: string,
+  ): IssueCurrentFields {
+    return {
+      version: 1,
+      ...this.buildTrackerFields(context),
+      ...this.buildLifecycleFields(context),
+      ...this.buildConfigFields(context),
+      ...this.buildHistoryFields(context),
+      ...this.buildRunFields(context),
+      ...this.buildRuntimeFields(context),
+      recordCreatedAt: now,
+      recordUpdatedAt: now,
+    } satisfies IssueCurrentFields;
+  }
+
+  private buildFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ): HistoryBackedGroupResult {
+    const tracker = this.buildTrackerFieldsFromHistory(context);
+    return {
+      fields: {
+        ...(tracker.fields === null ? {} : { tracker: tracker.fields }),
+      },
+      incompleteGroups: tracker.complete ? [] : ["tracker"],
+      sourceSnapshotIds: tracker.sourceSnapshotId
+        ? [tracker.sourceSnapshotId]
+        : [],
+    };
+  }
+
+  private buildTrackerFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | { complete: true; fields: TrackerFields; sourceSnapshotId: string }
+    | { complete: false; fields: null; sourceSnapshotId: null } {
+    const snapshot = latestTrackerObservationSnapshot(context.history);
+    if (snapshot === null) {
+      return { complete: false, fields: null, sourceSnapshotId: null };
+    }
+    if (
+      snapshot.issueId !== context.issue.id ||
+      snapshot.observedTrackerUpdatedAt !== context.issue.updatedAt
+    ) {
+      return { complete: false, fields: null, sourceSnapshotId: null };
+    }
+    const title =
+      typeof snapshot.observedTitle === "string"
+        ? snapshot.observedTitle
+        : null;
+    const state =
+      typeof snapshot.observedTrackerState === "string"
+        ? snapshot.observedTrackerState
+        : null;
+    const labels = stringArrayFromUnknown(snapshot.observedLabels);
+    const blockedBy = issueBlockersFromUnknown(snapshot.observedBlockedBy);
+    if (
+      title === null ||
+      state === null ||
+      labels === null ||
+      blockedBy === null
+    )
+      return { complete: false, fields: null, sourceSnapshotId: null };
+    const issue: Issue = {
+      id: snapshot.issueId,
+      identifier: snapshot.issueIdentifier,
+      title,
+      description:
+        typeof snapshot.observedDescription === "string"
+          ? snapshot.observedDescription
+          : null,
+      priority:
+        typeof snapshot.observedPriority === "number"
+          ? snapshot.observedPriority
+          : null,
+      state,
+      branchName:
+        typeof snapshot.observedBranchName === "string"
+          ? snapshot.observedBranchName
+          : null,
+      url:
+        typeof snapshot.observedTrackerUrl === "string"
+          ? snapshot.observedTrackerUrl
+          : null,
+      assigneeId:
+        typeof snapshot.observedAssigneeId === "string"
+          ? snapshot.observedAssigneeId
+          : null,
+      delegateId:
+        typeof snapshot.observedDelegateId === "string"
+          ? snapshot.observedDelegateId
+          : null,
+      assignedToWorker: snapshot.observedAssignedToWorker === true,
+      labels,
+      blockedBy,
+      hasChildren: snapshot.observedHasChildren === true,
+      createdAt:
+        typeof snapshot.observedTrackerCreatedAt === "string"
+          ? snapshot.observedTrackerCreatedAt
+          : null,
+      updatedAt:
+        typeof snapshot.observedTrackerUpdatedAt === "string"
+          ? snapshot.observedTrackerUpdatedAt
+          : null,
+    };
+    return {
+      complete: true,
+      sourceSnapshotId: snapshot.historySnapshotId,
+      fields: {
+        issueId: issue.id,
+        issueIdentifier: issue.identifier,
+        title: issue.title,
+        description: issue.description,
+        priority: issue.priority,
+        trackerState: issue.state,
+        branchName: issue.branchName,
+        trackerUrl: issue.url,
+        assigneeId: issue.assigneeId,
+        delegateId: issue.delegateId,
+        assignedToWorker: issue.assignedToWorker,
+        labels: [...issue.labels],
+        blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
+        hasChildren: issue.hasChildren === true,
+        trackerCreatedAt: issue.createdAt,
+        trackerUpdatedAt: issue.updatedAt,
+        currentIssueContentFingerprint: issueContentFingerprint(issue),
+      },
+    };
+  }
+
+  private compareHistoryBackedFields(
+    storeBuilt: IssueCurrentFields,
+    historyBuilt: HistoryBackedGroupResult,
+  ): void {
+    const groups = new Set(this.options.compareHistoryBackedFieldGroups ?? []);
+    if (groups.size === 0) return;
+    for (const group of groups) {
+      const fields = historyBuilt.fields[group];
+      if (fields === undefined) {
+        this.options.logger.warn(
+          "issue current-state history group incomplete",
+          {
+            issue_id: storeBuilt.issueId,
+            issue_identifier: storeBuilt.issueIdentifier,
+            field_group: group,
+          },
+        );
+        continue;
+      }
+      const mismatches = compareFieldGroup(storeBuilt, fields);
+      if (mismatches.length === 0) continue;
+      this.options.logger.warn("issue current-state history mismatch", {
+        issue_id: storeBuilt.issueId,
+        issue_identifier: storeBuilt.issueIdentifier,
+        field_group: group,
+        mismatches,
+        source_snapshot_ids: historyBuilt.sourceSnapshotIds,
+      });
+    }
+  }
+
+  private applyHistoryBackedFields(
+    storeBuilt: IssueCurrentFields,
+    historyBuilt: HistoryBackedGroupResult,
+  ): IssueCurrentFields {
+    let next = storeBuilt;
+    for (const group of this.options.historyBackedFieldGroups ?? []) {
+      const fields = historyBuilt.fields[group];
+      if (fields === undefined) continue;
+      next = { ...next, ...fields };
+    }
+    return next;
+  }
+
+  async buildSnapshot(
+    issue: Issue,
+    runtime: IssueCurrentStateRuntimeState,
+    input: IssueCurrentStateSnapshotBuildInput,
+  ): Promise<IssueCurrentStateSnapshot> {
+    const current = await this.build(issue, runtime);
+    const now = new Date().toISOString();
+    return immutableIssueSnapshot({
+      ...current,
+      ...this.buildTriggerFields(input, now),
+      ...(input.snapshotPatch ?? {}),
+    } satisfies IssueCurrentStateSnapshot);
+  }
+
+  private async loadBuildContext(
+    issue: Issue,
+    runtime: IssueCurrentStateRuntimeState,
+  ): Promise<IssueCurrentStateBuildContext> {
+    const lifecycle =
+      (await this.options.lifecycleStore?.get(issue.id)) ?? null;
     const runningEntry = runtime.runningEntry;
     let latestRun: RunRecord | null = null;
     let runs: RunRecord[] = [];
@@ -116,61 +501,130 @@ export class IssueCurrentStateBuilder {
     const pointers = lifecycle?.summaryPointers ?? null;
     const latestPrNumber = pointers?.prNumber ?? latestRun?.prNumber ?? null;
     const lastIssueBreakdownPlan =
-      lifecycle?.lastIssueBreakdownPlanId === undefined || lifecycle.lastIssueBreakdownPlanId === null
+      lifecycle?.lastIssueBreakdownPlanId === undefined ||
+      lifecycle.lastIssueBreakdownPlanId === null
         ? null
-        : lifecycle.issueBreakdownPlans.find((plan) => plan.id === lifecycle.lastIssueBreakdownPlanId) ?? null;
+        : (lifecycle.issueBreakdownPlans.find(
+            (plan) => plan.id === lifecycle.lastIssueBreakdownPlanId,
+          ) ?? null);
     const currentIssueFingerprint = issueContentFingerprint(issue);
-    const currentIssueBreakdownFingerprint = issueBreakdownConfigFingerprint(this.options.config);
-    const currentIssueTriageFingerprint = lifecycle === null ? null : issueTriageTriggerFingerprint(lifecycle);
+    const currentIssueBreakdownFingerprint = issueBreakdownConfigFingerprint(
+      this.options.config,
+    );
+    const currentIssueTriageFingerprint =
+      lifecycle === null ? null : issueTriageTriggerFingerprint(lifecycle);
     const issueTriageCurrentTriggerReports =
       lifecycle === null || currentIssueTriageFingerprint === null
         ? []
         : lifecycle.issueTriageReports.filter(
-            (report) => report.triggerFingerprint === currentIssueTriageFingerprint && !isSupersededLifecycleRecord(report),
+            (report) =>
+              report.triggerFingerprint === currentIssueTriageFingerprint &&
+              !isSupersededLifecycleRecord(report),
           );
     const lastIssueTriageReport =
       lifecycle === null || currentIssueTriageFingerprint === null
         ? null
-        : latestIssueTriageReportForFingerprint(lifecycle, currentIssueTriageFingerprint);
+        : latestIssueTriageReportForFingerprint(
+            lifecycle,
+            currentIssueTriageFingerprint,
+          );
     const latestAnyIssueTriageReport = latestIssueTriageReport(lifecycle);
-    const currentPostMortemFingerprint = lifecycle === null ? null : issuePostMortemTriggerFingerprint(lifecycle, issue);
+    const currentPostMortemFingerprint =
+      lifecycle === null
+        ? null
+        : issuePostMortemTriggerFingerprint(lifecycle, issue);
     const postMortemCurrentTriggerReports =
       lifecycle === null || currentPostMortemFingerprint === null
         ? []
-        : lifecycle.postMortemReports.filter((report) => report.triggerFingerprint === currentPostMortemFingerprint);
+        : lifecycle.postMortemReports.filter(
+            (report) =>
+              report.triggerFingerprint === currentPostMortemFingerprint,
+          );
     const lastPostMortemReport =
       lifecycle === null || currentPostMortemFingerprint === null
         ? null
-        : latestIssuePostMortemReportForFingerprint(lifecycle, currentPostMortemFingerprint);
-    const mergePolicyConfigHash = mergePolicyConfigFingerprint(this.options.config);
-    const mergePolicyLatestCompletionReport = lifecycle === null ? null : latestLifecycleCompletionReport(lifecycle);
-    const mergePolicyLatestApprovalVerdict = lifecycle === null ? null : latestCurrentApprovalPassVerdict(lifecycle);
-    const mergePolicyObservationFingerprint = mergePolicyObservationInputFingerprint({
-      issue,
-      lifecycle,
-      report: mergePolicyLatestCompletionReport,
-      verdict: mergePolicyLatestApprovalVerdict,
-      configFingerprint: mergePolicyConfigHash,
-    });
-    const existingIssueState = await this.options.issueStateStore.get(issue.id).catch(() => null);
-    const lastMergePolicyObservation = latestMergePolicyObservationForFingerprint(
-      existingIssueState?.history ?? [],
-      mergePolicyObservationFingerprint,
+        : latestIssuePostMortemReportForFingerprint(
+            lifecycle,
+            currentPostMortemFingerprint,
+          );
+    const mergePolicyConfigHash = mergePolicyConfigFingerprint(
+      this.options.config,
     );
+    const mergePolicyLatestCompletionReport =
+      lifecycle === null ? null : latestLifecycleCompletionReport(lifecycle);
+    const mergePolicyLatestApprovalVerdict =
+      lifecycle === null ? null : latestCurrentApprovalPassVerdict(lifecycle);
+    const mergePolicyObservationFingerprint =
+      mergePolicyObservationInputFingerprint({
+        issue,
+        lifecycle,
+        report: mergePolicyLatestCompletionReport,
+        verdict: mergePolicyLatestApprovalVerdict,
+        configFingerprint: mergePolicyConfigHash,
+      });
+    const existingIssueState = await this.options.issueStateStore
+      .get(issue.id)
+      .catch(() => null);
+    const history = existingIssueState?.history ?? [];
+    const lastMergePolicyObservation =
+      latestMergePolicyObservationForFingerprint(
+        history,
+        mergePolicyObservationFingerprint,
+      );
     const mergePolicyLatestCompletionRun =
       mergePolicyLatestCompletionReport === null
         ? null
-        : runs.find((run) => run.runId === mergePolicyLatestCompletionReport.runId) ??
-          (await this.options.runStore?.getRun(mergePolicyLatestCompletionReport.runId).catch(() => null)) ??
-          null;
-    const runningRunId = runningEntry?.activeRunId ?? runningEntry?.runId ?? null;
+        : (runs.find(
+            (run) => run.runId === mergePolicyLatestCompletionReport.runId,
+          ) ??
+          (await this.options.runStore
+            ?.getRun(mergePolicyLatestCompletionReport.runId)
+            .catch(() => null)) ??
+          null);
+    const runningRunId =
+      runningEntry?.activeRunId ?? runningEntry?.runId ?? null;
     const pendingPublication =
       runningRunId === null
         ? pendingPublicationHandoffForRun(lifecycle)
-        : pendingPublicationHandoffForRun(lifecycle, { runId: runningRunId }) ?? pendingPublicationHandoffForRun(lifecycle);
+        : (pendingPublicationHandoffForRun(lifecycle, {
+            runId: runningRunId,
+          }) ?? pendingPublicationHandoffForRun(lifecycle));
     const runningRunPhase = runningEntry?.runPhase ?? null;
     return {
-      version: 1,
+      issue,
+      runtime,
+      lifecycle,
+      runs,
+      latestRun,
+      pointers,
+      lastIssueBreakdownPlan,
+      currentIssueFingerprint,
+      currentIssueBreakdownFingerprint,
+      currentIssueTriageFingerprint,
+      issueTriageCurrentTriggerReports,
+      lastIssueTriageReport,
+      latestAnyIssueTriageReport,
+      currentPostMortemFingerprint,
+      postMortemCurrentTriggerReports,
+      lastPostMortemReport,
+      mergePolicyConfigHash,
+      mergePolicyLatestCompletionReport,
+      mergePolicyLatestApprovalVerdict,
+      mergePolicyObservationFingerprint,
+      lastMergePolicyObservation,
+      mergePolicyLatestCompletionRun,
+      pendingPublication,
+      runningEntry,
+      runningRunPhase,
+      history,
+    };
+  }
+
+  private buildTrackerFields(
+    context: IssueCurrentStateBuildContext,
+  ): TrackerFields {
+    const { issue } = context;
+    return {
       issueId: issue.id,
       issueIdentifier: issue.identifier,
       title: issue.title,
@@ -187,67 +641,142 @@ export class IssueCurrentStateBuilder {
       hasChildren: issue.hasChildren === true,
       trackerCreatedAt: issue.createdAt,
       trackerUpdatedAt: issue.updatedAt,
-      phase: lifecycle?.phase ?? phaseForIssueState(issue.state, this.options.config),
+      currentIssueContentFingerprint: context.currentIssueFingerprint,
+    };
+  }
+
+  private buildLifecycleFields(
+    context: IssueCurrentStateBuildContext,
+  ): LifecycleFields {
+    const { issue, lifecycle } = context;
+    return {
+      phase:
+        lifecycle?.phase ??
+        phaseForIssueState(issue.state, this.options.config),
       reviewRound: lifecycle?.reviewRound ?? 0,
       incompleteTurnCount: lifecycle?.incompleteTurnCount ?? 0,
       planningFailureCount: lifecycle?.planningFailureCount ?? 0,
       planningDispatchRetryCount: lifecycle?.planningDispatchRetryCount ?? 0,
       lastPlanningFailureAt: lifecycle?.lastPlanningFailureAt ?? null,
-      planningRetryDueAt: lifecycle === null ? null : planningRetryDueAtIso(lifecycle, this.options.config),
+      planningRetryDueAt:
+        lifecycle === null
+          ? null
+          : planningRetryDueAtIso(lifecycle, this.options.config),
       blockedReason: lifecycle?.blockedReason ?? null,
       lastIssueBreakdownPlanId: lifecycle?.lastIssueBreakdownPlanId ?? null,
-      lastIssueBreakdownPlanApplicationStatus: lastIssueBreakdownPlan?.applicationStatus ?? null,
-      lastIssueBreakdownPlanIssueContentFingerprint: lastIssueBreakdownPlan?.issueContentFingerprint ?? null,
-      lastIssueBreakdownPlanConfigFingerprint: lastIssueBreakdownPlan?.configFingerprint ?? null,
+      lastIssueBreakdownPlanApplicationStatus:
+        context.lastIssueBreakdownPlan?.applicationStatus ?? null,
+      lastIssueBreakdownPlanIssueContentFingerprint:
+        context.lastIssueBreakdownPlan?.issueContentFingerprint ?? null,
+      lastIssueBreakdownPlanConfigFingerprint:
+        context.lastIssueBreakdownPlan?.configFingerprint ?? null,
       lastIssueBreakdownPlanSatisfiesCurrentValidation:
-        lastIssueBreakdownPlan === null ? false : issueBreakdownPlanSatisfiesCurrentValidation(lastIssueBreakdownPlan, this.options.config),
-      currentIssueContentFingerprint: currentIssueFingerprint,
-      currentIssueBreakdownConfigFingerprint: currentIssueBreakdownFingerprint,
-      lastIssueTriageReportId: lastIssueTriageReport?.id ?? lifecycle?.lastIssueTriageReportId ?? null,
-      lastIssueTriageReportTriggerFingerprint: lastIssueTriageReport?.triggerFingerprint ?? null,
-      lastIssueTriageReportWritebackOperationKeys: lastIssueTriageReport?.writebackOperationKeys ?? null,
-      currentIssueTriageTriggerFingerprint: currentIssueTriageFingerprint,
-      issueTriageCurrentTriggerReportIds: issueTriageCurrentTriggerReports.map((report) => report.id),
-      latestIssueTriageReportBlockers: activeIssueTriageBlockers(latestAnyIssueTriageReport).map((blocker) => ({
+        context.lastIssueBreakdownPlan === null
+          ? false
+          : issueBreakdownPlanSatisfiesCurrentValidation(
+              context.lastIssueBreakdownPlan,
+              this.options.config,
+            ),
+      lastIssueTriageReportId:
+        context.lastIssueTriageReport?.id ??
+        lifecycle?.lastIssueTriageReportId ??
+        null,
+      lastIssueTriageReportTriggerFingerprint:
+        context.lastIssueTriageReport?.triggerFingerprint ?? null,
+      lastIssueTriageReportWritebackOperationKeys:
+        context.lastIssueTriageReport?.writebackOperationKeys ?? null,
+      currentIssueTriageTriggerFingerprint:
+        context.currentIssueTriageFingerprint,
+      issueTriageCurrentTriggerReportIds:
+        context.issueTriageCurrentTriggerReports.map((report) => report.id),
+      latestIssueTriageReportBlockers: activeIssueTriageBlockers(
+        context.latestAnyIssueTriageReport,
+      ).map((blocker) => ({
         ...blocker,
         evidence: [...blocker.evidence],
       })),
-      lastPostMortemReportId: lastPostMortemReport?.id ?? lifecycle?.lastPostMortemReportId ?? null,
-      lastPostMortemReportTriggerFingerprint: lastPostMortemReport?.triggerFingerprint ?? null,
-      lastPostMortemReportWritebackOperationKeys: lastPostMortemReport?.writebackOperationKeys ?? null,
-      currentPostMortemTriggerFingerprint: currentPostMortemFingerprint,
-      postMortemCurrentTriggerReportIds: postMortemCurrentTriggerReports.map((report) => report.id),
+      lastPostMortemReportId:
+        context.lastPostMortemReport?.id ??
+        lifecycle?.lastPostMortemReportId ??
+        null,
+      lastPostMortemReportTriggerFingerprint:
+        context.lastPostMortemReport?.triggerFingerprint ?? null,
+      lastPostMortemReportWritebackOperationKeys:
+        context.lastPostMortemReport?.writebackOperationKeys ?? null,
+      currentPostMortemTriggerFingerprint: context.currentPostMortemFingerprint,
+      postMortemCurrentTriggerReportIds:
+        context.postMortemCurrentTriggerReports.map((report) => report.id),
       lastCompletionReportId: lifecycle?.lastCompletionReportId ?? null,
-      lastCompletionReportRejectionId: lifecycle?.lastCompletionReportRejectionId ?? null,
+      lastCompletionReportRejectionId:
+        lifecycle?.lastCompletionReportRejectionId ?? null,
       lastReviewVerdictId: lifecycle?.lastReviewVerdictId ?? null,
       lastMergeGateResultId: lifecycle?.lastMergeGateResultId ?? null,
-      latestCompletionReport: mergePolicyLatestCompletionReport,
-      latestApprovalPassVerdict: mergePolicyLatestApprovalVerdict,
+      latestCompletionReport: context.mergePolicyLatestCompletionReport,
+      latestApprovalPassVerdict: context.mergePolicyLatestApprovalVerdict,
       mergeGate: lifecycle?.mergeGate ?? null,
       mergeConflict: lifecycle?.mergeConflict ?? null,
       lifecycleSummaryCiStatus: lifecycle?.summaryPointers.ciStatus ?? null,
-      mergePolicyMode: this.options.config.mergePolicy.mode,
-      mergePolicySourceStates: [...this.options.config.mergePolicy.sourceStates],
-      mergePolicyDoneState: this.options.config.mergePolicy.doneState,
-      mergePolicyConflictsState: this.options.config.mergePolicy.conflictsState,
-      mergePolicyRequiredChecks: [...this.options.config.mergePolicy.requiredChecks],
-      mergePolicyMaxMergeGateFailures: this.options.config.reviewLoop.failureLimits.mergeGateFailures,
-      mergePolicyConfigFingerprint: mergePolicyConfigHash,
-      currentMergePolicyObservationInputFingerprint: mergePolicyObservationFingerprint,
-      lastMergePolicyObservationFingerprint: lastMergePolicyObservation?.inputFingerprint ?? null,
-      lastMergePolicyObservationStatus: lastMergePolicyObservation?.status ?? null,
-      lastMergePolicyObservation,
       mergePolicyMerge: lifecycle?.merge ?? null,
       mergePolicyMergeGate: lifecycle?.mergeGate ?? null,
       mergePolicyMergeGateResults: lifecycle?.mergeGateResults ?? [],
       mergePolicyMergeConflict: lifecycle?.mergeConflict ?? null,
-      mergePolicyLatestCompletionReport: mergePolicyLatestCompletionReport,
-      mergePolicyLatestApprovalVerdict: mergePolicyLatestApprovalVerdict,
+      mergePolicyLatestCompletionReport:
+        context.mergePolicyLatestCompletionReport,
+      mergePolicyLatestApprovalVerdict:
+        context.mergePolicyLatestApprovalVerdict,
       mergePolicyReviewFeedback: lifecycle?.reviewFeedback ?? [],
-      mergePolicyLatestCompletionRun,
-      pendingPublicationApprovalRunId: pendingPublication?.pendingReport.runId ?? null,
-      pendingPublicationApprovalReportId: pendingPublication?.pendingReport.id ?? null,
-      pendingPublicationApprovalReason: pendingPublication === null ? null : lifecycle?.blockedReason ?? null,
+      pendingPublicationApprovalRunId:
+        context.pendingPublication?.pendingReport.runId ?? null,
+      pendingPublicationApprovalReportId:
+        context.pendingPublication?.pendingReport.id ?? null,
+      pendingPublicationApprovalReason:
+        context.pendingPublication === null
+          ? null
+          : (lifecycle?.blockedReason ?? null),
+    };
+  }
+
+  private buildConfigFields(
+    context: IssueCurrentStateBuildContext,
+  ): ConfigFields {
+    return {
+      currentIssueBreakdownConfigFingerprint:
+        context.currentIssueBreakdownFingerprint,
+      lifecyclePersistenceAvailable: this.options.lifecycleStore !== undefined,
+      mergePolicyMode: this.options.config.mergePolicy.mode,
+      mergePolicySourceStates: [
+        ...this.options.config.mergePolicy.sourceStates,
+      ],
+      mergePolicyDoneState: this.options.config.mergePolicy.doneState,
+      mergePolicyConflictsState: this.options.config.mergePolicy.conflictsState,
+      mergePolicyRequiredChecks: [
+        ...this.options.config.mergePolicy.requiredChecks,
+      ],
+      mergePolicyMaxMergeGateFailures:
+        this.options.config.reviewLoop.failureLimits.mergeGateFailures,
+      mergePolicyConfigFingerprint: context.mergePolicyConfigHash,
+    };
+  }
+
+  private buildHistoryFields(
+    context: IssueCurrentStateBuildContext,
+  ): HistoryFields {
+    return {
+      currentMergePolicyObservationInputFingerprint:
+        context.mergePolicyObservationFingerprint,
+      lastMergePolicyObservationFingerprint:
+        context.lastMergePolicyObservation?.inputFingerprint ?? null,
+      lastMergePolicyObservationStatus:
+        context.lastMergePolicyObservation?.status ?? null,
+      lastMergePolicyObservation: context.lastMergePolicyObservation,
+    };
+  }
+
+  private buildRunFields(context: IssueCurrentStateBuildContext): RunFields {
+    const { issue, latestRun, pointers } = context;
+    const latestPrNumber = pointers?.prNumber ?? latestRun?.prNumber ?? null;
+    return {
+      mergePolicyLatestCompletionRun: context.mergePolicyLatestCompletionRun,
       latestRunId: latestRun?.runId ?? pointers?.lastRunId ?? null,
       latestRunStatus: latestRun?.status ?? null,
       latestRunRole: latestRun?.role ?? null,
@@ -256,39 +785,60 @@ export class IssueCurrentStateBuilder {
       latestRunCompletedAt: latestRun?.completedAt ?? null,
       latestRunError: latestRun?.error ?? null,
       latestPrUrl: pointers?.prUrl ?? latestRun?.prUrl ?? null,
-      latestPrNumber: typeof latestPrNumber === "number" ? latestPrNumber : null,
+      latestPrNumber:
+        typeof latestPrNumber === "number" ? latestPrNumber : null,
       latestPrHeadSha: pointers?.prHeadSha ?? latestRun?.prHeadSha ?? null,
       latestPrBranch: pointers?.prBranch ?? latestRun?.prBranch ?? null,
-      latestWorkspaceKey: pointers?.workspaceKey ?? latestRun?.workspaceKey ?? null,
-      latestWorkspacePath: pointers?.workspacePath ?? latestRun?.workspacePath ?? null,
-      latestGitBranchName: pointers?.gitBranchName ?? pointers?.branchName ?? latestRun?.gitBranchName ?? issue.branchName,
-      running: runtime.running,
-      runningRole: runningEntry?.role ?? null,
-      runningRunPhase,
-      runningRunKind: runningRunPhase === null ? null : runKindForPhase(runningRunPhase),
-      runningManualDispatchStage: runningEntry?.manualDispatch?.stage ?? null,
-      runningManualIgnoreState: runningEntry?.manualDispatch?.ignoreState === true,
-      runningHasPendingPublicationApproval: pendingPublication !== null,
-      runningCancellationRequested: runningEntry !== null && runningEntry.cancellationRequestedAt !== null,
-      claimed: runtime.claimed,
-      paused: runtime.paused,
-      retrying: runtime.retrying,
-      consecutiveSdkErrorFailures: countConsecutiveWorkerRuns(runs, isCountedSdkWaitErrorFailure),
-      consecutiveInfraFailures: countConsecutiveWorkerRuns(runs, isCountedInfraFailure),
-      recordCreatedAt: new Date().toISOString(),
-      recordUpdatedAt: new Date().toISOString(),
+      latestWorkspaceKey:
+        pointers?.workspaceKey ?? latestRun?.workspaceKey ?? null,
+      latestWorkspacePath:
+        pointers?.workspacePath ?? latestRun?.workspacePath ?? null,
+      latestGitBranchName:
+        pointers?.gitBranchName ??
+        pointers?.branchName ??
+        latestRun?.gitBranchName ??
+        issue.branchName,
+      consecutiveSdkErrorFailures: countConsecutiveWorkerRuns(
+        context.runs,
+        isCountedSdkWaitErrorFailure,
+      ),
+      consecutiveInfraFailures: countConsecutiveWorkerRuns(
+        context.runs,
+        isCountedInfraFailure,
+      ),
     };
   }
 
-  async buildSnapshot(
-    issue: Issue,
-    runtime: IssueCurrentStateRuntimeState,
+  private buildRuntimeFields(
+    context: IssueCurrentStateBuildContext,
+  ): RuntimeFields {
+    return {
+      running: context.runtime.running,
+      runningRole: context.runningEntry?.role ?? null,
+      runningRunPhase: context.runningRunPhase,
+      runningRunKind:
+        context.runningRunPhase === null
+          ? null
+          : runKindForPhase(context.runningRunPhase),
+      runningManualDispatchStage:
+        context.runningEntry?.manualDispatch?.stage ?? null,
+      runningManualIgnoreState:
+        context.runningEntry?.manualDispatch?.ignoreState === true,
+      runningHasPendingPublicationApproval: context.pendingPublication !== null,
+      runningCancellationRequested:
+        context.runningEntry !== null &&
+        context.runningEntry.cancellationRequestedAt !== null,
+      claimed: context.runtime.claimed,
+      paused: context.runtime.paused,
+      retrying: context.runtime.retrying,
+    };
+  }
+
+  private buildTriggerFields(
     input: IssueCurrentStateSnapshotBuildInput,
-  ): Promise<IssueCurrentStateSnapshot> {
-    const current = await this.build(issue, runtime);
-    const now = new Date().toISOString();
-    return immutableIssueSnapshot({
-      ...current,
+    now: string,
+  ): TriggerFields {
+    return {
       snapshotId: createIssueSnapshotId(),
       snapshotAt: now,
       triggerType: input.triggerType,
@@ -304,17 +854,80 @@ export class IssueCurrentStateBuilder {
       manualStage: input.manualStage,
       manualForceLabels: input.manualForceLabels,
       manualIgnoreState: input.manualIgnoreState,
-      ...(input.snapshotPatch ?? {}),
-    } satisfies IssueCurrentStateSnapshot);
+    };
   }
 }
 
-function latestLifecycleCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {
+function latestTrackerObservationSnapshot(
+  history: readonly IssueHistorySnapshot[],
+): IssueHistorySnapshot | null {
+  for (const snapshot of history.slice().reverse()) {
+    if (
+      snapshot.snapshotKind === "evidence" &&
+      snapshot.evidenceKind === "tracker" &&
+      snapshot.evidenceEventType === "tracker_issue_observed"
+    ) {
+      return snapshot;
+    }
+  }
+  return null;
+}
+
+function stringArrayFromUnknown(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? [...value]
+    : null;
+}
+
+function issueBlockersFromUnknown(value: unknown): Issue["blockedBy"] | null {
+  if (!Array.isArray(value)) return null;
+  const blockers: Issue["blockedBy"] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+    const record = item as Record<string, unknown>;
+    blockers.push({
+      id: typeof record.id === "string" ? record.id : null,
+      identifier:
+        typeof record.identifier === "string" ? record.identifier : null,
+      state: typeof record.state === "string" ? record.state : null,
+    });
+  }
+  return blockers;
+}
+
+function compareFieldGroup(
+  storeBuilt: IssueCurrentFields,
+  historyFields: Partial<IssueCurrentFields>,
+): Array<{
+  field: string;
+  storeValue: unknown;
+  historyValue: unknown;
+}> {
+  const mismatches: Array<{
+    field: string;
+    storeValue: unknown;
+    historyValue: unknown;
+  }> = [];
+  for (const [field, historyValue] of Object.entries(historyFields)) {
+    const storeValue = storeBuilt[field as keyof IssueCurrentFields];
+    if (stableJson(storeValue) === stableJson(historyValue)) continue;
+    mismatches.push({ field, storeValue, historyValue });
+  }
+  return mismatches;
+}
+
+function latestLifecycleCompletionReport(
+  lifecycle: IssueLifecycleRecord,
+): IssueCompletionReportRecord | null {
   if (lifecycle.lastCompletionReportId) {
-    const exact = lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
+    const exact = lifecycle.completionReports.find(
+      (report) => report.id === lifecycle.lastCompletionReportId,
+    );
     if (exact) return exact;
   }
-  return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
+  return (
+    lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null
+  );
 }
 
 function mergePolicyConfigFingerprint(config: ServiceConfig): string {
@@ -328,7 +941,8 @@ function mergePolicyConfigFingerprint(config: ServiceConfig): string {
       mergeMethod: config.mergePolicy.mergeMethod,
       noCiAllowed: config.mergePolicy.noCiAllowed,
       noCiEvidence: config.mergePolicy.noCiEvidence,
-      missingCheckStabilizationMs: config.mergePolicy.missingCheckStabilizationMs,
+      missingCheckStabilizationMs:
+        config.mergePolicy.missingCheckStabilizationMs,
       maxConflictFixTurns: config.mergePolicy.maxConflictFixTurns,
       mergeGateFailures: config.reviewLoop.failureLimits.mergeGateFailures,
     }),
@@ -389,7 +1003,11 @@ function latestMergePolicyObservationForFingerprint(
   for (const snapshot of history.slice().reverse()) {
     if (snapshot.transitionKind !== "merge_policy_observe") continue;
     for (const action of snapshot.actions.slice().reverse()) {
-      if (action.actionType !== "record_merge_policy_observation" || action.status !== "succeeded") continue;
+      if (
+        action.actionType !== "record_merge_policy_observation" ||
+        action.status !== "succeeded"
+      )
+        continue;
       const observation = mergePolicyObservationFromUnknown(action.details);
       if (observation?.inputFingerprint === fingerprint) return observation;
     }
@@ -397,32 +1015,61 @@ function latestMergePolicyObservationForFingerprint(
   return null;
 }
 
-function planningRetryDueAtIso(lifecycle: IssueLifecycleRecord, config: ServiceConfig): string | null {
-  if (lifecycle.planningFailureCount <= 0 || lifecycle.lastPlanningFailureAt === null) return null;
+function planningRetryDueAtIso(
+  lifecycle: IssueLifecycleRecord,
+  config: ServiceConfig,
+): string | null {
+  if (
+    lifecycle.planningFailureCount <= 0 ||
+    lifecycle.lastPlanningFailureAt === null
+  )
+    return null;
   const failedAtMs = Date.parse(lifecycle.lastPlanningFailureAt);
   if (!Number.isFinite(failedAtMs)) return null;
-  return new Date(failedAtMs + planningRetryDelayMs(lifecycle.planningFailureCount, config)).toISOString();
+  return new Date(
+    failedAtMs + planningRetryDelayMs(lifecycle.planningFailureCount, config),
+  ).toISOString();
 }
 
-function planningBackoffRemainingMs(lifecycle: IssueLifecycleRecord, config: ServiceConfig, nowMs = Date.now()): number {
-  if (lifecycle.planningFailureCount <= 0 || lifecycle.lastPlanningFailureAt === null) return 0;
+function planningBackoffRemainingMs(
+  lifecycle: IssueLifecycleRecord,
+  config: ServiceConfig,
+  nowMs = Date.now(),
+): number {
+  if (
+    lifecycle.planningFailureCount <= 0 ||
+    lifecycle.lastPlanningFailureAt === null
+  )
+    return 0;
   const lastFailureMs = Date.parse(lifecycle.lastPlanningFailureAt);
   if (!Number.isFinite(lastFailureMs)) return 0;
-  const dueMs = lastFailureMs + planningRetryDelayMs(lifecycle.planningFailureCount, config);
+  const dueMs =
+    lastFailureMs +
+    planningRetryDelayMs(lifecycle.planningFailureCount, config);
   return Math.max(dueMs - nowMs, 0);
 }
 
-function planningRetryDelayMs(failureCount: number, config: ServiceConfig): number {
+function planningRetryDelayMs(
+  failureCount: number,
+  config: ServiceConfig,
+): number {
   return Math.min(
-    config.issueBreakdown.planningRetryBaseMs * 2 ** Math.max(failureCount - 1, 0),
+    config.issueBreakdown.planningRetryBaseMs *
+      2 ** Math.max(failureCount - 1, 0),
     config.issueBreakdown.planningRetryMaxMs,
   );
 }
 
-function countConsecutiveWorkerRuns(runs: RunRecord[], predicate: (run: RunRecord) => boolean): number {
+function countConsecutiveWorkerRuns(
+  runs: RunRecord[],
+  predicate: (run: RunRecord) => boolean,
+): number {
   const seen = new Set<string>();
   const workerRuns = runs
-    .filter((run) => run.role === "worker" && !seen.has(run.runId) && seen.add(run.runId))
+    .filter(
+      (run) =>
+        run.role === "worker" && !seen.has(run.runId) && seen.add(run.runId),
+    )
     .sort(compareRunChronology);
   let count = 0;
   for (const run of workerRuns.slice().reverse()) {
@@ -469,12 +1116,15 @@ function isCountedInfraFailure(run: RunRecord): boolean {
   );
 }
 
-function isInfraFailureDiagnosticCode(code: string | null | undefined): boolean {
+function isInfraFailureDiagnosticCode(
+  code: string | null | undefined,
+): boolean {
   return typeof code === "string" && INFRA_FAILURE_DIAGNOSTIC_CODES.has(code);
 }
 
 function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  if (Array.isArray(value))
+    return `[${value.map((item) => stableJson(item)).join(",")}]`;
   if (value && typeof value === "object") {
     return `{${Object.entries(value as Record<string, unknown>)
       .sort(([left], [right]) => left.localeCompare(right))

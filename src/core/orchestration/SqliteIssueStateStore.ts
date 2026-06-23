@@ -5,13 +5,14 @@ import sqlite3 from "sqlite3";
 
 import type { Issue } from "../types.js";
 import { FileIssueStateStore } from "./FileIssueStateStore.js";
-import type {
-  IssueCurrentFields,
-  IssueHistorySnapshot,
-  IssueStateRecord,
-  IssueStateStore,
-  TransitionActionRecord,
-  TransitionErrorRecord,
+import {
+  normalizeIssueHistorySnapshotEvidenceFields,
+  type IssueCurrentFields,
+  type IssueHistorySnapshot,
+  type IssueStateRecord,
+  type IssueStateStore,
+  type TransitionActionRecord,
+  type TransitionErrorRecord,
 } from "./IssueOrchestrationState.js";
 
 type SqliteDatabase = InstanceType<typeof sqlite3.Database>;
@@ -19,6 +20,8 @@ type SqliteDatabase = InstanceType<typeof sqlite3.Database>;
 interface IssueStateRow {
   issue_id: string;
   issue_identifier: string;
+  // Cached current state for fast reads. Durable issue truth is captured in
+  // issue_history as field groups become history-backed.
   current_json: string;
 }
 
@@ -80,12 +83,17 @@ export class SqliteIssueStateStore implements IssueStateStore {
 
   async ensureIssue(current: IssueCurrentFields): Promise<IssueStateRecord> {
     await this.withWrite(current.issueId, async (database) => {
-      const existing = await this.findUnlocked(database, current.issueId, current.issueIdentifier);
+      const existing = await this.findUnlocked(
+        database,
+        current.issueId,
+        current.issueIdentifier,
+      );
       const now = new Date().toISOString();
       const record: IssueCurrentFields = {
         ...current,
         version: 1,
-        recordCreatedAt: existing?.recordCreatedAt ?? current.recordCreatedAt ?? now,
+        recordCreatedAt:
+          existing?.recordCreatedAt ?? current.recordCreatedAt ?? now,
         recordUpdatedAt: now,
       };
       await this.run(
@@ -98,18 +106,35 @@ export class SqliteIssueStateStore implements IssueStateStore {
             current_json = excluded.current_json,
             record_updated_at = excluded.record_updated_at
         `,
-        [record.issueId, record.issueIdentifier, JSON.stringify(record), record.recordCreatedAt, record.recordUpdatedAt],
+        [
+          record.issueId,
+          record.issueIdentifier,
+          JSON.stringify(record),
+          record.recordCreatedAt,
+          record.recordUpdatedAt,
+        ],
       );
     });
     const record = await this.get(current.issueId);
-    if (!record) throw new Error(`Issue state was not persisted for ${current.issueIdentifier}`);
+    if (!record)
+      throw new Error(
+        `Issue state was not persisted for ${current.issueIdentifier}`,
+      );
     return record;
   }
 
-  async updateCurrent(issue: Pick<Issue, "id" | "identifier">, patch: Partial<IssueCurrentFields>): Promise<IssueStateRecord> {
+  async updateCurrent(
+    issue: Pick<Issue, "id" | "identifier">,
+    patch: Partial<IssueCurrentFields>,
+  ): Promise<IssueStateRecord> {
     await this.withWrite(issue.id, async (database) => {
-      const existing = await this.findUnlocked(database, issue.id, issue.identifier);
-      if (!existing) throw new Error(`Issue state does not exist for ${issue.identifier}`);
+      const existing = await this.findUnlocked(
+        database,
+        issue.id,
+        issue.identifier,
+      );
+      if (!existing)
+        throw new Error(`Issue state does not exist for ${issue.identifier}`);
       const current: IssueCurrentFields = {
         ...existing,
         ...patch,
@@ -130,25 +155,41 @@ export class SqliteIssueStateStore implements IssueStateStore {
       );
     });
     const record = await this.get(issue.id);
-    if (!record) throw new Error(`Issue state does not exist for ${issue.identifier}`);
+    if (!record)
+      throw new Error(`Issue state does not exist for ${issue.identifier}`);
     return record;
   }
 
-  async appendSnapshot(issue: Pick<Issue, "id" | "identifier">, snapshot: IssueHistorySnapshot): Promise<IssueStateRecord> {
+  async appendSnapshot(
+    issue: Pick<Issue, "id" | "identifier">,
+    snapshot: IssueHistorySnapshot,
+  ): Promise<IssueStateRecord> {
     await this.withWrite(issue.id, async (database) => {
-      const existing = await this.findUnlocked(database, issue.id, issue.identifier);
-      if (!existing) throw new Error(`Issue state does not exist for ${issue.identifier}`);
+      const existing = await this.findUnlocked(
+        database,
+        issue.id,
+        issue.identifier,
+      );
+      if (!existing)
+        throw new Error(`Issue state does not exist for ${issue.identifier}`);
       const row = await this.getRow<{ max_sequence: number }>(
         database,
         "SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM issue_history WHERE issue_id = ?",
         [existing.issueId],
       );
       const sequence = (row?.max_sequence ?? 0) + 1;
-      await this.insertSnapshotUnlocked(database, existing.issueId, existing.issueIdentifier, sequence, normalizeIssueHistorySnapshot(snapshot));
+      await this.insertSnapshotUnlocked(
+        database,
+        existing.issueId,
+        existing.issueIdentifier,
+        sequence,
+        normalizeIssueHistorySnapshot(snapshot),
+      );
       await this.touchIssue(database, existing.issueId);
     });
     const record = await this.get(issue.id);
-    if (!record) throw new Error(`Issue state does not exist for ${issue.identifier}`);
+    if (!record)
+      throw new Error(`Issue state does not exist for ${issue.identifier}`);
     return record;
   }
 
@@ -161,16 +202,31 @@ export class SqliteIssueStateStore implements IssueStateStore {
     },
   ): Promise<IssueStateRecord | null> {
     await this.withWrite(issue.id, async (database) => {
-      const existing = await this.findUnlocked(database, issue.id, issue.identifier);
+      const existing = await this.findUnlocked(
+        database,
+        issue.id,
+        issue.identifier,
+      );
       if (!existing) return;
-      const snapshot = await this.findSnapshotUnlocked(database, existing.issueId, historySnapshotId);
+      const snapshot = await this.findSnapshotUnlocked(
+        database,
+        existing.issueId,
+        historySnapshotId,
+      );
       if (!snapshot) return;
       const next: IssueHistorySnapshot = {
         ...snapshot,
-        actions: patch.actions === undefined ? snapshot.actions : [...patch.actions],
-        errors: patch.errors === undefined ? snapshot.errors : [...patch.errors],
+        actions:
+          patch.actions === undefined ? snapshot.actions : [...patch.actions],
+        errors:
+          patch.errors === undefined ? snapshot.errors : [...patch.errors],
       };
-      await this.updateSnapshotUnlocked(database, existing.issueId, historySnapshotId, next);
+      await this.updateSnapshotUnlocked(
+        database,
+        existing.issueId,
+        historySnapshotId,
+        next,
+      );
     });
     return this.get(issue.id);
   }
@@ -181,14 +237,27 @@ export class SqliteIssueStateStore implements IssueStateStore {
     action: TransitionActionRecord,
   ): Promise<IssueStateRecord | null> {
     await this.withWrite(issue.id, async (database) => {
-      const existing = await this.findUnlocked(database, issue.id, issue.identifier);
+      const existing = await this.findUnlocked(
+        database,
+        issue.id,
+        issue.identifier,
+      );
       if (!existing) return;
-      const snapshot = await this.findSnapshotUnlocked(database, existing.issueId, historySnapshotId);
+      const snapshot = await this.findSnapshotUnlocked(
+        database,
+        existing.issueId,
+        historySnapshotId,
+      );
       if (!snapshot) return;
-      await this.updateSnapshotUnlocked(database, existing.issueId, historySnapshotId, {
-        ...snapshot,
-        actions: [...snapshot.actions, action],
-      });
+      await this.updateSnapshotUnlocked(
+        database,
+        existing.issueId,
+        historySnapshotId,
+        {
+          ...snapshot,
+          actions: [...snapshot.actions, action],
+        },
+      );
     });
     return this.get(issue.id);
   }
@@ -199,14 +268,27 @@ export class SqliteIssueStateStore implements IssueStateStore {
     error: TransitionErrorRecord,
   ): Promise<IssueStateRecord | null> {
     await this.withWrite(issue.id, async (database) => {
-      const existing = await this.findUnlocked(database, issue.id, issue.identifier);
+      const existing = await this.findUnlocked(
+        database,
+        issue.id,
+        issue.identifier,
+      );
       if (!existing) return;
-      const snapshot = await this.findSnapshotUnlocked(database, existing.issueId, historySnapshotId);
+      const snapshot = await this.findSnapshotUnlocked(
+        database,
+        existing.issueId,
+        historySnapshotId,
+      );
       if (!snapshot) return;
-      await this.updateSnapshotUnlocked(database, existing.issueId, historySnapshotId, {
-        ...snapshot,
-        errors: [...snapshot.errors, error],
-      });
+      await this.updateSnapshotUnlocked(
+        database,
+        existing.issueId,
+        historySnapshotId,
+        {
+          ...snapshot,
+          errors: [...snapshot.errors, error],
+        },
+      );
     });
     return this.get(issue.id);
   }
@@ -232,7 +314,11 @@ export class SqliteIssueStateStore implements IssueStateStore {
             return;
           }
           if (created === null) {
-            reject(new Error("SQLite database open callback fired before database assignment"));
+            reject(
+              new Error(
+                "SQLite database open callback fired before database assignment",
+              ),
+            );
             return;
           }
           resolve(created);
@@ -241,7 +327,9 @@ export class SqliteIssueStateStore implements IssueStateStore {
     });
     database.configure("busyTimeout", 5000);
     try {
-      await this.exec(database, `
+      await this.exec(
+        database,
+        `
         PRAGMA journal_mode = WAL;
         PRAGMA foreign_keys = ON;
 
@@ -280,7 +368,8 @@ export class SqliteIssueStateStore implements IssueStateStore {
 
         CREATE INDEX IF NOT EXISTS issue_history_transition_kind_idx
           ON issue_history(transition_kind, ruleset_id);
-      `);
+      `,
+      );
       await this.ensureHistoryAuditColumns(database);
       await this.migrateLegacyFileIssueState(database);
     } catch (error) {
@@ -291,12 +380,16 @@ export class SqliteIssueStateStore implements IssueStateStore {
     return database;
   }
 
-  private async withStore<T>(operation: (database: SqliteDatabase) => Promise<T> | T): Promise<T> {
+  private async withStore<T>(
+    operation: (database: SqliteDatabase) => Promise<T> | T,
+  ): Promise<T> {
     const previous = this.writeLock;
-    const current = previous.catch(() => undefined).then(async () => {
-      const database = await this.db();
-      return operation(database);
-    });
+    const current = previous
+      .catch(() => undefined)
+      .then(async () => {
+        const database = await this.db();
+        return operation(database);
+      });
     this.writeLock = current.then(
       () => undefined,
       () => undefined,
@@ -304,7 +397,10 @@ export class SqliteIssueStateStore implements IssueStateStore {
     return current;
   }
 
-  private async withWrite(_key: string, operation: (database: SqliteDatabase) => Promise<void> | void): Promise<void> {
+  private async withWrite(
+    _key: string,
+    operation: (database: SqliteDatabase) => Promise<void> | void,
+  ): Promise<void> {
     await this.withStore(async (database) => {
       await this.exec(database, "BEGIN IMMEDIATE");
       try {
@@ -317,7 +413,11 @@ export class SqliteIssueStateStore implements IssueStateStore {
     });
   }
 
-  private async findUnlocked(database: SqliteDatabase, issueId: string, issueIdentifier: string): Promise<IssueStateRecord | null> {
+  private async findUnlocked(
+    database: SqliteDatabase,
+    issueId: string,
+    issueIdentifier: string,
+  ): Promise<IssueStateRecord | null> {
     const row = await this.getRow<IssueStateRow>(
       database,
       `
@@ -332,17 +432,34 @@ export class SqliteIssueStateStore implements IssueStateStore {
     return row ? this.recordFromRow(database, row) : null;
   }
 
-  private async ensureHistoryAuditColumns(database: SqliteDatabase): Promise<void> {
-    const columns = new Set((await this.allRows<TableInfoRow>(database, "PRAGMA table_info(issue_history)")).map((row) => row.name));
+  private async ensureHistoryAuditColumns(
+    database: SqliteDatabase,
+  ): Promise<void> {
+    const columns = new Set(
+      (
+        await this.allRows<TableInfoRow>(
+          database,
+          "PRAGMA table_info(issue_history)",
+        )
+      ).map((row) => row.name),
+    );
     if (!columns.has("ruleset_version")) {
-      await this.run(database, "ALTER TABLE issue_history ADD COLUMN ruleset_version TEXT NOT NULL DEFAULT 'legacy'");
+      await this.run(
+        database,
+        "ALTER TABLE issue_history ADD COLUMN ruleset_version TEXT NOT NULL DEFAULT 'legacy'",
+      );
     }
     if (!columns.has("ruleset_fingerprint")) {
-      await this.run(database, "ALTER TABLE issue_history ADD COLUMN ruleset_fingerprint TEXT NOT NULL DEFAULT 'legacy'");
+      await this.run(
+        database,
+        "ALTER TABLE issue_history ADD COLUMN ruleset_fingerprint TEXT NOT NULL DEFAULT 'legacy'",
+      );
     }
   }
 
-  private async migrateLegacyFileIssueState(database: SqliteDatabase): Promise<void> {
+  private async migrateLegacyFileIssueState(
+    database: SqliteDatabase,
+  ): Promise<void> {
     const legacyStore = new FileIssueStateStore(this.stateDir);
     const records = await legacyStore.list();
     if (records.length === 0) return;
@@ -350,9 +467,11 @@ export class SqliteIssueStateStore implements IssueStateStore {
     await this.exec(database, "BEGIN IMMEDIATE");
     try {
       for (const record of records) {
-        const existing = await this.getRow<IssueStateRow>(database, "SELECT issue_id, issue_identifier, current_json FROM issue_state WHERE issue_id = ?", [
-          record.issueId,
-        ]);
+        const existing = await this.getRow<IssueStateRow>(
+          database,
+          "SELECT issue_id, issue_identifier, current_json FROM issue_state WHERE issue_id = ?",
+          [record.issueId],
+        );
         if (existing) continue;
         await this.insertRecordUnlocked(database, record);
       }
@@ -363,9 +482,14 @@ export class SqliteIssueStateStore implements IssueStateStore {
     }
   }
 
-  private async insertRecordUnlocked(database: SqliteDatabase, record: IssueStateRecord): Promise<void> {
+  private async insertRecordUnlocked(
+    database: SqliteDatabase,
+    record: IssueStateRecord,
+  ): Promise<void> {
     const { history: _history, ...currentFields } = record;
-    const current = normalizeIssueCurrentFields(currentFields as IssueCurrentFields);
+    const current = normalizeIssueCurrentFields(
+      currentFields as IssueCurrentFields,
+    );
     await this.run(
       database,
       `
@@ -376,12 +500,24 @@ export class SqliteIssueStateStore implements IssueStateStore {
           current_json = excluded.current_json,
           record_updated_at = excluded.record_updated_at
       `,
-      [current.issueId, current.issueIdentifier, JSON.stringify(current), current.recordCreatedAt, current.recordUpdatedAt],
+      [
+        current.issueId,
+        current.issueIdentifier,
+        JSON.stringify(current),
+        current.recordCreatedAt,
+        current.recordUpdatedAt,
+      ],
     );
     let sequence = 1;
     for (const rawSnapshot of record.history) {
       const snapshot = normalizeIssueHistorySnapshot(rawSnapshot);
-      await this.insertSnapshotUnlocked(database, current.issueId, current.issueIdentifier, sequence, snapshot);
+      await this.insertSnapshotUnlocked(
+        database,
+        current.issueId,
+        current.issueIdentifier,
+        sequence,
+        snapshot,
+      );
       sequence += 1;
     }
   }
@@ -396,7 +532,11 @@ export class SqliteIssueStateStore implements IssueStateStore {
       "SELECT snapshot_json FROM issue_history WHERE issue_id = ? AND history_snapshot_id = ?",
       [issueId, historySnapshotId],
     );
-    return row ? normalizeIssueHistorySnapshot(JSON.parse(row.snapshot_json) as IssueHistorySnapshot) : null;
+    return row
+      ? normalizeIssueHistorySnapshot(
+          JSON.parse(row.snapshot_json) as IssueHistorySnapshot,
+        )
+      : null;
   }
 
   private async updateSnapshotUnlocked(
@@ -405,11 +545,11 @@ export class SqliteIssueStateStore implements IssueStateStore {
     historySnapshotId: string,
     snapshot: IssueHistorySnapshot,
   ): Promise<void> {
-    await this.run(database, "UPDATE issue_history SET snapshot_json = ? WHERE issue_id = ? AND history_snapshot_id = ?", [
-      JSON.stringify(snapshot),
-      issueId,
-      historySnapshotId,
-    ]);
+    await this.run(
+      database,
+      "UPDATE issue_history SET snapshot_json = ? WHERE issue_id = ? AND history_snapshot_id = ?",
+      [JSON.stringify(snapshot), issueId, historySnapshotId],
+    );
     await this.touchIssue(database, issueId);
   }
 
@@ -458,15 +598,24 @@ export class SqliteIssueStateStore implements IssueStateStore {
     );
   }
 
-  private async touchIssue(database: SqliteDatabase, issueId: string): Promise<void> {
-    await this.run(database, "UPDATE issue_state SET record_updated_at = ? WHERE issue_id = ?", [
-      new Date().toISOString(),
-      issueId,
-    ]);
+  private async touchIssue(
+    database: SqliteDatabase,
+    issueId: string,
+  ): Promise<void> {
+    await this.run(
+      database,
+      "UPDATE issue_state SET record_updated_at = ? WHERE issue_id = ?",
+      [new Date().toISOString(), issueId],
+    );
   }
 
-  private async recordFromRow(database: SqliteDatabase, row: IssueStateRow): Promise<IssueStateRecord> {
-    const current = normalizeIssueCurrentFields(JSON.parse(row.current_json) as IssueCurrentFields);
+  private async recordFromRow(
+    database: SqliteDatabase,
+    row: IssueStateRow,
+  ): Promise<IssueStateRecord> {
+    const current = normalizeIssueCurrentFields(
+      JSON.parse(row.current_json) as IssueCurrentFields,
+    );
     const historyRows = await this.allRows<IssueHistoryRow>(
       database,
       "SELECT snapshot_json FROM issue_history WHERE issue_id = ? ORDER BY sequence",
@@ -475,7 +624,9 @@ export class SqliteIssueStateStore implements IssueStateStore {
     return {
       ...current,
       history: historyRows.map((historyRow) =>
-        normalizeIssueHistorySnapshot(JSON.parse(historyRow.snapshot_json) as IssueHistorySnapshot),
+        normalizeIssueHistorySnapshot(
+          JSON.parse(historyRow.snapshot_json) as IssueHistorySnapshot,
+        ),
       ),
     };
   }
@@ -489,7 +640,11 @@ export class SqliteIssueStateStore implements IssueStateStore {
     });
   }
 
-  private async run(database: SqliteDatabase, sql: string, params: readonly unknown[] = []): Promise<void> {
+  private async run(
+    database: SqliteDatabase,
+    sql: string,
+    params: readonly unknown[] = [],
+  ): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       database.run(sql, [...params], (error) => {
         if (error) reject(error);
@@ -498,7 +653,11 @@ export class SqliteIssueStateStore implements IssueStateStore {
     });
   }
 
-  private async getRow<T>(database: SqliteDatabase, sql: string, params: readonly unknown[] = []): Promise<T | undefined> {
+  private async getRow<T>(
+    database: SqliteDatabase,
+    sql: string,
+    params: readonly unknown[] = [],
+  ): Promise<T | undefined> {
     return new Promise<T | undefined>((resolve, reject) => {
       database.get<T>(sql, [...params], (error, row) => {
         if (error) reject(error);
@@ -507,7 +666,11 @@ export class SqliteIssueStateStore implements IssueStateStore {
     });
   }
 
-  private async allRows<T>(database: SqliteDatabase, sql: string, params: readonly unknown[] = []): Promise<T[]> {
+  private async allRows<T>(
+    database: SqliteDatabase,
+    sql: string,
+    params: readonly unknown[] = [],
+  ): Promise<T[]> {
     return new Promise<T[]>((resolve, reject) => {
       database.all<T>(sql, [...params], (error, rows) => {
         if (error) reject(error);
@@ -517,8 +680,12 @@ export class SqliteIssueStateStore implements IssueStateStore {
   }
 
   private async closeDatabase(database: SqliteDatabase): Promise<void> {
-    await this.exec(database, "PRAGMA wal_checkpoint(TRUNCATE)").catch(() => undefined);
-    await this.exec(database, "PRAGMA journal_mode = DELETE").catch(() => undefined);
+    await this.exec(database, "PRAGMA wal_checkpoint(TRUNCATE)").catch(
+      () => undefined,
+    );
+    await this.exec(database, "PRAGMA journal_mode = DELETE").catch(
+      () => undefined,
+    );
     await new Promise<void>((resolve, reject) => {
       database.close((error) => {
         if (error) reject(error);
@@ -528,76 +695,136 @@ export class SqliteIssueStateStore implements IssueStateStore {
   }
 }
 
-function normalizeIssueCurrentFields(record: IssueCurrentFields): IssueCurrentFields {
+function normalizeIssueCurrentFields(
+  record: IssueCurrentFields,
+): IssueCurrentFields {
   return {
     ...record,
     version: 1,
-    lastPlanningFailureAt: typeof record.lastPlanningFailureAt === "string" ? record.lastPlanningFailureAt : null,
-    planningRetryDueAt: typeof record.planningRetryDueAt === "string" ? record.planningRetryDueAt : null,
-    issueTriageCurrentTriggerReportIds: Array.isArray(record.issueTriageCurrentTriggerReportIds)
-      ? record.issueTriageCurrentTriggerReportIds.filter((item): item is string => typeof item === "string")
+    lastPlanningFailureAt:
+      typeof record.lastPlanningFailureAt === "string"
+        ? record.lastPlanningFailureAt
+        : null,
+    planningRetryDueAt:
+      typeof record.planningRetryDueAt === "string"
+        ? record.planningRetryDueAt
+        : null,
+    issueTriageCurrentTriggerReportIds: Array.isArray(
+      record.issueTriageCurrentTriggerReportIds,
+    )
+      ? record.issueTriageCurrentTriggerReportIds.filter(
+          (item): item is string => typeof item === "string",
+        )
       : [],
-    latestIssueTriageReportBlockers: Array.isArray(record.latestIssueTriageReportBlockers)
+    latestIssueTriageReportBlockers: Array.isArray(
+      record.latestIssueTriageReportBlockers,
+    )
       ? record.latestIssueTriageReportBlockers
       : [],
-    postMortemCurrentTriggerReportIds: Array.isArray(record.postMortemCurrentTriggerReportIds)
-      ? record.postMortemCurrentTriggerReportIds.filter((item): item is string => typeof item === "string")
+    postMortemCurrentTriggerReportIds: Array.isArray(
+      record.postMortemCurrentTriggerReportIds,
+    )
+      ? record.postMortemCurrentTriggerReportIds.filter(
+          (item): item is string => typeof item === "string",
+        )
       : [],
     latestCompletionReport: record.latestCompletionReport ?? null,
     latestApprovalPassVerdict: record.latestApprovalPassVerdict ?? null,
     mergeGate: record.mergeGate ?? null,
     mergeConflict: record.mergeConflict ?? null,
     lifecycleSummaryCiStatus:
-      typeof record.lifecycleSummaryCiStatus === "string" ? record.lifecycleSummaryCiStatus : null,
-    mergePolicyMode: typeof record.mergePolicyMode === "string" ? record.mergePolicyMode : "manual",
-    mergePolicySourceStates: Array.isArray(record.mergePolicySourceStates) ? record.mergePolicySourceStates : [],
-    mergePolicyDoneState: typeof record.mergePolicyDoneState === "string" ? record.mergePolicyDoneState : null,
+      typeof record.lifecycleSummaryCiStatus === "string"
+        ? record.lifecycleSummaryCiStatus
+        : null,
+    lifecyclePersistenceAvailable:
+      record.lifecyclePersistenceAvailable === true,
+    mergePolicyMode:
+      typeof record.mergePolicyMode === "string"
+        ? record.mergePolicyMode
+        : "manual",
+    mergePolicySourceStates: Array.isArray(record.mergePolicySourceStates)
+      ? record.mergePolicySourceStates
+      : [],
+    mergePolicyDoneState:
+      typeof record.mergePolicyDoneState === "string"
+        ? record.mergePolicyDoneState
+        : null,
     mergePolicyConflictsState:
-      typeof record.mergePolicyConflictsState === "string" ? record.mergePolicyConflictsState : null,
-    mergePolicyRequiredChecks: Array.isArray(record.mergePolicyRequiredChecks) ? record.mergePolicyRequiredChecks : [],
+      typeof record.mergePolicyConflictsState === "string"
+        ? record.mergePolicyConflictsState
+        : null,
+    mergePolicyRequiredChecks: Array.isArray(record.mergePolicyRequiredChecks)
+      ? record.mergePolicyRequiredChecks
+      : [],
     mergePolicyMaxMergeGateFailures:
-      typeof record.mergePolicyMaxMergeGateFailures === "number" && Number.isFinite(record.mergePolicyMaxMergeGateFailures)
+      typeof record.mergePolicyMaxMergeGateFailures === "number" &&
+      Number.isFinite(record.mergePolicyMaxMergeGateFailures)
         ? record.mergePolicyMaxMergeGateFailures
         : 0,
     mergePolicyConfigFingerprint:
-      typeof record.mergePolicyConfigFingerprint === "string" ? record.mergePolicyConfigFingerprint : "legacy",
+      typeof record.mergePolicyConfigFingerprint === "string"
+        ? record.mergePolicyConfigFingerprint
+        : "legacy",
     currentMergePolicyObservationInputFingerprint:
       typeof record.currentMergePolicyObservationInputFingerprint === "string"
         ? record.currentMergePolicyObservationInputFingerprint
         : null,
     lastMergePolicyObservationFingerprint:
-      typeof record.lastMergePolicyObservationFingerprint === "string" ? record.lastMergePolicyObservationFingerprint : null,
+      typeof record.lastMergePolicyObservationFingerprint === "string"
+        ? record.lastMergePolicyObservationFingerprint
+        : null,
     lastMergePolicyObservationStatus:
-      typeof record.lastMergePolicyObservationStatus === "string" ? record.lastMergePolicyObservationStatus : null,
+      typeof record.lastMergePolicyObservationStatus === "string"
+        ? record.lastMergePolicyObservationStatus
+        : null,
     lastMergePolicyObservation: record.lastMergePolicyObservation ?? null,
     mergePolicyMerge: record.mergePolicyMerge ?? null,
     mergePolicyMergeGate: record.mergePolicyMergeGate ?? null,
-    mergePolicyMergeGateResults: Array.isArray(record.mergePolicyMergeGateResults)
+    mergePolicyMergeGateResults: Array.isArray(
+      record.mergePolicyMergeGateResults,
+    )
       ? record.mergePolicyMergeGateResults
       : [],
     mergePolicyMergeConflict: record.mergePolicyMergeConflict ?? null,
-    mergePolicyLatestCompletionReport: record.mergePolicyLatestCompletionReport ?? null,
-    mergePolicyLatestApprovalVerdict: record.mergePolicyLatestApprovalVerdict ?? null,
-    mergePolicyReviewFeedback: Array.isArray(record.mergePolicyReviewFeedback) ? record.mergePolicyReviewFeedback : [],
-    mergePolicyLatestCompletionRun: record.mergePolicyLatestCompletionRun ?? null,
+    mergePolicyLatestCompletionReport:
+      record.mergePolicyLatestCompletionReport ?? null,
+    mergePolicyLatestApprovalVerdict:
+      record.mergePolicyLatestApprovalVerdict ?? null,
+    mergePolicyReviewFeedback: Array.isArray(record.mergePolicyReviewFeedback)
+      ? record.mergePolicyReviewFeedback
+      : [],
+    mergePolicyLatestCompletionRun:
+      record.mergePolicyLatestCompletionRun ?? null,
   };
 }
 
-function normalizeIssueHistorySnapshot(snapshot: IssueHistorySnapshot): IssueHistorySnapshot {
-  return {
+function normalizeIssueHistorySnapshot(
+  snapshot: IssueHistorySnapshot,
+): IssueHistorySnapshot {
+  return normalizeIssueHistorySnapshotEvidenceFields({
     ...snapshot,
-    snapshotKind: snapshot.snapshotKind === "evidence" || snapshot.transitionKind === "record_evidence" ? "evidence" : "transition",
+    snapshotKind:
+      snapshot.snapshotKind === "evidence" ||
+      snapshot.transitionKind === "record_evidence"
+        ? "evidence"
+        : "transition",
     triggerSource:
-      snapshot.triggerSource === "manual_cli" || snapshot.triggerSource === "transition"
+      snapshot.triggerSource === "manual_cli" ||
+      snapshot.triggerSource === "transition"
         ? snapshot.triggerSource
         : "orchestrator",
     transitionRequestContext: snapshot.transitionRequestContext ?? null,
-    rulesetVersion: typeof snapshot.rulesetVersion === "string" && snapshot.rulesetVersion.length > 0 ? snapshot.rulesetVersion : "legacy",
+    rulesetVersion:
+      typeof snapshot.rulesetVersion === "string" &&
+      snapshot.rulesetVersion.length > 0
+        ? snapshot.rulesetVersion
+        : "legacy",
     rulesetFingerprint:
-      typeof snapshot.rulesetFingerprint === "string" && snapshot.rulesetFingerprint.length > 0
+      typeof snapshot.rulesetFingerprint === "string" &&
+      snapshot.rulesetFingerprint.length > 0
         ? snapshot.rulesetFingerprint
         : `${snapshot.rulesetId}@legacy:${snapshot.rulesetPriority}`,
     actions: Array.isArray(snapshot.actions) ? snapshot.actions : [],
     errors: Array.isArray(snapshot.errors) ? snapshot.errors : [],
-  };
+  });
 }

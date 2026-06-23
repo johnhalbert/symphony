@@ -23,7 +23,12 @@ describe("SqliteIssueStateStore", () => {
 
   afterEach(async () => {
     await Promise.all(stores.splice(0).map((store) => store.close()));
-    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    await rm(root, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 25,
+    });
   });
 
   it("persists current issue state, appends flat history snapshots, and updates actions and errors", async () => {
@@ -35,17 +40,36 @@ describe("SqliteIssueStateStore", () => {
       {
         id: "dispatch.worker",
         priority: 100,
-        evaluate: () => ({ transitionKind: "dispatch_worker", role: "worker", runPhase: "implementation" }),
+        evaluate: () => ({
+          transitionKind: "dispatch_worker",
+          role: "worker",
+          runPhase: "implementation",
+        }),
       },
     ]).decide(currentSnapshot(current), []);
     expect(snapshot).not.toBeNull();
 
-    await store.appendSnapshot({ id: current.issueId, identifier: current.issueIdentifier }, snapshot!);
+    await store.appendSnapshot(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!,
+    );
     const action = transitionAction({ actionType: "render_prompt" });
-    const error = transitionErrorFromUnknown(new Error("boom"), { actionId: action.actionId });
-    await store.appendSnapshotAction({ id: current.issueId, identifier: current.issueIdentifier }, snapshot!.historySnapshotId, action);
-    await store.appendSnapshotError({ id: current.issueId, identifier: current.issueIdentifier }, snapshot!.historySnapshotId, error);
-    await expect(access(path.join(root, "issue-state.sqlite"))).resolves.toBeUndefined();
+    const error = transitionErrorFromUnknown(new Error("boom"), {
+      actionId: action.actionId,
+    });
+    await store.appendSnapshotAction(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!.historySnapshotId,
+      action,
+    );
+    await store.appendSnapshotError(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!.historySnapshotId,
+      error,
+    );
+    await expect(
+      access(path.join(root, "issue-state.sqlite")),
+    ).resolves.toBeUndefined();
 
     const reloaded = new SqliteIssueStateStore(root);
     stores.push(reloaded);
@@ -79,17 +103,26 @@ describe("SqliteIssueStateStore", () => {
         id: "dispatch.worker",
         priority: 100,
         version: "legacy-test-v1",
-        evaluate: () => ({ transitionKind: "dispatch_worker", role: "worker", runPhase: "implementation" }),
+        evaluate: () => ({
+          transitionKind: "dispatch_worker",
+          role: "worker",
+          runPhase: "implementation",
+        }),
       },
     ]).decide(currentSnapshot(current), []);
     expect(snapshot).not.toBeNull();
-    await legacy.appendSnapshot({ id: current.issueId, identifier: current.issueIdentifier }, snapshot!);
+    await legacy.appendSnapshot(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!,
+    );
 
     const migrated = new SqliteIssueStateStore(root);
     stores.push(migrated);
     const record = await migrated.get(current.issueId);
 
-    await expect(access(path.join(root, "issue-state.sqlite"))).resolves.toBeUndefined();
+    await expect(
+      access(path.join(root, "issue-state.sqlite")),
+    ).resolves.toBeUndefined();
     expect(record).toMatchObject({
       issueId: current.issueId,
       issueIdentifier: current.issueIdentifier,
@@ -119,13 +152,34 @@ describe("SqliteIssueStateStore", () => {
           evidenceKind: "run",
           evidenceEventType: "run_started",
           evidenceSourceId: "run-1",
-          evidencePayload: { runId: "run-1", role: "worker" },
+          evidencePayload: {
+            runId: "run-1",
+            role: "worker",
+            runPhase: "implementation",
+            runKind: "implementation",
+            status: "running",
+            sessionId: "session-1",
+            attempt: 1,
+            turnNumber: 2,
+            harnessId: "codex",
+            workspaceKey: "TEST-1",
+            workspacePath: "/tmp/workspaces/TEST-1",
+            promptTemplateKeys: ["worker.system", "worker.user"],
+            tokens: {
+              inputTokens: 10,
+              outputTokens: 20,
+              totalTokens: 30,
+            },
+          },
         }),
       },
     ]).decide(currentSnapshot(current), []);
     expect(snapshot).not.toBeNull();
 
-    await store.appendSnapshot({ id: current.issueId, identifier: current.issueIdentifier }, snapshot!);
+    await store.appendSnapshot(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!,
+    );
     const reloaded = new SqliteIssueStateStore(root);
     stores.push(reloaded);
 
@@ -138,7 +192,27 @@ describe("SqliteIssueStateStore", () => {
           evidenceKind: "run",
           evidenceEventType: "run_started",
           evidenceSourceId: "run-1",
-          evidencePayload: { runId: "run-1", role: "worker" },
+          evidencePayload: {
+            runId: "run-1",
+            role: "worker",
+          },
+          runId: "run-1",
+          role: "worker",
+          runPhase: "implementation",
+          runKind: "implementation",
+          runStatus: "running",
+          runSessionId: "session-1",
+          runAttempt: 1,
+          runTurnNumber: 2,
+          runHarnessId: "codex",
+          runWorkspaceKey: "TEST-1",
+          runWorkspacePath: "/tmp/workspaces/TEST-1",
+          runPromptTemplateKeys: ["worker.system", "worker.user"],
+          runTokens: {
+            inputTokens: 10,
+            outputTokens: 20,
+            totalTokens: 30,
+          },
         },
       ],
     });
@@ -153,7 +227,10 @@ describe("SqliteIssueStateStore", () => {
       {
         id: "orchestrator.merge_policy.observe",
         priority: 150,
-        evaluate: () => ({ transitionKind: "merge_policy_observe", reason: "merge_policy_live_observation_required" }),
+        evaluate: () => ({
+          transitionKind: "merge_policy_observe",
+          reason: "merge_policy_live_observation_required",
+        }),
       },
     ]).decide(
       currentSnapshot(current, {
@@ -177,7 +254,10 @@ describe("SqliteIssueStateStore", () => {
     );
     expect(snapshot).not.toBeNull();
 
-    await store.appendSnapshot({ id: current.issueId, identifier: current.issueIdentifier }, snapshot!);
+    await store.appendSnapshot(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!,
+    );
     const reloaded = new SqliteIssueStateStore(root);
     stores.push(reloaded);
 
@@ -256,6 +336,7 @@ function currentFields(): IssueCurrentFields {
     mergeGate: null,
     mergeConflict: null,
     lifecycleSummaryCiStatus: null,
+    lifecyclePersistenceAvailable: false,
     mergePolicyMode: "manual",
     mergePolicySourceStates: [],
     mergePolicyDoneState: null,
@@ -310,7 +391,10 @@ function currentFields(): IssueCurrentFields {
   };
 }
 
-function currentSnapshot(current: IssueCurrentFields, overrides: Partial<IssueCurrentStateSnapshot> = {}): IssueCurrentStateSnapshot {
+function currentSnapshot(
+  current: IssueCurrentFields,
+  overrides: Partial<IssueCurrentStateSnapshot> = {},
+): IssueCurrentStateSnapshot {
   const now = "2026-01-01T00:00:01.000Z";
   return {
     ...current,

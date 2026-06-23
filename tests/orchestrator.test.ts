@@ -35,11 +35,21 @@ import {
   planIssueBreakdownFinalizationWritebacks,
 } from "../src/core/IssueBreakdownPlanApplyService.js";
 import { IssueBreakdownPlanService } from "../src/core/IssueBreakdownPlanService.js";
-import { IssueTriageService, issueTriageTriggerFingerprint } from "../src/core/IssueTriageService.js";
+import {
+  IssueTriageService,
+  issueTriageTriggerFingerprint,
+} from "../src/core/IssueTriageService.js";
 import type { MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
-import { Orchestrator, sortIssuesForDispatch, type PullRequestDiscoveryClient } from "../src/core/orchestrator/Orchestrator.js";
-import type { IssueCurrentStateSnapshot, IssueHistorySnapshot } from "../src/core/orchestration/IssueOrchestrationState.js";
+import {
+  Orchestrator,
+  sortIssuesForDispatch,
+  type PullRequestDiscoveryClient,
+} from "../src/core/orchestrator/Orchestrator.js";
+import type {
+  IssueCurrentStateSnapshot,
+  IssueHistorySnapshot,
+} from "../src/core/orchestration/IssueOrchestrationState.js";
 import { SqliteIssueStateStore } from "../src/core/orchestration/SqliteIssueStateStore.js";
 import {
   FileIssueLifecycleStore,
@@ -75,11 +85,21 @@ import {
 } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
-import type { Issue, TokenCounts, TrackerStateLists } from "../src/core/types.js";
+import type {
+  Issue,
+  TokenCounts,
+  TrackerStateLists,
+} from "../src/core/types.js";
 import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
-type IssueCreateWriteback = Extract<NewWritebackOperation, { kind: "issue_create" }>;
-type IssueRelationWriteback = Extract<NewWritebackOperation, { kind: "issue_relation" }>;
+type IssueCreateWriteback = Extract<
+  NewWritebackOperation,
+  { kind: "issue_create" }
+>;
+type IssueRelationWriteback = Extract<
+  NewWritebackOperation,
+  { kind: "issue_relation" }
+>;
 type CommentWriteback = Extract<NewWritebackOperation, { kind: "comment" }>;
 type RequestedTransitionCall = {
   candidateSource: string;
@@ -101,7 +121,12 @@ describe("Orchestrator", () => {
   afterEach(async () => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
-    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    await rm(root, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 25,
+    });
   });
 
   it("sorts issues by priority, creation date, then identifier", () => {
@@ -152,7 +177,11 @@ describe("Orchestrator", () => {
       },
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -168,7 +197,8 @@ describe("Orchestrator", () => {
 
     await expect(runStore.getRun("orphan-run-1")).resolves.toMatchObject({
       status: "cancelled",
-      error: "Run cancelled during Symphony startup because no live orchestrator owns it.",
+      error:
+        "Run cancelled during Symphony startup because no live orchestrator owns it.",
       cancellationSource: "service_stop",
       cancellationOutcome: "cancelled",
       sdkRunStatus: "cancelled",
@@ -206,9 +236,15 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -219,7 +255,9 @@ describe("Orchestrator", () => {
       lifecycleStore,
       runStore,
     });
-    expect(orchestrator.registeredTransitionRulesets().map((ruleset) => ruleset.id)).toEqual(
+    expect(
+      orchestrator.registeredTransitionRulesets().map((ruleset) => ruleset.id),
+    ).toEqual(
       expect.arrayContaining([
         "manual.dispatch",
         "orchestrator.dispatch.worker.implementation",
@@ -238,13 +276,22 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Review-cycle hardening:");
     expect(harness.runs[0]?.prompt).toContain("underlying contract invariant");
-    expect(harness.runs[0]?.prompt).toContain("derive a conservative checklist");
+    expect(harness.runs[0]?.prompt).toContain(
+      "derive a conservative checklist",
+    );
     expect(harness.runs[0]?.prompt).toContain("issue-authoring gap");
-    expect(harness.runs[0]?.prompt).not.toContain("Compact Symphony handoff packet:");
+    expect(harness.runs[0]?.prompt).not.toContain(
+      "Compact Symphony handoff packet:",
+    );
     expect(harness.runs[0]?.ctx.role).toBe("worker");
     expect(orchestrator.snapshot().counts.running).toBe(0);
-    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
-    const dispatchSnapshot = issueState?.history.find((snapshot) => snapshot.transitionKind === "dispatch_worker");
+    const issueState = await readIssueState(
+      config.workspace.stateDir,
+      candidate.id,
+    );
+    const dispatchSnapshot = issueState?.history.find(
+      (snapshot) => snapshot.transitionKind === "dispatch_worker",
+    );
     expect(dispatchSnapshot).toMatchObject({
       triggerType: "orchestrator.tick",
       candidateSource: "tick_candidates",
@@ -255,7 +302,9 @@ describe("Orchestrator", () => {
     });
     expect(dispatchSnapshot).not.toHaveProperty("current");
     expect(dispatchSnapshot).not.toHaveProperty("transitionRequest");
-    expect(dispatchSnapshot?.actions.map((action) => action.actionType)).toEqual(
+    expect(
+      dispatchSnapshot?.actions.map((action) => action.actionType),
+    ).toEqual(
       expect.arrayContaining([
         "record_agent_dispatch_started",
         "create_running_entry",
@@ -266,9 +315,12 @@ describe("Orchestrator", () => {
     );
     const evidenceEvents = issueState?.history
       .filter((snapshot) => snapshot.snapshotKind === "evidence")
-      .map((snapshot) => `${snapshot.evidenceKind}:${snapshot.evidenceEventType}`);
+      .map(
+        (snapshot) => `${snapshot.evidenceKind}:${snapshot.evidenceEventType}`,
+      );
     expect(evidenceEvents).toEqual(
       expect.arrayContaining([
+        "tracker:tracker_issue_observed",
         "workspace:workspace_created",
         "workspace:workspace_before_run_completed",
         "workspace:workspace_after_run_completed",
@@ -280,6 +332,24 @@ describe("Orchestrator", () => {
         "run:agent_run_exit",
       ]),
     );
+    const trackerObservation = issueState?.history.find(
+      (snapshot) =>
+        snapshot.snapshotKind === "evidence" &&
+        snapshot.evidenceKind === "tracker" &&
+        snapshot.evidenceEventType === "tracker_issue_observed",
+    );
+    expect(trackerObservation).toMatchObject({
+      triggerType: "orchestrator.tick",
+      evidenceSourceId: candidate.id,
+      observedTrackerState: "Todo",
+      observedLabels: candidate.labels,
+      observedBranchName: candidate.branchName,
+      observedPriority: candidate.priority,
+      observedAssignedToWorker: candidate.assignedToWorker,
+      observedHasChildren: candidate.hasChildren === true,
+      observedTrackerCreatedAt: candidate.createdAt,
+      observedTrackerUpdatedAt: candidate.updatedAt,
+    });
   });
 
   it("runs dashboard operator chat through the configured harness and persists assistant output", async () => {
@@ -287,14 +357,25 @@ describe("Orchestrator", () => {
     const logger = new StructuredLogger(() => undefined);
     const tracker = idleTracker();
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-    const conversationStore = new FileOrchestratorConversationStore(config.workspace.stateDir);
+    const conversationStore = new FileOrchestratorConversationStore(
+      config.workspace.stateDir,
+    );
     const harness = new FakeOperatorChatHarness([
-      { type: "session_started", sessionId: "operator-session-1", runId: "operator-run-1", model: "test-planner" },
+      {
+        type: "session_started",
+        sessionId: "operator-session-1",
+        runId: "operator-run-1",
+        model: "test-planner",
+      },
       { type: "progress", activitySource: "delta", message: "Hello " },
       { type: "progress", activitySource: "delta", message: "operator" },
       { type: "completed" },
     ]);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -336,7 +417,9 @@ describe("Orchestrator", () => {
 
     await eventually(async () => {
       const messages = await conversationStore.listMessages("operator-room");
-      expect(messages.map((message) => [message.role, message.status, message.body])).toEqual([
+      expect(
+        messages.map((message) => [message.role, message.status, message.body]),
+      ).toEqual([
         ["user", "completed", "what is running?"],
         ["assistant", "completed", "Hello operator"],
       ]);
@@ -345,7 +428,10 @@ describe("Orchestrator", () => {
     expect(harness.operatorContexts[0]).toMatchObject({
       conversationId: "operator-room",
       messageId: "client-message-1",
-      statusServer: { baseUrl: "http://127.0.0.1:7331", mutationToken: "secret" },
+      statusServer: {
+        baseUrl: "http://127.0.0.1:7331",
+        mutationToken: "secret",
+      },
     });
     await eventually(async () => {
       const run = await runStore.getRun("operator-run-1");
@@ -360,7 +446,9 @@ describe("Orchestrator", () => {
       });
     });
     const transcript = await runStore.readTranscript("operator-run-1");
-    expect(transcript.events.map((event) => event.eventType)).toContain("completed");
+    expect(transcript.events.map((event) => event.eventType)).toContain(
+      "completed",
+    );
   });
 
   it("persists distinct Hermes ACP runtime metadata on started runs", async () => {
@@ -386,11 +474,16 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-    const harness: AgentHarness & { runs: Array<{ ctx: AgentRunContext; prompt: string }> } = {
+    const harness: AgentHarness & {
+      runs: Array<{ ctx: AgentRunContext; prompt: string }>;
+    } = {
       id: "hermes_acp",
       capabilities: { continuation: true, mcpHandoff: true },
       runs: [],
-      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+      async *run(
+        ctx: AgentRunContext,
+        prompt: string,
+      ): AsyncIterable<AgentEvent> {
         this.runs.push({ ctx, prompt });
         yield {
           type: "session_started",
@@ -401,7 +494,11 @@ describe("Orchestrator", () => {
         yield { type: "completed", message: "hermes acp completed" };
       },
     };
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -414,10 +511,15 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "Hermes ACP dispatch");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "Hermes ACP run completion");
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "Hermes ACP run completion",
+    );
     await orchestrator.stop();
 
-    await expect(runStore.latestRunForIssue(candidate.id)).resolves.toMatchObject({
+    await expect(
+      runStore.latestRunForIssue(candidate.id),
+    ).resolves.toMatchObject({
       harnessId: "hermes_acp",
       runtimeModel: "anthropic/claude-sonnet-test",
       runtimeModelParams: [],
@@ -453,11 +555,16 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-    const harness: AgentHarness & { runs: Array<{ ctx: AgentRunContext; prompt: string }> } = {
+    const harness: AgentHarness & {
+      runs: Array<{ ctx: AgentRunContext; prompt: string }>;
+    } = {
       id: "hermes_acp",
       capabilities: { continuation: true, mcpHandoff: true },
       runs: [],
-      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+      async *run(
+        ctx: AgentRunContext,
+        prompt: string,
+      ): AsyncIterable<AgentEvent> {
         this.runs.push({ ctx, prompt });
         yield {
           type: "session_started",
@@ -470,7 +577,11 @@ describe("Orchestrator", () => {
         yield { type: "completed", message: "hermes acp completed" };
       },
     };
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -482,18 +593,30 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "Hermes ACP default dispatch");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "Hermes ACP default run completion");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "Hermes ACP default dispatch",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "Hermes ACP default run completion",
+    );
     await orchestrator.stop();
 
-    await expect(runStore.latestRunForIssue(candidate.id)).resolves.toMatchObject({
+    await expect(
+      runStore.latestRunForIssue(candidate.id),
+    ).resolves.toMatchObject({
       runId: "hermes-acp-run-1",
       sessionId: "symphony-profile:acp-session-1:hermes-acp-run-1",
       agentId: "acp-session-1",
       harnessId: "hermes_acp",
       runtimeModel: null,
       runtimeModelParams: [],
-      runtimeSettingSources: ["host_hermes:PATH:hermes", "source_profile:active", "profile_prefix:symphony"],
+      runtimeSettingSources: [
+        "host_hermes:PATH:hermes",
+        "source_profile:active",
+        "profile_prefix:symphony",
+      ],
       runtimeMode: null,
       runtimeAgentLifecycle: "reuse_by_issue",
     });
@@ -555,7 +678,11 @@ describe("Orchestrator", () => {
           channel: "chat",
           kind: "assistant_reasoning_delta",
           text: "Hermes ACP thought update",
-          payload: { reasoning: true, messagePreview: "thought preview", redacted: true },
+          payload: {
+            reasoning: true,
+            messagePreview: "thought preview",
+            redacted: true,
+          },
         }),
       },
       {
@@ -567,7 +694,13 @@ describe("Orchestrator", () => {
           channel: "tool",
           kind: "tool_call_started",
           text: "Hermes ACP tool started: terminal",
-          payload: { toolCallId: "call-1", toolName: "terminal", status: "running", outputPreview: "started", redacted: true },
+          payload: {
+            toolCallId: "call-1",
+            toolName: "terminal",
+            status: "running",
+            outputPreview: "started",
+            redacted: true,
+          },
         }),
       },
       {
@@ -579,7 +712,13 @@ describe("Orchestrator", () => {
           channel: "tool",
           kind: "tool_call_completed",
           text: "Hermes ACP tool completed: terminal",
-          payload: { toolCallId: "call-1", toolName: "terminal", status: "succeeded", outputPreview: "tests passed", redacted: true },
+          payload: {
+            toolCallId: "call-1",
+            toolName: "terminal",
+            status: "succeeded",
+            outputPreview: "tests passed",
+            redacted: true,
+          },
         }),
       },
       {
@@ -590,7 +729,12 @@ describe("Orchestrator", () => {
           channel: "token",
           kind: "token_usage_reported",
           text: "Token usage reported",
-          payload: { inputTokens: 3, outputTokens: 5, totalTokens: 8, usageSource: "stream" },
+          payload: {
+            inputTokens: 3,
+            outputTokens: 5,
+            totalTokens: 8,
+            usageSource: "stream",
+          },
         }),
       },
       {
@@ -603,7 +747,12 @@ describe("Orchestrator", () => {
           channel: "diagnostic",
           kind: "runtime_diagnostic",
           text: "ACP permission denied",
-          payload: { code: "hermes_acp_permission_denied", severity: "info", messagePreview: "permission denied", redacted: true },
+          payload: {
+            code: "hermes_acp_permission_denied",
+            severity: "info",
+            messagePreview: "permission denied",
+            redacted: true,
+          },
         }),
       },
       {
@@ -618,7 +767,11 @@ describe("Orchestrator", () => {
         }),
       },
     ]);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -630,13 +783,23 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "run-activity harness dispatched");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "run-activity harness exited");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "run-activity harness dispatched",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "run-activity harness exited",
+    );
     await settleOrchestratorExit();
     await orchestrator.stop();
 
     const run = await runStore.latestRunForIssue(candidate.id);
-    expect(run).toMatchObject({ runId, status: "succeeded", tokens: { inputTokens: 3, outputTokens: 5, totalTokens: 8 } });
+    expect(run).toMatchObject({
+      runId,
+      status: "succeeded",
+      tokens: { inputTokens: 3, outputTokens: 5, totalTokens: 8 },
+    });
     const transcript = await runStore.readTranscript(runId);
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toEqual(
@@ -654,7 +817,11 @@ describe("Orchestrator", () => {
     );
     expect(eventTypes).not.toContain("agent_message_chunk");
     expect(eventTypes).not.toContain("session/update");
-    expect(transcript.events.find((event) => event.eventType === "assistant_message_delta")).toMatchObject({
+    expect(
+      transcript.events.find(
+        (event) => event.eventType === "assistant_message_delta",
+      ),
+    ).toMatchObject({
       source: "harness",
       message: "hello",
       payload: {
@@ -666,47 +833,123 @@ describe("Orchestrator", () => {
         sequenceSource: "harness",
       },
     });
-    expect(transcript.events.find((event) => event.eventType === "runtime_diagnostic")).toMatchObject({
-      payload: { kind: "runtime_diagnostic", code: "hermes_acp_permission_denied", messagePreview: "permission denied" },
+    expect(
+      transcript.events.find(
+        (event) => event.eventType === "runtime_diagnostic",
+      ),
+    ).toMatchObject({
+      payload: {
+        kind: "runtime_diagnostic",
+        code: "hermes_acp_permission_denied",
+        messagePreview: "permission denied",
+      },
     });
-    const projected = projectWebTranscript(transcript.events, { includeRunPrelude: false });
+    const projected = projectWebTranscript(transcript.events, {
+      includeRunPrelude: false,
+    });
     expect(projected).toEqual(
       expect.arrayContaining([
         { kind: "assistant", ts: expect.any(String), text: "hello" },
-        { kind: "user", ts: expect.any(String), from: "user", issue: "", text: "Do work" },
+        {
+          kind: "user",
+          ts: expect.any(String),
+          from: "user",
+          issue: "",
+          text: "Do work",
+        },
         { kind: "thinking", ts: expect.any(String), text: "thought preview" },
-        expect.objectContaining({ kind: "tool_call", call_id: "call-1", name: "terminal", status: "succeeded", result: "tests passed" }),
-        { kind: "status", state: "token_usage_reported", ts: expect.any(String), text: "Tokens: input 3 · output 5 · total 8" },
-        { kind: "status", state: "runtime_diagnostic", ts: expect.any(String), text: "ACP permission denied" },
-        { kind: "status", state: "run_succeeded", ts: expect.any(String), text: "Run completed" },
+        expect.objectContaining({
+          kind: "tool_call",
+          call_id: "call-1",
+          name: "terminal",
+          status: "succeeded",
+          result: "tests passed",
+        }),
+        {
+          kind: "status",
+          state: "token_usage_reported",
+          ts: expect.any(String),
+          text: "Tokens: input 3 · output 5 · total 8",
+        },
+        {
+          kind: "status",
+          state: "runtime_diagnostic",
+          ts: expect.any(String),
+          text: "ACP permission denied",
+        },
+        {
+          kind: "status",
+          state: "run_succeeded",
+          ts: expect.any(String),
+          text: "Run completed",
+        },
       ]),
     );
   });
 
   it("persists harness-provided ACP terminal failure and cancellation metadata through the shared orchestrator transcript path", async () => {
     const failed = await runTerminalRunActivityScenario(root, "failed");
-    expect(failed.run).toMatchObject({ status: "failed", error: "Run failed token=[redacted]" });
+    expect(failed.run).toMatchObject({
+      status: "failed",
+      error: "Run failed token=[redacted]",
+    });
     expect(failed.eventTypes).toContain("run_failed");
     expect(failed.eventTypes).not.toContain("failed");
-    expect(failed.transcript.events.find((event) => event.eventType === "run_failed")).toMatchObject({
+    expect(
+      failed.transcript.events.find(
+        (event) => event.eventType === "run_failed",
+      ),
+    ).toMatchObject({
       message: "Run failed token=[redacted]",
-      payload: { kind: "run_failed", actor: "runtime", channel: "terminal", protocol: "acp", reason: "provider_error" },
+      payload: {
+        kind: "run_failed",
+        actor: "runtime",
+        channel: "terminal",
+        protocol: "acp",
+        reason: "provider_error",
+      },
     });
     expect(failed.projected).toEqual(
-      expect.arrayContaining([{ kind: "status", state: "run_failed", ts: expect.any(String), text: "Run failed token=[redacted]" }]),
+      expect.arrayContaining([
+        {
+          kind: "status",
+          state: "run_failed",
+          ts: expect.any(String),
+          text: "Run failed token=[redacted]",
+        },
+      ]),
     );
-    expect(JSON.stringify(failed.transcript)).not.toContain("SECRET_TERMINAL_TOKEN");
+    expect(JSON.stringify(failed.transcript)).not.toContain(
+      "SECRET_TERMINAL_TOKEN",
+    );
 
     const cancelled = await runTerminalRunActivityScenario(root, "cancelled");
     expect(cancelled.run).toMatchObject({ status: "cancelled" });
     expect(cancelled.eventTypes).toContain("run_cancelled");
     expect(cancelled.eventTypes).not.toContain("cancelled");
-    expect(cancelled.transcript.events.find((event) => event.eventType === "run_cancelled")).toMatchObject({
+    expect(
+      cancelled.transcript.events.find(
+        (event) => event.eventType === "run_cancelled",
+      ),
+    ).toMatchObject({
       message: "Run cancelled",
-      payload: { kind: "run_cancelled", actor: "runtime", channel: "terminal", protocol: "acp", reason: "operator_cancelled" },
+      payload: {
+        kind: "run_cancelled",
+        actor: "runtime",
+        channel: "terminal",
+        protocol: "acp",
+        reason: "operator_cancelled",
+      },
     });
     expect(cancelled.projected).toEqual(
-      expect.arrayContaining([{ kind: "status", state: "run_cancelled", ts: expect.any(String), text: "Run cancelled" }]),
+      expect.arrayContaining([
+        {
+          kind: "status",
+          state: "run_cancelled",
+          ts: expect.any(String),
+          text: "Run cancelled",
+        },
+      ]),
     );
   });
 
@@ -735,7 +978,11 @@ describe("Orchestrator", () => {
       providerId: "openai-codex",
       model: "gpt-5-test",
     });
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -747,9 +994,18 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "provider-limit run dispatched");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "provider-limit run exited");
-    await waitFor(() => orchestrator.snapshot().providerGates.length === 1, "active provider-limit gate");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "provider-limit run dispatched",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "provider-limit run exited",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().providerGates.length === 1,
+      "active provider-limit gate",
+    );
     const gatedSnapshot = orchestrator.snapshot();
 
     expect(gatedSnapshot.counts.retrying).toBe(0);
@@ -757,9 +1013,15 @@ describe("Orchestrator", () => {
       kind: "windowed_bucket_exhausted",
       resumePolicy: "auto_at_window_close",
       window: { resumeAt, windowKind: "codex_5h" },
-      source: { issueIdentifier: "TEST-1", role: "worker", runPhase: "implementation" },
+      source: {
+        issueIdentifier: "TEST-1",
+        role: "worker",
+        runPhase: "implementation",
+      },
     });
-    await expect(runStore.latestRunForIssue(candidate.id)).resolves.toMatchObject({
+    await expect(
+      runStore.latestRunForIssue(candidate.id),
+    ).resolves.toMatchObject({
       status: "failed",
       providerLimit: {
         kind: "windowed_bucket_exhausted",
@@ -770,12 +1032,18 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     expect(harness.runs).toHaveLength(1);
-    const msUntilWindowCloses = Math.max(Date.parse(resumeAt) - Date.now() + 50, 0);
+    const msUntilWindowCloses = Math.max(
+      Date.parse(resumeAt) - Date.now() + 50,
+      0,
+    );
     if (msUntilWindowCloses > 0) {
       await new Promise((resolve) => setTimeout(resolve, msUntilWindowCloses));
     }
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "dispatch after provider window closes");
+    await waitFor(
+      () => harness.runs.length === 2,
+      "dispatch after provider window closes",
+    );
     await orchestrator.stop();
   });
 
@@ -803,7 +1071,11 @@ describe("Orchestrator", () => {
       "hermes_acp",
       { providerId: "openrouter", model: "anthropic/claude-sonnet-acp" },
     );
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -815,21 +1087,45 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "Hermes ACP provider-limit run dispatched");
-    await waitFor(() => orchestrator.snapshot().providerGates.length === 1, "Hermes ACP provider gate recorded");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "Hermes ACP provider-limit run exited");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "Hermes ACP provider-limit run dispatched",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().providerGates.length === 1,
+      "Hermes ACP provider gate recorded",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "Hermes ACP provider-limit run exited",
+    );
 
     expect(orchestrator.snapshot().providerGates[0]).toMatchObject({
-      scope: { harnessId: "hermes_acp", providerId: "openrouter", model: "anthropic/claude-sonnet-acp" },
+      scope: {
+        harnessId: "hermes_acp",
+        providerId: "openrouter",
+        model: "anthropic/claude-sonnet-acp",
+      },
       resumePolicy: "manual",
     });
-    await expect(runStore.latestRunForIssue(candidate.id)).resolves.toMatchObject({
+    await expect(
+      runStore.latestRunForIssue(candidate.id),
+    ).resolves.toMatchObject({
       harnessId: "hermes_acp",
       status: "failed",
       runtimeModel: "anthropic/claude-sonnet-acp",
-      runtimeSettingSources: ["host_hermes:PATH:hermes", "source_profile:active", "profile_prefix:symphony", "provider:openrouter"],
+      runtimeSettingSources: [
+        "host_hermes:PATH:hermes",
+        "source_profile:active",
+        "profile_prefix:symphony",
+        "provider:openrouter",
+      ],
       providerLimit: {
-        scope: { harnessId: "hermes_acp", providerId: "openrouter", model: "anthropic/claude-sonnet-acp" },
+        scope: {
+          harnessId: "hermes_acp",
+          providerId: "openrouter",
+          model: "anthropic/claude-sonnet-acp",
+        },
       },
       failureKind: "provider_limit",
     });
@@ -837,9 +1133,14 @@ describe("Orchestrator", () => {
     await orchestrator.refreshNow();
     expect(harness.runs).toHaveLength(1);
     const gateId = orchestrator.snapshot().providerGates[0]!.id;
-    await expect(orchestrator.clearProviderGate(gateId)).resolves.toMatchObject({ id: gateId });
+    await expect(orchestrator.clearProviderGate(gateId)).resolves.toMatchObject(
+      { id: gateId },
+    );
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "Hermes ACP dispatch after provider gate clear");
+    await waitFor(
+      () => harness.runs.length === 2,
+      "Hermes ACP dispatch after provider gate clear",
+    );
     await orchestrator.stop();
   });
 
@@ -859,8 +1160,14 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const harness = new ProviderLimitThenCompleteHarness({ providerId: "openai-codex" });
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ProviderLimitThenCompleteHarness({
+      providerId: "openai-codex",
+    });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -871,14 +1178,22 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => orchestrator.snapshot().providerGates.length === 1, "manual provider gate");
+    await waitFor(
+      () => orchestrator.snapshot().providerGates.length === 1,
+      "manual provider gate",
+    );
     const gateId = orchestrator.snapshot().providerGates[0]!.id;
 
     await orchestrator.refreshNow();
     expect(harness.runs).toHaveLength(1);
-    await expect(orchestrator.clearProviderGate(gateId)).resolves.toMatchObject({ id: gateId });
+    await expect(orchestrator.clearProviderGate(gateId)).resolves.toMatchObject(
+      { id: gateId },
+    );
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "dispatch after manual gate clear");
+    await waitFor(
+      () => harness.runs.length === 2,
+      "dispatch after manual gate clear",
+    );
     await orchestrator.stop();
   });
 
@@ -889,7 +1204,11 @@ describe("Orchestrator", () => {
     config.issueBreakdown.planningLabels = ["planning"];
     config.writeback.enabled = true;
     config.writeback.mode = "live";
-    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
     let currentState = "Todo";
     let updatedAt = "2026-01-02T00:00:00Z";
     const tracker: TrackerClient = {
@@ -897,22 +1216,36 @@ describe("Orchestrator", () => {
         return [{ ...candidate, state: currentState, updatedAt }];
       },
       async fetchIssuesByStates(states) {
-        return issuesInStates([{ ...candidate, state: currentState, updatedAt }], states);
+        return issuesInStates(
+          [{ ...candidate, state: currentState, updatedAt }],
+          states,
+        );
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState, updatedAt }];
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
     const writer = new StateChangingWriter((state) => {
       currentState = state;
       updatedAt = "2026-01-02T00:01:00Z";
     });
-    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(config.workspace.stateDir),
+      writer,
+      logger,
+      300_000,
+    );
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -929,37 +1262,57 @@ describe("Orchestrator", () => {
     await waitFor(() => harness.runs.length === 1);
     await waitFor(() => orchestrator.snapshot().counts.running === 0);
     await waitForAsync(
-      async () => ((await lifecycleStore.get(candidate.id))?.issueBreakdownPlans.length ?? 0) === 1,
+      async () =>
+        ((await lifecycleStore.get(candidate.id))?.issueBreakdownPlans.length ??
+          0) === 1,
       "persisted issue breakdown plan",
     );
     await settleOrchestratorExit();
     expect(writer.transitions).toEqual([]);
-    await waitForAsync(async () => {
-      await orchestrator.refreshNow();
-      return harness.runs.length === 2;
-    }, "implementation dispatch after accepted plan", 5_000);
+    await waitForAsync(
+      async () => {
+        await orchestrator.refreshNow();
+        return harness.runs.length === 2;
+      },
+      "implementation dispatch after accepted plan",
+      5_000,
+    );
     await waitFor(() => orchestrator.snapshot().counts.running === 0);
 
     await orchestrator.refreshNow();
     await settleOrchestratorExit();
     await orchestrator.stop();
 
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+    ]);
     expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
     expect(harness.runs[0]?.ctx.role).toBe("planner");
     expect(harness.runs[0]?.prompt).toContain("Plan TEST-1");
     expect(harness.runs[0]?.prompt).toContain("submit_issue_breakdown_plan");
     expect(harness.runs[1]?.ctx.runPhase).toBe("implementation");
     expect(harness.runs[1]?.ctx.role).toBe("worker");
-    expect(harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")).toHaveLength(1);
+    expect(
+      harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown"),
+    ).toHaveLength(1);
     expect(harness.runs[1]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[1]?.prompt).toContain("Issue breakdown plan:");
     expect(harness.runs[1]?.prompt).toContain("Create implementation task");
-    await expect(runStore.latestRunForIssue(candidate.id, { role: "planner", runPhase: "issue_breakdown" })).resolves.toMatchObject({
+    await expect(
+      runStore.latestRunForIssue(candidate.id, {
+        role: "planner",
+        runPhase: "issue_breakdown",
+      }),
+    ).resolves.toMatchObject({
       runPhase: "issue_breakdown",
       runKind: "planning",
     });
-    await expect(runStore.latestRunForIssue(candidate.id, { role: "worker", runPhase: "implementation" })).resolves.toMatchObject({
+    await expect(
+      runStore.latestRunForIssue(candidate.id, {
+        role: "worker",
+        runPhase: "implementation",
+      }),
+    ).resolves.toMatchObject({
       runPhase: "implementation",
       runKind: "implementation",
     });
@@ -973,7 +1326,11 @@ describe("Orchestrator", () => {
     config.issueBreakdown.planningLabels = ["planning"];
     config.writeback.enabled = true;
     config.writeback.mode = "live";
-    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -986,19 +1343,30 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
     const writer = new StateChangingWriter(() => undefined);
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
       lifecycleStore,
       runStore: new FileRunTranscriptStore(config.workspace.stateDir),
-      writeback: new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000),
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        logger,
+        300_000,
+      ),
     });
 
     await orchestrator.refreshNow();
@@ -1011,18 +1379,26 @@ describe("Orchestrator", () => {
 
     const lifecycle = await lifecycleStore.get(candidate.id);
     expect(writer.issueCreates).toEqual([]);
-    expect(harness.runs.filter((run) => run.ctx.runPhase === "implementation")).toHaveLength(0);
-    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("not_requested");
+    expect(
+      harness.runs.filter((run) => run.ctx.runPhase === "implementation"),
+    ).toHaveLength(0);
+    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe(
+      "not_requested",
+    );
     expect(lifecycle?.issueBreakdownPlans[0]?.createdIssueRefs).toEqual([]);
   }, 10_000);
 
   it("startup processDue skips superseded issue breakdown children, relations, and comments", async () => {
-    const fixture = await createIssueBreakdownStartupFixture(root, { scenario: "superseded" });
+    const fixture = await createIssueBreakdownStartupFixture(root, {
+      scenario: "superseded",
+    });
 
     await fixture.orchestrator.start();
     await fixture.orchestrator.stop();
     const lifecycle = await fixture.lifecycleStore.get(fixture.parentIssue.id);
-    const planA = lifecycle?.issueBreakdownPlans.find((plan) => plan.id === fixture.supersededPlan.id);
+    const planA = lifecycle?.issueBreakdownPlans.find(
+      (plan) => plan.id === fixture.supersededPlan.id,
+    );
 
     for (const key of fixture.replayOperationKeys) {
       await expect(fixture.outboxStore.get(key)).resolves.toMatchObject({
@@ -1039,16 +1415,23 @@ describe("Orchestrator", () => {
     expect(fixture.writer.issueRelations).toEqual([]);
     expect(fixture.writer.comments).toEqual([]);
     expect(lifecycle?.lastIssueBreakdownPlanId).toBe(fixture.currentPlan?.id);
-    expect(planA).toMatchObject({ applicationStatus: "pending", applicationBlockedReason: null });
+    expect(planA).toMatchObject({
+      applicationStatus: "pending",
+      applicationBlockedReason: null,
+    });
   });
 
   it("startup processDue skips drifted issue breakdown replay without marking the plan stale", async () => {
-    const fixture = await createIssueBreakdownStartupFixture(root, { scenario: "drifted" });
+    const fixture = await createIssueBreakdownStartupFixture(root, {
+      scenario: "drifted",
+    });
 
     await fixture.orchestrator.start();
     await fixture.orchestrator.stop();
     const lifecycle = await fixture.lifecycleStore.get(fixture.parentIssue.id);
-    const plan = lifecycle?.issueBreakdownPlans.find((candidatePlan) => candidatePlan.id === fixture.supersededPlan.id);
+    const plan = lifecycle?.issueBreakdownPlans.find(
+      (candidatePlan) => candidatePlan.id === fixture.supersededPlan.id,
+    );
 
     for (const key of fixture.replayOperationKeys) {
       await expect(fixture.outboxStore.get(key)).resolves.toMatchObject({
@@ -1070,13 +1453,17 @@ describe("Orchestrator", () => {
   });
 
   it("startup processDue still applies fresh current issue breakdown work", async () => {
-    const fixture = await createIssueBreakdownStartupFixture(root, { scenario: "fresh" });
+    const fixture = await createIssueBreakdownStartupFixture(root, {
+      scenario: "fresh",
+    });
 
     await fixture.orchestrator.start();
     await fixture.orchestrator.stop();
 
     for (const key of fixture.replayOperationKeys) {
-      await expect(fixture.outboxStore.get(key)).resolves.toMatchObject({ status: "succeeded" });
+      await expect(fixture.outboxStore.get(key)).resolves.toMatchObject({
+        status: "succeeded",
+      });
     }
     expect(fixture.writer.issueCreates).toHaveLength(1);
     expect(fixture.writer.issueRelations).toHaveLength(1);
@@ -1101,17 +1488,33 @@ describe("Orchestrator", () => {
     let updatedAt = "2026-01-02T00:00:00Z";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return [{ ...candidate, state: currentState, title: currentTitle, updatedAt }];
+        return [
+          { ...candidate, state: currentState, title: currentTitle, updatedAt },
+        ];
       },
       async fetchIssuesByStates(states) {
-        return issuesInStates([{ ...candidate, state: currentState, title: currentTitle, updatedAt }], states);
+        return issuesInStates(
+          [
+            {
+              ...candidate,
+              state: currentState,
+              title: currentTitle,
+              updatedAt,
+            },
+          ],
+          states,
+        );
       },
       async fetchIssueStatesByIds() {
-        return [{ ...candidate, state: currentState, title: currentTitle, updatedAt }];
+        return [
+          { ...candidate, state: currentState, title: currentTitle, updatedAt },
+        ];
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
     const writer = new StateChangingWriter((state) => {
       currentState = state;
@@ -1121,42 +1524,70 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
       lifecycleStore,
       runStore: new FileRunTranscriptStore(config.workspace.stateDir),
-      writeback: new WritebackProcessor(new FileWritebackOutboxStore(config.workspace.stateDir), writer, logger, 300_000),
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        logger,
+        300_000,
+      ),
     });
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1);
     await waitFor(() => orchestrator.snapshot().counts.running === 0);
     await waitForAsync(
-      async () => ((await lifecycleStore.get(candidate.id))?.issueBreakdownPlans.length ?? 0) === 1,
+      async () =>
+        ((await lifecycleStore.get(candidate.id))?.issueBreakdownPlans.length ??
+          0) === 1,
       "persisted issue breakdown plan",
     );
     await settleOrchestratorExit();
     await orchestrator.refreshNow();
-    await waitFor(() => writer.transitions.length === 1, "dispatch writeback applied", 10_000);
+    await waitFor(
+      () => writer.transitions.length === 1,
+      "dispatch writeback applied",
+      10_000,
+    );
     await waitFor(
       () =>
         harness.runs.length === 2 ||
         orchestrator
           .snapshot()
           .running.some(
-            (run) => run.issueId === candidate.id && run.role === "worker" && run.runPhase === "implementation",
+            (run) =>
+              run.issueId === candidate.id &&
+              run.role === "worker" &&
+              run.runPhase === "implementation",
           ),
       "stale post-writeback implementation dispatch",
       10_000,
     );
-    await waitFor(() => harness.runs.length === 2, "stale post-writeback implementation harness run", 10_000);
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "stale post-writeback implementation completion", 10_000);
+    await waitFor(
+      () => harness.runs.length === 2,
+      "stale post-writeback implementation harness run",
+      10_000,
+    );
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "stale post-writeback implementation completion",
+      10_000,
+    );
     await orchestrator.stop();
 
     const lifecycle = await lifecycleStore.get(candidate.id);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+    ]);
     expect(harness.runs[0]?.ctx.runPhase).toBe("issue_breakdown");
     expect(harness.runs[1]?.ctx.runPhase).toBe("implementation");
     expect(lifecycle?.planningFailureCount).toBe(0);
@@ -1173,7 +1604,11 @@ describe("Orchestrator", () => {
       title: "Original work",
       updatedAt: "2026-01-02T00:00:00Z",
     });
-    const changed = { ...candidate, title: "Changed work", updatedAt: "2026-01-02T00:05:00Z" };
+    const changed = {
+      ...candidate,
+      title: "Changed work",
+      updatedAt: "2026-01-02T00:05:00Z",
+    };
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -1186,14 +1621,32 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-    await submitTwoChildPlan(config, lifecycleStore, candidate, "plan-a", "run-plan-a");
-    await submitTwoChildPlan(config, lifecycleStore, changed, "plan-b", "run-plan-b");
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    await submitTwoChildPlan(
+      config,
+      lifecycleStore,
+      candidate,
+      "plan-a",
+      "run-plan-a",
+    );
+    await submitTwoChildPlan(
+      config,
+      lifecycleStore,
+      changed,
+      "plan-b",
+      "run-plan-b",
+    );
     const harness = new FakeHarness();
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -1221,7 +1674,11 @@ describe("Orchestrator", () => {
       title: "Original work",
       updatedAt: "2026-01-02T00:00:00Z",
     });
-    const changed = { ...candidate, title: "Changed work", updatedAt: "2026-01-02T00:05:00Z" };
+    const changed = {
+      ...candidate,
+      title: "Changed work",
+      updatedAt: "2026-01-02T00:05:00Z",
+    };
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -1234,14 +1691,32 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-    await submitTwoChildPlan(config, lifecycleStore, candidate, "plan-a", "run-plan-a");
-    await submitTwoChildPlan(config, lifecycleStore, changed, "plan-b", "run-plan-b");
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    await submitTwoChildPlan(
+      config,
+      lifecycleStore,
+      candidate,
+      "plan-a",
+      "run-plan-a",
+    );
+    await submitTwoChildPlan(
+      config,
+      lifecycleStore,
+      changed,
+      "plan-b",
+      "run-plan-b",
+    );
     const harness = new FakeHarness();
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -1265,7 +1740,11 @@ describe("Orchestrator", () => {
     config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
     config.issueBreakdown.planningLabels = ["planning"];
     config.reviewLoop.maxIncompleteTurns = 2;
-    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -1278,8 +1757,14 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     await lifecycleStore.ensureIssue(candidate, { incompleteTurnCount: 2 });
     const harness = new IssueBreakdownAcceptingHarness(lifecycleStore);
     const orchestrator = new Orchestrator({
@@ -1302,12 +1787,18 @@ describe("Orchestrator", () => {
   });
 
   it("[event-guard:completed] treats accepted issue breakdown plans as succeeded when the harness completes after submitting", async () => {
-    const result = await runAcceptedIssueBreakdownHandoffScenario(root, { type: "completed" });
+    const result = await runAcceptedIssueBreakdownHandoffScenario(root, {
+      type: "completed",
+    });
     const transcript = await result.runStore.readTranscript(result.planRunId);
     const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toEqual(
-      expect.arrayContaining(["session_started", "handoff_terminal", "completed"]),
+      expect.arrayContaining([
+        "session_started",
+        "handoff_terminal",
+        "completed",
+      ]),
     );
     await expectReplaySucceededFromHandoff(result.stateDir, result.planRunId, {
       runPhase: "issue_breakdown",
@@ -1325,7 +1816,10 @@ describe("Orchestrator", () => {
 
     expect(eventTypes).toContain("session_started");
     expect(eventTypes).toContain("handoff_terminal");
-    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+    expect(
+      transcript.events.find((event) => event.eventType === "handoff_terminal")
+        ?.payload,
+    ).toMatchObject({
       kind: "issue_breakdown_plan",
       status: "succeeded",
     });
@@ -1338,13 +1832,18 @@ describe("Orchestrator", () => {
   });
 
   it("[event-guard:cancelled] treats accepted issue breakdown plans as succeeded when the harness is cancelled after submitting", async () => {
-    const result = await runAcceptedIssueBreakdownHandoffScenario(root, { type: "cancelled" });
+    const result = await runAcceptedIssueBreakdownHandoffScenario(root, {
+      type: "cancelled",
+    });
     const transcript = await result.runStore.readTranscript(result.planRunId);
     const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
     expect(eventTypes).toContain("handoff_terminal");
-    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+    expect(
+      transcript.events.find((event) => event.eventType === "handoff_terminal")
+        ?.payload,
+    ).toMatchObject({
       kind: "issue_breakdown_plan",
       status: "succeeded",
     });
@@ -1357,13 +1856,19 @@ describe("Orchestrator", () => {
   });
 
   it("[exit-guard:throw] terminalizes accepted planning runs when the harness throws after submitting without a terminal event", async () => {
-    const result = await runAcceptedIssueBreakdownHandoffScenario(root, "throw");
+    const result = await runAcceptedIssueBreakdownHandoffScenario(
+      root,
+      "throw",
+    );
     const transcript = await result.runStore.readTranscript(result.planRunId);
     const eventTypes = transcript.events.map((event) => event.eventType);
 
     expect(eventTypes).toContain("session_started");
     expect(eventTypes).toContain("handoff_terminal");
-    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+    expect(
+      transcript.events.find((event) => event.eventType === "handoff_terminal")
+        ?.payload,
+    ).toMatchObject({
       kind: "issue_breakdown_plan",
       status: "succeeded",
     });
@@ -1382,7 +1887,11 @@ describe("Orchestrator", () => {
     config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
     config.issueBreakdown.planningLabels = ["planning"];
     config.issueBreakdown.maxPlanningFailures = 3;
-    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -1395,13 +1904,19 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const harness = new IssueBreakdownRejectingHarness();
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -1411,22 +1926,44 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1);
-    const run = await waitForTerminalRunRecord(runStore, "rejecting-plan-run-1");
-    await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
+    const run = await waitForTerminalRunRecord(
+      runStore,
+      "rejecting-plan-run-1",
+    );
+    await waitForAsync(
+      async () =>
+        (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1,
+    );
     await settleOrchestratorExit();
     await waitForAsync(async () => {
       const current = await runStore.readTranscript("rejecting-plan-run-1");
-      return current.events.some((event) => event.eventType === "planning_run_failed");
+      return current.events.some(
+        (event) => event.eventType === "planning_run_failed",
+      );
     }, "planning failure transcript event");
     const transcript = await runStore.readTranscript("rejecting-plan-run-1");
     await orchestrator.stop();
 
     const eventTypes = transcript.events.map((event) => event.eventType);
     const planningEventTypes = eventTypes.filter((eventType) =>
-      ["session_started", "completed", "failed", "cancelled", "planning_run_failed"].includes(eventType),
+      [
+        "session_started",
+        "completed",
+        "failed",
+        "cancelled",
+        "planning_run_failed",
+      ].includes(eventType),
     );
-    expect(planningEventTypes).toEqual(["session_started", "completed", "planning_run_failed"]);
-    expect(transcript.events.find((event) => event.eventType === "planning_run_failed")?.payload).toMatchObject({
+    expect(planningEventTypes).toEqual([
+      "session_started",
+      "completed",
+      "planning_run_failed",
+    ]);
+    expect(
+      transcript.events.find(
+        (event) => event.eventType === "planning_run_failed",
+      )?.payload,
+    ).toMatchObject({
       status: "failed",
       error: "Planning run completed without submit_issue_breakdown_plan",
       planningFailureCount: 1,
@@ -1438,7 +1975,8 @@ describe("Orchestrator", () => {
       runKind: "planning",
       failureKind: "planning_run_failed",
       failureDiagnosticCode: "planning_run_failed",
-      failureDiagnosticMessage: "Planning run completed without submit_issue_breakdown_plan",
+      failureDiagnosticMessage:
+        "Planning run completed without submit_issue_breakdown_plan",
     });
     await expectReplayFailedFromPlanningFailure(
       config.workspace.stateDir,
@@ -1453,7 +1991,10 @@ describe("Orchestrator", () => {
   it("[replay:planning-no-plan] records durable failed state when issue breakdown fails or throws before submitting a plan", async () => {
     for (const scenario of [
       {
-        terminal: { type: "failed", error: "planning harness reported failure" } as const,
+        terminal: {
+          type: "failed",
+          error: "planning harness reported failure",
+        } as const,
         expectedRunId: "no-plan-terminal-run-1",
         expectedEvents: ["session_started", "failed", "planning_run_failed"],
         expectedError: "planning harness reported failure",
@@ -1465,13 +2006,20 @@ describe("Orchestrator", () => {
         expectedError: "planning harness threw before submitting a plan",
       },
     ]) {
-      const scenarioRoot = path.join(root, `no-plan-${typeof scenario.terminal === "string" ? scenario.terminal : scenario.terminal.type}`);
+      const scenarioRoot = path.join(
+        root,
+        `no-plan-${typeof scenario.terminal === "string" ? scenario.terminal : scenario.terminal.type}`,
+      );
       const config = testConfig(scenarioRoot);
       config.issueBreakdown.enabled = true;
       config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
       config.issueBreakdown.planningLabels = ["planning"];
       config.issueBreakdown.maxPlanningFailures = 3;
-      const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+      const candidate = issue({
+        state: "Todo",
+        labels: ["planning"],
+        updatedAt: "2026-01-02T00:00:00Z",
+      });
       const tracker: TrackerClient = {
         async fetchCandidateIssues() {
           return [candidate];
@@ -1484,13 +2032,21 @@ describe("Orchestrator", () => {
         },
       };
       const logger = new StructuredLogger(() => undefined);
-      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(
+        config.workspace.stateDir,
+      );
       const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-      const harness = new IssueBreakdownNoPlanTerminalHarness(scenario.terminal);
+      const harness = new IssueBreakdownNoPlanTerminalHarness(
+        scenario.terminal,
+      );
       const orchestrator = new Orchestrator({
         config,
         tracker,
-        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        workspaceManager: new WorkspaceManager({
+          workspace: config.workspace,
+          hooks: config.hooks,
+          logger,
+        }),
         harness,
         logger,
         promptTemplate: "Work on {{ issue.identifier }}",
@@ -1501,16 +2057,31 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
       await waitFor(() => harness.runs.length === 1);
       await waitForTerminalRunRecord(runStore, scenario.expectedRunId);
-      await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
+      await waitForAsync(
+        async () =>
+          (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1,
+      );
       await settleOrchestratorExit();
       const transcript = await runStore.readTranscript(scenario.expectedRunId);
       await orchestrator.stop();
 
       const scenarioEventTypes = transcript.events
         .map((event) => event.eventType)
-        .filter((eventType) => ["session_started", "completed", "failed", "cancelled", "planning_run_failed"].includes(eventType));
+        .filter((eventType) =>
+          [
+            "session_started",
+            "completed",
+            "failed",
+            "cancelled",
+            "planning_run_failed",
+          ].includes(eventType),
+        );
       expect(scenarioEventTypes).toEqual(scenario.expectedEvents);
-      await expectReplayFailedFromPlanningFailure(config.workspace.stateDir, scenario.expectedRunId, scenario.expectedError);
+      await expectReplayFailedFromPlanningFailure(
+        config.workspace.stateDir,
+        scenario.expectedRunId,
+        scenario.expectedError,
+      );
       const lifecycle = await lifecycleStore.get(candidate.id);
       expect(lifecycle?.lastPlanningFailureRunId).toBe(scenario.expectedRunId);
       expect(lifecycle?.incompleteTurnCount).toBe(0);
@@ -1524,7 +2095,11 @@ describe("Orchestrator", () => {
     config.issueBreakdown.planningLabels = ["planning"];
     config.issueBreakdown.maxPlanningFailures = 1;
     config.reviewLoop.maxIncompleteTurns = 2;
-    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -1537,13 +2112,19 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     await lifecycleStore.ensureIssue(candidate, { incompleteTurnCount: 2 });
     const harness = new IssueBreakdownRejectingHarness();
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -1563,7 +2144,9 @@ describe("Orchestrator", () => {
     expect(lifecycle?.planningFailureCount).toBe(1);
     expect(lifecycle?.incompleteTurnCount).toBe(2);
     expect(lifecycle?.phase).toBe("blocked");
-    expect(lifecycle?.blockedReason).toBe("max planning failures reached (1/1)");
+    expect(lifecycle?.blockedReason).toBe(
+      "max planning failures reached (1/1)",
+    );
     expect(lifecycle?.lastPlanningFailureRunId).toBe("rejecting-plan-run-1");
   });
 
@@ -1575,7 +2158,11 @@ describe("Orchestrator", () => {
     config.issueBreakdown.maxPlanningFailures = 3;
     config.issueBreakdown.planningRetryBaseMs = 10_000;
     config.issueBreakdown.planningRetryMaxMs = 10_000;
-    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -1588,12 +2175,18 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const harness = new IssueBreakdownRejectingHarness();
     const first = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -1604,14 +2197,21 @@ describe("Orchestrator", () => {
     await first.refreshNow();
     await waitFor(() => harness.runs.length === 1);
     await waitFor(() => first.snapshot().counts.running === 0);
-    await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
+    await waitForAsync(
+      async () =>
+        (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1,
+    );
     await settleOrchestratorExit();
     await first.stop();
 
     const second = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -1622,11 +2222,19 @@ describe("Orchestrator", () => {
     await second.refreshNow();
     await settleOrchestratorExit();
     expect(harness.runs).toHaveLength(1);
-    await lifecycleStore.updateIssue(candidate, { lastPlanningFailureAt: "2000-01-01T00:00:00.000Z" });
+    await lifecycleStore.updateIssue(candidate, {
+      lastPlanningFailureAt: "2000-01-01T00:00:00.000Z",
+    });
     await second.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "planning retry after durable backoff");
+    await waitFor(
+      () => harness.runs.length === 2,
+      "planning retry after durable backoff",
+    );
     await waitFor(() => second.snapshot().counts.running === 0);
-    await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 2);
+    await waitForAsync(
+      async () =>
+        (await lifecycleStore.get(candidate.id))?.planningFailureCount === 2,
+    );
     await settleOrchestratorExit();
     await second.stop();
 
@@ -1644,7 +2252,11 @@ describe("Orchestrator", () => {
     config.issueBreakdown.maxPlanningDispatchRetries = 1;
     config.issueBreakdown.planningRetryBaseMs = 20;
     config.issueBreakdown.planningRetryMaxMs = 20;
-    const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["planning"],
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -1658,12 +2270,18 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const harness = new IssueBreakdownRejectingHarness();
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -1675,13 +2293,17 @@ describe("Orchestrator", () => {
     await waitFor(() => harness.runs.length === 1);
     await waitFor(() => orchestrator.snapshot().counts.running === 0);
     currentState = "Blocked";
-    await waitForAsync(async () => {
-      try {
-        return (await lifecycleStore.get(candidate.id))?.phase === "blocked";
-      } catch {
-        return false;
-      }
-    }, "planning dispatch retry block", 2_000);
+    await waitForAsync(
+      async () => {
+        try {
+          return (await lifecycleStore.get(candidate.id))?.phase === "blocked";
+        } catch {
+          return false;
+        }
+      },
+      "planning dispatch retry block",
+      2_000,
+    );
     await orchestrator.stop();
 
     const lifecycle = await lifecycleStore.get(candidate.id);
@@ -1689,7 +2311,9 @@ describe("Orchestrator", () => {
     expect(lifecycle?.planningFailureCount).toBe(1);
     expect(lifecycle?.planningDispatchRetryCount).toBe(1);
     expect(lifecycle?.incompleteTurnCount).toBe(0);
-    expect(lifecycle?.blockedReason).toBe("max planning dispatch retries reached (1/1)");
+    expect(lifecycle?.blockedReason).toBe(
+      "max planning dispatch retries reached (1/1)",
+    );
   });
 
   it("does not route planning-labeled issues to implementation when planning persistence is missing", async () => {
@@ -1714,7 +2338,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -1746,13 +2374,19 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness: new FakeHarness(),
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
     });
 
-    await expect(orchestrator.requestIssueBreakdown(candidate.id)).rejects.toMatchObject({
+    await expect(
+      orchestrator.requestIssueBreakdown(candidate.id),
+    ).rejects.toMatchObject({
       code: "invalid_request",
     });
     await orchestrator.stop();
@@ -1774,7 +2408,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new CursorPromptHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -1791,7 +2429,9 @@ describe("Orchestrator", () => {
     expect(harness.prompts[0]).toContain("Work on TEST-1");
     expect(harness.prompts[0]).toContain("Symphony MCP completion handoff");
     expect(harness.prompts[0]).toContain("Active issue: TEST-1 (issue-1)");
-    expect(harness.prompts[0]).toContain("call the submit_completion_report MCP tool");
+    expect(harness.prompts[0]).toContain(
+      "call the submit_completion_report MCP tool",
+    );
     expect(harness.prompts[0]).toContain("Symphony injects runId and issueId");
     expect(harness.prompts[0]).toContain("Do not comment on Linear");
   });
@@ -1813,7 +2453,11 @@ describe("Orchestrator", () => {
     const logEntries: unknown[] = [];
     const logger = new StructuredLogger((entry) => logEntries.push(entry));
     const harness = new NonMcpHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -1829,7 +2473,9 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.prompts).toEqual([]);
-    expect(JSON.stringify(logEntries) + JSON.stringify(snapshot.retrying)).toContain(
+    expect(
+      JSON.stringify(logEntries) + JSON.stringify(snapshot.retrying),
+    ).toContain(
       "Runtime harness no-mcp does not support Symphony MCP handoff required for implementation",
     );
   });
@@ -1850,7 +2496,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -1883,7 +2533,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -1911,12 +2565,21 @@ describe("Orchestrator", () => {
         return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
-        return [{ ...candidate, blockedBy: [{ id: "blocker", identifier: "TEST-0", state: null }] }];
+        return [
+          {
+            ...candidate,
+            blockedBy: [{ id: "blocker", identifier: "TEST-0", state: null }],
+          },
+        ];
       },
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -1950,7 +2613,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -1971,7 +2638,10 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.agent.requireLabels = ["dogfood-ready"];
     config.agent.workerExcludeLabels = ["review_only"];
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready", "review_only"] });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready", "review_only"],
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -1985,7 +2655,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2018,7 +2692,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2049,12 +2727,18 @@ describe("Orchestrator", () => {
       },
       async fetchIssueStatesByIds() {
         refreshes += 1;
-        return [refreshes === 1 ? candidate : { ...candidate, state: "Human Review" }];
+        return [
+          refreshes === 1 ? candidate : { ...candidate, state: "Human Review" },
+        ];
       },
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2101,8 +2785,14 @@ describe("Orchestrator", () => {
       300_000,
     );
     const harness = new FakeHarness();
-    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(
+      path.join(root, "state"),
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2120,14 +2810,20 @@ describe("Orchestrator", () => {
 
     expect(harness.runs).toHaveLength(1);
     expect(currentState).toBe("In Progress");
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+    ]);
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "fake-issue-1-1:run-started",
       "fake-issue-1-1:run-succeeded",
     ]);
     expect(writer.comments[1]?.body).toContain("worker turn completed");
-    expect(writer.comments[1]?.body).toContain("not been marked ready for review");
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    expect(writer.comments[1]?.body).toContain(
+      "not been marked ready for review",
+    );
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       incompleteTurnCount: 1,
     });
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
@@ -2163,8 +2859,14 @@ describe("Orchestrator", () => {
       300_000,
     );
     const harness = new FakeHarness();
-    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(
+      path.join(root, "state"),
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2182,8 +2884,12 @@ describe("Orchestrator", () => {
 
     expect(harness.runs).toHaveLength(2);
     expect(currentState).toBe("In Progress");
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+    ]);
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       incompleteTurnCount: 2,
     });
   });
@@ -2215,10 +2921,19 @@ describe("Orchestrator", () => {
       currentState = state;
     });
     const stateDir = config.workspace.stateDir;
-    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(stateDir),
+      writer,
+      logger,
+      300_000,
+    );
     const harness = new FakeHarness();
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2236,18 +2951,29 @@ describe("Orchestrator", () => {
 
     expect(harness.runs).toHaveLength(2);
     expect(currentState).toBe("Blocked");
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Blocked"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+      "Blocked",
+    ]);
     expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
       "fake-issue-1-1:run-started",
       "fake-issue-1-2:run-started",
       "fake-issue-1-2:blocked-escalation",
     ]);
-    expect(writer.comments[2]?.body).toContain("max incomplete turns reached (2/2)");
+    expect(writer.comments[2]?.body).toContain(
+      "max incomplete turns reached (2/2)",
+    );
     expect(writer.comments[2]?.body).toContain("Incomplete turns: 2 / 2");
     expect(writer.comments[2]?.body).toContain("Last completion report:");
     expect(writer.comments[2]?.body).toContain("Required human action:");
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-succeeded"),
+      ),
+    ).toBe(false);
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       phase: "blocked",
       incompleteTurnCount: 2,
       blockedReason: "max incomplete turns reached (2/2)",
@@ -2266,10 +2992,14 @@ describe("Orchestrator", () => {
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
+        return currentState === "Blocked"
+          ? []
+          : [{ ...candidate, state: currentState }];
       },
       async fetchIssuesByStates() {
-        return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
+        return currentState === "Blocked"
+          ? []
+          : [{ ...candidate, state: currentState }];
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -2280,14 +3010,23 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 0);
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(stateDir),
+      writer,
+      logger,
+      0,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const harness = new SdkWaitErrorHarness();
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -2298,14 +3037,31 @@ describe("Orchestrator", () => {
 
     try {
       await orchestrator.refreshNow();
-      await waitFor(() => currentState === "Blocked" && orchestrator.snapshot().counts.retrying === 0, "sdk error escalation");
+      await waitFor(
+        () =>
+          currentState === "Blocked" &&
+          orchestrator.snapshot().counts.retrying === 0,
+        "sdk error escalation",
+        10_000,
+      );
     } finally {
       await orchestrator.stop();
     }
 
-    expect(harness.runs).toEqual(["sdk-error-run-1", "sdk-error-run-2", "sdk-error-run-3"]);
+    expect(harness.runs).toEqual([
+      "sdk-error-run-1",
+      "sdk-error-run-2",
+      "sdk-error-run-3",
+    ]);
     const runs = await runStore.listRunsForIssue(candidate.id);
-    expect(runs.map((run) => [run.runId, run.status, run.sdkRunStatus, run.sdkRunStatusSource])).toEqual([
+    expect(
+      runs.map((run) => [
+        run.runId,
+        run.status,
+        run.sdkRunStatus,
+        run.sdkRunStatusSource,
+      ]),
+    ).toEqual([
       ["sdk-error-run-1", "failed", "error", "wait"],
       ["sdk-error-run-2", "failed", "error", "wait"],
       ["sdk-error-run-3", "failed", "error", "wait"],
@@ -2314,22 +3070,65 @@ describe("Orchestrator", () => {
       failureKind: "cursor_sdk_terminal_error",
       failureDiagnosticCode: "cursor_run_wait_terminal_error",
     });
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Blocked"]);
-    expect(writer.comments.at(-1)?.body).toContain("consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+      "Blocked",
+    ]);
+    expect(writer.comments.at(-1)?.body).toContain(
+      "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
+    );
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       phase: "blocked",
-      blockedReason: "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
+      blockedReason:
+        "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
     });
-    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
-    expect(issueState?.history.filter((snapshot) => snapshot.transitionKind === "retry_run")).toHaveLength(2);
-    const block = issueState?.history.find((snapshot) => snapshot.transitionKind === "block_issue");
+    const issueState = await readIssueState(
+      config.workspace.stateDir,
+      candidate.id,
+    );
+    expect(
+      issueState?.history.filter(
+        (snapshot) => snapshot.transitionKind === "retry_run",
+      ),
+    ).toHaveLength(2);
+    expect(
+      issueState?.history
+        .filter(
+          (snapshot) =>
+            snapshot.snapshotKind === "evidence" &&
+            snapshot.evidenceKind === "harness" &&
+            snapshot.evidenceEventType?.startsWith("retry_"),
+        )
+        .map((snapshot) => ({
+          eventType: snapshot.evidenceEventType,
+          attempt: snapshot.retryAttempt,
+          delayMs: snapshot.retryDelayMs,
+        })),
+    ).toEqual(
+      expect.arrayContaining([
+        { eventType: "retry_scheduled", attempt: 1, delayMs: 0 },
+        { eventType: "retry_fired", attempt: 1, delayMs: 0 },
+        { eventType: "retry_cleared", attempt: 1, delayMs: 0 },
+        { eventType: "retry_scheduled", attempt: 2, delayMs: 0 },
+        { eventType: "retry_fired", attempt: 2, delayMs: 0 },
+        { eventType: "retry_cleared", attempt: 2, delayMs: 0 },
+      ]),
+    );
+    const block = issueState?.history.find(
+      (snapshot) => snapshot.transitionKind === "block_issue",
+    );
     expect(block).toMatchObject({
       candidateSource: "block_issue",
       rulesetId: "orchestrator.block_issue",
-      blockedReason: "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
+      blockedReason:
+        "consecutive Cursor SDK wait errors reached limit (3 failures; max_sdk_error_retries=2)",
     });
     expect(block?.actions.map((action) => action.actionType)).toEqual(
-      expect.arrayContaining(["update_lifecycle_blocked", "apply_blocked_escalation_writebacks", "record_block_issue"]),
+      expect.arrayContaining([
+        "update_lifecycle_blocked",
+        "apply_blocked_escalation_writebacks",
+        "record_block_issue",
+      ]),
     );
   });
 
@@ -2345,10 +3144,14 @@ describe("Orchestrator", () => {
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
+        return currentState === "Blocked"
+          ? []
+          : [{ ...candidate, state: currentState }];
       },
       async fetchIssuesByStates() {
-        return currentState === "Blocked" ? [] : [{ ...candidate, state: currentState }];
+        return currentState === "Blocked"
+          ? []
+          : [{ ...candidate, state: currentState }];
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -2359,14 +3162,23 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 0);
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(stateDir),
+      writer,
+      logger,
+      0,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const harness = new InfraFailureHarness();
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -2377,7 +3189,12 @@ describe("Orchestrator", () => {
 
     try {
       await orchestrator.refreshNow();
-      await waitFor(() => currentState === "Blocked" && orchestrator.snapshot().counts.retrying === 0, "infra failure escalation");
+      await waitFor(
+        () =>
+          currentState === "Blocked" &&
+          orchestrator.snapshot().counts.retrying === 0,
+        "infra failure escalation",
+      );
     } finally {
       await orchestrator.stop();
     }
@@ -2391,76 +3208,99 @@ describe("Orchestrator", () => {
       failureKind: "harness_diagnostic",
       failureDiagnosticCode: "hermes_gateway_exit",
     });
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Blocked"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+      "Blocked",
+    ]);
     expect(writer.comments.at(-1)?.body).toContain(
       "consecutive harness infrastructure failures reached limit (1 failures; max_infra_failures=1)",
     );
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       phase: "blocked",
-      blockedReason: "consecutive harness infrastructure failures reached limit (1 failures; max_infra_failures=1)",
+      blockedReason:
+        "consecutive harness infrastructure failures reached limit (1 failures; max_infra_failures=1)",
     });
   });
 
   it.each([
     ["setup-incomplete", PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON],
     ["awaiting operator", PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON],
-  ] as const)("does not burn incomplete turns while %s publication approval handoff is active", async (_name, blockedReason) => {
-    const config = testConfig(root);
-    config.reviewLoop.maxIncompleteTurns = 2;
-    config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
-    const tracker: TrackerClient = {
-      async fetchCandidateIssues() {
-        return [];
-      },
-      async fetchIssuesByStates(states) {
-        return issuesInStates([], states);
-      },
-      async fetchIssueStatesByIds() {
-        throw new Error("incomplete turn guard should not refresh active issues");
-      },
-    };
-    const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-    await lifecycleStore.ensureIssue(candidate, {
-      ...pendingApprovalLifecyclePatch(candidate, root, "run-1", blockedReason),
-      phase: "implementation",
-      incompleteTurnCount: 1,
-    });
-    const writer = new StateChangingWriter(() => undefined);
-    const orchestrator = new Orchestrator({
-      config,
-      tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
-      harness: new FakeHarness(),
-      logger,
-      promptTemplate: "Work on {{ issue.identifier }}",
-      lifecycleStore,
-    });
-
-    try {
-      await (
-        orchestrator as unknown as {
-          recordIncompleteTurn(entry: unknown): Promise<void>;
-        }
-      ).recordIncompleteTurn({
-        issue: candidate,
-        runId: "run-1",
-        activeRunId: "run-1",
-        lifecycle: await lifecycleStore.get(candidate.id),
+  ] as const)(
+    "does not burn incomplete turns while %s publication approval handoff is active",
+    async (_name, blockedReason) => {
+      const config = testConfig(root);
+      config.reviewLoop.maxIncompleteTurns = 2;
+      config.reviewLoop.blockedStates = ["Blocked"];
+      const candidate = issue({
+        state: "In Progress",
+        branchName: "symphony/TEST-1",
       });
-
-      await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates(states) {
+          return issuesInStates([], states);
+        },
+        async fetchIssueStatesByIds() {
+          throw new Error(
+            "incomplete turn guard should not refresh active issues",
+          );
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const lifecycleStore = new FileIssueLifecycleStore(
+        config.workspace.stateDir,
+      );
+      await lifecycleStore.ensureIssue(candidate, {
+        ...pendingApprovalLifecyclePatch(
+          candidate,
+          root,
+          "run-1",
+          blockedReason,
+        ),
         phase: "implementation",
-        blockedReason,
         incompleteTurnCount: 1,
       });
-      expect(writer.comments).toEqual([]);
-      expect(writer.transitions).toEqual([]);
-    } finally {
-      await orchestrator.stop();
-    }
-  });
+      const writer = new StateChangingWriter(() => undefined);
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager: new WorkspaceManager({
+          workspace: config.workspace,
+          hooks: config.hooks,
+          logger,
+        }),
+        harness: new FakeHarness(),
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+      });
+
+      try {
+        await (
+          orchestrator as unknown as {
+            recordIncompleteTurn(entry: unknown): Promise<void>;
+          }
+        ).recordIncompleteTurn({
+          issue: candidate,
+          runId: "run-1",
+          activeRunId: "run-1",
+          lifecycle: await lifecycleStore.get(candidate.id),
+        });
+
+        await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+          phase: "implementation",
+          blockedReason,
+          incompleteTurnCount: 1,
+        });
+        expect(writer.comments).toEqual([]);
+        expect(writer.transitions).toEqual([]);
+      } finally {
+        await orchestrator.stop();
+      }
+    },
+  );
 
   it("blocks a reviewer fail verdict at the max reviewer failure ceiling", async () => {
     const config = testConfig(root);
@@ -2472,14 +3312,19 @@ describe("Orchestrator", () => {
     config.reviewLoop.maxReviewRounds = 1;
     config.reviewLoop.failureLimits.reviewerFailures = 1;
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "In Review";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
       async fetchIssuesByStates(states) {
-        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+        return states.includes(currentState)
+          ? [{ ...candidate, state: currentState }]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -2491,7 +3336,12 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const runStore = new FileRunTranscriptStore(stateDir);
     const report = completionReportRecord(candidate);
@@ -2500,8 +3350,16 @@ describe("Orchestrator", () => {
       lastCompletionReportId: report.id,
       completionReports: [report],
     });
-    const harness = new ReviewVerdictSubmittingHarness("fail", lifecycleStore, outboxStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ReviewVerdictSubmittingHarness(
+      "fail",
+      lifecycleStore,
+      outboxStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2515,19 +3373,30 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "head-advanced repair dispatch");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "head-advanced repair dispatch",
+    );
     await orchestrator.stop();
 
     expect(harness.runs).toEqual([{ role: "reviewer", runId: "review-run-1" }]);
     expect(currentState).toBe("Blocked");
-    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual(["review-run-1:blocked-escalation"]);
-    expect(writer.comments[0]?.body).toContain("max reviewer failures reached (1/1)");
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
+      "review-run-1:blocked-escalation",
+    ]);
+    expect(writer.comments[0]?.body).toContain(
+      "max reviewer failures reached (1/1)",
+    );
     expect(writer.comments[0]?.body).toContain("Review rounds: 1 / 1");
     expect(writer.comments[0]?.body).toContain("Last completion report:");
     expect(writer.comments[0]?.body).toContain("Last review verdict:");
     expect(writer.comments[0]?.body).toContain("Add reviewer MCP integration.");
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Blocked"]);
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "Blocked",
+    ]);
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       phase: "blocked",
       reviewRound: 1,
       incompleteTurnCount: 0,
@@ -2541,7 +3410,10 @@ describe("Orchestrator", () => {
     config.issueTriage.enabled = true;
     config.writeback.enabled = true;
     config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -2554,7 +3426,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     await lifecycleStore.ensureIssue(candidate, {
@@ -2562,8 +3436,15 @@ describe("Orchestrator", () => {
       reviewRound: 3,
       blockedReason: "max reviewer failures reached (3/3)",
     });
-    const harness = new IssueTriageAcceptingHarness(lifecycleStore, outboxStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new IssueTriageAcceptingHarness(
+      lifecycleStore,
+      outboxStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2577,7 +3458,10 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "issue triage dispatch");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "issue triage completion");
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "issue triage completion",
+    );
     await orchestrator.stop();
 
     expect(harness.runs[0]?.ctx.role).toBe("triage");
@@ -2611,8 +3495,12 @@ describe("Orchestrator", () => {
       issueId: "issue-1",
       runId: "triage-run-1",
     });
-    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("## Symphony Issue Triage");
-    expect(writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "").toContain("Recommended human action:");
+    expect(
+      writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "",
+    ).toContain("## Symphony Issue Triage");
+    expect(
+      writebacks[0]?.kind === "comment" ? writebacks[0].payload.body : "",
+    ).toContain("Recommended human action:");
     await expect(runStore.getRun("triage-run-1")).resolves.toMatchObject({
       role: "triage",
       runPhase: "issue_triage",
@@ -2635,20 +3523,32 @@ describe("Orchestrator", () => {
         return [];
       },
       async fetchIssuesByStates(states) {
-        return states.some((candidateState) => candidateState.toLowerCase() === state.toLowerCase()) ? [currentIssue()] : [];
+        return states.some(
+          (candidateState) =>
+            candidateState.toLowerCase() === state.toLowerCase(),
+        )
+          ? [currentIssue()]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [currentIssue()];
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writer = new StateChangingWriter((nextState) => {
       state = nextState;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+    );
     const seeded = await lifecycleStore.ensureIssue(currentIssue(), {
       phase: "blocked",
       reviewRound: 3,
@@ -2667,27 +3567,43 @@ describe("Orchestrator", () => {
           triggerFingerprint: issueTriageTriggerFingerprint(seeded),
           disposition: "implementation_repair",
           confidence: "medium",
-          summary: "Worker should produce a fresh no-diff repair packet after CI is fixed.",
+          summary:
+            "Worker should produce a fresh no-diff repair packet after CI is fixed.",
           evidence: ["blockedReason=max merge gate failures reached (3/3)"],
-          recommendedAction: "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
+          recommendedAction:
+            "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
           blockers: [
             {
               kind: "implementation_unsatisfied_requirements",
               status: "active",
               nextActor: "worker",
               confidence: "medium",
-              summary: "The failed merge-gate verdict is unsuperseded by a newer completion report.",
-              evidence: ["latest review verdict was recorded after latest completion report"],
-              recommendedAction: "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
+              summary:
+                "The failed merge-gate verdict is unsuperseded by a newer completion report.",
+              evidence: [
+                "latest review verdict was recorded after latest completion report",
+              ],
+              recommendedAction:
+                "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
             },
           ],
           submittedAt: "2026-01-01T00:00:00.000Z",
-          writebackOperationKeys: ["comment:issue-1:issue-triage:triage-worker"],
+          writebackOperationKeys: [
+            "comment:issue-1:issue-triage:triage-worker",
+          ],
         },
       ],
     });
-    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ManualDispatchRecordingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2722,20 +3638,32 @@ describe("Orchestrator", () => {
         return [];
       },
       async fetchIssuesByStates(states) {
-        return states.some((candidateState) => candidateState.toLowerCase() === state.toLowerCase()) ? [currentIssue()] : [];
+        return states.some(
+          (candidateState) =>
+            candidateState.toLowerCase() === state.toLowerCase(),
+        )
+          ? [currentIssue()]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [currentIssue()];
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writer = new StateChangingWriter((nextState) => {
       state = nextState;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+    );
     const seeded = await lifecycleStore.ensureIssue(currentIssue(), {
       phase: "blocked",
       reviewRound: 3,
@@ -2754,27 +3682,35 @@ describe("Orchestrator", () => {
           triggerFingerprint: issueTriageTriggerFingerprint(seeded),
           disposition: "implementation_repair",
           confidence: "medium",
-          summary: "Worker blocker is mixed with an active operator-owned merge gate blocker.",
+          summary:
+            "Worker blocker is mixed with an active operator-owned merge gate blocker.",
           evidence: ["blockedReason=max merge gate failures reached (3/3)"],
-          recommendedAction: "Do not dispatch worker while the active gate blocker needs operator action.",
+          recommendedAction:
+            "Do not dispatch worker while the active gate blocker needs operator action.",
           blockers: [
             {
               kind: "implementation_unsatisfied_requirements",
               status: "active",
               nextActor: "worker",
               confidence: "medium",
-              summary: "The failed merge-gate verdict is unsuperseded by a newer completion report.",
-              evidence: ["latest merge-gate verdict was recorded after latest completion report"],
-              recommendedAction: "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
+              summary:
+                "The failed merge-gate verdict is unsuperseded by a newer completion report.",
+              evidence: [
+                "latest merge-gate verdict was recorded after latest completion report",
+              ],
+              recommendedAction:
+                "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
             },
             {
               kind: "merge_gate_check_failure",
               status: "active",
               nextActor: "operator",
               confidence: "high",
-              summary: "The current PR head is blocked on a required check failure.",
+              summary:
+                "The current PR head is blocked on a required check failure.",
               evidence: ["Typecheck and test failed on the current PR head"],
-              recommendedAction: "Fix or rerun the required check before dispatching another worker.",
+              recommendedAction:
+                "Fix or rerun the required check before dispatching another worker.",
             },
           ],
           submittedAt: "2026-01-01T00:00:00.000Z",
@@ -2782,8 +3718,16 @@ describe("Orchestrator", () => {
         },
       ],
     });
-    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ManualDispatchRecordingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2816,31 +3760,50 @@ describe("Orchestrator", () => {
     const currentIssue = (): Issue => ({ ...candidate, state });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return config.tracker.activeStates.some((activeState) => activeState.toLowerCase() === state.toLowerCase())
+        return config.tracker.activeStates.some(
+          (activeState) => activeState.toLowerCase() === state.toLowerCase(),
+        )
           ? [currentIssue()]
           : [];
       },
       async fetchIssuesByStates(states) {
-        return states.some((candidateState) => candidateState.toLowerCase() === state.toLowerCase()) ? [currentIssue()] : [];
+        return states.some(
+          (candidateState) =>
+            candidateState.toLowerCase() === state.toLowerCase(),
+        )
+          ? [currentIssue()]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [currentIssue()];
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writer = new StateChangingWriter((nextState) => {
       state = nextState;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+    );
     const blockedReason = "max merge gate failures reached (5/3)";
     const mergeGate = {
       id: "merge-gate:issue-1:pr-42:head-sha-1",
       status: "blocked" as const,
       headSha: "head-sha-1",
-      pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "head-sha-1",
+        branch: "symphony/TEST-1",
+      },
       requiredChecks: ["Typecheck and test"],
       checks: [
         {
@@ -2885,27 +3848,35 @@ describe("Orchestrator", () => {
           triggerFingerprint: issueTriageTriggerFingerprint(seeded),
           disposition: "implementation_repair",
           confidence: "medium",
-          summary: "Worker blocker is mixed with an active operator-owned merge gate blocker.",
+          summary:
+            "Worker blocker is mixed with an active operator-owned merge gate blocker.",
           evidence: ["blockedReason=max merge gate failures reached (5/3)"],
-          recommendedAction: "Do not dispatch worker while the active gate blocker needs operator action.",
+          recommendedAction:
+            "Do not dispatch worker while the active gate blocker needs operator action.",
           blockers: [
             {
               kind: "implementation_unsatisfied_requirements",
               status: "active",
               nextActor: "worker",
               confidence: "medium",
-              summary: "The failed merge-gate verdict is unsuperseded by a newer completion report.",
-              evidence: ["latest merge-gate verdict was recorded after latest completion report"],
-              recommendedAction: "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
+              summary:
+                "The failed merge-gate verdict is unsuperseded by a newer completion report.",
+              evidence: [
+                "latest merge-gate verdict was recorded after latest completion report",
+              ],
+              recommendedAction:
+                "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
             },
             {
               kind: "merge_gate_check_failure",
               status: "active",
               nextActor: "operator",
               confidence: "high",
-              summary: "The current PR head is blocked on a required check failure.",
+              summary:
+                "The current PR head is blocked on a required check failure.",
               evidence: ["Typecheck and test failed on the current PR head"],
-              recommendedAction: "Fix or rerun the required check before dispatching another worker.",
+              recommendedAction:
+                "Fix or rerun the required check before dispatching another worker.",
             },
           ],
           submittedAt: "2026-01-01T00:00:00.000Z",
@@ -2913,8 +3884,16 @@ describe("Orchestrator", () => {
         },
       ],
     });
-    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ManualDispatchRecordingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -2928,7 +3907,10 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => writer.transitions.length === 1, "mixed triage blocked rebound");
+    await waitFor(
+      () => writer.transitions.length === 1,
+      "mixed triage blocked rebound",
+    );
     await orchestrator.stop();
 
     expect(writer.transitions[0]).toMatchObject({
@@ -2956,25 +3938,39 @@ describe("Orchestrator", () => {
     const currentIssue = (): Issue => ({ ...candidate, state });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return config.tracker.activeStates.some((activeState) => activeState.toLowerCase() === state.toLowerCase())
+        return config.tracker.activeStates.some(
+          (activeState) => activeState.toLowerCase() === state.toLowerCase(),
+        )
           ? [currentIssue()]
           : [];
       },
       async fetchIssuesByStates(states) {
-        return states.some((candidateState) => candidateState.toLowerCase() === state.toLowerCase()) ? [currentIssue()] : [];
+        return states.some(
+          (candidateState) =>
+            candidateState.toLowerCase() === state.toLowerCase(),
+        )
+          ? [currentIssue()]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [currentIssue()];
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writer = new StateChangingWriter((nextState) => {
       state = nextState;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+    );
     const blockedReason = "max merge gate failures reached (5/3)";
     const seeded = await lifecycleStore.ensureIssue(currentIssue(), {
       phase: "blocked",
@@ -3002,27 +3998,35 @@ describe("Orchestrator", () => {
           triggerFingerprint: issueTriageTriggerFingerprint(seeded),
           disposition: "implementation_repair",
           confidence: "medium",
-          summary: "Worker blocker is mixed with an active operator-owned merge gate blocker.",
+          summary:
+            "Worker blocker is mixed with an active operator-owned merge gate blocker.",
           evidence: ["blockedReason=max merge gate failures reached (5/3)"],
-          recommendedAction: "Operator moved the issue to In Progress to start a fresh worker attempt.",
+          recommendedAction:
+            "Operator moved the issue to In Progress to start a fresh worker attempt.",
           blockers: [
             {
               kind: "implementation_unsatisfied_requirements",
               status: "active",
               nextActor: "worker",
               confidence: "medium",
-              summary: "The failed merge-gate verdict is unsuperseded by a newer completion report.",
-              evidence: ["latest merge-gate verdict was recorded after latest completion report"],
-              recommendedAction: "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
+              summary:
+                "The failed merge-gate verdict is unsuperseded by a newer completion report.",
+              evidence: [
+                "latest merge-gate verdict was recorded after latest completion report",
+              ],
+              recommendedAction:
+                "Produce a fresh completion report that supersedes the stale failing merge-gate verdict.",
             },
             {
               kind: "merge_gate_check_failure",
               status: "active",
               nextActor: "operator",
               confidence: "high",
-              summary: "The current PR head is blocked on a required check failure.",
+              summary:
+                "The current PR head is blocked on a required check failure.",
               evidence: ["Typecheck and test failed on the current PR head"],
-              recommendedAction: "Fix or rerun the required check before dispatching another worker.",
+              recommendedAction:
+                "Fix or rerun the required check before dispatching another worker.",
             },
           ],
           submittedAt: "2026-01-01T00:00:00.000Z",
@@ -3031,7 +4035,11 @@ describe("Orchestrator", () => {
       ],
     });
     const harness = new LifecycleSnapshotHarness(lifecycleStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3046,7 +4054,10 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "operator-resumed worker dispatch");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "operator-resumed worker dispatch",
+    );
     await orchestrator.stop();
 
     expect(state).toBe("In Progress");
@@ -3070,7 +4081,10 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
     config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -3083,7 +4097,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     const seeded = await lifecycleStore.ensureIssue(candidate, {
@@ -3123,8 +4139,15 @@ describe("Orchestrator", () => {
         },
       ],
     });
-    const harness = new IssueTriageAcceptingHarness(lifecycleStore, outboxStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new IssueTriageAcceptingHarness(
+      lifecycleStore,
+      outboxStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3136,10 +4159,17 @@ describe("Orchestrator", () => {
       runStore,
     });
 
-    const result = await orchestrator.runManualAgent(candidate.id, { stage: "triage" });
+    const result = await orchestrator.runManualAgent(candidate.id, {
+      stage: "triage",
+    });
     await orchestrator.stop();
 
-    expect(result).toMatchObject({ status: "completed", role: "triage", runPhase: "issue_triage", finalStatus: "succeeded" });
+    expect(result).toMatchObject({
+      status: "completed",
+      role: "triage",
+      runPhase: "issue_triage",
+      finalStatus: "succeeded",
+    });
     expect(harness.runs[0]?.ctx.manualDispatch).toBe(true);
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       issueTriageReports: [
@@ -3157,7 +4187,10 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
     config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -3170,14 +4203,23 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
       blockedReason: "needs operator",
     });
-    const harness = new IssueTriageAcceptingHarness(lifecycleStore, new FileWritebackOutboxStore(config.workspace.stateDir));
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new IssueTriageAcceptingHarness(
+      lifecycleStore,
+      new FileWritebackOutboxStore(config.workspace.stateDir),
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3189,10 +4231,15 @@ describe("Orchestrator", () => {
       runStore,
     });
 
-    const result = await orchestrator.runManualAgent(candidate.id, { stage: "triage" });
+    const result = await orchestrator.runManualAgent(candidate.id, {
+      stage: "triage",
+    });
     await orchestrator.stop();
 
-    expect(result).toMatchObject({ status: "not_dispatched", reason: "lifecycle_gate_blocked" });
+    expect(result).toMatchObject({
+      status: "not_dispatched",
+      reason: "lifecycle_gate_blocked",
+    });
     expect(harness.runs).toHaveLength(0);
   });
 
@@ -3213,7 +4260,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     await lifecycleStore.ensureIssue(candidate, {
@@ -3221,8 +4270,15 @@ describe("Orchestrator", () => {
       reviewRound: 3,
       blockedReason: "max reviewer failures reached (3/3)",
     });
-    const harness = new IssueTriageAcceptingHarness(lifecycleStore, outboxStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new IssueTriageAcceptingHarness(
+      lifecycleStore,
+      outboxStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3234,15 +4290,24 @@ describe("Orchestrator", () => {
       runStore,
     });
 
-    const forceOnly = await orchestrator.runManualAgent(candidate.id, { stage: "triage", forceLabels: true });
-    const forcedStateOverride = await orchestrator.runManualAgent(candidate.id, {
+    const forceOnly = await orchestrator.runManualAgent(candidate.id, {
       stage: "triage",
       forceLabels: true,
-      ignoreState: true,
     });
+    const forcedStateOverride = await orchestrator.runManualAgent(
+      candidate.id,
+      {
+        stage: "triage",
+        forceLabels: true,
+        ignoreState: true,
+      },
+    );
     await orchestrator.stop();
 
-    expect(forceOnly).toMatchObject({ status: "not_dispatched", reason: "issue_not_in_blocked_state" });
+    expect(forceOnly).toMatchObject({
+      status: "not_dispatched",
+      reason: "issue_not_in_blocked_state",
+    });
     expect(forcedStateOverride).toMatchObject({
       status: "completed",
       role: "triage",
@@ -3267,7 +4332,11 @@ describe("Orchestrator", () => {
   it("manual worker dispatch force bypasses worker exclude labels only", async () => {
     const config = testConfig(root);
     config.agent.workerExcludeLabels = ["review_only"];
-    const candidate = issue({ state: "Todo", labels: ["review_only"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["review_only"],
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -3280,11 +4349,21 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
-    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ManualDispatchRecordingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3296,20 +4375,39 @@ describe("Orchestrator", () => {
       runStore,
     });
 
-    const blocked = await orchestrator.runManualAgent(candidate.id, { stage: "worker" });
-    const forced = await orchestrator.runManualAgent(candidate.id, { stage: "worker", forceLabels: true });
+    const blocked = await orchestrator.runManualAgent(candidate.id, {
+      stage: "worker",
+    });
+    const forced = await orchestrator.runManualAgent(candidate.id, {
+      stage: "worker",
+      forceLabels: true,
+    });
     await orchestrator.stop();
 
-    expect(blocked).toMatchObject({ status: "not_dispatched", reason: "worker_excluded_label:review_only" });
-    expect(forced).toMatchObject({ status: "completed", role: "worker", runPhase: "implementation" });
+    expect(blocked).toMatchObject({
+      status: "not_dispatched",
+      reason: "worker_excluded_label:review_only",
+    });
+    expect(forced).toMatchObject({
+      status: "completed",
+      role: "worker",
+      runPhase: "implementation",
+    });
     expect(harness.runs).toHaveLength(1);
-    expect(harness.runs[0]?.ctx).toMatchObject({ role: "worker", runPhase: "implementation", manualDispatch: true });
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "worker",
+      runPhase: "implementation",
+      manualDispatch: true,
+    });
   });
 
   it("manual worker dispatch requires force to ignore the current issue state gate", async () => {
     const config = testConfig(root);
     config.reviewLoop.reviewStates = ["In Review"];
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -3322,11 +4420,21 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
-    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ManualDispatchRecordingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3338,17 +4446,32 @@ describe("Orchestrator", () => {
       runStore,
     });
 
-    const missingForce = await orchestrator.runManualAgent(candidate.id, { stage: "worker", ignoreState: true });
-    const forceOnly = await orchestrator.runManualAgent(candidate.id, { stage: "worker", forceLabels: true });
-    const forcedStateOverride = await orchestrator.runManualAgent(candidate.id, {
+    const missingForce = await orchestrator.runManualAgent(candidate.id, {
       stage: "worker",
-      forceLabels: true,
       ignoreState: true,
     });
+    const forceOnly = await orchestrator.runManualAgent(candidate.id, {
+      stage: "worker",
+      forceLabels: true,
+    });
+    const forcedStateOverride = await orchestrator.runManualAgent(
+      candidate.id,
+      {
+        stage: "worker",
+        forceLabels: true,
+        ignoreState: true,
+      },
+    );
     await orchestrator.stop();
 
-    expect(missingForce).toMatchObject({ status: "not_dispatched", reason: "ignore_state_requires_force" });
-    expect(forceOnly).toMatchObject({ status: "not_dispatched", reason: "issue_not_in_worker_active_state" });
+    expect(missingForce).toMatchObject({
+      status: "not_dispatched",
+      reason: "ignore_state_requires_force",
+    });
+    expect(forceOnly).toMatchObject({
+      status: "not_dispatched",
+      reason: "issue_not_in_worker_active_state",
+    });
     expect(forcedStateOverride).toMatchObject({
       status: "completed",
       role: "worker",
@@ -3377,7 +4500,10 @@ describe("Orchestrator", () => {
   it("manual worker dispatch from blocked resets the failure budget before the run starts", async () => {
     const config = testConfig(root);
     config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -3390,7 +4516,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const approvalVerdict: IssueReviewVerdictRecord = {
       ...reviewVerdictRecord(candidate),
@@ -3399,7 +4527,9 @@ describe("Orchestrator", () => {
       runId: "review-run-pass",
       verdict: "pass",
       findings: [],
-      acceptanceResults: [{ text: "Approved", satisfied: true, evidence: "review passed" }],
+      acceptanceResults: [
+        { text: "Approved", satisfied: true, evidence: "review passed" },
+      ],
       submittedAt: "2026-01-01T00:00:02.000Z",
     };
     await lifecycleStore.ensureIssue(candidate, {
@@ -3425,7 +4555,11 @@ describe("Orchestrator", () => {
       mergeGate: blockedMergeGate(candidate),
     });
     const harness = new LifecycleSnapshotHarness(lifecycleStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3444,7 +4578,11 @@ describe("Orchestrator", () => {
     });
     await orchestrator.stop();
 
-    expect(result).toMatchObject({ status: "completed", role: "worker", runPhase: "implementation" });
+    expect(result).toMatchObject({
+      status: "completed",
+      role: "worker",
+      runPhase: "implementation",
+    });
     expect(harness.snapshots[0]).toMatchObject({
       reviewRound: 0,
       incompleteTurnCount: 0,
@@ -3462,21 +4600,32 @@ describe("Orchestrator", () => {
   it("operator Ready to Merge resume resets merge-gate rounds before rerunning the gate", async () => {
     const config = mergePolicyOrchestratorConfig(root);
     let state = "Ready to Merge";
-    const candidate = issue({ state, branchName: "symphony/TEST-1", labels: ["dogfood-ready"] });
+    const candidate = issue({
+      state,
+      branchName: "symphony/TEST-1",
+      labels: ["dogfood-ready"],
+    });
     const currentIssue = (): Issue => ({ ...candidate, state });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
       },
       async fetchIssuesByStates(states) {
-        return states.some((candidateState) => candidateState.toLowerCase() === state.toLowerCase()) ? [currentIssue()] : [];
+        return states.some(
+          (candidateState) =>
+            candidateState.toLowerCase() === state.toLowerCase(),
+        )
+          ? [currentIssue()]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [currentIssue()];
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writer = new StateChangingWriter((nextState) => {
@@ -3489,7 +4638,9 @@ describe("Orchestrator", () => {
       runId: "review-run-pass",
       verdict: "pass",
       findings: [],
-      acceptanceResults: [{ text: "Approved", satisfied: true, evidence: "review passed" }],
+      acceptanceResults: [
+        { text: "Approved", satisfied: true, evidence: "review passed" },
+      ],
       submittedAt: "2026-01-01T00:00:02.000Z",
     };
     await lifecycleStore.ensureIssue(currentIssue(), {
@@ -3516,13 +4667,22 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness: new FakeHarness(),
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
       lifecycleStore,
       runStore,
-      writeback: new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs),
+      writeback: new WritebackProcessor(
+        outboxStore,
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
       pullRequestMergeClient: new FailingRequiredCheckMergeClient(),
     });
 
@@ -3551,14 +4711,25 @@ describe("Orchestrator", () => {
         reviewRound: 1,
       },
     });
-    expect(lifecycle?.mergeGateResults?.find((result) => result.id === "merge-gate:issue-1:pr-42:abc123")?.writebackOperationKeys).toEqual([
+    expect(
+      lifecycle?.mergeGateResults?.find(
+        (result) => result.id === "merge-gate:issue-1:pr-42:abc123",
+      )?.writebackOperationKeys,
+    ).toEqual([
       "comment:issue-1:merge-gate:merge-gate_issue-1_pr-42_abc123:repair:abc123_test_failure:r1",
       "transition:issue-1:merge-gate:merge-gate_issue-1_pr-42_abc123:repair:abc123_test_failure:r1:In Progress",
     ]);
-    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
+    const issueState = await readIssueState(
+      config.workspace.stateDir,
+      candidate.id,
+    );
     const mergePolicySnapshots =
-      issueState?.history.filter((snapshot) => snapshot.transitionKind.startsWith("merge_policy_")) ?? [];
-    expect(mergePolicySnapshots.map((snapshot) => snapshot.transitionKind)).toEqual([
+      issueState?.history.filter((snapshot) =>
+        snapshot.transitionKind.startsWith("merge_policy_"),
+      ) ?? [];
+    expect(
+      mergePolicySnapshots.map((snapshot) => snapshot.transitionKind),
+    ).toEqual([
       "merge_policy_reset_operator_resume",
       "merge_policy_observe",
       "merge_policy_dispatch_repair",
@@ -3566,7 +4737,9 @@ describe("Orchestrator", () => {
     expect(
       mergePolicySnapshots.map((snapshot) => {
         const context =
-          snapshot.transitionRequestContext?.kind === "merge_policy_chain" ? snapshot.transitionRequestContext : null;
+          snapshot.transitionRequestContext?.kind === "merge_policy_chain"
+            ? snapshot.transitionRequestContext
+            : null;
         return {
           triggerType: snapshot.triggerType,
           triggerSource: snapshot.triggerSource,
@@ -3599,14 +4772,17 @@ describe("Orchestrator", () => {
       },
     ]);
     const firstContext =
-      mergePolicySnapshots[1]?.transitionRequestContext?.kind === "merge_policy_chain"
+      mergePolicySnapshots[1]?.transitionRequestContext?.kind ===
+      "merge_policy_chain"
         ? mergePolicySnapshots[1].transitionRequestContext
         : null;
     const chainId = firstContext?.payload.chainId;
     expect(typeof chainId).toBe("string");
     expect(
       mergePolicySnapshots.map((snapshot) =>
-        snapshot.transitionRequestContext?.kind === "merge_policy_chain" ? snapshot.transitionRequestContext.payload.chainId : null,
+        snapshot.transitionRequestContext?.kind === "merge_policy_chain"
+          ? snapshot.transitionRequestContext.payload.chainId
+          : null,
       ),
     ).toEqual([null, chainId, chainId]);
     expect(mergePolicySnapshots[1]?.transitionRequestContext).toMatchObject({
@@ -3625,7 +4801,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker: emptyTracker(),
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness: new FakeHarness(),
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -3654,7 +4834,12 @@ describe("Orchestrator", () => {
       transitionKind: "merge_policy_observe",
       mergePolicyObservationInputFingerprint: "merge-policy-input",
     });
-    expect(observeRuleset?.evaluate({ ...base, candidateSource: "worker_candidates" }, [])).toMatchObject({
+    expect(
+      observeRuleset?.evaluate(
+        { ...base, candidateSource: "worker_candidates" },
+        [],
+      ),
+    ).toMatchObject({
       transitionKind: "merge_policy_observe",
       mergePolicyObservationInputFingerprint: "merge-policy-input",
     });
@@ -3701,6 +4886,59 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
+  it("worker dispatch ruleset ignores candidate source lineage", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const workerRuleset = orchestrator
+      .registeredTransitionRulesets()
+      .find(
+        (ruleset) =>
+          ruleset.id === "orchestrator.dispatch.worker.implementation",
+      );
+    expect(workerRuleset).toBeDefined();
+    const base = mergePolicyRulesetSnapshot({
+      trackerState: "Todo",
+      phase: "implementation",
+      latestPrNumber: null,
+      latestPrHeadSha: null,
+      latestPrBranch: null,
+      latestGitBranchName: null,
+      currentMergePolicyObservationInputFingerprint: null,
+      candidateSource: "tick_candidates",
+    });
+
+    expect(workerRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "dispatch_worker",
+      role: "worker",
+      runPhase: "implementation",
+      reason: "worker_dispatch",
+    });
+    expect(
+      workerRuleset?.evaluate(
+        { ...base, candidateSource: "reviewer_candidates" },
+        [],
+      ),
+    ).toMatchObject({
+      transitionKind: "dispatch_worker",
+      role: "worker",
+      runPhase: "implementation",
+      reason: "worker_dispatch",
+    });
+    await orchestrator.stop();
+  });
+
   it.each([
     {
       name: "null transition",
@@ -3708,55 +4946,90 @@ describe("Orchestrator", () => {
     },
     {
       name: "noop transition",
-      response: { transition: transitionSnapshot("noop", "noop-1"), acted: false },
+      response: {
+        transition: transitionSnapshot("noop", "noop-1"),
+        acted: false,
+      },
     },
     {
       name: "unacted transition",
-      response: { transition: transitionSnapshot("merge_policy_observe", "observe-1"), acted: false },
+      response: {
+        transition: transitionSnapshot("merge_policy_observe", "observe-1"),
+        acted: false,
+      },
     },
     {
       name: "non-continuable transition",
-      response: { transition: transitionSnapshot("merge_policy_dispatch_repair", "dispatch-repair-1"), acted: true },
-    },
-  ])("merge-policy requested transition chain stops on $name", async ({ response }) => {
-    const { candidate, orchestrator, requester } = mergePolicyLoopHarness(root, [response]);
-
-    await requester.processMergePolicyTransitionCandidate(candidate);
-    await orchestrator.stop();
-
-    expect(requester.requestTransition).toHaveBeenCalledTimes(1);
-    const requestCalls = requester.requestTransition.mock.calls as Array<[RequestedTransitionCall]>;
-    expect(requestCalls[0]?.[0]).toMatchObject({
-      candidateSource: "merge_policy_chain",
-      context: {
-        kind: "merge_policy_chain",
-        parentHistorySnapshotId: null,
-        parentTransitionKind: null,
-        payload: {
-          iteration: 0,
-          maxIterations: 6,
-        },
+      response: {
+        transition: transitionSnapshot(
+          "merge_policy_dispatch_repair",
+          "dispatch-repair-1",
+        ),
+        acted: true,
       },
-    });
-  });
+    },
+  ])(
+    "merge-policy requested transition chain stops on $name",
+    async ({ response }) => {
+      const { candidate, orchestrator, requester } = mergePolicyLoopHarness(
+        root,
+        [response],
+      );
+
+      await requester.processMergePolicyTransitionCandidate(candidate);
+      await orchestrator.stop();
+
+      expect(requester.requestTransition).toHaveBeenCalledTimes(1);
+      const requestCalls = requester.requestTransition.mock.calls as Array<
+        [RequestedTransitionCall]
+      >;
+      expect(requestCalls[0]?.[0]).toMatchObject({
+        candidateSource: "merge_policy_chain",
+        context: {
+          kind: "merge_policy_chain",
+          parentHistorySnapshotId: null,
+          parentTransitionKind: null,
+          payload: {
+            iteration: 0,
+            maxIterations: 6,
+          },
+        },
+      });
+    },
+  );
 
   it("merge-policy requested transition chain increments context and logs when the cap is reached", async () => {
     const logs: string[] = [];
     const responses = Array.from({ length: 6 }, (_, index) => ({
-      transition: transitionSnapshot("merge_policy_observe", `observe-${index}`),
+      transition: transitionSnapshot(
+        "merge_policy_observe",
+        `observe-${index}`,
+      ),
       acted: true,
     }));
-    const { candidate, orchestrator, requester } = mergePolicyLoopHarness(root, responses, logs);
+    const { candidate, orchestrator, requester } = mergePolicyLoopHarness(
+      root,
+      responses,
+      logs,
+    );
 
     await requester.processMergePolicyTransitionCandidate(candidate);
     await orchestrator.stop();
 
     expect(requester.requestTransition).toHaveBeenCalledTimes(6);
-    const requestCalls = requester.requestTransition.mock.calls as Array<[RequestedTransitionCall]>;
+    const requestCalls = requester.requestTransition.mock.calls as Array<
+      [RequestedTransitionCall]
+    >;
     const contexts = requestCalls.map((call) => call[0].context);
-    expect(contexts.map((context) => context.payload.iteration)).toEqual([0, 1, 2, 3, 4, 5]);
-    expect(contexts.map((context) => context.payload.maxIterations)).toEqual([6, 6, 6, 6, 6, 6]);
-    expect(new Set(contexts.map((context) => context.payload.chainId)).size).toBe(1);
+    expect(contexts.map((context) => context.payload.iteration)).toEqual([
+      0, 1, 2, 3, 4, 5,
+    ]);
+    expect(contexts.map((context) => context.payload.maxIterations)).toEqual([
+      6, 6, 6, 6, 6, 6,
+    ]);
+    expect(
+      new Set(contexts.map((context) => context.payload.chainId)).size,
+    ).toBe(1);
     expect(contexts[0]).toMatchObject({
       parentHistorySnapshotId: null,
       parentTransitionKind: null,
@@ -3769,14 +5042,24 @@ describe("Orchestrator", () => {
       parentHistorySnapshotId: "observe-4",
       parentTransitionKind: "merge_policy_observe",
     });
-    expect(logs.some((line) => line.includes('message="merge policy transition chain reached iteration cap"'))).toBe(true);
+    expect(
+      logs.some((line) =>
+        line.includes(
+          'message="merge policy transition chain reached iteration cap"',
+        ),
+      ),
+    ).toBe(true);
   });
 
   it("manual worker dispatch does not auto-route planning-labeled issues to planner", async () => {
     const config = testConfig(root);
     config.issueBreakdown.enabled = true;
     config.issueBreakdown.planningLabels = ["needs_breakdown"];
-    const candidate = issue({ state: "Todo", labels: ["needs_breakdown"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["needs_breakdown"],
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -3789,11 +5072,21 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
-    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ManualDispatchRecordingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3805,17 +5098,29 @@ describe("Orchestrator", () => {
       runStore,
     });
 
-    const result = await orchestrator.runManualAgent(candidate.id, { stage: "worker" });
+    const result = await orchestrator.runManualAgent(candidate.id, {
+      stage: "worker",
+    });
     await orchestrator.stop();
 
-    expect(result).toMatchObject({ status: "completed", role: "worker", runPhase: "implementation" });
-    expect(harness.runs[0]?.ctx).toMatchObject({ role: "worker", runPhase: "implementation" });
+    expect(result).toMatchObject({
+      status: "completed",
+      role: "worker",
+      runPhase: "implementation",
+    });
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "worker",
+      runPhase: "implementation",
+    });
   });
 
   it("manual reviewer dispatch fails clearly when review evidence is unavailable", async () => {
     const config = testConfig(root);
     config.reviewLoop.reviewStates = ["In Review"];
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -3828,11 +5133,21 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
-    const harness = new ManualDispatchRecordingHarness(lifecycleStore, outboxStore, runStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ManualDispatchRecordingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3844,10 +5159,15 @@ describe("Orchestrator", () => {
       runStore,
     });
 
-    const result = await orchestrator.runManualAgent(candidate.id, { stage: "reviewer" });
+    const result = await orchestrator.runManualAgent(candidate.id, {
+      stage: "reviewer",
+    });
     await orchestrator.stop();
 
-    expect(result).toMatchObject({ status: "not_dispatched", reason: "review_evidence_unavailable" });
+    expect(result).toMatchObject({
+      status: "not_dispatched",
+      reason: "review_evidence_unavailable",
+    });
     expect(harness.runs).toHaveLength(0);
   });
 
@@ -3856,7 +5176,10 @@ describe("Orchestrator", () => {
     config.issueTriage.enabled = true;
     config.writeback.enabled = true;
     config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -3869,18 +5192,32 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writer = new StateChangingWriter(() => undefined);
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+    );
     await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
       reviewRound: 3,
       blockedReason: "max reviewer failures reached (3/3)",
     });
-    const harness = new IssueTriageAcceptingHarness(lifecycleStore, outboxStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new IssueTriageAcceptingHarness(
+      lifecycleStore,
+      outboxStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3895,7 +5232,10 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "issue triage dispatch");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "issue triage completion");
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "issue triage completion",
+    );
     await orchestrator.stop();
 
     expect(writer.comments).toHaveLength(1);
@@ -3904,7 +5244,9 @@ describe("Orchestrator", () => {
       dedupeKey: "issue-triage:triage-run-1",
     });
     expect(writer.comments[0]?.body).toContain("## Symphony Issue Triage");
-    expect(writer.comments[0]?.body).toContain("Decompose the hidden scope into blocking child issues.");
+    expect(writer.comments[0]?.body).toContain(
+      "Decompose the hidden scope into blocking child issues.",
+    );
     await expect(outboxStore.list()).resolves.toEqual([
       expect.objectContaining({
         idempotencyKey: "comment:issue-1:issue-triage:triage-run-1",
@@ -3918,7 +5260,10 @@ describe("Orchestrator", () => {
     config.issueTriage.enabled = true;
     config.writeback.enabled = true;
     config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "Blocked", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -3931,11 +5276,18 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
     const writer = new StateChangingWriter(() => undefined);
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+    );
     const seeded = await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
       reviewRound: 3,
@@ -3954,18 +5306,22 @@ describe("Orchestrator", () => {
           triggerFingerprint: issueTriageTriggerFingerprint(seeded),
           disposition: "decompose_issue",
           confidence: "high",
-          summary: "Existing triage report was accepted before writebacks existed.",
+          summary:
+            "Existing triage report was accepted before writebacks existed.",
           evidence: ["blockedReason=max reviewer failures reached (3/3)"],
-          recommendedAction: "Publish the missing triage recommendation without rerunning the agent.",
+          recommendedAction:
+            "Publish the missing triage recommendation without rerunning the agent.",
           blockers: [
             {
               kind: "under_specified_needs_decomposition",
               status: "active",
               nextActor: "planner",
               confidence: "high",
-              summary: "Existing triage report was accepted before writebacks existed.",
+              summary:
+                "Existing triage report was accepted before writebacks existed.",
               evidence: ["blockedReason=max reviewer failures reached (3/3)"],
-              recommendedAction: "Publish the missing triage recommendation without rerunning the agent.",
+              recommendedAction:
+                "Publish the missing triage recommendation without rerunning the agent.",
             },
           ],
           submittedAt: "2026-01-01T00:00:00.000Z",
@@ -3974,7 +5330,11 @@ describe("Orchestrator", () => {
       ],
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -3996,7 +5356,9 @@ describe("Orchestrator", () => {
       dedupeKey: "issue-triage:triage-1",
     });
     expect(writer.comments[0]?.body).toContain("## Symphony Issue Triage");
-    expect(writer.comments[0]?.body).toContain("Publish the missing triage recommendation without rerunning the agent.");
+    expect(writer.comments[0]?.body).toContain(
+      "Publish the missing triage recommendation without rerunning the agent.",
+    );
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       lastIssueTriageReportId: "issue-triage-report:issue-1:triage-1",
       issueTriageReports: [
@@ -4005,8 +5367,14 @@ describe("Orchestrator", () => {
         },
       ],
     });
-    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
-    const reconciliation = issueState?.history.find((snapshot) => snapshot.transitionKind === "reconcile_issue_triage_report_writeback");
+    const issueState = await readIssueState(
+      config.workspace.stateDir,
+      candidate.id,
+    );
+    const reconciliation = issueState?.history.find(
+      (snapshot) =>
+        snapshot.transitionKind === "reconcile_issue_triage_report_writeback",
+    );
     expect(reconciliation).toMatchObject({
       candidateSource: "tick_candidates",
       rulesetId: "orchestrator.reconcile_issue_triage_report_writeback",
@@ -4039,14 +5407,20 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
+    const lifecycleStore = new FileIssueLifecycleStore(
+      path.join(root, "state"),
+    );
     await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
       incompleteTurnCount: 2,
       blockedReason: "max incomplete turns reached (2/2)",
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -4062,7 +5436,9 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(0);
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       phase: "blocked",
       blockedReason: "max incomplete turns reached (2/2)",
     });
@@ -4071,55 +5447,80 @@ describe("Orchestrator", () => {
   it.each([
     ["setup-incomplete", PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON],
     ["awaiting operator", PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON],
-  ] as const)("does not redispatch issues with %s pending publication approval before Linear reaches Blocked", async (_name, blockedReason) => {
-    const config = testConfig(root);
-    config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
-    const tracker: TrackerClient = {
-      async fetchCandidateIssues() {
-        return [candidate];
-      },
-      async fetchIssuesByStates(states) {
-        return issuesInStates([candidate], states);
-      },
-      async fetchIssueStatesByIds() {
-        return [candidate];
-      },
-    };
-    const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
-    await lifecycleStore.ensureIssue(candidate, {
-      ...pendingApprovalLifecyclePatch(candidate, root, "run-1", blockedReason),
-      phase: "implementation",
-    });
-    const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
-    const orchestrator = new Orchestrator({
-      config,
-      tracker,
-      workspaceManager,
-      harness,
-      logger,
-      promptTemplate: "Work on {{ issue.identifier }}",
-      lifecycleStore,
-    });
+  ] as const)(
+    "does not redispatch issues with %s pending publication approval before Linear reaches Blocked",
+    async (_name, blockedReason) => {
+      const config = testConfig(root);
+      config.reviewLoop.blockedStates = ["Blocked"];
+      const candidate = issue({
+        state: "In Progress",
+        branchName: "symphony/TEST-1",
+      });
+      const tracker: TrackerClient = {
+        async fetchCandidateIssues() {
+          return [candidate];
+        },
+        async fetchIssuesByStates(states) {
+          return issuesInStates([candidate], states);
+        },
+        async fetchIssueStatesByIds() {
+          return [candidate];
+        },
+      };
+      const logger = new StructuredLogger(() => undefined);
+      const lifecycleStore = new FileIssueLifecycleStore(
+        path.join(root, "state"),
+      );
+      await lifecycleStore.ensureIssue(candidate, {
+        ...pendingApprovalLifecyclePatch(
+          candidate,
+          root,
+          "run-1",
+          blockedReason,
+        ),
+        phase: "implementation",
+      });
+      const harness = new FakeHarness();
+      const workspaceManager = new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      });
+      const orchestrator = new Orchestrator({
+        config,
+        tracker,
+        workspaceManager,
+        harness,
+        logger,
+        promptTemplate: "Work on {{ issue.identifier }}",
+        lifecycleStore,
+      });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    await orchestrator.stop();
+      await orchestrator.refreshNow();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await orchestrator.stop();
 
-    expect(harness.runs).toHaveLength(0);
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
-      phase: "implementation",
-      blockedReason,
-    });
-  });
+      expect(harness.runs).toHaveLength(0);
+      await expect(
+        lifecycleStore.get(candidate.identifier),
+      ).resolves.toMatchObject({
+        phase: "implementation",
+        blockedReason,
+      });
+    },
+  );
 
   it("does not stall-cancel lifecycle-only pending publication approval handoffs", async () => {
     const config = testConfig(root);
     config.reviewLoop.blockedStates = ["Blocked"];
-    (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = { stall_timeout_ms: 1 };
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = {
+      stall_timeout_ms: 1,
+    };
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -4133,12 +5534,18 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const harness = new BlockingHarness();
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -4148,12 +5555,20 @@ describe("Orchestrator", () => {
 
     try {
       await orchestrator.refreshNow();
-      await waitFor(() => typeof orchestrator.snapshot().running[0]?.runId === "string", "worker run start");
+      await waitFor(
+        () => typeof orchestrator.snapshot().running[0]?.runId === "string",
+        "worker run start",
+      );
       const runId = orchestrator.snapshot().running[0]?.runId ?? "";
       await waitForRunRecord(runStore, runId);
       await lifecycleStore.ensureIssue(
         candidate,
-        pendingApprovalLifecyclePatch(candidate, root, runId, PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON),
+        pendingApprovalLifecyclePatch(
+          candidate,
+          root,
+          runId,
+          PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
+        ),
       );
       await runStore.updateRun(runId, {
         metadata: {
@@ -4166,7 +5581,9 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
 
       expect(orchestrator.snapshot().counts.running).toBe(1);
-      expect(orchestrator.snapshot().running[0]?.liveness.idleAlert).toMatchObject({
+      expect(
+        orchestrator.snapshot().running[0]?.liveness.idleAlert,
+      ).toMatchObject({
         active: false,
         reason: "suppressed",
       });
@@ -4181,7 +5598,9 @@ describe("Orchestrator", () => {
         blockedReason: PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
         incompleteTurnCount: 0,
       });
-      await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(1);
+      await expect(
+        runStore.listRunsForIssue(candidate.id),
+      ).resolves.toHaveLength(1);
     } finally {
       await orchestrator.stop();
     }
@@ -4190,21 +5609,28 @@ describe("Orchestrator", () => {
   it.each([
     {
       name: "comment fails while Blocked transition succeeds",
-      writer: (setState: (state: string) => void) => new PublicationApprovalCommentFailingWriter(setState),
+      writer: (setState: (state: string) => void) =>
+        new PublicationApprovalCommentFailingWriter(setState),
       stateBeforeRecovery: "Blocked",
       recoveryComments: 1,
       recoveryTransitions: 0,
     },
     {
       name: "Blocked transition fails after comment succeeds",
-      writer: (setState: (state: string) => void) => new PublicationApprovalTransitionFailingWriter(setState),
+      writer: (setState: (state: string) => void) =>
+        new PublicationApprovalTransitionFailingWriter(setState),
       stateBeforeRecovery: "Todo",
       recoveryComments: 0,
       recoveryTransitions: 1,
     },
   ])(
     "recovers a real post-exit pending publication approval handoff after partial audit failure: $name",
-    async ({ writer, stateBeforeRecovery, recoveryComments, recoveryTransitions }) => {
+    async ({
+      writer,
+      stateBeforeRecovery,
+      recoveryComments,
+      recoveryTransitions,
+    }) => {
       const config = testConfig(root);
       config.writeback.enabled = true;
       config.writeback.mode = "live";
@@ -4217,14 +5643,22 @@ describe("Orchestrator", () => {
       config.github.token = "github-token";
       config.github.operatorApproval!.requiredForPublication = true;
       config.workspace.source.baseRef = "main";
-      const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+      const candidate = issue({
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/TEST-1",
+      });
       let currentState = "Todo";
       const tracker: TrackerClient = {
         async fetchCandidateIssues() {
-          return ["Todo", "In Progress"].includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+          return ["Todo", "In Progress"].includes(currentState)
+            ? [{ ...candidate, state: currentState }]
+            : [];
         },
         async fetchIssuesByStates(states) {
-          return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+          return states.includes(currentState)
+            ? [{ ...candidate, state: currentState }]
+            : [];
         },
         async fetchIssueStatesByIds() {
           return [{ ...candidate, state: currentState }];
@@ -4232,14 +5666,29 @@ describe("Orchestrator", () => {
       };
       const logger = new StructuredLogger(() => undefined);
       const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
-      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-      const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
-      const approvalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
-      const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+      const lifecycleStore = new FileIssueLifecycleStore(
+        config.workspace.stateDir,
+      );
+      const outboxStore = new FileWritebackOutboxStore(
+        config.workspace.stateDir,
+      );
+      const approvalStore = new FileOperatorApprovalStore(
+        config.workspace.stateDir,
+      );
+      const operatorApproval = new OperatorApprovalService({
+        config,
+        store: approvalStore,
+        runStore,
+      });
       const partialWriter = writer((state) => {
         currentState = state;
       });
-      const partialWriteback = new WritebackProcessor(outboxStore, partialWriter, logger, config.writeback.maxBackoffMs);
+      const partialWriteback = new WritebackProcessor(
+        outboxStore,
+        partialWriter,
+        logger,
+        config.writeback.maxBackoffMs,
+      );
       const publisher = new FakeCompletionReportPublisher({
         action: "created",
         url: "https://github.com/acme/symphony/pull/42",
@@ -4261,7 +5710,11 @@ describe("Orchestrator", () => {
       const firstOrchestrator = new Orchestrator({
         config,
         tracker,
-        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        workspaceManager: new WorkspaceManager({
+          workspace: config.workspace,
+          hooks: config.hooks,
+          logger,
+        }),
         harness,
         logger,
         promptTemplate: "Work on {{ issue.identifier }}",
@@ -4272,14 +5725,22 @@ describe("Orchestrator", () => {
       });
 
       await firstOrchestrator.refreshNow();
-      await waitFor(() => firstOrchestrator.snapshot().counts.running === 0, "partial audit worker exit");
+      await waitFor(
+        () => firstOrchestrator.snapshot().counts.running === 0,
+        "partial audit worker exit",
+      );
       await firstOrchestrator.stop();
 
       expect(harness.prompts).toHaveLength(1);
       expect(harness.prompts[0]).toContain("Work on TEST-1");
       expect(currentState).toBe(stateBeforeRecovery);
-      await expect(approvalStore.findPendingForRun("report-run-1")).resolves.toBeNull();
-      const runBeforeRecovery = await waitForTerminalRunRecord(runStore, "report-run-1");
+      await expect(
+        approvalStore.findPendingForRun("report-run-1"),
+      ).resolves.toBeNull();
+      const runBeforeRecovery = await waitForTerminalRunRecord(
+        runStore,
+        "report-run-1",
+      );
       expect(runBeforeRecovery).toMatchObject({ status: "succeeded" });
       expect(runBeforeRecovery?.pendingApprovalRequestId ?? null).toBeNull();
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
@@ -4294,19 +5755,38 @@ describe("Orchestrator", () => {
           }),
         ],
       });
-      expect(partialWriter.comments.some((comment) => comment.dedupeKey?.includes("run-failed"))).toBe(false);
-      expect(partialWriter.comments.some((comment) => comment.dedupeKey?.includes("run-cancelled"))).toBe(false);
+      expect(
+        partialWriter.comments.some((comment) =>
+          comment.dedupeKey?.includes("run-failed"),
+        ),
+      ).toBe(false);
+      expect(
+        partialWriter.comments.some((comment) =>
+          comment.dedupeKey?.includes("run-cancelled"),
+        ),
+      ).toBe(false);
       expect(firstOrchestrator.snapshot().counts.retrying).toBe(0);
-      await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(1);
+      await expect(
+        runStore.listRunsForIssue(candidate.id),
+      ).resolves.toHaveLength(1);
 
       const recoveryWriter = new StateChangingWriter((state) => {
         currentState = state;
       });
-      const recoveryWriteback = new WritebackProcessor(outboxStore, recoveryWriter, logger, config.writeback.maxBackoffMs);
+      const recoveryWriteback = new WritebackProcessor(
+        outboxStore,
+        recoveryWriter,
+        logger,
+        config.writeback.maxBackoffMs,
+      );
       const recoveryOrchestrator = new Orchestrator({
         config,
         tracker,
-        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        workspaceManager: new WorkspaceManager({
+          workspace: config.workspace,
+          hooks: config.hooks,
+          logger,
+        }),
         harness: new FakeHarness(),
         logger,
         promptTemplate: "Work on {{ issue.identifier }}",
@@ -4328,27 +5808,44 @@ describe("Orchestrator", () => {
       await recoveryOrchestrator.refreshNow();
 
       const approvals = await approvalStore.list();
-      expect(approvals.filter((approval) => approval.runId === "report-run-1")).toHaveLength(1);
+      expect(
+        approvals.filter((approval) => approval.runId === "report-run-1"),
+      ).toHaveLength(1);
       await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
         status: "succeeded",
         pendingApprovalRequestId: pending?.requestId,
         pendingApprovalRequestedAt: pending?.requestedAt,
       });
       const transcript = await runStore.readTranscript("report-run-1");
-      expect(transcript.events.filter((event) => event.eventType === "approval_request")).toHaveLength(1);
+      expect(
+        transcript.events.filter(
+          (event) => event.eventType === "approval_request",
+        ),
+      ).toHaveLength(1);
       expect(recoveryWriter.comments).toHaveLength(recoveryComments);
       expect(recoveryWriter.transitions).toHaveLength(recoveryTransitions);
-      const pendingAuditOperations = (await outboxStore.list()).filter((operation) =>
-        operation.idempotencyKey.includes("publication-approval-pending"),
+      const pendingAuditOperations = (await outboxStore.list()).filter(
+        (operation) =>
+          operation.idempotencyKey.includes("publication-approval-pending"),
       );
       expect(pendingAuditOperations).toHaveLength(2);
-      expect(pendingAuditOperations.map((operation) => operation.status)).toEqual(["succeeded", "succeeded"]);
+      expect(
+        pendingAuditOperations.map((operation) => operation.status),
+      ).toEqual(["succeeded", "succeeded"]);
       expect(recoveryOrchestrator.snapshot().counts.running).toBe(0);
       expect(recoveryOrchestrator.snapshot().counts.retrying).toBe(0);
       expect(harness.prompts).toHaveLength(1);
-      await expect(runStore.listRunsForIssue(candidate.id)).resolves.toHaveLength(1);
-      const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
-      const recovery = issueState?.history.find((snapshot) => snapshot.transitionKind === "recover_publication_approval");
+      await expect(
+        runStore.listRunsForIssue(candidate.id),
+      ).resolves.toHaveLength(1);
+      const issueState = await readIssueState(
+        config.workspace.stateDir,
+        candidate.id,
+      );
+      const recovery = issueState?.history.find(
+        (snapshot) =>
+          snapshot.transitionKind === "recover_publication_approval",
+      );
       expect(recovery).toMatchObject({
         candidateSource: "pending_publication_approval",
         rulesetId: "orchestrator.recover_publication_approval",
@@ -4379,7 +5876,11 @@ describe("Orchestrator", () => {
     config.github.token = "github-token";
     config.github.operatorApproval!.requiredForPublication = true;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -4396,11 +5897,20 @@ describe("Orchestrator", () => {
     const stateDir = config.workspace.stateDir;
     const outboxStore = new FileWritebackOutboxStore(stateDir);
     const writer = new StateChangingWriter(() => undefined);
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const approvalStore = new FileOperatorApprovalStore(stateDir);
-    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    const operatorApproval = new OperatorApprovalService({
+      config,
+      store: approvalStore,
+      runStore,
+    });
     await startApprovalRun(runStore, candidate, "run-1", root);
     const { record: approval } = await approvalStore.requestOrGetPending(
       {
@@ -4417,7 +5927,11 @@ describe("Orchestrator", () => {
           evidenceCursor: "idem-1",
           summaryPreview: "Implemented the requested handoff.",
           changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
-          plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+          plannedOperations: [
+            "commit_if_needed",
+            "git_push",
+            "pull_request_create_or_reuse",
+          ],
         },
       },
       null,
@@ -4430,12 +5944,19 @@ describe("Orchestrator", () => {
         pendingApprovalRequestedAt: approval.requestedAt,
       },
     });
-    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+    await lifecycleStore.ensureIssue(
+      candidate,
+      pendingApprovalLifecyclePatch(candidate, root, "run-1"),
+    );
     const lifecycleBefore = await lifecycleStore.get(candidate.id);
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness: new FakeHarness(),
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -4453,12 +5974,18 @@ describe("Orchestrator", () => {
       expect(await outboxStore.list()).toEqual([]);
       expect(writer.comments).toEqual([]);
       expect(writer.transitions).toEqual([]);
-      await expect(lifecycleStore.get(candidate.id)).resolves.toEqual(lifecycleBefore);
+      await expect(lifecycleStore.get(candidate.id)).resolves.toEqual(
+        lifecycleBefore,
+      );
       await expect(runStore.getRun("run-1")).resolves.toMatchObject({
         pendingApprovalRequestId: approval.requestId,
         pendingApprovalRequestedAt: approval.requestedAt,
       });
-      expect(logs.some((line) => line.includes("pending publication approval recovered"))).toBe(false);
+      expect(
+        logs.some((line) =>
+          line.includes("pending publication approval recovered"),
+        ),
+      ).toBe(false);
       expect(orchestrator.snapshot().counts.running).toBe(0);
     } finally {
       await orchestrator.stop();
@@ -4476,7 +6003,11 @@ describe("Orchestrator", () => {
     config.github.token = "github-token";
     config.github.operatorApproval!.requiredForPublication = true;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -4493,12 +6024,24 @@ describe("Orchestrator", () => {
     const stateDir = config.workspace.stateDir;
     const outboxStore = new FileWritebackOutboxStore(stateDir);
     const writer = new StateChangingWriter(() => undefined);
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const approvalStore = new FileOperatorApprovalStore(stateDir);
-    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
-    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "missing-run"));
+    const operatorApproval = new OperatorApprovalService({
+      config,
+      store: approvalStore,
+      runStore,
+    });
+    await lifecycleStore.ensureIssue(
+      candidate,
+      pendingApprovalLifecyclePatch(candidate, root, "missing-run"),
+    );
     const lifecycleBefore = await lifecycleStore.get(candidate.id);
     const publisher = new FakeCompletionReportPublisher({
       action: "created",
@@ -4513,7 +6056,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -4532,11 +6079,17 @@ describe("Orchestrator", () => {
       expect(await outboxStore.list()).toEqual([]);
       expect(writer.comments).toEqual([]);
       expect(writer.transitions).toEqual([]);
-      await expect(lifecycleStore.get(candidate.id)).resolves.toEqual(lifecycleBefore);
+      await expect(lifecycleStore.get(candidate.id)).resolves.toEqual(
+        lifecycleBefore,
+      );
       await expect(runStore.getRun("missing-run")).resolves.toBeNull();
       expect(publisher.inputs).toEqual([]);
       expect(harness.runs).toEqual([]);
-      expect(logs.some((line) => line.includes("pending publication approval recovered"))).toBe(false);
+      expect(
+        logs.some((line) =>
+          line.includes("pending publication approval recovered"),
+        ),
+      ).toBe(false);
       expect(orchestrator.snapshot().counts.running).toBe(0);
     } finally {
       await orchestrator.stop();
@@ -4556,7 +6109,11 @@ describe("Orchestrator", () => {
     config.github.token = "github-token";
     config.github.operatorApproval!.requiredForPublication = true;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -4573,14 +6130,29 @@ describe("Orchestrator", () => {
     const stateDir = config.workspace.stateDir;
     const outboxStore = new FileWritebackOutboxStore(stateDir);
     const writer = new FailingWriter();
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, config.writeback.maxBackoffMs);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const approvalStore = new FileOperatorApprovalStore(stateDir);
-    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    const operatorApproval = new OperatorApprovalService({
+      config,
+      store: approvalStore,
+      runStore,
+    });
     await startApprovalRun(runStore, candidate, "run-1", root);
-    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
-    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+    await runStore.updateRun("run-1", {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await lifecycleStore.ensureIssue(
+      candidate,
+      pendingApprovalLifecyclePatch(candidate, root, "run-1"),
+    );
     const lifecycleBefore = await lifecycleStore.get(candidate.id);
     const publisher = new FakeCompletionReportPublisher({
       action: "created",
@@ -4595,7 +6167,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -4610,22 +6186,36 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
       const operationsAfterFirstTick = await outboxStore.list();
       expect(operationsAfterFirstTick).toHaveLength(2);
-      expect(operationsAfterFirstTick.map((operation) => operation.status)).toEqual(["retrying", "retrying"]);
+      expect(
+        operationsAfterFirstTick.map((operation) => operation.status),
+      ).toEqual(["retrying", "retrying"]);
 
       await orchestrator.refreshNow();
       const operationsAfterSecondTick = await outboxStore.list();
       expect(operationsAfterSecondTick).toHaveLength(2);
-      expect(operationsAfterSecondTick.map((operation) => operation.status)).toEqual(["retrying", "retrying"]);
+      expect(
+        operationsAfterSecondTick.map((operation) => operation.status),
+      ).toEqual(["retrying", "retrying"]);
 
       expect(await approvalStore.list()).toHaveLength(0);
-      await expect(approvalStore.findPendingForRun("run-1")).resolves.toBeNull();
+      await expect(
+        approvalStore.findPendingForRun("run-1"),
+      ).resolves.toBeNull();
       expect(writer.comments).toEqual([]);
       expect(writer.transitions).toEqual([]);
-      await expect(lifecycleStore.get(candidate.id)).resolves.toEqual(lifecycleBefore);
-      expect((await runStore.getRun("run-1"))?.pendingApprovalRequestId ?? null).toBeNull();
+      await expect(lifecycleStore.get(candidate.id)).resolves.toEqual(
+        lifecycleBefore,
+      );
+      expect(
+        (await runStore.getRun("run-1"))?.pendingApprovalRequestId ?? null,
+      ).toBeNull();
       expect(publisher.inputs).toEqual([]);
       expect(harness.runs).toEqual([]);
-      expect(logs.some((line) => line.includes("pending publication approval recovered"))).toBe(false);
+      expect(
+        logs.some((line) =>
+          line.includes("pending publication approval recovered"),
+        ),
+      ).toBe(false);
       expect(orchestrator.snapshot().counts.running).toBe(0);
     } finally {
       await orchestrator.stop();
@@ -4647,14 +6237,20 @@ describe("Orchestrator", () => {
     config.github.token = "github-token";
     config.github.operatorApproval!.requiredForPublication = true;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Blocked";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
       },
       async fetchIssuesByStates(states) {
-        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+        return states.includes(currentState)
+          ? [{ ...candidate, state: currentState }]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -4666,14 +6262,29 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const approvalStore = new FileOperatorApprovalStore(stateDir);
-    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    const operatorApproval = new OperatorApprovalService({
+      config,
+      store: approvalStore,
+      runStore,
+    });
     await startApprovalRun(runStore, candidate, "run-1", root);
-    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
-    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+    await runStore.updateRun("run-1", {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await lifecycleStore.ensureIssue(
+      candidate,
+      pendingApprovalLifecyclePatch(candidate, root, "run-1"),
+    );
     const { record } = await approvalStore.requestOrGetPending(
       {
         issueId: candidate.id,
@@ -4698,7 +6309,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -4711,23 +6326,42 @@ describe("Orchestrator", () => {
 
     try {
       await orchestrator.refreshNow();
-      await waitFor(() => publisher.inputs.length === 1, "approved recovery publication");
       await waitFor(
-        () => harness.runs.filter((run) => run.ctx.role === "reviewer").length === 1,
+        () => publisher.inputs.length === 1,
+        "approved recovery publication",
+      );
+      await waitFor(
+        () =>
+          harness.runs.filter((run) => run.ctx.role === "reviewer").length ===
+          1,
         "reviewer dispatch after approved recovery",
       );
 
       expect(await approvalStore.list()).toHaveLength(1);
-      await expect(approvalStore.findPendingForRun("run-1")).resolves.toBeNull();
+      await expect(
+        approvalStore.findPendingForRun("run-1"),
+      ).resolves.toBeNull();
       expect(publisher.inputs[0]).toMatchObject({
         workspacePath: path.join(root, "workspace"),
         branchName: "symphony/TEST-1",
         baseBranch: "main",
         evidenceCursor: "idem-1",
       });
-      expect(writer.comments.filter((comment) => comment.body.includes("## Symphony Completion Report"))).toHaveLength(1);
-      expect(writer.comments.filter((comment) => comment.body.includes("## Symphony Publication Approval Setup Incomplete"))).toHaveLength(1);
-      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Blocked", "In Review"]);
+      expect(
+        writer.comments.filter((comment) =>
+          comment.body.includes("## Symphony Completion Report"),
+        ),
+      ).toHaveLength(1);
+      expect(
+        writer.comments.filter((comment) =>
+          comment.body.includes(
+            "## Symphony Publication Approval Setup Incomplete",
+          ),
+        ),
+      ).toHaveLength(1);
+      expect(
+        writer.transitions.map((transition) => transition.toState),
+      ).toEqual(["Blocked", "In Review"]);
       expect(currentState).toBe("In Review");
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "review",
@@ -4751,8 +6385,12 @@ describe("Orchestrator", () => {
         prHeadSha: "abc123",
         prBranch: "symphony/TEST-1",
       });
-      expect((await runStore.getRun("run-1"))?.pendingApprovalRequestId ?? null).toBeNull();
-      expect(harness.runs.filter((run) => run.ctx.role === "worker")).toHaveLength(0);
+      expect(
+        (await runStore.getRun("run-1"))?.pendingApprovalRequestId ?? null,
+      ).toBeNull();
+      expect(
+        harness.runs.filter((run) => run.ctx.role === "worker"),
+      ).toHaveLength(0);
       expect(orchestrator.snapshot().counts.retrying).toBe(0);
     } finally {
       await orchestrator.stop();
@@ -4773,7 +6411,11 @@ describe("Orchestrator", () => {
     config.github.token = "github-token";
     config.github.operatorApproval!.requiredForPublication = true;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -4789,14 +6431,29 @@ describe("Orchestrator", () => {
     const stateDir = config.workspace.stateDir;
     const outboxStore = new FileWritebackOutboxStore(stateDir);
     const writer = new StateChangingWriter(() => undefined);
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const approvalStore = new FileOperatorApprovalStore(stateDir);
-    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    const operatorApproval = new OperatorApprovalService({
+      config,
+      store: approvalStore,
+      runStore,
+    });
     await startApprovalRun(runStore, candidate, "run-1", root);
-    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
-    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+    await runStore.updateRun("run-1", {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await lifecycleStore.ensureIssue(
+      candidate,
+      pendingApprovalLifecyclePatch(candidate, root, "run-1"),
+    );
     const { record } = await approvalStore.requestOrGetPending(
       {
         issueId: candidate.id,
@@ -4820,7 +6477,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness: new FakeHarness(),
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -4835,13 +6496,37 @@ describe("Orchestrator", () => {
       await orchestrator.refreshNow();
 
       expect(await approvalStore.list()).toHaveLength(1);
-      await expect(approvalStore.findPendingForRun("run-1")).resolves.toBeNull();
+      await expect(
+        approvalStore.findPendingForRun("run-1"),
+      ).resolves.toBeNull();
       expect(publisher.inputs).toEqual([]);
-      expect(writer.comments.filter((comment) => comment.body.includes("## Symphony Publication Approval Setup Incomplete"))).toHaveLength(1);
-      expect(writer.comments.filter((comment) => comment.body.includes("## Symphony Publication Approval Not Completed"))).toHaveLength(1);
-      expect(writer.comments.some((comment) => comment.body.includes("Status: accepted"))).toBe(false);
-      expect(writer.comments.some((comment) => comment.body.includes("Status: expired"))).toBe(true);
-      expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Blocked"]);
+      expect(
+        writer.comments.filter((comment) =>
+          comment.body.includes(
+            "## Symphony Publication Approval Setup Incomplete",
+          ),
+        ),
+      ).toHaveLength(1);
+      expect(
+        writer.comments.filter((comment) =>
+          comment.body.includes(
+            "## Symphony Publication Approval Not Completed",
+          ),
+        ),
+      ).toHaveLength(1);
+      expect(
+        writer.comments.some((comment) =>
+          comment.body.includes("Status: accepted"),
+        ),
+      ).toBe(false);
+      expect(
+        writer.comments.some((comment) =>
+          comment.body.includes("Status: expired"),
+        ),
+      ).toBe(true);
+      expect(
+        writer.transitions.map((transition) => transition.toState),
+      ).toEqual(["Blocked"]);
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "blocked",
         blockedReason: "publication approval expired",
@@ -4880,7 +6565,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
+    const lifecycleStore = new FileIssueLifecycleStore(
+      path.join(root, "state"),
+    );
     await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
       reviewRound: 3,
@@ -4888,7 +6575,11 @@ describe("Orchestrator", () => {
       blockedReason: "max review rounds reached (3/3)",
     });
     const harness = new BlockingHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -4901,7 +6592,10 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await orchestrator.refreshNow();
-    await waitFor(() => orchestrator.snapshot().running[0]?.runId !== null, "blocked lifecycle worker start");
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.runId !== null,
+      "blocked lifecycle worker start",
+    );
     const lifecycle = orchestrator.snapshot().running[0]?.lifecycle;
     await orchestrator.stop();
 
@@ -4920,7 +6614,10 @@ describe("Orchestrator", () => {
     config.writeback.mode = "live";
     config.writeback.dispatchState = "In Progress";
     config.reviewLoop.blockedStates = ["Blocked"];
-    const candidate = issue({ state: "Todo", updatedAt: "2026-01-01T01:00:00Z" });
+    const candidate = issue({
+      state: "Todo",
+      updatedAt: "2026-01-01T01:00:00Z",
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -4950,7 +6647,12 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
@@ -4959,7 +6661,11 @@ describe("Orchestrator", () => {
       blockedReason: "max review rounds reached (3/3)",
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -4973,9 +6679,18 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "worker dispatch after human Todo unblock");
-    await waitFor(() => writer.transitions.length === 1, "dispatch transition writeback");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "worker dispatch exit");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "worker dispatch after human Todo unblock",
+    );
+    await waitFor(
+      () => writer.transitions.length === 1,
+      "dispatch transition writeback",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "worker dispatch exit",
+    );
     await settleOrchestratorExit();
     await orchestrator.stop();
 
@@ -5006,7 +6721,11 @@ describe("Orchestrator", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -5025,7 +6744,12 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const publisher = new FakeCompletionReportPublisher({
@@ -5037,8 +6761,17 @@ describe("Orchestrator", () => {
       lastPushedAt: "2026-01-01T00:00:01Z",
       evidenceCursor: "idem-1",
     });
-    const harness = new ReportingHarness(lifecycleStore, outboxStore, runStore, publisher);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ReportingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+      publisher,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -5061,11 +6794,24 @@ describe("Orchestrator", () => {
       "report-run-1:run-started",
       "pull-request-handoff:pr-42:abc123",
     ]);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Human Review"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+      "Human Review",
+    ]);
     expect(currentState).toBe("Human Review");
-    expect(writer.comments[1]?.body).toContain("https://github.com/acme/symphony/pull/42");
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
-    expect(writer.comments.some((comment) => comment.body.includes("without an accepted completion report"))).toBe(false);
+    expect(writer.comments[1]?.body).toContain(
+      "https://github.com/acme/symphony/pull/42",
+    );
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-succeeded"),
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.body.includes("without an accepted completion report"),
+      ),
+    ).toBe(false);
     await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
       prUrl: "https://github.com/acme/symphony/pull/42",
       prNumber: 42,
@@ -5073,7 +6819,9 @@ describe("Orchestrator", () => {
       prBranch: "symphony/TEST-1",
       lastEvidenceCursor: "idem-1",
     });
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       phase: "review",
       incompleteTurnCount: 0,
       summaryPointers: {
@@ -5092,7 +6840,10 @@ describe("Orchestrator", () => {
     config.agent.maxTurns = 2;
     config.writeback.enabled = true;
     config.writeback.mode = "live";
-    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -5108,11 +6859,24 @@ describe("Orchestrator", () => {
     const stateDir = config.workspace.stateDir;
     const outboxStore = new FileWritebackOutboxStore(stateDir);
     const writer = new StateChangingWriter(() => undefined);
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
-    const harness = new RejectedCompletionReportHarness(lifecycleStore, outboxStore, runStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new RejectedCompletionReportHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -5126,29 +6890,61 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.prompts.length === 2, "worker continuation after rejected completion report");
-    await waitFor(() => writer.comments.some((comment) => comment.body.includes("Status: rejected")), "rejection comment");
+    await waitFor(
+      () => harness.prompts.length === 2,
+      "worker continuation after rejected completion report",
+    );
+    await waitFor(
+      () =>
+        writer.comments.some((comment) =>
+          comment.body.includes("Status: rejected"),
+        ),
+      "rejection comment",
+    );
     await orchestrator.stop();
 
-    const rejectionComment = writer.comments.find((comment) => comment.body.includes("Status: rejected"));
-    expect(rejectionComment?.dedupeKey).toBe("reject-run-1:completion-report:rejected-idem-1:rejected");
-    expect(rejectionComment?.body).toContain("Completion report cannot be accepted with unsatisfied acceptance checklist items");
-    expect(rejectionComment?.body).toContain("REQ-1 Required validation is complete.");
+    const rejectionComment = writer.comments.find((comment) =>
+      comment.body.includes("Status: rejected"),
+    );
+    expect(rejectionComment?.dedupeKey).toBe(
+      "reject-run-1:completion-report:rejected-idem-1:rejected",
+    );
+    expect(rejectionComment?.body).toContain(
+      "Completion report cannot be accepted with unsatisfied acceptance checklist items",
+    );
+    expect(rejectionComment?.body).toContain(
+      "REQ-1 Required validation is complete.",
+    );
     expect(harness.prompts[1]).toContain(
       "Next action: Fix the rejected completion report: satisfy every acceptance checklist item with durable evidence before submitting again.",
     );
     expect(harness.prompts[1]).toContain("Latest rejected completion report:");
-    expect(harness.prompts[1]).toContain("Reason: Completion report cannot be accepted with unsatisfied acceptance checklist items");
-    expect(harness.prompts[1]).toContain("REQ-1 Required validation is complete.");
+    expect(harness.prompts[1]).toContain(
+      "Reason: Completion report cannot be accepted with unsatisfied acceptance checklist items",
+    );
+    expect(harness.prompts[1]).toContain(
+      "REQ-1 Required validation is complete.",
+    );
     const lifecycle = await lifecycleStore.get(candidate.id);
     expect(lifecycle?.incompleteTurnCount).toBeGreaterThanOrEqual(1);
     expect(lifecycle).toMatchObject({
-      lastCompletionReportRejectionId: "completion-report-rejection:issue-1:rejected-idem-1",
+      lastCompletionReportRejectionId:
+        "completion-report-rejection:issue-1:rejected-idem-1",
     });
     const issueState = await readIssueState(stateDir, candidate.id);
-    const workerSnapshots = issueState?.history.filter((snapshot) => snapshot.transitionKind === "dispatch_worker") ?? [];
-    expect(workerSnapshots.every((snapshot) => snapshot.rulesetId !== "legacy.dispatch_worker")).toBe(true);
-    const rejectionSnapshot = issueState?.history.find((snapshot) => snapshot.transitionKind === "reconcile_completion_report_rejection");
+    const workerSnapshots =
+      issueState?.history.filter(
+        (snapshot) => snapshot.transitionKind === "dispatch_worker",
+      ) ?? [];
+    expect(
+      workerSnapshots.every(
+        (snapshot) => snapshot.rulesetId !== "legacy.dispatch_worker",
+      ),
+    ).toBe(true);
+    const rejectionSnapshot = issueState?.history.find(
+      (snapshot) =>
+        snapshot.transitionKind === "reconcile_completion_report_rejection",
+    );
     expect(rejectionSnapshot).toMatchObject({
       triggerType: "runtime.requested",
       triggerSource: "transition",
@@ -5166,15 +6962,27 @@ describe("Orchestrator", () => {
         },
       },
     });
-    expect(rejectionSnapshot?.actions.map((action) => action.actionType)).toEqual(
+    expect(
+      rejectionSnapshot?.actions.map((action) => action.actionType),
+    ).toEqual(
       expect.arrayContaining([
         "load_completion_report_rejection",
         "mark_completion_report_rejected",
         "process_completion_report_rejection_writebacks",
       ]),
     );
-    expect(workerSnapshots.some((snapshot) => snapshot.actions.some((action) => action.actionType === "reject_completion_report"))).toBe(false);
-    expect(issueState?.history.some((snapshot) => snapshot.transitionKind === "handoff_repair")).toBe(false);
+    expect(
+      workerSnapshots.some((snapshot) =>
+        snapshot.actions.some(
+          (action) => action.actionType === "reject_completion_report",
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      issueState?.history.some(
+        (snapshot) => snapshot.transitionKind === "handoff_repair",
+      ),
+    ).toBe(false);
   });
 
   it("[event-guard:failed] treats accepted completion reports as handoff when the harness fails after reporting", async () => {
@@ -5193,7 +7001,11 @@ describe("Orchestrator", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -5212,7 +7024,12 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const publisher = new FakeCompletionReportPublisher({
@@ -5224,11 +7041,21 @@ describe("Orchestrator", () => {
       lastPushedAt: "2026-01-01T00:00:01Z",
       evidenceCursor: "idem-1",
     });
-    const harness = new ReportingHarness(lifecycleStore, outboxStore, runStore, publisher, {
-      type: "failed",
-      error: "post-handoff harness failure",
+    const harness = new ReportingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+      publisher,
+      {
+        type: "failed",
+        error: "post-handoff harness failure",
+      },
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
     });
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -5251,12 +7078,31 @@ describe("Orchestrator", () => {
       "report-run-1:run-started",
       "pull-request-handoff:pr-42:abc123",
     ]);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Human Review"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+      "Human Review",
+    ]);
     expect(currentState).toBe("Human Review");
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-failed"))).toBe(false);
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-cancelled"))).toBe(false);
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
-    expect(writer.comments.some((comment) => comment.body.includes("without an accepted completion report"))).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-failed"),
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-cancelled"),
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-succeeded"),
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.body.includes("without an accepted completion report"),
+      ),
+    ).toBe(false);
     await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
       status: "succeeded",
       prUrl: "https://github.com/acme/symphony/pull/42",
@@ -5265,7 +7111,9 @@ describe("Orchestrator", () => {
       prBranch: "symphony/TEST-1",
       lastEvidenceCursor: "idem-1",
     });
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       phase: "review",
       incompleteTurnCount: 0,
       summaryPointers: {
@@ -5280,7 +7128,10 @@ describe("Orchestrator", () => {
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
     expect(eventTypes).toContain("handoff_terminal");
-    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+    expect(
+      transcript.events.find((event) => event.eventType === "handoff_terminal")
+        ?.payload,
+    ).toMatchObject({
       kind: "pull_request_handoff",
       status: "succeeded",
     });
@@ -5312,7 +7163,11 @@ describe("Orchestrator", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -5331,7 +7186,12 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const publisher = new FakeCompletionReportPublisher({
@@ -5343,10 +7203,20 @@ describe("Orchestrator", () => {
       lastPushedAt: "2026-01-01T00:00:01Z",
       evidenceCursor: "idem-1",
     });
-    const harness = new ReportingHarness(lifecycleStore, outboxStore, runStore, publisher, {
-      type: "cancelled",
+    const harness = new ReportingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+      publisher,
+      {
+        type: "cancelled",
+      },
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
     });
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -5369,12 +7239,31 @@ describe("Orchestrator", () => {
       "report-run-1:run-started",
       "pull-request-handoff:pr-42:abc123",
     ]);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Human Review"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+      "Human Review",
+    ]);
     expect(currentState).toBe("Human Review");
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-failed"))).toBe(false);
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-cancelled"))).toBe(false);
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
-    expect(writer.comments.some((comment) => comment.body.includes("without an accepted completion report"))).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-failed"),
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-cancelled"),
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-succeeded"),
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.body.includes("without an accepted completion report"),
+      ),
+    ).toBe(false);
     await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
       status: "succeeded",
       prUrl: "https://github.com/acme/symphony/pull/42",
@@ -5383,7 +7272,9 @@ describe("Orchestrator", () => {
       prBranch: "symphony/TEST-1",
       lastEvidenceCursor: "idem-1",
     });
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       phase: "review",
       incompleteTurnCount: 0,
       summaryPointers: {
@@ -5398,7 +7289,10 @@ describe("Orchestrator", () => {
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
     expect(eventTypes).toContain("handoff_terminal");
-    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+    expect(
+      transcript.events.find((event) => event.eventType === "handoff_terminal")
+        ?.payload,
+    ).toMatchObject({
       kind: "pull_request_handoff",
       status: "succeeded",
     });
@@ -5430,7 +7324,11 @@ describe("Orchestrator", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -5449,7 +7347,12 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const publisher = new FakeCompletionReportPublisher({
@@ -5461,8 +7364,18 @@ describe("Orchestrator", () => {
       lastPushedAt: "2026-01-01T00:00:01Z",
       evidenceCursor: "idem-1",
     });
-    const harness = new ReportingHarness(lifecycleStore, outboxStore, runStore, publisher, "throw");
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ReportingHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+      publisher,
+      "throw",
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -5485,12 +7398,31 @@ describe("Orchestrator", () => {
       "report-run-1:run-started",
       "pull-request-handoff:pr-42:abc123",
     ]);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress", "Human Review"]);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+      "Human Review",
+    ]);
     expect(currentState).toBe("Human Review");
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-failed"))).toBe(false);
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-cancelled"))).toBe(false);
-    expect(writer.comments.some((comment) => comment.dedupeKey.includes("run-succeeded"))).toBe(false);
-    expect(writer.comments.some((comment) => comment.body.includes("without an accepted completion report"))).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-failed"),
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-cancelled"),
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.dedupeKey.includes("run-succeeded"),
+      ),
+    ).toBe(false);
+    expect(
+      writer.comments.some((comment) =>
+        comment.body.includes("without an accepted completion report"),
+      ),
+    ).toBe(false);
     await expect(runStore.getRun("report-run-1")).resolves.toMatchObject({
       status: "succeeded",
       prUrl: "https://github.com/acme/symphony/pull/42",
@@ -5499,7 +7431,9 @@ describe("Orchestrator", () => {
       prBranch: "symphony/TEST-1",
       lastEvidenceCursor: "idem-1",
     });
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       phase: "review",
       incompleteTurnCount: 0,
       summaryPointers: {
@@ -5514,7 +7448,10 @@ describe("Orchestrator", () => {
     const eventTypes = transcript.events.map((event) => event.eventType);
     expect(eventTypes).toContain("session_started");
     expect(eventTypes).toContain("handoff_terminal");
-    expect(transcript.events.find((event) => event.eventType === "handoff_terminal")?.payload).toMatchObject({
+    expect(
+      transcript.events.find((event) => event.eventType === "handoff_terminal")
+        ?.payload,
+    ).toMatchObject({
       kind: "pull_request_handoff",
       status: "succeeded",
     });
@@ -5547,7 +7484,11 @@ describe("Orchestrator", () => {
     config.github.operatorApproval!.rejectPolicy = "fail";
     config.github.operatorApproval!.pollIntervalMs = 5;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -5566,11 +7507,20 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const approvalStore = new FileOperatorApprovalStore(stateDir);
-    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    const operatorApproval = new OperatorApprovalService({
+      config,
+      store: approvalStore,
+      runStore,
+    });
     const publisher = new FakeCompletionReportPublisher({
       action: "created",
       url: "https://github.com/acme/symphony/pull/42",
@@ -5589,7 +7539,11 @@ describe("Orchestrator", () => {
       operatorApproval,
       writeback,
     );
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -5614,7 +7568,10 @@ describe("Orchestrator", () => {
       error: OPERATOR_REJECTED_PUBLICATION_ERROR,
       pendingApprovalRequestId: null,
     });
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "approval-rejected worker exit");
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "approval-rejected worker exit",
+    );
 
     const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
@@ -5627,8 +7584,15 @@ describe("Orchestrator", () => {
     expect(finalRun?.cancellationSource ?? null).toBeNull();
     expect(finalRun?.cancellationOutcome ?? "none").toBe("none");
     expect(publisher.inputs).toEqual([]);
-    expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Setup Incomplete"))).toBe(true);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+    expect(
+      writer.comments.some((comment) =>
+        comment.body.includes("Publication Approval Setup Incomplete"),
+      ),
+    ).toBe(true);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "Todo",
+      "Blocked",
+    ]);
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
     await orchestrator.stop();
   });
@@ -5649,7 +7613,11 @@ describe("Orchestrator", () => {
     config.github.operatorApproval!.rejectPolicy = "cancel";
     config.github.operatorApproval!.pollIntervalMs = 5;
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -5668,11 +7636,20 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const approvalStore = new FileOperatorApprovalStore(stateDir);
-    const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+    const operatorApproval = new OperatorApprovalService({
+      config,
+      store: approvalStore,
+      runStore,
+    });
     const publisher = new FakeCompletionReportPublisher({
       action: "created",
       url: "https://github.com/acme/symphony/pull/42",
@@ -5691,7 +7668,11 @@ describe("Orchestrator", () => {
       operatorApproval,
       writeback,
     );
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -5706,12 +7687,22 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     const pending = await waitForPendingApproval(approvalStore, "report-run-1");
-    expect(writer.comments.some((comment) => comment.body.includes("Publication Approval Setup Incomplete"))).toBe(true);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
+    expect(
+      writer.comments.some((comment) =>
+        comment.body.includes("Publication Approval Setup Incomplete"),
+      ),
+    ).toBe(true);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "Todo",
+      "Blocked",
+    ]);
     const result = await operatorApproval.resolve(pending.requestId, "reject");
     await orchestrator.cancelIssue(candidate.id);
     await orchestrator.recordPublicationApprovalTerminal(result.request);
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "approval-rejected cancel-policy worker exit");
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "approval-rejected cancel-policy worker exit",
+    );
 
     const finalRun = await waitForTerminalRunRecord(runStore, "report-run-1");
     expect(finalRun).toMatchObject({
@@ -5720,10 +7711,24 @@ describe("Orchestrator", () => {
       pendingApprovalRequestId: null,
     });
     expect(publisher.inputs).toEqual([]);
-    expect(writer.comments.some((comment) => comment.body.includes("Status: rejected"))).toBe(true);
-    expect(writer.comments.some((comment) => comment.dedupeKey === "report-run-1:completion-report:idem-1")).toBe(false);
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Todo", "Blocked"]);
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    expect(
+      writer.comments.some((comment) =>
+        comment.body.includes("Status: rejected"),
+      ),
+    ).toBe(true);
+    expect(
+      writer.comments.some(
+        (comment) =>
+          comment.dedupeKey === "report-run-1:completion-report:idem-1",
+      ),
+    ).toBe(false);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "Todo",
+      "Blocked",
+    ]);
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       phase: "blocked",
       blockedReason: "publication approval rejected",
       incompleteTurnCount: 0,
@@ -5753,7 +7758,11 @@ describe("Orchestrator", () => {
     config.github.repo = "symphony";
     config.github.token = "github-token";
     config.workspace.source.baseRef = "main";
-    const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Blocked",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Blocked";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -5772,12 +7781,23 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     await startApprovalRun(runStore, candidate, "run-1", root);
-    await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
-    await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+    await runStore.updateRun("run-1", {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await lifecycleStore.ensureIssue(
+      candidate,
+      pendingApprovalLifecyclePatch(candidate, root, "run-1"),
+    );
     const publisher = new FakeCompletionReportPublisher({
       action: "created",
       url: "https://github.com/acme/symphony/pull/42",
@@ -5790,7 +7810,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness: new FakeHarness(),
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -5800,9 +7824,11 @@ describe("Orchestrator", () => {
       completionReportPublisher: publisher,
     });
 
-    await expect(orchestrator.resumeApprovedPublication(approvalRecordFor("approved", candidate, "run-1", root))).resolves.toBe(
-      true,
-    );
+    await expect(
+      orchestrator.resumeApprovedPublication(
+        approvalRecordFor("approved", candidate, "run-1", root),
+      ),
+    ).resolves.toBe(true);
 
     expect(publisher.inputs).toHaveLength(1);
     expect(publisher.inputs[0]).toMatchObject({
@@ -5814,7 +7840,9 @@ describe("Orchestrator", () => {
     expect(writer.comments).toHaveLength(1);
     expect(writer.comments[0]?.body).toContain("## Symphony Completion Report");
     expect(writer.comments[0]?.body).toContain("Status: accepted");
-    expect(writer.comments[0]?.body).not.toContain("Publication Approval Not Completed");
+    expect(writer.comments[0]?.body).not.toContain(
+      "Publication Approval Not Completed",
+    );
     expect(writer.transitions).toHaveLength(1);
     expect(writer.transitions[0]).toMatchObject({ toState: "In Review" });
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
@@ -5858,7 +7886,11 @@ describe("Orchestrator", () => {
       config.github.repo = "symphony";
       config.github.token = "github-token";
       config.workspace.source.baseRef = "main";
-      const candidate = issue({ state: "Blocked", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+      const candidate = issue({
+        state: "Blocked",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/TEST-1",
+      });
       const tracker: TrackerClient = {
         async fetchCandidateIssues() {
           return [];
@@ -5874,16 +7906,31 @@ describe("Orchestrator", () => {
       const stateDir = config.workspace.stateDir;
       const outboxStore = new FileWritebackOutboxStore(stateDir);
       const writer = new StateChangingWriter(() => undefined);
-      const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+      const writeback = new WritebackProcessor(
+        outboxStore,
+        writer,
+        logger,
+        300_000,
+      );
       const runStore = new FileRunTranscriptStore(stateDir);
       const lifecycleStore = new FileIssueLifecycleStore(stateDir);
       await startApprovalRun(runStore, candidate, "run-1", root);
-      await runStore.updateRun("run-1", { status: "succeeded", completedAt: "2026-01-01T00:00:00.000Z" });
-      await lifecycleStore.ensureIssue(candidate, pendingApprovalLifecyclePatch(candidate, root, "run-1"));
+      await runStore.updateRun("run-1", {
+        status: "succeeded",
+        completedAt: "2026-01-01T00:00:00.000Z",
+      });
+      await lifecycleStore.ensureIssue(
+        candidate,
+        pendingApprovalLifecyclePatch(candidate, root, "run-1"),
+      );
       const orchestrator = new Orchestrator({
         config,
         tracker,
-        workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+        workspaceManager: new WorkspaceManager({
+          workspace: config.workspace,
+          hooks: config.hooks,
+          logger,
+        }),
         harness: new FakeHarness(),
         logger,
         promptTemplate: "Work on {{ issue.identifier }}",
@@ -5891,16 +7938,30 @@ describe("Orchestrator", () => {
         runStore,
         writeback,
       });
-      const approval = approvalRecordFor(status, candidate, "run-1", root, staleReason);
+      const approval = approvalRecordFor(
+        status,
+        candidate,
+        "run-1",
+        root,
+        staleReason,
+      );
 
-      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
-      await expect(orchestrator.recordPublicationApprovalTerminal(approval)).resolves.toBe(true);
+      await expect(
+        orchestrator.recordPublicationApprovalTerminal(approval),
+      ).resolves.toBe(true);
+      await expect(
+        orchestrator.recordPublicationApprovalTerminal(approval),
+      ).resolves.toBe(true);
 
       expect(writer.comments).toHaveLength(1);
-      expect(writer.comments[0]?.body).toContain("## Symphony Publication Approval Not Completed");
+      expect(writer.comments[0]?.body).toContain(
+        "## Symphony Publication Approval Not Completed",
+      );
       expect(writer.comments[0]?.body).toContain(`Status: ${status}`);
       expect(writer.comments[0]?.body).toContain(`Reason: ${staleReason}`);
-      expect(writer.comments[0]?.body).toContain("The worker completion report remains stored");
+      expect(writer.comments[0]?.body).toContain(
+        "The worker completion report remains stored",
+      );
       expect(writer.transitions).toEqual([]);
       await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
         phase: "blocked",
@@ -5922,14 +7983,22 @@ describe("Orchestrator", () => {
     expect(config.continuationContext.searchEnabled).toBe(false);
     expect(config.continuationContext.summarizationEnabled).toBe(false);
 
-    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "Todo";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return ["Todo", "In Progress"].includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+        return ["Todo", "In Progress"].includes(currentState)
+          ? [{ ...candidate, state: currentState }]
+          : [];
       },
       async fetchIssuesByStates(states) {
-        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+        return states.includes(currentState)
+          ? [{ ...candidate, state: currentState }]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -5941,11 +8010,24 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
-    const harness = new ManufacturedReviewLoopHarness(lifecycleStore, outboxStore, runStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ManufacturedReviewLoopHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -5961,7 +8043,10 @@ describe("Orchestrator", () => {
     try {
       await orchestrator.refreshNow();
       await waitFor(
-        () => currentState === "In Review" && harness.runs.length === 1 && orchestrator.snapshot().counts.running === 0,
+        () =>
+          currentState === "In Review" &&
+          harness.runs.length === 1 &&
+          orchestrator.snapshot().counts.running === 0,
         "first worker handoff",
       );
       await runStore.appendEvent({
@@ -5975,21 +8060,30 @@ describe("Orchestrator", () => {
 
       await orchestrator.refreshNow();
       await waitFor(
-        () => currentState === "In Progress" && harness.runs.length === 2 && orchestrator.snapshot().counts.running === 0,
+        () =>
+          currentState === "In Progress" &&
+          harness.runs.length === 2 &&
+          orchestrator.snapshot().counts.running === 0,
         "reviewer fail handoff",
       );
       await settleOrchestratorExit();
 
       await orchestrator.refreshNow();
       await waitFor(
-        () => currentState === "In Review" && harness.runs.length === 3 && orchestrator.snapshot().counts.running === 0,
+        () =>
+          currentState === "In Review" &&
+          harness.runs.length === 3 &&
+          orchestrator.snapshot().counts.running === 0,
         "revision worker handoff",
       );
       await settleOrchestratorExit();
 
       await orchestrator.refreshNow();
       await waitFor(
-        () => currentState === "Ready to Merge" && harness.runs.length === 4 && orchestrator.snapshot().counts.running === 0,
+        () =>
+          currentState === "Ready to Merge" &&
+          harness.runs.length === 4 &&
+          orchestrator.snapshot().counts.running === 0,
         "reviewer pass handoff",
       );
     } finally {
@@ -6002,8 +8096,12 @@ describe("Orchestrator", () => {
       { role: "worker", runId: "smoke-worker-run-2" },
       { role: "reviewer", runId: "smoke-review-run-2" },
     ]);
-    expect(harness.runs[2]?.prompt).toContain("Reviewer gate findings to address");
-    expect(harness.runs[2]?.prompt).toContain("Add the manufactured smoke revision.");
+    expect(harness.runs[2]?.prompt).toContain(
+      "Reviewer gate findings to address",
+    );
+    expect(harness.runs[2]?.prompt).toContain(
+      "Add the manufactured smoke revision.",
+    );
     expect(harness.runs[2]?.prompt).not.toContain("RAW_TRANSCRIPT_SECRET");
     expect(harness.runs[2]?.prompt.length).toBeLessThan(12_000);
     expect(currentState).toBe("Ready to Merge");
@@ -6023,14 +8121,12 @@ describe("Orchestrator", () => {
       lastCompletionReportId: "completion-report:issue-1:smoke-report-2",
       lastReviewVerdictId: "review-verdict:issue-1:smoke-verdict-pass",
     });
-    expect(lifecycle?.completionReports.map((report) => report.idempotencyKey)).toEqual([
-      "smoke-report-1",
-      "smoke-report-2",
-    ]);
-    expect(lifecycle?.reviewVerdicts.map((verdict) => verdict.idempotencyKey)).toEqual([
-      "smoke-verdict-fail",
-      "smoke-verdict-pass",
-    ]);
+    expect(
+      lifecycle?.completionReports.map((report) => report.idempotencyKey),
+    ).toEqual(["smoke-report-1", "smoke-report-2"]);
+    expect(
+      lifecycle?.reviewVerdicts.map((verdict) => verdict.idempotencyKey),
+    ).toEqual(["smoke-verdict-fail", "smoke-verdict-pass"]);
     expect(lifecycle?.summaryPointers.workspacePath).toBeTruthy();
 
     const runs = await runStore.listRunsForIssue(candidate.identifier);
@@ -6047,14 +8143,20 @@ describe("Orchestrator", () => {
     for (const runId of runs.map((run) => run.runId)) {
       await expect(runStore.readTranscript(runId)).resolves.toMatchObject({
         runId,
-        events: expect.arrayContaining([expect.objectContaining({ eventType: "completed" })]),
+        events: expect.arrayContaining([
+          expect.objectContaining({ eventType: "completed" }),
+        ]),
       });
     }
-    await expect(runStore.readTranscript("smoke-worker-run-2")).resolves.toMatchObject({
+    await expect(
+      runStore.readTranscript("smoke-worker-run-2"),
+    ).resolves.toMatchObject({
       events: expect.arrayContaining([
         expect.objectContaining({
           eventType: "lane_memo_updated",
-          payload: expect.objectContaining({ memoSizeChars: expect.any(Number) }),
+          payload: expect.objectContaining({
+            memoSizeChars: expect.any(Number),
+          }),
         }),
       ]),
     });
@@ -6066,8 +8168,13 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewerPromptTemplate =
       "Review {{ issue.identifier }} as {{ role }}: {{ completionReport.summary }}\n{% for item in workspaceEvidence %}{{ item }}\n{% endfor %}{% for item in runDigest %}{{ item }}\n{% endfor %}";
-    config.reviewLoop.reviewerPromptExtensions = ["Custom project reviewer extension."];
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    config.reviewLoop.reviewerPromptExtensions = [
+      "Custom project reviewer extension.",
+    ];
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     const fetchedReviewStates: string[][] = [];
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -6122,7 +8229,11 @@ describe("Orchestrator", () => {
       message: "Implemented the reviewer dispatch lane.",
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -6138,18 +8249,34 @@ describe("Orchestrator", () => {
     await waitFor(() => harness.runs.length === 1, "reviewer dispatch");
     await orchestrator.stop();
 
-    expect(fetchedReviewStates).toEqual([expect.arrayContaining(["In Review"])]);
+    expect(fetchedReviewStates).toEqual([
+      expect.arrayContaining(["In Review"]),
+    ]);
     expect(harness.runs).toHaveLength(1);
     expect(harness.runs[0]?.ctx.role).toBe("reviewer");
     expect(harness.runs[0]?.prompt).toContain("Review TEST-1 as reviewer");
-    expect(harness.runs[0]?.prompt).toContain("Implemented the requested change.");
-    expect(harness.runs[0]?.prompt).toContain("Pull request: https://github.com/acme/symphony/pull/42");
-    expect(harness.runs[0]?.prompt).toContain("Implemented the reviewer dispatch lane.");
-    expect(harness.runs[0]?.prompt).not.toContain("Custom project reviewer extension.");
-    expect(harness.runs[0]?.prompt).not.toContain("General software review matrix:");
+    expect(harness.runs[0]?.prompt).toContain(
+      "Implemented the requested change.",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "Pull request: https://github.com/acme/symphony/pull/42",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "Implemented the reviewer dispatch lane.",
+    );
+    expect(harness.runs[0]?.prompt).not.toContain(
+      "Custom project reviewer extension.",
+    );
+    expect(harness.runs[0]?.prompt).not.toContain(
+      "General software review matrix:",
+    );
     const runs = await runStore.listRunsForIssue(candidate.identifier);
-    expect(runs.find((run) => run.runId === "fake-issue-1-1")).toMatchObject({ role: "reviewer" });
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 0 });
+    expect(runs.find((run) => run.runId === "fake-issue-1-1")).toMatchObject({
+      role: "reviewer",
+    });
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({ reviewRound: 0 });
   });
 
   it("allows reviewer dispatch for worker-scoped excluded labels", async () => {
@@ -6159,7 +8286,11 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
     config.agent.requireLabels = ["dogfood-ready"];
     config.agent.workerExcludeLabels = ["review_only"];
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1", labels: ["dogfood-ready", "review_only"] });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+      labels: ["dogfood-ready", "review_only"],
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -6172,7 +8303,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const report = completionReportRecord(candidate);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "review",
@@ -6183,7 +8316,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -6192,7 +8329,10 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "review_only reviewer dispatch");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "review_only reviewer dispatch",
+    );
     await orchestrator.stop();
 
     expect(harness.runs[0]?.ctx.role).toBe("reviewer");
@@ -6205,7 +8345,11 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
     config.agent.requireLabels = ["dogfood-ready"];
     config.agent.reviewerExcludeLabels = ["no-agent-review"];
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1", labels: ["dogfood-ready", "no-agent-review"] });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+      labels: ["dogfood-ready", "no-agent-review"],
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -6218,7 +8362,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const report = completionReportRecord(candidate);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "review",
@@ -6229,7 +8375,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -6252,7 +8402,10 @@ describe("Orchestrator", () => {
       "Check project-specific billing boundaries.",
       "Keep {{ issue.identifier }} literal and {{ missing.value }} literal.",
     ];
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -6282,7 +8435,11 @@ describe("Orchestrator", () => {
       },
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -6301,23 +8458,37 @@ describe("Orchestrator", () => {
     const prompt = harness.runs[0]?.prompt ?? "";
     expect(prompt).toContain("submit_pull_request_review_feedback");
     expect(prompt).toContain("submit_review_verdict.evidence");
-    expect(prompt.indexOf("submit_pull_request_review_feedback")).toBeLessThan(prompt.indexOf("submit_review_verdict"));
+    expect(prompt.indexOf("submit_pull_request_review_feedback")).toBeLessThan(
+      prompt.indexOf("submit_review_verdict"),
+    );
     expect(prompt).toContain('event "APPROVE"');
     expect(prompt).toContain('event "REQUEST_CHANGES"');
-    expect(prompt).toContain("These supplemental comments do not satisfy pass approval");
-    expect(prompt).not.toContain('event "REQUEST_CHANGES", "COMMENT", or "APPROVE"');
-    expect(prompt).toContain("PR number, repository, token, or commit identity");
+    expect(prompt).toContain(
+      "These supplemental comments do not satisfy pass approval",
+    );
+    expect(prompt).not.toContain(
+      'event "REQUEST_CHANGES", "COMMENT", or "APPROVE"',
+    );
+    expect(prompt).toContain(
+      "PR number, repository, token, or commit identity",
+    );
     expect(prompt).toContain("Symphony service-owned review feedback workflow");
     expect(prompt).toContain("Do not run gh pr review");
     expect(prompt).toContain("direct GitHub API/curl writes");
-    expect(prompt).toContain("Before any fail verdict, classify every concern as either a gate finding or a discovery finding");
+    expect(prompt).toContain(
+      "Before any fail verdict, classify every concern as either a gate finding or a discovery finding",
+    );
     expect(prompt).toContain("Gate findings must be contract-entitled");
-    expect(prompt).toContain("Discovery findings are valuable backlog/decomposition evidence");
+    expect(prompt).toContain(
+      "Discovery findings are valuable backlog/decomposition evidence",
+    );
     expect(prompt).toContain("General software review matrix:");
     expect(prompt).toContain("Persistence/durability");
     expect(prompt).toContain("Project-specific reviewer extensions:");
     expect(prompt).toContain("Check project-specific billing boundaries.");
-    expect(prompt).toContain("Keep {{ issue.identifier }} literal and {{ missing.value }} literal.");
+    expect(prompt).toContain(
+      "Keep {{ issue.identifier }} literal and {{ missing.value }} literal.",
+    );
     expect(prompt).not.toContain("Keep TEST-1 literal");
     expect(prompt.indexOf("General software review matrix:")).toBeLessThan(
       prompt.indexOf("Project-specific reviewer extensions:"),
@@ -6334,7 +8505,10 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
     config.writeback.enabled = true;
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -6373,11 +8547,19 @@ describe("Orchestrator", () => {
       repoPath: root,
       baseRef: "main",
     });
-    const harness = new MissingReviewVerdictThenRepairHarness(lifecycleStore, outboxStore, runStore);
+    const harness = new MissingReviewVerdictThenRepairHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -6386,10 +8568,18 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "review handoff repair dispatch");
+    await waitFor(
+      () => harness.runs.length === 2,
+      "review handoff repair dispatch",
+    );
     await orchestrator.stop();
 
-    expect(harness.runs.map((run) => [run.runId, run.ctx.handoffRepair?.kind ?? null])).toEqual([
+    expect(
+      harness.runs.map((run) => [
+        run.runId,
+        run.ctx.handoffRepair?.kind ?? null,
+      ]),
+    ).toEqual([
       ["review-source-run-1", null],
       ["review-repair-run-1", "review_verdict"],
     ]);
@@ -6399,7 +8589,9 @@ describe("Orchestrator", () => {
       profileKey: "review-source-profile",
       sessionKey: "review-source-session-key",
     });
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       lastReviewVerdictId: "review-verdict:issue-1:review-repair-verdict",
       reviewVerdicts: [
         {
@@ -6408,16 +8600,20 @@ describe("Orchestrator", () => {
         },
       ],
     });
-    await expect(runStore.getRun("review-repair-run-1")).resolves.toMatchObject({
-      status: "succeeded",
-      handoffRepairSourceRunId: "review-source-run-1",
-      handoffRepairKind: "review_verdict",
-      handoffRepairAttempt: 1,
-      hermesResumeSourceRunId: "review-source-run-1",
-      hermesResumeReason: "handoff_repair",
-    });
+    await expect(runStore.getRun("review-repair-run-1")).resolves.toMatchObject(
+      {
+        status: "succeeded",
+        handoffRepairSourceRunId: "review-source-run-1",
+        handoffRepairKind: "review_verdict",
+        handoffRepairAttempt: 1,
+        hermesResumeSourceRunId: "review-source-run-1",
+        hermesResumeReason: "handoff_repair",
+      },
+    );
     const issueState = await readIssueState(stateDir, candidate.id);
-    const repairSnapshot = issueState?.history.find((snapshot) => snapshot.transitionKind === "handoff_repair");
+    const repairSnapshot = issueState?.history.find(
+      (snapshot) => snapshot.transitionKind === "handoff_repair",
+    );
     expect(repairSnapshot).toMatchObject({
       triggerType: "runtime.requested",
       triggerSource: "transition",
@@ -6459,9 +8655,15 @@ describe("Orchestrator", () => {
         "reconcile_handoff_repair_result",
       ]),
     );
-    expect(repairSnapshot?.actions.some((action) => action.actionType === "start_agent_run")).toBe(false);
+    expect(
+      repairSnapshot?.actions.some(
+        (action) => action.actionType === "start_agent_run",
+      ),
+    ).toBe(false);
     const verdictSnapshot = issueState?.history.find(
-      (snapshot) => snapshot.transitionKind === "reconcile_review_verdict_handoff" && snapshot.runId === "review-repair-run-1",
+      (snapshot) =>
+        snapshot.transitionKind === "reconcile_review_verdict_handoff" &&
+        snapshot.runId === "review-repair-run-1",
     );
     expect(verdictSnapshot).toMatchObject({
       triggerType: "runtime.requested",
@@ -6499,7 +8701,10 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
     config.writeback.enabled = true;
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -6538,13 +8743,22 @@ describe("Orchestrator", () => {
       repoPath: root,
       baseRef: "main",
     });
-    const harness = new MissingReviewVerdictThenRepairHarness(lifecycleStore, outboxStore, runStore, {
-      writeSourceResumeMetadata: false,
-    });
+    const harness = new MissingReviewVerdictThenRepairHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+      {
+        writeSourceResumeMetadata: false,
+      },
+    );
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -6553,18 +8767,31 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "non-resumable review source run");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "non-resumable review run exit");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "non-resumable review source run",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "non-resumable review run exit",
+    );
     await orchestrator.stop();
 
-    expect(harness.runs.map((run) => [run.runId, run.ctx.handoffRepair?.kind ?? null])).toEqual([
-      ["review-source-run-1", null],
-    ]);
+    expect(
+      harness.runs.map((run) => [
+        run.runId,
+        run.ctx.handoffRepair?.kind ?? null,
+      ]),
+    ).toEqual([["review-source-run-1", null]]);
     const sourceRun = await runStore.getRun("review-source-run-1");
     expect(sourceRun?.hermesProfileKey ?? null).toBeNull();
     expect(sourceRun?.hermesSessionKey ?? null).toBeNull();
     const issueState = await readIssueState(stateDir, candidate.id);
-    expect(issueState?.history.some((snapshot) => snapshot.transitionKind === "handoff_repair")).toBe(false);
+    expect(
+      issueState?.history.some(
+        (snapshot) => snapshot.transitionKind === "handoff_repair",
+      ),
+    ).toBe(false);
   });
 
   it("skips handoff repair when the configured attempt budget is exhausted", async () => {
@@ -6576,7 +8803,10 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
     config.writeback.enabled = true;
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -6638,11 +8868,19 @@ describe("Orchestrator", () => {
         handoffRepairAttempt: 1,
       },
     });
-    const harness = new MissingReviewVerdictThenRepairHarness(lifecycleStore, outboxStore, runStore);
+    const harness = new MissingReviewVerdictThenRepairHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+    );
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -6651,15 +8889,28 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "review source run with exhausted repair budget");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "exhausted-budget review run exit");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "review source run with exhausted repair budget",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "exhausted-budget review run exit",
+    );
     await orchestrator.stop();
 
-    expect(harness.runs.map((run) => [run.runId, run.ctx.handoffRepair?.kind ?? null])).toEqual([
-      ["review-source-run-1", null],
-    ]);
+    expect(
+      harness.runs.map((run) => [
+        run.runId,
+        run.ctx.handoffRepair?.kind ?? null,
+      ]),
+    ).toEqual([["review-source-run-1", null]]);
     const issueState = await readIssueState(stateDir, candidate.id);
-    expect(issueState?.history.some((snapshot) => snapshot.transitionKind === "handoff_repair")).toBe(false);
+    expect(
+      issueState?.history.some(
+        (snapshot) => snapshot.transitionKind === "handoff_repair",
+      ),
+    ).toBe(false);
   });
 
   it("records a domain transition error when handoff repair completes without the required handoff", async () => {
@@ -6670,7 +8921,10 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
     config.writeback.enabled = true;
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -6709,13 +8963,22 @@ describe("Orchestrator", () => {
       repoPath: root,
       baseRef: "main",
     });
-    const harness = new MissingReviewVerdictThenRepairHarness(lifecycleStore, outboxStore, runStore, {
-      submitRepairVerdict: false,
-    });
+    const harness = new MissingReviewVerdictThenRepairHarness(
+      lifecycleStore,
+      outboxStore,
+      runStore,
+      {
+        submitRepairVerdict: false,
+      },
+    );
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -6724,26 +8987,40 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "review handoff repair without handoff dispatch");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "failed repair run exit");
+    await waitFor(
+      () => harness.runs.length === 2,
+      "review handoff repair without handoff dispatch",
+    );
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "failed repair run exit",
+    );
     await orchestrator.stop();
 
     const issueState = await readIssueState(stateDir, candidate.id);
-    const repairSnapshot = issueState?.history.find((snapshot) => snapshot.transitionKind === "handoff_repair");
-    const failedAction = repairSnapshot?.actions.find((action) => action.actionType === "reconcile_handoff_repair_result");
+    const repairSnapshot = issueState?.history.find(
+      (snapshot) => snapshot.transitionKind === "handoff_repair",
+    );
+    const failedAction = repairSnapshot?.actions.find(
+      (action) => action.actionType === "reconcile_handoff_repair_result",
+    );
     expect(failedAction).toMatchObject({
       status: "failed",
-      message: "MCP handoff repair finished without required review verdict handoff",
+      message:
+        "MCP handoff repair finished without required review verdict handoff",
     });
     expect(repairSnapshot?.errors).toEqual([
       expect.objectContaining({
         errorType: "domain",
         actionId: failedAction?.actionId,
         code: "conflict",
-        message: "MCP handoff repair finished without required review verdict handoff",
+        message:
+          "MCP handoff repair finished without required review verdict handoff",
       }),
     ]);
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       lastReviewVerdictId: null,
       reviewVerdicts: [],
     });
@@ -6756,7 +9033,10 @@ describe("Orchestrator", () => {
     config.mergePolicy.conflictsState = "Merge Conflicts";
     config.hermes.workerSessionLifecycle = "reuse_by_issue";
     config.hermes.mergeConflictSessionReuse = "implementation_worker";
-    const candidate = issue({ state: "Merge Conflicts", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Merge Conflicts",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -6769,7 +9049,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const report = completionReportRecord(candidate);
     await lifecycleStore.ensureIssue(candidate, {
@@ -6801,7 +9083,11 @@ describe("Orchestrator", () => {
       completedAt: "2026-01-01T00:00:02.000Z",
       metadata: {
         hermesProfileKey: "implementation-profile",
-        hermesProfileDir: path.join(config.hermes.stateDir, "profiles", "implementation-profile"),
+        hermesProfileDir: path.join(
+          config.hermes.stateDir,
+          "profiles",
+          "implementation-profile",
+        ),
         hermesSessionKey: "implementation-session-key",
       },
     });
@@ -6809,7 +9095,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -6818,7 +9108,10 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "merge conflict repair dispatch");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "merge conflict repair dispatch",
+    );
     await orchestrator.stop();
 
     expect(harness.runs[0]?.ctx.runPhase).toBe("merge_conflict_resolution");
@@ -6828,27 +9121,36 @@ describe("Orchestrator", () => {
       profileKey: "implementation-profile",
       sessionKey: "implementation-session-key",
     });
-    expect(harness.runs[0]?.prompt).toContain("submit_merge_conflict_resolution");
+    expect(harness.runs[0]?.prompt).toContain(
+      "submit_merge_conflict_resolution",
+    );
   });
 
   it("does not dispatch conflict-state workers without merge-conflict lifecycle metadata", async () => {
     const config = testConfig(root);
     config.mergePolicy.mode = "gated";
     config.mergePolicy.conflictsState = "Merge Conflicts";
-    const candidate = issue({ state: "Merge Conflicts", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Merge Conflicts",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
       },
       async fetchIssuesByStates(states) {
-        return states.length === 1 && states.includes("Merge Conflicts") ? [candidate] : [];
+        return states.length === 1 && states.includes("Merge Conflicts")
+          ? [candidate]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [candidate];
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "merge_conflict_resolution",
@@ -6857,7 +9159,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -6875,7 +9181,10 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.mergePolicy.mode = "gated";
     config.mergePolicy.conflictsState = "Merge Conflicts";
-    const candidate = issue({ state: "Merge Conflicts", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Merge Conflicts",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -6888,7 +9197,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "merge_conflict_resolution",
@@ -6898,7 +9209,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -6907,7 +9222,10 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "single merge conflict repair dispatch");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "single merge conflict repair dispatch",
+    );
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(1);
@@ -6918,7 +9236,10 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.mergePolicy.mode = "gated";
     config.mergePolicy.conflictsState = "Merge Conflicts";
-    const candidate = issue({ state: "Merge Conflicts", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "Merge Conflicts",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
@@ -6931,7 +9252,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const conflict: IssueMergeConflictMetadata = {
       ...openMergeConflict(candidate),
@@ -6942,7 +9265,8 @@ describe("Orchestrator", () => {
       lastConflictFixRunId: "conflict-run-3",
       attemptRunIds: ["conflict-run-1", "conflict-run-2", "conflict-run-3"],
       blockedAt: "2026-01-01T00:00:04.000Z",
-      blockedReason: "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
+      blockedReason:
+        "merge conflicts remain unresolved (3/3 conflict-fix attempts)",
     };
     await lifecycleStore.ensureIssue(candidate, {
       phase: "blocked",
@@ -6953,7 +9277,11 @@ describe("Orchestrator", () => {
     const orchestrator = new Orchestrator({
       config,
       tracker,
-      workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
       harness,
       logger,
       promptTemplate: "Work on {{ issue.identifier }}",
@@ -6962,7 +9290,10 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "conflict repair dispatch after operator resume");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "conflict repair dispatch after operator resume",
+    );
     await orchestrator.stop();
 
     expect(harness.runs[0]?.runPhase).toBe("merge_conflict_resolution");
@@ -6988,14 +9319,19 @@ describe("Orchestrator", () => {
     config.tracker.handoffStates = ["In Review"];
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "In Review";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
       async fetchIssuesByStates(states) {
-        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+        return states.includes(currentState)
+          ? [{ ...candidate, state: currentState }]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -7007,7 +9343,12 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const runStore = new FileRunTranscriptStore(stateDir);
     const report = completionReportRecord(candidate);
@@ -7038,8 +9379,16 @@ describe("Orchestrator", () => {
       repoPath: root,
       baseRef: "main",
     });
-    const harness = new ReviewVerdictSubmittingHarness("fail", lifecycleStore, outboxStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ReviewVerdictSubmittingHarness(
+      "fail",
+      lifecycleStore,
+      outboxStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7053,16 +9402,25 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "review fail verdict dispatch");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "review fail verdict dispatch",
+    );
     await orchestrator.stop();
 
     expect(harness.runs).toEqual([{ role: "reviewer", runId: "review-run-1" }]);
     expect(currentState).toBe("In Progress");
-    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual(["review-run-1:review-verdict-fail"]);
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
+      "review-run-1:review-verdict-fail",
+    ]);
     expect(writer.comments[0]?.body).toContain("Symphony review failed");
     expect(writer.comments[0]?.body).toContain("Add reviewer MCP integration.");
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "In Progress",
+    ]);
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       phase: "implementation",
       reviewRound: 1,
       lastReviewVerdictId: "review-verdict:issue-1:review-verdict-fail-1",
@@ -7078,14 +9436,19 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewPassState = "Ready to Merge";
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
-    const candidate = issue({ state: "In Review", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "In Review";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
       async fetchIssuesByStates(states) {
-        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+        return states.includes(currentState)
+          ? [{ ...candidate, state: currentState }]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -7097,7 +9460,12 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const runStore = new FileRunTranscriptStore(stateDir);
     const report = completionReportRecord(candidate);
@@ -7106,8 +9474,16 @@ describe("Orchestrator", () => {
       lastCompletionReportId: report.id,
       completionReports: [report],
     });
-    const harness = new ReviewVerdictSubmittingHarness("pass", lifecycleStore, outboxStore);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const harness = new ReviewVerdictSubmittingHarness(
+      "pass",
+      lifecycleStore,
+      outboxStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7121,15 +9497,24 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "review pass verdict dispatch");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "review pass verdict dispatch",
+    );
     await orchestrator.stop();
 
     expect(harness.runs).toEqual([{ role: "reviewer", runId: "review-run-1" }]);
     expect(currentState).toBe("Ready to Merge");
-    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual(["review-run-1:review-verdict-pass"]);
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toEqual([
+      "review-run-1:review-verdict-pass",
+    ]);
     expect(writer.comments[0]?.body).toContain("Symphony review passed");
-    expect(writer.transitions.map((transition) => transition.toState)).toEqual(["Ready to Merge"]);
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "Ready to Merge",
+    ]);
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       phase: "passed",
       reviewRound: 0,
       lastReviewVerdictId: "review-verdict:issue-1:review-verdict-pass-1",
@@ -7153,7 +9538,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7190,7 +9579,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7227,7 +9620,9 @@ describe("Orchestrator", () => {
       },
     };
     const logger = new StructuredLogger(() => undefined);
-    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
+    const lifecycleStore = new FileIssueLifecycleStore(
+      path.join(root, "state"),
+    );
     const report = completionReportRecord(candidate);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "review",
@@ -7235,7 +9630,11 @@ describe("Orchestrator", () => {
       completionReports: [report],
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7269,7 +9668,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7308,7 +9711,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new BlockingHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7342,7 +9749,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new BlockingHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7353,14 +9764,25 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-123", "blocking run start");
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.runId === "run-123",
+      "blocking run start",
+    );
     currentState = config.tracker.terminalStates[0] ?? "Done";
     await orchestrator.refreshNow();
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "state-change termination");
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "state-change termination",
+    );
     await orchestrator.stop();
 
-    const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
-    const termination = issueState?.history.find((snapshot) => snapshot.transitionKind === "terminate_running");
+    const issueState = await readIssueState(
+      config.workspace.stateDir,
+      candidate.id,
+    );
+    const termination = issueState?.history.find(
+      (snapshot) => snapshot.transitionKind === "terminate_running",
+    );
     expect(termination).toMatchObject({
       triggerType: "orchestrator.tick",
       candidateSource: "running_reconciliation",
@@ -7395,9 +9817,18 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new BlockingHarness();
-    const lifecycleStore = new FileIssueLifecycleStore(path.join(root, "state"));
-    await lifecycleStore.ensureIssue(candidate, { reviewRound: 1, incompleteTurnCount: 2 });
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const lifecycleStore = new FileIssueLifecycleStore(
+      path.join(root, "state"),
+    );
+    await lifecycleStore.ensureIssue(candidate, {
+      reviewRound: 1,
+      incompleteTurnCount: 2,
+    });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7430,7 +9861,9 @@ describe("Orchestrator", () => {
         lastRunId: "run-123",
       },
     });
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       reviewRound: 1,
       incompleteTurnCount: 2,
     });
@@ -7462,7 +9895,11 @@ describe("Orchestrator", () => {
       headSha: "abc123",
       lastPushedAt: "2026-01-01T00:01:00Z",
     });
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7483,14 +9920,19 @@ describe("Orchestrator", () => {
     const transcript = await runStore.readTranscript(run?.runId ?? "");
     const lifecycle = await lifecycleStore.get(candidate.identifier);
 
-    expect(pullRequestClient.branches).toEqual(["symphony/TEST-1", "symphony/TEST-1"]);
+    expect(pullRequestClient.branches).toEqual([
+      "symphony/TEST-1",
+      "symphony/TEST-1",
+    ]);
     expect(run).toMatchObject({
       prUrl: "https://github.com/octo-org/symphony/pull/12",
       prNumber: 12,
       lastPushedAt: "2026-01-01T00:01:00Z",
       gitBranchName: "symphony/TEST-1",
     });
-    expect(transcript.events.filter((event) => event.eventType === "pr_opened")).toHaveLength(1);
+    expect(
+      transcript.events.filter((event) => event.eventType === "pr_opened"),
+    ).toHaveLength(1);
     expect(lifecycle?.summaryPointers).toMatchObject({
       prUrl: "https://github.com/octo-org/symphony/pull/12",
       prNumber: 12,
@@ -7503,7 +9945,10 @@ describe("Orchestrator", () => {
   it("lazy-resolves worker GitHub discovery credentials when no discovery client override is injected", async () => {
     const config = githubProfileConfig(root, {
       profiles: {
-        discovery: { value: "$GITHUB_DISCOVERY_TOKEN", capabilities: ["github.discovery"] },
+        discovery: {
+          value: "$GITHUB_DISCOVERY_TOKEN",
+          capabilities: ["github.discovery"],
+        },
       },
       roles: {
         worker: {
@@ -7528,7 +9973,11 @@ describe("Orchestrator", () => {
     };
     const authorizations: string[] = [];
     vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
-      authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
+      authorizations.push(
+        String(
+          (init?.headers as Record<string, string> | undefined)?.authorization,
+        ),
+      );
       const url = new URL(String(input));
       expect(url.pathname).toBe("/repos/acme/symphony/pulls");
       return new Response(
@@ -7536,7 +9985,11 @@ describe("Orchestrator", () => {
           {
             html_url: "https://github.com/acme/symphony/pull/42",
             number: 42,
-            head: { ref: "symphony/TEST-1", sha: "abc123", repo: { pushed_at: "2026-01-01T00:00:01Z" } },
+            head: {
+              ref: "symphony/TEST-1",
+              sha: "abc123",
+              repo: { pushed_at: "2026-01-01T00:00:01Z" },
+            },
           },
         ]),
         { status: 200, headers: { "content-type": "application/json" } },
@@ -7544,7 +9997,11 @@ describe("Orchestrator", () => {
     });
     const logger = new StructuredLogger(() => undefined);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7558,13 +10015,18 @@ describe("Orchestrator", () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     await orchestrator.stop();
 
-    expect(authorizations).toEqual(["Bearer discovery-secret", "Bearer discovery-secret"]);
+    expect(authorizations).toEqual([
+      "Bearer discovery-secret",
+      "Bearer discovery-secret",
+    ]);
   });
 
   it("injects PR review evidence into the next worker prompt after requested changes", async () => {
     const config = testConfig(root);
     config.reviewLoop.continuationHistoryThreshold = 5;
-    config.reviewLoop.workerPromptExtensions = ["Check project-specific publication replay."];
+    config.reviewLoop.workerPromptExtensions = [
+      "Check project-specific publication replay.",
+    ];
     const candidate = issue({ state: "In Progress", branchName: null });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -7651,7 +10113,11 @@ describe("Orchestrator", () => {
       },
     ]);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7671,17 +10137,35 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Review-cycle hardening:");
     expect(harness.runs[0]?.prompt).toContain("underlying contract invariant");
-    expect(harness.runs[0]?.prompt).toContain("General software change matrix:");
-    expect(harness.runs[0]?.prompt).toContain("Project-specific worker extensions:");
-    expect(harness.runs[0]?.prompt).toContain("Check project-specific publication replay.");
+    expect(harness.runs[0]?.prompt).toContain(
+      "General software change matrix:",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "Project-specific worker extensions:",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "Check project-specific publication replay.",
+    );
     expect(harness.runs[0]?.prompt).toContain("PR review feedback to address");
-    expect(harness.runs[0]?.prompt).toContain("Compact Symphony handoff packet:");
-    expect(harness.runs[0]?.prompt).toContain("Active unresolved PR review evidence:");
-    expect(harness.runs[0]?.prompt).toContain("Reviewer verdict: fail / requested changes");
-    expect(harness.runs[0]?.prompt).toContain("src/core/review/PullRequestReviewEvidenceService.ts:72");
+    expect(harness.runs[0]?.prompt).toContain(
+      "Compact Symphony handoff packet:",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "Active unresolved PR review evidence:",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "Reviewer verdict: fail / requested changes",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "src/core/review/PullRequestReviewEvidenceService.ts:72",
+    );
     expect(harness.runs[0]?.prompt).toContain("thread: thread-1");
-    expect(harness.runs[0]?.prompt).toContain("Add coverage for the dedupe path.");
-    expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42");
+    expect(harness.runs[0]?.prompt).toContain(
+      "Add coverage for the dedupe path.",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "https://github.com/acme/symphony/pull/42",
+    );
     expect(harness.runs[0]?.prompt).not.toContain("linear-linkback");
     expect(harness.runs[0]?.prompt).not.toContain("Linear linkback");
   });
@@ -7768,7 +10252,11 @@ describe("Orchestrator", () => {
       },
     ]);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7787,17 +10275,25 @@ describe("Orchestrator", () => {
     const prompt = harness.runs[0]?.prompt ?? "";
     expect(pullRequestReviewClient.calls).toEqual([42]);
     expect(prompt).toContain("Work on TEST-1");
-    expect(prompt).not.toContain("PR review feedback to address before submitting another completion report:");
-    expect(prompt).not.toContain("Reviewer gate findings to address before submitting another completion report:");
+    expect(prompt).not.toContain(
+      "PR review feedback to address before submitting another completion report:",
+    );
+    expect(prompt).not.toContain(
+      "Reviewer gate findings to address before submitting another completion report:",
+    );
     expect(prompt).not.toContain("Reviewer verdict: fail / requested changes");
     expect(prompt).not.toContain("linear-linkback");
     expect(prompt).not.toContain("Linear linkback");
     expect(prompt).not.toContain("<!-- linear-review-link -->");
-    expect(prompt).not.toContain("Address active unresolved PR review evidence before submitting another completion report.");
+    expect(prompt).not.toContain(
+      "Address active unresolved PR review evidence before submitting another completion report.",
+    );
     if (prompt.includes("Compact Symphony handoff packet:")) {
       expect(prompt).toContain("Active unresolved PR review evidence:\n- None");
     }
-    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+    await expect(
+      lifecycleStore.get(candidate.identifier),
+    ).resolves.toMatchObject({
       reviewEvidence: {
         lastIngestedCursor: null,
         items: [],
@@ -7848,7 +10344,9 @@ describe("Orchestrator", () => {
       const url = new URL(String(input));
       calls.push({
         pathname: url.pathname,
-        authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+        authorization: String(
+          (init?.headers as Record<string, string> | undefined)?.authorization,
+        ),
       });
       if (url.pathname === "/graphql") {
         return jsonResponse({
@@ -7868,7 +10366,8 @@ describe("Orchestrator", () => {
         return jsonResponse([
           {
             id: 1001,
-            html_url: "https://github.com/acme/symphony/pull/42#pullrequestreview-1001",
+            html_url:
+              "https://github.com/acme/symphony/pull/42#pullrequestreview-1001",
             state: "CHANGES_REQUESTED",
             body: "Please address the reviewer-owned evidence path.",
             user: { login: "reviewer-a" },
@@ -7880,7 +10379,11 @@ describe("Orchestrator", () => {
       return jsonResponse([]);
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7902,12 +10405,17 @@ describe("Orchestrator", () => {
       "Bearer review-read-secret",
     ]);
     expect(harness.runs[0]?.prompt).toContain("PR review feedback to address");
-    expect(harness.runs[0]?.prompt).toContain("Please address the reviewer-owned evidence path.");
+    expect(harness.runs[0]?.prompt).toContain(
+      "Please address the reviewer-owned evidence path.",
+    );
   });
 
   it("injects the latest fail verdict findings and workspace context into the next worker prompt", async () => {
     const config = testConfig(root);
-    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -7939,7 +10447,11 @@ describe("Orchestrator", () => {
       },
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -7955,21 +10467,34 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
-    expect(harness.runs[0]?.prompt).toContain("Reviewer gate findings to address");
+    expect(harness.runs[0]?.prompt).toContain(
+      "Reviewer gate findings to address",
+    );
     expect(harness.runs[0]?.prompt).toContain("Lifecycle counters:");
     expect(harness.runs[0]?.prompt).toContain("Reviewer failures: 0");
     expect(harness.runs[0]?.prompt).toContain("Latest workspace/git evidence:");
     expect(harness.runs[0]?.prompt).toContain("Branch: symphony/TEST-1");
-    expect(harness.runs[0]?.prompt).toContain("Pull request: #42 https://github.com/acme/symphony/pull/42");
+    expect(harness.runs[0]?.prompt).toContain(
+      "Pull request: #42 https://github.com/acme/symphony/pull/42",
+    );
     expect(harness.runs[0]?.prompt).toContain("Acceptance criteria gaps:");
-    expect(harness.runs[0]?.prompt).toContain("Duplicate verdicts are idempotent");
-    expect(harness.runs[0]?.prompt).toContain("Add regression coverage for duplicate verdict submissions.");
-    expect(harness.runs[0]?.prompt).toContain("https://github.com/acme/symphony/pull/42#discussion_r1");
+    expect(harness.runs[0]?.prompt).toContain(
+      "Duplicate verdicts are idempotent",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "Add regression coverage for duplicate verdict submissions.",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "https://github.com/acme/symphony/pull/42#discussion_r1",
+    );
   });
 
   it("injects blocked reviewer verdict context into the resumed worker prompt", async () => {
     const config = testConfig(root);
-    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -7995,10 +10520,13 @@ describe("Orchestrator", () => {
         {
           text: "Required validation evidence is available",
           satisfied: false,
-          evidence: "The worker and reviewer command surfaces cannot execute the required validation.",
+          evidence:
+            "The worker and reviewer command surfaces cannot execute the required validation.",
         },
       ],
-      findings: ["Focused validation is unavailable to worker and reviewer command surfaces."],
+      findings: [
+        "Focused validation is unavailable to worker and reviewer command surfaces.",
+      ],
       gateFindings: [],
       discoveryFindings: [],
       evidence: ["reviewer observed command-policy denial"],
@@ -8022,7 +10550,11 @@ describe("Orchestrator", () => {
       },
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8039,23 +10571,38 @@ describe("Orchestrator", () => {
 
     const prompt = harness.runs[0]?.prompt ?? "";
     const systemPrompt = harness.runs[0]?.ctx.ephemeralSystemPrompt ?? "";
-    expect(prompt).toContain("Reviewer blocked findings to resolve before submitting another completion report:");
-    expect(prompt).toContain("Reviewer verdict: blocked / human action required");
+    expect(prompt).toContain(
+      "Reviewer blocked findings to resolve before submitting another completion report:",
+    );
+    expect(prompt).toContain(
+      "Reviewer verdict: blocked / human action required",
+    );
     expect(prompt).toContain(
       "Next action: Resume after the blocked review: verify the human/operator blocker is resolved, then complete any remaining implementation or validation and submit a new completion report.",
     );
     expect(prompt).toContain("Latest blocked reviewer verdict:");
-    expect(prompt).toContain("Focused validation is unavailable to worker and reviewer command surfaces.");
-    expect(prompt).toContain("The worker and reviewer command surfaces cannot execute the required validation.");
+    expect(prompt).toContain(
+      "Focused validation is unavailable to worker and reviewer command surfaces.",
+    );
+    expect(prompt).toContain(
+      "The worker and reviewer command surfaces cannot execute the required validation.",
+    );
     expect(prompt).toContain("reviewer observed command-policy denial");
-    expect(systemPrompt).toContain("Resume after the blocked review only after the human/operator blocker has been resolved");
+    expect(systemPrompt).toContain(
+      "Resume after the blocked review only after the human/operator blocker has been resolved",
+    );
     expect(systemPrompt).toContain("Latest blocked review:");
-    expect(systemPrompt).toContain("Focused validation is unavailable to worker and reviewer command surfaces.");
+    expect(systemPrompt).toContain(
+      "Focused validation is unavailable to worker and reviewer command surfaces.",
+    );
   });
 
   it("injects dedicated merge-gate repair context instead of reviewer-fail framing", async () => {
     const config = testConfig(root);
-    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -8085,7 +10632,13 @@ describe("Orchestrator", () => {
           issueId: candidate.id,
           issueIdentifier: candidate.identifier,
           verdict: "fail",
-          acceptanceResults: [{ text: "Required checks pass", satisfied: false, evidence: "test failed" }],
+          acceptanceResults: [
+            {
+              text: "Required checks pass",
+              satisfied: false,
+              evidence: "test failed",
+            },
+          ],
           findings: ["Required check failed: test: failure"],
           gateFindings: [],
           discoveryFindings: [],
@@ -8099,7 +10652,12 @@ describe("Orchestrator", () => {
         id: "merge-gate:issue-1:pr-42:head-sha-1",
         status: "repair_dispatched",
         headSha: "head-sha-1",
-        pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
         requiredChecks: ["test"],
         checks: [
           {
@@ -8125,7 +10683,11 @@ describe("Orchestrator", () => {
       },
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8141,13 +10703,20 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     expect(harness.runs[0]?.prompt).toContain("## Symphony Merge Gate Repair");
-    expect(harness.runs[0]?.prompt).toContain("test: failing / failure (https://ci.test/test)");
-    expect(harness.runs[0]?.prompt).not.toContain("Reviewer gate findings to address");
+    expect(harness.runs[0]?.prompt).toContain(
+      "test: failing / failure (https://ci.test/test)",
+    );
+    expect(harness.runs[0]?.prompt).not.toContain(
+      "Reviewer gate findings to address",
+    );
   });
 
   it("shows head-advanced guidance without old-head repair context after the current PR head advances", async () => {
     const config = testConfig(root);
-    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [candidate];
@@ -8183,7 +10752,13 @@ describe("Orchestrator", () => {
           issueId: candidate.id,
           issueIdentifier: candidate.identifier,
           verdict: "fail",
-          acceptanceResults: [{ text: "Required checks pass", satisfied: false, evidence: "test failed" }],
+          acceptanceResults: [
+            {
+              text: "Required checks pass",
+              satisfied: false,
+              evidence: "test failed",
+            },
+          ],
           findings: ["Required check failed: test: failure"],
           gateFindings: [],
           discoveryFindings: [],
@@ -8199,11 +10774,19 @@ describe("Orchestrator", () => {
           issueId: candidate.id,
           issueIdentifier: candidate.identifier,
           verdict: "fail",
-          acceptanceResults: [{ text: "Current head review finding is addressed", satisfied: false, evidence: "Missing regression test." }],
+          acceptanceResults: [
+            {
+              text: "Current head review finding is addressed",
+              satisfied: false,
+              evidence: "Missing regression test.",
+            },
+          ],
           findings: ["Add regression coverage for the current PR head."],
           gateFindings: [],
           discoveryFindings: [],
-          evidence: ["https://github.com/acme/symphony/pull/42#discussion_current"],
+          evidence: [
+            "https://github.com/acme/symphony/pull/42#discussion_current",
+          ],
           reviewer: "reviewer-1",
           submittedAt: "2026-01-01T00:00:02.000Z",
           writebackOperationKeys: [],
@@ -8213,7 +10796,12 @@ describe("Orchestrator", () => {
         id: "merge-gate:issue-1:pr-42:head-sha-1",
         status: "repair_dispatched",
         headSha: "head-sha-1",
-        pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
         requiredChecks: ["test"],
         checks: [
           {
@@ -8246,7 +10834,11 @@ describe("Orchestrator", () => {
       headSha: "head-sha-2",
       lastPushedAt: "2026-01-01T00:02:00Z",
     });
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8259,19 +10851,38 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "head-advanced repair dispatch");
+    await waitFor(
+      () => harness.runs.length === 1,
+      "head-advanced repair dispatch",
+    );
     await orchestrator.stop();
 
     expect(pullRequestClient.branches[0]).toBe("symphony/TEST-1");
-    expect(harness.runs[0]?.prompt).toContain("## Symphony Merge Gate Head Advanced");
-    expect(harness.runs[0]?.prompt).toContain("Current PR head SHA: head-sha-2");
+    expect(harness.runs[0]?.prompt).toContain(
+      "## Symphony Merge Gate Head Advanced",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "Current PR head SHA: head-sha-2",
+    );
     expect(harness.runs[0]?.prompt).toContain("normal review approval");
-    expect(harness.runs[0]?.prompt).toContain("Reviewer gate findings to address");
-    expect(harness.runs[0]?.prompt).toContain("Add regression coverage for the current PR head.");
-    expect(harness.runs[0]?.prompt).not.toContain("## Symphony Merge Gate Repair");
-    expect(harness.runs[0]?.prompt).not.toContain("test: failing / failure (https://ci.test/test)");
-    expect(harness.runs[0]?.prompt).not.toContain("Repair the Symphony merge-gate checks");
-    expect(harness.runs[0]?.prompt).not.toContain("completion-report:issue-1:repair-1");
+    expect(harness.runs[0]?.prompt).toContain(
+      "Reviewer gate findings to address",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "Add regression coverage for the current PR head.",
+    );
+    expect(harness.runs[0]?.prompt).not.toContain(
+      "## Symphony Merge Gate Repair",
+    );
+    expect(harness.runs[0]?.prompt).not.toContain(
+      "test: failing / failure (https://ci.test/test)",
+    );
+    expect(harness.runs[0]?.prompt).not.toContain(
+      "Repair the Symphony merge-gate checks",
+    );
+    expect(harness.runs[0]?.prompt).not.toContain(
+      "completion-report:issue-1:repair-1",
+    );
   });
 
   it("recovers a satisfied head-superseded rebind before dispatching another worker", async () => {
@@ -8279,14 +10890,19 @@ describe("Orchestrator", () => {
     config.writeback.enabled = true;
     config.writeback.mode = "live";
     config.reviewLoop.reviewPassState = "Ready to Merge";
-    const candidate = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
     let currentState = "In Progress";
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
       async fetchIssuesByStates(states) {
-        return states.includes(currentState) ? [{ ...candidate, state: currentState }] : [];
+        return states.includes(currentState)
+          ? [{ ...candidate, state: currentState }]
+          : [];
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -8299,7 +10915,12 @@ describe("Orchestrator", () => {
     const writer = new StateChangingWriter((state) => {
       currentState = state;
     });
-    const writeback = new WritebackProcessor(outboxStore, writer, logger, 300_000);
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
     const report = {
       ...completionReportRecord(candidate),
       id: "completion-report:issue-1:fresh-head",
@@ -8317,9 +10938,13 @@ describe("Orchestrator", () => {
       idempotencyKey: "fresh-head-pass",
       runId: "review-run-2",
       verdict: "pass",
-      acceptanceResults: [{ text: "Fresh head approved", satisfied: true, evidence: "reviewed" }],
+      acceptanceResults: [
+        { text: "Fresh head approved", satisfied: true, evidence: "reviewed" },
+      ],
       findings: [],
-      evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-2"],
+      evidence: [
+        "https://github.com/acme/symphony/pull/42#pullrequestreview-2",
+      ],
     };
     await lifecycleStore.ensureIssue(candidate, {
       phase: "implementation",
@@ -8349,7 +10974,12 @@ describe("Orchestrator", () => {
         id: "merge-gate:issue-1:pr-42:head-sha-1",
         status: "superseded",
         headSha: "head-sha-1",
-        pullRequest: { url: "https://github.com/acme/symphony/pull/42", number: 42, headSha: "head-sha-1", branch: "symphony/TEST-1" },
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "head-sha-1",
+          branch: "symphony/TEST-1",
+        },
         requiredChecks: ["test"],
         checks: [
           {
@@ -8375,7 +11005,11 @@ describe("Orchestrator", () => {
       },
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8388,7 +11022,10 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => writer.transitions.length === 1, "head-superseded recovery transition");
+    await waitFor(
+      () => writer.transitions.length === 1,
+      "head-superseded recovery transition",
+    );
     await orchestrator.stop();
 
     expect(harness.runs).toEqual([]);
@@ -8401,7 +11038,9 @@ describe("Orchestrator", () => {
         reason: "Symphony merge gate head supersession rebound satisfied",
       },
     ]);
-    expect(writer.comments[0]?.dedupeKey).toContain("head-superseded-recovered:head-sha-2");
+    expect(writer.comments[0]?.dedupeKey).toContain(
+      "head-superseded-recovered:head-sha-2",
+    );
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       phase: "passed",
       blockedReason: null,
@@ -8427,7 +11066,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new BlockingHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8438,9 +11081,15 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-123", "active issue dispatch before cancellation");
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.runId === "run-123",
+      "active issue dispatch before cancellation",
+    );
     await orchestrator.cancelIssue(candidate.id);
-    await waitFor(() => harness.stoppedRunIds.length === 1, "active issue cancellation");
+    await waitFor(
+      () => harness.stoppedRunIds.length === 1,
+      "active issue cancellation",
+    );
     await orchestrator.stop();
 
     expect(harness.stoppedRunIds).toEqual(["run-123"]);
@@ -8463,7 +11112,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new HeldCancellationHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8474,7 +11127,10 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-123", "run to start");
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.runId === "run-123",
+      "run to start",
+    );
     const active = orchestrator.snapshot().running[0];
     expect(active).toMatchObject({
       issueIdentifier: "TEST-1",
@@ -8512,15 +11168,22 @@ describe("Orchestrator", () => {
       },
     });
     expect(cancelling?.cancellation.requestedAt).toEqual(expect.any(String));
-    expect(cancelling?.cancellation.harnessStopRequestedAt).toEqual(expect.any(String));
+    expect(cancelling?.cancellation.harnessStopRequestedAt).toEqual(
+      expect.any(String),
+    );
 
     await orchestrator.cancelIssue(candidate.id);
     const repeatedCancel = orchestrator.snapshot().running[0];
-    expect(repeatedCancel?.cancellation.requestedAt).toBe(cancelling?.cancellation.requestedAt);
+    expect(repeatedCancel?.cancellation.requestedAt).toBe(
+      cancelling?.cancellation.requestedAt,
+    );
     expect(repeatedCancel?.cancellation.reason).toBe("operator request");
 
     harness.release();
-    await waitFor(() => orchestrator.snapshot().running.length === 0, "cancelled run to exit");
+    await waitFor(
+      () => orchestrator.snapshot().running.length === 0,
+      "cancelled run to exit",
+    );
     await orchestrator.stop();
   });
 
@@ -8541,7 +11204,11 @@ describe("Orchestrator", () => {
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const harness = new FailingStopHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8553,8 +11220,13 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-failing-stop", "run to start");
-    await expect(orchestrator.cancelIssue(candidate.id)).resolves.toBeUndefined();
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.runId === "run-failing-stop",
+      "run to start",
+    );
+    await expect(
+      orchestrator.cancelIssue(candidate.id),
+    ).resolves.toBeUndefined();
 
     const cancelling = orchestrator.snapshot().running[0];
     expect(cancelling).toMatchObject({
@@ -8571,10 +11243,15 @@ describe("Orchestrator", () => {
         },
       },
     });
-    expect(cancelling?.cancellation.harnessStopFailedAt).toEqual(expect.any(String));
+    expect(cancelling?.cancellation.harnessStopFailedAt).toEqual(
+      expect.any(String),
+    );
 
     harness.release();
-    await waitFor(() => orchestrator.snapshot().running.length === 0, "cancelled run to exit");
+    await waitFor(
+      () => orchestrator.snapshot().running.length === 0,
+      "cancelled run to exit",
+    );
     await expect(runStore.getRun("run-failing-stop")).resolves.toMatchObject({
       status: "cancelled",
       cancelFailed: false,
@@ -8589,7 +11266,9 @@ describe("Orchestrator", () => {
 
   it("keeps quiet SDK-running work active instead of stall-cancelling it", async () => {
     const config = testConfig(root);
-    (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = { stall_timeout_ms: 1 };
+    (config.raw as { codex?: { stall_timeout_ms?: number } }).codex = {
+      stall_timeout_ms: 1,
+    };
     const candidate = issue({ state: "Todo" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -8605,7 +11284,11 @@ describe("Orchestrator", () => {
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const harness = new StalledAbortHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8617,7 +11300,10 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-stalled", "stalled run to start");
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.runId === "run-stalled",
+      "stalled run to start",
+    );
     await new Promise((resolve) => setTimeout(resolve, 5));
     await orchestrator.refreshNow();
     const quiet = orchestrator.snapshot().running[0];
@@ -8637,7 +11323,10 @@ describe("Orchestrator", () => {
     });
 
     harness.release();
-    await waitFor(() => orchestrator.snapshot().running.length === 0, "stalled run to exit");
+    await waitFor(
+      () => orchestrator.snapshot().running.length === 0,
+      "stalled run to exit",
+    );
 
     await expect(runStore.getRun("run-stalled")).resolves.toMatchObject({
       status: "succeeded",
@@ -8662,7 +11351,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new PreSessionCancellationHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8692,7 +11385,10 @@ describe("Orchestrator", () => {
     expect(harness.stoppedRunIds).toEqual([]);
 
     harness.release();
-    await waitFor(() => orchestrator.snapshot().running.length === 0, "pre-session cancelled run to exit");
+    await waitFor(
+      () => orchestrator.snapshot().running.length === 0,
+      "pre-session cancelled run to exit",
+    );
     await orchestrator.stop();
   });
 
@@ -8712,7 +11408,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new PreSessionCancellationHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8726,7 +11426,9 @@ describe("Orchestrator", () => {
     await harness.started;
     const stopPromise = orchestrator.stop();
     await waitFor(
-      () => orchestrator.snapshot().running[0]?.cancellation.source === "service_stop",
+      () =>
+        orchestrator.snapshot().running[0]?.cancellation.source ===
+        "service_stop",
       "service stop cancellation to be recorded",
     );
 
@@ -8764,7 +11466,11 @@ describe("Orchestrator", () => {
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const harness = new ServiceStopAbortHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8776,10 +11482,15 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => orchestrator.snapshot().running[0]?.runId === "run-service-stop", "service-stop run to start");
+    await waitFor(
+      () => orchestrator.snapshot().running[0]?.runId === "run-service-stop",
+      "service-stop run to start",
+    );
     const stopPromise = orchestrator.stop();
     await waitFor(
-      () => orchestrator.snapshot().running[0]?.cancellation.source === "service_stop",
+      () =>
+        orchestrator.snapshot().running[0]?.cancellation.source ===
+        "service_stop",
       "service stop cancellation to be recorded",
     );
     expect(orchestrator.snapshot().running[0]).toMatchObject({
@@ -8821,7 +11532,11 @@ describe("Orchestrator", () => {
     };
     const logger = new StructuredLogger(() => undefined);
     const harness = new NonResumableHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8861,7 +11576,11 @@ describe("Orchestrator", () => {
     ]);
     const runStore = new FileRunTranscriptStore(root);
     const lifecycleStore = new FileIssueLifecycleStore(root);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8878,9 +11597,17 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
 
     const runs = await runStore.listRunsForIssue(candidate.id);
-    expect(runs.map((run) => ({ runId: run.runId, tokens: run.tokens }))).toEqual([
-      { runId: "token-run-1", tokens: { inputTokens: 100, outputTokens: 50, totalTokens: 150 } },
-      { runId: "token-run-2", tokens: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } },
+    expect(
+      runs.map((run) => ({ runId: run.runId, tokens: run.tokens })),
+    ).toEqual([
+      {
+        runId: "token-run-1",
+        tokens: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+      },
+      {
+        runId: "token-run-2",
+        tokens: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      },
     ]);
     expect(orchestrator.snapshot().totals).toMatchObject({
       inputTokens: 110,
@@ -8907,7 +11634,11 @@ describe("Orchestrator", () => {
     const logger = new StructuredLogger(() => undefined);
     const harness = new DiagnosticActivityHarness();
     const runStore = new FileRunTranscriptStore(root);
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -8919,7 +11650,11 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitForAsync(async () => (await runStore.getRun("diagnostic-run-1"))?.status === "succeeded", "diagnostic activity run");
+    await waitForAsync(
+      async () =>
+        (await runStore.getRun("diagnostic-run-1"))?.status === "succeeded",
+      "diagnostic activity run",
+    );
     await orchestrator.stop();
 
     const run = await runStore.getRun("diagnostic-run-1");
@@ -8930,7 +11665,11 @@ describe("Orchestrator", () => {
       tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
       transcriptEventCount: 6,
     });
-    expect(orchestrator.snapshot().totals).toMatchObject({ inputTokens: 12, outputTokens: 8, totalTokens: 20 });
+    expect(orchestrator.snapshot().totals).toMatchObject({
+      inputTokens: 12,
+      outputTokens: 8,
+      totalTokens: 20,
+    });
     expect(orchestrator.snapshot().rateLimits).toEqual({
       requests: { remaining: 2, resetAt: "2026-01-01T00:30:00.000Z" },
       authorization: "[redacted]",
@@ -8954,13 +11693,19 @@ describe("Orchestrator", () => {
     });
     expect(transcript.events[3]).toMatchObject({
       eventType: "tokens",
-      payload: { kind: "usage", tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 } },
+      payload: {
+        kind: "usage",
+        tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+      },
     });
     expect(transcript.events[4]).toMatchObject({
       eventType: "rate_limits",
       payload: {
         kind: "rate_limits",
-        rateLimits: { requests: { remaining: 2, resetAt: "2026-01-01T00:30:00.000Z" }, authorization: "[redacted]" },
+        rateLimits: {
+          requests: { remaining: 2, resetAt: "2026-01-01T00:30:00.000Z" },
+          authorization: "[redacted]",
+        },
       },
     });
     expect(serializedTranscript).not.toContain("SECRET_DIAGNOSTIC_TOKEN");
@@ -9006,7 +11751,11 @@ describe("Orchestrator", () => {
       message: "Prior run exists without a lifecycle handoff.",
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -9032,7 +11781,9 @@ describe("Orchestrator", () => {
     const config = testConfig(root);
     config.agent.maxTurns = 2;
     config.reviewLoop.continuationHistoryThreshold = 5;
-    config.reviewLoop.workerPromptExtensions = ["Check continuation-specific project invariants."];
+    config.reviewLoop.workerPromptExtensions = [
+      "Check continuation-specific project invariants.",
+    ];
     const candidate = issue({ state: "Todo" });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
@@ -9050,7 +11801,11 @@ describe("Orchestrator", () => {
     const runStore = new FileRunTranscriptStore(stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -9063,19 +11818,29 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "continuation dispatch below event threshold", 5_000);
+    await waitFor(
+      () => harness.runs.length === 2,
+      "continuation dispatch below event threshold",
+      5_000,
+    );
     await orchestrator.stop();
 
     expect(harness.runs).toHaveLength(2);
     expect(harness.runs[1]?.prompt).toContain("Structured continuation brief:");
     expect(harness.runs[1]?.prompt).toContain("Review-cycle hardening:");
     expect(harness.runs[1]?.prompt).toContain("underlying contract invariant");
-    expect(harness.runs[1]?.prompt).toContain("Check continuation-specific project invariants.");
+    expect(harness.runs[1]?.prompt).toContain(
+      "Check continuation-specific project invariants.",
+    );
     expect(harness.runs[1]?.prompt).toContain("Mode: summary");
     expect(harness.runs[1]?.prompt).toContain("Transcript/status pointers:");
-    expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/fake-issue-1-1/transcript");
+    expect(harness.runs[1]?.prompt).toContain(
+      "/api/v1/runs/fake-issue-1-1/transcript",
+    );
     expect(harness.runs[1]?.prompt).not.toContain("completed: fake completed");
-    expect(harness.runs[1]?.prompt).not.toContain("Continue working on the issue. Check current issue state");
+    expect(harness.runs[1]?.prompt).not.toContain(
+      "Continue working on the issue. Check current issue state",
+    );
   });
 
   it("uses stored summaries and API pointers in continuation prompts above the event threshold", async () => {
@@ -9130,7 +11895,11 @@ describe("Orchestrator", () => {
       message: "Prior run stopped before handoff.",
     });
     const harness = new FakeHarness();
-    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
     const orchestrator = new Orchestrator({
       config,
       tracker,
@@ -9141,35 +11910,54 @@ describe("Orchestrator", () => {
       runStore,
       lifecycleStore,
     });
-    const createdSummary = await orchestrator.createContinuationSummary(candidate);
+    const createdSummary =
+      await orchestrator.createContinuationSummary(candidate);
     const storedLifecycle = await lifecycleStore.get(candidate.identifier);
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 2, "continuation dispatch above event threshold", 5_000);
+    await waitFor(
+      () => harness.runs.length === 2,
+      "continuation dispatch above event threshold",
+      5_000,
+    );
     await orchestrator.stop();
 
-    expect(createdSummary.summaryReference.id).toContain("continuation-summary:issue-1:");
+    expect(createdSummary.summaryReference.id).toContain(
+      "continuation-summary:issue-1:",
+    );
     expect(createdSummary.summaryReference.runIds).toEqual(["prior-run-1"]);
     expect(createdSummary.summaryReference.transcriptEventCount).toBe(2);
-    expect(createdSummary.summaryReference.transcriptPointers).toEqual(["/api/v1/runs/prior-run-1/transcript"]);
+    expect(createdSummary.summaryReference.transcriptPointers).toEqual([
+      "/api/v1/runs/prior-run-1/transcript",
+    ]);
     expect(createdSummary.summaryReference.statusApiPointers).toEqual([
       "/api/v1/issues/TEST-1",
       "/api/v1/issues/TEST-1/runs",
       "/api/v1/runs/prior-run-1",
     ]);
-    expect(storedLifecycle?.summaryReferences).toEqual([createdSummary.summaryReference]);
+    expect(storedLifecycle?.summaryReferences).toEqual([
+      createdSummary.summaryReference,
+    ]);
     expect(harness.runs).toHaveLength(2);
     expect(harness.runs[1]?.prompt).toContain("Mode: summary");
-    expect(harness.runs[1]?.prompt).toContain(`Reference: ${createdSummary.summaryReference.id}`);
-    expect(harness.runs[1]?.prompt).toContain("Continuation history summarization is not automated yet.");
-    expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1/transcript");
+    expect(harness.runs[1]?.prompt).toContain(
+      `Reference: ${createdSummary.summaryReference.id}`,
+    );
+    expect(harness.runs[1]?.prompt).toContain(
+      "Continuation history summarization is not automated yet.",
+    );
+    expect(harness.runs[1]?.prompt).toContain(
+      "/api/v1/runs/prior-run-1/transcript",
+    );
     expect(harness.runs[1]?.prompt).toContain("/api/v1/issues/TEST-1");
     expect(harness.runs[1]?.prompt).toContain("/api/v1/runs/prior-run-1");
     expect(harness.runs[1]?.prompt).not.toContain("Full relevant history:");
   });
 });
 
-function completionReportRecord(candidate = issue()): IssueCompletionReportRecord {
+function completionReportRecord(
+  candidate = issue(),
+): IssueCompletionReportRecord {
   return {
     id: `completion-report:${candidate.id}:idem-1`,
     idempotencyKey: "idem-1",
@@ -9274,14 +12062,23 @@ async function appendApprovalFeedback(
   candidate: Issue,
   runId: string,
 ): Promise<void> {
-  const lifecycle = (await lifecycleStore.get(candidate.id)) ?? (await lifecycleStore.get(candidate.identifier));
-  if (!lifecycle) throw new Error(`Missing lifecycle for ${candidate.identifier}`);
+  const lifecycle =
+    (await lifecycleStore.get(candidate.id)) ??
+    (await lifecycleStore.get(candidate.identifier));
+  if (!lifecycle)
+    throw new Error(`Missing lifecycle for ${candidate.identifier}`);
   await lifecycleStore.updateIssue(candidate, {
-    reviewFeedback: [...lifecycle.reviewFeedback, approvalFeedbackRecord(candidate, runId)],
+    reviewFeedback: [
+      ...lifecycle.reviewFeedback,
+      approvalFeedbackRecord(candidate, runId),
+    ],
   });
 }
 
-function approvalFeedbackRecord(candidate: Issue, runId: string): IssueReviewFeedbackRecord {
+function approvalFeedbackRecord(
+  candidate: Issue,
+  runId: string,
+): IssueReviewFeedbackRecord {
   return {
     id: `review-feedback:${candidate.id}:${runId}:approve-1`,
     idempotencyKey: "approve-1",
@@ -9299,7 +12096,8 @@ function approvalFeedbackRecord(candidate: Issue, runId: string): IssueReviewFee
       branch: candidate.branchName,
     },
     reviewer: "reviewer-agent",
-    reviewUrl: "https://github.com/acme/symphony/pull/42#pullrequestreview-approve",
+    reviewUrl:
+      "https://github.com/acme/symphony/pull/42#pullrequestreview-approve",
     commentUrls: [],
     submittedAt: "2026-01-01T00:00:02Z",
   };
@@ -9418,13 +12216,27 @@ function approvalRecordFor(
       evidenceCursor: "idem-1",
       summaryPreview: "Implemented the requested handoff.",
       changedFiles: ["src/core/orchestrator/Orchestrator.ts"],
-      plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+      plannedOperations: [
+        "commit_if_needed",
+        "git_push",
+        "pull_request_create_or_reuse",
+      ],
     },
     requestedAt: "2026-01-01T00:00:00.000Z",
     expiresAt: status === "expired" ? "2026-01-01T00:00:01.000Z" : null,
     resolvedAt: status === "pending" ? null : "2026-01-01T00:00:02.000Z",
-    resolvedBy: status === "approved" || status === "rejected" ? "operator" : status === "pending" ? null : "system",
-    decision: status === "approved" ? "approve" : status === "rejected" ? "reject" : null,
+    resolvedBy:
+      status === "approved" || status === "rejected"
+        ? "operator"
+        : status === "pending"
+          ? null
+          : "system",
+    decision:
+      status === "approved"
+        ? "approve"
+        : status === "rejected"
+          ? "reject"
+          : null,
     staleReason,
   };
 }
@@ -9433,7 +12245,10 @@ function githubProfileConfig(
   workspaceRoot: string,
   input: {
     profiles: Record<string, { value: string; capabilities: string[] }>;
-    roles: { worker?: Record<string, string>; reviewer?: Record<string, string> };
+    roles: {
+      worker?: Record<string, string>;
+      reviewer?: Record<string, string>;
+    };
     env: Record<string, string>;
   },
 ) {
@@ -9509,12 +12324,22 @@ async function createIssueBreakdownStartupFixture(
     title: "Original issue",
     updatedAt: "2026-01-01T00:00:00.000Z",
   });
-  const seeded = await seedIssueBreakdownReplayWork(config, lifecycleStore, outboxStore, parentIssue, {
-    supersede: options.scenario === "superseded",
-  });
+  const seeded = await seedIssueBreakdownReplayWork(
+    config,
+    lifecycleStore,
+    outboxStore,
+    parentIssue,
+    {
+      supersede: options.scenario === "superseded",
+    },
+  );
   const resolvedIssue =
     options.scenario === "drifted"
-      ? { ...parentIssue, title: "Changed issue", updatedAt: "2026-01-02T00:00:00.000Z" }
+      ? {
+          ...parentIssue,
+          title: "Changed issue",
+          updatedAt: "2026-01-02T00:00:00.000Z",
+        }
       : parentIssue;
   const tracker: TrackerClient = {
     async fetchCandidateIssues() {
@@ -9543,7 +12368,11 @@ async function createIssueBreakdownStartupFixture(
   const orchestrator = new Orchestrator({
     config,
     tracker,
-    workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+    workspaceManager: new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    }),
     harness: new FakeHarness(),
     logger,
     promptTemplate: "Work on {{ issue.identifier }}",
@@ -9564,7 +12393,9 @@ async function createIssueBreakdownStartupFixture(
   };
 }
 
-type StartupReplayActivityFixture = Awaited<ReturnType<typeof createIssueBreakdownStartupFixture>>;
+type StartupReplayActivityFixture = Awaited<
+  ReturnType<typeof createIssueBreakdownStartupFixture>
+>;
 
 async function expectStartupReplayActivitySkipReasons(
   fixture: StartupReplayActivityFixture,
@@ -9576,7 +12407,9 @@ async function expectStartupReplayActivitySkipReasons(
   const activity = await fetchActivityForIssue(fixture);
   const expectedKinds = ["issue_create", "issue_relation", "comment"];
   for (const [index, key] of fixture.replayOperationKeys.entries()) {
-    const item = activity.find((candidate) => candidate.id === `writeback:${key}`);
+    const item = activity.find(
+      (candidate) => candidate.id === `writeback:${key}`,
+    );
     expect(item).toMatchObject({
       kind: "writeback_operation",
       writeback: {
@@ -9590,12 +12423,21 @@ async function expectStartupReplayActivitySkipReasons(
   }
 }
 
-async function fetchActivityForIssue(fixture: StartupReplayActivityFixture): Promise<ActivityWritebackItem[]> {
+async function fetchActivityForIssue(
+  fixture: StartupReplayActivityFixture,
+): Promise<ActivityWritebackItem[]> {
   const logger = new StructuredLogger(() => undefined);
   const server = new StatusServer({
     orchestrator: fixture.orchestrator,
-    workspaceManager: new WorkspaceManager({ workspace: fixture.config.workspace, hooks: fixture.config.hooks, logger }),
-    workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: fixture.config.workspace.root, openerCommand: null }),
+    workspaceManager: new WorkspaceManager({
+      workspace: fixture.config.workspace,
+      hooks: fixture.config.hooks,
+      logger,
+    }),
+    workspaceOpener: new CursorWorkspaceOpener({
+      workspaceRoot: fixture.config.workspace.root,
+      openerCommand: null,
+    }),
     lifecycleStore: fixture.lifecycleStore,
     writebackOutbox: fixture.outboxStore,
     host: "127.0.0.1",
@@ -9610,7 +12452,9 @@ async function fetchActivityForIssue(fixture: StartupReplayActivityFixture): Pro
       `http://${address.host}:${address.port}/api/v1/activity?issue=${encodeURIComponent(fixture.parentIssue.identifier)}&limit=100`,
     );
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { activity: ActivityWritebackItem[] };
+    const body = (await response.json()) as {
+      activity: ActivityWritebackItem[];
+    };
     return body.activity;
   } finally {
     await server.stop();
@@ -9650,7 +12494,11 @@ function mergePolicyOrchestratorConfig(root: string) {
       },
       workspace: { root },
       writeback: { enabled: true, mode: "live", dispatch_state: "In Progress" },
-      review_loop: { review_states: ["In Review"], review_pass_state: "Ready to Merge", blocked_states: ["Blocked"] },
+      review_loop: {
+        review_states: ["In Review"],
+        review_pass_state: "Ready to Merge",
+        blocked_states: ["Blocked"],
+      },
       merge_policy: {
         mode: "gated",
         source_states: ["Ready to Merge"],
@@ -9672,17 +12520,41 @@ async function seedIssueBreakdownReplayWork(
   outboxStore: FileWritebackOutboxStore,
   parentIssue: Issue,
   options: { supersede: boolean },
-): Promise<{ plan: IssueBreakdownPlanRecord; currentPlan: IssueBreakdownPlanRecord | null; replayOperationKeys: string[] }> {
-  const plan = await submitTwoChildPlan(config, lifecycleStore, parentIssue, "plan-a", "run-plan-a");
-  const childOperations = planIssueBreakdownApplicationWritebacks(parentIssue, plan) as IssueCreateWriteback[];
+): Promise<{
+  plan: IssueBreakdownPlanRecord;
+  currentPlan: IssueBreakdownPlanRecord | null;
+  replayOperationKeys: string[];
+}> {
+  const plan = await submitTwoChildPlan(
+    config,
+    lifecycleStore,
+    parentIssue,
+    "plan-a",
+    "run-plan-a",
+  );
+  const childOperations = planIssueBreakdownApplicationWritebacks(
+    parentIssue,
+    plan,
+  ) as IssueCreateWriteback[];
   const planWithRefs = {
     ...plan,
-    createdIssueRefs: childOperations.map((operation) => createdIssueRefForOperation(operation)),
+    createdIssueRefs: childOperations.map((operation) =>
+      createdIssueRefForOperation(operation),
+    ),
   };
-  const finalOperations = planIssueBreakdownFinalizationWritebacks(parentIssue, planWithRefs);
-  const relationOperation = finalOperations.find((operation): operation is IssueRelationWriteback => operation.kind === "issue_relation");
-  const parentCommentOperation = finalOperations.find((operation): operation is CommentWriteback => operation.kind === "comment");
-  if (!relationOperation || !parentCommentOperation) throw new Error("expected relation and parent comment writebacks");
+  const finalOperations = planIssueBreakdownFinalizationWritebacks(
+    parentIssue,
+    planWithRefs,
+  );
+  const relationOperation = finalOperations.find(
+    (operation): operation is IssueRelationWriteback =>
+      operation.kind === "issue_relation",
+  );
+  const parentCommentOperation = finalOperations.find(
+    (operation): operation is CommentWriteback => operation.kind === "comment",
+  );
+  if (!relationOperation || !parentCommentOperation)
+    throw new Error("expected relation and parent comment writebacks");
 
   const applicationOperationKeys = [
     ...childOperations.map((operation) => operation.idempotencyKey),
@@ -9690,15 +12562,16 @@ async function seedIssueBreakdownReplayWork(
   ];
   const lifecycle = await lifecycleStore.get(parentIssue.id);
   await lifecycleStore.updateIssue(parentIssue, {
-    issueBreakdownPlans: (lifecycle?.issueBreakdownPlans ?? []).map((candidatePlan) =>
-      candidatePlan.id === plan.id
-        ? {
-            ...planWithRefs,
-            applicationStatus: "pending",
-            applicationOperationKeys,
-            applicationBlockedReason: null,
-          }
-        : candidatePlan,
+    issueBreakdownPlans: (lifecycle?.issueBreakdownPlans ?? []).map(
+      (candidatePlan) =>
+        candidatePlan.id === plan.id
+          ? {
+              ...planWithRefs,
+              applicationStatus: "pending",
+              applicationOperationKeys,
+              applicationBlockedReason: null,
+            }
+          : candidatePlan,
     ),
     lastIssueBreakdownPlanId: plan.id,
   });
@@ -9711,11 +12584,23 @@ async function seedIssueBreakdownReplayWork(
   );
   await outboxStore.enqueueOnce(parentCommentOperation);
 
-  const currentPlan = options.supersede ? await submitTwoChildPlan(config, lifecycleStore, parentIssue, "plan-b", "run-plan-b") : null;
+  const currentPlan = options.supersede
+    ? await submitTwoChildPlan(
+        config,
+        lifecycleStore,
+        parentIssue,
+        "plan-b",
+        "run-plan-b",
+      )
+    : null;
   return {
     plan,
     currentPlan,
-    replayOperationKeys: [childOperations[0]!.idempotencyKey, relationOperation.idempotencyKey, parentCommentOperation.idempotencyKey],
+    replayOperationKeys: [
+      childOperations[0]!.idempotencyKey,
+      relationOperation.idempotencyKey,
+      parentCommentOperation.idempotencyKey,
+    ],
   };
 }
 
@@ -9726,7 +12611,10 @@ async function submitTwoChildPlan(
   idempotencyKey: string,
   runId: string,
 ): Promise<IssueBreakdownPlanRecord> {
-  const result = await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
+  const result = await new IssueBreakdownPlanService({
+    config,
+    lifecycleStore,
+  }).submit_issue_breakdown_plan(
     {
       runId,
       issueId: parentIssue.id,
@@ -9749,12 +12637,19 @@ async function submitTwoChildPlan(
       ],
       idempotencyKey,
     },
-    { issue: parentIssue, activeRunId: runId, role: "worker", phase: "issue_breakdown" },
+    {
+      issue: parentIssue,
+      activeRunId: runId,
+      role: "worker",
+      phase: "issue_breakdown",
+    },
   );
   return result.plan;
 }
 
-function createdIssueRefForOperation(operation: IssueCreateWriteback): IssueBreakdownCreatedIssueRef {
+function createdIssueRefForOperation(
+  operation: IssueCreateWriteback,
+): IssueBreakdownCreatedIssueRef {
   const childNumber = operation.payload.proposedIssueIndex + 1;
   return {
     proposedIssueIndex: operation.payload.proposedIssueIndex,
@@ -9775,14 +12670,25 @@ class RunActivityHarness implements AgentHarness {
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.runs.push({ ctx, prompt });
-    yield { type: "session_started", sessionId: `fake-${ctx.issue.id}-${ctx.turnNumber}` };
+    yield {
+      type: "session_started",
+      sessionId: `fake-${ctx.issue.id}-${ctx.turnNumber}`,
+    };
     for (const event of this.events) yield event;
   }
 }
 
-function acpActivity(runId: string, sequence: number, overrides: Partial<RunActivityEvent>): RunActivityEvent {
+function acpActivity(
+  runId: string,
+  sequence: number,
+  overrides: Partial<RunActivityEvent>,
+): RunActivityEvent {
   const payload =
-    overrides.payload && typeof overrides.payload === "object" && !Array.isArray(overrides.payload) ? overrides.payload : {};
+    overrides.payload &&
+    typeof overrides.payload === "object" &&
+    !Array.isArray(overrides.payload)
+      ? overrides.payload
+      : {};
   return {
     eventId: `${runId}:activity:${sequence}`,
     runSessionId: `profile:acp-session-1:${runId}`,
@@ -9797,9 +12703,16 @@ function acpActivity(runId: string, sequence: number, overrides: Partial<RunActi
   } as RunActivityEvent;
 }
 
-async function runTerminalRunActivityScenario(root: string, terminal: "failed" | "cancelled") {
+async function runTerminalRunActivityScenario(
+  root: string,
+  terminal: "failed" | "cancelled",
+) {
   const config = testConfig(root);
-  const candidate = issue({ id: `issue-${terminal}`, identifier: `TEST-${terminal.toUpperCase()}`, state: "Todo" });
+  const candidate = issue({
+    id: `issue-${terminal}`,
+    identifier: `TEST-${terminal.toUpperCase()}`,
+    state: "Todo",
+  });
   let active = true;
   let refreshes = 0;
   const tracker: TrackerClient = {
@@ -9829,7 +12742,11 @@ async function runTerminalRunActivityScenario(root: string, terminal: "failed" |
             channel: "terminal",
             kind: "run_failed",
             text: "Run failed token=SECRET_TERMINAL_TOKEN",
-            payload: { reason: "provider_error", errorPreview: "Run failed token=SECRET_TERMINAL_TOKEN", redacted: true },
+            payload: {
+              reason: "provider_error",
+              errorPreview: "Run failed token=SECRET_TERMINAL_TOKEN",
+              redacted: true,
+            },
           }),
         }
       : {
@@ -9843,7 +12760,11 @@ async function runTerminalRunActivityScenario(root: string, terminal: "failed" |
           }),
         };
   const harness = new RunActivityHarness([terminalEvent]);
-  const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+  const workspaceManager = new WorkspaceManager({
+    workspace: config.workspace,
+    hooks: config.hooks,
+    logger,
+  });
   const orchestrator = new Orchestrator({
     config,
     tracker,
@@ -9855,8 +12776,14 @@ async function runTerminalRunActivityScenario(root: string, terminal: "failed" |
   });
 
   await orchestrator.refreshNow();
-  await waitFor(() => harness.runs.length === 1, `${terminal} run-activity harness dispatched`);
-  await waitFor(() => orchestrator.snapshot().counts.running === 0, `${terminal} run-activity harness exited`);
+  await waitFor(
+    () => harness.runs.length === 1,
+    `${terminal} run-activity harness dispatched`,
+  );
+  await waitFor(
+    () => orchestrator.snapshot().counts.running === 0,
+    `${terminal} run-activity harness exited`,
+  );
   await settleOrchestratorExit();
   await orchestrator.stop();
 
@@ -9866,11 +12793,17 @@ async function runTerminalRunActivityScenario(root: string, terminal: "failed" |
     run,
     transcript,
     eventTypes: transcript.events.map((event) => event.eventType),
-    projected: projectWebTranscript(transcript.events, { includeRunPrelude: false }),
+    projected: projectWebTranscript(transcript.events, {
+      includeRunPrelude: false,
+    }),
   };
 }
 
-async function waitFor(predicate: () => boolean, description = "condition", timeoutMs = 2_000): Promise<void> {
+async function waitFor(
+  predicate: () => boolean,
+  description = "condition",
+  timeoutMs = 2_000,
+): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     if (predicate()) return;
@@ -9879,7 +12812,11 @@ async function waitFor(predicate: () => boolean, description = "condition", time
   expect(predicate(), `Timed out waiting for ${description}`).toBe(true);
 }
 
-async function waitForAsync(predicate: () => Promise<boolean>, description = "condition", timeoutMs = 2_000): Promise<void> {
+async function waitForAsync(
+  predicate: () => Promise<boolean>,
+  description = "condition",
+  timeoutMs = 2_000,
+): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     if (await predicate()) return;
@@ -9888,7 +12825,11 @@ async function waitForAsync(predicate: () => Promise<boolean>, description = "co
   expect(await predicate(), `Timed out waiting for ${description}`).toBe(true);
 }
 
-async function waitForPendingApproval(store: FileOperatorApprovalStore, runId: string, timeoutMs = 2_000) {
+async function waitForPendingApproval(
+  store: FileOperatorApprovalStore,
+  runId: string,
+  timeoutMs = 2_000,
+) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     const pending = await store.findPendingForRun(runId);
@@ -9898,7 +12839,11 @@ async function waitForPendingApproval(store: FileOperatorApprovalStore, runId: s
   throw new Error(`Timed out waiting for pending approval on ${runId}`);
 }
 
-async function waitForRunRecord(store: FileRunTranscriptStore, runId: string, timeoutMs = 2_000) {
+async function waitForRunRecord(
+  store: FileRunTranscriptStore,
+  runId: string,
+  timeoutMs = 2_000,
+) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     try {
@@ -9912,7 +12857,11 @@ async function waitForRunRecord(store: FileRunTranscriptStore, runId: string, ti
   throw new Error(`Timed out waiting for run record ${runId}`);
 }
 
-async function waitForTerminalRunRecord(store: FileRunTranscriptStore, runId: string, timeoutMs = 2_000) {
+async function waitForTerminalRunRecord(
+  store: FileRunTranscriptStore,
+  runId: string,
+  timeoutMs = 2_000,
+) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     try {
@@ -9935,7 +12884,9 @@ async function expectReplaySucceededFromHandoff(
   runId: string,
   expected: Record<string, unknown> = {},
 ): Promise<void> {
-  const rebuilt = await new FileRunTranscriptStore(stateDir).rebuildRunFromTranscript(runId);
+  const rebuilt = await new FileRunTranscriptStore(
+    stateDir,
+  ).rebuildRunFromTranscript(runId);
   expect(rebuilt).toMatchObject({
     status: "succeeded",
     completedAt: expect.any(String),
@@ -9954,7 +12905,9 @@ async function expectReplayFailedFromPlanningFailure(
   error: string,
   expected: Record<string, unknown> = {},
 ): Promise<void> {
-  const rebuilt = await new FileRunTranscriptStore(stateDir).rebuildRunFromTranscript(runId);
+  const rebuilt = await new FileRunTranscriptStore(
+    stateDir,
+  ).rebuildRunFromTranscript(runId);
   expect(rebuilt).toMatchObject({
     status: "failed",
     completedAt: expect.any(String),
@@ -9982,7 +12935,11 @@ async function runAcceptedIssueBreakdownHandoffScenario(
   config.issueBreakdown.promptTemplate = "Plan {{ issue.identifier }}";
   config.issueBreakdown.planningLabels = ["planning"];
   config.issueBreakdown.maxPlanningFailures = 3;
-  const candidate = issue({ state: "Todo", labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+  const candidate = issue({
+    state: "Todo",
+    labels: ["planning"],
+    updatedAt: "2026-01-02T00:00:00Z",
+  });
   let active = true;
   const tracker: TrackerClient = {
     async fetchCandidateIssues() {
@@ -10009,7 +12966,11 @@ async function runAcceptedIssueBreakdownHandoffScenario(
   const orchestrator = new Orchestrator({
     config,
     tracker,
-    workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+    workspaceManager: new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    }),
     harness,
     logger,
     promptTemplate: "Work on {{ issue.identifier }}",
@@ -10018,10 +12979,16 @@ async function runAcceptedIssueBreakdownHandoffScenario(
   });
 
   await orchestrator.refreshNow();
-  await waitFor(() => harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown").length === 1);
+  await waitFor(
+    () =>
+      harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")
+        .length === 1,
+  );
   await waitFor(() => orchestrator.snapshot().counts.running === 0);
   await settleOrchestratorExit();
-  const planRunId = harness.runs.find((run) => run.ctx.runPhase === "issue_breakdown")?.runId ?? "";
+  const planRunId =
+    harness.runs.find((run) => run.ctx.runPhase === "issue_breakdown")?.runId ??
+    "";
   const lifecycle = await lifecycleStore.get(candidate.id);
 
   await expect(runStore.getRun(planRunId)).resolves.toMatchObject({
@@ -10040,7 +13007,9 @@ async function runAcceptedIssueBreakdownHandoffScenario(
   await orchestrator.refreshNow();
   await settleOrchestratorExit();
   await orchestrator.stop();
-  expect(harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown")).toHaveLength(1);
+  expect(
+    harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown"),
+  ).toHaveLength(1);
 
   return { runStore, planRunId, stateDir: config.workspace.stateDir };
 }
@@ -10068,7 +13037,10 @@ function emptyTracker(): TrackerClient {
   };
 }
 
-function mergePolicyChainContext(iteration: number, parent: IssueHistorySnapshot | null = null) {
+function mergePolicyChainContext(
+  iteration: number,
+  parent: IssueHistorySnapshot | null = null,
+) {
   return {
     kind: "merge_policy_chain" as const,
     requestId: `transition-request-${iteration}`,
@@ -10083,9 +13055,14 @@ function mergePolicyChainContext(iteration: number, parent: IssueHistorySnapshot
   };
 }
 
-function mergePolicyRulesetSnapshot(overrides: Partial<IssueCurrentStateSnapshot> = {}): IssueCurrentStateSnapshot {
+function mergePolicyRulesetSnapshot(
+  overrides: Partial<IssueCurrentStateSnapshot> = {},
+): IssueCurrentStateSnapshot {
   const now = "2026-01-01T00:00:00.000Z";
-  const candidate = issue({ state: "Ready to Merge", branchName: "symphony/TEST-1" });
+  const candidate = issue({
+    state: "Ready to Merge",
+    branchName: "symphony/TEST-1",
+  });
   return {
     version: 1,
     issueId: candidate.id,
@@ -10139,6 +13116,7 @@ function mergePolicyRulesetSnapshot(overrides: Partial<IssueCurrentStateSnapshot
     mergeGate: null,
     mergeConflict: null,
     lifecycleSummaryCiStatus: null,
+    lifecyclePersistenceAvailable: true,
     mergePolicyMode: "gated",
     mergePolicySourceStates: ["Ready to Merge"],
     mergePolicyDoneState: "Done",
@@ -10226,11 +13204,18 @@ function mergePolicyLoopHarness(
 ) {
   const config = mergePolicyOrchestratorConfig(root);
   const logger = new StructuredLogger((line) => logs.push(line));
-  const candidate = issue({ state: "Ready to Merge", branchName: "symphony/TEST-1" });
+  const candidate = issue({
+    state: "Ready to Merge",
+    branchName: "symphony/TEST-1",
+  });
   const orchestrator = new Orchestrator({
     config,
     tracker: emptyTracker(),
-    workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
+    workspaceManager: new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    }),
     harness: new FakeHarness(),
     logger,
     promptTemplate: "Work on {{ issue.identifier }}",
@@ -10240,7 +13225,9 @@ function mergePolicyLoopHarness(
     processMergePolicyTransitionCandidate(issue: Issue): Promise<void>;
   };
   let responseIndex = 0;
-  requester.requestTransition = vi.fn(async () => responses[Math.min(responseIndex++, responses.length - 1)]);
+  requester.requestTransition = vi.fn(
+    async () => responses[Math.min(responseIndex++, responses.length - 1)],
+  );
   return { candidate, orchestrator, requester };
 }
 
@@ -10249,9 +13236,17 @@ class BlockingHarness implements AgentHarness {
   readonly stoppedRunIds: string[] = [];
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
-    yield { type: "session_started", sessionId: "session-123", runId: "run-123" };
+    yield {
+      type: "session_started",
+      sessionId: "session-123",
+      runId: "run-123",
+    };
     if (!ctx.abortSignal.aborted) {
-      await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+      await new Promise<void>((resolve) =>
+        ctx.abortSignal.addEventListener("abort", () => resolve(), {
+          once: true,
+        }),
+      );
     }
     yield { type: "cancelled" };
   }
@@ -10270,7 +13265,11 @@ class HeldCancellationHarness implements AgentHarness {
   });
 
   async *run(): AsyncIterable<AgentEvent> {
-    yield { type: "session_started", sessionId: "session-123", runId: "run-123" };
+    yield {
+      type: "session_started",
+      sessionId: "session-123",
+      runId: "run-123",
+    };
     await this.released;
     yield { type: "cancelled" };
   }
@@ -10293,7 +13292,11 @@ class FailingStopHarness implements AgentHarness {
   });
 
   async *run(): AsyncIterable<AgentEvent> {
-    yield { type: "session_started", sessionId: "session-failing-stop", runId: "run-failing-stop" };
+    yield {
+      type: "session_started",
+      sessionId: "session-failing-stop",
+      runId: "run-failing-stop",
+    };
     yield { type: "progress", message: "working", activitySource: "stream" };
     await this.released;
     yield { type: "cancelled" };
@@ -10317,7 +13320,11 @@ class StalledAbortHarness implements AgentHarness {
   });
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
-    yield { type: "session_started", sessionId: "session-stalled", runId: "run-stalled" };
+    yield {
+      type: "session_started",
+      sessionId: "session-stalled",
+      runId: "run-stalled",
+    };
     await this.released;
     if (ctx.abortSignal.aborted) {
       yield { type: "cancelled" };
@@ -10346,7 +13353,11 @@ class PreSessionCancellationHarness implements AgentHarness {
   async *run(): AsyncIterable<AgentEvent> {
     this.resolveStarted();
     await this.released;
-    yield { type: "session_started", sessionId: "session-pre", runId: "run-pre" };
+    yield {
+      type: "session_started",
+      sessionId: "session-pre",
+      runId: "run-pre",
+    };
     yield { type: "cancelled" };
   }
 
@@ -10368,9 +13379,17 @@ class ServiceStopAbortHarness implements AgentHarness {
   });
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
-    yield { type: "session_started", sessionId: "session-service-stop", runId: "run-service-stop" };
+    yield {
+      type: "session_started",
+      sessionId: "session-service-stop",
+      runId: "run-service-stop",
+    };
     if (!ctx.abortSignal.aborted) {
-      await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+      await new Promise<void>((resolve) =>
+        ctx.abortSignal.addEventListener("abort", () => resolve(), {
+          once: true,
+        }),
+      );
     }
     await this.released;
     throw new Error("service stop abort");
@@ -10403,7 +13422,11 @@ class CursorPromptHarness implements AgentHarness {
 
   async *run(_ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.prompts.push(prompt);
-    yield { type: "session_started", sessionId: "cursor-session-1", runId: "cursor-run-1" };
+    yield {
+      type: "session_started",
+      sessionId: "cursor-session-1",
+      runId: "cursor-run-1",
+    };
     yield { type: "completed" };
   }
 }
@@ -10415,14 +13438,22 @@ class NonMcpHarness implements AgentHarness {
 
   async *run(_ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.prompts.push(prompt);
-    yield { type: "session_started", sessionId: "no-mcp-session", runId: "no-mcp-run" };
+    yield {
+      type: "session_started",
+      sessionId: "no-mcp-session",
+      runId: "no-mcp-run",
+    };
     yield { type: "completed" };
   }
 }
 
 class ManualDispatchRecordingHarness implements AgentHarness {
   readonly id = "manual-dispatch-recording";
-  readonly capabilities = { continuation: true, mcpHandoff: true, ephemeralSystemPrompt: true };
+  readonly capabilities = {
+    continuation: true,
+    mcpHandoff: true,
+    ephemeralSystemPrompt: true,
+  };
   readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
 
   constructor(
@@ -10447,7 +13478,13 @@ class ManualDispatchRecordingHarness implements AgentHarness {
           issueId: ctx.issue.id,
           summary: "Manual worker dispatch completed.",
           validationEvidence: ["manual dispatch test"],
-          acceptanceChecklist: [{ text: "Manual dispatch started the requested worker stage.", satisfied: true, evidence: "test" }],
+          acceptanceChecklist: [
+            {
+              text: "Manual dispatch started the requested worker stage.",
+              satisfied: true,
+              evidence: "test",
+            },
+          ],
           changedFiles: [],
           branchName: ctx.workspace.gitBranchName ?? ctx.issue.branchName,
           pullRequest: null,
@@ -10462,7 +13499,9 @@ class ManualDispatchRecordingHarness implements AgentHarness {
           workspacePath: ctx.workspace.path,
           workspace: ctx.workspace,
           phase: "implementation",
-          ...(ctx.manualDispatchIgnoreState === true ? { ignoreStateGate: true } : {}),
+          ...(ctx.manualDispatchIgnoreState === true
+            ? { ignoreStateGate: true }
+            : {}),
         },
       );
     }
@@ -10472,15 +13511,25 @@ class ManualDispatchRecordingHarness implements AgentHarness {
 
 class LifecycleSnapshotHarness implements AgentHarness {
   readonly id = "lifecycle-snapshot";
-  readonly capabilities = { continuation: true, mcpHandoff: true, ephemeralSystemPrompt: true };
+  readonly capabilities = {
+    continuation: true,
+    mcpHandoff: true,
+    ephemeralSystemPrompt: true,
+  };
   readonly runs: AgentRunContext[] = [];
-  readonly snapshots: Array<Awaited<ReturnType<FileIssueLifecycleStore["get"]>>> = [];
+  readonly snapshots: Array<
+    Awaited<ReturnType<FileIssueLifecycleStore["get"]>>
+  > = [];
 
   constructor(private readonly lifecycleStore: FileIssueLifecycleStore) {}
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
     this.runs.push(ctx);
-    yield { type: "session_started", sessionId: "snapshot-session-1", runId: "snapshot-run-1" };
+    yield {
+      type: "session_started",
+      sessionId: "snapshot-session-1",
+      runId: "snapshot-run-1",
+    };
     this.snapshots.push(await this.lifecycleStore.get(ctx.issue.id));
     yield { type: "completed" };
   }
@@ -10511,7 +13560,14 @@ class FailingRequiredCheckMergeClient implements MergePolicyGitHubClient {
   }
 
   async getRequiredCheckResults() {
-    return [{ name: "test", status: "failure" as const, conclusion: "failure", url: "https://ci.test/test" }];
+    return [
+      {
+        name: "test",
+        status: "failure" as const,
+        conclusion: "failure",
+        url: "https://ci.test/test",
+      },
+    ];
   }
 
   async mergePullRequest(): Promise<never> {
@@ -10536,9 +13592,16 @@ class ProviderLimitThenCompleteHarness implements AgentHarness {
   readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
 
   constructor(
-    private readonly limit: { providerId: string; model?: string | null; resumeAt?: string | null },
+    private readonly limit: {
+      providerId: string;
+      model?: string | null;
+      resumeAt?: string | null;
+    },
     readonly id = "hermes",
-    private readonly sessionRuntimeMetadata: { providerId?: string | null; model?: string | null } = {},
+    private readonly sessionRuntimeMetadata: {
+      providerId?: string | null;
+      model?: string | null;
+    } = {},
   ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
@@ -10547,8 +13610,12 @@ class ProviderLimitThenCompleteHarness implements AgentHarness {
       type: "session_started",
       sessionId: `provider-limit-${this.runs.length}`,
       runId: `provider-limit-run-${this.runs.length}`,
-      ...(this.sessionRuntimeMetadata.providerId === undefined ? {} : { providerId: this.sessionRuntimeMetadata.providerId }),
-      ...(this.sessionRuntimeMetadata.model === undefined ? {} : { model: this.sessionRuntimeMetadata.model }),
+      ...(this.sessionRuntimeMetadata.providerId === undefined
+        ? {}
+        : { providerId: this.sessionRuntimeMetadata.providerId }),
+      ...(this.sessionRuntimeMetadata.model === undefined
+        ? {}
+        : { model: this.sessionRuntimeMetadata.model }),
     };
     if (this.runs.length === 1) {
       yield {
@@ -10586,7 +13653,10 @@ class IssueBreakdownAcceptingHarness implements AgentHarness {
     const runId = `${ctx.runPhase ?? "implementation"}-run-${this.runs.length}`;
     yield { type: "session_started", sessionId: `${runId}-session`, runId };
     if (ctx.runPhase === "issue_breakdown") {
-      await new IssueBreakdownPlanService({ config: ctx.config, lifecycleStore: this.lifecycleStore }).submit_issue_breakdown_plan(
+      await new IssueBreakdownPlanService({
+        config: ctx.config,
+        lifecycleStore: this.lifecycleStore,
+      }).submit_issue_breakdown_plan(
         {
           runId,
           issueId: ctx.issue.id,
@@ -10648,7 +13718,8 @@ class IssueTriageAcceptingHarness implements AgentHarness {
               confidence: "high",
               summary: "Repeated review failures exposed hidden child scope.",
               evidence: ["blockedReason=max reviewer failures reached (3/3)"],
-              recommendedAction: "Decompose the hidden scope into blocking child issues.",
+              recommendedAction:
+                "Decompose the hidden scope into blocking child issues.",
             },
           ],
           idempotencyKey: runId,
@@ -10666,11 +13737,19 @@ class IssueTriageAcceptingHarness implements AgentHarness {
   }
 }
 
-type IssueBreakdownHandoffTerminal = { type: "completed" } | { type: "failed"; error: string } | { type: "cancelled" } | "throw";
+type IssueBreakdownHandoffTerminal =
+  | { type: "completed" }
+  | { type: "failed"; error: string }
+  | { type: "cancelled" }
+  | "throw";
 
 class IssueBreakdownHandoffHarness implements AgentHarness {
   readonly id = "issue-breakdown-handoff";
-  readonly runs: Array<{ ctx: AgentRunContext; prompt: string; runId: string }> = [];
+  readonly runs: Array<{
+    ctx: AgentRunContext;
+    prompt: string;
+    runId: string;
+  }> = [];
 
   constructor(
     private readonly lifecycleStore: FileIssueLifecycleStore,
@@ -10686,7 +13765,10 @@ class IssueBreakdownHandoffHarness implements AgentHarness {
       return;
     }
 
-    await new IssueBreakdownPlanService({ config: ctx.config, lifecycleStore: this.lifecycleStore }).submit_issue_breakdown_plan(
+    await new IssueBreakdownPlanService({
+      config: ctx.config,
+      lifecycleStore: this.lifecycleStore,
+    }).submit_issue_breakdown_plan(
       {
         runId,
         issueId: ctx.issue.id,
@@ -10733,13 +13815,18 @@ class IssueBreakdownNoPlanTerminalHarness implements AgentHarness {
   readonly id = "issue-breakdown-no-plan-terminal";
   readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
 
-  constructor(private readonly terminal: Extract<AgentEvent, { type: "failed" }> | "throw") {}
+  constructor(
+    private readonly terminal:
+      | Extract<AgentEvent, { type: "failed" }>
+      | "throw",
+  ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.runs.push({ ctx, prompt });
     const runId = `no-plan-terminal-run-${this.runs.length}`;
     yield { type: "session_started", sessionId: `${runId}-session`, runId };
-    if (this.terminal === "throw") throw new Error("planning harness threw before submitting a plan");
+    if (this.terminal === "throw")
+      throw new Error("planning harness threw before submitting a plan");
     yield this.terminal;
   }
 }
@@ -10750,7 +13837,10 @@ class TokenSequenceHarness implements AgentHarness {
 
   constructor(private readonly tokenEvents: TokenCounts[]) {}
 
-  async *run(_ctx: AgentRunContext, _prompt: string): AsyncIterable<AgentEvent> {
+  async *run(
+    _ctx: AgentRunContext,
+    _prompt: string,
+  ): AsyncIterable<AgentEvent> {
     const runNumber = this.runs.length + 1;
     const runId = `token-run-${runNumber}`;
     this.runs.push(runId);
@@ -10765,15 +13855,29 @@ class DiagnosticActivityHarness implements AgentHarness {
   readonly id = "diagnostic-activity";
 
   async *run(): AsyncIterable<AgentEvent> {
-    yield { type: "session_started", sessionId: "diagnostic-session-1", runId: "diagnostic-run-1" };
-    yield { type: "progress", activitySource: "tool", message: "terminal tool completed" };
+    yield {
+      type: "session_started",
+      sessionId: "diagnostic-session-1",
+      runId: "diagnostic-run-1",
+    };
+    yield {
+      type: "progress",
+      activitySource: "tool",
+      message: "terminal tool completed",
+    };
     yield {
       type: "run_diagnostic",
       code: "hermes_gateway_protocol_error",
       message: "Hermes gateway diagnostic token=SECRET_DIAGNOSTIC_TOKEN",
-      payload: { preview: "malformed gateway line", rawPayload: { token: "SECRET_DIAGNOSTIC_TOKEN" } },
+      payload: {
+        preview: "malformed gateway line",
+        rawPayload: { token: "SECRET_DIAGNOSTIC_TOKEN" },
+      },
     };
-    yield { type: "tokens", tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 } };
+    yield {
+      type: "tokens",
+      tokens: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+    };
     yield {
       type: "rate_limits",
       payload: {
@@ -10818,7 +13922,10 @@ class InfraFailureHarness implements AgentHarness {
       message: "Hermes gateway exited before the run completed (code 0)",
       payload: { runId, gatewayExitCode: 0 },
     };
-    yield { type: "failed", error: "Hermes gateway exited before the run completed (code 0)" };
+    yield {
+      type: "failed",
+      error: "Hermes gateway exited before the run completed (code 0)",
+    };
   }
 }
 
@@ -10839,7 +13946,11 @@ class RejectedCompletionReportHarness implements AgentHarness {
     const turn = this.prompts.length + 1;
     const runId = `reject-run-${turn}`;
     this.prompts.push(prompt);
-    yield { type: "session_started", sessionId: `reject-session-${turn}`, runId };
+    yield {
+      type: "session_started",
+      sessionId: `reject-session-${turn}`,
+      runId,
+    };
     if (turn === 1) {
       try {
         await new CompletionReportService({
@@ -10852,12 +13963,15 @@ class RejectedCompletionReportHarness implements AgentHarness {
             runId,
             issueId: ctx.issue.id,
             summary: "Implemented part of the requested handoff.",
-            validationEvidence: ["Focused validation could not run in this worker environment."],
+            validationEvidence: [
+              "Focused validation could not run in this worker environment.",
+            ],
             acceptanceChecklist: [
               {
                 text: "REQ-1 Required validation is complete.",
                 satisfied: false,
-                evidence: "Focused validation could not run in this worker environment.",
+                evidence:
+                  "Focused validation could not run in this worker environment.",
               },
             ],
             changedFiles: ["src/core/CompletionReportService.ts"],
@@ -10877,7 +13991,11 @@ class RejectedCompletionReportHarness implements AgentHarness {
           },
         );
       } catch (error) {
-        if (!(error instanceof SymphonyError) || error.code !== "invalid_request") throw error;
+        if (
+          !(error instanceof SymphonyError) ||
+          error.code !== "invalid_request"
+        )
+          throw error;
       }
     }
     yield { type: "completed" };
@@ -10893,23 +14011,36 @@ class ReportingHarness implements AgentHarness {
     private readonly outboxStore: FileWritebackOutboxStore,
     private readonly runStore: FileRunTranscriptStore,
     private readonly publisher: CompletionReportPullRequestPublisher,
-    private readonly terminalEvent: ReportingHarnessTerminal = { type: "completed" },
+    private readonly terminalEvent: ReportingHarnessTerminal = {
+      type: "completed",
+    },
     private readonly operatorApproval?: OperatorApprovalService,
-    private readonly writebackProcessor?: Pick<WritebackProcessor, "processDue">,
+    private readonly writebackProcessor?: Pick<
+      WritebackProcessor,
+      "processDue"
+    >,
   ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.prompts.push(prompt);
-    yield { type: "session_started", sessionId: "report-session-1", runId: "report-run-1" };
+    yield {
+      type: "session_started",
+      sessionId: "report-session-1",
+      runId: "report-run-1",
+    };
     try {
       await new CompletionReportService({
         config: ctx.config,
         lifecycleStore: this.lifecycleStore,
         writebackOutbox: this.outboxStore,
-        ...(this.writebackProcessor ? { writebackProcessor: this.writebackProcessor } : {}),
+        ...(this.writebackProcessor
+          ? { writebackProcessor: this.writebackProcessor }
+          : {}),
         runStore: this.runStore,
         pullRequestPublisher: this.publisher,
-        ...(this.operatorApproval ? { operatorApproval: this.operatorApproval } : {}),
+        ...(this.operatorApproval
+          ? { operatorApproval: this.operatorApproval }
+          : {}),
       }).submitCompletionReport(
         {
           runId: "report-run-1",
@@ -10944,7 +14075,10 @@ class ReportingHarness implements AgentHarness {
         yield this.terminalEvent;
         return;
       }
-      yield { type: "failed", error: error instanceof Error ? error.message : String(error) };
+      yield {
+        type: "failed",
+        error: error instanceof Error ? error.message : String(error),
+      };
       return;
     }
     if (this.terminalEvent === "throw") {
@@ -10965,8 +14099,12 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
   ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
-    const roleRunNumber = this.runs.filter((run) => run.role === ctx.role).length + 1;
-    const runId = ctx.role === "reviewer" ? `smoke-review-run-${roleRunNumber}` : `smoke-worker-run-${roleRunNumber}`;
+    const roleRunNumber =
+      this.runs.filter((run) => run.role === ctx.role).length + 1;
+    const runId =
+      ctx.role === "reviewer"
+        ? `smoke-review-run-${roleRunNumber}`
+        : `smoke-worker-run-${roleRunNumber}`;
     this.runs.push({ role: ctx.role, runId, prompt });
     yield { type: "session_started", sessionId: `${runId}-session`, runId };
 
@@ -10976,11 +14114,18 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
       await this.submitCompletionReport(ctx, runId, roleRunNumber);
     }
 
-    yield { type: "progress", message: `${ctx.role} submitted manufactured review-loop evidence.` };
+    yield {
+      type: "progress",
+      message: `${ctx.role} submitted manufactured review-loop evidence.`,
+    };
     yield { type: "completed" };
   }
 
-  private async submitCompletionReport(ctx: AgentRunContext, runId: string, runNumber: number): Promise<void> {
+  private async submitCompletionReport(
+    ctx: AgentRunContext,
+    runId: string,
+    runNumber: number,
+  ): Promise<void> {
     await new CompletionReportService({
       config: ctx.config,
       lifecycleStore: this.lifecycleStore,
@@ -10999,7 +14144,10 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
           {
             text: "Manufactured fail/revise/pass smoke is covered.",
             satisfied: true,
-            evidence: runNumber === 1 ? "Initial manufactured implementation." : "Revision worker handled reviewer feedback.",
+            evidence:
+              runNumber === 1
+                ? "Initial manufactured implementation."
+                : "Revision worker handled reviewer feedback.",
           },
         ],
         changedFiles: ["tests/orchestrator.test.ts"],
@@ -11025,7 +14173,11 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
     );
   }
 
-  private async submitReviewVerdict(ctx: AgentRunContext, runId: string, runNumber: number): Promise<void> {
+  private async submitReviewVerdict(
+    ctx: AgentRunContext,
+    runId: string,
+    runNumber: number,
+  ): Promise<void> {
     if (runNumber > 1) {
       await appendApprovalFeedback(this.lifecycleStore, ctx.issue, runId);
     }
@@ -11044,7 +14196,8 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
               {
                 text: "Revision worker handles the manufactured reviewer feedback.",
                 satisfied: false,
-                evidence: "First worker intentionally leaves the manufactured revision outstanding.",
+                evidence:
+                  "First worker intentionally leaves the manufactured revision outstanding.",
               },
             ],
             findings: ["Add the manufactured smoke revision."],
@@ -11059,7 +14212,8 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
               {
                 text: "Revision worker handles the manufactured reviewer feedback.",
                 satisfied: true,
-                evidence: "Second worker prompt included and addressed the manufactured revision.",
+                evidence:
+                  "Second worker prompt included and addressed the manufactured revision.",
               },
             ],
             findings: [],
@@ -11112,7 +14266,9 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
               },
             ],
             findings: ["Add reviewer MCP integration."],
-            evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-1"],
+            evidence: [
+              "https://github.com/acme/symphony/pull/42#pullrequestreview-1",
+            ],
             idempotencyKey: "review-verdict-fail-1",
           }
         : {
@@ -11127,7 +14283,9 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
               },
             ],
             findings: [],
-            evidence: ["https://github.com/acme/symphony/pull/42#pullrequestreview-2"],
+            evidence: [
+              "https://github.com/acme/symphony/pull/42#pullrequestreview-2",
+            ],
             idempotencyKey: "review-verdict-pass-1",
           },
       {
@@ -11145,13 +14303,20 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
 class MissingReviewVerdictThenRepairHarness implements AgentHarness {
   readonly id = "hermes";
   readonly capabilities = { continuation: true, mcpHandoff: true };
-  readonly runs: Array<{ ctx: AgentRunContext; prompt: string; runId: string }> = [];
+  readonly runs: Array<{
+    ctx: AgentRunContext;
+    prompt: string;
+    runId: string;
+  }> = [];
 
   constructor(
     private readonly lifecycleStore: FileIssueLifecycleStore,
     private readonly outboxStore: FileWritebackOutboxStore,
     private readonly runStore: FileRunTranscriptStore,
-    private readonly options: { submitRepairVerdict?: boolean; writeSourceResumeMetadata?: boolean } = {},
+    private readonly options: {
+      submitRepairVerdict?: boolean;
+      writeSourceResumeMetadata?: boolean;
+    } = {},
   ) {}
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
@@ -11163,8 +14328,14 @@ class MissingReviewVerdictThenRepairHarness implements AgentHarness {
       await this.runStore.updateRun(runId, {
         metadata: {
           hermesProfileKey: "review-source-profile",
-          hermesProfileDir: path.join(ctx.config.hermes.stateDir, "profiles", "review-source-profile"),
-          hermesSessionKey: isRepair ? "review-repair-session-key" : "review-source-session-key",
+          hermesProfileDir: path.join(
+            ctx.config.hermes.stateDir,
+            "profiles",
+            "review-source-profile",
+          ),
+          hermesSessionKey: isRepair
+            ? "review-repair-session-key"
+            : "review-source-session-key",
           hermesResumeSourceRunId: ctx.hermesResume?.sourceRunId ?? null,
           hermesResumeReason: ctx.hermesResume?.reason ?? null,
           handoffRepairSourceRunId: ctx.handoffRepair?.sourceRunId ?? null,
@@ -11188,7 +14359,8 @@ class MissingReviewVerdictThenRepairHarness implements AgentHarness {
             {
               text: "Reviewer handoff repair submits the missing verdict.",
               satisfied: false,
-              evidence: "Repair run resumed the reviewer session and submitted this verdict.",
+              evidence:
+                "Repair run resumed the reviewer session and submitted this verdict.",
             },
           ],
           findings: ["Repair path submitted the previously missing verdict."],
@@ -11215,7 +14387,11 @@ class ContextRecordingHermesHarness implements AgentHarness {
 
   async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
     this.runs.push({ ctx, prompt });
-    yield { type: "session_started", sessionId: `context-session-${this.runs.length}`, runId: `context-run-${this.runs.length}` };
+    yield {
+      type: "session_started",
+      sessionId: `context-session-${this.runs.length}`,
+      runId: `context-run-${this.runs.length}`,
+    };
     yield { type: "completed" };
   }
 }
@@ -11227,9 +14403,17 @@ class BlockingRecordingHarness implements AgentHarness {
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
     this.runs.push(ctx);
-    yield { type: "session_started", sessionId: `blocking-session-${this.runs.length}`, runId: `blocking-run-${this.runs.length}` };
+    yield {
+      type: "session_started",
+      sessionId: `blocking-session-${this.runs.length}`,
+      runId: `blocking-run-${this.runs.length}`,
+    };
     if (!ctx.abortSignal.aborted) {
-      await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }));
+      await new Promise<void>((resolve) =>
+        ctx.abortSignal.addEventListener("abort", () => resolve(), {
+          once: true,
+        }),
+      );
     }
     yield { type: "completed" };
   }
@@ -11241,11 +14425,17 @@ class FakeOperatorChatHarness implements AgentHarness {
 
   constructor(private readonly events: AgentEvent[]) {}
 
-  async *run(_ctx: AgentRunContext, _prompt: string): AsyncIterable<AgentEvent> {
+  async *run(
+    _ctx: AgentRunContext,
+    _prompt: string,
+  ): AsyncIterable<AgentEvent> {
     throw new Error("issue run is not implemented by FakeOperatorChatHarness");
   }
 
-  async *runOperatorChat(ctx: OperatorChatRunContext, _prompt: string): AsyncIterable<AgentEvent> {
+  async *runOperatorChat(
+    ctx: OperatorChatRunContext,
+    _prompt: string,
+  ): AsyncIterable<AgentEvent> {
     this.operatorContexts.push(ctx);
     for (const event of this.events) yield event;
   }
@@ -11265,7 +14455,10 @@ function idleTracker(): TrackerClient {
   };
 }
 
-async function eventually(assertion: () => Promise<void> | void, timeoutMs = 1000): Promise<void> {
+async function eventually(
+  assertion: () => Promise<void> | void,
+  timeoutMs = 1000,
+): Promise<void> {
   const startedAt = Date.now();
   let lastError: unknown = null;
   while (Date.now() - startedAt < timeoutMs) {
@@ -11283,7 +14476,9 @@ async function eventually(assertion: () => Promise<void> | void, timeoutMs = 100
 class FakeCompletionReportPublisher implements CompletionReportPullRequestPublisher {
   readonly inputs: CompletionReportPullRequestPublicationInput[] = [];
 
-  constructor(private readonly publication: CompletionReportPullRequestPublication) {}
+  constructor(
+    private readonly publication: CompletionReportPullRequestPublication,
+  ) {}
 
   async publishPullRequest(
     input: CompletionReportPullRequestPublicationInput,
@@ -11317,9 +14512,13 @@ class FakePullRequestReviewEvidenceClient implements PullRequestReviewEvidenceCl
 
   constructor(private readonly evidence: RemotePullRequestReviewEvidence[]) {}
 
-  async listPullRequestReviewEvidence(input: { pullRequestNumber: number }): Promise<RemotePullRequestReviewEvidence[]> {
+  async listPullRequestReviewEvidence(input: {
+    pullRequestNumber: number;
+  }): Promise<RemotePullRequestReviewEvidence[]> {
     this.calls.push(input.pullRequestNumber);
-    return this.evidence.filter((item) => item.pullRequestNumber === input.pullRequestNumber);
+    return this.evidence.filter(
+      (item) => item.pullRequestNumber === input.pullRequestNumber,
+    );
   }
 }
 
@@ -11331,25 +14530,36 @@ class StateChangingWriter implements TrackerWriter {
 
   constructor(private readonly setState: (state: string) => void) {}
 
-  async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+  async transitionIssueState(
+    input: TrackerTransitionInput,
+  ): Promise<TrackerWriteResult> {
     this.transitions.push(input);
     this.setState(input.toState);
     return { status: "applied" };
   }
 
-  async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+  async createIssueComment(
+    input: TrackerCommentInput,
+  ): Promise<TrackerWriteResult> {
     this.comments.push(input);
     return { status: "applied" };
   }
 
-  async createIssueFromPlan(input: TrackerIssueCreateInput): Promise<TrackerWriteResult> {
+  async createIssueFromPlan(
+    input: TrackerIssueCreateInput,
+  ): Promise<TrackerWriteResult> {
     this.issueCreates.push(input);
-    const childNumber = (input.proposedIssueIndex ?? this.issueCreates.length - 1) + 1;
+    const childNumber =
+      (input.proposedIssueIndex ?? this.issueCreates.length - 1) + 1;
     return {
       status: "applied",
       evidence: {
         kind: "issue_create",
-        issue: { id: `child-${childNumber}`, identifier: `TEST-${childNumber + 1}`, url: `https://linear.test/TEST-${childNumber + 1}` },
+        issue: {
+          id: `child-${childNumber}`,
+          identifier: `TEST-${childNumber + 1}`,
+          url: `https://linear.test/TEST-${childNumber + 1}`,
+        },
         issueCreateStatus: "created",
         parentIssueId: input.parentIssueId,
         dedupeKey: input.dedupeKey,
@@ -11359,7 +14569,9 @@ class StateChangingWriter implements TrackerWriter {
     };
   }
 
-  async createIssueRelation(input: TrackerIssueRelationInput): Promise<TrackerWriteResult> {
+  async createIssueRelation(
+    input: TrackerIssueRelationInput,
+  ): Promise<TrackerWriteResult> {
     this.issueRelations.push(input);
     return { status: "applied" };
   }
@@ -11369,17 +14581,23 @@ class FailingWriter implements TrackerWriter {
   readonly transitions: TrackerTransitionInput[] = [];
   readonly comments: TrackerCommentInput[] = [];
 
-  async transitionIssueState(_input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+  async transitionIssueState(
+    _input: TrackerTransitionInput,
+  ): Promise<TrackerWriteResult> {
     throw new Error("linear transition failed");
   }
 
-  async createIssueComment(_input: TrackerCommentInput): Promise<TrackerWriteResult> {
+  async createIssueComment(
+    _input: TrackerCommentInput,
+  ): Promise<TrackerWriteResult> {
     throw new Error("linear comment failed");
   }
 }
 
 class PublicationApprovalCommentFailingWriter extends StateChangingWriter {
-  async createIssueComment(input: TrackerCommentInput): Promise<TrackerWriteResult> {
+  async createIssueComment(
+    input: TrackerCommentInput,
+  ): Promise<TrackerWriteResult> {
     if (input.dedupeKey?.includes("publication-approval-pending")) {
       throw new Error("linear pending approval comment failed");
     }
@@ -11388,7 +14606,9 @@ class PublicationApprovalCommentFailingWriter extends StateChangingWriter {
 }
 
 class PublicationApprovalTransitionFailingWriter extends StateChangingWriter {
-  async transitionIssueState(input: TrackerTransitionInput): Promise<TrackerWriteResult> {
+  async transitionIssueState(
+    input: TrackerTransitionInput,
+  ): Promise<TrackerWriteResult> {
     if (
       input.toState === "Blocked" &&
       (input.reason?.includes("operator approval for PR publication") ||

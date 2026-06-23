@@ -22,7 +22,11 @@ describe("IssueOrchestrationEngine", () => {
         priority: 10,
         evaluate() {
           calls.push("first");
-          return { transitionKind: "dispatch_worker", role: "worker", runPhase: "implementation" };
+          return {
+            transitionKind: "dispatch_worker",
+            role: "worker",
+            runPhase: "implementation",
+          };
         },
       },
     ]);
@@ -51,7 +55,10 @@ describe("IssueOrchestrationEngine", () => {
         id: "bad",
         priority: 1,
         evaluate() {
-          return { transitionKind: "noop", transitionRequest: { reason: "nested" } };
+          return {
+            transitionKind: "noop",
+            transitionRequest: { reason: "nested" },
+          };
         },
       },
     ]);
@@ -65,7 +72,12 @@ describe("IssueOrchestrationEngine", () => {
         id: "dispatch.worker",
         priority: 10,
         evaluate() {
-          return { transitionKind: "dispatch_worker", role: "worker", runPhase: "implementation", reason: "worker_dispatch" };
+          return {
+            transitionKind: "dispatch_worker",
+            role: "worker",
+            runPhase: "implementation",
+            reason: "worker_dispatch",
+          };
         },
       },
     ]);
@@ -185,6 +197,7 @@ function snapshot(): IssueCurrentStateSnapshot {
     mergeGate: null,
     mergeConflict: null,
     lifecycleSummaryCiStatus: null,
+    lifecyclePersistenceAvailable: false,
     mergePolicyMode: "manual",
     mergePolicySourceStates: [],
     mergePolicyDoneState: null,

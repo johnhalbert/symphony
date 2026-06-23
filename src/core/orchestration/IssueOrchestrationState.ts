@@ -4,6 +4,7 @@ import type { AgentHandoffRepairKind } from "../harness/AgentHarness.js";
 import type { MergePolicyObservation } from "../merge/MergePolicyService.js";
 import type {
   IssueCompletionReportRecord,
+  IssueLifecyclePatch,
   IssueMergeConflictMetadata,
   IssueMergeGateResultRecord,
   IssueMergeGateState,
@@ -13,9 +14,18 @@ import type {
   IssueTriageBlockerRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import type { RunRecord } from "../persistence/RunTranscriptStore.js";
-import type { AgentRunPhase, AgentRunKind, AgentRunRole, Issue, TokenCounts } from "../types.js";
+import type {
+  AgentRunPhase,
+  AgentRunKind,
+  AgentRunRole,
+  Issue,
+  TokenCounts,
+} from "../types.js";
 
-export type IssueTriggerType = "orchestrator.tick" | "manual.cli_agent_run" | "runtime.requested";
+export type IssueTriggerType =
+  | "orchestrator.tick"
+  | "manual.cli_agent_run"
+  | "runtime.requested";
 export type IssueTriggerSource = "orchestrator" | "manual_cli" | "transition";
 
 export type IssueTransitionKind =
@@ -65,7 +75,14 @@ export type IssueTransitionKind =
   | "noop";
 
 export type IssueHistorySnapshotKind = "transition" | "evidence";
-export type IssueEvidenceKind = "run" | "lifecycle" | "writeback" | "approval" | "workspace" | "tracker" | "harness";
+export type IssueEvidenceKind =
+  | "run"
+  | "lifecycle"
+  | "writeback"
+  | "approval"
+  | "workspace"
+  | "tracker"
+  | "harness";
 
 export interface TransitionRequestContextEnvelope<K extends string, P> {
   kind: K;
@@ -76,48 +93,52 @@ export interface TransitionRequestContextEnvelope<K extends string, P> {
   payload: P;
 }
 
-export type MergePolicyChainTransitionRequestContext = TransitionRequestContextEnvelope<
-  "merge_policy_chain",
-  {
-    chainId: string;
-    iteration: number;
-    maxIterations: number;
-  }
->;
+export type MergePolicyChainTransitionRequestContext =
+  TransitionRequestContextEnvelope<
+    "merge_policy_chain",
+    {
+      chainId: string;
+      iteration: number;
+      maxIterations: number;
+    }
+  >;
 
-export type HandoffRepairTransitionRequestContext = TransitionRequestContextEnvelope<
-  "handoff_repair",
-  {
-    sourceRunId: string;
-    kind: AgentHandoffRepairKind;
-    repairAttempt: number;
-    turnNumber: number;
-    role: AgentRunRole;
-    runPhase: AgentRunPhase;
-    runKind: AgentRunKind;
-  }
->;
+export type HandoffRepairTransitionRequestContext =
+  TransitionRequestContextEnvelope<
+    "handoff_repair",
+    {
+      sourceRunId: string;
+      kind: AgentHandoffRepairKind;
+      repairAttempt: number;
+      turnNumber: number;
+      role: AgentRunRole;
+      runPhase: AgentRunPhase;
+      runKind: AgentRunKind;
+    }
+  >;
 
-export type HandoffReconciliationTransitionRequestContext = TransitionRequestContextEnvelope<
-  "handoff_reconciliation",
-  {
-    runId: string;
-    handoffKind: AgentHandoffRepairKind;
-    role: AgentRunRole;
-    runPhase: AgentRunPhase;
-    runKind: AgentRunKind;
-  }
->;
+export type HandoffReconciliationTransitionRequestContext =
+  TransitionRequestContextEnvelope<
+    "handoff_reconciliation",
+    {
+      runId: string;
+      handoffKind: AgentHandoffRepairKind;
+      role: AgentRunRole;
+      runPhase: AgentRunPhase;
+      runKind: AgentRunKind;
+    }
+  >;
 
-export type CompletionReportRejectionTransitionRequestContext = TransitionRequestContextEnvelope<
-  "completion_report_rejection",
-  {
-    runId: string;
-    role: AgentRunRole;
-    runPhase: AgentRunPhase;
-    runKind: AgentRunKind;
-  }
->;
+export type CompletionReportRejectionTransitionRequestContext =
+  TransitionRequestContextEnvelope<
+    "completion_report_rejection",
+    {
+      runId: string;
+      role: AgentRunRole;
+      runPhase: AgentRunPhase;
+      runKind: AgentRunKind;
+    }
+  >;
 
 export type IssueTransitionRequestContext =
   | MergePolicyChainTransitionRequestContext
@@ -178,6 +199,7 @@ export interface IssueCurrentFields {
   mergeGate: IssueMergeGateState | null;
   mergeConflict: IssueMergeConflictMetadata | null;
   lifecycleSummaryCiStatus: string | null;
+  lifecyclePersistenceAvailable: boolean;
   mergePolicyMode: string;
   mergePolicySourceStates: string[];
   mergePolicyDoneState: string | null;
@@ -352,6 +374,347 @@ export interface IssueHistorySnapshot extends IssueCurrentStateSnapshot {
   [key: string]: unknown;
 }
 
+export interface IssueEvidenceHistorySnapshot<
+  K extends IssueEvidenceKind = IssueEvidenceKind,
+  E extends string = string,
+> extends IssueHistorySnapshot {
+  snapshotKind: "evidence";
+  transitionKind: "record_evidence";
+  evidenceKind: K;
+  evidenceEventType: E;
+  evidenceSourceId: string | null;
+}
+
+export interface TrackerObservedIssueSnapshot extends IssueEvidenceHistorySnapshot<
+  "tracker",
+  "tracker_issue_observed"
+> {
+  observedTitle: string;
+  observedDescription: string | null;
+  observedTrackerState: string;
+  observedLabels: string[];
+  observedBranchName: string | null;
+  observedTrackerUrl: string | null;
+  observedPriority: number | null;
+  observedAssigneeId: string | null;
+  observedDelegateId: string | null;
+  observedAssignedToWorker: boolean;
+  observedBlockedBy: Issue["blockedBy"];
+  observedHasChildren: boolean;
+  observedTrackerCreatedAt: string | null;
+  observedTrackerUpdatedAt: string | null;
+}
+
+export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
+  "lifecycle",
+  string
+> {
+  lifecyclePatch: IssueLifecyclePatch | Record<string, unknown> | null;
+  lifecyclePhase: string | null;
+  lifecycleBlockedReason: string | null;
+  lifecycleReviewRound: number | null;
+  lifecycleIncompleteTurnCount: number | null;
+  lifecyclePlanningFailureCount: number | null;
+  lifecyclePlanningDispatchRetryCount: number | null;
+  lifecycleLastCompletionReportId: string | null;
+  lifecycleLastReviewVerdictId: string | null;
+  lifecycleLastMergeGateResultId: string | null;
+  lifecycleSummaryPointers: unknown;
+}
+
+export interface RunEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
+  "run",
+  string
+> {
+  runId: string | null;
+  role: AgentRunRole | null;
+  runPhase: AgentRunPhase | null;
+  runKind: AgentRunKind | null;
+  runStatus: string | null;
+  runSessionId: string | null;
+  runCompletedAt: string | null;
+  runError: string | null;
+  runTokens: TokenCounts | null;
+  runAttempt: number | null;
+  runTurnNumber: number | null;
+  runHarnessId: string | null;
+  runWorkspaceKey: string | null;
+  runWorkspacePath: string | null;
+  runPromptTemplateKeys: string[] | null;
+}
+
+export interface WritebackEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
+  "writeback",
+  string
+> {
+  writebackIdempotencyKey: string | null;
+  writebackKind: string | null;
+  writebackIssueId: string | null;
+  writebackRunId: string | null;
+  writebackStatus: string | null;
+  writebackResultStatus: string | null;
+  writebackResultMessage: string | null;
+  writebackLastError: string | null;
+}
+
+export interface ApprovalEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
+  "approval",
+  string
+> {
+  approvalRequestId: string | null;
+  approvalIssueId: string | null;
+  approvalIssueIdentifier: string | null;
+  approvalStatus: string | null;
+  approvalRunId: string | null;
+  approvalEvidenceCursor: string | null;
+  approvalAction: string | null;
+}
+
+export interface WorkspaceEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
+  "workspace",
+  string
+> {
+  workspaceKey: string | null;
+  workspacePath: string | null;
+  workspaceGitBranchName: string | null;
+  workspaceRepoPath: string | null;
+  workspaceBaseRef: string | null;
+  role: AgentRunRole | null;
+  runPhase: AgentRunPhase | null;
+  runKind: AgentRunKind | null;
+}
+
+export interface RuntimeRetryEvidenceSnapshot extends IssueEvidenceHistorySnapshot<
+  "harness",
+  "retry_scheduled" | "retry_fired" | "retry_cleared"
+> {
+  retryAttempt: number | null;
+  retryDelayMs: number | null;
+  retryError: string | null;
+  retryDueAt: string | null;
+}
+
+export type IssueTypedEvidenceSnapshot =
+  | TrackerObservedIssueSnapshot
+  | LifecycleMutationEvidenceSnapshot
+  | RunEvidenceSnapshot
+  | WritebackEvidenceSnapshot
+  | ApprovalEvidenceSnapshot
+  | WorkspaceEvidenceSnapshot
+  | RuntimeRetryEvidenceSnapshot;
+
+export function normalizeIssueHistorySnapshotEvidenceFields(
+  snapshot: IssueHistorySnapshot,
+): IssueHistorySnapshot {
+  if (snapshot.transitionKind !== "record_evidence") return snapshot;
+  const payload = recordPayload(snapshot.evidencePayload);
+  switch (snapshot.evidenceKind) {
+    case "tracker":
+      return copyMissingEvidenceFields(snapshot, {
+        observedTitle: stringField(payload, "title") ?? snapshot.title,
+        observedDescription:
+          stringField(payload, "description") ?? snapshot.description,
+        observedTrackerState:
+          stringField(payload, "state") ?? snapshot.trackerState,
+        observedLabels: stringArrayField(payload, "labels") ?? snapshot.labels,
+        observedBranchName:
+          stringField(payload, "branchName") ?? snapshot.branchName,
+        observedTrackerUrl: stringField(payload, "url") ?? snapshot.trackerUrl,
+        observedPriority: numberField(payload, "priority") ?? snapshot.priority,
+        observedAssigneeId:
+          stringField(payload, "assigneeId") ?? snapshot.assigneeId,
+        observedDelegateId:
+          stringField(payload, "delegateId") ?? snapshot.delegateId,
+        observedAssignedToWorker:
+          booleanField(payload, "assignedToWorker") ??
+          snapshot.assignedToWorker,
+        observedBlockedBy:
+          arrayField(payload, "blockedBy") ?? snapshot.blockedBy,
+        observedHasChildren:
+          booleanField(payload, "hasChildren") ?? snapshot.hasChildren,
+        observedTrackerCreatedAt:
+          stringField(payload, "createdAt") ?? snapshot.trackerCreatedAt,
+        observedTrackerUpdatedAt:
+          stringField(payload, "updatedAt") ?? snapshot.trackerUpdatedAt,
+      });
+    case "lifecycle":
+      return copyMissingEvidenceFields(snapshot, {
+        lifecyclePatch: payload?.patch ?? null,
+        lifecyclePhase: stringField(payload, "phase"),
+        lifecycleBlockedReason: stringField(payload, "blockedReason"),
+        lifecycleReviewRound: numberField(payload, "reviewRound"),
+        lifecycleIncompleteTurnCount: numberField(
+          payload,
+          "incompleteTurnCount",
+        ),
+        lifecyclePlanningFailureCount: numberField(
+          payload,
+          "planningFailureCount",
+        ),
+        lifecyclePlanningDispatchRetryCount: numberField(
+          payload,
+          "planningDispatchRetryCount",
+        ),
+        lifecycleLastCompletionReportId: stringField(
+          payload,
+          "lastCompletionReportId",
+        ),
+        lifecycleLastReviewVerdictId: stringField(
+          payload,
+          "lastReviewVerdictId",
+        ),
+        lifecycleLastMergeGateResultId: stringField(
+          payload,
+          "lastMergeGateResultId",
+        ),
+        lifecycleSummaryPointers: payload?.summaryPointers ?? null,
+      });
+    case "run":
+      return copyMissingEvidenceFields(snapshot, {
+        runId: stringField(payload, "runId") ?? snapshot.runId ?? null,
+        role: stringField(payload, "role") ?? snapshot.role ?? null,
+        runPhase: stringField(payload, "runPhase") ?? snapshot.runPhase ?? null,
+        runKind: stringField(payload, "runKind") ?? snapshot.runKind ?? null,
+        runStatus: stringField(payload, "status"),
+        runSessionId: stringField(payload, "sessionId"),
+        runCompletedAt: stringField(payload, "completedAt"),
+        runError: stringField(payload, "error"),
+        runTokens: tokenCountsField(payload, "tokens"),
+        runAttempt: numberField(payload, "attempt"),
+        runTurnNumber: numberField(payload, "turnNumber"),
+        runHarnessId: stringField(payload, "harnessId"),
+        runWorkspaceKey: stringField(payload, "workspaceKey"),
+        runWorkspacePath: stringField(payload, "workspacePath"),
+        runPromptTemplateKeys: stringArrayField(payload, "promptTemplateKeys"),
+      });
+    case "writeback":
+      return copyMissingEvidenceFields(snapshot, {
+        writebackIdempotencyKey: stringField(payload, "idempotencyKey"),
+        writebackKind: stringField(payload, "kind"),
+        writebackIssueId: stringField(payload, "issueId"),
+        writebackRunId: stringField(payload, "runId"),
+        writebackStatus: stringField(payload, "status"),
+        writebackResultStatus: stringField(payload, "resultStatus"),
+        writebackResultMessage: stringField(payload, "resultMessage"),
+        writebackLastError: stringField(payload, "lastError"),
+      });
+    case "approval":
+      return copyMissingEvidenceFields(snapshot, {
+        approvalRequestId: stringField(payload, "requestId"),
+        approvalIssueId: stringField(payload, "issueId"),
+        approvalIssueIdentifier: stringField(payload, "issueIdentifier"),
+        approvalStatus: stringField(payload, "status"),
+        approvalRunId: stringField(payload, "runId"),
+        approvalEvidenceCursor: stringField(payload, "evidenceCursor"),
+        approvalAction: stringField(payload, "action"),
+      });
+    case "workspace":
+      return copyMissingEvidenceFields(snapshot, {
+        workspaceKey: stringField(payload, "workspaceKey"),
+        workspacePath: stringField(payload, "workspacePath"),
+        workspaceGitBranchName: stringField(payload, "gitBranchName"),
+        workspaceRepoPath: stringField(payload, "repoPath"),
+        workspaceBaseRef: stringField(payload, "baseRef"),
+        role: stringField(payload, "role") ?? snapshot.role ?? null,
+        runPhase: stringField(payload, "runPhase") ?? snapshot.runPhase ?? null,
+        runKind: stringField(payload, "runKind") ?? snapshot.runKind ?? null,
+      });
+    case "harness":
+      if (
+        snapshot.evidenceEventType !== "retry_scheduled" &&
+        snapshot.evidenceEventType !== "retry_fired" &&
+        snapshot.evidenceEventType !== "retry_cleared"
+      ) {
+        return snapshot;
+      }
+      return copyMissingEvidenceFields(snapshot, {
+        retryAttempt:
+          numberField(payload, "attempt") ?? snapshot.retryAttempt ?? null,
+        retryDelayMs:
+          numberField(payload, "delayMs") ?? snapshot.retryDelayMs ?? null,
+        retryError:
+          stringField(payload, "error") ?? snapshot.retryError ?? null,
+        retryDueAt: stringField(payload, "dueAt"),
+      });
+    default:
+      return snapshot;
+  }
+}
+
+function copyMissingEvidenceFields(
+  snapshot: IssueHistorySnapshot,
+  fields: Record<string, unknown>,
+): IssueHistorySnapshot {
+  const next: IssueHistorySnapshot = { ...snapshot };
+  for (const [key, value] of Object.entries(fields)) {
+    if (next[key] === undefined) next[key] = value;
+  }
+  return next;
+}
+
+function recordPayload(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringField(
+  payload: Record<string, unknown> | null,
+  key: string,
+): string | null {
+  const value = payload?.[key];
+  return typeof value === "string" ? value : null;
+}
+
+function numberField(
+  payload: Record<string, unknown> | null,
+  key: string,
+): number | null {
+  const value = payload?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function booleanField(
+  payload: Record<string, unknown> | null,
+  key: string,
+): boolean | null {
+  const value = payload?.[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+function arrayField(
+  payload: Record<string, unknown> | null,
+  key: string,
+): unknown[] | null {
+  const value = payload?.[key];
+  return Array.isArray(value) ? value : null;
+}
+
+function stringArrayField(
+  payload: Record<string, unknown> | null,
+  key: string,
+): string[] | null {
+  const value = payload?.[key];
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? value
+    : null;
+}
+
+function tokenCountsField(
+  payload: Record<string, unknown> | null,
+  key: string,
+): TokenCounts | null {
+  const value = payload?.[key];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const inputTokens = numberField(record, "inputTokens");
+  const outputTokens = numberField(record, "outputTokens");
+  const totalTokens = numberField(record, "totalTokens");
+  return inputTokens === null || outputTokens === null || totalTokens === null
+    ? null
+    : { inputTokens, outputTokens, totalTokens };
+}
+
 export interface TransitionRuleset {
   id: string;
   priority: number;
@@ -379,8 +742,14 @@ export interface IssueStateStore {
   get(issueIdOrIdentifier: string): Promise<IssueStateRecord | null>;
   list(): Promise<IssueStateRecord[]>;
   ensureIssue(current: IssueCurrentFields): Promise<IssueStateRecord>;
-  updateCurrent(issue: Pick<Issue, "id" | "identifier">, patch: Partial<IssueCurrentFields>): Promise<IssueStateRecord>;
-  appendSnapshot(issue: Pick<Issue, "id" | "identifier">, snapshot: IssueHistorySnapshot): Promise<IssueStateRecord>;
+  updateCurrent(
+    issue: Pick<Issue, "id" | "identifier">,
+    patch: Partial<IssueCurrentFields>,
+  ): Promise<IssueStateRecord>;
+  appendSnapshot(
+    issue: Pick<Issue, "id" | "identifier">,
+    snapshot: IssueHistorySnapshot,
+  ): Promise<IssueStateRecord>;
   updateSnapshotActions(
     issue: Pick<Issue, "id" | "identifier">,
     historySnapshotId: string,
@@ -449,15 +818,27 @@ export function transitionErrorFromUnknown(
     actionId: input.actionId ?? null,
     message: record?.message ?? String(error),
     stack: record?.stack ?? null,
-    code: typeof (error as { code?: unknown })?.code === "string" ? (error as { code: string }).code : null,
-    cause: record?.cause instanceof Error ? record.cause.message : record?.cause === undefined ? null : String(record.cause),
+    code:
+      typeof (error as { code?: unknown })?.code === "string"
+        ? (error as { code: string }).code
+        : null,
+    cause:
+      record?.cause instanceof Error
+        ? record.cause.message
+        : record?.cause === undefined
+          ? null
+          : String(record.cause),
     details: input.details ?? null,
     recordedAt: new Date().toISOString(),
   };
 }
 
-export function immutableIssueSnapshot(snapshot: IssueCurrentStateSnapshot): IssueCurrentStateSnapshot {
-  return deepFreeze(JSON.parse(JSON.stringify(snapshot)) as IssueCurrentStateSnapshot);
+export function immutableIssueSnapshot(
+  snapshot: IssueCurrentStateSnapshot,
+): IssueCurrentStateSnapshot {
+  return deepFreeze(
+    JSON.parse(JSON.stringify(snapshot)) as IssueCurrentStateSnapshot,
+  );
 }
 
 function deepFreeze<T>(value: T): T {
