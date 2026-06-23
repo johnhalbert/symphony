@@ -1,6 +1,6 @@
 import type { TrackerConfig } from "../../core/config/Config.js";
 import { SymphonyError } from "../../core/errors.js";
-import type { TrackerClient } from "../../core/tracker/TrackerClient.js";
+import type { FetchIssuesByStatesOptions, TrackerClient } from "../../core/tracker/TrackerClient.js";
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
@@ -352,12 +352,17 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     );
   }
 
-  async fetchIssuesByStates(stateNames: string[]): Promise<Issue[]> {
+  async fetchIssuesByStates(stateNames: string[], options: FetchIssuesByStatesOptions = {}): Promise<Issue[]> {
     if (stateNames.length === 0) return [];
-    return this.fetchPagedIssues(ISSUES_BY_STATES_QUERY, {
-      projectSlug: this.config.projectSlug,
-      states: stateNames,
-    });
+    const assigneeFilter = options.applyRouting === true ? await this.routingAssigneeFilter() : null;
+    return this.fetchPagedIssues(
+      ISSUES_BY_STATES_QUERY,
+      {
+        projectSlug: this.config.projectSlug,
+        states: stateNames,
+      },
+      assigneeFilter,
+    );
   }
 
   async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {

@@ -55,6 +55,11 @@ interface FakeLeaseRecord {
   disposeStatuses: HostHermesAcpTerminalStatus[];
 }
 
+function issuesInStates(issues: Issue[], states: string[]): Issue[] {
+  const wanted = new Set(states.map((state) => state.toLowerCase()));
+  return issues.filter((item) => wanted.has(item.state.toLowerCase()));
+}
+
 type NotificationHandler = (params: unknown, notification: HostHermesAcpJsonRpcNotification) => void;
 type ClientRequestHandler = (params: unknown, request: HostHermesAcpJsonRpcRequest) => unknown | Promise<unknown>;
 
@@ -1724,8 +1729,8 @@ describe("HermesAcpHarness", () => {
       async fetchCandidateIssues() {
         return active ? [candidate] : [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return active ? issuesInStates([candidate], states) : [];
       },
       async fetchIssueStatesByIds() {
         refreshes += 1;

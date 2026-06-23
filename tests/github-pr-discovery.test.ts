@@ -12,7 +12,13 @@ import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, T
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import { GitHubPullRequestClient } from "../src/integrations/github/GitHubPullRequestClient.js";
+import type { Issue } from "../src/core/types.js";
 import { issue, testConfig } from "./helpers.js";
+
+function issuesInStates(issues: Issue[], states: string[]): Issue[] {
+  const wanted = new Set(states.map((state) => state.toLowerCase()));
+  return issues.filter((item) => wanted.has(item.state.toLowerCase()));
+}
 
 describe("GitHub pull request discovery", () => {
   let root: string;
@@ -108,8 +114,8 @@ describe("GitHub pull request discovery", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         refreshes += 1;
@@ -175,14 +181,14 @@ describe("GitHub pull request discovery", () => {
     config.github.prHandoff.requiredChecks = ["Typecheck and test"];
     const candidate = issue({ state: "Todo", labels: ["dogfood-ready"], branchName: "symphony/TEST-1" });
     let currentState = "Todo";
-    let candidateFetches = 0;
+    let stateFetches = 0;
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        candidateFetches += 1;
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        stateFetches += 1;
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -218,7 +224,7 @@ describe("GitHub pull request discovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     await orchestrator.stop();
 
-    expect(candidateFetches).toBeGreaterThanOrEqual(1);
+    expect(stateFetches).toBeGreaterThanOrEqual(1);
     expect(harness.runs).toHaveLength(1);
     expect(writer.transitions.map((transition) => transition.toState)).toEqual(["In Progress"]);
     expect(writer.comments.map((comment) => comment.dedupeKey)).not.toContain("pull-request-handoff:pr-42:abc123");
@@ -249,8 +255,8 @@ describe("GitHub pull request discovery", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];

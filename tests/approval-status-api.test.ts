@@ -34,6 +34,11 @@ import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { issue, testConfig } from "./helpers.js";
 
+function issuesInStates(issues: Issue[], states: string[]): Issue[] {
+  const wanted = new Set(states.map((state) => state.toLowerCase()));
+  return issues.filter((item) => wanted.has(item.state.toLowerCase()));
+}
+
 describe("approval status API", () => {
   let root: string;
   let config: ServiceConfig;
@@ -528,8 +533,8 @@ describe("approval status API", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];

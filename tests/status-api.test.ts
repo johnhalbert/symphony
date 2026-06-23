@@ -23,6 +23,11 @@ import type { Issue, IssueDetailsEnvelope, IssueStatusView, TrackerStateLists } 
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { issue, testConfig } from "./helpers.js";
 
+function issuesInStates(issues: Issue[], states: string[]): Issue[] {
+  const wanted = new Set(states.map((state) => state.toLowerCase()));
+  return issues.filter((item) => wanted.has(item.state.toLowerCase()));
+}
+
 describe("StatusServer durable API", () => {
   let root: string;
 
@@ -682,8 +687,8 @@ describe("StatusServer durable API", () => {
       async fetchCandidateIssues() {
         return candidateAvailable ? [candidate] : [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return candidateAvailable ? issuesInStates([candidate], states) : [];
       },
       async fetchIssueStatesByIds() {
         return [candidate];

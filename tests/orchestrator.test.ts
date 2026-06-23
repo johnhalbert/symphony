@@ -86,6 +86,11 @@ type RequestedTransitionCall = {
   context: ReturnType<typeof mergePolicyChainContext>;
 };
 
+function issuesInStates(issues: Issue[], states: string[]): Issue[] {
+  const wanted = new Set(states.map((state) => state.toLowerCase()));
+  return issues.filter((item) => wanted.has(item.state.toLowerCase()));
+}
+
 describe("Orchestrator", () => {
   let root: string;
 
@@ -115,8 +120,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -189,8 +194,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return active ? [candidate] : [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates(active ? [candidate] : [], states);
       },
       async fetchIssueStatesByIds() {
         refreshes += 1;
@@ -242,7 +247,7 @@ describe("Orchestrator", () => {
     const dispatchSnapshot = issueState?.history.find((snapshot) => snapshot.transitionKind === "dispatch_worker");
     expect(dispatchSnapshot).toMatchObject({
       triggerType: "orchestrator.tick",
-      candidateSource: "worker_candidates",
+      candidateSource: "tick_candidates",
       rulesetId: "orchestrator.dispatch.worker.implementation",
       role: "worker",
       runPhase: "implementation",
@@ -372,8 +377,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -439,8 +444,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -503,8 +508,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return active ? [candidate] : [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates(active ? [candidate] : [], states);
       },
       async fetchIssueStatesByIds() {
         refreshes += 1;
@@ -716,8 +721,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -784,8 +789,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -846,8 +851,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -891,8 +896,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState, updatedAt }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState, updatedAt }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState, updatedAt }];
@@ -973,8 +978,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1098,8 +1103,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState, title: currentTitle, updatedAt }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState, title: currentTitle, updatedAt }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState, title: currentTitle, updatedAt }];
@@ -1173,8 +1178,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1221,8 +1226,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1265,8 +1270,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1382,8 +1387,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1409,6 +1414,10 @@ describe("Orchestrator", () => {
     const run = await waitForTerminalRunRecord(runStore, "rejecting-plan-run-1");
     await waitForAsync(async () => (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1);
     await settleOrchestratorExit();
+    await waitForAsync(async () => {
+      const current = await runStore.readTranscript("rejecting-plan-run-1");
+      return current.events.some((event) => event.eventType === "planning_run_failed");
+    }, "planning failure transcript event");
     const transcript = await runStore.readTranscript("rejecting-plan-run-1");
     await orchestrator.stop();
 
@@ -1467,8 +1476,8 @@ describe("Orchestrator", () => {
         async fetchCandidateIssues() {
           return [candidate];
         },
-        async fetchIssuesByStates() {
-          return [];
+        async fetchIssuesByStates(states) {
+          return issuesInStates([candidate], states);
         },
         async fetchIssueStatesByIds() {
           return [candidate];
@@ -1520,8 +1529,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1571,8 +1580,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1641,8 +1650,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -1693,8 +1702,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1726,8 +1735,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1756,8 +1765,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1794,8 +1803,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1832,8 +1841,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: "Done" }];
@@ -1865,8 +1874,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, assignedToWorker: false }];
@@ -1898,8 +1907,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, blockedBy: [{ id: "blocker", identifier: "TEST-0", state: null }] }];
@@ -1932,8 +1941,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -1967,8 +1976,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -2000,8 +2009,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -2035,8 +2044,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         refreshes += 1;
@@ -2074,8 +2083,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -2136,8 +2145,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -2194,8 +2203,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -2404,8 +2413,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
       },
       async fetchIssueStatesByIds() {
         throw new Error("incomplete turn guard should not refresh active issues");
@@ -3153,8 +3162,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -3196,8 +3205,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -3263,8 +3272,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -3548,7 +3557,7 @@ describe("Orchestrator", () => {
     ]);
     const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
     const mergePolicySnapshots =
-      issueState?.history.filter((snapshot) => snapshot.candidateSource === "merge_policy_candidates") ?? [];
+      issueState?.history.filter((snapshot) => snapshot.transitionKind.startsWith("merge_policy_")) ?? [];
     expect(mergePolicySnapshots.map((snapshot) => snapshot.transitionKind)).toEqual([
       "merge_policy_reset_operator_resume",
       "merge_policy_observe",
@@ -3568,11 +3577,11 @@ describe("Orchestrator", () => {
       }),
     ).toEqual([
       {
-        triggerType: "runtime.requested",
-        triggerSource: "transition",
-        contextKind: "merge_policy_chain",
-        iteration: 0,
-        maxIterations: 6,
+        triggerType: "orchestrator.tick",
+        triggerSource: "orchestrator",
+        contextKind: null,
+        iteration: null,
+        maxIterations: null,
       },
       {
         triggerType: "runtime.requested",
@@ -3590,8 +3599,8 @@ describe("Orchestrator", () => {
       },
     ]);
     const firstContext =
-      mergePolicySnapshots[0]?.transitionRequestContext?.kind === "merge_policy_chain"
-        ? mergePolicySnapshots[0].transitionRequestContext
+      mergePolicySnapshots[1]?.transitionRequestContext?.kind === "merge_policy_chain"
+        ? mergePolicySnapshots[1].transitionRequestContext
         : null;
     const chainId = firstContext?.payload.chainId;
     expect(typeof chainId).toBe("string");
@@ -3599,7 +3608,7 @@ describe("Orchestrator", () => {
       mergePolicySnapshots.map((snapshot) =>
         snapshot.transitionRequestContext?.kind === "merge_policy_chain" ? snapshot.transitionRequestContext.payload.chainId : null,
       ),
-    ).toEqual([chainId, chainId, chainId]);
+    ).toEqual([null, chainId, chainId]);
     expect(mergePolicySnapshots[1]?.transitionRequestContext).toMatchObject({
       parentHistorySnapshotId: mergePolicySnapshots[0]?.historySnapshotId,
       parentTransitionKind: "merge_policy_reset_operator_resume",
@@ -3610,7 +3619,7 @@ describe("Orchestrator", () => {
     });
   });
 
-  it("merge-policy rulesets require requested-transition provenance and candidate source", async () => {
+  it("merge-policy rulesets require merge-policy state and requested-transition context", async () => {
     const config = mergePolicyOrchestratorConfig(root);
     const logger = new StructuredLogger(() => undefined);
     const orchestrator = new Orchestrator({
@@ -3645,7 +3654,10 @@ describe("Orchestrator", () => {
       transitionKind: "merge_policy_observe",
       mergePolicyObservationInputFingerprint: "merge-policy-input",
     });
-    expect(observeRuleset?.evaluate({ ...base, candidateSource: "worker_candidates" }, [])).toBeNull();
+    expect(observeRuleset?.evaluate({ ...base, candidateSource: "worker_candidates" }, [])).toMatchObject({
+      transitionKind: "merge_policy_observe",
+      mergePolicyObservationInputFingerprint: "merge-policy-input",
+    });
     expect(
       observeRuleset?.evaluate(
         {
@@ -3657,7 +3669,10 @@ describe("Orchestrator", () => {
         },
         [],
       ),
-    ).toBeNull();
+    ).toMatchObject({
+      transitionKind: "merge_policy_observe",
+      mergePolicyObservationInputFingerprint: "merge-policy-input",
+    });
     expect(
       observeRuleset?.evaluate(
         {
@@ -3712,7 +3727,7 @@ describe("Orchestrator", () => {
     expect(requester.requestTransition).toHaveBeenCalledTimes(1);
     const requestCalls = requester.requestTransition.mock.calls as Array<[RequestedTransitionCall]>;
     expect(requestCalls[0]?.[0]).toMatchObject({
-      candidateSource: "merge_policy_candidates",
+      candidateSource: "merge_policy_chain",
       context: {
         kind: "merge_policy_chain",
         parentHistorySnapshotId: null,
@@ -3766,8 +3781,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -3993,7 +4008,7 @@ describe("Orchestrator", () => {
     const issueState = await readIssueState(config.workspace.stateDir, candidate.id);
     const reconciliation = issueState?.history.find((snapshot) => snapshot.transitionKind === "reconcile_issue_triage_report_writeback");
     expect(reconciliation).toMatchObject({
-      candidateSource: "triage_writeback_reconciliation",
+      candidateSource: "tick_candidates",
       rulesetId: "orchestrator.reconcile_issue_triage_report_writeback",
       reason: "issue_triage_report_writeback_reconciliation",
     });
@@ -4016,8 +4031,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -4064,8 +4079,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -4109,8 +4124,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -4369,8 +4384,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -4466,8 +4481,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -4546,8 +4561,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -4763,8 +4778,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -4857,8 +4872,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -4911,8 +4926,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -4997,8 +5012,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -5082,8 +5097,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -5184,8 +5199,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -5303,8 +5318,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -5421,8 +5436,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -5538,8 +5553,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -5640,8 +5655,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -5744,8 +5759,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -5848,8 +5863,8 @@ describe("Orchestrator", () => {
         async fetchCandidateIssues() {
           return [];
         },
-        async fetchIssuesByStates() {
-          return [];
+        async fetchIssuesByStates(states) {
+          return issuesInStates([], states);
         },
         async fetchIssueStatesByIds() {
           return [candidate];
@@ -6123,7 +6138,7 @@ describe("Orchestrator", () => {
     await waitFor(() => harness.runs.length === 1, "reviewer dispatch");
     await orchestrator.stop();
 
-    expect(fetchedReviewStates).toEqual([["In Review"]]);
+    expect(fetchedReviewStates).toEqual([expect.arrayContaining(["In Review"])]);
     expect(harness.runs).toHaveLength(1);
     expect(harness.runs[0]?.ctx.role).toBe("reviewer");
     expect(harness.runs[0]?.prompt).toContain("Review TEST-1 as reviewer");
@@ -7129,8 +7144,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -7165,8 +7180,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         refreshes += 1;
@@ -7245,8 +7260,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -7284,8 +7299,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -7318,8 +7333,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [{ ...candidate, state: currentState }];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([{ ...candidate, state: currentState }], states);
       },
       async fetchIssueStatesByIds() {
         return [{ ...candidate, state: currentState }];
@@ -7371,8 +7386,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -7428,8 +7443,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -7504,8 +7519,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -7555,8 +7570,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -7678,8 +7693,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -7813,8 +7828,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -7897,8 +7912,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -7959,8 +7974,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8045,8 +8060,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8137,8 +8152,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8403,8 +8418,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8439,8 +8454,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8516,8 +8531,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8580,8 +8595,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8638,8 +8653,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8688,8 +8703,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8739,8 +8754,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8797,8 +8812,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8832,8 +8847,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8882,8 +8897,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -8960,8 +8975,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -9023,8 +9038,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -9073,8 +9088,8 @@ describe("Orchestrator", () => {
       async fetchCandidateIssues() {
         return [candidate];
       },
-      async fetchIssuesByStates() {
-        return [];
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -9505,8 +9520,8 @@ async function createIssueBreakdownStartupFixture(
     async fetchCandidateIssues() {
       return [];
     },
-    async fetchIssuesByStates() {
-      return [];
+    async fetchIssuesByStates(states) {
+      return issuesInStates([], states);
     },
     async fetchIssueStatesByIds() {
       return [resolvedIssue];
@@ -9791,8 +9806,8 @@ async function runTerminalRunActivityScenario(root: string, terminal: "failed" |
     async fetchCandidateIssues() {
       return active ? [candidate] : [];
     },
-    async fetchIssuesByStates() {
-      return [];
+    async fetchIssuesByStates(states) {
+      return issuesInStates(active ? [candidate] : [], states);
     },
     async fetchIssueStatesByIds() {
       refreshes += 1;
@@ -9973,8 +9988,8 @@ async function runAcceptedIssueBreakdownHandoffScenario(
     async fetchCandidateIssues() {
       return active ? [candidate] : [];
     },
-    async fetchIssuesByStates() {
-      return [];
+    async fetchIssuesByStates(states) {
+      return issuesInStates(active ? [candidate] : [], states);
     },
     async fetchIssueStatesByIds() {
       return [candidate];
@@ -10044,8 +10059,8 @@ function emptyTracker(): TrackerClient {
     async fetchCandidateIssues() {
       return [];
     },
-    async fetchIssuesByStates() {
-      return [];
+    async fetchIssuesByStates(states) {
+      return issuesInStates([], states);
     },
     async fetchIssueStatesByIds() {
       return [];
@@ -11241,8 +11256,8 @@ function idleTracker(): TrackerClient {
     async fetchCandidateIssues() {
       return [];
     },
-    async fetchIssuesByStates() {
-      return [];
+    async fetchIssuesByStates(states) {
+      return issuesInStates([], states);
     },
     async fetchIssueStatesByIds() {
       return [];
