@@ -271,6 +271,101 @@ describe("SqliteIssueStateStore", () => {
     ]);
   });
 
+  it("reads issue records from history when cached current_json is invalid", async () => {
+    const store = new SqliteIssueStateStore(root);
+    stores.push(store);
+    const current = currentFields();
+    await store.ensureIssue(current);
+    const snapshot = new IssueOrchestrationEngine([
+      {
+        id: "dispatch.worker",
+        priority: 100,
+        evaluate: () => ({
+          transitionKind: "dispatch_worker",
+          role: "worker",
+          runPhase: "implementation",
+        }),
+      },
+    ]).decide(currentSnapshot(current), []);
+    expect(snapshot).not.toBeNull();
+    await store.appendSnapshot(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!,
+    );
+    await store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    await updateSqliteCurrentJson(
+      path.join(root, "issue-state.sqlite"),
+      current.issueId,
+      "{not valid json",
+    );
+    const reloaded = new SqliteIssueStateStore(root);
+    stores.push(reloaded);
+
+    await expect(reloaded.get(current.issueIdentifier)).resolves.toMatchObject({
+      issueId: current.issueId,
+      issueIdentifier: current.issueIdentifier,
+      history: [{ transitionKind: "dispatch_worker" }],
+    });
+    await expect(reloaded.list()).resolves.toMatchObject([
+      {
+        issueId: current.issueId,
+        issueIdentifier: current.issueIdentifier,
+        history: [{ transitionKind: "dispatch_worker" }],
+      },
+    ]);
+  });
+
+  it("updates snapshot actions without parsing cached current_json", async () => {
+    const store = new SqliteIssueStateStore(root);
+    stores.push(store);
+    const current = currentFields();
+    await store.ensureIssue(current);
+    const snapshot = new IssueOrchestrationEngine([
+      {
+        id: "dispatch.worker",
+        priority: 100,
+        evaluate: () => ({
+          transitionKind: "dispatch_worker",
+          role: "worker",
+          runPhase: "implementation",
+        }),
+      },
+    ]).decide(currentSnapshot(current), []);
+    expect(snapshot).not.toBeNull();
+    await store.appendSnapshot(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!,
+    );
+    await store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    await updateSqliteCurrentJson(
+      path.join(root, "issue-state.sqlite"),
+      current.issueId,
+      "{not valid json",
+    );
+    const reloaded = new SqliteIssueStateStore(root);
+    stores.push(reloaded);
+    const action = transitionAction({ actionType: "render_prompt" });
+
+    await expect(
+      reloaded.appendSnapshotAction(
+        { id: current.issueId, identifier: current.issueIdentifier },
+        snapshot!.historySnapshotId,
+        action,
+      ),
+    ).resolves.toMatchObject({
+      history: [
+        {
+          transitionKind: "dispatch_worker",
+          actions: [{ actionType: "render_prompt" }],
+        },
+      ],
+    });
+  });
+
   it("round-trips runtime requested transition context in snapshot json", async () => {
     const store = new SqliteIssueStateStore(root);
     stores.push(store);

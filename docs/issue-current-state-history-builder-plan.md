@@ -44,11 +44,12 @@ succeeded, skipped, and failed action records, plus runtime/domain errors.
 
 ## Current Gaps
 
-- `SqliteIssueStateStore` stores `current_json` and separate history rows.
-- `current_json` is documented and tested as cached current state. Durable
-  decision-state field groups can be rebuilt from typed history when fresh
-  enough evidence is available; remaining gaps are intentional runtime-local
-  fields and action/outbox-owned operational details.
+- `SqliteIssueStateStore` stores `current_json` for compatibility/bootstrap
+  records and separate history rows.
+- `current_json` is documented and tested as a compatibility cache. Normal
+  issue-state reads use the latest typed history snapshot when history exists;
+  remaining gaps are intentional runtime-local fields and action/outbox-owned
+  operational details.
 - Issue history is complete enough to rebuild the durable field groups listed in
   `HISTORY_BACKED_FIELD_GROUPS`.
 - Live runtime objects still exist only in in-memory runtime maps because they
@@ -93,7 +94,7 @@ truth:
 
 - Treat the current builder, tick, and ruleset work as the baseline.
 - Keep `candidateSource` as lineage metadata.
-- Keep `current_json` as persisted current state for now.
+- Keep `current_json` as persisted compatibility/bootstrap state for now.
 - Do not make history authoritative until parity exists.
 
 Validation:
@@ -229,7 +230,8 @@ Acceptance:
 - Flip field groups one at a time from store-backed to history-backed inside the
   builder.
 - Keep fallback to store-backed behavior for incomplete legacy history.
-- Keep writing `current_json`, but treat it as cached state.
+- Keep writing `current_json`, but normal reads should prefer typed history and
+  use the cache only for no-history bootstrap records.
 - Add a rebuild test:
   - delete or ignore `current_json`
   - rebuild current fields from history
@@ -237,8 +239,8 @@ Acceptance:
 
 ### Phase 8: Finalize Cache Semantics
 
-- Document `current_json` as cached current snapshot storage, not durable source
-  of truth.
+- Document `current_json` as compatibility current snapshot storage, not durable
+  source of truth.
 - Add a rebuild utility/test helper for issue state from history.
 - Keep SQLite schema compatible; avoid destructive migration.
 - Add operational logging for history-incomplete fallback cases.
@@ -260,9 +262,9 @@ Acceptance:
   lifecycle-post-mortem/runtime-control field authority can be enabled in the
   builder and is enabled for orchestrator decisions with
   freshness/completeness guards.
-- Implemented: `current_json` remains written for compatibility and fast reads,
-  but is treated as cached current state for field groups that can be rebuilt
-  from history.
+- Implemented: `current_json` remains written for compatibility and no-history
+  bootstrap reads, but SQLite issue-state `get/list` prefer typed history and
+  avoid reading/parsing the cache when history exists.
 - Implemented: configured history-backed field groups emit fallback warnings
   when candidate history snapshots exist but fail freshness/completeness checks.
 - Implemented: parity coverage exists for tracker, run-summary,

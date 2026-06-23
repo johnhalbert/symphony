@@ -20,14 +20,12 @@ type SqliteDatabase = InstanceType<typeof sqlite3.Database>;
 interface IssueStateRow {
   issue_id: string;
   issue_identifier: string;
-  // Cached current state for fast reads. Durable issue truth is captured in
-  // issue_history as field groups become history-backed.
-  current_json: string;
 }
 
-interface IssueIdentityRow {
-  issue_id: string;
-  issue_identifier: string;
+interface IssueCurrentCacheRow {
+  // Compatibility cache for pre-history/bootstrap records. Normal reads prefer
+  // the latest issue_history snapshot when any history exists.
+  current_json: string;
 }
 
 interface IssueHistoryRow {
@@ -64,7 +62,7 @@ export class SqliteIssueStateStore implements IssueStateStore {
       const row = await this.getRow<IssueStateRow>(
         database,
         `
-          SELECT issue_id, issue_identifier, current_json
+          SELECT issue_id, issue_identifier
           FROM issue_state
           WHERE issue_id = ? OR issue_identifier = ?
           ORDER BY CASE WHEN issue_id = ? THEN 0 ELSE 1 END
@@ -80,7 +78,7 @@ export class SqliteIssueStateStore implements IssueStateStore {
     issueIdOrIdentifier: string,
   ): Promise<IssueHistorySnapshot[] | null> {
     return this.withStore(async (database) => {
-      const row = await this.getRow<IssueIdentityRow>(
+      const row = await this.getRow<IssueStateRow>(
         database,
         `
           SELECT issue_id, issue_identifier
@@ -99,7 +97,7 @@ export class SqliteIssueStateStore implements IssueStateStore {
     return this.withStore(async (database) => {
       const rows = await this.allRows<IssueStateRow>(
         database,
-        "SELECT issue_id, issue_identifier, current_json FROM issue_state ORDER BY issue_identifier",
+        "SELECT issue_id, issue_identifier FROM issue_state ORDER BY issue_identifier",
       );
       return Promise.all(rows.map((row) => this.recordFromRow(database, row)));
     });
@@ -445,7 +443,7 @@ export class SqliteIssueStateStore implements IssueStateStore {
     const row = await this.getRow<IssueStateRow>(
       database,
       `
-        SELECT issue_id, issue_identifier, current_json
+        SELECT issue_id, issue_identifier
         FROM issue_state
         WHERE issue_id = ? OR issue_identifier = ?
         ORDER BY CASE WHEN issue_id = ? THEN 0 ELSE 1 END
@@ -493,7 +491,7 @@ export class SqliteIssueStateStore implements IssueStateStore {
       for (const record of records) {
         const existing = await this.getRow<IssueStateRow>(
           database,
-          "SELECT issue_id, issue_identifier, current_json FROM issue_state WHERE issue_id = ?",
+          "SELECT issue_id, issue_identifier FROM issue_state WHERE issue_id = ?",
           [record.issueId],
         );
         if (existing) continue;
@@ -637,13 +635,13 @@ export class SqliteIssueStateStore implements IssueStateStore {
     database: SqliteDatabase,
     row: IssueStateRow,
   ): Promise<IssueStateRecord> {
-    const current = normalizeIssueCurrentFields(
-      JSON.parse(row.current_json) as IssueCurrentFields,
-    );
     const history = await this.historyFromIssueIdUnlocked(
       database,
       row.issue_id,
     );
+    const current =
+      currentFieldsFromLatestHistory(history) ??
+      (await this.currentFromCacheUnlocked(database, row.issue_id));
     return {
       ...current,
       history,
@@ -663,6 +661,21 @@ export class SqliteIssueStateStore implements IssueStateStore {
       normalizeIssueHistorySnapshot(
         JSON.parse(historyRow.snapshot_json) as IssueHistorySnapshot,
       ),
+    );
+  }
+
+  private async currentFromCacheUnlocked(
+    database: SqliteDatabase,
+    issueId: string,
+  ): Promise<IssueCurrentFields> {
+    const row = await this.getRow<IssueCurrentCacheRow>(
+      database,
+      "SELECT current_json FROM issue_state WHERE issue_id = ?",
+      [issueId],
+    );
+    if (!row) throw new Error(`Issue state does not exist for ${issueId}`);
+    return normalizeIssueCurrentFields(
+      JSON.parse(row.current_json) as IssueCurrentFields,
     );
   }
 
@@ -835,6 +848,15 @@ function normalizeIssueCurrentFields(
     mergePolicyLatestCompletionRun:
       record.mergePolicyLatestCompletionRun ?? null,
   };
+}
+
+function currentFieldsFromLatestHistory(
+  history: readonly IssueHistorySnapshot[],
+): IssueCurrentFields | null {
+  const latest = history.at(-1);
+  return latest === undefined
+    ? null
+    : normalizeIssueCurrentFields(latest as IssueCurrentFields);
 }
 
 function normalizeIssueHistorySnapshot(
