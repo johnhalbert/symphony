@@ -565,6 +565,115 @@ describe("IssueCurrentStateBuilder", () => {
       lifecycleSummaryCiStatus: "success",
     });
   });
+
+  it("can build lifecycle report fields from typed history evidence", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture({ state: "In Review" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const completionReport = {
+      id: "completion-1",
+      idempotencyKey: "completion-1",
+      runId: "worker-run-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      summary: "Store completion summary",
+      validationEvidence: ["store validation"],
+      acceptanceChecklist: [],
+      changedFiles: ["src/store.ts"],
+      branchName: "feature/test-1",
+      pullRequest: {
+        url: "https://github.test/acme/repo/pull/7",
+        number: 7,
+        headSha: "abc123",
+        branch: "feature/test-1",
+      },
+      risks: [],
+      acceptedAt: "2026-01-01T00:00:01.000Z",
+      writebackOperationKeys: [],
+    };
+    const passVerdict = {
+      id: "verdict-1",
+      idempotencyKey: "verdict-1",
+      runId: "review-run-1",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      verdict: "pass" as const,
+      acceptanceResults: [],
+      findings: [],
+      gateFindings: [],
+      discoveryFindings: [],
+      evidence: ["store evidence"],
+      reviewer: "store-reviewer",
+      submittedAt: "2026-01-01T00:00:02.000Z",
+      writebackOperationKeys: [],
+    };
+    const lifecycle = await lifecycleStore.ensureIssue(issue, {
+      phase: "passed",
+      lastCompletionReportId: completionReport.id,
+      lastReviewVerdictId: passVerdict.id,
+      completionReports: [completionReport],
+      reviewVerdicts: [passVerdict],
+    });
+    const historyStore = new MemoryIssueStateStore();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+    const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+    const historyCompletionReport = {
+      ...completionReport,
+      summary: "History completion summary",
+      validationEvidence: ["history validation"],
+      changedFiles: ["src/history.ts"],
+    };
+    const historyPassVerdict = {
+      ...passVerdict,
+      evidence: ["history evidence"],
+      reviewer: "history-reviewer",
+    };
+    const historyLifecycle: IssueLifecycleRecord = {
+      ...lifecycle,
+      completionReports: [historyCompletionReport],
+      reviewVerdicts: [historyPassVerdict],
+    };
+    historyStore.record = {
+      ...storeCurrent,
+      history: [lifecycleEvidenceSnapshot(storeCurrent, historyLifecycle)],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["lifecycleReports"],
+    });
+
+    const current = await historyBackedBuilder.build(issue, emptyRuntime());
+
+    expect(current.latestCompletionReport).toMatchObject({
+      id: "completion-1",
+      summary: "History completion summary",
+      validationEvidence: ["history validation"],
+      changedFiles: ["src/history.ts"],
+    });
+    expect(current.mergePolicyLatestCompletionReport).toMatchObject({
+      id: "completion-1",
+      summary: "History completion summary",
+    });
+    expect(current.latestApprovalPassVerdict).toMatchObject({
+      id: "verdict-1",
+      evidence: ["history evidence"],
+      reviewer: "history-reviewer",
+    });
+    expect(current.mergePolicyLatestApprovalVerdict).toMatchObject({
+      id: "verdict-1",
+      reviewer: "history-reviewer",
+    });
+  });
 });
 
 function builderConfig(root: string): ServiceConfig {
@@ -725,6 +834,10 @@ function lifecycleEvidenceSnapshot(
   lifecycle: IssueLifecycleRecord,
 ): IssueHistorySnapshot {
   const at = "2026-01-01T00:00:04.000Z";
+  const latestCompletionReport =
+    latestCompletionReportForTestLifecycle(lifecycle);
+  const latestApprovalPassVerdict =
+    latestApprovalPassVerdictForTestLifecycle(lifecycle);
   return {
     ...current,
     snapshotId: "issue-snapshot:lifecycle-evidence",
@@ -766,8 +879,12 @@ function lifecycleEvidenceSnapshot(
       planningDispatchRetryCount: lifecycle.planningDispatchRetryCount,
       lastPlanningFailureAt: lifecycle.lastPlanningFailureAt,
       lastCompletionReportId: lifecycle.lastCompletionReportId,
+      lastCompletionReportRejectionId:
+        lifecycle.lastCompletionReportRejectionId,
       lastReviewVerdictId: lifecycle.lastReviewVerdictId,
       lastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
+      latestCompletionReport,
+      latestApprovalPassVerdict,
       summaryPointers: lifecycle.summaryPointers,
     },
     lifecyclePatch: null,
@@ -780,11 +897,44 @@ function lifecycleEvidenceSnapshot(
     lifecyclePlanningDispatchRetryCount: lifecycle.planningDispatchRetryCount,
     lifecycleLastPlanningFailureAt: lifecycle.lastPlanningFailureAt,
     lifecycleLastCompletionReportId: lifecycle.lastCompletionReportId,
+    lifecycleLastCompletionReportRejectionId:
+      lifecycle.lastCompletionReportRejectionId,
     lifecycleLastReviewVerdictId: lifecycle.lastReviewVerdictId,
     lifecycleLastMergeGateResultId: lifecycle.lastMergeGateResultId ?? null,
+    lifecycleLatestCompletionReport: latestCompletionReport,
+    lifecycleLatestApprovalPassVerdict: latestApprovalPassVerdict,
     lifecycleSummaryCiStatus: lifecycle.summaryPointers.ciStatus,
     lifecycleSummaryPointers: lifecycle.summaryPointers,
   };
+}
+
+function latestCompletionReportForTestLifecycle(
+  lifecycle: IssueLifecycleRecord,
+): IssueLifecycleRecord["completionReports"][number] | null {
+  if (lifecycle.lastCompletionReportId) {
+    return (
+      lifecycle.completionReports.find(
+        (report) => report.id === lifecycle.lastCompletionReportId,
+      ) ?? null
+    );
+  }
+  return lifecycle.completionReports.at(-1) ?? null;
+}
+
+function latestApprovalPassVerdictForTestLifecycle(
+  lifecycle: IssueLifecycleRecord,
+): IssueLifecycleRecord["reviewVerdicts"][number] | null {
+  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
+    if (
+      verdict.verdict === "pass" &&
+      verdict.issueId === lifecycle.issueId &&
+      verdict.issueIdentifier === lifecycle.issueIdentifier &&
+      !verdict.supersededAt
+    ) {
+      return verdict;
+    }
+  }
+  return null;
 }
 
 function runEvidenceSnapshots(

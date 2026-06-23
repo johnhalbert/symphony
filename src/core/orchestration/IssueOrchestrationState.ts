@@ -419,8 +419,11 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   lifecyclePlanningDispatchRetryCount: number | null;
   lifecycleLastPlanningFailureAt: string | null;
   lifecycleLastCompletionReportId: string | null;
+  lifecycleLastCompletionReportRejectionId: string | null;
   lifecycleLastReviewVerdictId: string | null;
   lifecycleLastMergeGateResultId: string | null;
+  lifecycleLatestCompletionReport: IssueCompletionReportRecord | null;
+  lifecycleLatestApprovalPassVerdict: IssueReviewVerdictRecord | null;
   lifecycleSummaryCiStatus: string | null;
   lifecycleSummaryPointers: unknown;
 }
@@ -579,6 +582,10 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
           payload,
           "lastCompletionReportId",
         ),
+        lifecycleLastCompletionReportRejectionId: stringField(
+          payload,
+          "lastCompletionReportRejectionId",
+        ),
         lifecycleLastReviewVerdictId: stringField(
           payload,
           "lastReviewVerdictId",
@@ -587,6 +594,16 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
           payload,
           "lastMergeGateResultId",
         ),
+        lifecycleLatestCompletionReport:
+          recordField<IssueCompletionReportRecord>(
+            payload,
+            "latestCompletionReport",
+          ),
+        lifecycleLatestApprovalPassVerdict:
+          recordField<IssueReviewVerdictRecord>(
+            payload,
+            "latestApprovalPassVerdict",
+          ),
         lifecycleSummaryCiStatus: stringField(
           recordPayload(payload?.summaryPointers),
           "ciStatus",
@@ -711,6 +728,16 @@ function copyMissingEvidenceFields(
 function recordPayload(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
+    : null;
+}
+
+function recordField<T extends object>(
+  payload: Record<string, unknown> | null,
+  key: string,
+): T | null {
+  const value = payload?.[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as T)
     : null;
 }
 

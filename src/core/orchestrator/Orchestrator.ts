@@ -951,7 +951,12 @@ export class Orchestrator {
       runStore: options.runStore,
       issueStateStore: this.issueStateStore,
       logger: options.logger,
-      historyBackedFieldGroups: ["tracker", "runSummary", "lifecycleCore"],
+      historyBackedFieldGroups: [
+        "tracker",
+        "runSummary",
+        "lifecycleCore",
+        "lifecycleReports",
+      ],
     });
     this.transitionRulesets = this.createTransitionRulesets();
     this.transitionEngine = new IssueOrchestrationEngine(
@@ -8131,8 +8136,14 @@ export class Orchestrator {
         planningDispatchRetryCount: input.lifecycle.planningDispatchRetryCount,
         lastPlanningFailureAt: input.lifecycle.lastPlanningFailureAt ?? null,
         lastCompletionReportId: input.lifecycle.lastCompletionReportId ?? null,
+        lastCompletionReportRejectionId:
+          input.lifecycle.lastCompletionReportRejectionId ?? null,
         lastReviewVerdictId: input.lifecycle.lastReviewVerdictId ?? null,
         lastMergeGateResultId: input.lifecycle.lastMergeGateResultId ?? null,
+        latestCompletionReport: latestCompletionReport(input.lifecycle),
+        latestApprovalPassVerdict: latestCurrentApprovalPassVerdict(
+          input.lifecycle,
+        ),
         mergeGate: input.lifecycle.mergeGate ?? null,
         mergeConflict: input.lifecycle.mergeConflict ?? null,
         summaryPointers: input.lifecycle.summaryPointers,

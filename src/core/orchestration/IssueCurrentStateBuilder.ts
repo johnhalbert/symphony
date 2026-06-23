@@ -103,7 +103,8 @@ export interface IssueCurrentStateBuilderOptions {
 export type IssueCurrentStateHistoryFieldGroup =
   | "tracker"
   | "runSummary"
-  | "lifecycleCore";
+  | "lifecycleCore"
+  | "lifecycleReports";
 
 type IssueBreakdownPlan = IssueLifecycleRecord["issueBreakdownPlans"][number];
 type IssueTriageReport = IssueLifecycleRecord["issueTriageReports"][number];
@@ -194,6 +195,15 @@ type LifecycleCoreFields = Pick<
   | "lastReviewVerdictId"
   | "lastMergeGateResultId"
   | "lifecycleSummaryCiStatus"
+>;
+
+type LifecycleReportFields = Pick<
+  LifecycleFields,
+  | "lastCompletionReportRejectionId"
+  | "latestCompletionReport"
+  | "latestApprovalPassVerdict"
+  | "mergePolicyLatestCompletionReport"
+  | "mergePolicyLatestApprovalVerdict"
 >;
 
 type ConfigFields = Pick<
@@ -289,6 +299,7 @@ interface HistoryBackedGroupFields {
   tracker?: TrackerFields;
   runSummary?: RunSummaryFields;
   lifecycleCore?: LifecycleCoreFields;
+  lifecycleReports?: LifecycleReportFields;
 }
 
 interface HistoryBackedGroupResult {
@@ -361,6 +372,8 @@ export class IssueCurrentStateBuilder {
     const tracker = this.buildTrackerFieldsFromHistory(context);
     const runSummary = this.buildRunSummaryFieldsFromHistory(context);
     const lifecycleCore = this.buildLifecycleCoreFieldsFromHistory(context);
+    const lifecycleReports =
+      this.buildLifecycleReportFieldsFromHistory(context);
     return {
       fields: {
         ...(tracker.fields === null ? {} : { tracker: tracker.fields }),
@@ -370,17 +383,24 @@ export class IssueCurrentStateBuilder {
         ...(lifecycleCore.fields === null
           ? {}
           : { lifecycleCore: lifecycleCore.fields }),
+        ...(lifecycleReports.fields === null
+          ? {}
+          : { lifecycleReports: lifecycleReports.fields }),
       },
       incompleteGroups: [
         ...(tracker.complete ? [] : (["tracker"] as const)),
         ...(runSummary.complete ? [] : (["runSummary"] as const)),
         ...(lifecycleCore.complete ? [] : (["lifecycleCore"] as const)),
+        ...(lifecycleReports.complete ? [] : (["lifecycleReports"] as const)),
       ],
       sourceSnapshotIds: [
         ...(tracker.sourceSnapshotId ? [tracker.sourceSnapshotId] : []),
         ...runSummary.sourceSnapshotIds,
         ...(lifecycleCore.sourceSnapshotId
           ? [lifecycleCore.sourceSnapshotId]
+          : []),
+        ...(lifecycleReports.sourceSnapshotId
+          ? [lifecycleReports.sourceSnapshotId]
           : []),
       ],
     };
@@ -618,6 +638,90 @@ export class IssueCurrentStateBuilder {
         lifecycleSummaryCiStatus: stringFromUnknown(
           snapshot.lifecycleSummaryCiStatus,
         ),
+      },
+    };
+  }
+
+  private buildLifecycleReportFieldsFromHistory(
+    context: IssueCurrentStateBuildContext,
+  ):
+    | {
+        complete: true;
+        fields: LifecycleReportFields;
+        sourceSnapshotId: string;
+      }
+    | { complete: false; fields: null; sourceSnapshotId: string | null } {
+    const snapshot = latestLifecycleMutationSnapshot(context.history);
+    if (snapshot === null) {
+      return { complete: false, fields: null, sourceSnapshotId: null };
+    }
+    if (
+      context.lifecycle === null ||
+      stringFromUnknown(snapshot.lifecycleUpdatedAt) !==
+        context.lifecycle.updatedAt
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const lastCompletionReportRejectionId = stringFromUnknown(
+      snapshot.lifecycleLastCompletionReportRejectionId,
+    );
+    if (
+      !historyStringMatchesKnown(
+        lastCompletionReportRejectionId,
+        context.lifecycle.lastCompletionReportRejectionId,
+      )
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const latestCompletionReport =
+      recordFromUnknown<IssueCompletionReportRecord>(
+        snapshot.lifecycleLatestCompletionReport,
+      );
+    if (
+      !historyRecordIdMatchesKnown(
+        latestCompletionReport,
+        context.mergePolicyLatestCompletionReport?.id,
+      )
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    const latestApprovalPassVerdict =
+      recordFromUnknown<IssueReviewVerdictRecord>(
+        snapshot.lifecycleLatestApprovalPassVerdict,
+      );
+    if (
+      !historyRecordIdMatchesKnown(
+        latestApprovalPassVerdict,
+        context.mergePolicyLatestApprovalVerdict?.id,
+      )
+    ) {
+      return {
+        complete: false,
+        fields: null,
+        sourceSnapshotId: snapshot.historySnapshotId,
+      };
+    }
+    return {
+      complete: true,
+      sourceSnapshotId: snapshot.historySnapshotId,
+      fields: {
+        lastCompletionReportRejectionId,
+        latestCompletionReport,
+        latestApprovalPassVerdict,
+        mergePolicyLatestCompletionReport: latestCompletionReport,
+        mergePolicyLatestApprovalVerdict: latestApprovalPassVerdict,
       },
     };
   }
@@ -1308,6 +1412,13 @@ function historyNumberMatchesKnown(
   return knownValue == null || historyValue === knownValue;
 }
 
+function historyRecordIdMatchesKnown(
+  historyRecord: { id: string } | null,
+  knownId: string | null | undefined,
+): boolean {
+  return knownId == null || historyRecord?.id === knownId;
+}
+
 function isCountedHistorySdkWaitErrorFailure(run: HistoryRunSummary): boolean {
   return (
     run.role === "worker" &&
@@ -1346,6 +1457,12 @@ function numberFromUnknown(value: unknown): number | null {
 
 function booleanFromUnknown(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
+}
+
+function recordFromUnknown<T extends { id: string }>(value: unknown): T | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Partial<T>;
+  return typeof record.id === "string" ? (record as T) : null;
 }
 
 function compareFieldGroup(
