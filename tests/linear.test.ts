@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { LinearTrackerClient, normalizeIssue } from "../src/integrations/linear/LinearTrackerClient.js";
+import {
+  buildLinearIssueCandidateFilter,
+  LinearTrackerClient,
+  normalizeIssue,
+} from "../src/integrations/linear/LinearTrackerClient.js";
 import { testConfig } from "./helpers.js";
 
 describe("LinearTrackerClient", () => {
@@ -123,6 +127,120 @@ describe("LinearTrackerClient", () => {
     const issues = await client.fetchCandidateIssues();
 
     expect(issues.map((item) => item.identifier)).toEqual(["T-1", "T-2"]);
+  });
+
+  it("builds filtered tick candidate filters with safe label exclusion semantics", () => {
+    const filter = buildLinearIssueCandidateFilter(
+      {
+        branches: [
+          {
+            id: "active_todo_dispatch",
+            stateNames: ["Todo"],
+            requireLabels: ["dogfood-ready", "post_mortem"],
+            excludeLabels: ["dogfood-blocked"],
+            requireAssignedToWorker: true,
+            requireNoOpenBlockers: true,
+            requireNoChildren: true,
+          },
+          {
+            id: "blocked_triage",
+            stateNames: ["Blocked"],
+            requireLabels: ["dogfood-ready"],
+            excludeLabels: ["dogfood-blocked"],
+          },
+        ],
+      },
+      { projectSlug: "TEST", assignee: "me" },
+    );
+
+    expect(filter).toEqual({
+      and: [
+        { project: { slugId: { eq: "TEST" } } },
+        {
+          or: [
+            {
+              and: [
+                { state: { name: { in: ["Todo"] } } },
+                { labels: { name: { eq: "dogfood-ready" } } },
+                { labels: { name: { eq: "post_mortem" } } },
+                {
+                  labels: {
+                    every: { name: { nin: ["dogfood-blocked"] } },
+                  },
+                },
+                {
+                  or: [
+                    { assignee: { isMe: { eq: true } } },
+                    { delegate: { isMe: { eq: true } } },
+                  ],
+                },
+                { hasBlockedByRelations: { eq: false } },
+                { children: { length: { eq: 0 } } },
+              ],
+            },
+            {
+              and: [
+                { state: { name: { in: ["Blocked"] } } },
+                { labels: { name: { eq: "dogfood-ready" } } },
+                {
+                  labels: {
+                    every: { name: { nin: ["dogfood-blocked"] } },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("fetches filtered tick candidates with configured max page size", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    let calls = 0;
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      calls += 1;
+      requests.push(JSON.parse(String(init?.body)));
+      return jsonResponse({
+        data: {
+          issues: {
+            nodes: [
+              {
+                id: `id-${calls}`,
+                identifier: `T-${calls}`,
+                title: "Title",
+                state: { name: "Todo" },
+              },
+            ],
+            pageInfo: {
+              hasNextPage: calls === 1,
+              endCursor: calls === 1 ? "next-page" : null,
+            },
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const issues = await client.fetchIssueCandidatesByFilter({
+      branches: [{ id: "todo", stateNames: ["Todo"] }],
+    });
+
+    expect(issues.map((item) => item.identifier)).toEqual(["T-1", "T-2"]);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.query).toContain("SymphonyTickIssueCandidates");
+    expect(requests[0]?.variables).toMatchObject({
+      first: 250,
+      after: null,
+      filter: {
+        and: [
+          { project: { slugId: { eq: "TEST" } } },
+          { state: { name: { in: ["Todo"] } } },
+        ],
+      },
+    });
+    expect(requests[1]?.variables.after).toBe("next-page");
   });
 
   it("fetches bounded project workflow states with team identity", async () => {

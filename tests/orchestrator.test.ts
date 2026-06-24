@@ -77,7 +77,10 @@ import type {
   TrackerWriteResult,
   TrackerWriter,
 } from "../src/core/tracker/TrackerWriter.js";
-import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
+import type {
+  TrackerClient,
+  TrackerIssueCandidateFilterInput,
+} from "../src/core/tracker/TrackerClient.js";
 import {
   FileWritebackOutboxStore,
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
@@ -385,6 +388,83 @@ describe("Orchestrator", () => {
         },
       ]),
     );
+  });
+
+  it("gathers filtered tick candidates before processing", async () => {
+    const config = testConfig(root);
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.excludeLabels = ["dogfood-blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.sourceStates = ["Ready to Merge"];
+    config.mergePolicy.conflictsState = "Approved with Conflicts";
+    config.postMortem.enabled = true;
+    config.postMortem.doneStates = ["Done"];
+    config.postMortem.requireLabels = ["post_mortem"];
+    const first = issue({ id: "issue-1", identifier: "TEST-1" });
+    const second = issue({ id: "issue-2", identifier: "TEST-2" });
+    const filteredInputs: TrackerIssueCandidateFilterInput[] = [];
+    let stateFetches = 0;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        stateFetches += 1;
+        return issuesInStates([first, second], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [];
+      },
+      async fetchIssueCandidatesByFilter(input) {
+        filteredInputs.push(input);
+        return [second, first, second];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    try {
+      const candidates = await (
+        orchestrator as unknown as {
+          fetchTickIssueCandidates(): Promise<Issue[]>;
+        }
+      ).fetchTickIssueCandidates();
+
+      expect(candidates.map((candidate) => candidate.identifier)).toEqual([
+        "TEST-2",
+        "TEST-1",
+      ]);
+      expect(stateFetches).toBe(0);
+      expect(filteredInputs).toHaveLength(1);
+      expect(filteredInputs[0]?.branches.map((branch) => branch.id)).toEqual([
+        "active_todo_dispatch",
+        "active_non_todo_dispatch",
+        "review_dispatch",
+        "blocked_triage",
+        "merge_policy",
+        "post_mortem",
+      ]);
+      expect(filteredInputs[0]?.branches.find((branch) => branch.id === "post_mortem")).toMatchObject({
+        stateNames: ["Done"],
+        requireLabels: ["dogfood-ready", "post_mortem"],
+        excludeLabels: ["dogfood-blocked"],
+      });
+    } finally {
+      await orchestrator.stop();
+    }
   });
 
   it("dispatches eligible work through the harness", async () => {
@@ -2234,6 +2314,12 @@ describe("Orchestrator", () => {
           (await lifecycleStore.get(candidate.id))?.planningFailureCount === 1,
       );
       await settleOrchestratorExit();
+      await waitForAsync(async () => {
+        const current = await runStore.readTranscript(scenario.expectedRunId);
+        return current.events.some(
+          (event) => event.eventType === "planning_run_failed",
+        );
+      }, "planning failure transcript event");
       const transcript = await runStore.readTranscript(scenario.expectedRunId);
       await orchestrator.stop();
 

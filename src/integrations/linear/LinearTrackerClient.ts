@@ -1,6 +1,11 @@
 import type { TrackerConfig } from "../../core/config/Config.js";
 import { SymphonyError } from "../../core/errors.js";
-import type { FetchIssuesByStatesOptions, TrackerClient } from "../../core/tracker/TrackerClient.js";
+import type {
+  FetchIssuesByStatesOptions,
+  TrackerClient,
+  TrackerIssueCandidateFilterBranch,
+  TrackerIssueCandidateFilterInput,
+} from "../../core/tracker/TrackerClient.js";
 import type {
   TrackerCommentInput,
   TrackerIssueCreateInput,
@@ -142,6 +147,8 @@ export interface LinearWorkflowTeamStates {
   states: string[];
 }
 
+type LinearIssueFilter = Record<string, unknown>;
+
 const ISSUE_FIELDS = `
   id
   identifier
@@ -167,9 +174,9 @@ const VIEWER_QUERY = `
 `;
 
 const CANDIDATE_QUERY = `
-  query SymphonyCandidateIssues($projectSlug: String!, $activeStates: [String!], $after: String) {
+  query SymphonyCandidateIssues($projectSlug: String!, $activeStates: [String!], $first: Int!, $after: String) {
     issues(
-      first: 50,
+      first: $first,
       after: $after,
       filter: {
         project: { slugId: { eq: $projectSlug } },
@@ -183,14 +190,28 @@ const CANDIDATE_QUERY = `
 `;
 
 const ISSUES_BY_STATES_QUERY = `
-  query SymphonyIssuesByStates($projectSlug: String!, $states: [String!], $after: String) {
+  query SymphonyIssuesByStates($projectSlug: String!, $states: [String!], $first: Int!, $after: String) {
     issues(
-      first: 50,
+      first: $first,
       after: $after,
       filter: {
         project: { slugId: { eq: $projectSlug } },
         state: { name: { in: $states } }
       }
+    ) {
+      nodes { ${ISSUE_FIELDS} }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`;
+
+const TICK_ISSUE_CANDIDATES_QUERY = `
+  query SymphonyTickIssueCandidates($filter: IssueFilter!, $first: Int!, $after: String) {
+    issues(
+      first: $first,
+      after: $after,
+      orderBy: updatedAt,
+      filter: $filter
     ) {
       nodes { ${ISSUE_FIELDS} }
       pageInfo { hasNextPage endCursor }
@@ -361,6 +382,20 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
         projectSlug: this.config.projectSlug,
         states: stateNames,
       },
+      assigneeFilter,
+    );
+  }
+
+  async fetchIssueCandidatesByFilter(input: TrackerIssueCandidateFilterInput): Promise<Issue[]> {
+    const filter = buildLinearIssueCandidateFilter(input, {
+      projectSlug: this.config.projectSlug,
+      assignee: this.config.assignee,
+    });
+    if (filter === null) return [];
+    const assigneeFilter = await this.routingAssigneeFilter();
+    return this.fetchPagedIssues(
+      TICK_ISSUE_CANDIDATES_QUERY,
+      { filter },
       assigneeFilter,
     );
   }
@@ -589,7 +624,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       const response: { issues: { nodes: LinearIssueNode[]; pageInfo: LinearPageInfo } } =
         await this.graphql<{ issues: { nodes: LinearIssueNode[]; pageInfo: LinearPageInfo } }>(
         query,
-        { ...variables, after },
+        { ...variables, first: linearPageSize(this.config.pageSize), after },
       );
       issues.push(
         ...response.issues.nodes
@@ -715,6 +750,88 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     }
     return body.data;
   }
+}
+
+export function buildLinearIssueCandidateFilter(
+  input: TrackerIssueCandidateFilterInput,
+  options: { projectSlug: string; assignee: string | null },
+): LinearIssueFilter | null {
+  const branches = input.branches
+    .map((branch) => linearFilterForCandidateBranch(branch, options.assignee))
+    .filter((branch): branch is LinearIssueFilter => branch !== null);
+  if (branches.length === 0) return null;
+  const projectFilter: LinearIssueFilter = {
+    project: { slugId: { eq: options.projectSlug } },
+  };
+  return {
+    and: [
+      projectFilter,
+      branches.length === 1 ? branches[0] : { or: branches },
+    ],
+  };
+}
+
+function linearFilterForCandidateBranch(
+  branch: TrackerIssueCandidateFilterBranch,
+  assignee: string | null,
+): LinearIssueFilter | null {
+  const stateNames = uniqueStrings(
+    branch.stateNames.map((state) => state.trim()).filter((state) => state.length > 0),
+  );
+  if (stateNames.length === 0) return null;
+
+  const filters: LinearIssueFilter[] = [
+    { state: { name: { in: stateNames } } },
+    ...requiredLabelFilters(branch.requireLabels),
+  ];
+
+  const excludeLabels = uniqueNormalizedLabels(branch.excludeLabels ?? []);
+  if (excludeLabels.length > 0) {
+    filters.push({ labels: { every: { name: { nin: excludeLabels } } } });
+  }
+  if (branch.requireAssignedToWorker === true) {
+    const routingFilter = assigneeRoutingFilter(assignee);
+    if (routingFilter !== null) filters.push(routingFilter);
+  }
+  if (branch.requireNoOpenBlockers === true) {
+    filters.push({ hasBlockedByRelations: { eq: false } });
+  }
+  if (branch.requireNoChildren === true) {
+    filters.push({ children: { length: { eq: 0 } } });
+  }
+
+  return filters.length === 1 ? filters[0] ?? null : { and: filters };
+}
+
+function requiredLabelFilters(labels: string[] | undefined): LinearIssueFilter[] {
+  return uniqueNormalizedLabels(labels ?? []).map((label) => ({
+    labels: { name: { eq: label } },
+  }));
+}
+
+function uniqueNormalizedLabels(labels: string[]): string[] {
+  return uniqueStrings(
+    labels.map((label) => label.trim().toLowerCase()).filter((label) => label.length > 0),
+  );
+}
+
+function assigneeRoutingFilter(assignee: string | null): LinearIssueFilter | null {
+  const route = assignee?.trim();
+  if (!route) return null;
+  const userFilter =
+    route.toLowerCase() === "me"
+      ? { isMe: { eq: true } }
+      : { id: { eq: route } };
+  return {
+    or: [
+      { assignee: userFilter },
+      { delegate: userFilter },
+    ],
+  };
+}
+
+function linearPageSize(value: number): number {
+  return Number.isInteger(value) && value >= 1 && value <= 250 ? value : 250;
 }
 
 export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFilter | null = null): Issue | null {

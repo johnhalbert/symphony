@@ -20,6 +20,7 @@ const rawConfigSchema = z
         api_key: z.string().optional(),
         project_slug: z.string().optional(),
         assignee: z.string().optional(),
+        page_size: z.number().int().min(1).max(250).optional(),
         active_states: stringArray.optional(),
         handoff_states: stringArray.optional(),
         terminal_states: stringArray.optional(),
@@ -381,6 +382,7 @@ export interface TrackerConfig {
   apiKey: string;
   projectSlug: string;
   assignee: string | null;
+  pageSize: number;
   activeStates: string[];
   handoffStates: string[];
   terminalStates: string[];
@@ -974,6 +976,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       apiKey: trackerApiKey,
       projectSlug,
       assignee: trackerAssignee.length === 0 ? null : trackerAssignee,
+      pageSize: raw.tracker?.page_size ?? 250,
       activeStates,
       handoffStates,
       terminalStates,

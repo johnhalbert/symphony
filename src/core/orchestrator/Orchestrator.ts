@@ -26,7 +26,11 @@ import {
   renderReviewMcpHandoffPrompt,
 } from "../harness/HandoffMcp.js";
 import type { Logger } from "../logging/StructuredLogger.js";
-import type { TrackerClient } from "../tracker/TrackerClient.js";
+import type {
+  TrackerClient,
+  TrackerIssueCandidateFilterBranch,
+  TrackerIssueCandidateFilterInput,
+} from "../tracker/TrackerClient.js";
 import {
   runKindForPhase,
   toIssueStatusView,
@@ -2855,23 +2859,160 @@ export class Orchestrator {
 
   private async fetchTickIssueCandidates(): Promise<Issue[]> {
     const byId = new Map<string, Issue>();
-    const states = this.tickIssueCandidateStates();
-    if (states.length > 0) {
+    const filter = this.tickIssueCandidateFilter();
+    let fetchedWithFilter = false;
+    if (
+      filter.branches.length > 0 &&
+      typeof this.options.tracker.fetchIssueCandidatesByFilter === "function"
+    ) {
       try {
-        for (const issue of await this.options.tracker.fetchIssuesByStates(
-          states,
-          { applyRouting: true },
-        )) {
+        for (const issue of await this.options.tracker.fetchIssueCandidatesByFilter(filter)) {
           byId.set(issue.id, issue);
         }
+        fetchedWithFilter = true;
       } catch (error) {
-        this.options.logger.warn("tick issue state fetch failed", {
-          states,
+        this.options.logger.warn("filtered tick issue candidate fetch failed", {
+          branches: filter.branches.map((branch) => branch.id),
           error: errorMessage(error),
         });
       }
     }
+    if (!fetchedWithFilter) {
+      const states = this.tickIssueCandidateStates();
+      if (states.length > 0) {
+        try {
+          for (const issue of await this.options.tracker.fetchIssuesByStates(
+            states,
+            { applyRouting: true },
+          )) {
+            byId.set(issue.id, issue);
+          }
+        } catch (error) {
+          this.options.logger.warn("tick issue state fetch failed", {
+            states,
+            error: errorMessage(error),
+          });
+        }
+      }
+    }
+    if (fetchedWithFilter) {
+      await this.addKnownTickIssueCandidates(byId);
+    }
     return [...byId.values()];
+  }
+
+  private tickIssueCandidateFilter(): TrackerIssueCandidateFilterInput {
+    const branches: TrackerIssueCandidateFilterBranch[] = [];
+    const globalRequiredLabels = this.config.agent.requireLabels;
+    const globalExcludeLabels = this.config.agent.excludeLabels;
+    const activeStates = uniqueStateNames(this.config.tracker.activeStates);
+    const todoStates = activeStates.filter(
+      (state) => state.trim().toLowerCase() === "todo",
+    );
+    const nonTodoActiveStates = activeStates.filter(
+      (state) => state.trim().toLowerCase() !== "todo",
+    );
+    if (todoStates.length > 0) {
+      branches.push({
+        id: "active_todo_dispatch",
+        stateNames: todoStates,
+        requireLabels: globalRequiredLabels,
+        excludeLabels: globalExcludeLabels,
+        requireAssignedToWorker: true,
+        requireNoOpenBlockers: true,
+        requireNoChildren: true,
+      });
+    }
+    if (nonTodoActiveStates.length > 0) {
+      branches.push({
+        id: "active_non_todo_dispatch",
+        stateNames: nonTodoActiveStates,
+        requireLabels: globalRequiredLabels,
+        excludeLabels: globalExcludeLabels,
+        requireAssignedToWorker: true,
+        requireNoChildren: true,
+      });
+    }
+    if (this.config.reviewLoop.reviewStates.length > 0) {
+      branches.push({
+        id: "review_dispatch",
+        stateNames: this.config.reviewLoop.reviewStates,
+        requireLabels: globalRequiredLabels,
+        excludeLabels: globalExcludeLabels,
+        requireNoOpenBlockers: true,
+      });
+    }
+    if (this.config.reviewLoop.blockedStates.length > 0) {
+      branches.push({
+        id: "blocked_triage",
+        stateNames: this.config.reviewLoop.blockedStates,
+        requireLabels: globalRequiredLabels,
+        excludeLabels: globalExcludeLabels,
+      });
+    }
+    const mergeStates = uniqueStateNames([
+      ...(this.config.mergePolicy.mode === "gated"
+        ? this.config.mergePolicy.sourceStates
+        : []),
+      ...(this.config.mergePolicy.mode === "gated" &&
+      this.config.mergePolicy.conflictsState !== null
+        ? [this.config.mergePolicy.conflictsState]
+        : []),
+    ]);
+    if (mergeStates.length > 0) {
+      branches.push({
+        id: "merge_policy",
+        stateNames: mergeStates,
+        requireLabels: globalRequiredLabels,
+        excludeLabels: globalExcludeLabels,
+      });
+    }
+    if (this.config.postMortem.enabled && this.config.postMortem.doneStates.length > 0) {
+      branches.push({
+        id: "post_mortem",
+        stateNames: this.config.postMortem.doneStates,
+        requireLabels: [
+          ...globalRequiredLabels,
+          ...this.config.postMortem.requireLabels,
+        ],
+        excludeLabels: [
+          ...globalExcludeLabels,
+          ...this.config.postMortem.excludeLabels,
+        ],
+      });
+    }
+    return { branches };
+  }
+
+  private async addKnownTickIssueCandidates(byId: Map<string, Issue>): Promise<void> {
+    const states = this.tickIssueCandidateStates();
+    if (states.length === 0) return;
+    let records: IssueStateRecord[];
+    try {
+      records = await this.issueStateStore.list();
+    } catch (error) {
+      this.options.logger.warn("known tick issue candidate list failed", {
+        error: errorMessage(error),
+      });
+      return;
+    }
+    const candidateIds = records
+      .filter((record) => !byId.has(record.issueId))
+      .filter((record) => isStateIn(record.trackerState, states))
+      .map((record) => record.issueId);
+    if (candidateIds.length === 0) return;
+    try {
+      for (const issue of await this.options.tracker.fetchIssueStatesByIds(
+        candidateIds,
+      )) {
+        byId.set(issue.id, issue);
+      }
+    } catch (error) {
+      this.options.logger.warn("known tick issue candidate refresh failed", {
+        issue_count: candidateIds.length,
+        error: errorMessage(error),
+      });
+    }
   }
 
   private tickIssueCandidateStates(): string[] {
