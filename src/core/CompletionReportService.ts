@@ -1,4 +1,11 @@
 import { z } from "zod";
+import {
+  BaseRefVerifier,
+  baseRefBlockedReason,
+  localRemoteBaseRefExists,
+  type BaseRefGitHubClient,
+  type IssueBaseRefObservation,
+} from "./BaseRefVerification.js";
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError } from "./errors.js";
 import type {
@@ -94,12 +101,15 @@ export interface CompletionReportServiceOptions {
   writebackProcessor?: Pick<WritebackProcessor, "processDue"> & Partial<Pick<WritebackProcessor, "enqueueAndProcess">>;
   runStore?: Pick<RunTranscriptStore, "appendEvent" | "getRun" | "recordPullRequestEvent" | "updateRun">;
   pullRequestPublisher?: CompletionReportPullRequestPublisher;
+  baseRefVerifier?: Pick<BaseRefVerifier, "verify">;
   operatorApproval?: Pick<OperatorApprovalService, "requestPublicationApproval" | "waitForPublicationApprovalRequest"> &
     Partial<Pick<OperatorApprovalService, "get" | "getByDedupe">>;
 }
 
 export interface CompletionReportPullRequestPublisher {
   publishPullRequest(input: CompletionReportPullRequestPublicationInput): Promise<CompletionReportPullRequestPublication>;
+  getBranchHeadSha?(input: { branchName: string }): Promise<string>;
+  gitAuthHeader?(): Promise<string>;
   getRequiredCheckResults?(input: {
     headSha: string;
     requiredChecks: string[];
@@ -379,6 +389,7 @@ export class CompletionReportService {
       phase: "blocked",
     };
     const publicationInput = this.buildPublicationInput(report, context, lifecycle);
+    await this.verifyBaseRefBeforePublication(input.issue, publicationInput, "recover_publication_approval");
     const publication = await this.options.pullRequestPublisher.publishPullRequest(publicationInput);
     const result = await this.finalizeCompletionReport({
       report,
@@ -689,7 +700,48 @@ export class CompletionReportService {
       throw new SymphonyError("invalid_request", "PR publication is enabled but no GitHub publisher is configured");
     }
     const publicationInput = this.buildPublicationInput(report, context, existingLifecycle);
+    await this.verifyBaseRefBeforePublication(context.issue, publicationInput, "reconcile_completion_report_handoff");
     return this.options.pullRequestPublisher.publishPullRequest(publicationInput);
+  }
+
+  private async verifyBaseRefBeforePublication(
+    issue: Issue,
+    publicationInput: CompletionReportPullRequestPublicationInput,
+    operation: string,
+  ): Promise<IssueBaseRefObservation | null> {
+    const client = baseRefClientFromPublisher(this.options.pullRequestPublisher);
+    if (client === null) return null;
+    if (
+      this.options.baseRefVerifier === undefined &&
+      !(await localRemoteBaseRefExists({
+        workspacePath: publicationInput.workspacePath,
+        baseRef: publicationInput.baseBranch,
+      }))
+    ) {
+      return null;
+    }
+    const observation = await (this.options.baseRefVerifier ?? new BaseRefVerifier()).verify({
+      workspacePath: publicationInput.workspacePath,
+      branchName: publicationInput.branchName,
+      baseRef: publicationInput.baseBranch,
+      operation,
+      client,
+    });
+    if (observation.classification === "ok") {
+      await this.options.lifecycleStore.updateIssue(issue, {
+        baseRefObservation: observation,
+      });
+      return observation;
+    }
+    const blockedReason = baseRefBlockedReason(observation);
+    await this.options.lifecycleStore.updateIssue(issue, {
+      phase: "blocked",
+      blockedReason,
+      baseRefObservation: observation,
+    });
+    throw new SymphonyError("invalid_request", blockedReason, {
+      baseRefObservation: observation,
+    });
   }
 
   private async evaluatePullRequestHandoffChecks(
@@ -953,6 +1005,10 @@ export class CompletionReportService {
     if (latestLifecycle?.phase === "blocked" && latestLifecycle.blockedReason === terminalReason) {
       return [];
     }
+    await this.options.lifecycleStore.updateIssue(context.issue, {
+      phase: "blocked",
+      blockedReason: terminalReason,
+    });
     const issue = {
       ...context.issue,
       state: this.options.config.reviewLoop.blockedStates[0] ?? context.issue.state,
@@ -969,10 +1025,6 @@ export class CompletionReportService {
     )) {
       enqueued.push(await this.enqueueWritebackForImmediateProcessing(operation));
     }
-    await this.options.lifecycleStore.updateIssue(context.issue, {
-      phase: "blocked",
-      blockedReason: `publication approval ${approval.status}`,
-    });
     if (!processedOnEnqueue) await this.processDueForOperations(enqueued);
     return enqueued;
   }
@@ -1380,6 +1432,22 @@ function completionReportInputFromRecord(record: IssueCompletionReportRecord): C
     risks: record.risks,
     idempotencyKey: record.idempotencyKey,
   };
+}
+
+function baseRefClientFromPublisher(
+  publisher: CompletionReportPullRequestPublisher | undefined,
+): BaseRefGitHubClient | null {
+  if (
+    publisher &&
+    typeof publisher.getBranchHeadSha === "function" &&
+    typeof publisher.gitAuthHeader === "function"
+  ) {
+    return {
+      getBranchHeadSha: (input) => publisher.getBranchHeadSha!(input),
+      gitAuthHeader: () => publisher.gitAuthHeader!(),
+    };
+  }
+  return null;
 }
 
 function workspaceFromApproval(approval: OperatorApprovalRecord, lifecycle: NonNullable<ExistingIssueLifecycle>): Workspace {

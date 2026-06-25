@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import {
+  BaseRefVerifier,
+  baseRefBlockedReason,
+  localRemoteBaseRefExists,
+  type BaseRefGitHubClient,
+} from "../BaseRefVerification.js";
 import type {
   PullRequestIssueCommentFeedbackInput,
   PullRequestReviewCommentFeedbackInput,
@@ -83,6 +89,8 @@ export interface PullRequestReviewFeedbackClient {
   submitPullRequestReviewFeedback(input: PullRequestReviewFeedbackInput): Promise<PullRequestReviewFeedbackResult>;
   submitPullRequestReviewCommentFeedback(input: PullRequestReviewCommentFeedbackInput): Promise<PullRequestReviewFeedbackResult>;
   submitPullRequestIssueCommentFeedback(input: PullRequestIssueCommentFeedbackInput): Promise<PullRequestReviewFeedbackResult>;
+  getBranchHeadSha?(input: { branchName: string }): Promise<string>;
+  gitAuthHeader?(): Promise<string>;
 }
 
 export interface ReviewFeedbackActiveContext {
@@ -100,6 +108,7 @@ export interface PullRequestReviewFeedbackServiceOptions {
   config: ServiceConfig;
   lifecycleStore: IssueLifecycleStore;
   client: PullRequestReviewFeedbackClient;
+  baseRefVerifier?: Pick<BaseRefVerifier, "verify">;
 }
 
 export interface PullRequestReviewFeedbackSubmitResult {
@@ -145,7 +154,7 @@ export class PullRequestReviewFeedbackService {
       return resultFromRecord(existing, true);
     }
 
-    const result = await this.writeFeedback(feedback, pullRequest);
+    const result = await this.writeFeedback(feedback, pullRequest, lifecycle, context.issue);
     const urls = urlsFromFeedbackResult(result);
     if (urls.length === 0) {
       throw new SymphonyError("tracker_error", "GitHub PR feedback did not return a durable URL");
@@ -207,6 +216,8 @@ export class PullRequestReviewFeedbackService {
   private async writeFeedback(
     feedback: PullRequestReviewFeedbackInputValue,
     pullRequest: CompletionReportPullRequestRef,
+    lifecycle: IssueLifecycleRecord,
+    issue: Issue,
   ): Promise<PullRequestReviewFeedbackResult> {
     if (feedback.kind === "issue_comment") {
       return this.options.client.submitPullRequestIssueCommentFeedback({
@@ -214,6 +225,7 @@ export class PullRequestReviewFeedbackService {
         body: feedback.body,
       });
     }
+    await this.verifyBaseRefBeforeReviewFeedback(lifecycle, issue);
     if (feedback.kind === "review_comment") {
       return this.options.client.submitPullRequestReviewCommentFeedback({
         pullRequestNumber: requiredPullRequestNumber(pullRequest),
@@ -238,6 +250,49 @@ export class PullRequestReviewFeedbackService {
         ...(comment.startLine === undefined ? {} : { startLine: comment.startLine }),
         ...(comment.startSide === undefined ? {} : { startSide: comment.startSide }),
       })),
+    });
+  }
+
+  private async verifyBaseRefBeforeReviewFeedback(
+    lifecycle: IssueLifecycleRecord,
+    issue: Issue,
+  ): Promise<void> {
+    const client = baseRefClientFromReviewFeedbackClient(this.options.client);
+    if (client === null) return;
+    const workspacePath = lifecycle.summaryPointers.workspacePath;
+    const branchName =
+      lifecycle.summaryPointers.gitBranchName ??
+      lifecycle.summaryPointers.prBranch ??
+      lifecycle.summaryPointers.branchName ??
+      issue.branchName;
+    const baseRef = lifecycle.summaryPointers.baseRef ?? this.options.config.workspace.source.baseRef;
+    if (
+      this.options.baseRefVerifier === undefined &&
+      !(await localRemoteBaseRefExists({ workspacePath, baseRef }))
+    ) {
+      return;
+    }
+    const observation = await (this.options.baseRefVerifier ?? new BaseRefVerifier()).verify({
+      workspacePath,
+      branchName,
+      baseRef,
+      operation: "review_feedback",
+      client,
+    });
+    if (observation.classification === "ok") {
+      await this.options.lifecycleStore.updateIssue(issue, {
+        baseRefObservation: observation,
+      });
+      return;
+    }
+    const blockedReason = baseRefBlockedReason(observation);
+    await this.options.lifecycleStore.updateIssue(issue, {
+      phase: "blocked",
+      blockedReason,
+      baseRefObservation: observation,
+    });
+    throw new SymphonyError("invalid_request", blockedReason, {
+      baseRefObservation: observation,
     });
   }
 }
@@ -347,6 +402,21 @@ function requiredHeadSha(pullRequest: CompletionReportPullRequestRef): string {
     throw new SymphonyError("invalid_request", "Inline or review feedback requires a lifecycle-bound pull request head SHA");
   }
   return value;
+}
+
+function baseRefClientFromReviewFeedbackClient(
+  client: PullRequestReviewFeedbackClient,
+): BaseRefGitHubClient | null {
+  if (
+    typeof client.getBranchHeadSha === "function" &&
+    typeof client.gitAuthHeader === "function"
+  ) {
+    return {
+      getBranchHeadSha: (input) => client.getBranchHeadSha!(input),
+      gitAuthHeader: () => client.gitAuthHeader!(),
+    };
+  }
+  return null;
 }
 
 function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {

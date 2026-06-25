@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
+import type { IssueBaseRefObservation } from "../BaseRefVerification.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type { Issue } from "../types.js";
 import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
@@ -643,6 +644,7 @@ export interface IssueLifecycleRecord {
   issueTriageReports: IssueTriageReportRecord[];
   postMortemReports: IssuePostMortemReportRecord[];
   reviewEvidence: PullRequestReviewEvidenceState;
+  baseRefObservation?: IssueBaseRefObservation | null;
   mergeGate?: IssueMergeGateState | null;
   merge: IssueMergeMetadata | null;
   mergeConflict: IssueMergeConflictMetadata | null;
@@ -679,6 +681,7 @@ export interface IssueLifecyclePatch {
   issueTriageReports?: IssueTriageReportRecord[];
   postMortemReports?: IssuePostMortemReportRecord[];
   reviewEvidence?: PullRequestReviewEvidenceState;
+  baseRefObservation?: IssueBaseRefObservation | null;
   mergeGate?: IssueMergeGateState | null;
   merge?: IssueMergeMetadata | null;
   mergeConflict?: IssueMergeConflictMetadata | null;
@@ -757,6 +760,7 @@ export class FileIssueLifecycleStore {
       issueTriageReports: patch.issueTriageReports ?? existing?.issueTriageReports ?? [],
       postMortemReports: patch.postMortemReports ?? existing?.postMortemReports ?? [],
       reviewEvidence: patch.reviewEvidence ?? existing?.reviewEvidence ?? defaultReviewEvidence(),
+      baseRefObservation: patchValue(patch, "baseRefObservation", existing?.baseRefObservation ?? null),
       mergeGate: patchValue(patch, "mergeGate", existing?.mergeGate ?? null),
       merge: patchValue(patch, "merge", existing?.merge ?? null),
       mergeConflict: patchValue(patch, "mergeConflict", existing?.mergeConflict ?? null),
@@ -1271,6 +1275,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     issueTriageReports: normalizeIssueTriageReports(value.issueTriageReports, filePath),
     postMortemReports: normalizePostMortemReports(value.postMortemReports, filePath),
     reviewEvidence: normalizeReviewEvidence(value.reviewEvidence, filePath),
+    baseRefObservation: normalizeBaseRefObservation(value.baseRefObservation, filePath),
     mergeGate: normalizeMergeGateState(value.mergeGate, filePath),
     merge: normalizeMergeMetadata(value.merge, filePath),
     mergeConflict: normalizeMergeConflictMetadata(value.mergeConflict, filePath),
@@ -1567,6 +1572,54 @@ function normalizeReviewEvidence(value: unknown, filePath: string): PullRequestR
     ),
     items: normalizeReviewEvidenceItems(value.items, filePath),
     updatedAt: optionalNullableString(value.updatedAt, filePath, "reviewEvidence.updatedAt"),
+  };
+}
+
+function normalizeBaseRefObservation(value: unknown, filePath: string): IssueBaseRefObservation | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "baseRefObservation is invalid");
+  const classification = value.classification;
+  if (!isBaseRefObservationClassification(classification)) {
+    throw corruptLifecycle(filePath, "baseRefObservation.classification is invalid");
+  }
+  return {
+    version: 1,
+    inputFingerprint: requiredString(value.inputFingerprint, filePath, "baseRefObservation.inputFingerprint"),
+    classification,
+    operation: requiredString(value.operation, filePath, "baseRefObservation.operation"),
+    checkedAt: requiredString(value.checkedAt, filePath, "baseRefObservation.checkedAt"),
+    workspacePath: optionalNullableString(value.workspacePath, filePath, "baseRefObservation.workspacePath"),
+    branchName: optionalNullableString(value.branchName, filePath, "baseRefObservation.branchName"),
+    baseRef: optionalNullableString(value.baseRef, filePath, "baseRefObservation.baseRef"),
+    normalizedBaseBranch: optionalNullableString(
+      value.normalizedBaseBranch,
+      filePath,
+      "baseRefObservation.normalizedBaseBranch",
+    ),
+    localBaseRef: optionalNullableString(value.localBaseRef, filePath, "baseRefObservation.localBaseRef"),
+    githubBaseHeadSha: optionalNullableString(
+      value.githubBaseHeadSha,
+      filePath,
+      "baseRefObservation.githubBaseHeadSha",
+    ),
+    localBaseHeadShaBeforeFetch: optionalNullableString(
+      value.localBaseHeadShaBeforeFetch,
+      filePath,
+      "baseRefObservation.localBaseHeadShaBeforeFetch",
+    ),
+    localBaseHeadShaAfterFetch: optionalNullableString(
+      value.localBaseHeadShaAfterFetch,
+      filePath,
+      "baseRefObservation.localBaseHeadShaAfterFetch",
+    ),
+    worktreeHeadSha: optionalNullableString(value.worktreeHeadSha, filePath, "baseRefObservation.worktreeHeadSha"),
+    localBaseIsAncestorOfHead: optionalNullableBoolean(
+      value.localBaseIsAncestorOfHead,
+      filePath,
+      "baseRefObservation.localBaseIsAncestorOfHead",
+    ),
+    reason: optionalNullableString(value.reason, filePath, "baseRefObservation.reason"),
+    error: optionalNullableString(value.error, filePath, "baseRefObservation.error"),
   };
 }
 
@@ -2966,6 +3019,17 @@ function isMergeGateCheckOutcome(value: unknown): value is IssueMergeGateCheckOu
 
 function isMergeGateRawCheckStatus(value: unknown): value is IssueMergeGateRawCheckStatus {
   return value === "success" || value === "failure" || value === "pending" || value === "missing" || value === "unknown";
+}
+
+function isBaseRefObservationClassification(value: unknown): value is IssueBaseRefObservation["classification"] {
+  return (
+    value === "ok" ||
+    value === "local_base_mismatch" ||
+    value === "branch_not_based_on_live_base" ||
+    value === "base_ref_unavailable" ||
+    value === "base_ref_fetch_failed" ||
+    value === "base_ref_compare_failed"
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

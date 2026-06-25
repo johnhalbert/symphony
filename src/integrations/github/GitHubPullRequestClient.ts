@@ -391,7 +391,7 @@ export class GitHubPullRequestClient {
   }
 
   async getBranchHeadSha(input: BranchHeadLookupInput): Promise<string> {
-    this.assertConfiguredForMerge();
+    this.assertConfiguredForRepositoryAccess();
     const branchName = normalizeBaseBranch(input.branchName) ?? input.branchName.trim();
     if (branchName.length === 0) {
       throw new SymphonyError("invalid_request", "A branch name is required for GitHub branch head lookup");
@@ -411,7 +411,7 @@ export class GitHubPullRequestClient {
   }
 
   async gitAuthHeader(): Promise<string> {
-    this.assertConfiguredForMerge();
+    this.assertConfiguredForRepositoryAccess();
     return `AUTHORIZATION: bearer ${await this.resolveAuthToken()}`;
   }
 

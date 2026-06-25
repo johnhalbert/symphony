@@ -1,8 +1,14 @@
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServiceConfig } from "../config/Config.js";
+import {
+  BaseRefVerifier,
+  baseRefBlockedReason,
+  baseRefObservationInputFingerprint,
+  type IssueBaseRefObservation,
+} from "../BaseRefVerification.js";
 import { SymphonyError, errorMessage } from "../errors.js";
 import type {
   AgentActivitySource,
@@ -466,6 +472,7 @@ interface OrchestratorTransitionContext {
   attempt: number | null;
   allowExistingClaim: boolean;
   dispatch: DispatchTransitionScratch;
+  baseRef: BaseRefTransitionScratch;
   reportWriteback: ReportWritebackTransitionScratch;
   publicationApproval: PublicationApprovalTransitionScratch;
   termination: TerminationTransitionScratch;
@@ -485,6 +492,10 @@ interface DispatchTransitionScratch {
   reviewEvidence?: ReviewerDispatchEvidence | null;
   dispatchWriteback?: NewWritebackOperation | null;
   entry?: RunningEntry;
+}
+
+interface BaseRefTransitionScratch {
+  observation?: IssueBaseRefObservation;
 }
 
 interface ReportWritebackTransitionScratch {
@@ -3054,6 +3065,10 @@ export class Orchestrator {
         await this.continueMergePolicyTransitionChain(issue, result.transition);
         return true;
       }
+      if (baseRefTransitionShouldContinue(result.transition.transitionKind)) {
+        await this.continueBaseRefTransitionChain(issue, result.transition);
+        return true;
+      }
       if (!tickTransitionShouldContinue(result.transition.transitionKind))
         return acted;
     }
@@ -4024,6 +4039,37 @@ export class Orchestrator {
 
   private createTransitions(): IssueTransition<OrchestratorTransitionContext>[] {
     return [
+      {
+        kind: "base_ref_observe",
+        actions: [
+          {
+            id: "record_base_ref_observation",
+            execute: (context) => this.recordBaseRefObservationAction(context),
+          },
+        ],
+      },
+      {
+        kind: "base_ref_block",
+        actions: [
+          {
+            id: "load_block_issue_lifecycle",
+            execute: (context) => this.loadBlockIssueLifecycleAction(context),
+          },
+          {
+            id: "update_lifecycle_blocked",
+            execute: (context) => this.updateLifecycleBlockedAction(context),
+          },
+          {
+            id: "apply_blocked_escalation_writebacks",
+            execute: (context) =>
+              this.applyBlockedEscalationWritebacksAction(context),
+          },
+          {
+            id: "record_block_issue",
+            execute: (context) => this.recordBlockIssueAction(context),
+          },
+        ],
+      },
       {
         kind: "dispatch_worker",
         actions: [
@@ -6341,6 +6387,68 @@ export class Orchestrator {
     };
   }
 
+  private async recordBaseRefObservationAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const targetRequest = baseRefTargetRequestFromTransition(context.transition);
+    if (targetRequest === null) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Base ref observation target transition is missing",
+      };
+    }
+    const workspacePath = nonEmptyString(context.transition.latestWorkspacePath);
+    const branchName =
+      nonEmptyString(context.transition.latestGitBranchName) ??
+      nonEmptyString(context.transition.latestPrBranch) ??
+      nonEmptyString(context.transition.branchName);
+    const baseRef =
+      nonEmptyString(context.transition.latestBaseRef) ??
+      nonEmptyString(this.config.workspace.source.baseRef);
+    const client = createGitHubPullRequestClientForCapability(
+      this.config,
+      "github.merge",
+    );
+    const observation = await new BaseRefVerifier().verify({
+      workspacePath,
+      branchName,
+      baseRef,
+      operation: targetRequest.transitionKind,
+      client,
+    });
+    context.baseRef.observation = observation;
+    const lifecycle =
+      (await this.updateIssueLifecycleWithEvidence(
+        context.issue,
+        { baseRefObservation: observation },
+        "base_ref_observed",
+        context.transition.historySnapshotId,
+      )) ?? null;
+    if (lifecycle === null) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Base ref observation requires lifecycle persistence",
+      };
+    }
+    return {
+      details: {
+        targetTransitionKind: targetRequest.transitionKind,
+        classification: observation.classification,
+        inputFingerprint: observation.inputFingerprint,
+        workspacePath: observation.workspacePath,
+        branchName: observation.branchName,
+        baseRef: observation.baseRef,
+        githubBaseHeadSha: observation.githubBaseHeadSha,
+        localBaseHeadShaAfterFetch: observation.localBaseHeadShaAfterFetch,
+        worktreeHeadSha: observation.worktreeHeadSha,
+        localBaseIsAncestorOfHead: observation.localBaseIsAncestorOfHead,
+        reason: observation.reason,
+      },
+    };
+  }
+
   private async updateLifecycleBlockedAction(
     context: OrchestratorTransitionContext,
   ) {
@@ -6934,17 +7042,20 @@ export class Orchestrator {
           )
             return null;
           const target = manualAgentRunTarget(snapshot.manualStage);
-          return dispatchTransitionRequest({
-            role: target.role,
-            runPhase: target.runPhase,
-            reason: "manual_dispatch",
-            promptScenario: promptScenarioForDispatch(
-              target.role,
-              target.runPhase,
-              true,
-            ),
-            manualDispatch: true,
-          });
+          return this.baseRefGuardedTransitionRequest(
+            snapshot,
+            dispatchTransitionRequest({
+              role: target.role,
+              runPhase: target.runPhase,
+              reason: "manual_dispatch",
+              promptScenario: promptScenarioForDispatch(
+                target.role,
+                target.runPhase,
+                true,
+              ),
+              manualDispatch: true,
+            }),
+          );
         },
       },
       {
@@ -6958,7 +7069,7 @@ export class Orchestrator {
         evaluate: (snapshot) =>
           snapshot.triggerType === "orchestrator.tick" &&
           snapshot.pendingPublicationApprovalRunId !== null
-            ? {
+            ? this.baseRefGuardedTransitionRequest(snapshot, {
                 transitionKind: "recover_publication_approval",
                 reason: "recover_pending_publication_approval",
                 runId: snapshot.pendingPublicationApprovalRunId,
@@ -6966,7 +7077,7 @@ export class Orchestrator {
                   snapshot.pendingPublicationApprovalReportId,
                 pendingPublicationApprovalReason:
                   snapshot.pendingPublicationApprovalReason,
-              }
+              })
             : null,
       },
       {
@@ -7099,21 +7210,42 @@ export class Orchestrator {
             : null,
       },
       {
+        id: "orchestrator.base_ref.chain",
+        priority: 44,
+        evaluate: (snapshot) => {
+          const context = snapshot.transitionRequestContext;
+          if (
+            snapshot.triggerType !== "runtime.requested" ||
+            snapshot.triggerSource !== "transition" ||
+            context?.kind !== "base_ref_chain"
+          ) {
+            return null;
+          }
+          return this.baseRefGuardedTransitionRequest(
+            snapshot,
+            context.payload.targetRequest,
+          );
+        },
+      },
+      {
         id: "orchestrator.dispatch.merge_conflict_worker",
         priority: 40,
         evaluate: (snapshot) =>
           snapshot.triggerType === "orchestrator.tick" &&
           this.rulesetCanDispatchWorker(snapshot, "merge_conflict_resolution")
-            ? dispatchTransitionRequest({
-                role: "worker",
-                runPhase: "merge_conflict_resolution",
-                reason: "merge_conflict_resolution_required",
-                promptScenario: promptScenarioForDispatch(
-                  "worker",
-                  "merge_conflict_resolution",
-                  false,
-                ),
-              })
+            ? this.baseRefGuardedTransitionRequest(
+                snapshot,
+                dispatchTransitionRequest({
+                  role: "worker",
+                  runPhase: "merge_conflict_resolution",
+                  reason: "merge_conflict_resolution_required",
+                  promptScenario: promptScenarioForDispatch(
+                    "worker",
+                    "merge_conflict_resolution",
+                    false,
+                  ),
+                }),
+              )
             : null,
       },
       {
@@ -7176,16 +7308,19 @@ export class Orchestrator {
         evaluate: (snapshot) =>
           snapshot.triggerType === "orchestrator.tick" &&
           this.rulesetCanDispatchWorker(snapshot, "implementation")
-            ? dispatchTransitionRequest({
-                role: "worker",
-                runPhase: "implementation",
-                reason: "worker_dispatch",
-                promptScenario: promptScenarioForDispatch(
-                  "worker",
-                  "implementation",
-                  false,
-                ),
-              })
+            ? this.baseRefGuardedTransitionRequest(
+                snapshot,
+                dispatchTransitionRequest({
+                  role: "worker",
+                  runPhase: "implementation",
+                  reason: "worker_dispatch",
+                  promptScenario: promptScenarioForDispatch(
+                    "worker",
+                    "implementation",
+                    false,
+                  ),
+                }),
+              )
             : null,
       },
       {
@@ -7194,16 +7329,19 @@ export class Orchestrator {
         evaluate: (snapshot) =>
           snapshot.triggerType === "orchestrator.tick" &&
           this.rulesetCanDispatchReviewer(snapshot)
-            ? dispatchTransitionRequest({
-                role: "reviewer",
-                runPhase: "review",
-                reason: "reviewer_dispatch",
-                promptScenario: promptScenarioForDispatch(
-                  "reviewer",
-                  "review",
-                  false,
-                ),
-              })
+            ? this.baseRefGuardedTransitionRequest(
+                snapshot,
+                dispatchTransitionRequest({
+                  role: "reviewer",
+                  runPhase: "review",
+                  reason: "reviewer_dispatch",
+                  promptScenario: promptScenarioForDispatch(
+                    "reviewer",
+                    "review",
+                    false,
+                  ),
+                }),
+              )
             : null,
       },
       {
@@ -7237,7 +7375,7 @@ export class Orchestrator {
           ) {
             return null;
           }
-          return {
+          return this.baseRefGuardedTransitionRequest(snapshot, {
             transitionKind: handoffReconciliationTransitionKind(
               context.payload.handoffKind,
             ),
@@ -7247,7 +7385,7 @@ export class Orchestrator {
             runKind: context.payload.runKind,
             runId: context.payload.runId,
             handoffKind: context.payload.handoffKind,
-          };
+          });
         },
       },
       {
@@ -7429,15 +7567,97 @@ export class Orchestrator {
             observation,
           );
           if (request === null || request.transitionKind !== kind) return null;
-          return {
+          return this.baseRefGuardedTransitionRequest(snapshot, {
             ...request,
             reason: observation.reason ?? kind,
             mergePolicyObservationInputFingerprint:
               observation.inputFingerprint,
-          };
+          });
         },
       })),
     ];
+  }
+
+  private baseRefGuardedTransitionRequest(
+    snapshot: IssueCurrentStateSnapshot,
+    targetRequest: IssueTransitionRequest,
+  ): IssueTransitionRequest {
+    if (!this.rulesetShouldGuardBaseRef(snapshot, targetRequest)) {
+      return targetRequest;
+    }
+    const expectedFingerprint = this.baseRefObservationFingerprintForSnapshot(
+      snapshot,
+      targetRequest.transitionKind,
+    );
+    const chainContext =
+      snapshot.transitionRequestContext?.kind === "base_ref_chain"
+        ? snapshot.transitionRequestContext
+        : null;
+    const observation = snapshot.lastBaseRefObservation ?? null;
+    if (
+      chainContext?.payload.targetTransitionKind ===
+        targetRequest.transitionKind &&
+      observation !== null &&
+      observation.operation === targetRequest.transitionKind &&
+      observation.inputFingerprint === expectedFingerprint
+    ) {
+      if (observation.classification === "ok") return targetRequest;
+      const blockedReason = baseRefBlockedReason(observation);
+      return {
+        transitionKind: "base_ref_block",
+        reason: blockedReason,
+        blockedReason,
+        runId: snapshot.latestRunId ?? snapshot.issueId,
+        baseRefObservationFingerprint: observation.inputFingerprint,
+        baseRefObservationClassification: observation.classification,
+      };
+    }
+    return {
+      transitionKind: "base_ref_observe",
+      reason: "base_ref_observation_required",
+      baseRefTargetTransitionKind: targetRequest.transitionKind,
+      baseRefTargetRequest: targetRequest,
+    };
+  }
+
+  private rulesetShouldGuardBaseRef(
+    snapshot: IssueCurrentStateSnapshot,
+    targetRequest: IssueTransitionRequest,
+  ): boolean {
+    if (!BASE_REF_GUARDED_TRANSITION_KINDS.has(targetRequest.transitionKind))
+      return false;
+    if (!snapshot.lifecyclePersistenceAvailable) return false;
+    const workspacePath = nonEmptyString(snapshot.latestWorkspacePath);
+    if (workspacePath === null || !workspaceLooksLikeGitWorktree(workspacePath))
+      return false;
+    if (
+      nonEmptyString(snapshot.latestGitBranchName) === null &&
+      nonEmptyString(snapshot.latestPrBranch) === null &&
+      nonEmptyString(snapshot.branchName) === null
+    ) {
+      return false;
+    }
+    return (
+      nonEmptyString(snapshot.latestBaseRef) !== null ||
+      nonEmptyString(this.config.workspace.source.baseRef) !== null
+    );
+  }
+
+  private baseRefObservationFingerprintForSnapshot(
+    snapshot: IssueCurrentStateSnapshot,
+    targetTransitionKind: IssueTransitionKind,
+  ): string {
+    return baseRefObservationInputFingerprint({
+      workspacePath: nonEmptyString(snapshot.latestWorkspacePath),
+      branchName:
+        nonEmptyString(snapshot.latestGitBranchName) ??
+        nonEmptyString(snapshot.latestPrBranch) ??
+        nonEmptyString(snapshot.branchName),
+      baseRef:
+        nonEmptyString(snapshot.latestBaseRef) ??
+        nonEmptyString(this.config.workspace.source.baseRef),
+      operation: targetTransitionKind,
+    });
   }
 
   private versionTransitionRulesets(
@@ -8535,6 +8755,7 @@ export class Orchestrator {
         mergeGateResults: input.lifecycle.mergeGateResults ?? [],
         mergeConflict: input.lifecycle.mergeConflict ?? null,
         reviewFeedback: input.lifecycle.reviewFeedback,
+        baseRefObservation: input.lifecycle.baseRefObservation,
         summaryPointers: input.lifecycle.summaryPointers,
       },
     });
@@ -8741,6 +8962,7 @@ export class Orchestrator {
       attempt: options.attempt,
       allowExistingClaim: options.allowExistingClaim,
       dispatch: {},
+      baseRef: {},
       reportWriteback: {},
       publicationApproval: {},
       termination: {},
@@ -12828,6 +13050,10 @@ export class Orchestrator {
       },
       allowExistingClaim: true,
     });
+    if (result.transition?.transitionKind === "base_ref_observe" && result.acted) {
+      await this.continueBaseRefTransitionChain(entry.issue, result.transition);
+      return true;
+    }
     return (
       result.transition?.transitionKind ===
         handoffReconciliationTransitionKind(handoffKind) && result.acted
@@ -12877,6 +13103,10 @@ export class Orchestrator {
       )
         return;
       previousTransition = result.transition;
+      if (baseRefTransitionShouldContinue(result.transition.transitionKind)) {
+        await this.continueBaseRefTransitionChain(issue, result.transition);
+        return;
+      }
       if (
         !mergePolicyTransitionShouldContinue(result.transition.transitionKind)
       )
@@ -12891,6 +13121,55 @@ export class Orchestrator {
         max_iterations: maxIterations,
       },
     );
+  }
+
+  private async continueBaseRefTransitionChain(
+    issue: Issue,
+    initialPreviousTransition: IssueHistorySnapshot,
+  ): Promise<void> {
+    const targetRequest = baseRefTargetRequestFromTransition(
+      initialPreviousTransition,
+    );
+    if (targetRequest === null) return;
+    const chainId = `base_ref_chain:${randomUUID()}`;
+    const maxIterations = 3;
+    let previousTransition = initialPreviousTransition;
+    for (let iteration = 1; iteration < maxIterations; iteration += 1) {
+      const result = await this.requestTransition({
+        issue,
+        candidateSource: "base_ref_chain",
+        context: {
+          kind: "base_ref_chain",
+          requestId: `transition_request:${randomUUID()}`,
+          requestedAt: new Date().toISOString(),
+          parentHistorySnapshotId: previousTransition.historySnapshotId,
+          parentTransitionKind: previousTransition.transitionKind,
+          payload: {
+            targetTransitionKind: targetRequest.transitionKind,
+            targetRequest,
+            chainId,
+            iteration,
+            maxIterations,
+          },
+        },
+      });
+      if (
+        result.transition === null ||
+        result.transition.transitionKind === "noop" ||
+        !result.acted
+      )
+        return;
+      previousTransition = result.transition;
+      if (!baseRefTransitionShouldContinue(result.transition.transitionKind))
+        return;
+    }
+    this.options.logger.warn("base ref transition chain reached iteration cap", {
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      chain_id: chainId,
+      max_iterations: maxIterations,
+      target_transition_kind: targetRequest.transitionKind,
+    });
   }
 
   private async updateLifecycle(
@@ -14409,8 +14688,23 @@ export function sortIssuesForDispatch(issues: Issue[]): Issue[] {
   });
 }
 
+const BASE_REF_GUARDED_TRANSITION_KINDS = new Set<IssueTransitionKind>([
+  "dispatch_worker",
+  "dispatch_reviewer",
+  "reconcile_completion_report_handoff",
+  "reconcile_merge_conflict_resolution_handoff",
+  "merge_policy_refresh_conflict_base",
+  "merge_policy_prepare_conflict",
+  "merge_policy_dispatch_repair",
+  "merge_policy_merge_pull_request",
+]);
+
 function issueTransitionRulesetPriority(kind: IssueTransitionKind): number {
   switch (kind) {
+    case "base_ref_observe":
+      return 45;
+    case "base_ref_block":
+      return 46;
     case "terminate_running":
       return 10;
     case "recover_publication_approval":
@@ -14564,6 +14858,10 @@ function mergePolicyTransitionShouldContinue(
   );
 }
 
+function baseRefTransitionShouldContinue(kind: IssueTransitionKind): boolean {
+  return kind === "base_ref_observe";
+}
+
 function tickTransitionShouldContinue(kind: IssueTransitionKind): boolean {
   return kind === "reset_merge_conflict_after_operator_resume";
 }
@@ -14617,6 +14915,31 @@ function dispatchTransitionRequest(input: {
     promptScenario: input.promptScenario,
     manualDispatch: input.manualDispatch === true,
   };
+}
+
+function baseRefTargetRequestFromTransition(
+  transition: IssueHistorySnapshot,
+): IssueTransitionRequest | null {
+  const value = transition.baseRefTargetRequest;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const request = value as Partial<IssueTransitionRequest>;
+    if (
+      typeof request.transitionKind === "string" &&
+      BASE_REF_GUARDED_TRANSITION_KINDS.has(
+        request.transitionKind as IssueTransitionKind,
+      )
+    ) {
+      return request as IssueTransitionRequest;
+    }
+  }
+  const targetKind = transition.baseRefTargetTransitionKind;
+  if (
+    typeof targetKind === "string" &&
+    BASE_REF_GUARDED_TRANSITION_KINDS.has(targetKind as IssueTransitionKind)
+  ) {
+    return { transitionKind: targetKind as IssueTransitionKind };
+  }
+  return null;
 }
 
 function isManualAgentRunStage(
@@ -14813,6 +15136,14 @@ function nonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
     : null;
+}
+
+function workspaceLooksLikeGitWorktree(workspacePath: string): boolean {
+  try {
+    return existsSync(path.join(workspacePath, ".git"));
+  } catch {
+    return false;
+  }
 }
 
 function latestCompletionReport(

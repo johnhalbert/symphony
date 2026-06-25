@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { AgentHandoffRepairKind } from "../harness/AgentHarness.js";
+import type { IssueBaseRefObservation } from "../BaseRefVerification.js";
 import type { MergePolicyObservation } from "../merge/MergePolicyService.js";
 import type {
   IssueBreakdownPlanRecord,
@@ -33,6 +34,8 @@ export type IssueTriggerSource = "orchestrator" | "manual_cli" | "transition";
 
 export type IssueTransitionKind =
   | "record_evidence"
+  | "base_ref_observe"
+  | "base_ref_block"
   | "dispatch_worker"
   | "dispatch_planner"
   | "dispatch_reviewer"
@@ -144,8 +147,21 @@ export type CompletionReportRejectionTransitionRequestContext =
     }
   >;
 
+export type BaseRefChainTransitionRequestContext =
+  TransitionRequestContextEnvelope<
+    "base_ref_chain",
+    {
+      targetTransitionKind: IssueTransitionKind;
+      targetRequest: IssueTransitionRequest;
+      chainId: string;
+      iteration: number;
+      maxIterations: number;
+    }
+  >;
+
 export type IssueTransitionRequestContext =
   | MergePolicyChainTransitionRequestContext
+  | BaseRefChainTransitionRequestContext
   | HandoffRepairTransitionRequestContext
   | HandoffReconciliationTransitionRequestContext
   | CompletionReportRejectionTransitionRequestContext;
@@ -215,6 +231,10 @@ export interface IssueCurrentFields {
   lastMergePolicyObservationFingerprint: string | null;
   lastMergePolicyObservationStatus: string | null;
   lastMergePolicyObservation: MergePolicyObservation | null;
+  latestBaseRef?: string | null;
+  lastBaseRefObservationFingerprint?: string | null;
+  lastBaseRefObservationClassification?: IssueBaseRefObservation["classification"] | null;
+  lastBaseRefObservation?: IssueBaseRefObservation | null;
   mergePolicyMerge: IssueMergeMetadata | null;
   mergePolicyMergeGate: IssueMergeGateState | null;
   mergePolicyMergeGateResults: IssueMergeGateResultRecord[];
@@ -443,6 +463,7 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   lifecycleMergeGateResults: IssueMergeGateResultRecord[] | null;
   lifecycleMergeConflict: IssueMergeConflictMetadata | null;
   lifecycleReviewFeedback: IssueReviewFeedbackRecord[] | null;
+  lifecycleBaseRefObservation: IssueBaseRefObservation | null;
   lifecycleSummaryCiStatus: string | null;
   lifecycleSummaryPointers: unknown;
 }
@@ -717,6 +738,10 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
         lifecycleReviewFeedback: recordArrayField<IssueReviewFeedbackRecord>(
           payload,
           "reviewFeedback",
+        ),
+        lifecycleBaseRefObservation: recordField<IssueBaseRefObservation>(
+          payload,
+          "baseRefObservation",
         ),
         lifecycleSummaryCiStatus: stringField(
           recordPayload(payload?.summaryPointers),

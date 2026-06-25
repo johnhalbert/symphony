@@ -3,6 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CompletionReportService, type CompletionReportActiveContext, type CompletionReportInput } from "../src/core/CompletionReportService.js";
+import type {
+  BaseRefVerificationInput,
+  IssueBaseRefObservation,
+} from "../src/core/BaseRefVerification.js";
 import { SymphonyError } from "../src/core/errors.js";
 import { FileIssueLifecycleStore, buildWorkerHandoffPacket, type IssueMergeGateState } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
@@ -495,6 +499,47 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("blocks service-owned PR publication when base ref verification fails", async () => {
+    const publisher = new BaseRefAwareFakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+    });
+    const observation = baseRefObservation({
+      classification: "branch_not_based_on_live_base",
+      reason: "Worktree HEAD is not based on the live origin base",
+    });
+    const { service, lifecycleStore } = fixture({
+      publisher,
+      baseRefVerifier: {
+        verify: async (_input: BaseRefVerificationInput) => observation,
+      },
+    });
+
+    await expect(
+      service.submitCompletionReport(report(), contextWithWorkspace()),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message:
+        "base ref verification failed: worktree needs rebase over latest origin base",
+    });
+
+    expect(publisher.inputs).toHaveLength(0);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason:
+        "base ref verification failed: worktree needs rebase over latest origin base",
+      baseRefObservation: {
+        classification: "branch_not_based_on_live_base",
+        inputFingerprint: observation.inputFingerprint,
+      },
+    });
+  });
+
   it("reuses a service-discovered PR and prevents duplicate publication on replay", async () => {
     const publisher = new FakePublisher({
       action: "reused",
@@ -847,7 +892,11 @@ describe("CompletionReportService", () => {
     });
   });
 
-  function fixture(options: { publisher?: CompletionReportPullRequestPublisher; configure?: (config: ReturnType<typeof testConfig>) => void } = {}) {
+  function fixture(options: {
+    publisher?: CompletionReportPullRequestPublisher;
+    baseRefVerifier?: { verify(input: BaseRefVerificationInput): Promise<IssueBaseRefObservation> };
+    configure?: (config: ReturnType<typeof testConfig>) => void;
+  } = {}) {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.dispatchState = "In Progress";
@@ -873,6 +922,7 @@ describe("CompletionReportService", () => {
       writebackOutbox: outbox,
       runStore,
       ...(options.publisher === undefined ? {} : { pullRequestPublisher: options.publisher }),
+      ...(options.baseRefVerifier === undefined ? {} : { baseRefVerifier: options.baseRefVerifier }),
     });
     return { service, lifecycleStore, outbox, runStore };
   }
@@ -1025,6 +1075,41 @@ class FakePublisher implements CompletionReportPullRequestPublisher {
     this.checkInputs.push(input);
     return this.checks;
   }
+}
+
+class BaseRefAwareFakePublisher extends FakePublisher {
+  async getBranchHeadSha(_input: { branchName: string }): Promise<string> {
+    return "base-sha";
+  }
+
+  async gitAuthHeader(): Promise<string> {
+    return "AUTHORIZATION: bearer test-token";
+  }
+}
+
+function baseRefObservation(
+  overrides: Partial<IssueBaseRefObservation> = {},
+): IssueBaseRefObservation {
+  return {
+    version: 1,
+    inputFingerprint: "base-ref:fingerprint",
+    classification: "ok",
+    operation: "reconcile_completion_report_handoff",
+    checkedAt: "2026-01-01T00:00:00.000Z",
+    workspacePath: "/tmp/workspace",
+    branchName: "symphony/TEST-1",
+    baseRef: "main",
+    normalizedBaseBranch: "main",
+    localBaseRef: "refs/remotes/origin/main",
+    githubBaseHeadSha: "base-sha",
+    localBaseHeadShaBeforeFetch: "old-base-sha",
+    localBaseHeadShaAfterFetch: "base-sha",
+    worktreeHeadSha: "head-sha",
+    localBaseIsAncestorOfHead: true,
+    reason: null,
+    error: null,
+    ...overrides,
+  };
 }
 
 function approvalRecord(

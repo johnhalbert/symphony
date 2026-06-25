@@ -91,9 +91,51 @@ describe("ServiceOwnedMergeConflictGit", () => {
       }),
     ).rejects.toThrow(/outside the service-prepared conflict set/);
   });
+
+  it("reports prepared base drift through shared local base verification", async () => {
+    const { workspace, remote, featureHeadSha, liveBaseHeadSha, initialSha, branchName } = await conflictedRepo(root);
+    const serviceGit = new ServiceOwnedMergeConflictGit();
+    await serviceGit.prepare({
+      workspacePath: workspace,
+      branchName,
+      expectedHeadSha: featureHeadSha,
+      baseBranch: "main",
+      observedPrBaseHeadSha: initialSha,
+      liveBaseHeadSha,
+      authHeader: "AUTHORIZATION: bearer test-token",
+    });
+    const updater = path.join(root, "updater");
+    await git(["clone", remote, updater], root);
+    await git(["checkout", "main"], updater);
+    await writeFile(path.join(updater, "drift.txt"), "new base\n", "utf8");
+    await git(["add", "drift.txt"], updater);
+    await commit(updater, "base drift");
+    await git(["push", "origin", "main"], updater);
+
+    await expect(
+      serviceGit.finalize({
+        workspacePath: workspace,
+        branchName,
+        previousRemoteHeadSha: featureHeadSha,
+        preparedBaseHeadSha: liveBaseHeadSha,
+        baseBranch: "main",
+        conflictedFiles: ["file.txt"],
+        changedFiles: ["file.txt"],
+        authHeader: "AUTHORIZATION: bearer test-token",
+      }),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      details: {
+        kind: "prepared_base_ref_drift",
+        expectedSha: liveBaseHeadSha,
+        baseBranch: "main",
+      },
+    });
+  });
 });
 
 async function conflictedRepo(root: string): Promise<{
+  remote: string;
   workspace: string;
   branchName: string;
   initialSha: string;
@@ -131,7 +173,7 @@ async function conflictedRepo(root: string): Promise<{
   await git(["push", "origin", "main"], workspace);
   await git(["checkout", branchName], workspace);
 
-  return { workspace, branchName, initialSha, featureHeadSha, liveBaseHeadSha };
+  return { remote, workspace, branchName, initialSha, featureHeadSha, liveBaseHeadSha };
 }
 
 function commit(cwd: string, message: string): Promise<string> {

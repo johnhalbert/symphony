@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { ServiceConfig } from "../config/Config.js";
+import type { IssueBaseRefObservation } from "../BaseRefVerification.js";
 import { errorMessage } from "../errors.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import { pendingPublicationHandoffForRun } from "../CompletionReportService.js";
@@ -310,6 +311,10 @@ type HistoryFields = Pick<
   | "lastMergePolicyObservationFingerprint"
   | "lastMergePolicyObservationStatus"
   | "lastMergePolicyObservation"
+  | "latestBaseRef"
+  | "lastBaseRefObservationFingerprint"
+  | "lastBaseRefObservationClassification"
+  | "lastBaseRefObservation"
 >;
 
 type RunFields = Pick<
@@ -1657,6 +1662,12 @@ export class IssueCurrentStateBuilder {
       lastMergePolicyObservationStatus:
         context.lastMergePolicyObservation?.status ?? null,
       lastMergePolicyObservation: context.lastMergePolicyObservation,
+      latestBaseRef: context.pointers?.baseRef ?? null,
+      lastBaseRefObservationFingerprint:
+        context.lifecycle?.baseRefObservation?.inputFingerprint ?? null,
+      lastBaseRefObservationClassification:
+        context.lifecycle?.baseRefObservation?.classification ?? null,
+      lastBaseRefObservation: context.lifecycle?.baseRefObservation ?? null,
     };
   }
 
@@ -2086,6 +2097,9 @@ function lifecycleRecordFromHistorySnapshot(
     issueTriageReports,
     postMortemReports,
     reviewEvidence: emptyHistoryReviewEvidence(),
+    baseRefObservation: baseRefObservationFromUnknown(
+      snapshot.lifecycleBaseRefObservation,
+    ),
     mergeGate: recordFromUnknown<IssueMergeGateState>(
       snapshot.lifecycleMergeGate,
     ),
@@ -2724,6 +2738,17 @@ function recordFromUnknown<T extends { id: string }>(value: unknown): T | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Partial<T>;
   return typeof record.id === "string" ? (record as T) : null;
+}
+
+function baseRefObservationFromUnknown(value: unknown): IssueBaseRefObservation | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Partial<IssueBaseRefObservation>;
+  return record.version === 1 &&
+    typeof record.inputFingerprint === "string" &&
+    typeof record.classification === "string" &&
+    typeof record.operation === "string"
+    ? (record as IssueBaseRefObservation)
+    : null;
 }
 
 function recordArrayFromUnknown<T extends { id: string }>(

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { fetchAndVerifyLocalRemoteBaseRef } from "../BaseRefVerification.js";
 import { SymphonyError } from "../errors.js";
 
 const DEFAULT_GIT_TIMEOUT_MS = 120_000;
@@ -120,9 +121,15 @@ export class ServiceOwnedMergeConflictGit {
     const git = new ServiceGit(input.workspacePath);
     await git.assertCurrentBranch(input.branchName);
     await git.fetchBranch(input.branchName, input.authHeader);
-    await git.fetchBranch(input.baseBranch, input.authHeader);
     await git.assertRefSha(`refs/remotes/origin/${input.branchName}`, input.previousRemoteHeadSha, "expected PR head");
-    await git.assertPreparedBaseRefSha(`refs/remotes/origin/${input.baseBranch}`, input.preparedBaseHeadSha, input.baseBranch);
+    await fetchAndVerifyLocalRemoteBaseRef({
+      workspacePath: input.workspacePath,
+      baseRef: input.baseBranch,
+      expectedBaseHeadSha: input.preparedBaseHeadSha,
+      authHeader: input.authHeader,
+      createMismatchError: ({ refName, actualSha, expectedSha, baseBranch }) =>
+        preparedBaseRefDriftError(refName, actualSha, expectedSha, baseBranch),
+    });
     const workerTouchedFiles = await git.workerTouchedFiles();
     const actualOutside = workerTouchedFiles.filter((file) => !allowed.has(file));
     if (actualOutside.length > 0) {
@@ -179,12 +186,6 @@ class ServiceGit {
     if (actual !== expectedSha) {
       throw new SymphonyError("invalid_request", `${refName} resolved to ${actual}, not ${label} ${expectedSha}`);
     }
-  }
-
-  async assertPreparedBaseRefSha(refName: string, expectedSha: string, baseBranch: string): Promise<void> {
-    const actual = await this.refSha(refName);
-    if (actual === expectedSha) return;
-    throw preparedBaseRefDriftError(refName, actual, expectedSha, baseBranch);
   }
 
   async refSha(refName: string): Promise<string> {
@@ -328,9 +329,14 @@ async function prepareFromCleanWorkspace(
   input: ServiceOwnedMergeConflictPreparationInput,
 ): Promise<ServiceOwnedMergeConflictPreparationResult> {
   await git.fetchBranch(input.branchName, input.authHeader);
-  await git.fetchBranch(input.baseBranch, input.authHeader);
   await git.assertRefSha(`refs/remotes/origin/${input.branchName}`, input.expectedHeadSha, "expected PR head");
-  await git.assertRefSha(`refs/remotes/origin/${input.baseBranch}`, input.liveBaseHeadSha, "expected live base");
+  await fetchAndVerifyLocalRemoteBaseRef({
+    workspacePath: input.workspacePath,
+    baseRef: input.baseBranch,
+    expectedBaseHeadSha: input.liveBaseHeadSha,
+    authHeader: input.authHeader,
+    errorMessageLabel: "expected live base",
+  });
   await git.ensureCommit(input.expectedHeadSha);
   await git.resetHard(input.expectedHeadSha);
 
