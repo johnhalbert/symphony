@@ -554,6 +554,7 @@ export class GitHubPullRequestClient {
     const branchName = normalizeBranchName(input.branchName);
     assertSafePublishBranch(branchName);
     const baseBranch = normalizeBaseBranch(input.baseBranch) ?? input.baseBranch.trim();
+    const localBaseRef = normalizeLocalBaseRef(input.baseBranch);
     if (baseBranch.length === 0) {
       throw new SymphonyError("invalid_request", "A base branch is required for GitHub PR publication");
     }
@@ -563,7 +564,7 @@ export class GitHubPullRequestClient {
     await git.assertCurrentBranch(branchName);
 
     const dirty = await git.hasCommittableChanges();
-    const branchDiffBeforeCommit = await git.hasBranchDiff(baseBranch);
+    const branchDiffBeforeCommit = await git.hasBranchDiff(localBaseRef);
     if (!existing && !dirty && !branchDiffBeforeCommit) {
       throw new SymphonyError(
         "invalid_request",
@@ -578,7 +579,7 @@ export class GitHubPullRequestClient {
       await git.commitEmpty(input.title, input.body);
     }
 
-    const branchDiffAfterCommit = dirty || forceEmptyCommit ? await git.hasBranchDiff(baseBranch) : branchDiffBeforeCommit;
+    const branchDiffAfterCommit = dirty || forceEmptyCommit ? await git.hasBranchDiff(localBaseRef) : branchDiffBeforeCommit;
     if (!existing && !branchDiffAfterCommit) {
       throw new SymphonyError(
         "invalid_request",
@@ -1301,6 +1302,10 @@ function normalizeBaseBranch(value: string | null): string | null {
   const trimmed = value?.trim() ?? "";
   if (trimmed.length === 0) return null;
   return trimmed.replace(/^refs\/heads\//, "").replace(/^origin\//, "");
+}
+
+function normalizeLocalBaseRef(value: string): string {
+  return value.trim().replace(/^refs\/heads\//, "");
 }
 
 function githubRefPath(branchName: string): string {

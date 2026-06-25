@@ -527,6 +527,42 @@ describe("GitHubPullRequestClient", () => {
     }
   });
 
+  it("keeps origin-qualified base refs for local publication diff checks", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-origin-base-diff-"));
+    try {
+      const workspace = await initPublishRepo(root, { remote: true });
+      await git(["checkout", "main"], workspace);
+      await writeFile(path.join(workspace, "upstream.txt"), "upstream\n", "utf8");
+      await git(["add", "upstream.txt"], workspace);
+      await git(["-c", "user.name=Symphony Test", "-c", "user.email=symphony@example.com", "commit", "-m", "upstream"], workspace);
+      await git(["push", "-u", "origin", "main"], workspace);
+      await git(["reset", "--hard", "HEAD~1"], workspace);
+      await git(["checkout", "symphony/TEST-1"], workspace);
+      await git(["reset", "--hard", "origin/main"], workspace);
+
+      const calls: Array<{ method: string; pathname: string }> = [];
+      const client = new GitHubPullRequestClient(config(), async (input, init) => {
+        const url = new URL(String(input));
+        calls.push({ method: init?.method ?? "GET", pathname: url.pathname });
+        return jsonResponse([]);
+      });
+
+      await expect(
+        client.publishPullRequest({
+          workspacePath: workspace,
+          branchName: "symphony/TEST-1",
+          baseBranch: "origin/main",
+          title: "TEST-1: Work",
+          body: "body",
+          evidenceCursor: "idem-1",
+        }),
+      ).rejects.toThrow(/no committable changes/);
+      expect(calls).toEqual([{ method: "GET", pathname: "/repos/octo-org/symphony/pulls" }]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects PR publication when the worktree has no diff and no existing PR", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-no-diff-"));
     try {
