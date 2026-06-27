@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
+import type { IssueBaseRefObservation } from "../src/core/BaseRefVerification.js";
 import { MergePolicyService, type MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
 import {
   ServiceOwnedMergeConflictGit,
@@ -707,6 +708,158 @@ describe("MergePolicyService", () => {
       expectedHeadSha: "rebased-head-sha",
     });
     expect(currentIssue.state).toBe("Done");
+  });
+
+  it("repairs stale worktree base with a clean local rebase and routes back to implementation", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "In Review", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const conflictGit = new FakeConflictGit({
+      status: "clean",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      rebasedHeadSha: "rebased-head-sha",
+      conflictedFiles: [],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient(),
+      conflictGit,
+    });
+
+    const result = await service.repairBaseRefDrift(currentIssue, baseRefObservation());
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result).toEqual({ status: "base_ref_repaired", headSha: "rebased-head-sha" });
+    expect(conflictGit.prepareInput).toMatchObject({
+      workspacePath: path.join(root, currentIssue.identifier),
+      branchName: "symphony/TEST-1",
+      expectedHeadSha: "head-sha-1",
+      baseBranch: "main",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      authHeader: "AUTHORIZATION: bearer test-token",
+    });
+    expect(conflictGit.publishInput).toBeNull();
+    expect(currentIssue.state).toBe("In Progress");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["In Review", "In Progress"],
+        toState: "In Progress",
+        reason: "Symphony rebased stale worktree base; worker reverification required",
+      },
+    ]);
+    expect(writer.comments[0]?.body).toContain("Status: clean rebase prepared, worker reverification required");
+    expect(lifecycle).toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      mergeGate: null,
+      mergeConflict: null,
+      summaryPointers: {
+        prHeadSha: "rebased-head-sha",
+        prBranch: "symphony/TEST-1",
+        baseRef: "main",
+      },
+    });
+  });
+
+  it("routes stale worktree base rebase conflicts to the service-prepared conflict worker", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "In Review", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const conflictGit = new FakeConflictGit({
+      status: "conflicted",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      conflictedFiles: ["src/index.ts"],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient(),
+      conflictGit,
+    });
+
+    const result = await service.repairBaseRefDrift(currentIssue, baseRefObservation());
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("conflict_dispatched");
+    expect(conflictGit.publishInput).toBeNull();
+    expect(currentIssue.state).toBe("Approved with Conflicts");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["In Review"],
+        toState: "Approved with Conflicts",
+        reason: "Symphony gated merge blocked: Worktree rebase over the live origin base produced conflicts",
+      },
+    ]);
+    expect(writer.comments[0]?.body).toContain("Status: approved pull request has merge conflicts");
+    expect(lifecycle).toMatchObject({
+      phase: "merge_conflict_resolution",
+      blockedReason: null,
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "pending",
+        currentHeadSha: "head-sha-1",
+        baseBranch: "main",
+        baseHeadSha: "base-sha-2",
+        sourceState: "In Review",
+        conflictsState: "Approved with Conflicts",
+        servicePreparation: {
+          status: "conflicted",
+          originalHeadSha: "head-sha-1",
+          liveBaseHeadSha: "base-sha-2",
+          preparedBaseHeadSha: "base-sha-2",
+          squashCommitSha: "squash-sha-1",
+          conflictedFiles: ["src/index.ts"],
+        },
+      },
+      summaryPointers: {
+        ciStatus: "conflicted",
+        prHeadSha: "head-sha-1",
+        prBranch: "symphony/TEST-1",
+        baseRef: "main",
+      },
+    });
   });
 
   it("blocks combined check and conflict failures when no conflict state is configured", async () => {
@@ -3556,6 +3709,29 @@ function mergeConflictRecord(input: { resolutionStatus?: "pending" | "resolved";
     writebackOperationKeys: [],
     blockedAt: null,
     blockedReason: null,
+  };
+}
+
+function baseRefObservation(overrides: Partial<IssueBaseRefObservation> = {}): IssueBaseRefObservation {
+  return {
+    version: 1,
+    inputFingerprint: "base-ref-fingerprint",
+    classification: "branch_not_based_on_live_base",
+    operation: "dispatch_reviewer",
+    checkedAt: "2026-01-01T00:00:02.000Z",
+    workspacePath: path.join(root, "TEST-1"),
+    branchName: "symphony/TEST-1",
+    baseRef: "main",
+    normalizedBaseBranch: "main",
+    localBaseRef: "refs/remotes/origin/main",
+    githubBaseHeadSha: "base-sha-2",
+    localBaseHeadShaBeforeFetch: "base-sha-1",
+    localBaseHeadShaAfterFetch: "base-sha-2",
+    worktreeHeadSha: "head-sha-1",
+    localBaseIsAncestorOfHead: false,
+    reason: "Worktree HEAD is not based on the live origin base",
+    error: null,
+    ...overrides,
   };
 }
 

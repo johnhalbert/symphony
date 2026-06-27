@@ -35,6 +35,7 @@ export type IssueTriggerSource = "orchestrator" | "manual_cli" | "transition";
 export type IssueTransitionKind =
   | "record_evidence"
   | "base_ref_observe"
+  | "base_ref_repair"
   | "base_ref_block"
   | "dispatch_worker"
   | "dispatch_planner"
@@ -1015,6 +1016,7 @@ export interface IssueStateStore {
   close?(): Promise<void>;
   get(issueIdOrIdentifier: string): Promise<IssueStateRecord | null>;
   getHistory(issueIdOrIdentifier: string): Promise<IssueHistorySnapshot[] | null>;
+  listCurrent?(): Promise<IssueCurrentFields[]>;
   list(): Promise<IssueStateRecord[]>;
   ensureIssue(current: IssueCurrentFields): Promise<IssueStateRecord>;
   updateCurrent(

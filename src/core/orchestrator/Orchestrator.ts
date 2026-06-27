@@ -122,6 +122,7 @@ import {
 import {
   transitionAction,
   transitionErrorFromUnknown,
+  type IssueCurrentFields,
   type IssueCurrentStateSnapshot,
   type IssueEvidenceKind,
   type IssueHistorySnapshot,
@@ -180,6 +181,7 @@ import {
   type MergePolicyMergePlan,
   type MergePolicyObservation,
   type MergePolicyRecordedMerge,
+  type MergePolicyResult,
 } from "../merge/MergePolicyService.js";
 import {
   mergePolicyObservationFromUnknown,
@@ -496,6 +498,7 @@ interface DispatchTransitionScratch {
 
 interface BaseRefTransitionScratch {
   observation?: IssueBaseRefObservation;
+  repairResult?: MergePolicyResult;
 }
 
 interface ReportWritebackTransitionScratch {
@@ -2998,9 +3001,9 @@ export class Orchestrator {
   private async addKnownTickIssueCandidates(byId: Map<string, Issue>): Promise<void> {
     const states = this.tickIssueCandidateStates();
     if (states.length === 0) return;
-    let records: IssueStateRecord[];
+    let records: IssueCurrentFields[];
     try {
-      records = await this.issueStateStore.list();
+      records = await this.listIssueCurrentFields();
     } catch (error) {
       this.options.logger.warn("known tick issue candidate list failed", {
         error: errorMessage(error),
@@ -4045,6 +4048,15 @@ export class Orchestrator {
           {
             id: "record_base_ref_observation",
             execute: (context) => this.recordBaseRefObservationAction(context),
+          },
+        ],
+      },
+      {
+        kind: "base_ref_repair",
+        actions: [
+          {
+            id: "repair_base_ref_drift",
+            execute: (context) => this.repairBaseRefDriftAction(context),
           },
         ],
       },
@@ -6449,6 +6461,53 @@ export class Orchestrator {
     };
   }
 
+  private async repairBaseRefDriftAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const observation = context.transition.lastBaseRefObservation ?? null;
+    const requestedFingerprint = nonEmptyString(
+      context.transition.baseRefObservationFingerprint,
+    );
+    if (observation === null) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Base ref repair requires a recorded base ref observation",
+      };
+    }
+    if (
+      requestedFingerprint !== null &&
+      observation.inputFingerprint !== requestedFingerprint
+    ) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Base ref repair observation fingerprint is stale",
+      };
+    }
+    const result = await this.mergePolicyServiceForContext(
+      context,
+    ).repairBaseRefDrift(context.issue, observation);
+    context.baseRef.repairResult = result;
+    return {
+      details: {
+        classification: observation.classification,
+        inputFingerprint: observation.inputFingerprint,
+        resultStatus: result.status,
+        ...(result.status === "base_ref_repaired"
+          ? { rebasedHeadSha: result.headSha }
+          : {}),
+        ...(result.status === "conflict_dispatched"
+          ? {
+              mergeConflictId: result.conflict.id,
+              conflictStatus: result.conflict.status,
+              conflictResolutionStatus: result.conflict.resolutionStatus,
+            }
+          : {}),
+      },
+    };
+  }
+
   private async updateLifecycleBlockedAction(
     context: OrchestratorTransitionContext,
   ) {
@@ -7603,6 +7662,14 @@ export class Orchestrator {
     ) {
       if (observation.classification === "ok") return targetRequest;
       const blockedReason = baseRefBlockedReason(observation);
+      if (baseRefObservationCanRepairByRebase(observation)) {
+        return {
+          transitionKind: "base_ref_repair",
+          reason: blockedReason,
+          baseRefObservationFingerprint: observation.inputFingerprint,
+          baseRefObservationClassification: observation.classification,
+        };
+      }
       return {
         transitionKind: "base_ref_block",
         reason: blockedReason,
@@ -7626,6 +7693,12 @@ export class Orchestrator {
   ): boolean {
     if (!BASE_REF_GUARDED_TRANSITION_KINDS.has(targetRequest.transitionKind))
       return false;
+    if (
+      targetRequest.transitionKind === "dispatch_worker" &&
+      targetRequest.runPhase === "merge_conflict_resolution"
+    ) {
+      return false;
+    }
     if (!snapshot.lifecyclePersistenceAvailable) return false;
     const workspacePath = nonEmptyString(snapshot.latestWorkspacePath);
     if (workspacePath === null || !workspaceLooksLikeGitWorktree(workspacePath))
@@ -9190,9 +9263,9 @@ export class Orchestrator {
   }
 
   private async restoreRuntimeControlFromIssueHistory(): Promise<void> {
-    let records: IssueStateRecord[];
+    let records: IssueCurrentFields[];
     try {
-      records = await this.issueStateStore.list();
+      records = await this.listIssueCurrentFields();
     } catch (error) {
       this.options.logger.warn("startup issue runtime restore failed", {
         error: errorMessage(error),
@@ -9238,6 +9311,13 @@ export class Orchestrator {
         stale_claims_released: releasedClaims,
       });
     }
+  }
+
+  private async listIssueCurrentFields(): Promise<IssueCurrentFields[]> {
+    if (this.issueStateStore.listCurrent) {
+      return this.issueStateStore.listCurrent();
+    }
+    return this.issueStateStore.list();
   }
 
   private async recoverPendingPublicationApprovalHandoffs(): Promise<void> {
@@ -14692,7 +14772,9 @@ const BASE_REF_GUARDED_TRANSITION_KINDS = new Set<IssueTransitionKind>([
   "dispatch_worker",
   "dispatch_reviewer",
   "reconcile_completion_report_handoff",
+  "reconcile_review_verdict_handoff",
   "reconcile_merge_conflict_resolution_handoff",
+  "recover_publication_approval",
   "merge_policy_refresh_conflict_base",
   "merge_policy_prepare_conflict",
   "merge_policy_dispatch_repair",
@@ -14703,8 +14785,10 @@ function issueTransitionRulesetPriority(kind: IssueTransitionKind): number {
   switch (kind) {
     case "base_ref_observe":
       return 45;
-    case "base_ref_block":
+    case "base_ref_repair":
       return 46;
+    case "base_ref_block":
+      return 47;
     case "terminate_running":
       return 10;
     case "recover_publication_approval":
@@ -14862,6 +14946,12 @@ function baseRefTransitionShouldContinue(kind: IssueTransitionKind): boolean {
   return kind === "base_ref_observe";
 }
 
+function baseRefObservationCanRepairByRebase(
+  observation: IssueBaseRefObservation,
+): boolean {
+  return observation.classification === "branch_not_based_on_live_base";
+}
+
 function tickTransitionShouldContinue(kind: IssueTransitionKind): boolean {
   return kind === "reset_merge_conflict_after_operator_resume";
 }
@@ -14977,10 +15067,11 @@ function snapshotAsIssue(snapshot: IssueCurrentStateSnapshot): Issue {
   return currentFieldsAsIssue(snapshot);
 }
 
+function currentFieldsAsIssue(current: IssueCurrentFields): Issue;
 function currentFieldsAsIssue(current: IssueStateRecord): Issue;
 function currentFieldsAsIssue(current: IssueCurrentStateSnapshot): Issue;
 function currentFieldsAsIssue(
-  current: IssueStateRecord | IssueCurrentStateSnapshot,
+  current: IssueCurrentFields | IssueStateRecord | IssueCurrentStateSnapshot,
 ): Issue {
   return {
     id: current.issueId,

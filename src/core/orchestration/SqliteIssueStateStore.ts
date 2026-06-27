@@ -28,6 +28,12 @@ interface IssueCurrentCacheRow {
   current_json: string;
 }
 
+interface IssueCurrentListRow {
+  issue_id: string;
+  current_json: string;
+  snapshot_json: string | null;
+}
+
 interface IssueHistoryRow {
   snapshot_json: string;
 }
@@ -100,6 +106,29 @@ export class SqliteIssueStateStore implements IssueStateStore {
         "SELECT issue_id, issue_identifier FROM issue_state ORDER BY issue_identifier",
       );
       return Promise.all(rows.map((row) => this.recordFromRow(database, row)));
+    });
+  }
+
+  async listCurrent(): Promise<IssueCurrentFields[]> {
+    return this.withStore(async (database) => {
+      const rows = await this.allRows<IssueCurrentListRow>(
+        database,
+        `
+          SELECT
+            issue_state.issue_id,
+            issue_state.current_json,
+            (
+              SELECT snapshot_json
+              FROM issue_history
+              WHERE issue_history.issue_id = issue_state.issue_id
+              ORDER BY sequence DESC
+              LIMIT 1
+            ) AS snapshot_json
+          FROM issue_state
+          ORDER BY issue_identifier
+        `,
+      );
+      return rows.map((row) => this.currentFromListRow(row));
     });
   }
 
@@ -674,6 +703,19 @@ export class SqliteIssueStateStore implements IssueStateStore {
       [issueId],
     );
     if (!row) throw new Error(`Issue state does not exist for ${issueId}`);
+    return normalizeIssueCurrentFields(
+      JSON.parse(row.current_json) as IssueCurrentFields,
+    );
+  }
+
+  private currentFromListRow(
+    row: IssueCurrentListRow,
+  ): IssueCurrentFields {
+    if (typeof row.snapshot_json === "string" && row.snapshot_json.length > 0) {
+      return normalizeIssueCurrentFields(
+        JSON.parse(row.snapshot_json) as IssueCurrentFields,
+      );
+    }
     return normalizeIssueCurrentFields(
       JSON.parse(row.current_json) as IssueCurrentFields,
     );

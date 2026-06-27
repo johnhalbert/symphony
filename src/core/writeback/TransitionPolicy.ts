@@ -116,6 +116,17 @@ export interface MergeConflictsWritebackContext {
   reason: string;
 }
 
+export interface BaseRefRepairWritebackContext {
+  issue: Issue;
+  operationId: string;
+  fromState: string;
+  branchName: string;
+  baseBranch: string;
+  previousHeadSha: string;
+  rebasedHeadSha: string;
+  baseHeadSha: string;
+}
+
 export interface MergeGateHeadSupersessionWritebackContext {
   issue: Issue;
   gateId: string;
@@ -1188,6 +1199,49 @@ export function planMergeConflictsWritebacks(
         fromStates: [context.fromState],
         toState: context.conflictsState,
         reason: `Symphony gated merge blocked: ${context.reason}`,
+      },
+    },
+  ];
+}
+
+export function planBaseRefRepairWritebacks(
+  context: BaseRefRepairWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  const eventKey = `base-ref-repair:${safeKeySegment(context.operationId)}:${safeKeySegment(context.rebasedHeadSha)}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Base Ref Repair",
+          "",
+          "Status: clean rebase prepared, worker reverification required",
+          `Next state: ${config.writeback.dispatchState} (worker queue)`,
+          "",
+          `Branch: ${context.branchName}`,
+          `Base branch: ${context.baseBranch}`,
+          `Base head SHA: ${context.baseHeadSha}`,
+          `Previous worktree head SHA: ${context.previousHeadSha}`,
+          `Rebased worktree head SHA: ${context.rebasedHeadSha}`,
+          "",
+          "Required action:",
+          "Symphony rebased the worktree over the live origin base. The implementation worker must revalidate the rebased changes and submit a fresh completion report before PR publication or review continues.",
+        ].join("\n"),
+      },
+    },
+    {
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      payload: {
+        fromStates: uniqueStates([context.fromState, config.writeback.dispatchState]),
+        toState: config.writeback.dispatchState,
+        reason: "Symphony rebased stale worktree base; worker reverification required",
       },
     },
   ];

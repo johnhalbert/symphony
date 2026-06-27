@@ -57,6 +57,13 @@ export class FileIssueStateStore implements IssueStateStore {
       .map((record) => normalizeIssueStateRecord(record));
   }
 
+  async listCurrent(): Promise<IssueCurrentFields[]> {
+    return (await this.list()).map((record) => {
+      const { history: _history, ...current } = record;
+      return normalizeIssueCurrentFields(current as IssueCurrentFields);
+    });
+  }
+
   async ensureIssue(current: IssueCurrentFields): Promise<IssueStateRecord> {
     const existing = await this.find(current.issueId, current.issueIdentifier);
     const now = new Date().toISOString();

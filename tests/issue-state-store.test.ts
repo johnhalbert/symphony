@@ -303,6 +303,13 @@ describe("SqliteIssueStateStore", () => {
     const reloaded = new SqliteIssueStateStore(root);
     stores.push(reloaded);
 
+    await expect(reloaded.listCurrent()).resolves.toMatchObject([
+      {
+        issueId: current.issueId,
+        issueIdentifier: current.issueIdentifier,
+        trackerState: current.trackerState,
+      },
+    ]);
     await expect(reloaded.get(current.issueIdentifier)).resolves.toMatchObject({
       issueId: current.issueId,
       issueIdentifier: current.issueIdentifier,
@@ -315,6 +322,56 @@ describe("SqliteIssueStateStore", () => {
         history: [{ transitionKind: "dispatch_worker" }],
       },
     ]);
+  });
+
+  it("lists current issue state without parsing history snapshots", async () => {
+    const store = new SqliteIssueStateStore(root);
+    stores.push(store);
+    const current = currentFields();
+    await store.ensureIssue(current);
+    const engine = new IssueOrchestrationEngine([
+      {
+        id: "dispatch.worker",
+        priority: 100,
+        evaluate: () => ({
+          transitionKind: "dispatch_worker",
+          role: "worker",
+          runPhase: "implementation",
+        }),
+      },
+    ]);
+    const snapshot = engine.decide(currentSnapshot(current), []);
+    expect(snapshot).not.toBeNull();
+    await store.appendSnapshot(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!,
+    );
+    const latestSnapshot = engine.decide(currentSnapshot(current), []);
+    expect(latestSnapshot).not.toBeNull();
+    await store.appendSnapshot(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      latestSnapshot!,
+    );
+    await store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    await updateSqliteHistorySnapshotJson(
+      path.join(root, "issue-state.sqlite"),
+      snapshot!.historySnapshotId,
+      "{not valid json",
+    );
+    const reloaded = new SqliteIssueStateStore(root);
+    stores.push(reloaded);
+
+    const currentRecords = await reloaded.listCurrent();
+    expect(currentRecords).toMatchObject([
+      {
+        issueId: current.issueId,
+        issueIdentifier: current.issueIdentifier,
+        trackerState: current.trackerState,
+      },
+    ]);
+    expect((currentRecords[0] as { history?: unknown } | undefined)?.history).toBeUndefined();
   });
 
   it("updates snapshot actions without parsing cached current_json", async () => {
@@ -434,6 +491,28 @@ async function updateSqliteCurrentJson(
   issueId: string,
   currentJson: string,
 ): Promise<void> {
+  await updateSqliteJson(databasePath, "UPDATE issue_state SET current_json = ? WHERE issue_id = ?", [
+    currentJson,
+    issueId,
+  ]);
+}
+
+async function updateSqliteHistorySnapshotJson(
+  databasePath: string,
+  historySnapshotId: string,
+  snapshotJson: string,
+): Promise<void> {
+  await updateSqliteJson(databasePath, "UPDATE issue_history SET snapshot_json = ? WHERE history_snapshot_id = ?", [
+    snapshotJson,
+    historySnapshotId,
+  ]);
+}
+
+async function updateSqliteJson(
+  databasePath: string,
+  sql: string,
+  params: readonly unknown[],
+): Promise<void> {
   const database = await new Promise<sqlite3.Database>((resolve, reject) => {
     const opened = new sqlite3.Database(databasePath, (error) => {
       if (error) reject(error);
@@ -442,14 +521,10 @@ async function updateSqliteCurrentJson(
   });
   try {
     await new Promise<void>((resolve, reject) => {
-      database.run(
-        "UPDATE issue_state SET current_json = ? WHERE issue_id = ?",
-        [currentJson, issueId],
-        (error) => {
-          if (error) reject(error);
-          else resolve();
-        },
-      );
+      database.run(sql, [...params], (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
     });
   } finally {
     await new Promise<void>((resolve, reject) => {

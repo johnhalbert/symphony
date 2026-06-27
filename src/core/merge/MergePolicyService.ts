@@ -10,6 +10,7 @@ import type {
   PullRequestMergeResult,
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
+import type { IssueBaseRefObservation } from "../BaseRefVerification.js";
 import type { ResolvedCredential } from "../config/CredentialProfiles.js";
 import { SymphonyError } from "../errors.js";
 import type { Logger } from "../logging/StructuredLogger.js";
@@ -33,6 +34,7 @@ import type { RunRecord, RunTranscriptStore } from "../persistence/RunTranscript
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import type { Issue } from "../types.js";
 import {
+  planBaseRefRepairWritebacks,
   planMergeCompletedWritebacks,
   planMergeConflictsWritebacks,
   planMergeGateBlockedWritebacks,
@@ -70,6 +72,7 @@ export interface MergePolicyGitHubClient {
 
 export type MergePolicyResult =
   | { status: "skipped"; reason: string }
+  | { status: "base_ref_repaired"; headSha: string }
   | { status: "merged"; merge: IssueMergeMetadata }
   | { status: "already_merged"; merge: IssueMergeMetadata }
   | { status: "checks_pending"; gate: MergeGateStatus }
@@ -940,6 +943,143 @@ export class MergePolicyService {
     const writebackPlan = this.planServiceConflictWritebacks(issue, plan, execution);
     await this.applyServiceConflictWritebacks(issue, plan, writebackPlan);
     return this.recordServicePreparedMergeConflict(issue, plan, execution, writebackPlan);
+  }
+
+  async repairBaseRefDrift(issue: Issue, observation: IssueBaseRefObservation): Promise<MergePolicyResult> {
+    this.requireGatedServiceConfiguration();
+    if (observation.classification !== "branch_not_based_on_live_base") {
+      throw new SymphonyError("invalid_request", "Base ref repair requires a worktree head that is not based on the live base");
+    }
+    const latestIssue = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? issue;
+    const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    if (!lifecycle) throw new SymphonyError("invalid_request", "Base ref repair requires an issue lifecycle record");
+
+    const workspacePath = requireValue(observation.workspacePath, "Base ref repair requires a workspace path");
+    const branchName =
+      observation.branchName ??
+      lifecycle.summaryPointers.gitBranchName ??
+      lifecycle.summaryPointers.prBranch ??
+      lifecycle.summaryPointers.branchName;
+    const originalHeadSha =
+      observation.worktreeHeadSha ??
+      lifecycle.summaryPointers.prHeadSha ??
+      latestCompletionReport(lifecycle)?.pullRequest?.headSha;
+    const baseBranch =
+      observation.normalizedBaseBranch ??
+      observation.baseRef ??
+      lifecycle.summaryPointers.baseRef;
+    const liveBaseHeadSha =
+      observation.localBaseHeadShaAfterFetch ??
+      observation.githubBaseHeadSha;
+    const requiredBranchName = requireValue(branchName, "Base ref repair requires a branch name");
+    const requiredOriginalHeadSha = requireValue(originalHeadSha, "Base ref repair requires the worktree head SHA");
+    const requiredBaseBranch = requireValue(baseBranch, "Base ref repair requires a base branch");
+    const requiredLiveBaseHeadSha = requireValue(liveBaseHeadSha, "Base ref repair requires the live base head SHA");
+    const pullRequest = pullRequestForBaseRefRepair(lifecycle, requiredBranchName, requiredOriginalHeadSha);
+    const sourceState = latestIssue.state;
+
+    const github = this.options.client ?? createGitHubPullRequestClientForCapability(this.options.config, "github.merge");
+    const authHeader = await github.gitAuthHeader();
+    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const preparation = await conflictGit.prepare({
+      workspacePath,
+      branchName: requiredBranchName,
+      expectedHeadSha: requiredOriginalHeadSha,
+      baseBranch: requiredBaseBranch,
+      observedPrBaseHeadSha: observation.localBaseHeadShaBeforeFetch,
+      liveBaseHeadSha: requiredLiveBaseHeadSha,
+      authHeader,
+    });
+
+    const operationId = `base-ref:${issue.id}:${requiredOriginalHeadSha}:${requiredLiveBaseHeadSha}`;
+    if (preparation.status === "clean") {
+      const operations = planBaseRefRepairWritebacks(
+        {
+          issue: latestIssue,
+          operationId,
+          fromState: sourceState,
+          branchName: requiredBranchName,
+          baseBranch: requiredBaseBranch,
+          previousHeadSha: requiredOriginalHeadSha,
+          rebasedHeadSha: preparation.rebasedHeadSha,
+          baseHeadSha: requiredLiveBaseHeadSha,
+        },
+        this.options.config,
+      );
+      await this.requireMergeGateWritebacksSucceeded(latestIssue, operations, this.options.config.writeback.dispatchState);
+      await this.options.lifecycleStore.updateIssue(latestIssue, {
+        phase: "implementation",
+        blockedReason: null,
+        mergeGate: null,
+        mergeConflict: null,
+        summaryPointers: {
+          ciStatus: null,
+          workspacePath,
+          gitBranchName: requiredBranchName,
+          prUrl: pullRequest.url,
+          prNumber: pullRequest.number,
+          prHeadSha: preparation.rebasedHeadSha,
+          prBranch: requiredBranchName,
+          baseRef: requiredBaseBranch,
+        },
+      });
+      return { status: "base_ref_repaired", headSha: preparation.rebasedHeadSha };
+    }
+
+    const conflictsState = this.options.config.mergePolicy.conflictsState;
+    if (conflictsState === null) {
+      throw new SymphonyError("invalid_request", "merge_policy.conflicts_state is required before Symphony can prepare a base-ref conflict repair");
+    }
+    const operations = planMergeConflictsWritebacks(
+      {
+        issue: latestIssue,
+        mergeId: operationId,
+        fromState: sourceState,
+        conflictsState,
+        pullRequest,
+        mergeableState: "dirty",
+        reason: "Worktree rebase over the live origin base produced conflicts",
+      },
+      this.options.config,
+    );
+    await this.requireMergeGateWritebacksSucceeded(latestIssue, operations, conflictsState);
+
+    const now = new Date().toISOString();
+    const conflict = buildBaseRefRepairMergeConflict({
+      issue: latestIssue,
+      pullRequest,
+      sourceState,
+      conflictsState,
+      baseBranch: requiredBaseBranch,
+      baseHeadSha: requiredLiveBaseHeadSha,
+      preparation,
+      maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
+      now,
+    });
+    const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
+      phase: "merge_conflict_resolution",
+      blockedReason: null,
+      mergeGate: null,
+      mergeConflict: {
+        ...conflict,
+        writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
+      },
+      summaryPointers: {
+        ciStatus: "conflicted",
+        workspacePath,
+        gitBranchName: requiredBranchName,
+        prUrl: pullRequest.url,
+        prNumber: pullRequest.number,
+        prHeadSha: requiredOriginalHeadSha,
+        prBranch: requiredBranchName,
+        baseRef: requiredBaseBranch,
+      },
+    });
+    return {
+      status: "conflict_dispatched",
+      gate: emptyGateStatus(operationId, pullRequest, requiredOriginalHeadSha, this.options.config.mergePolicy.requiredChecks),
+      conflict: updated.mergeConflict ?? conflict,
+    };
   }
 
   async planServicePreparedMergeConflict(
@@ -2240,6 +2380,72 @@ function pullRequestRefForResolvedConflict(mergeConflict: IssueMergeConflictMeta
   return {
     ...mergeConflict.pullRequest,
     headSha: resolvedHeadSha,
+  };
+}
+
+function pullRequestForBaseRefRepair(
+  lifecycle: IssueLifecycleRecord,
+  branchName: string,
+  headSha: string,
+): CompletionReportPullRequestRef {
+  const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+  return {
+    url: reportPullRequest?.url ?? lifecycle.summaryPointers.prUrl,
+    number: reportPullRequest?.number ?? lifecycle.summaryPointers.prNumber,
+    headSha,
+    branch: reportPullRequest?.branch ?? lifecycle.summaryPointers.prBranch ?? branchName,
+  };
+}
+
+function buildBaseRefRepairMergeConflict(input: {
+  issue: Issue;
+  pullRequest: CompletionReportPullRequestRef;
+  sourceState: string;
+  conflictsState: string;
+  baseBranch: string;
+  baseHeadSha: string;
+  preparation: ServiceOwnedMergeConflictPreparationResult & { status: "conflicted" };
+  maxFixTurns: number;
+  now: string;
+}): IssueMergeConflictMetadata {
+  return {
+    id: `merge-conflict:${input.issue.id}:${input.preparation.originalHeadSha}:${input.preparation.liveBaseHeadSha}`,
+    status: "open",
+    resolutionStatus: "pending",
+    pullRequest: { ...input.pullRequest, headSha: input.preparation.originalHeadSha },
+    approvedHeadSha: input.preparation.originalHeadSha,
+    currentHeadSha: input.preparation.originalHeadSha,
+    resolvedHeadSha: null,
+    baseBranch: input.baseBranch,
+    baseHeadSha: input.baseHeadSha,
+    sourceState: input.sourceState,
+    conflictsState: input.conflictsState,
+    reason: "Worktree rebase over the live origin base produced conflicts",
+    mergeableState: "dirty",
+    servicePreparation: {
+      strategy: "squash_rebase",
+      status: "conflicted",
+      originalHeadSha: input.preparation.originalHeadSha,
+      observedPrBaseHeadSha: input.preparation.observedPrBaseHeadSha,
+      liveBaseHeadSha: input.preparation.liveBaseHeadSha,
+      preparedBaseHeadSha: input.preparation.preparedBaseHeadSha,
+      mergeBaseSha: input.preparation.mergeBaseSha,
+      squashCommitSha: input.preparation.squashCommitSha,
+      conflictedFiles: input.preparation.conflictedFiles,
+      preparedAt: input.now,
+      finalizedAt: null,
+      finalizedHeadSha: null,
+    },
+    detectedAt: input.now,
+    updatedAt: input.now,
+    fixTurnCount: 0,
+    maxFixTurns: input.maxFixTurns,
+    lastConflictFixRunId: null,
+    lastConflictResolutionReportId: null,
+    attemptRunIds: [],
+    writebackOperationKeys: [],
+    blockedAt: null,
+    blockedReason: null,
   };
 }
 
