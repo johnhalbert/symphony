@@ -3238,6 +3238,103 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("counts failed implementation runs without a completion report against the incomplete turn ceiling", async () => {
+    const config = testConfig(root);
+    config.agent.maxRetryBackoffMs = 0;
+    config.agent.maxTurns = 5;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["Human Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.maxIncompleteTurns = 2;
+    const candidate = issue({ state: "Todo", labels: ["dogfood-ready"] });
+    let currentState = "Todo";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return currentState === "Blocked"
+          ? []
+          : [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates(states) {
+        return currentState === "Blocked"
+          ? []
+          : issuesInStates([{ ...candidate, state: currentState }], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(stateDir),
+      writer,
+      logger,
+      0,
+    );
+    const harness = new FakeHarness({ fail: true });
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          currentState === "Blocked" &&
+          orchestrator.snapshot().counts.running === 0 &&
+          orchestrator.snapshot().counts.retrying === 0,
+        "failed worker incomplete-turn escalation",
+        15_000,
+      );
+    } finally {
+      await orchestrator.stop();
+    }
+
+    const recordedRuns = await runStore.listRunsForIssue(candidate.id);
+    expect(recordedRuns.map((run) => [run.runId, run.status])).toEqual([
+      ["fake-issue-1-1", "failed"],
+      ["fake-issue-1-2", "failed"],
+    ]);
+    expect(writer.transitions.map((transition) => transition.toState)).toContain(
+      "In Progress",
+    );
+    expect(writer.transitions.map((transition) => transition.toState)).toContain(
+      "Blocked",
+    );
+    expect(
+      writer.comments.some((comment) =>
+        comment.body.includes("Symphony worker run failed."),
+      ),
+    ).toBe(true);
+    expect(writer.comments.at(-1)?.body).toContain(
+      "max incomplete turns reached (2/2)",
+    );
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      incompleteTurnCount: 2,
+      blockedReason: "max incomplete turns reached (2/2)",
+    });
+  });
+
   it("blocks after consecutive worker SDK wait errors reach the retry cap", async () => {
     const config = testConfig(root);
     config.agent.maxSdkErrorRetries = 2;

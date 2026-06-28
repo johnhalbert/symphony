@@ -680,11 +680,37 @@ describe("CompletionReportService", () => {
     const { service, lifecycleStore, outbox } = fixture({ publisher });
 
     await expect(service.submitCompletionReport(report(), contextWithWorkspace())).rejects.toMatchObject({
-      code: "tracker_error",
+      code: "invalid_request",
+      message: "Completion report could not publish the pull request: GitHub branch push failed",
+      details: {
+        reasonCode: "pull_request_publication_failed",
+        rejectionId: "completion-report-rejection:issue-1:idem-1",
+        reportId: "completion-report:issue-1:idem-1",
+      },
     });
 
-    expect(await lifecycleStore.get("issue-1")).toBeNull();
-    expect(await outbox.list()).toHaveLength(0);
+    const lifecycle = await lifecycleStore.get("issue-1");
+    expect(lifecycle).toMatchObject({
+      phase: "implementation",
+      lastCompletionReportRejectionId: "completion-report-rejection:issue-1:idem-1",
+      completionReportRejections: [
+        {
+          id: "completion-report-rejection:issue-1:idem-1",
+          reasonCode: "pull_request_publication_failed",
+          reason: "Completion report could not publish the pull request: GitHub branch push failed",
+          writebackOperationKeys: ["comment:issue-1:run-1:completion-report:idem-1:rejected"],
+        },
+      ],
+    });
+    const operations = await outbox.list();
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({
+      kind: "comment",
+      idempotencyKey: "comment:issue-1:run-1:completion-report:idem-1:rejected",
+    });
+    const comment = operations[0]?.kind === "comment" ? operations[0].payload.body : "";
+    expect(comment).toContain("Status: rejected");
+    expect(comment).toContain("Completion report could not publish the pull request: GitHub branch push failed");
   });
 
   it("does not accept self-reported PR metadata as PR-driven handoff evidence", async () => {

@@ -1220,7 +1220,7 @@ export function planBaseRefRepairWritebacks(
         body: [
           "## Symphony Base Ref Repair",
           "",
-          "Status: clean rebase prepared, worker reverification required",
+          "Status: clean rebase published, worker reverification required",
           `Next state: ${config.writeback.dispatchState} (worker queue)`,
           "",
           `Branch: ${context.branchName}`,
@@ -1230,7 +1230,7 @@ export function planBaseRefRepairWritebacks(
           `Rebased worktree head SHA: ${context.rebasedHeadSha}`,
           "",
           "Required action:",
-          "Symphony rebased the worktree over the live origin base. The implementation worker must revalidate the rebased changes and submit a fresh completion report before PR publication or review continues.",
+          "Symphony rebased the worktree over the live origin base and published the rebased head to the PR branch. The implementation worker must revalidate the rebased changes and submit a fresh completion report before review continues.",
         ].join("\n"),
       },
     },

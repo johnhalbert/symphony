@@ -170,7 +170,7 @@ export interface IssueCompletionReportRejectionRecord {
   runId: string;
   issueId: string;
   issueIdentifier: string;
-  reasonCode: "unsatisfied_acceptance_checklist";
+  reasonCode: IssueCompletionReportRejectionReasonCode;
   reason: string;
   summary: string;
   validationEvidence: string[];
@@ -182,6 +182,10 @@ export interface IssueCompletionReportRejectionRecord {
   rejectedAt: string;
   writebackOperationKeys: string[];
 }
+
+export type IssueCompletionReportRejectionReasonCode =
+  | "unsatisfied_acceptance_checklist"
+  | "pull_request_publication_failed";
 
 export type IssueReviewVerdict = "pass" | "fail" | "blocked";
 
@@ -1780,7 +1784,7 @@ function normalizeCompletionReportRejection(
   index: number,
 ): IssueCompletionReportRejectionRecord {
   if (!isRecord(value)) throw corruptLifecycle(filePath, `completionReportRejections[${index}] is invalid`);
-  if (value.reasonCode !== "unsatisfied_acceptance_checklist") {
+  if (!isCompletionReportRejectionReasonCode(value.reasonCode)) {
     throw corruptLifecycle(filePath, `completionReportRejections[${index}].reasonCode is invalid`);
   }
   return {
@@ -1810,6 +1814,10 @@ function normalizeCompletionReportRejection(
       `completionReportRejections[${index}].writebackOperationKeys`,
     ),
   };
+}
+
+function isCompletionReportRejectionReasonCode(value: unknown): value is IssueCompletionReportRejectionReasonCode {
+  return value === "unsatisfied_acceptance_checklist" || value === "pull_request_publication_failed";
 }
 
 function normalizeReviewVerdict(value: unknown, filePath: string, index: number): IssueReviewVerdictRecord {

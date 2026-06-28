@@ -993,6 +993,12 @@ export class MergePolicyService {
 
     const operationId = `base-ref:${issue.id}:${requiredOriginalHeadSha}:${requiredLiveBaseHeadSha}`;
     if (preparation.status === "clean") {
+      await conflictGit.publishPreparedHead({
+        workspacePath,
+        branchName: requiredBranchName,
+        previousRemoteHeadSha: requiredOriginalHeadSha,
+        authHeader,
+      });
       const operations = planBaseRefRepairWritebacks(
         {
           issue: latestIssue,

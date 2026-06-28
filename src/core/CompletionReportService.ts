@@ -7,7 +7,7 @@ import {
   type IssueBaseRefObservation,
 } from "./BaseRefVerification.js";
 import type { ServiceConfig } from "./config/Config.js";
-import { SymphonyError } from "./errors.js";
+import { SymphonyError, errorMessage } from "./errors.js";
 import type {
   CompletionReportChecklistItem,
   CompletionReportPullRequestRef,
@@ -47,6 +47,13 @@ export const PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON = "publication approva
 export const PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON = "awaiting operator approval for PR publication";
 export const PUBLICATION_APPROVAL_BLOCKED_REASON = PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON;
 const SETTLED_WRITEBACK_STATUSES = new Set<WritebackStatus>(["succeeded", "skipped"]);
+
+class PullRequestPublicationFailure extends Error {
+  constructor(readonly publicationError: unknown) {
+    super(errorMessage(publicationError));
+    this.name = "PullRequestPublicationFailure";
+  }
+}
 
 const completionReportSchema = z.object({
   runId: z.string().trim().min(1),
@@ -152,7 +159,7 @@ export interface CompletionReportResult {
 }
 
 interface CompletionReportReadinessRejection {
-  reasonCode: "unsatisfied_acceptance_checklist";
+  reasonCode: "unsatisfied_acceptance_checklist" | "pull_request_publication_failed";
   reason: string;
   unsatisfiedAcceptanceChecklist: Array<{ text: string; evidence: string | null }>;
 }
@@ -341,12 +348,25 @@ export class CompletionReportService {
       });
     }
 
-    let publication: CompletionReportPullRequestPublication | null;
+    let publication: CompletionReportPullRequestPublication | null = null;
     try {
       publication = await this.publishPullRequestIfNeeded(report, context, lifecycle);
     } catch (error) {
-      await this.recordPublicationApprovalTerminalIfNeeded(error, report, context, inputPullRequest);
-      throw error;
+      const publicationError = error instanceof PullRequestPublicationFailure ? error.publicationError : null;
+      if (publicationError === null) throw error;
+      const terminalApprovalRecorded = await this.recordPublicationApprovalTerminalIfNeeded(
+        publicationError,
+        report,
+        context,
+        inputPullRequest,
+      );
+      if (terminalApprovalRecorded) throw publicationError;
+      await this.rejectCompletionReport({
+        report,
+        context,
+        existingLifecycle: lifecycle,
+        rejection: completionReportPublicationRejection(publicationError),
+      });
     }
     return this.finalizeCompletionReport({ report, context, inputPullRequest, publication, lifecycle, existing });
   }
@@ -701,7 +721,11 @@ export class CompletionReportService {
     }
     const publicationInput = this.buildPublicationInput(report, context, existingLifecycle);
     await this.verifyBaseRefBeforePublication(context.issue, publicationInput, "reconcile_completion_report_handoff");
-    return this.options.pullRequestPublisher.publishPullRequest(publicationInput);
+    try {
+      return await this.options.pullRequestPublisher.publishPullRequest(publicationInput);
+    } catch (error) {
+      throw new PullRequestPublicationFailure(error);
+    }
   }
 
   private async verifyBaseRefBeforePublication(
@@ -984,10 +1008,11 @@ export class CompletionReportService {
     report: CompletionReportInput,
     context: CompletionReportActiveContext,
     pullRequest: CompletionReportPullRequestRef | null,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const approval = error instanceof SymphonyError ? approvalRecordFromDetails(error.details) : null;
-    if (!approval || !["rejected", "stale", "expired", "cancelled"].includes(approval.status)) return;
+    if (!approval || !["rejected", "stale", "expired", "cancelled"].includes(approval.status)) return false;
     await this.enqueuePublicationApprovalTerminal(approval, report, context, pullRequest);
+    return true;
   }
 
   private async enqueuePublicationApprovalTerminal(
@@ -1094,6 +1119,14 @@ function completionReportReadinessRejection(report: CompletionReportInput): Comp
       text: item.text,
       evidence: item.evidence,
     })),
+  };
+}
+
+function completionReportPublicationRejection(error: unknown): CompletionReportReadinessRejection {
+  return {
+    reasonCode: "pull_request_publication_failed",
+    reason: `Completion report could not publish the pull request: ${errorMessage(error)}`,
+    unsatisfiedAcceptanceChecklist: [],
   };
 }
 

@@ -710,7 +710,7 @@ describe("MergePolicyService", () => {
     expect(currentIssue.state).toBe("Done");
   });
 
-  it("repairs stale worktree base with a clean local rebase and routes back to implementation", async () => {
+  it("repairs stale worktree base with a clean local rebase, publishes it, and routes back to implementation", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",
       conflictsState: "Approved with Conflicts",
@@ -759,7 +759,12 @@ describe("MergePolicyService", () => {
       liveBaseHeadSha: "base-sha-2",
       authHeader: "AUTHORIZATION: bearer test-token",
     });
-    expect(conflictGit.publishInput).toBeNull();
+    expect(conflictGit.publishInput).toMatchObject({
+      workspacePath: path.join(root, currentIssue.identifier),
+      branchName: "symphony/TEST-1",
+      previousRemoteHeadSha: "head-sha-1",
+      authHeader: "AUTHORIZATION: bearer test-token",
+    });
     expect(currentIssue.state).toBe("In Progress");
     expect(writer.transitions).toEqual([
       {
@@ -769,7 +774,7 @@ describe("MergePolicyService", () => {
         reason: "Symphony rebased stale worktree base; worker reverification required",
       },
     ]);
-    expect(writer.comments[0]?.body).toContain("Status: clean rebase prepared, worker reverification required");
+    expect(writer.comments[0]?.body).toContain("Status: clean rebase published, worker reverification required");
     expect(lifecycle).toMatchObject({
       phase: "implementation",
       blockedReason: null,

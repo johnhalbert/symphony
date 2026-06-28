@@ -11629,6 +11629,24 @@ export class Orchestrator {
             entry.issue,
           );
         }
+        if (
+          entry.role === "worker" &&
+          entry.runPhase !== "merge_conflict_resolution" &&
+          (rejectedCompletionReport || entry.failureKind === null)
+        ) {
+          await this.recordIncompleteTurn(entry);
+          if (
+            entry.lifecycle?.phase === "blocked" ||
+            entry.lifecycle?.blockedReason !== null
+          ) {
+            await this.releaseIssueClaim(
+              entry.issue,
+              "worker_exit_released_claim",
+              entry.activeRunId ?? entry.runId ?? issueId,
+            );
+            return;
+          }
+        }
         const sdkErrorFailures = await this.consecutiveSdkErrorFailures(
           entry.issue,
         );
@@ -12792,7 +12810,7 @@ export class Orchestrator {
       incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns &&
       entry.lifecycle
     ) {
-      await this.escalateEntryBlocked(
+      entry.lifecycle = await this.escalateEntryBlocked(
         entry,
         `max incomplete turns reached (${incompleteTurnCount}/${this.config.reviewLoop.maxIncompleteTurns})`,
       );
@@ -12920,17 +12938,18 @@ export class Orchestrator {
   private async escalateEntryBlocked(
     entry: RunningEntry,
     reason: string,
-  ): Promise<void> {
+  ): Promise<IssueLifecycleRecord | null> {
     const lifecycle =
       entry.lifecycle ??
       (await this.options.lifecycleStore?.get(entry.issue.id));
-    if (!lifecycle) return;
+    if (!lifecycle) return null;
     entry.lifecycle = await this.escalateLifecycleBlocked(
       entry.issue,
       lifecycle,
       entry.activeRunId ?? entry.runId ?? entry.issue.id,
       reason,
     );
+    return entry.lifecycle;
   }
 
   private async escalateLifecycleBlocked(
