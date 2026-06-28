@@ -220,25 +220,10 @@ const TICK_ISSUE_CANDIDATES_QUERY = `
 `;
 
 const ISSUE_STATES_QUERY = `
-  query SymphonyIssueStates($ids: [ID!]) {
-    issues(filter: { id: { in: $ids } }) {
-      nodes {
-        id
-        identifier
-        title
-        description
-        priority
-        branchName
-        url
-        createdAt
-        updatedAt
-        state { name }
-        assignee { id }
-        delegate { id }
-        labels { nodes { name } }
-        children(first: 1) { nodes { id } }
-        inverseRelations { nodes { type issue { id identifier state { name } } } }
-      }
+  query SymphonyIssueStates($ids: [ID!], $first: Int!, $after: String) {
+    issues(first: $first, after: $after, filter: { id: { in: $ids } }) {
+      nodes { ${ISSUE_FIELDS} }
+      pageInfo { hasNextPage endCursor }
     }
   }
 `;
@@ -403,12 +388,11 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
   async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {
     if (issueIds.length === 0) return [];
     const assigneeFilter = await this.routingAssigneeFilter();
-    const response = await this.graphql<{ issues: { nodes: LinearIssueNode[] } }>(ISSUE_STATES_QUERY, {
-      ids: issueIds,
-    });
-    return response.issues.nodes
-      .map((node) => normalizeIssue(node, assigneeFilter))
-      .filter((issue): issue is Issue => issue !== null);
+    return this.fetchPagedIssues(
+      ISSUE_STATES_QUERY,
+      { ids: uniqueStrings(issueIds) },
+      assigneeFilter,
+    );
   }
 
   async fetchWorkflowStatesByTeam(): Promise<LinearWorkflowTeamStates[]> {
@@ -792,9 +776,6 @@ function linearFilterForCandidateBranch(
   if (branch.requireAssignedToWorker === true) {
     const routingFilter = assigneeRoutingFilter(assignee);
     if (routingFilter !== null) filters.push(routingFilter);
-  }
-  if (branch.requireNoOpenBlockers === true) {
-    filters.push({ hasBlockedByRelations: { eq: false } });
   }
   if (branch.requireNoChildren === true) {
     filters.push({ children: { length: { eq: 0 } } });

@@ -129,6 +129,47 @@ describe("LinearTrackerClient", () => {
     expect(issues.map((item) => item.identifier)).toEqual(["T-1", "T-2"]);
   });
 
+  it("paginates issue state lookups by id", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    let calls = 0;
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      calls += 1;
+      requests.push(JSON.parse(String(init?.body)));
+      return jsonResponse({
+        data: {
+          issues: {
+            nodes: [
+              {
+                id: `id-${calls}`,
+                identifier: `T-${calls}`,
+                title: "Title",
+                state: { name: "Todo" },
+              },
+            ],
+            pageInfo: {
+              hasNextPage: calls === 1,
+              endCursor: calls === 1 ? "next-page" : null,
+            },
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const issues = await client.fetchIssueStatesByIds(["id-1", "id-2", "id-1"]);
+
+    expect(issues.map((item) => item.identifier)).toEqual(["T-1", "T-2"]);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.query).toContain("SymphonyIssueStates");
+    expect(requests[0]?.variables).toMatchObject({
+      ids: ["id-1", "id-2"],
+      first: 250,
+      after: null,
+    });
+    expect(requests[1]?.variables.after).toBe("next-page");
+  });
+
   it("builds filtered tick candidate filters with safe label exclusion semantics", () => {
     const filter = buildLinearIssueCandidateFilter(
       {
@@ -174,7 +215,6 @@ describe("LinearTrackerClient", () => {
                     { delegate: { isMe: { eq: true } } },
                   ],
                 },
-                { hasBlockedByRelations: { eq: false } },
                 { children: { length: { eq: 0 } } },
               ],
             },
