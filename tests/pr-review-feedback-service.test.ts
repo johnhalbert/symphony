@@ -113,6 +113,29 @@ describe("PullRequestReviewFeedbackService", () => {
     expect(client.calls).toHaveLength(0);
   });
 
+  it("includes schema validation paths in invalid review feedback errors", async () => {
+    const { service, lifecycleStore, client } = fixture();
+    await seedLifecycle(lifecycleStore);
+
+    await expect(
+      service.submitPullRequestReviewFeedback(
+        { kind: "review_comment", body: "Inline note.", idempotencyKey: "inline-invalid" },
+        context(),
+      ),
+    ).rejects.toThrow(/PR review feedback is invalid: .*path: Inline review comments require path.*line: Inline review comments require line.*side: Inline review comments require side/);
+    expect(client.calls).toHaveLength(0);
+  });
+
+  it("rejects missing review feedback arguments with a targeted MCP payload message", async () => {
+    const { service, lifecycleStore, client } = fixture();
+    await seedLifecycle(lifecycleStore);
+
+    await expect(service.submitPullRequestReviewFeedback({}, context())).rejects.toThrow(
+      /PR review feedback arguments are required.*MCP supplies the active PR context only.*never call submit_pull_request_review_feedback with \{\}/,
+    );
+    expect(client.calls).toHaveLength(0);
+  });
+
   it("replays matching idempotency keys without duplicate GitHub writes and rejects conflicting payloads", async () => {
     const { service, lifecycleStore, client } = fixture();
     await seedLifecycle(lifecycleStore);

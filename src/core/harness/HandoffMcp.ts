@@ -168,6 +168,7 @@ export function renderReviewMcpHandoffPrompt(input: RuntimeHandoffPromptInput): 
     `- Repository path: ${input.repoPath ?? "n/a"}`,
     `- Base ref: ${input.baseRef ?? "n/a"}`,
     "- Use submit_pull_request_review_feedback for GitHub PR review feedback before submit_review_verdict; the allowed GitHub review-write path is the Symphony service-owned review feedback workflow against the lifecycle-bound PR.",
+    "- Never call submit_pull_request_review_feedback with {}; Symphony supplies PR context only, and you must still provide a feedback payload such as {\"kind\":\"review\",\"event\":\"APPROVE\",\"body\":\"...\",\"idempotencyKey\":\"...\"}.",
     "- Do not run gh pr review, gh pr comment, git push, direct GitHub API/curl writes, or otherwise write to GitHub directly from the reviewer command surface.",
     "- After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence, then call submit_review_verdict before ending the run.",
     "- Use verdict \"blocked\" when review cannot complete because required validation, tooling, credentials, or service-owned evidence is unavailable to the worker/reviewer and the bounded repair is not worker-owned.",

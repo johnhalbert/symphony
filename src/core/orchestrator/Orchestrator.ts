@@ -869,6 +869,9 @@ Tool payload guidance:
 - idempotencyKey: a stable unique key for this reviewer verdict.
 
 Feedback tool payload guidance:
+- Never call submit_pull_request_review_feedback with {}. The MCP server supplies the active PR context only; you must still provide the feedback payload.
+- Minimal pass approval payload: {"kind":"review","event":"APPROVE","body":"...","idempotencyKey":"..."}.
+- Minimal requested-changes payload: {"kind":"review","event":"REQUEST_CHANGES","body":"...","idempotencyKey":"..."}.
 - For a pass verdict, first use kind "review" with event "APPROVE" for whole-PR approval feedback; include inline comments when helpful.
 - For a fail verdict, use kind "review" with event "REQUEST_CHANGES" when submitting whole-PR review feedback; include inline comments when helpful.
 - Use kind "review_comment" for a single inline comment or reply, and "issue_comment" only for supplemental high-level PR comments. These supplemental comments do not satisfy pass approval.

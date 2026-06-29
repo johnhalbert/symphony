@@ -39,6 +39,33 @@ describe("review feedback MCP handoff", () => {
     expect(output).toContain("REQUEST_CHANGES");
     expect(output).not.toContain('"COMMENT"');
     expect(output).toContain("idempotencyKey");
+    expect(output).toContain("Arguments are required");
+    expect(output).toContain("Never call this tool with an empty object");
+    expect(output).toContain("Required reviewer feedback payload");
+    expect(output).toContain("Reply to an existing PR review comment");
+    expect(output).toContain("review-approve-<run-id>");
+  });
+
+  it("returns a targeted payload error when called with empty arguments", async () => {
+    const stateDir = path.join(root, "state");
+    const workflowPath = path.join(root, "WORKFLOW.md");
+    const contextFile = path.join(root, "review-feedback-context.json");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    await writeFile(workflowPath, workflow(stateDir), "utf8");
+    await seedLifecycle(lifecycleStore);
+    await writeReviewFeedbackMcpContext(contextFile, {
+      issue: issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      activeRunId: "review-run-1",
+      role: "reviewer",
+      phase: "review",
+    });
+
+    const output = await callToolWithEmptyArgumentsViaServer(workflowPath, contextFile);
+
+    expect(output).toContain('"isError":true');
+    expect(output).toContain("PR review feedback arguments are required");
+    expect(output).toContain("MCP supplies the active PR context only");
+    expect(output).toContain("never call submit_pull_request_review_feedback with {}");
   });
 
   it("submits PR review feedback and returns durable structured URLs without exposing tokens", async () => {
@@ -163,6 +190,48 @@ async function listToolsViaServer(): Promise<string> {
   while (Date.now() < deadline) {
     const outputText = Buffer.concat(chunks).toString("utf8");
     if (outputText.includes(REVIEW_FEEDBACK_TOOL_NAME)) return outputText;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function callToolWithEmptyArgumentsViaServer(workflowPath: string, contextFile: string): Promise<string> {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const chunks: Buffer[] = [];
+  output.on("data", (chunk: Buffer) => chunks.push(chunk));
+  const server = runReviewFeedbackMcpServer({
+    workflowPath,
+    contextFile,
+    input: input as unknown as NodeJS.ReadStream,
+    output: output as unknown as NodeJS.WriteStream,
+  });
+  input.end(
+    [
+      jsonRpcMessage({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "symphony-test-client", version: "0.1.0" },
+        },
+      }),
+      jsonRpcMessage({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
+      jsonRpcMessage({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: REVIEW_FEEDBACK_TOOL_NAME, arguments: {} },
+      }),
+    ].join(""),
+  );
+  await server;
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const outputText = Buffer.concat(chunks).toString("utf8");
+    if (outputText.includes("PR review feedback arguments are required")) return outputText;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   return Buffer.concat(chunks).toString("utf8");

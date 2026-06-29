@@ -73,5 +73,7 @@ describe("MCP handoff prompt rendering", () => {
     expect(prompt).toContain("Do not run gh pr review");
     expect(prompt).toContain("direct GitHub API/curl writes");
     expect(prompt).toContain("reviewUrl/commentUrls/urls");
+    expect(prompt).toContain("Never call submit_pull_request_review_feedback with {}");
+    expect(prompt).toContain('{"kind":"review","event":"APPROVE","body":"...","idempotencyKey":"..."}');
   });
 });

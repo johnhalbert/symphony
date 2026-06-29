@@ -89,7 +89,15 @@ export async function runReviewFeedbackMcpServer(options: {
     output: options.output,
     tool: {
       name: REVIEW_FEEDBACK_TOOL_NAME,
-      description: "Submit reviewer-owned GitHub PR feedback for the active lifecycle-bound pull request.",
+      description: [
+        "Submit reviewer-owned GitHub PR feedback for the active lifecycle-bound pull request.",
+        "Arguments are required: Symphony supplies PR context only, not the feedback payload.",
+        'For pass evidence use {"kind":"review","event":"APPROVE","body":"...","idempotencyKey":"..."}.',
+        'For requested changes use {"kind":"review","event":"REQUEST_CHANGES","body":"...","idempotencyKey":"..."}.',
+        'Use kind "review_comment" with path/line/side for a new inline comment or inReplyToId for a reply.',
+        'Use kind "issue_comment" only for supplemental high-level PR comments.',
+        "Never call this tool with an empty object.",
+      ].join(" "),
       inputSchema: reviewFeedbackInputSchema(),
       handler: (input) => submitReviewFeedbackFromMcp(input, options),
     },

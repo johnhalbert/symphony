@@ -399,6 +399,56 @@ describe("GitHubPullRequestClient", () => {
     ).rejects.toThrow(/Can not approve your own pull request with \[redacted\]/);
   });
 
+  it("surfaces full GitHub validation response details for review feedback failures", async () => {
+    const client = new GitHubPullRequestClient(config(), async () =>
+      jsonResponse(
+        {
+          message: "Validation Failed",
+          errors: [
+            {
+              resource: "PullRequestReview",
+              field: "commit_id",
+              code: "invalid",
+              value: "abc123",
+              message: "Commit must be the pull request head.",
+            },
+          ],
+          documentation_url: "https://docs.github.com/rest/pulls/reviews#create-a-review-for-a-pull-request",
+          status: "422",
+        },
+        422,
+        {
+          "x-github-request-id": "ABC:123:DEF",
+          "x-ratelimit-remaining": "4998",
+        },
+      ),
+    );
+
+    let error: unknown;
+    try {
+      await client.submitPullRequestReviewFeedback({
+        pullRequestNumber: 42,
+        headSha: "abc123",
+        event: "APPROVE",
+        body: "Looks good.",
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).toContain("GitHub PR review feedback returned HTTP 422");
+    expect(message).toContain('"message":"Validation Failed"');
+    expect(message).toContain('"resource":"PullRequestReview"');
+    expect(message).toContain('"field":"commit_id"');
+    expect(message).toContain('"code":"invalid"');
+    expect(message).toContain('"value":"abc123"');
+    expect(message).toContain('"documentation_url":"https://docs.github.com/rest/pulls/reviews#create-a-review-for-a-pull-request"');
+    expect(message).toContain('"x-github-request-id":"ABC:123:DEF"');
+    expect(message).toContain('"x-ratelimit-remaining":"4998"');
+  });
+
   it("reuses an existing open pull request without creating a duplicate", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-reuse-"));
     try {

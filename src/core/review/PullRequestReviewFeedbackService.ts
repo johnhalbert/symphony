@@ -82,6 +82,42 @@ const reviewFeedbackInputParser = z.union([
   reviewCommentFeedbackSchema,
   issueCommentFeedbackSchema,
 ]);
+const REVIEW_FEEDBACK_PAYLOAD_EXAMPLES: Record<string, unknown>[] = [
+  {
+    kind: "review",
+    event: "APPROVE",
+    body: "Review passed.",
+    idempotencyKey: "review-approve-<run-id>",
+  },
+  {
+    kind: "review",
+    event: "REQUEST_CHANGES",
+    body: "Requested changes.",
+    comments: [{ path: "src/file.ts", body: "Inline note.", line: 42, side: "RIGHT" }],
+    idempotencyKey: "review-request-changes-<run-id>",
+  },
+  {
+    kind: "review_comment",
+    body: "Inline note.",
+    path: "src/file.ts",
+    line: 42,
+    side: "RIGHT",
+    idempotencyKey: "review-comment-<run-id>",
+  },
+  {
+    kind: "review_comment",
+    body: "Reply note.",
+    inReplyToId: 123,
+    idempotencyKey: "review-comment-reply-<run-id>",
+  },
+  {
+    kind: "issue_comment",
+    body: "Supplemental high-level PR note.",
+    idempotencyKey: "issue-comment-<run-id>",
+  },
+];
+const EMPTY_REVIEW_FEEDBACK_ARGUMENTS_MESSAGE =
+  'PR review feedback arguments are required. MCP supplies the active PR context only; provide a feedback payload such as {"kind":"review","event":"APPROVE","body":"...","idempotencyKey":"..."} and never call submit_pull_request_review_feedback with {}.';
 
 export type PullRequestReviewFeedbackInputValue = z.infer<typeof reviewFeedbackInputParser>;
 
@@ -300,56 +336,83 @@ export class PullRequestReviewFeedbackService {
 export function reviewFeedbackInputSchema(): Record<string, unknown> {
   return {
     type: "object",
+    description:
+      "Required reviewer feedback payload. Symphony supplies the active lifecycle-bound PR context; the tool call must still include kind, body, idempotencyKey, and event for whole-PR reviews. Never call this tool with an empty object.",
+    examples: REVIEW_FEEDBACK_PAYLOAD_EXAMPLES,
     oneOf: [
       {
         type: "object",
+        title: "Whole-PR review",
+        description:
+          'Submit a whole-PR GitHub review. Use event "APPROVE" for pass review evidence or "REQUEST_CHANGES" for fail review feedback.',
         additionalProperties: false,
         required: ["kind", "event", "body", "idempotencyKey"],
         properties: {
-          kind: { const: "review" },
-          event: { enum: ["APPROVE", "REQUEST_CHANGES"] },
-          body: { type: "string", minLength: 1 },
+          kind: { const: "review", description: 'Required discriminator for a whole-PR review.' },
+          event: { enum: ["APPROVE", "REQUEST_CHANGES"], description: "Required GitHub review event." },
+          body: { type: "string", minLength: 1, description: "Required review body to publish on the PR." },
           comments: {
             type: "array",
+            description: "Optional inline review comments to submit with the whole-PR review.",
             items: {
               type: "object",
               additionalProperties: false,
               required: ["path", "body", "line", "side"],
               properties: {
-                path: { type: "string", minLength: 1 },
-                body: { type: "string", minLength: 1 },
-                line: { type: "integer", minimum: 1 },
-                side: { enum: ["LEFT", "RIGHT"] },
+                path: { type: "string", minLength: 1, description: "Repository-relative file path." },
+                body: { type: "string", minLength: 1, description: "Inline comment body." },
+                line: { type: "integer", minimum: 1, description: "Target line number." },
+                side: { enum: ["LEFT", "RIGHT"], description: "Diff side for the target line." },
                 startLine: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
                 startSide: { anyOf: [{ enum: ["LEFT", "RIGHT"] }, { type: "null" }] },
               },
             },
           },
-          idempotencyKey: { type: "string", minLength: 1 },
+          idempotencyKey: { type: "string", minLength: 1, description: "Required stable unique key for retry-safe submission." },
         },
       },
       {
         type: "object",
+        title: "Inline PR review comment",
+        description: "Create a single inline PR review comment. path, line, and side are required unless replying with inReplyToId.",
         additionalProperties: false,
-        required: ["kind", "body", "idempotencyKey"],
+        required: ["kind", "body", "path", "line", "side", "idempotencyKey"],
         properties: {
-          kind: { const: "review_comment" },
-          body: { type: "string", minLength: 1 },
+          kind: { const: "review_comment", description: 'Required discriminator for a PR review comment.' },
+          body: { type: "string", minLength: 1, description: "Required inline comment body." },
+          path: { type: "string", minLength: 1, description: "Required repository-relative file path." },
+          line: { type: "integer", minimum: 1, description: "Required target line number." },
+          side: { enum: ["LEFT", "RIGHT"], description: "Required diff side for the target line." },
+          inReplyToId: { type: "null", description: "Omit for a new inline comment; use the reply shape to reply." },
+          idempotencyKey: { type: "string", minLength: 1, description: "Required stable unique key for retry-safe submission." },
+        },
+      },
+      {
+        type: "object",
+        title: "PR review comment reply",
+        description: "Reply to an existing PR review comment by GitHub comment id.",
+        additionalProperties: false,
+        required: ["kind", "body", "inReplyToId", "idempotencyKey"],
+        properties: {
+          kind: { const: "review_comment", description: 'Required discriminator for a PR review comment reply.' },
+          body: { type: "string", minLength: 1, description: "Required reply body." },
           path: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
           line: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
           side: { anyOf: [{ enum: ["LEFT", "RIGHT"] }, { type: "null" }] },
-          inReplyToId: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
-          idempotencyKey: { type: "string", minLength: 1 },
+          inReplyToId: { type: "integer", minimum: 1, description: "Required GitHub review comment id to reply to." },
+          idempotencyKey: { type: "string", minLength: 1, description: "Required stable unique key for retry-safe submission." },
         },
       },
       {
         type: "object",
+        title: "High-level PR issue comment",
+        description: "Post a supplemental high-level PR comment. This does not satisfy pass approval.",
         additionalProperties: false,
         required: ["kind", "body", "idempotencyKey"],
         properties: {
-          kind: { const: "issue_comment" },
-          body: { type: "string", minLength: 1 },
-          idempotencyKey: { type: "string", minLength: 1 },
+          kind: { const: "issue_comment", description: 'Required discriminator for a high-level PR comment.' },
+          body: { type: "string", minLength: 1, description: "Required PR comment body." },
+          idempotencyKey: { type: "string", minLength: 1, description: "Required stable unique key for retry-safe submission." },
         },
       },
     ],
@@ -369,11 +432,52 @@ export function boundPullRequestForLifecycle(lifecycle: IssueLifecycleRecord): C
 }
 
 function parseReviewFeedback(input: unknown): PullRequestReviewFeedbackInputValue {
+  if (isEmptyReviewFeedbackInput(input)) {
+    throw new SymphonyError("invalid_request", EMPTY_REVIEW_FEEDBACK_ARGUMENTS_MESSAGE, {
+      examples: REVIEW_FEEDBACK_PAYLOAD_EXAMPLES,
+    });
+  }
   const parsed = reviewFeedbackInputParser.safeParse(input);
   if (!parsed.success) {
-    throw new SymphonyError("invalid_request", "PR review feedback is invalid", parsed.error.flatten());
+    throw new SymphonyError("invalid_request", `PR review feedback is invalid: ${zodIssueSummary(parsed.error.issues)}`, parsed.error.flatten());
   }
   return parsed.data;
+}
+
+function isEmptyReviewFeedbackInput(input: unknown): boolean {
+  if (input === undefined || input === null) return true;
+  if (typeof input !== "object" || Array.isArray(input)) return false;
+  return Object.keys(input as Record<string, unknown>).length === 0;
+}
+
+function zodIssueSummary(issues: z.ZodIssue[]): string {
+  const summary = zodIssueMessages(issues).join("; ");
+  return summary.length <= 1_000 ? summary : `${summary.slice(0, 997)}...`;
+}
+
+function zodIssueMessages(issues: z.ZodIssue[]): string[] {
+  return issues.flatMap((issue) => {
+    if (issue.code === "invalid_union") {
+      const nested = zodUnionIssueMessages(issue);
+      if (nested.length > 0) return nested;
+    }
+    const path = issue.path.length === 0 ? "$" : issue.path.join(".");
+    return `${path}: ${issue.message}`;
+  });
+}
+
+function zodUnionIssueMessages(issue: z.ZodIssue): string[] {
+  const candidate = issue as {
+    unionErrors?: Array<{ issues: z.ZodIssue[] }>;
+    errors?: z.ZodIssue[][];
+  };
+  if (Array.isArray(candidate.unionErrors)) {
+    return candidate.unionErrors.flatMap((error) => zodIssueMessages(error.issues));
+  }
+  if (Array.isArray(candidate.errors)) {
+    return candidate.errors.flatMap((issues) => zodIssueMessages(issues));
+  }
+  return [];
 }
 
 function requireLifecyclePullRequestNumber(value: number | null): number {

@@ -725,7 +725,9 @@ export class GitHubPullRequestClient {
 
   private async githubWriteError(response: Response, action: string): Promise<string> {
     const detail = await githubErrorDetail(response, this.#lastAuthToken ?? this.config.token ?? null);
-    return detail.length === 0 ? `${action} returned HTTP ${response.status}` : `${action} returned HTTP ${response.status}: ${detail}`;
+    const statusText = response.statusText.trim();
+    const status = statusText.length === 0 ? `${response.status}` : `${response.status} ${statusText}`;
+    return detail.length === 0 ? `${action} returned HTTP ${status}` : `${action} returned HTTP ${status}: ${detail}`;
   }
 
   private async createPullRequest(input: {
@@ -760,7 +762,7 @@ export class GitHubPullRequestClient {
         });
         if (raced) return raced;
       }
-      throw new SymphonyError("tracker_error", `GitHub PR creation returned HTTP ${response.status}`);
+      throw new SymphonyError("tracker_error", await this.githubWriteError(response, "GitHub PR creation"));
     }
 
     const pullRequest = normalizePullRequest((await response.json()) as GitHubPullRequestNode);
@@ -1265,26 +1267,42 @@ function requireNonEmpty(value: string, message: string): string {
 }
 
 async function githubErrorDetail(response: Response, token: string | null): Promise<string> {
-  let text = "";
+  const parts: string[] = [];
   try {
     const body = (await response.clone().json()) as unknown;
-    if (isRecord(body)) {
-      const message = asNullableString(body.message);
-      const errors = Array.isArray(body.errors)
-        ? body.errors
-            .map((error) => (isRecord(error) ? asNullableString(error.message) : null))
-            .filter((item): item is string => item !== null)
-        : [];
-      text = [message, ...errors].filter((item): item is string => item !== null && item.length > 0).join("; ");
-    }
+    parts.push(`body=${JSON.stringify(body)}`);
   } catch {
     try {
-      text = await response.text();
+      const text = await response.text();
+      if (text.length > 0) parts.push(`body=${text}`);
     } catch {
-      text = "";
+      // Ignore body read failures; status and headers still provide useful diagnostics.
     }
   }
-  return sanitizeSecret(text, token).slice(0, 500);
+  const headers = githubDiagnosticHeaders(response.headers);
+  if (headers.length > 0) parts.push(`headers=${JSON.stringify(Object.fromEntries(headers))}`);
+  return sanitizeSecret(parts.join("; "), token).slice(0, 2_000);
+}
+
+function githubDiagnosticHeaders(headers: Headers): Array<[string, string]> {
+  const blocked = new Set(["authorization", "cookie", "set-cookie"]);
+  const result: Array<[string, string]> = [];
+  headers.forEach((value, key) => {
+    const normalized = key.toLowerCase();
+    if (blocked.has(normalized)) return;
+    if (
+      normalized === "content-type" ||
+      normalized === "x-github-request-id" ||
+      normalized === "x-ratelimit-limit" ||
+      normalized === "x-ratelimit-remaining" ||
+      normalized === "x-ratelimit-reset" ||
+      normalized === "x-ratelimit-resource" ||
+      normalized === "x-ratelimit-used"
+    ) {
+      result.push([normalized, value]);
+    }
+  });
+  return result.sort(([left], [right]) => left.localeCompare(right));
 }
 
 function sanitizeSecret(value: string, secret: string | null): string {

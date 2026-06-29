@@ -8821,6 +8821,13 @@ describe("Orchestrator", () => {
     expect(prompt).toContain(
       "These supplemental comments do not satisfy pass approval",
     );
+    expect(prompt).toContain("Never call submit_pull_request_review_feedback with {}");
+    expect(prompt).toContain(
+      'Minimal pass approval payload: {"kind":"review","event":"APPROVE","body":"...","idempotencyKey":"..."}',
+    );
+    expect(prompt).toContain(
+      'Minimal requested-changes payload: {"kind":"review","event":"REQUEST_CHANGES","body":"...","idempotencyKey":"..."}',
+    );
     expect(prompt).not.toContain(
       'event "REQUEST_CHANGES", "COMMENT", or "APPROVE"',
     );
