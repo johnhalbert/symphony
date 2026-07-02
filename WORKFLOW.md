@@ -58,6 +58,11 @@ continuation_context:
   search_enabled: false
   summarization_enabled: false
 
+transcript_cleanup:
+  terminal_startup:
+    enabled: true
+    keep_latest_runs: 1
+
 issue_triage:
   enabled: true
   mode: classify_only

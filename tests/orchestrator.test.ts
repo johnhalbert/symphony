@@ -219,6 +219,53 @@ describe("Orchestrator", () => {
     );
   });
 
+  it("cleans terminal issue transcripts during startup even when workspace cleanup fails", async () => {
+    const config = testConfig(root);
+    const candidate = issue({ state: "Done" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([candidate], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startTranscriptCleanupRun(runStore, candidate, "terminal-run-old", root, 1);
+    await startTranscriptCleanupRun(runStore, candidate, "terminal-run-middle", root, 2);
+    await startTranscriptCleanupRun(runStore, candidate, "terminal-run-latest", root, 3);
+    const harness = new FakeHarness();
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    vi.spyOn(workspaceManager, "removeForIssue").mockRejectedValue(new Error("dirty worktree"));
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      runStore,
+    });
+
+    await orchestrator.start();
+    await orchestrator.stop();
+
+    expect(workspaceManager.removeForIssue).toHaveBeenCalledWith(candidate);
+    await expect(runStore.getRun("terminal-run-old")).resolves.toBeNull();
+    await expect(runStore.getRun("terminal-run-middle")).resolves.toBeNull();
+    await expect(runStore.getRun("terminal-run-latest")).resolves.toMatchObject({
+      runId: "terminal-run-latest",
+    });
+  });
+
   it("restores paused issues from durable runtime history on startup", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Todo" });
@@ -12542,6 +12589,42 @@ async function startApprovalRun(
     gitBranchName: candidate.branchName ?? "symphony/TEST-1",
     repoPath: root,
     baseRef: "main",
+  });
+}
+
+async function startTranscriptCleanupRun(
+  runStore: FileRunTranscriptStore,
+  candidate: Issue,
+  runId: string,
+  root: string,
+  turnNumber: number,
+): Promise<void> {
+  await runStore.startRun({
+    runId,
+    sessionId: `${runId}-session`,
+    agentId: `${runId}-agent`,
+    role: "worker",
+    issueId: candidate.id,
+    issueIdentifier: candidate.identifier,
+    attempt: null,
+    turnNumber,
+    prompt: "Worker prompt",
+    workspaceKey: candidate.identifier,
+    workspacePath: path.join(root, candidate.identifier),
+    gitBranchName: candidate.branchName ?? "symphony/TEST-1",
+    repoPath: root,
+    baseRef: "main",
+  });
+  await runStore.appendEvent({
+    runId,
+    at: `2026-01-01T00:00:0${turnNumber}.000Z`,
+    source: "harness",
+    eventType: "progress",
+    message: `progress ${turnNumber}`,
+  });
+  await runStore.updateRun(runId, {
+    status: "succeeded",
+    completedAt: `2026-01-01T00:00:0${turnNumber}.000Z`,
   });
 }
 

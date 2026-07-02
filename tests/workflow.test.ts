@@ -76,6 +76,12 @@ Work on {{ issue.identifier }}.`,
       searchEnabled: false,
       summarizationEnabled: false,
     });
+    expect(config.transcriptCleanup).toEqual({
+      terminalStartup: {
+        enabled: true,
+        keepLatestRuns: 1,
+      },
+    });
     expect(config.database).toEqual({
       postgres: {
         connectionString: null,
@@ -130,6 +136,29 @@ Work on {{ issue.identifier }}.`,
       canceled: ["Cancelled", "Canceled", "Duplicate"],
     });
     expect(config.workspace.stateDir.replace(/\\/g, "/")).toMatch(/\/repo\/symphony_workspaces\/\.symphony$/);
+  });
+
+  it("parses transcript cleanup config", () => {
+    const config = parseServiceConfig(
+      {
+        tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+        transcript_cleanup: {
+          terminal_startup: {
+            enabled: false,
+            keep_latest_runs: 3,
+          },
+        },
+      },
+      "/repo/WORKFLOW.md",
+      { LINEAR_API_KEY: "secret" },
+    );
+
+    expect(config.transcriptCleanup).toEqual({
+      terminalStartup: {
+        enabled: false,
+        keepLatestRuns: 3,
+      },
+    });
   });
 
   it("parses database-only config for migration commands without requiring tracker credentials", () => {
@@ -1416,10 +1445,14 @@ Work on {{ issue.identifier }}.
     } | undefined;
 
     expect(config.agent.harness).toBe("hermes");
-    expect(config.agent.maxConcurrentAgents).toBe(5);
+    expect(config.agent.maxConcurrentAgents).toBe(1);
     expect(config.agent.maxTurns).toBe(1);
     expect(config.mergePolicy.mode).toBe("gated");
     expect(config.continuationContext.searchEnabled).toBe(false);
+    expect(config.transcriptCleanup.terminalStartup).toEqual({
+      enabled: true,
+      keepLatestRuns: 1,
+    });
     expect(rawGithub?.pr_handoff?.enabled).toBeTypeOf("boolean");
     expect(config.github.prHandoff.enabled).toBe(rawGithub?.pr_handoff?.enabled);
     expect(config.github.token).toBeNull();

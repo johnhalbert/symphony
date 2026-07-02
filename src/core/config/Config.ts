@@ -94,6 +94,18 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    transcript_cleanup: z
+      .object({
+        terminal_startup: z
+          .object({
+            enabled: z.boolean().optional(),
+            keep_latest_runs: z.number().int().nonnegative().optional(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
     database: z
       .object({
         postgres: z
@@ -663,6 +675,13 @@ export interface IssueBoardConfig {
   columns: IssueBoardColumnMapping;
 }
 
+export interface TranscriptCleanupConfig {
+  terminalStartup: {
+    enabled: boolean;
+    keepLatestRuns: number;
+  };
+}
+
 export interface ServiceConfig {
   workflowPath: string;
   workflowDir: string;
@@ -685,6 +704,7 @@ export interface ServiceConfig {
   mergePolicy: MergePolicyConfig;
   issueBoard: IssueBoardConfig;
   continuationContext: ContinuationContextConfig;
+  transcriptCleanup: TranscriptCleanupConfig;
   database: DatabaseConfig;
   issueBreakdown: IssueBreakdownConfig;
   issueTriage: IssueTriageConfig;
@@ -714,6 +734,8 @@ const DEFAULT_HERMES_REQUEST_TIMEOUT_MS = 120_000;
 const DEFAULT_HERMES_SHUTDOWN_GRACE_MS = 2_000;
 const DEFAULT_HERMES_WORKER_SESSION_LIFECYCLE: HermesWorkerSessionLifecycle = "reuse_by_issue";
 const DEFAULT_HERMES_PROFILE_RETENTION: HermesProfileRetention = "failed";
+const DEFAULT_TRANSCRIPT_CLEANUP_TERMINAL_STARTUP_ENABLED = true;
+const DEFAULT_TRANSCRIPT_CLEANUP_TERMINAL_STARTUP_KEEP_LATEST_RUNS = 1;
 const DEFAULT_HERMES_ACP_PROFILE_PREFIX = "symphony";
 const DEFAULT_HANDOFF_REPAIR_PHASES: AgentRunPhase[] = [
   "implementation",
@@ -1117,6 +1139,14 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     continuationContext: {
       searchEnabled: raw.continuation_context?.search_enabled ?? false,
       summarizationEnabled: raw.continuation_context?.summarization_enabled ?? false,
+    },
+    transcriptCleanup: {
+      terminalStartup: {
+        enabled: raw.transcript_cleanup?.terminal_startup?.enabled ?? DEFAULT_TRANSCRIPT_CLEANUP_TERMINAL_STARTUP_ENABLED,
+        keepLatestRuns:
+          raw.transcript_cleanup?.terminal_startup?.keep_latest_runs ??
+          DEFAULT_TRANSCRIPT_CLEANUP_TERMINAL_STARTUP_KEEP_LATEST_RUNS,
+      },
     },
     database,
     issueBreakdown: {

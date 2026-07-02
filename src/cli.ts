@@ -26,6 +26,10 @@ import {
   type LifecycleReconciliationApplyResult,
   type LifecycleReconciliationResult,
 } from "./core/LifecycleReconciliationService.js";
+import {
+  RunTranscriptCleanupService,
+  type RunTranscriptCleanupResult,
+} from "./core/RunTranscriptCleanupService.js";
 import { FileIssueLifecycleStore } from "./core/persistence/IssueLifecycleStore.js";
 import { FileMcpExposureDiagnosticsStore } from "./core/persistence/McpExposureDiagnosticsStore.js";
 import { FileOrchestratorConversationStore } from "./core/persistence/OrchestratorConversationStore.js";
@@ -521,6 +525,63 @@ issueCommand
   });
 
 issueCommand
+  .command("cleanup-transcripts")
+  .description("Preview or apply run transcript cleanup for one issue or terminal issues")
+  .argument("[issueOrWorkflow]", "issue id or identifier, or workflow path when --terminal is used")
+  .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
+  .option("--terminal", "cleanup transcripts for issues in tracker.terminal_states")
+  .option("--apply", "delete selected run transcript directories; default is dry-run")
+  .option("--keep-latest <count>", "number of newest runs to preserve per issue")
+  .option("--json", "print JSON result")
+  .action(
+    async (
+      issueOrWorkflow: string | undefined,
+      workflowArg: string,
+      options: { terminal?: boolean; apply?: boolean; keepLatest?: string; json?: boolean },
+    ) => {
+      const terminal = options.terminal === true;
+      const issue = terminal ? null : issueOrWorkflow ?? null;
+      const workflow = terminal ? issueOrWorkflow ?? workflowArg : workflowArg;
+      if (!terminal && issue === null) {
+        throw new SymphonyError("invalid_request", "issue cleanup-transcripts requires an issue id or --terminal");
+      }
+
+      const workflowPath = path.resolve(process.cwd(), workflow);
+      const loader = new WorkflowLoader(workflowPath);
+      const loaded = await loader.load();
+      const config = loaded.serviceConfig;
+      const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+      const service = new RunTranscriptCleanupService({ runStore });
+      try {
+        const targets = terminal
+          ? (await createRuntimeTrackerClient(config).fetchIssuesByStates(config.tracker.terminalStates)).map((terminalIssue) => ({
+              issueIdOrIdentifier: terminalIssue.id,
+              issueId: terminalIssue.id,
+              issueIdentifier: terminalIssue.identifier,
+            }))
+          : [{ issueIdOrIdentifier: issue as string }];
+        const result = await service.cleanup({
+          targets,
+          keepLatestRuns:
+            options.keepLatest === undefined
+              ? config.transcriptCleanup.terminalStartup.keepLatestRuns
+              : parseNonnegativeIntegerOption(options.keepLatest, "--keep-latest"),
+          apply: options.apply === true,
+          reason: terminal ? "cli_terminal_transcript_cleanup" : "cli_issue_transcript_cleanup",
+        });
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(formatRunTranscriptCleanupResult(result, { terminal }));
+        }
+        if (result.totals.deletable === 0) process.exitCode = 2;
+      } finally {
+        await loader.close();
+      }
+    },
+  );
+
+issueCommand
   .command("reconcile-lifecycle")
   .description("Preview or apply lifecycle cleanup for superseded review, triage, and merge-gate records")
   .argument("[issueOrWorkflow]", "issue id or identifier, or workflow path when --all is used")
@@ -780,6 +841,14 @@ function parsePositiveIntegerOption(value: string | undefined, label: string): n
   return parsed;
 }
 
+function parseNonnegativeIntegerOption(value: string | undefined, label: string): number {
+  const parsed = Number(value ?? "0");
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a nonnegative integer`);
+  }
+  return parsed;
+}
+
 function formatRenderedPromptPreview(result: Extract<PromptPreviewResult, { status: "rendered" }>): string {
   return [
     "===== EPHEMERAL SYSTEM PROMPT =====",
@@ -914,6 +983,30 @@ function formatLifecycleReconciliationResult(
       lines.push(`    ${oneLineCli(action.detail)}`);
     }
   }
+  return lines.join("\n");
+}
+
+function formatRunTranscriptCleanupResult(result: RunTranscriptCleanupResult, options: { terminal: boolean }): string {
+  const lines = [
+    `Transcript cleanup ${result.apply ? "apply" : "dry-run"}${options.terminal ? " for terminal issues" : ""}`,
+    `  Issues: ${result.totals.issues}`,
+    `  Runs considered: ${result.totals.considered}`,
+    `  Kept: ${result.totals.kept}`,
+    `  Skipped running: ${result.totals.skippedRunning}`,
+    `  Deletable: ${result.totals.deletable}`,
+    ...(result.apply ? [`  Deleted: ${result.totals.deleted}`] : []),
+    `  Bytes ${result.apply ? "removed" : "deletable"}: ${result.apply ? result.totals.bytesRemoved : result.totals.bytesDeletable}`,
+  ];
+  for (const issue of result.issues.filter((item) => item.deletable > 0 || item.kept > 0 || item.skippedRunning > 0)) {
+    lines.push("", `${issue.issueIdentifier ?? issue.issueIdOrIdentifier}${issue.issueId ? ` (${issue.issueId})` : ""}`);
+    lines.push(
+      `  considered=${issue.considered} kept=${issue.kept} skipped_running=${issue.skippedRunning} deletable=${issue.deletable} deleted=${issue.deleted}`,
+    );
+    for (const run of issue.runs.filter((item) => item.action === "deletable" || item.action === "deleted")) {
+      lines.push(`  - ${run.action}: ${run.runId} ${run.status} ${run.bytes} bytes`);
+    }
+  }
+  if (result.totals.deletable === 0) lines.push("  No transcript cleanup needed.");
   return lines.join("\n");
 }
 

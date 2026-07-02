@@ -77,6 +77,7 @@ import {
   sortIssueTriageBlockers,
 } from "../IssueTriageService.js";
 import { LifecycleReconciliationService } from "../LifecycleReconciliationService.js";
+import { RunTranscriptCleanupService } from "../RunTranscriptCleanupService.js";
 import {
   issuePostMortemTriggerFingerprint,
   latestIssuePostMortemReportForFingerprint,
@@ -9178,11 +9179,24 @@ export class Orchestrator {
   }
 
   private async startupCleanup(): Promise<void> {
+    let terminalIssues: Issue[];
     try {
-      const terminalIssues = await this.options.tracker.fetchIssuesByStates(
+      terminalIssues = await this.options.tracker.fetchIssuesByStates(
         this.config.tracker.terminalStates,
       );
-      for (const issue of terminalIssues) {
+    } catch (error) {
+      this.options.logger.warn("startup terminal issue fetch failed", {
+        error: errorMessage(error),
+      });
+      return;
+    }
+
+    const transcriptCleanup =
+      this.options.runStore && this.config.transcriptCleanup.terminalStartup.enabled
+        ? new RunTranscriptCleanupService({ runStore: this.options.runStore })
+        : null;
+    for (const issue of terminalIssues) {
+      try {
         await this.options.workspaceManager.removeForIssue(issue);
         await this.recordIssueEvidenceSnapshot({
           issue,
@@ -9196,11 +9210,61 @@ export class Orchestrator {
             trackerState: issue.state,
           },
         });
+      } catch (error) {
+        this.options.logger.warn("startup terminal workspace cleanup failed", {
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          error: errorMessage(error),
+        });
       }
-    } catch (error) {
-      this.options.logger.warn("startup terminal cleanup failed", {
-        error: errorMessage(error),
-      });
+
+      if (!transcriptCleanup) continue;
+      try {
+        const result = await transcriptCleanup.cleanup({
+          targets: [
+            {
+              issueIdOrIdentifier: issue.id,
+              issueId: issue.id,
+              issueIdentifier: issue.identifier,
+            },
+          ],
+          keepLatestRuns: this.config.transcriptCleanup.terminalStartup.keepLatestRuns,
+          apply: true,
+          reason: "startup_terminal_cleanup",
+        });
+        if (result.totals.deleted > 0) {
+          this.options.logger.info("startup terminal transcript cleanup completed", {
+            issue_id: issue.id,
+            issue_identifier: issue.identifier,
+            kept_count: result.totals.kept,
+            deleted_count: result.totals.deleted,
+            bytes_removed: result.totals.bytesRemoved,
+          });
+          await this.recordIssueEvidenceSnapshot({
+            issue,
+            evidenceKind: "workspace",
+            eventType: "startup_terminal_transcripts_removed",
+            sourceId: issue.id,
+            reason: "startup_terminal_cleanup",
+            payload: {
+              issueId: issue.id,
+              issueIdentifier: issue.identifier,
+              trackerState: issue.state,
+              keepLatestRuns: result.keepLatestRuns,
+              considered: result.totals.considered,
+              kept: result.totals.kept,
+              deleted: result.totals.deleted,
+              bytesRemoved: result.totals.bytesRemoved,
+            },
+          });
+        }
+      } catch (error) {
+        this.options.logger.warn("startup terminal transcript cleanup failed", {
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          error: errorMessage(error),
+        });
+      }
     }
   }
 

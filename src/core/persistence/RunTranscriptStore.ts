@@ -301,6 +301,18 @@ export interface TranscriptSinkFailure {
   error: unknown;
 }
 
+export interface RunStorageUsage {
+  runId: string;
+  exists: boolean;
+  bytes: number;
+}
+
+export interface DeleteRunResult {
+  runId: string;
+  deleted: boolean;
+  bytesRemoved: number;
+}
+
 export class TranscriptEventSource {
   private readonly listeners: TranscriptSourceListener[] = [];
 
@@ -714,6 +726,29 @@ export class FileRunTranscriptStore {
     const entries = await fs.readdir(this.runsDir());
     const records = await mapWithFileReadConcurrency(entries, (entry) => readJsonIfExists<RunRecord>(this.metaPath(entry)));
     return records.filter((record): record is RunRecord => record !== null).map(normalizeRunRecord);
+  }
+
+  async getRunStorageUsage(runId: string): Promise<RunStorageUsage> {
+    const bytes = await directoryByteSize(this.runDir(runId));
+    return {
+      runId,
+      exists: bytes !== null,
+      bytes: bytes ?? 0,
+    };
+  }
+
+  async deleteRun(runId: string): Promise<DeleteRunResult> {
+    return this.withRunUpdateLock(runId, async () => {
+      await this.fileTranscriptSink.waitForIdle(runId);
+      const usage = await this.getRunStorageUsage(runId);
+      if (!usage.exists) {
+        this.transcriptEventCounts.delete(runId);
+        return { runId, deleted: false, bytesRemoved: 0 };
+      }
+      await fs.rm(this.runDir(runId), { recursive: true, force: true });
+      this.transcriptEventCounts.delete(runId);
+      return { runId, deleted: true, bytesRemoved: usage.bytes };
+    });
   }
 
   private async writeRun(record: RunRecord): Promise<void> {
@@ -1602,6 +1637,24 @@ async function writeJsonUnlocked(filePath: string, value: unknown): Promise<void
 }
 
 const writeJsonLocks = new Map<string, Promise<void>>();
+
+async function directoryByteSize(targetPath: string): Promise<number | null> {
+  let stats;
+  try {
+    stats = await fs.stat(targetPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stats.isDirectory()) return stats.size;
+  const entries = await fs.readdir(targetPath, { withFileTypes: true });
+  let total = 0;
+  for (const entry of entries) {
+    const childSize = await directoryByteSize(path.join(targetPath, entry.name));
+    total += childSize ?? 0;
+  }
+  return total;
+}
 
 async function readJsonIfExists<T>(filePath: string): Promise<T | null> {
   for (let attempt = 0; attempt < 5; attempt += 1) {

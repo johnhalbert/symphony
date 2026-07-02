@@ -965,6 +965,77 @@ describe("FileRunTranscriptStore", () => {
     expect(events).toHaveLength(1);
   });
 
+  it("deletes run transcript directories and removes runs from issue listings", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await startBasicRun(store, "run-delete");
+    await store.appendEvent({
+      runId: "run-delete",
+      at: "2026-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "delete me",
+    });
+
+    const usage = await store.getRunStorageUsage("run-delete");
+    expect(usage).toMatchObject({ runId: "run-delete", exists: true });
+    expect(usage.bytes).toBeGreaterThan(0);
+
+    await expect(store.deleteRun("run-delete")).resolves.toMatchObject({
+      runId: "run-delete",
+      deleted: true,
+      bytesRemoved: usage.bytes,
+    });
+
+    await expect(store.getRun("run-delete")).resolves.toBeNull();
+    await expect(store.listRunsForIssue("TEST-1")).resolves.toEqual([]);
+    await expect(store.readTranscript("run-delete")).resolves.toMatchObject({ events: [], total: 0 });
+    await expect(store.getRunStorageUsage("run-delete")).resolves.toEqual({
+      runId: "run-delete",
+      exists: false,
+      bytes: 0,
+    });
+  });
+
+  it("treats missing run deletion as a no-op", async () => {
+    const store = new FileRunTranscriptStore(root);
+
+    await expect(store.deleteRun("missing-run")).resolves.toEqual({
+      runId: "missing-run",
+      deleted: false,
+      bytesRemoved: 0,
+    });
+  });
+
+  it("waits for pending transcript sink writes before deleting a run", async () => {
+    const store = new FileRunTranscriptStore(root);
+    await startBasicRun(store, "run-delete-pending");
+    let releaseAppend!: () => void;
+    const appendStarted = new Promise<void>((resolve) => {
+      vi.spyOn(nodeFs, "appendFile").mockImplementationOnce(async () => {
+        resolve();
+        await new Promise<void>((release) => {
+          releaseAppend = release;
+        });
+      });
+    });
+
+    const append = store.appendEvent({
+      runId: "run-delete-pending",
+      at: "2026-01-01T00:00:00.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "pending write",
+    });
+    await appendStarted;
+    const deleted = store.deleteRun("run-delete-pending");
+    releaseAppend();
+
+    await expect(append).resolves.toMatchObject({ runId: "run-delete-pending" });
+    await expect(deleted).resolves.toMatchObject({ deleted: true });
+    await expect(store.getRun("run-delete-pending")).resolves.toBeNull();
+    await expect(store.readTranscript("run-delete-pending")).resolves.toMatchObject({ events: [], total: 0 });
+  });
+
   it("repairs transcript event counts without emitting transcript source events", async () => {
     const store = new FileRunTranscriptStore(root);
     await store.startRun({
