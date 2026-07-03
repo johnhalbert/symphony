@@ -1520,7 +1520,185 @@ describe("FileWritebackOutboxStore", () => {
     await expect(store.get(operationKey)).resolves.toMatchObject({ status: "succeeded", projectContext: docsProjectContext });
   });
 
+  it("uses the requested processDue project context to resolve the tracker writer", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const defaultWriter = new FakeWriter();
+    const persistedDocsWriter = new FakeWriter();
+    const scopedDocsWriter = new FakeWriter();
+    const scopedDocsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Docs (renamed)",
+      linearProjectSlug: "DOCS-ALT",
+      routingSource: "state_refresh",
+    } as const;
+    const processor = new WritebackProcessor(
+      store,
+      defaultWriter,
+      new StructuredLogger(() => undefined),
+      300_000,
+      undefined,
+      false,
+      undefined,
+      (projectContext) => {
+        if (projectContext?.projectContextId !== docsProjectContext.projectContextId) return defaultWriter;
+        return projectContext.linearProjectSlug === scopedDocsProjectContext.linearProjectSlug
+          ? scopedDocsWriter
+          : persistedDocsWriter;
+      },
+    );
+    const operationKey = "comment:issue-docs-scoped-writer:docs";
 
+    await store.enqueueOnce({
+      idempotencyKey: operationKey,
+      kind: "comment",
+      issueId: "issue-docs-scoped-writer",
+      projectContext: docsProjectContext,
+      runId: "run-docs-scoped-writer",
+      payload: { body: "Docs scoped writer", dedupeKey: "docs-scoped-writer" },
+    });
+
+    await processor.processDue({ projectContext: scopedDocsProjectContext });
+
+    expect(scopedDocsWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-docs-scoped-writer",
+        body: "Docs scoped writer",
+        dedupeKey: "docs-scoped-writer",
+      }),
+    ]);
+    expect(persistedDocsWriter.comments).toEqual([]);
+    expect(defaultWriter.comments).toEqual([]);
+    await expect(store.get(operationKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+  });
+
+  it("uses the requested enqueueAndProcess project context to resolve the tracker writer for idempotent replays", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const defaultWriter = new FakeWriter();
+    const persistedDocsWriter = new FakeWriter();
+    const scopedDocsWriter = new FakeWriter();
+    const scopedDocsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Docs (renamed)",
+      linearProjectSlug: "DOCS-ALT",
+      routingSource: "state_refresh",
+    } as const;
+    const processor = new WritebackProcessor(
+      store,
+      defaultWriter,
+      new StructuredLogger(() => undefined),
+      300_000,
+      undefined,
+      false,
+      undefined,
+      (projectContext) => {
+        if (projectContext?.projectContextId !== docsProjectContext.projectContextId) return defaultWriter;
+        return projectContext.linearProjectSlug === scopedDocsProjectContext.linearProjectSlug
+          ? scopedDocsWriter
+          : persistedDocsWriter;
+      },
+    );
+    const operationKey = "comment:issue-docs-scoped-replay:docs";
+
+    await store.enqueueOnce({
+      idempotencyKey: operationKey,
+      kind: "comment",
+      issueId: "issue-docs-scoped-replay",
+      projectContext: docsProjectContext,
+      runId: "run-docs-scoped-replay",
+      payload: { body: "Docs scoped replay", dedupeKey: "docs-scoped-replay" },
+    });
+
+    const record = await processor.enqueueAndProcess({
+      idempotencyKey: operationKey,
+      kind: "comment",
+      issueId: "issue-docs-scoped-replay",
+      projectContext: scopedDocsProjectContext,
+      runId: "run-docs-scoped-replay-requested-context",
+      payload: { body: "Docs scoped replay", dedupeKey: "docs-scoped-replay" },
+    });
+
+    expect(scopedDocsWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-docs-scoped-replay",
+        body: "Docs scoped replay",
+        dedupeKey: "docs-scoped-replay",
+      }),
+    ]);
+    expect(persistedDocsWriter.comments).toEqual([]);
+    expect(defaultWriter.comments).toEqual([]);
+    expect(record).toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.get(operationKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.list()).resolves.toHaveLength(1);
+  });
+
+  it("leaves sibling pending work untouched when enqueueAndProcess handles one scoped operation", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const docsWriter = new FakeWriter();
+    const symphonyWriter = new FakeWriter();
+    const docsProcessor = new WritebackProcessor(store, docsWriter, new StructuredLogger(() => undefined), 300_000);
+    const symphonyProcessor = new WritebackProcessor(store, symphonyWriter, new StructuredLogger(() => undefined), 300_000);
+    const docsKey = "comment:issue-docs-enqueue-scope:docs";
+    const symphonyKey = "comment:issue-symphony-enqueue-scope:symphony";
+
+    await store.enqueueOnce({
+      idempotencyKey: symphonyKey,
+      kind: "comment",
+      issueId: "issue-symphony-enqueue-scope",
+      projectContext: symphonyProjectContext,
+      runId: "run-symphony-enqueue-scope",
+      payload: { body: "Symphony sibling note", dedupeKey: "symphony-enqueue-scope" },
+    });
+
+    const docsRecord = await docsProcessor.enqueueAndProcess({
+      idempotencyKey: docsKey,
+      kind: "comment",
+      issueId: "issue-docs-enqueue-scope",
+      projectContext: docsProjectContext,
+      runId: "run-docs-enqueue-scope",
+      payload: { body: "Docs scoped note", dedupeKey: "docs-enqueue-scope" },
+    });
+
+    expect(docsWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-docs-enqueue-scope",
+        body: "Docs scoped note",
+        dedupeKey: "docs-enqueue-scope",
+      }),
+    ]);
+    expect(symphonyWriter.comments).toEqual([]);
+    expect(docsRecord).toMatchObject({ status: "succeeded", projectContext: docsProjectContext });
+    await expect(store.get(docsKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.get(symphonyKey, symphonyProjectContext)).resolves.toMatchObject({
+      status: "pending",
+      projectContext: symphonyProjectContext,
+    });
+
+    await symphonyProcessor.processDue({ projectContext: symphonyProjectContext });
+
+    expect(symphonyWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-symphony-enqueue-scope",
+        body: "Symphony sibling note",
+        dedupeKey: "symphony-enqueue-scope",
+      }),
+    ]);
+    await expect(store.get(symphonyKey, symphonyProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: symphonyProjectContext,
+    });
+  });
 
   it("enqueues idempotently and processes due operations", async () => {
     const store = new FileWritebackOutboxStore(root);
@@ -2151,6 +2329,119 @@ describe("FileWritebackOutboxStore", () => {
       issue: { id: "child-1", identifier: "TEST-2" },
     });
     expect(writer.issueCreates).toHaveLength(1);
+  });
+
+  it("uses the requested processDue project context for issue breakdown freshness lookups", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const config = testConfig(root);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const operationKey = "issue-create:issue-1:plan-1:0:hash";
+    const scopedDocsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Docs (renamed)",
+      linearProjectSlug: "DOCS-ALT",
+      routingSource: "state_refresh",
+    } as const;
+    const configContexts: Array<typeof scopedDocsProjectContext | undefined> = [];
+    const lookupRequests: Array<{ issueId: string; projectContext: typeof scopedDocsProjectContext | undefined }> = [];
+    const lifecycleStore = {
+      get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey], issue: parentIssue, config }),
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      {
+        getConfig: (projectContext) => {
+          configContexts.push(projectContext as typeof scopedDocsProjectContext | undefined);
+          return config;
+        },
+        resolveIssue: async (issueId, projectContext) => {
+          lookupRequests.push({
+            issueId,
+            projectContext: projectContext as typeof scopedDocsProjectContext | undefined,
+          });
+          return { status: "ok", issue: parentIssue };
+        },
+      },
+    );
+
+    await store.enqueueOnce({ ...issueCreateOperation(operationKey), projectContext: docsProjectContext });
+
+    await processor.processDue({ projectContext: scopedDocsProjectContext });
+
+    expect(configContexts).toEqual([scopedDocsProjectContext]);
+    expect(lookupRequests).toEqual([{ issueId: "issue-1", projectContext: scopedDocsProjectContext }]);
+    expect(writer.issueCreates).toHaveLength(1);
+    await expect(store.get(operationKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+  });
+
+  it("uses the requested enqueueAndProcess project context for issue breakdown freshness lookups during idempotent replays", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const config = testConfig(root);
+    const parentIssue = issue({ identifier: "ENG-1", labels: ["planning"], updatedAt: "2026-01-01T00:00:00.000Z" });
+    const operationKey = "issue-create:issue-1:plan-1:0:hash";
+    const scopedDocsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Docs (renamed)",
+      linearProjectSlug: "DOCS-ALT",
+      routingSource: "state_refresh",
+    } as const;
+    const configContexts: Array<typeof scopedDocsProjectContext | undefined> = [];
+    const lookupRequests: Array<{ issueId: string; projectContext: typeof scopedDocsProjectContext | undefined }> = [];
+    const lifecycleStore = {
+      get: async () => lifecycleWithIssueBreakdownPlan({ operationKeys: [operationKey], issue: parentIssue, config }),
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      {
+        getConfig: (projectContext) => {
+          configContexts.push(projectContext as typeof scopedDocsProjectContext | undefined);
+          return config;
+        },
+        resolveIssue: async (issueId, projectContext) => {
+          lookupRequests.push({
+            issueId,
+            projectContext: projectContext as typeof scopedDocsProjectContext | undefined,
+          });
+          return { status: "ok", issue: parentIssue };
+        },
+      },
+    );
+
+    await store.enqueueOnce({ ...issueCreateOperation(operationKey), projectContext: docsProjectContext });
+
+    const record = await processor.enqueueAndProcess({
+      ...issueCreateOperation(operationKey),
+      projectContext: scopedDocsProjectContext,
+      runId: "run-plan-1-renamed-context",
+    });
+
+    expect(configContexts).toEqual([scopedDocsProjectContext]);
+    expect(lookupRequests).toEqual([{ issueId: "issue-1", projectContext: scopedDocsProjectContext }]);
+    expect(writer.issueCreates).toHaveLength(1);
+    expect(record).toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.get(operationKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.list()).resolves.toHaveLength(1);
   });
 
   it("skips issue breakdown writebacks that are not registered on the current plan", async () => {
