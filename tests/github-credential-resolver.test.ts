@@ -3,8 +3,11 @@ import { parseServiceConfig } from "../src/core/config/Config.js";
 import { SymphonyError } from "../src/core/errors.js";
 import {
   createGitHubPullRequestClientForCapability,
+  createGitHubPullRequestClientForProjectContext,
   type GitHubCredentialCapability,
   resolveGitHubClientConfig,
+  resolveGitHubClientConfigForProjectContext,
+  resolveGitHubProjectContext,
 } from "../src/integrations/github/GitHubCredentialResolver.js";
 
 describe("GitHub credential resolver", () => {
@@ -342,6 +345,265 @@ describe("GitHub credential resolver", () => {
     });
   });
 
+  it("resolves context-specific GitHub settings for publication, review evidence, feedback, and merge capabilities", () => {
+    const { config, docsContext, contextEnv } = contextSpecificGitHubFixture();
+
+    // When project_contexts is configured, implicit resolution uses the registry default context.
+    expect(resolveGitHubProjectContext(config)).toMatchObject({
+      id: "docs",
+      label: "Documentation Site",
+      github: {
+        owner: "acme-docs",
+        repo: "docs-site",
+        headOwner: "docs-head-owner",
+        apiBaseUrl: "https://api.docs.github.test",
+      },
+    });
+    expect(resolveGitHubProjectContext(config, docsContext)).toMatchObject({
+      id: "docs",
+      label: "Documentation Site",
+      github: {
+        owner: "acme-docs",
+        repo: "docs-site",
+        headOwner: "docs-head-owner",
+        apiBaseUrl: "https://api.docs.github.test",
+      },
+    });
+    expect(resolveGitHubClientConfig(config, "github.publication")).toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      github: {
+        owner: "acme-docs",
+        repo: "docs-site",
+        headOwner: "docs-head-owner",
+        apiBaseUrl: "https://api.docs.github.test",
+        token: "docs-publication-token",
+      },
+      credential: { source: "profile", profileName: "publication", value: "docs-publication-token" },
+    });
+    expect(resolveGitHubClientConfigForProjectContext(config, "github.publication", docsContext)).toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      github: {
+        owner: "acme-docs",
+        repo: "docs-site",
+        headOwner: "docs-head-owner",
+        apiBaseUrl: "https://api.docs.github.test",
+        token: "docs-publication-token",
+      },
+      credential: { source: "profile", profileName: "publication", value: "docs-publication-token" },
+      projectContext: {
+        id: "docs",
+        label: "Documentation Site",
+      },
+    });
+    expect(resolveGitHubClientConfig(config, "github.review_evidence_read", { projectContext: docsContext, env: contextEnv })).toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      github: {
+        owner: "acme-docs",
+        repo: "docs-site",
+        headOwner: "docs-head-owner",
+        apiBaseUrl: "https://api.docs.github.test",
+        token: "docs-review-read-token",
+      },
+      credential: { source: "profile", profileName: "review-read", value: "docs-review-read-token" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.review_feedback_write", { projectContext: docsContext, env: contextEnv })).toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      github: {
+        owner: "acme-docs",
+        repo: "docs-site",
+        headOwner: "docs-head-owner",
+        apiBaseUrl: "https://api.docs.github.test",
+        token: "docs-feedback-token",
+      },
+      credential: { source: "profile", profileName: "feedback-write", value: "docs-feedback-token" },
+    });
+    expect(resolveGitHubClientConfig(config, "github.merge", { projectContext: docsContext, env: contextEnv })).toMatchObject({
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      github: {
+        owner: "acme-docs",
+        repo: "docs-site",
+        headOwner: "docs-head-owner",
+        apiBaseUrl: "https://api.docs.github.test",
+        token: "docs-merge-token",
+      },
+      credential: { source: "profile", profileName: "merge", value: "docs-merge-token" },
+    });
+  });
+
+  it("creates GitHub clients that call the resolved project-context repository for publication, review evidence, feedback, and merge", async () => {
+    const { config, docsContext } = contextSpecificGitHubFixture();
+
+    const publicationRequests: Array<{ host: string; path: string; authorization: string; method: string }> = [];
+    await createGitHubPullRequestClientForProjectContext(
+      config,
+      "github.publication",
+      docsContext,
+      async (input, init) => {
+        const url = new URL(String(input));
+        publicationRequests.push({
+          host: url.host,
+          path: url.pathname,
+          authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+          method: init?.method ?? "GET",
+        });
+        return new Response(JSON.stringify({}), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    ).checkRepositoryAccess();
+    expect(publicationRequests).toEqual([
+      {
+        host: "api.docs.github.test",
+        path: "/repos/acme-docs/docs-site",
+        authorization: "Bearer docs-publication-token",
+        method: "GET",
+      },
+    ]);
+
+    const reviewEvidenceRequests: Array<{ host: string; path: string; authorization: string; method: string; body: string | null }> = [];
+    await createGitHubPullRequestClientForProjectContext(
+      config,
+      "github.review_evidence_read",
+      docsContext,
+      async (input, init) => {
+        const url = new URL(String(input));
+        const body = typeof init?.body === "string" ? init.body : null;
+        reviewEvidenceRequests.push({
+          host: url.host,
+          path: url.pathname,
+          authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+          method: init?.method ?? "GET",
+          body,
+        });
+        if (url.pathname === "/graphql") {
+          return new Response(
+            JSON.stringify({
+              data: {
+                repository: {
+                  pullRequest: {
+                    reviewThreads: {
+                      pageInfo: { hasNextPage: false, endCursor: null },
+                      nodes: [],
+                    },
+                  },
+                },
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    ).listPullRequestReviewEvidence({ pullRequestNumber: 42 });
+    expect(reviewEvidenceRequests.map((request) => ({
+      host: request.host,
+      path: request.path,
+      authorization: request.authorization,
+      method: request.method,
+    }))).toEqual([
+      {
+        host: "api.docs.github.test",
+        path: "/repos/acme-docs/docs-site/pulls/42/reviews",
+        authorization: "Bearer docs-review-read-token",
+        method: "GET",
+      },
+      {
+        host: "api.docs.github.test",
+        path: "/repos/acme-docs/docs-site/pulls/42/comments",
+        authorization: "Bearer docs-review-read-token",
+        method: "GET",
+      },
+      {
+        host: "api.docs.github.test",
+        path: "/repos/acme-docs/docs-site/issues/42/comments",
+        authorization: "Bearer docs-review-read-token",
+        method: "GET",
+      },
+      {
+        host: "api.docs.github.test",
+        path: "/graphql",
+        authorization: "Bearer docs-review-read-token",
+        method: "POST",
+      },
+    ]);
+    expect(reviewEvidenceRequests[3]?.body).toContain('"owner":"acme-docs"');
+    expect(reviewEvidenceRequests[3]?.body).toContain('"repo":"docs-site"');
+
+    const reviewFeedbackRequests: Array<{ host: string; path: string; authorization: string; method: string }> = [];
+    await createGitHubPullRequestClientForProjectContext(
+      config,
+      "github.review_feedback_write",
+      docsContext,
+      async (input, init) => {
+        const url = new URL(String(input));
+        reviewFeedbackRequests.push({
+          host: url.host,
+          path: url.pathname,
+          authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+          method: init?.method ?? "GET",
+        });
+        return new Response(JSON.stringify({ html_url: "https://github.com/acme-docs/docs-site/pull/42#pullrequestreview-1", comments: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    ).submitPullRequestReviewFeedback({
+      pullRequestNumber: 42,
+      headSha: "head-sha-1",
+      event: "COMMENT",
+      body: "Looks good.",
+    });
+    expect(reviewFeedbackRequests).toEqual([
+      {
+        host: "api.docs.github.test",
+        path: "/repos/acme-docs/docs-site/pulls/42/reviews",
+        authorization: "Bearer docs-feedback-token",
+        method: "POST",
+      },
+    ]);
+
+    const mergeRequests: Array<{ host: string; path: string; authorization: string; method: string }> = [];
+    await createGitHubPullRequestClientForProjectContext(
+      config,
+      "github.merge",
+      docsContext,
+      async (input, init) => {
+        const url = new URL(String(input));
+        mergeRequests.push({
+          host: url.host,
+          path: url.pathname,
+          authorization: String((init?.headers as Record<string, string> | undefined)?.authorization),
+          method: init?.method ?? "GET",
+        });
+        return new Response(
+          JSON.stringify({
+            number: 42,
+            html_url: "https://github.com/acme-docs/docs-site/pull/42",
+            state: "open",
+            draft: false,
+            mergeable: true,
+            mergeable_state: "clean",
+            merged: false,
+            base: { ref: "main", sha: "base-sha-1" },
+            head: { ref: "docs/TEST-1", sha: "head-sha-1", repo: { pushed_at: "2026-01-01T00:00:01Z" } },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    ).getPullRequest({ pullRequestNumber: 42 });
+    expect(mergeRequests).toEqual([
+      {
+        host: "api.docs.github.test",
+        path: "/repos/acme-docs/docs-site/pulls/42",
+        authorization: "Bearer docs-merge-token",
+        method: "GET",
+      },
+    ]);
+  });
+
   it("rejects wrong-role-only GitHub assignments before legacy fallback", () => {
     for (const capability of githubCapabilities()) {
       const owner = expectedRole(capability);
@@ -375,6 +637,87 @@ describe("GitHub credential resolver", () => {
     }
   });
 });
+
+function contextSpecificGitHubFixture() {
+  const contextEnv = {
+    LINEAR_API_KEY: "linear-secret",
+    GLOBAL_GITHUB_PUBLICATION_TOKEN: "global-publication-token",
+    GLOBAL_GITHUB_REVIEW_READ_TOKEN: "global-review-read-token",
+    GLOBAL_GITHUB_FEEDBACK_TOKEN: "global-feedback-token",
+    GLOBAL_GITHUB_MERGE_TOKEN: "global-merge-token",
+    DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-token",
+    DOCS_GITHUB_REVIEW_READ_TOKEN: "docs-review-read-token",
+    DOCS_GITHUB_FEEDBACK_TOKEN: "docs-feedback-token",
+    DOCS_GITHUB_MERGE_TOKEN: "docs-merge-token",
+  };
+
+  const config = parseServiceConfig(
+    {
+      tracker: { kind: "linear", api_key: "$LINEAR_API_KEY", project_slug: "TEST" },
+      workspace: { root: "/repo/workspaces", state_dir: "/repo/state" },
+      github: {
+        owner: "acme",
+        repo: "symphony",
+        token: "legacy-github-token",
+        api_base_url: "https://api.github.test",
+      },
+      credential_profiles: {
+        profiles: {
+          publication: { value: "$GLOBAL_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+          "review-read": { value: "$GLOBAL_GITHUB_REVIEW_READ_TOKEN", capabilities: ["github.review_evidence_read"] },
+          "feedback-write": {
+            value: "$GLOBAL_GITHUB_FEEDBACK_TOKEN",
+            capabilities: ["github.review_feedback_write"],
+          },
+          merge: { value: "$GLOBAL_GITHUB_MERGE_TOKEN", capabilities: ["github.merge"] },
+        },
+        roles: {
+          reviewer: {
+            "github.review_evidence_read": "review-read",
+            "github.review_feedback_write": "feedback-write",
+          },
+          service: {
+            "github.publication": "publication",
+            "github.merge": "merge",
+          },
+        },
+      },
+      project_contexts: [
+        {
+          id: "docs",
+          label: "Documentation Site",
+          tracker: { project_slug: "DOCS" },
+          workspace: { source: { kind: "git", repository: "../docs-site" } },
+          github: {
+            owner: "acme-docs",
+            repo: "docs-site",
+            head_owner: "docs-head-owner",
+            api_base_url: "https://api.docs.github.test",
+          },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN" },
+              "review-read": { value: "$DOCS_GITHUB_REVIEW_READ_TOKEN" },
+              "feedback-write": { value: "$DOCS_GITHUB_FEEDBACK_TOKEN" },
+              merge: { value: "$DOCS_GITHUB_MERGE_TOKEN" },
+            },
+          },
+        },
+      ],
+    },
+    "/repo/WORKFLOW.md",
+    contextEnv,
+  );
+
+  const docsContext = {
+    projectContextId: "docs",
+    projectContextLabel: "Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "test",
+  } as const;
+
+  return { config, docsContext, contextEnv };
+}
 
 function githubCapabilities(): GitHubCredentialCapability[] {
   return [
