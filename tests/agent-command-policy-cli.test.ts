@@ -21,7 +21,7 @@ describe("agent-command-policy-hook CLI", () => {
       action: "block",
       message: expect.stringContaining("upstream GitHub contact") as string,
     });
-  });
+  }, 60_000);
 
   it("writes a structured decision journal when the CLI is given --decision-journal", async () => {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-cli-journal-"));

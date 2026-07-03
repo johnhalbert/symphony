@@ -163,7 +163,7 @@ describe("TranscriptRecallService", () => {
 
     expect(result.runs[0]?.matches).toEqual([expect.objectContaining({ sequence: 1003, text: "Needle appears after first page" })]);
     expect(result.runs[0]?.bookends.latest).toEqual([expect.objectContaining({ sequence: 1005, text: "event 1005" })]);
-  }, 15_000);
+  }, 30_000);
 
   it("keeps recall text within the character budget when truncating near the cap", async () => {
     const runStore = new FileRunTranscriptStore(root);

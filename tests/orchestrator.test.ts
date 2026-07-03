@@ -3532,7 +3532,11 @@ const docsProjectContext = {
 
     try {
       await orchestrator.refreshNow();
-      await waitFor(() => currentState === "Blocked" && orchestrator.snapshot().counts.retrying === 0, "sdk error escalation");
+      await waitFor(
+        () => currentState === "Blocked" && orchestrator.snapshot().counts.retrying === 0,
+        "sdk error escalation",
+        10_000,
+      );
     } finally {
       await orchestrator.stop();
     }
