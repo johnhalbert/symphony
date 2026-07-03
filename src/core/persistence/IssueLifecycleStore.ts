@@ -5,6 +5,7 @@ import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
   normalizeProjectContextResolution,
   projectContextResolutionFromIssue,
+  type ProjectContextRoutingProblemReason,
   type ProjectContextResolution,
 } from "../config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../errors.js";
@@ -56,6 +57,17 @@ export interface IssueLifecycleSummaryReference {
   configFingerprint?: string | null;
   cursorMode?: string | null;
   createdAt: string;
+}
+
+export type IssueLifecycleEventKind = "worker_dispatch_routing_failure";
+
+export interface IssueLifecycleEvent {
+  kind: IssueLifecycleEventKind;
+  recordedAt: string;
+  redacted: true;
+  reason: ProjectContextRoutingProblemReason;
+  safeMessage: string;
+  candidateContextIds: string[];
 }
 
 export interface ProposedIssueRecord {
@@ -410,6 +422,7 @@ export interface IssueLifecycleRecord {
   lastCompletionReportId: string | null;
   lastReviewVerdictId: string | null;
   blockedReason: string | null;
+  events: IssueLifecycleEvent[];
   summaryPointers: IssueLifecycleSummaryPointers;
   summaryReferences: IssueLifecycleSummaryReference[];
   issueBreakdownPlans: IssueBreakdownPlanRecord[];
@@ -439,6 +452,7 @@ export interface IssueLifecyclePatch {
   lastCompletionReportId?: string | null;
   lastReviewVerdictId?: string | null;
   blockedReason?: string | null;
+  events?: IssueLifecycleEvent[];
   summaryPointers?: Partial<IssueLifecycleSummaryPointers>;
   summaryReferences?: IssueLifecycleSummaryReference[];
   issueBreakdownPlans?: IssueBreakdownPlanRecord[];
@@ -497,6 +511,7 @@ export class FileIssueLifecycleStore {
       lastCompletionReportId: patchValue(patch, "lastCompletionReportId", existing?.lastCompletionReportId ?? null),
       lastReviewVerdictId: patchValue(patch, "lastReviewVerdictId", existing?.lastReviewVerdictId ?? null),
       blockedReason: patchValue(patch, "blockedReason", existing?.blockedReason ?? null),
+      events: patch.events ?? existing?.events ?? [],
       summaryPointers: {
         ...defaultSummaryPointers(),
         ...existing?.summaryPointers,
@@ -1037,6 +1052,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     lastCompletionReportId: nullableString(value.lastCompletionReportId, filePath, "lastCompletionReportId"),
     lastReviewVerdictId: nullableString(value.lastReviewVerdictId, filePath, "lastReviewVerdictId"),
     blockedReason: nullableString(value.blockedReason, filePath, "blockedReason"),
+    events: normalizeLifecycleEvents(value.events, filePath),
     summaryPointers: normalizeSummaryPointers(value.summaryPointers, filePath, projectContext),
     summaryReferences: normalizeSummaryReferences(value.summaryReferences, filePath),
     issueBreakdownPlans: normalizeIssueBreakdownPlans(value.issueBreakdownPlans, filePath, projectContext),
@@ -1096,6 +1112,45 @@ function normalizeSummaryReferences(value: unknown, filePath: string): IssueLife
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "summaryReferences is invalid");
   return value.map((item, index) => normalizeSummaryReference(item, filePath, index));
+}
+
+function normalizeLifecycleEvents(value: unknown, filePath: string): IssueLifecycleEvent[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "events is invalid");
+  return value.map((item, index) => normalizeLifecycleEvent(item, filePath, index));
+}
+
+function normalizeLifecycleEvent(value: unknown, filePath: string, index: number): IssueLifecycleEvent {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `events[${index}] is invalid`);
+  if (value.kind !== "worker_dispatch_routing_failure") {
+    throw corruptLifecycle(filePath, `events[${index}].kind is invalid`);
+  }
+  if (value.redacted !== true) {
+    throw corruptLifecycle(filePath, `events[${index}].redacted must be true`);
+  }
+  const reason = requiredString(value.reason, filePath, `events[${index}].reason`);
+  if (!isProjectContextRoutingProblemReason(reason)) {
+    throw corruptLifecycle(filePath, `events[${index}].reason is invalid`);
+  }
+  return {
+    kind: value.kind,
+    recordedAt: requiredString(value.recordedAt, filePath, `events[${index}].recordedAt`),
+    redacted: true,
+    reason,
+    safeMessage: requiredString(value.safeMessage, filePath, `events[${index}].safeMessage`),
+    candidateContextIds: requiredStringArray(value.candidateContextIds, filePath, `events[${index}].candidateContextIds`),
+  };
+}
+
+function isProjectContextRoutingProblemReason(value: string): value is ProjectContextRoutingProblemReason {
+  return (
+    value === "missing_context" ||
+    value === "ambiguous_context" ||
+    value === "disabled_context" ||
+    value === "credential_unavailable" ||
+    value === "codebase_unavailable" ||
+    value === "stale_context"
+  );
 }
 
 function normalizeSummaryReference(value: unknown, filePath: string, index: number): IssueLifecycleSummaryReference {

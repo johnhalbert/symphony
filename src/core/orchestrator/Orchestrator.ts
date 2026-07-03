@@ -8,6 +8,7 @@ import {
   normalizeProjectContextId,
   projectContextResolutionFromIssue,
   resolveProjectContextForIssue,
+  type ProjectContextRoutingProblem,
   type ProjectContextResolution,
 } from "../config/ProjectContexts.js";
 import { resolveServiceConfigForProjectContext } from "../config/ProjectContextServiceConfig.js";
@@ -89,6 +90,7 @@ import {
   buildWorkerHandoffPacket,
   phaseForIssueState,
   type IssueCompletionReportRecord,
+  type IssueLifecycleEvent,
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
   type IssueLifecycleSummaryReference,
@@ -1311,6 +1313,71 @@ export class Orchestrator {
     return routedProjectSlug !== null && projectContextSlug !== null && sameProjectSlug(routedProjectSlug, projectContextSlug);
   }
 
+  private async workerDispatchRoutingProblem(
+    issue: Issue,
+    requestedProjectContext?: ProjectContextResolution,
+  ): Promise<ProjectContextRoutingProblem | null> {
+    const usesConfiguredRouting =
+      !this.isMergeConflictState(issue.state) && this.config.projectContexts.contexts.some((context) => context.source === "explicit");
+    if (!usesConfiguredRouting) return null;
+    const lifecycle = this.options.lifecycleStore ? await this.options.lifecycleStore.get(issue.id) : null;
+    const persistedProjectContext = lifecycle && this.shouldPreserveLifecycleProjectContext(lifecycle)
+      ? lifecycle.projectContext
+      : undefined;
+    const persistedContextForRouting = this.issueHasTrackerRoutingProofForProjectContext(issue, requestedProjectContext)
+      ? undefined
+      : persistedProjectContext;
+    const routing = resolveProjectContextForIssue(
+      issue,
+      this.config.projectContexts,
+      persistedContextForRouting === undefined ? {} : { persistedContext: persistedContextForRouting },
+    );
+    return routing.kind === "problem" ? routing.problem : null;
+  }
+
+  private buildWorkerDispatchRoutingFailureEvent(problem: ProjectContextRoutingProblem): IssueLifecycleEvent {
+    return {
+      kind: "worker_dispatch_routing_failure",
+      recordedAt: new Date().toISOString(),
+      redacted: true,
+      reason: problem.reason,
+      safeMessage: problem.safeMessage,
+      candidateContextIds: [...new Set(problem.candidateContextIds)].sort(),
+    };
+  }
+
+  private sameWorkerDispatchRoutingFailure(
+    left: IssueLifecycleEvent | undefined,
+    right: IssueLifecycleEvent,
+  ): boolean {
+    if (!left) return false;
+    return (
+      left.kind === right.kind &&
+      left.redacted === right.redacted &&
+      left.reason === right.reason &&
+      left.safeMessage === right.safeMessage &&
+      left.candidateContextIds.length === right.candidateContextIds.length &&
+      left.candidateContextIds.every((candidateContextId, index) => candidateContextId === right.candidateContextIds[index])
+    );
+  }
+
+  private async recordWorkerDispatchRoutingFailure(issue: Issue, problem: ProjectContextRoutingProblem): Promise<void> {
+    const store = this.options.lifecycleStore;
+    if (!store) return;
+    const lifecycle = await store.get(issue.id);
+    const nextEvent = this.buildWorkerDispatchRoutingFailureEvent(problem);
+    const existingEvents = lifecycle?.events ?? [];
+    const lastEvent = existingEvents[existingEvents.length - 1];
+    if (this.sameWorkerDispatchRoutingFailure(lastEvent, nextEvent)) {
+      return;
+    }
+    await store.updateIssue(issue, {
+      phase: lifecycle?.phase ?? "unknown",
+      ...(lifecycle?.projectContext === undefined ? {} : { projectContext: lifecycle.projectContext }),
+      events: [...existingEvents.slice(-19), nextEvent],
+    });
+  }
+
   private issueMatchesRequestedProjectContext(
     issue: Issue,
     requestedProjectContext?: ProjectContextResolution,
@@ -2022,6 +2089,18 @@ export class Orchestrator {
     if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase)) return false;
 
     const requestedProjectContext = this.requestedProjectContextForIssue(issue);
+    const initialRoutingProblem = await this.workerDispatchRoutingProblem(issue, requestedProjectContext);
+    if (initialRoutingProblem) {
+      await this.recordWorkerDispatchRoutingFailure(issue, initialRoutingProblem);
+      this.options.logger.warn("worker dispatch skipped due to project context routing failure", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        reason: initialRoutingProblem.reason,
+        candidate_context_ids: initialRoutingProblem.candidateContextIds,
+        safe_message: initialRoutingProblem.safeMessage,
+      });
+      return false;
+    }
     let refreshed: Issue[];
     try {
       refreshed = await this.fetchIssueStatesByIdsForProjectContext([issue.id], requestedProjectContext);
@@ -2041,6 +2120,18 @@ export class Orchestrator {
     const latestRunPhase = this.isMergeConflictState(latest.state) ? "merge_conflict_resolution" : "implementation";
     if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase)) return false;
     const latestProjectContext = this.requestedProjectContextForIssue(latest, requestedProjectContext);
+    const latestRoutingProblem = await this.workerDispatchRoutingProblem(latest, latestProjectContext);
+    if (latestRoutingProblem) {
+      await this.recordWorkerDispatchRoutingFailure(latest, latestRoutingProblem);
+      this.options.logger.warn("worker dispatch skipped due to project context routing failure", {
+        issue_id: latest.id,
+        issue_identifier: latest.identifier,
+        reason: latestRoutingProblem.reason,
+        candidate_context_ids: latestRoutingProblem.candidateContextIds,
+        safe_message: latestRoutingProblem.safeMessage,
+      });
+      return false;
+    }
 
     const decision = await this.resolveWorkerDispatchDecision(latest);
     if (decision.action === "skip") {
