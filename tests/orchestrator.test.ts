@@ -99,6 +99,13 @@ const legacyDefaultProjectContext = {
   routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
 } as const;
 
+const symphonyProjectContext = {
+  projectContextId: "symphony",
+  projectContextLabel: "Symphony",
+  linearProjectSlug: "TEST",
+  routingSource: "candidate_poll",
+} as const;
+
 
 function addDocsPollingProjectContext(config: ReturnType<typeof testConfig>): void {
   if (config.projectContexts.byId.has(docsProjectContext.projectContextId)) return;
@@ -150,6 +157,56 @@ function addDocsPollingProjectContext(config: ReturnType<typeof testConfig>): vo
   (config.projectContexts.byId as unknown as Map<string, typeof docsContext>).set(docsContext.id, docsContext);
 }
 
+function addSymphonyPollingProjectContext(config: ReturnType<typeof testConfig>): void {
+  if (config.projectContexts.byId.has(symphonyProjectContext.projectContextId)) return;
+
+  const defaultContext = config.projectContexts.defaultContext;
+  const symphonyContext = {
+    ...defaultContext,
+    id: symphonyProjectContext.projectContextId,
+    label: symphonyProjectContext.projectContextLabel,
+    source: "explicit" as const,
+    tracker: {
+      ...defaultContext.tracker,
+      projectSlug: symphonyProjectContext.linearProjectSlug,
+    },
+    reviewLoop: {
+      ...config.reviewLoop,
+    },
+    issueBreakdown: {
+      ...config.issueBreakdown,
+    },
+    agent: {
+      ...config.agent,
+    },
+    publicMetadata: {
+      ...defaultContext.publicMetadata,
+      id: symphonyProjectContext.projectContextId,
+      label: symphonyProjectContext.projectContextLabel,
+      linearProjectSlug: symphonyProjectContext.linearProjectSlug,
+    },
+    publicSummary: {
+      ...defaultContext.publicSummary,
+      id: symphonyProjectContext.projectContextId,
+      label: symphonyProjectContext.projectContextLabel,
+      tracker: {
+        ...defaultContext.publicSummary.tracker,
+        projectSlug: symphonyProjectContext.linearProjectSlug,
+      },
+      publicMetadata: {
+        ...defaultContext.publicSummary.publicMetadata,
+        id: symphonyProjectContext.projectContextId,
+        label: symphonyProjectContext.projectContextLabel,
+        linearProjectSlug: symphonyProjectContext.linearProjectSlug,
+      },
+    },
+  };
+
+  config.projectContexts.contexts = [...config.projectContexts.contexts, symphonyContext];
+  config.projectContexts.enabledContexts = [...config.projectContexts.enabledContexts, symphonyContext];
+  (config.projectContexts.byId as unknown as Map<string, typeof symphonyContext>).set(symphonyContext.id, symphonyContext);
+}
+
 function requireDocsPollingContext(config: ReturnType<typeof testConfig>) {
   const docsContext = config.projectContexts.byId.get(docsProjectContext.projectContextId);
   expect(docsContext).toBeDefined();
@@ -159,20 +216,6 @@ function requireDocsPollingContext(config: ReturnType<typeof testConfig>) {
 
 describe("Orchestrator", () => {
   let root: string;
-
-const symphonyProjectContext = {
-  projectContextId: "symphony",
-  projectContextLabel: "Symphony",
-  linearProjectSlug: "TEST",
-  routingSource: "candidate_poll",
-} as const;
-
-const docsProjectContext = {
-  projectContextId: "docs",
-  projectContextLabel: "Documentation Site",
-  linearProjectSlug: "DOCS",
-  routingSource: "candidate_poll",
-} as const;
 
 
   beforeEach(async () => {
@@ -3080,6 +3123,204 @@ const docsProjectContext = {
         workspacePath: path.join(config.workspace.root, docsWorkspaceKey),
       },
     });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("records routing failures before skipping worker dispatch without workspace or Linear mutation for ambiguous project contexts", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["Human Review"];
+    addSymphonyPollingProjectContext(config);
+    const candidate = {
+      ...issue({
+        id: "issue-routing-ambiguous-1",
+        identifier: "ENG-409-A",
+        state: "Todo",
+        labels: ["dogfood-ready"],
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: legacyDefaultProjectContext.linearProjectSlug,
+        id: "linear-project-ambiguous-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const defaultTracker: TrackerClient & { candidateFetchCount: number; requestedIds: string[][] } = {
+      candidateFetchCount: 0,
+      requestedIds: [],
+      async fetchCandidateIssues() {
+        defaultTracker.candidateFetchCount += 1;
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        defaultTracker.requestedIds.push([...issueIds]);
+        return issueIds.includes(candidate.id) ? [candidate] : [];
+      },
+    };
+    const symphonyTracker: TrackerClient & { candidateFetchCount: number; requestedIds: string[][] } = {
+      candidateFetchCount: 0,
+      requestedIds: [],
+      async fetchCandidateIssues() {
+        symphonyTracker.candidateFetchCount += 1;
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        symphonyTracker.requestedIds.push([...issueIds]);
+        return [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter(() => undefined);
+    const stateDir = path.join(root, "state");
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 300_000);
+    const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === symphonyProjectContext.projectContextId ? symphonyTracker : defaultTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await orchestrator.refreshNow();
+    } finally {
+      await orchestrator.stop();
+      await settleOrchestratorExit();
+    }
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(defaultTracker.candidateFetchCount).toBeGreaterThanOrEqual(2);
+    expect(symphonyTracker.candidateFetchCount).toBeGreaterThanOrEqual(2);
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(symphonyTracker.requestedIds).toEqual([]);
+    expect(harness.runs).toHaveLength(0);
+    await expect(runStore.listRuns()).resolves.toEqual([]);
+    await expect(runStore.listWorkspaces()).resolves.toEqual([]);
+    expect(writer.transitions).toEqual([]);
+    expect(writer.comments).toEqual([]);
+    expect(lifecycle).toMatchObject({
+      phase: "blocked",
+      blockedReason: expect.stringContaining("matched multiple enabled project contexts"),
+      events: [
+        {
+          kind: "worker_dispatch_routing_failure",
+          redacted: true,
+          reason: "ambiguous_context",
+          candidateContextIds: [LEGACY_DEFAULT_PROJECT_CONTEXT_ID, symphonyProjectContext.projectContextId],
+        },
+      ],
+    });
+    expect(lifecycle?.events[0]?.safeMessage).toContain("matched multiple enabled project contexts");
+    expect(lifecycle?.events).toHaveLength(1);
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("records routing failures before skipping worker dispatch without workspace or Linear mutation for missing project contexts", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["Human Review"];
+    addDocsPollingProjectContext(config);
+    const candidate = {
+      ...issue({
+        id: "issue-routing-missing-1",
+        identifier: "ENG-409-B",
+        state: "Todo",
+        labels: ["dogfood-ready"],
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: "MISSING",
+        id: "linear-project-missing-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const defaultTracker: TrackerClient & { candidateFetchCount: number; requestedIds: string[][] } = {
+      candidateFetchCount: 0,
+      requestedIds: [],
+      async fetchCandidateIssues() {
+        defaultTracker.candidateFetchCount += 1;
+        return [candidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        defaultTracker.requestedIds.push([...issueIds]);
+        return issueIds.includes(candidate.id) ? [candidate] : [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const writer = new StateChangingWriter(() => undefined);
+    const stateDir = path.join(root, "state");
+    const writeback = new WritebackProcessor(new FileWritebackOutboxStore(stateDir), writer, logger, 300_000);
+    const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      writeback,
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await orchestrator.refreshNow();
+    } finally {
+      await orchestrator.stop();
+      await settleOrchestratorExit();
+    }
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(defaultTracker.candidateFetchCount).toBeGreaterThanOrEqual(2);
+    expect(defaultTracker.requestedIds).toEqual([]);
+    expect(harness.runs).toHaveLength(0);
+    await expect(runStore.listRuns()).resolves.toEqual([]);
+    await expect(runStore.listWorkspaces()).resolves.toEqual([]);
+    expect(writer.transitions).toEqual([]);
+    expect(writer.comments).toEqual([]);
+    expect(lifecycle).toMatchObject({
+      phase: "blocked",
+      blockedReason: expect.stringContaining("did not match any enabled project context"),
+      events: [
+        {
+          kind: "worker_dispatch_routing_failure",
+          redacted: true,
+          reason: "missing_context",
+          candidateContextIds: [],
+        },
+      ],
+    });
+    expect(lifecycle?.events[0]?.safeMessage).toContain("did not match any enabled project context");
+    expect(lifecycle?.events).toHaveLength(1);
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 

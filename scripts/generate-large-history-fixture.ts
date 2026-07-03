@@ -1034,6 +1034,7 @@ function buildLifecycleRecord(input: {
     lastCompletionReportId: completionReports.at(-1)?.id ?? null,
     lastReviewVerdictId: reviewVerdicts.at(-1)?.id ?? null,
     blockedReason: phase === "blocked" ? (isPendingFixturePublicationApproval(input.issueIndex) ? PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON : "Synthetic large-history fixture blocker") : null,
+    events: [],
     summaryPointers,
     summaryReferences: [
       {

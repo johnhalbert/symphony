@@ -441,7 +441,7 @@ function lifecycle(
     summaryPointers?: Partial<IssueLifecycleRecord["summaryPointers"]>;
   } = {},
 ): IssueLifecycleRecord {
-  const { summaryPointers: summaryPointerOverrides, ...recordOverrides } = overrides;
+  const { summaryPointers: summaryPointerOverrides, events: eventOverrides, ...recordOverrides } = overrides;
   return {
     issueId: "issue-1",
     issueIdentifier: "TEST-1",
@@ -456,6 +456,7 @@ function lifecycle(
     lastCompletionReportId: null,
     lastReviewVerdictId: null,
     blockedReason: null,
+    events: eventOverrides ?? [],
     summaryPointers: {
       workspaceKey: null,
       workspacePath: null,
