@@ -1640,6 +1640,66 @@ describe("FileWritebackOutboxStore", () => {
     await expect(store.list()).resolves.toHaveLength(1);
   });
 
+  it("leaves sibling pending work untouched when enqueueAndProcess handles one scoped operation", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const docsWriter = new FakeWriter();
+    const symphonyWriter = new FakeWriter();
+    const docsProcessor = new WritebackProcessor(store, docsWriter, new StructuredLogger(() => undefined), 300_000);
+    const symphonyProcessor = new WritebackProcessor(store, symphonyWriter, new StructuredLogger(() => undefined), 300_000);
+    const docsKey = "comment:issue-docs-enqueue-scope:docs";
+    const symphonyKey = "comment:issue-symphony-enqueue-scope:symphony";
+
+    await store.enqueueOnce({
+      idempotencyKey: symphonyKey,
+      kind: "comment",
+      issueId: "issue-symphony-enqueue-scope",
+      projectContext: symphonyProjectContext,
+      runId: "run-symphony-enqueue-scope",
+      payload: { body: "Symphony sibling note", dedupeKey: "symphony-enqueue-scope" },
+    });
+
+    const docsRecord = await docsProcessor.enqueueAndProcess({
+      idempotencyKey: docsKey,
+      kind: "comment",
+      issueId: "issue-docs-enqueue-scope",
+      projectContext: docsProjectContext,
+      runId: "run-docs-enqueue-scope",
+      payload: { body: "Docs scoped note", dedupeKey: "docs-enqueue-scope" },
+    });
+
+    expect(docsWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-docs-enqueue-scope",
+        body: "Docs scoped note",
+        dedupeKey: "docs-enqueue-scope",
+      }),
+    ]);
+    expect(symphonyWriter.comments).toEqual([]);
+    expect(docsRecord).toMatchObject({ status: "succeeded", projectContext: docsProjectContext });
+    await expect(store.get(docsKey, docsProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: docsProjectContext,
+    });
+    await expect(store.get(symphonyKey, symphonyProjectContext)).resolves.toMatchObject({
+      status: "pending",
+      projectContext: symphonyProjectContext,
+    });
+
+    await symphonyProcessor.processDue({ projectContext: symphonyProjectContext });
+
+    expect(symphonyWriter.comments).toEqual([
+      expect.objectContaining({
+        issueId: "issue-symphony-enqueue-scope",
+        body: "Symphony sibling note",
+        dedupeKey: "symphony-enqueue-scope",
+      }),
+    ]);
+    await expect(store.get(symphonyKey, symphonyProjectContext)).resolves.toMatchObject({
+      status: "succeeded",
+      projectContext: symphonyProjectContext,
+    });
+  });
+
   it("enqueues idempotently and processes due operations", async () => {
     const store = new FileWritebackOutboxStore(root);
     const writer = new FakeWriter();
