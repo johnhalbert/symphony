@@ -84,7 +84,7 @@ import {
   type RuntimeProviderGate,
 } from "../provider/ProviderLimits.js";
 import { mapAgentEventToRunActivityEvent } from "../transcript/RunActivityEventMapper.js";
-import { sanitizeAgentEventForPublicOutput } from "../transcript/TranscriptProjection.js";
+import { sanitizeAgentEventForPublicOutput, sanitizedPreviewValue } from "../transcript/TranscriptProjection.js";
 import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
   buildWorkerHandoffPacket,
@@ -1172,13 +1172,44 @@ export class Orchestrator {
     return (await tracker.fetchIssueStatesByIds([...issueIds])).map((issue) => this.issueWithRequestedProjectContext(issue, projectContext));
   }
 
-  private async fetchPollingIssues(read: (projectContext?: ProjectContextResolution) => Promise<Issue[]>): Promise<Issue[]> {
+  private projectContextPollingFailureMessage(error: unknown): string {
+    if (error instanceof SymphonyError && error.code === "config_validation_error") {
+      return "project-context tracker credentials unavailable";
+    }
+    return sanitizedPreviewValue(errorMessage(error)).preview ?? "unknown project-context polling failure";
+  }
+
+  private reportProjectContextPollingFailure(
+    projectContext: ProjectContextResolution | undefined,
+    operation: string,
+    error: unknown,
+  ): void {
+    this.options.logger.warn("project-context polling failed", {
+      operation,
+      projectContextId: projectContext?.projectContextId ?? null,
+      projectContextLabel: projectContext?.projectContextLabel ?? null,
+      errorCode: error instanceof SymphonyError ? error.code : null,
+      error: this.projectContextPollingFailureMessage(error),
+    });
+  }
+
+  private async fetchPollingIssues(
+    read: (projectContext?: ProjectContextResolution) => Promise<Issue[]>,
+    operation = "polling",
+  ): Promise<Issue[]> {
     const { projectContexts, inProgressIssueContexts, stickyIssueIds } = await this.pollingDispatchState();
     if (projectContexts.length === 0) return [];
 
     const issues = new Map<string, Issue>();
     for (const projectContext of projectContexts) {
-      for (const issue of await read(projectContext)) {
+      let projectContextIssues: Issue[];
+      try {
+        projectContextIssues = await read(projectContext);
+      } catch (error) {
+        this.reportProjectContextPollingFailure(projectContext, operation, error);
+        continue;
+      }
+      for (const issue of projectContextIssues) {
         const persistedProjectContext = inProgressIssueContexts.get(issue.id);
         const requestedProjectContext = this.requestedProjectContextForIssue(issue, projectContext);
         const shouldForcePersistedProjectContext = persistedProjectContext !== undefined && stickyIssueIds.has(issue.id);
@@ -1726,18 +1757,21 @@ export class Orchestrator {
         return;
       }
       await this.recoverPendingPublicationApprovalHandoffs();
-      const workerCandidates = await this.fetchPollingIssues((projectContext) =>
-        this.fetchCandidateIssuesForProjectContext(projectContext),
+      const workerCandidates = await this.fetchPollingIssues(
+        (projectContext) => this.fetchCandidateIssuesForProjectContext(projectContext),
+        "candidate_issue_polling",
       );
       for (const issue of sortIssuesForDispatch(workerCandidates)) {
         if (this.availableSlots() <= 0) break;
         await this.tryDispatchWorkerIssue(issue, null);
       }
-      const reviewerCandidates = await this.fetchPollingIssues((projectContext) =>
-        this.fetchIssuesByStatesForProjectContext(
-          this.configForProjectContext(projectContext).reviewLoop.reviewStates,
-          projectContext,
-        ),
+      const reviewerCandidates = await this.fetchPollingIssues(
+        (projectContext) =>
+          this.fetchIssuesByStatesForProjectContext(
+            this.configForProjectContext(projectContext).reviewLoop.reviewStates,
+            projectContext,
+          ),
+        "review_state_polling",
       );
       for (const issue of sortIssuesForDispatch(reviewerCandidates)) {
         if (this.availableSlots() <= 0) break;
@@ -1777,8 +1811,10 @@ export class Orchestrator {
 
   private async startupCleanup(): Promise<void> {
     try {
-      const terminalIssues = await this.fetchPollingIssues((projectContext) =>
-        this.fetchIssuesByStatesForProjectContext(this.configForProjectContext(projectContext).tracker.terminalStates, projectContext),
+      const terminalIssues = await this.fetchPollingIssues(
+        (projectContext) =>
+          this.fetchIssuesByStatesForProjectContext(this.configForProjectContext(projectContext).tracker.terminalStates, projectContext),
+        "startup_terminal_state_polling",
       );
       for (const issue of terminalIssues) {
         await this.options.workspaceManager.removeForIssue(issue);
@@ -3905,15 +3941,18 @@ export class Orchestrator {
   private async reconcileMergePolicyIssues(): Promise<void> {
     let candidates: Issue[];
     try {
-      candidates = await this.fetchPollingIssues((projectContext) => {
-        const config = this.configForProjectContext(projectContext);
-        if (config.mergePolicy.mode !== "gated" || config.mergePolicy.sourceStates.length === 0) return Promise.resolve([]);
-        const states = [
-          ...config.mergePolicy.sourceStates,
-          ...(config.mergePolicy.conflictsState === null ? [] : [config.mergePolicy.conflictsState]),
-        ];
-        return this.fetchIssuesByStatesForProjectContext(uniqueStateNames(states), projectContext);
-      });
+      candidates = await this.fetchPollingIssues(
+        (projectContext) => {
+          const config = this.configForProjectContext(projectContext);
+          if (config.mergePolicy.mode !== "gated" || config.mergePolicy.sourceStates.length === 0) return Promise.resolve([]);
+          const states = [
+            ...config.mergePolicy.sourceStates,
+            ...(config.mergePolicy.conflictsState === null ? [] : [config.mergePolicy.conflictsState]),
+          ];
+          return this.fetchIssuesByStatesForProjectContext(uniqueStateNames(states), projectContext);
+        },
+        "merge_policy_state_polling",
+      );
     } catch (error) {
       this.options.logger.warn("merge policy issue fetch failed", { error: errorMessage(error) });
       return;
