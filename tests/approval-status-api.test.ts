@@ -1301,8 +1301,8 @@ describe("approval status API", () => {
               branch: "symphony/TEST-1",
             },
             writebackOperationKeys: [
-              writebackIdentityKey("comment:issue-1:run-1:completion-report:idem-1", docsProjectContext),
-              writebackIdentityKey("transition:issue-1:run-1:completion-report:idem-1:In Review", docsProjectContext),
+              writebackIdentityKey("comment:issue-1:run-1:completion-report:idem-1"),
+              writebackIdentityKey("transition:issue-1:run-1:completion-report:idem-1:In Review"),
             ],
           }),
         ],
