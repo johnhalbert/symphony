@@ -2947,6 +2947,114 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("discovers eligible candidates from two Linear projects in one service cycle", async () => {
+    const config = testConfig(root);
+    addDocsPollingProjectContext(config);
+    const defaultCandidate = {
+      ...issue({
+        id: "issue-default-1",
+        identifier: "ENG-123",
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/ENG-123",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: legacyDefaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const docsCandidate = trackerIssue({
+      id: "issue-docs-1",
+      identifier: "ENG-456",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      branchName: "symphony/docs/ENG-456",
+    });
+    const defaultTracker = trackerClientFixture({
+      candidates: [defaultCandidate],
+      issues: [defaultCandidate],
+    });
+    const docsTracker = trackerClientFixture({
+      candidates: [docsCandidate],
+      issues: [docsCandidate],
+    });
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const harness: AgentHarness & {
+      runs: Array<{ ctx: AgentRunContext; prompt: string }>;
+      stoppedRunIds: string[];
+    } = {
+      id: "multi-project-candidate-polling",
+      capabilities: { continuation: true, mcpHandoff: true },
+      runs: [],
+      stoppedRunIds: [],
+      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+        this.runs.push({ ctx, prompt });
+        const runId = `run-${ctx.issue.id}-${ctx.turnNumber}`;
+        yield { type: "session_started", sessionId: `session-${ctx.issue.id}-${ctx.turnNumber}`, runId };
+        if (!ctx.abortSignal.aborted) {
+          await new Promise<void>((resolve) =>
+            ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        }
+        yield { type: "cancelled" };
+      },
+      async stop(runId: string): Promise<void> {
+        this.stoppedRunIds.push(runId);
+      },
+    };
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 2, "two project-scoped candidates dispatched in one refresh");
+      await waitFor(() => orchestrator.snapshot().counts.running === 2, "two project-scoped runs active");
+    } finally {
+      await orchestrator.stop();
+      await settleOrchestratorExit();
+    }
+
+    const defaultHarnessRun = harness.runs.find((run) => run.ctx.issue.id === defaultCandidate.id);
+    const docsHarnessRun = harness.runs.find((run) => run.ctx.issue.id === docsCandidate.id);
+
+    expect(defaultTracker.candidateFetchCount).toBe(1);
+    expect(docsTracker.candidateFetchCount).toBe(1);
+    expect(harness.runs).toHaveLength(2);
+    expect(harness.runs.map((run) => run.ctx.issue.id).sort()).toEqual([defaultCandidate.id, docsCandidate.id].sort());
+    expect(defaultHarnessRun?.ctx.projectContext).toMatchObject(legacyDefaultProjectContext);
+    expect(docsHarnessRun?.ctx.projectContext).toMatchObject(docsProjectContext);
+    expect(defaultHarnessRun?.ctx.workspace).toMatchObject({
+      workspaceKey: defaultCandidate.identifier,
+      path: path.join(config.workspace.root, defaultCandidate.identifier),
+    });
+    expect(docsHarnessRun?.ctx.workspace).toMatchObject({
+      workspaceKey: `docs__${docsCandidate.identifier}`,
+      path: path.join(config.workspace.root, `docs__${docsCandidate.identifier}`),
+    });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
   it("routes duplicate identifiers from distinct project contexts into distinct workspaces and persisted state", async () => {
     const config = testConfig(root);
     addDocsPollingProjectContext(config);
