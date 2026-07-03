@@ -1368,13 +1368,21 @@ export class Orchestrator {
     const nextEvent = this.buildWorkerDispatchRoutingFailureEvent(problem);
     const existingEvents = lifecycle?.events ?? [];
     const lastEvent = existingEvents[existingEvents.length - 1];
-    if (this.sameWorkerDispatchRoutingFailure(lastEvent, nextEvent)) {
+    const nextBlockedReason = lifecycle?.blockedReason ?? problem.safeMessage;
+    if (
+      this.sameWorkerDispatchRoutingFailure(lastEvent, nextEvent) &&
+      lifecycle?.phase === "blocked" &&
+      lifecycle.blockedReason === nextBlockedReason
+    ) {
       return;
     }
     await store.updateIssue(issue, {
-      phase: lifecycle?.phase ?? "unknown",
+      phase: "blocked",
+      blockedReason: nextBlockedReason,
       ...(lifecycle?.projectContext === undefined ? {} : { projectContext: lifecycle.projectContext }),
-      events: [...existingEvents.slice(-19), nextEvent],
+      events: this.sameWorkerDispatchRoutingFailure(lastEvent, nextEvent)
+        ? existingEvents
+        : [...existingEvents.slice(-19), nextEvent],
     });
   }
 

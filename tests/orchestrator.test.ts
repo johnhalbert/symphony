@@ -99,6 +99,13 @@ const legacyDefaultProjectContext = {
   routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
 } as const;
 
+const symphonyProjectContext = {
+  projectContextId: "symphony",
+  projectContextLabel: "Symphony",
+  linearProjectSlug: "TEST",
+  routingSource: "candidate_poll",
+} as const;
+
 
 function addDocsPollingProjectContext(config: ReturnType<typeof testConfig>): void {
   if (config.projectContexts.byId.has(docsProjectContext.projectContextId)) return;
@@ -209,20 +216,6 @@ function requireDocsPollingContext(config: ReturnType<typeof testConfig>) {
 
 describe("Orchestrator", () => {
   let root: string;
-
-const symphonyProjectContext = {
-  projectContextId: "symphony",
-  projectContextLabel: "Symphony",
-  linearProjectSlug: "TEST",
-  routingSource: "candidate_poll",
-} as const;
-
-const docsProjectContext = {
-  projectContextId: "docs",
-  projectContextLabel: "Documentation Site",
-  linearProjectSlug: "DOCS",
-  routingSource: "candidate_poll",
-} as const;
 
 
   beforeEach(async () => {
@@ -3226,8 +3219,8 @@ const docsProjectContext = {
     expect(writer.transitions).toEqual([]);
     expect(writer.comments).toEqual([]);
     expect(lifecycle).toMatchObject({
-      phase: "unknown",
-      blockedReason: null,
+      phase: "blocked",
+      blockedReason: expect.stringContaining("matched multiple enabled project contexts"),
       events: [
         {
           kind: "worker_dispatch_routing_failure",
@@ -3278,21 +3271,6 @@ const docsProjectContext = {
         return issueIds.includes(candidate.id) ? [candidate] : [];
       },
     };
-    const docsTracker: TrackerClient & { candidateFetchCount: number; requestedIds: string[][] } = {
-      candidateFetchCount: 0,
-      requestedIds: [],
-      async fetchCandidateIssues() {
-        docsTracker.candidateFetchCount += 1;
-        return [];
-      },
-      async fetchIssuesByStates() {
-        return [];
-      },
-      async fetchIssueStatesByIds(issueIds) {
-        docsTracker.requestedIds.push([...issueIds]);
-        return [];
-      },
-    };
     const logger = new StructuredLogger(() => undefined);
     const writer = new StateChangingWriter(() => undefined);
     const stateDir = path.join(root, "state");
@@ -3304,9 +3282,6 @@ const docsProjectContext = {
     const orchestrator = new Orchestrator({
       config,
       tracker: defaultTracker,
-      trackerResolver(projectContext) {
-        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
-      },
       workspaceManager,
       harness,
       logger,
@@ -3326,17 +3301,15 @@ const docsProjectContext = {
 
     const lifecycle = await lifecycleStore.get(candidate.id);
     expect(defaultTracker.candidateFetchCount).toBeGreaterThanOrEqual(2);
-    expect(docsTracker.candidateFetchCount).toBeGreaterThanOrEqual(2);
     expect(defaultTracker.requestedIds).toEqual([]);
-    expect(docsTracker.requestedIds).toEqual([]);
     expect(harness.runs).toHaveLength(0);
     await expect(runStore.listRuns()).resolves.toEqual([]);
     await expect(runStore.listWorkspaces()).resolves.toEqual([]);
     expect(writer.transitions).toEqual([]);
     expect(writer.comments).toEqual([]);
     expect(lifecycle).toMatchObject({
-      phase: "unknown",
-      blockedReason: null,
+      phase: "blocked",
+      blockedReason: expect.stringContaining("did not match any enabled project context"),
       events: [
         {
           kind: "worker_dispatch_routing_failure",

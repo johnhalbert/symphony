@@ -2838,6 +2838,7 @@ function lifecycleWithReports(overrides: { lastCompletionReportId: string; compl
     lastCompletionReportId: overrides.lastCompletionReportId,
     lastReviewVerdictId: null,
     blockedReason: null,
+    events: [],
     summaryPointers,
     summaryReferences: [],
     issueBreakdownPlans: [],
