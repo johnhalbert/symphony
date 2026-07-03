@@ -1,4 +1,4 @@
-import type { ServiceConfig, GitHubConfig } from "../../core/config/Config.js";
+import type { ServiceConfig, GitHubConfig, WorkflowProjectContext } from "../../core/config/Config.js";
 import {
   resolveProjectContextCredentialView,
   type ProjectContextCredentialResolutionOptions,
@@ -23,8 +23,11 @@ export const GITHUB_CREDENTIAL_CAPABILITY_OWNERS: Readonly<Record<GitHubCredenti
 export interface ResolvedGitHubClientConfig {
   capability: GitHubCredentialCapability;
   role: CredentialRole;
+  projectContextId: string;
+  projectContextLabel: string;
   github: GitHubConfig;
   credential: ResolvedCredential | null;
+  projectContext: WorkflowProjectContext;
 }
 
 export function resolveGitHubClientConfig(
@@ -57,12 +60,15 @@ export function resolveGitHubClientConfig(
     return {
       capability,
       role,
+      projectContextId: view.projectContextId,
+      projectContextLabel: view.projectContext.label,
       github: {
         ...view.github,
         token: null,
         app: credential.app,
       },
       credential,
+      projectContext: view.projectContext,
     };
   }
 
@@ -70,12 +76,23 @@ export function resolveGitHubClientConfig(
   return {
     capability,
     role,
+    projectContextId: view.projectContextId,
+    projectContextLabel: view.projectContext.label,
     github: {
       ...view.github,
       token: selectedStaticCredential?.value ?? null,
     },
     credential: selectedStaticCredential,
+    projectContext: view.projectContext,
   };
+}
+
+export function resolveGitHubClientConfigForProjectContext(
+  config: ServiceConfig,
+  capability: GitHubCredentialCapability,
+  projectContext?: ProjectContextCredentialResolutionOptions["projectContext"],
+): ResolvedGitHubClientConfig {
+  return resolveGitHubClientConfig(config, capability, { projectContext });
 }
 
 export function createGitHubPullRequestClientForCapability(
@@ -84,8 +101,28 @@ export function createGitHubPullRequestClientForCapability(
   fetchImpl?: FetchLike,
   options: ProjectContextCredentialResolutionOptions = {},
 ): GitHubPullRequestClient {
-  const resolved = resolveGitHubClientConfig(config, capability, options).github;
-  return new GitHubPullRequestClient(resolved, fetchImpl, createGitHubAuthTokenProvider(resolved, fetchImpl));
+  const resolved = resolveGitHubClientConfig(config, capability, options);
+  return new GitHubPullRequestClient(
+    resolved.github,
+    fetchImpl,
+    createGitHubAuthTokenProvider(resolved.github, fetchImpl),
+  );
+}
+
+export function createGitHubPullRequestClientForProjectContext(
+  config: ServiceConfig,
+  capability: GitHubCredentialCapability,
+  projectContext: ProjectContextCredentialResolutionOptions["projectContext"],
+  fetchImpl?: FetchLike,
+): GitHubPullRequestClient {
+  return createGitHubPullRequestClientForCapability(config, capability, fetchImpl, { projectContext });
+}
+
+export function resolveGitHubProjectContext(
+  config: ServiceConfig,
+  projectContext?: ProjectContextCredentialResolutionOptions["projectContext"],
+): WorkflowProjectContext {
+  return resolveProjectContextCredentialView({ config, projectContext }).projectContext;
 }
 
 function createGitHubAuthTokenProvider(
