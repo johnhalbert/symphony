@@ -2827,41 +2827,67 @@ function mergePolicyObservationInputFingerprint(input: {
 }): string | null {
   if (input.lifecycle === null) return null;
   return sha256Short(
-    stableJson({
-      configFingerprint: input.configFingerprint,
-      issueId: input.issue.id,
-      trackerState: input.issue.state,
-      trackerUpdatedAt: input.issue.updatedAt,
-      lifecycleUpdatedAt: input.lifecycle.updatedAt,
-      phase: input.lifecycle.phase,
-      blockedReason: input.lifecycle.blockedReason,
-      lastCompletionReportId: input.lifecycle.lastCompletionReportId,
-      lastReviewVerdictId: input.lifecycle.lastReviewVerdictId,
-      lastMergeGateResultId: input.lifecycle.lastMergeGateResultId ?? null,
-      report: input.report
-        ? {
-            id: input.report.id,
-            runId: input.report.runId,
-            acceptedAt: input.report.acceptedAt,
-            pullRequest: input.report.pullRequest,
-          }
-        : null,
-      verdict: input.verdict
-        ? {
-            id: input.verdict.id,
-            runId: input.verdict.runId,
-            verdict: input.verdict.verdict,
-            submittedAt: input.verdict.submittedAt,
-          }
-        : null,
-      merge: input.lifecycle.merge,
-      mergeGate: input.lifecycle.mergeGate,
-      mergeGateResults: input.lifecycle.mergeGateResults ?? [],
-      mergeConflict: input.lifecycle.mergeConflict,
-      reviewFeedback: input.lifecycle.reviewFeedback,
-      summaryPointers: input.lifecycle.summaryPointers,
-    }),
+    stableJson(
+      mergePolicyDecisionInput({ ...input, lifecycle: input.lifecycle }),
+    ),
   );
+}
+
+function mergePolicyDecisionInput(input: {
+  issue: Issue;
+  lifecycle: IssueLifecycleRecord;
+  report: IssueCompletionReportRecord | null;
+  verdict: IssueReviewVerdictRecord | null;
+  configFingerprint: string;
+}) {
+  const pointers = input.lifecycle.summaryPointers;
+  // This hash is a semantic merge-policy freshness invariant. Evidence-only
+  // lifecycle writes, such as base-ref observations, must not invalidate an
+  // otherwise reusable merge-policy observation.
+  return {
+    configFingerprint: input.configFingerprint,
+    issueId: input.issue.id,
+    trackerState: input.issue.state,
+    trackerUpdatedAt: input.issue.updatedAt,
+    phase: input.lifecycle.phase,
+    blockedReason: input.lifecycle.blockedReason,
+    lastCompletionReportId: input.lifecycle.lastCompletionReportId,
+    lastReviewVerdictId: input.lifecycle.lastReviewVerdictId,
+    lastMergeGateResultId: input.lifecycle.lastMergeGateResultId ?? null,
+    report: input.report
+      ? {
+          id: input.report.id,
+          runId: input.report.runId,
+          acceptedAt: input.report.acceptedAt,
+          pullRequest: input.report.pullRequest,
+        }
+      : null,
+    verdict: input.verdict
+      ? {
+          id: input.verdict.id,
+          runId: input.verdict.runId,
+          verdict: input.verdict.verdict,
+          submittedAt: input.verdict.submittedAt,
+        }
+      : null,
+    merge: input.lifecycle.merge,
+    mergeGate: input.lifecycle.mergeGate,
+    mergeGateResults: input.lifecycle.mergeGateResults ?? [],
+    mergeConflict: input.lifecycle.mergeConflict,
+    reviewFeedback: input.lifecycle.reviewFeedback,
+    routingPointers: {
+      workspaceKey: pointers.workspaceKey,
+      workspacePath: pointers.workspacePath,
+      branchName: pointers.branchName,
+      gitBranchName: pointers.gitBranchName,
+      repoPath: pointers.repoPath,
+      baseRef: pointers.baseRef,
+      prUrl: pointers.prUrl,
+      prNumber: pointers.prNumber,
+      prHeadSha: pointers.prHeadSha,
+      prBranch: pointers.prBranch,
+    },
+  };
 }
 
 function latestMergePolicyObservationForFingerprint(

@@ -7,6 +7,7 @@ import {
   PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
   pendingPublicationHandoffForRun,
 } from "../src/core/CompletionReportService.js";
+import type { IssueBaseRefObservation } from "../src/core/BaseRefVerification.js";
 import {
   parseServiceConfig,
   type ServiceConfig,
@@ -381,6 +382,57 @@ describe("IssueCurrentStateBuilder", () => {
         withoutObservation.currentMergePolicyObservationInputFingerprint,
       observationKind: "checks_pending",
     });
+
+    await lifecycleStore.updateIssue(issue, {
+      baseRefObservation: baseRefObservationFixture({
+        checkedAt: "2026-01-01T00:00:04.000Z",
+      }),
+    });
+    const afterBaseRefEvidence = await builderWithoutHistory.build(
+      issue,
+      emptyRuntime(),
+    );
+    expect(
+      afterBaseRefEvidence.currentMergePolicyObservationInputFingerprint,
+    ).toBe(withoutObservation.currentMergePolicyObservationInputFingerprint);
+    expect(afterBaseRefEvidence.lastMergePolicyObservation).toMatchObject({
+      inputFingerprint:
+        withoutObservation.currentMergePolicyObservationInputFingerprint,
+      observationKind: "checks_pending",
+    });
+
+    await lifecycleStore.updateIssue(issue, {
+      summaryPointers: {
+        lastPushedAt: "2026-01-01T00:00:05.000Z",
+        lastEvidenceCursor: "publication-cursor-2",
+      },
+    });
+    const afterPublicationEvidenceCursor = await builderWithoutHistory.build(
+      issue,
+      emptyRuntime(),
+    );
+    expect(
+      afterPublicationEvidenceCursor.currentMergePolicyObservationInputFingerprint,
+    ).toBe(withoutObservation.currentMergePolicyObservationInputFingerprint);
+    expect(
+      afterPublicationEvidenceCursor.lastMergePolicyObservation,
+    ).toMatchObject({
+      inputFingerprint:
+        withoutObservation.currentMergePolicyObservationInputFingerprint,
+      observationKind: "checks_pending",
+    });
+
+    await lifecycleStore.updateIssue(issue, {
+      summaryPointers: { prHeadSha: "def456" },
+    });
+    const afterPrHeadChange = await builderWithoutHistory.build(
+      issue,
+      emptyRuntime(),
+    );
+    expect(
+      afterPrHeadChange.currentMergePolicyObservationInputFingerprint,
+    ).not.toBe(withoutObservation.currentMergePolicyObservationInputFingerprint);
+    expect(afterPrHeadChange.lastMergePolicyObservation).toBeNull();
   });
 
   it("can build tracker fields from typed history evidence", async () => {
@@ -2401,6 +2453,31 @@ function reviewVerdictFixture(
     reviewer: null,
     submittedAt: "2026-01-01T00:00:05.000Z",
     writebackOperationKeys: [],
+    ...overrides,
+  };
+}
+
+function baseRefObservationFixture(
+  overrides: Partial<IssueBaseRefObservation> = {},
+): IssueBaseRefObservation {
+  return {
+    version: 1,
+    inputFingerprint: "base-ref-fingerprint",
+    classification: "ok",
+    operation: "merge_policy_dispatch_repair",
+    checkedAt: "2026-01-01T00:00:03.000Z",
+    workspacePath: "/tmp/workspace",
+    branchName: "feature/test-1",
+    baseRef: "origin/main",
+    normalizedBaseBranch: "main",
+    localBaseRef: "refs/remotes/origin/main",
+    githubBaseHeadSha: "base-head",
+    localBaseHeadShaBeforeFetch: "base-head",
+    localBaseHeadShaAfterFetch: "base-head",
+    worktreeHeadSha: "feature-head",
+    localBaseIsAncestorOfHead: true,
+    reason: null,
+    error: null,
     ...overrides,
   };
 }

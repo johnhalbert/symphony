@@ -6422,10 +6422,9 @@ export class Orchestrator {
     const baseRef =
       nonEmptyString(context.transition.latestBaseRef) ??
       nonEmptyString(this.config.workspace.source.baseRef);
-    const client = createGitHubPullRequestClientForCapability(
-      this.config,
-      "github.merge",
-    );
+    const client =
+      this.options.pullRequestMergeClient ??
+      createGitHubPullRequestClientForCapability(this.config, "github.merge");
     const observation = await new BaseRefVerifier().verify({
       workspacePath,
       branchName,

@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -5195,6 +5196,209 @@ describe("Orchestrator", () => {
       parentHistorySnapshotId: mergePolicySnapshots[1]?.historySnapshotId,
       parentTransitionKind: "merge_policy_observe",
     });
+  });
+
+  it("keeps merge-policy observations fresh across an ok base-ref guard before repair dispatch", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    let state = "Ready to Merge";
+    const branchName = "symphony/TEST-1";
+    const candidate = issue({
+      state,
+      branchName,
+      labels: ["dogfood-ready"],
+    });
+    const repo = await createBaseRefGuardRepo(root, branchName);
+    const baseHeadSha = await gitForTest(["rev-parse", "main"], repo.workspace);
+    const currentIssue = (): Issue => ({ ...candidate, state });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.some(
+          (candidateState) =>
+            candidateState.toLowerCase() === state.toLowerCase(),
+        )
+          ? [currentIssue()]
+          : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await runStore.startRun({
+      runId: "worker-run-1",
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      runPhase: "implementation",
+      runKind: "implementation",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: repo.workspace,
+      gitBranchName: branchName,
+      repoPath: repo.workspace,
+      baseRef: "origin/main",
+    });
+    await runStore.updateRun("worker-run-1", {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:03.000Z",
+      metadata: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: branchName,
+      },
+    });
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((nextState) => {
+      state = nextState;
+    });
+    const approvalVerdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(candidate),
+      id: "review-verdict:issue-1:approval-pass",
+      idempotencyKey: "approval-pass",
+      runId: "review-run-pass",
+      verdict: "pass",
+      findings: [],
+      acceptanceResults: [
+        { text: "Approved", satisfied: true, evidence: "review passed" },
+      ],
+      submittedAt: "2026-01-01T00:00:02.000Z",
+    };
+    await lifecycleStore.ensureIssue(currentIssue(), {
+      phase: "passed",
+      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      lastReviewVerdictId: approvalVerdict.id,
+      completionReports: [completionReportRecord(candidate)],
+      reviewVerdicts: [approvalVerdict],
+      reviewFeedback: [approvalFeedbackRecord(candidate, approvalVerdict.runId)],
+      summaryPointers: {
+        workspaceKey: candidate.identifier,
+        workspacePath: repo.workspace,
+        branchName,
+        gitBranchName: branchName,
+        repoPath: repo.workspace,
+        baseRef: "origin/main",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: branchName,
+      },
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        outboxStore,
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
+      pullRequestMergeClient: new FailingRequiredCheckMergeClient({
+        baseHeadSha,
+      }),
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    expect(state).toBe("In Progress");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: candidate.id,
+        fromStates: ["Ready to Merge"],
+        toState: "In Progress",
+        reason: "Symphony merge gate required CI repair",
+      },
+    ]);
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(lifecycle).toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      baseRefObservation: {
+        classification: "ok",
+        operation: "merge_policy_dispatch_repair",
+        worktreeHeadSha: await gitForTest(["rev-parse", "HEAD"], repo.workspace),
+        githubBaseHeadSha: baseHeadSha,
+        localBaseIsAncestorOfHead: true,
+      },
+      mergeGate: {
+        status: "repair_dispatched",
+        reviewRound: 1,
+      },
+    });
+    const issueState = await readIssueState(
+      config.workspace.stateDir,
+      candidate.id,
+    );
+    const history = issueState?.history ?? [];
+    expect(history.map((snapshot) => snapshot.transitionKind)).toEqual(
+      expect.arrayContaining([
+        "merge_policy_observe",
+        "base_ref_observe",
+        "merge_policy_dispatch_repair",
+      ]),
+    );
+    const baseRefSnapshot = history.find(
+      (snapshot) => snapshot.transitionKind === "base_ref_observe",
+    );
+    const repairSnapshot = history.find(
+      (snapshot) => snapshot.transitionKind === "merge_policy_dispatch_repair",
+    );
+    expect(baseRefSnapshot?.actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actionType: "record_base_ref_observation",
+          status: "succeeded",
+          details: expect.objectContaining({
+            targetTransitionKind: "merge_policy_dispatch_repair",
+            classification: "ok",
+          }),
+        }),
+      ]),
+    );
+    expect(repairSnapshot?.actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actionType: "plan_merge_gate_repair_writebacks",
+          status: "succeeded",
+        }),
+        expect.objectContaining({
+          actionType: "apply_merge_gate_repair_writebacks",
+          status: "succeeded",
+        }),
+        expect.objectContaining({
+          actionType: "record_merge_gate_repair_lifecycle",
+          status: "succeeded",
+        }),
+      ]),
+    );
+    expect(repairSnapshot?.errors).toEqual([]);
+    expect(
+      history
+        .flatMap((snapshot) => snapshot.errors)
+        .map((error) => error.message),
+    ).not.toContain("Merge policy transition requires a fresh observation");
   });
 
   it("merge-policy rulesets require merge-policy state and requested-transition context", async () => {
@@ -13489,6 +13693,67 @@ async function readIssueState(stateDir: string, issueIdOrIdentifier: string) {
   }
 }
 
+async function createBaseRefGuardRepo(
+  root: string,
+  branchName: string,
+): Promise<{ workspace: string; remote: string }> {
+  const remote = path.join(root, "remote.git");
+  const workspace = path.join(root, "workspace");
+  await gitForTest(["init", "--bare", remote], root);
+  await gitForTest(["init", workspace], root);
+  await gitForTest(["checkout", "-b", "main"], workspace);
+  await writeFile(path.join(workspace, "README.md"), "initial\n", "utf8");
+  await gitForTest(["add", "README.md"], workspace);
+  await commitForTest("initial", workspace);
+  await gitForTest(["remote", "add", "origin", remote], workspace);
+  await gitForTest(["push", "-u", "origin", "main"], workspace);
+  await gitForTest(["checkout", "-b", branchName], workspace);
+  await writeFile(path.join(workspace, "feature.txt"), "feature\n", "utf8");
+  await gitForTest(["add", "feature.txt"], workspace);
+  await commitForTest("feature", workspace);
+  return { workspace, remote };
+}
+
+function commitForTest(message: string, cwd: string): Promise<string> {
+  return gitForTest(
+    [
+      "-c",
+      "user.name=Symphony Test",
+      "-c",
+      "user.email=symphony@example.com",
+      "commit",
+      "-m",
+      message,
+    ],
+    cwd,
+  );
+}
+
+function gitForTest(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) {
+        resolve(stdout.trim());
+      } else {
+        reject(new Error(`git ${args.join(" ")} failed: ${stderr}`));
+      }
+    });
+  });
+}
+
 function emptyTracker(): TrackerClient {
   return {
     async fetchCandidateIssues() {
@@ -14098,6 +14363,10 @@ class LifecycleSnapshotHarness implements AgentHarness {
 }
 
 class FailingRequiredCheckMergeClient implements MergePolicyGitHubClient {
+  constructor(
+    private readonly options: { baseHeadSha?: string } = {},
+  ) {}
+
   async getPullRequest() {
     return {
       url: "https://github.com/acme/symphony/pull/42",
@@ -14113,12 +14382,12 @@ class FailingRequiredCheckMergeClient implements MergePolicyGitHubClient {
       mergeable: true,
       mergeableState: "clean",
       baseBranch: "main",
-      baseHeadSha: "base-sha-1",
+      baseHeadSha: this.options.baseHeadSha ?? "base-sha-1",
     };
   }
 
   async getBranchHeadSha() {
-    return "base-sha-1";
+    return this.options.baseHeadSha ?? "base-sha-1";
   }
 
   async getRequiredCheckResults() {
