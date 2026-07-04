@@ -30,6 +30,11 @@ import {
   FileOrchestratorConversationStore,
   type OrchestratorConversationStore,
 } from "../src/core/persistence/OrchestratorConversationStore.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import { projectOrchestratorChatProjectionPayload } from "../src/core/persistence/OrchestratorChatProjectionReducer.js";
 import { testConfig } from "./helpers.js";
 
@@ -419,6 +424,87 @@ describe("/api/v1/web route contracts", () => {
       { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
       { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "legacy-room" },
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    ]);
+  });
+
+  it("treats stale durable history payloads missing project context attribution as rebuild candidates", async () => {
+    const runStore = new RecordingRunStore([
+      runRecordFixture({
+        runId: "run-history-current",
+        sessionId: "session-history-current",
+        issueId: "issue-history-current",
+        issueIdentifier: "ENG-424",
+        updatedAt: "2026-05-31T00:02:00.000Z",
+        completedAt: "2026-05-31T00:02:00.000Z",
+        status: "succeeded",
+      }),
+    ]);
+    const staleSession = historySessionFixture({
+      id: "run-history-current",
+      issue: "ENG-424",
+      title: "ENG-424: Durable history",
+      updatedAt: "2026-05-31T00:02:00.000Z",
+      msgCount: 0,
+      lastEvent: "legacy durable history",
+      toolCount: 0,
+    }) as Record<string, unknown>;
+    const staleRunSession = staleSession["runSession"] as Record<string, unknown>;
+    delete staleSession["projectContext"];
+    delete staleRunSession["projectContext"];
+    const staleHistory = {
+      sessions: [staleSession],
+      transcriptBySession: {},
+      timeline: [],
+      defaultSessionId: "run-history-current",
+    };
+    const sourceRevisions = [{ source: "runs", revision: "7", observedAt: null }];
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
+        staleHistory,
+        { sourceRevisions, revision: 6 },
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server } = createStatusServer(root, {
+      projectionReader,
+      projectionWriter,
+      runStore: runStore.asRunTranscriptStore(),
+      webProjectionRevisionProviders: [
+        {
+          source: "runs",
+          getRevision: () => ({ source: "runs", revision: "7", observedAt: null }),
+        },
+      ],
+    });
+    const address = await server.start();
+    try {
+      const history = await getJson(`${baseUrlFor(address)}/api/v1/web/history`);
+      expect(history.response.headers.get("x-symphony-projection-status")).toBe("stale");
+      expect(history.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(history.body).not.toEqual(staleHistory);
+      expect(history.body).toMatchObject({
+        defaultSessionId: "run-history-current",
+        sessions: [
+          {
+            id: "run-history-current",
+            projectContext: legacyDefaultProjectContext(),
+            runSession: { projectContext: legacyDefaultProjectContext() },
+          },
+        ],
+      });
+      expect((history.body as { timeline: unknown[] }).timeline).toHaveLength(2);
+    } finally {
+      await server.stop();
+    }
+
+    expect(projectionWriter.writeFor("history_projection").payload).toEqual(
+      expect.objectContaining({
+        defaultSessionId: "run-history-current",
+      }),
+    );
+    expect(projectionReader.selectors).toEqual([
+      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
     ]);
   });
 
@@ -2510,6 +2596,12 @@ function historySessionFixture(input: {
   state?: "running" | "finished" | "error" | "cancelled" | "queued" | "not_live";
   status?: RunRecord["status"];
   model?: string;
+  projectContext?: {
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string | null;
+    routingSource: string;
+  };
 }) {
   const {
     id,
@@ -2525,12 +2617,14 @@ function historySessionFixture(input: {
     state = "finished",
     status = "succeeded",
     model = "claude-sonnet-4",
+    projectContext = legacyDefaultProjectContext(),
   } = input;
   return {
     id,
     issue,
     title,
     ...(subtitle ? { subtitle } : {}),
+    projectContext,
     state,
     model,
     startedAt,
@@ -2542,6 +2636,7 @@ function historySessionFixture(input: {
       runId: id,
       sessionId: id,
       agentId,
+      projectContext,
       role: "worker" as const,
       runPhase: "implementation" as const,
       runKind: "implementation" as const,
@@ -2617,6 +2712,15 @@ function historySessionFixture(input: {
         transcript: `/api/v1/web/sessions/${encodeURIComponent(id)}/transcript`,
       },
     },
+  };
+}
+
+function legacyDefaultProjectContext() {
+  return {
+    projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+    linearProjectSlug: null,
+    routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
   };
 }
 
