@@ -8,6 +8,7 @@ import type { WorkspaceOpener } from "./WorkspaceOpener.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
   normalizeProjectContextId,
+  normalizeProjectContextResolution,
   projectContextResolutionFromIssue,
   type ProjectContextResolution,
 } from "../core/config/ProjectContexts.js";
@@ -108,7 +109,12 @@ import {
   type OrchestratorChatCommandResultStatus,
 } from "../core/orchestrator/OrchestratorChatCommand.js";
 
-import { applyWebHistoryRuntimeLiveness, projectWebHistory } from "./WebHistoryProjection.js";
+import {
+  applyWebHistoryRuntimeLiveness,
+  isWebHistoryProjectionPayloadCurrent,
+  isWebHistorySessionListCurrent,
+  projectWebHistory,
+} from "./WebHistoryProjection.js";
 import {
   emptyWebTranscriptProjectionPayload,
   isWebTranscriptProjectionPayload,
@@ -1907,7 +1913,7 @@ export class StatusServer {
         config: this.options.dashboard ?? null,
       });
       const issues = projectWebIssueBoard(board);
-      const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot });
+      const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot, activityRuns: activitySources.runs });
       const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
       const sidebar = projectWebSidebar(dashboard, issues, history, chat);
       await this.recordProjectionRebuildEntry(
@@ -1939,7 +1945,7 @@ export class StatusServer {
         query: { issue: null, offset: 0, limit: limits.timelineLimit },
         includeTranscriptEvents: false,
       });
-      const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot });
+      const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot, activityRuns });
       await this.recordProjectionRebuildEntry(
         this.webHistoryProjectionWriteInput(history, {
           sourceIndex,
@@ -2791,7 +2797,7 @@ export class StatusServer {
       config: this.options.dashboard ?? null,
     });
     const issues = projectWebIssueBoard(board);
-    const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot });
+    const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot, activityRuns: activitySources.runs });
     const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
     const sidebar = projectWebSidebar(dashboard, issues, history, chat);
     await this.persistWebSidebarProjection(sidebar, {
@@ -2832,7 +2838,7 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: limits.timelineLimit },
       includeTranscriptEvents: false,
     });
-    const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot });
+    const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot, activityRuns });
     await this.persistWebHistoryProjection(history, {
       sourceIndex,
       limits,
@@ -2947,6 +2953,12 @@ export class StatusServer {
   private async isDurableProjectionRecordCurrent(record: ProjectionPayloadRecord): Promise<boolean> {
     const orchestratorChatRecordCurrent = await this.isDurableOrchestratorChatProjectionRecordCurrent(record);
     if (orchestratorChatRecordCurrent !== null) return orchestratorChatRecordCurrent;
+    if (record.revision.projectionName === "history_projection" && !isWebHistoryProjectionPayloadCurrent(record.payload)) {
+      return false;
+    }
+    if (record.revision.projectionName === "sidebar_projection" && !isWebSidebarProjectionPayloadCurrent(record.payload)) {
+      return false;
+    }
 
     const currentRevisions = projectionCurrentSourceRevisionsForRead(
       record.revision.projectionName,
@@ -5251,6 +5263,7 @@ interface ActivityItem {
   at: string;
   kind: "run_started" | "run_completed" | "transcript_event" | "writeback_operation";
   source: "run" | TranscriptEvent["source"] | "writeback";
+  projectContext?: ProjectContextResolution | null;
   issue: {
     id: string;
     identifier: string;
@@ -5679,6 +5692,7 @@ function activityItemForRun(run: RunRecord, kind: Extract<ActivityItem["kind"], 
     at,
     kind,
     source: "run",
+    projectContext: activityProjectContext(run.projectContext),
     issue: activityIssue(run),
     run: activityRun(run),
     transcript: null,
@@ -5693,6 +5707,7 @@ function activityItemForTranscriptEvent(run: RunRecord, event: TranscriptEvent):
     at: event.at,
     kind: "transcript_event",
     source: event.source,
+    projectContext: activityProjectContext(run.projectContext),
     issue: activityIssue(run),
     run: activityRun(run),
     transcript: {
@@ -5720,6 +5735,7 @@ function activityItemForWritebackOperation(
     at: operation.updatedAt,
     kind: "writeback_operation",
     source: "writeback",
+    projectContext: activityProjectContext(run?.projectContext ?? operation.projectContext),
     issue: {
       id: issueId,
       identifier: issueIdentifier,
@@ -5756,6 +5772,15 @@ function activityItemForWritebackOperation(
       transcript: null,
     },
   };
+}
+
+function activityProjectContext(projectContext: Partial<ProjectContextResolution> | null | undefined): ProjectContextResolution {
+  return normalizeProjectContextResolution(projectContext);
+}
+
+function isWebSidebarProjectionPayloadCurrent(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return isWebHistorySessionListCurrent((value as { sessions?: unknown }).sessions);
 }
 
 function writebackSkipReason(operation: WritebackOperation): WritebackSkipReason | null {

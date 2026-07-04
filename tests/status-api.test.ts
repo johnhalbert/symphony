@@ -3917,10 +3917,22 @@ describe("StatusServer durable API", () => {
           msgCount: number;
           lastEvent: string;
           toolCount: number;
+          projectContext: {
+            projectContextId: string;
+            projectContextLabel: string;
+            linearProjectSlug: string | null;
+            routingSource: string;
+          };
           runSession: {
             runId: string;
             sessionId: string | null;
             agentId: string | null;
+            projectContext: {
+              projectContextId: string;
+              projectContextLabel: string;
+              linearProjectSlug: string | null;
+              routingSource: string;
+            };
             role: string;
             runPhase: string | null;
             runKind: string | null;
@@ -3947,6 +3959,7 @@ describe("StatusServer durable API", () => {
         "lastEvent",
         "model",
         "msgCount",
+        "projectContext",
         "runSession",
         "startedAt",
         "state",
@@ -3963,10 +3976,22 @@ describe("StatusServer durable API", () => {
         msgCount: 1,
         lastEvent: "TEST-1 not live",
         toolCount: 0,
+        projectContext: {
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+          linearProjectSlug: null,
+          routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+        },
         runSession: {
           runId: "web-run-1",
           sessionId: "cursor-session-1",
           agentId: "agent-1",
+          projectContext: {
+            projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+            projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+            linearProjectSlug: null,
+            routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+          },
           role: "worker",
           runPhase: "implementation",
           runKind: "implementation",
@@ -6153,6 +6178,16 @@ describe("StatusServer durable API", () => {
       },
     });
     await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-docs-activity-1:runless-report",
+      kind: "comment",
+      issueId: docsIssue.id,
+      projectContext: docsProjectContext,
+      payload: {
+        body: "DOCS_RUNLESS_WRITEBACK_BODY",
+        dedupeKey: "docs-runless-report",
+      },
+    });
+    await writebackOutbox.enqueueOnce({
       idempotencyKey: "comment:issue-symphony-activity-1:report",
       kind: "comment",
       issueId: symphonyIssue.id,
@@ -6189,6 +6224,7 @@ describe("StatusServer durable API", () => {
       const docsBody = (await docsResponse.json()) as {
         activity: Array<{
           kind: string;
+          projectContext: typeof docsProjectContext | null;
           issue: { id: string; identifier: string };
           run: { runId: string; role: string } | null;
           transcript: { sequence: number; eventType: string; message: string | null } | null;
@@ -6210,7 +6246,7 @@ describe("StatusServer durable API", () => {
       expect(docsResponse.status).toBe(200);
       expect(docsBody.counts).toMatchObject({
         distinctRunsConsidered: 1,
-        writebackOperationsConsidered: 1,
+        writebackOperationsConsidered: 2,
       });
       expect(docsBody.activity).not.toHaveLength(0);
       expect(docsBody.activity.every((item) => item.issue.id === docsIssue.id)).toBe(true);
@@ -6229,14 +6265,30 @@ describe("StatusServer durable API", () => {
         },
       });
 
-      const writebackItem = docsBody.activity.find((item) => item.kind === "writeback_operation");
-      expect(writebackItem).toMatchObject({
+      const runBackedWritebackItem = docsBody.activity.find(
+        (item) => item.kind === "writeback_operation" && item.run?.runId === "run-docs-activity-1",
+      );
+      expect(runBackedWritebackItem).toMatchObject({
+        projectContext: docsProjectContext,
         issue: { id: docsIssue.id, identifier: docsIssue.identifier },
         run: { runId: "run-docs-activity-1", role: "worker" },
         writeback: { operationKind: "comment", status: "pending" },
         links: {
           issue: `/api/v1/board/issues/${docsIssue.id}`,
           run: "/api/v1/runs/run-docs-activity-1",
+          transcript: null,
+        },
+      });
+
+      const runlessWritebackItem = docsBody.activity.find((item) => item.kind === "writeback_operation" && item.run === null);
+      expect(runlessWritebackItem).toMatchObject({
+        projectContext: docsProjectContext,
+        issue: { id: docsIssue.id, identifier: docsIssue.identifier },
+        run: null,
+        writeback: { operationKind: "comment", status: "pending" },
+        links: {
+          issue: `/api/v1/board/issues/${docsIssue.id}`,
+          run: null,
           transcript: null,
         },
       });
