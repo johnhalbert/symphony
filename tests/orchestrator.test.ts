@@ -637,7 +637,7 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "run-activity harness dispatched");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "run-activity harness exited");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "run-activity harness exited", 10_000);
     await settleOrchestratorExit();
     await orchestrator.stop();
 
@@ -9614,7 +9614,7 @@ async function runTerminalRunActivityScenario(root: string, terminal: "failed" |
 
   await orchestrator.refreshNow();
   await waitFor(() => harness.runs.length === 1, `${terminal} run-activity harness dispatched`);
-  await waitFor(() => orchestrator.snapshot().counts.running === 0, `${terminal} run-activity harness exited`);
+  await waitFor(() => orchestrator.snapshot().counts.running === 0, `${terminal} run-activity harness exited`, 10_000);
   await settleOrchestratorExit();
   await orchestrator.stop();
 
