@@ -58,6 +58,12 @@ export interface WebTranscriptSourceModel {
   cursors: WebTranscriptSourceCursorModel;
 }
 
+export interface WebTranscriptSourceIdentityFallback {
+  sessionId?: string | null;
+  issueId?: string | null;
+  issueIdentifier?: string | null;
+}
+
 export type TranscriptMessage =
   | {
       kind: "system";
@@ -164,6 +170,7 @@ export interface WebTranscriptWindowProjectionOptions {
   requestedPage?: { offset: number; limit: number } | null;
   tailLimit: number;
   refetchHref?: string | null;
+  sourceIdentity?: WebTranscriptSourceIdentityFallback | null;
 }
 
 export function projectWebTranscript(
@@ -183,7 +190,7 @@ export function projectWebTranscriptWindow(
   const pageModel = webTranscriptWindowPageModel(page);
   const windowKind = options.kind ?? page.windowKind ?? (options.requestedPage ? "page" : "tail");
   const refetchHref = options.refetchHref ?? webTranscriptRefetchHref(options.run ?? null);
-  const source = projectTranscriptSourceMetadata(options.run ?? null, page, pageModel, windowKind);
+  const source = projectTranscriptSourceMetadata(options.run ?? null, page, pageModel, windowKind, options.sourceIdentity ?? null);
   const window: WebTranscriptWindowModel = {
     ...pageModel,
     kind: windowKind,
@@ -715,12 +722,13 @@ function projectTranscriptSourceMetadata(
   page: TranscriptPage,
   pageModel: WebTranscriptWindowPageModel,
   windowKind: "page" | "tail",
+  sourceIdentity: WebTranscriptSourceIdentityFallback | null = null,
 ): WebTranscriptSourceModel {
   return {
     runId: firstCleanString(run?.runId, page.runId) ?? page.runId,
-    sessionId: firstCleanString(run?.sessionId),
-    issueId: firstCleanString(run?.issueId),
-    issueIdentifier: firstCleanString(run?.issueIdentifier),
+    sessionId: firstCleanString(run?.sessionId, sourceIdentity?.sessionId),
+    issueId: firstCleanString(run?.issueId, sourceIdentity?.issueId),
+    issueIdentifier: firstCleanString(run?.issueIdentifier, sourceIdentity?.issueIdentifier),
     projectContext: projectRunProjectContext(run),
     workspace: projectRunWorkspaceIdentity(run),
     cursors: {

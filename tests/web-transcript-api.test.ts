@@ -1242,6 +1242,205 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("preserves cached tail metadata while backfilling source for durable-only transcript envelopes", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const durableMessages = [{ kind: "assistant", text: "durable tail event" }];
+    const projectionReader = new StaticProjectionReader(
+      {
+        schemaVersion: 1,
+        messages: durableMessages,
+        page: {
+          offset: 700,
+          limit: 500,
+          size: 1,
+          total: 1_200,
+          nextOffset: null,
+          previousOffset: 200,
+          hasNext: false,
+          hasPrevious: true,
+          firstSequence: 1_200,
+          lastSequence: 1_200,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+        },
+        window: {
+          kind: "tail",
+          tailLimit: 500,
+          messageCount: 1,
+          requested: { offset: null, limit: 500 },
+        },
+        activeTail: {
+          enabled: true,
+          canAppend: true,
+          runStatus: "running",
+          tailLimit: 500,
+          afterSequence: 1_234,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+          refetchHref: "/cached-refetch",
+          gapFallback: { strategy: "refetch", reason: "tail-gap", href: "/cached-gap" },
+        },
+        recovery: { strategy: "refetch", reason: "tail-gap", href: "/cached-recovery" },
+        compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+      },
+      [],
+      {
+        runId: "durable-tail-run",
+        sessionId: "durable-tail-session",
+        issueKey: "TEST-1",
+        offset: 700,
+        limit: 500,
+        nextOffset: null,
+        previousOffset: 200,
+        total: 1_200,
+        windowKind: "tail",
+        hasNext: false,
+        hasPrevious: true,
+        eventCount: 1,
+        firstSequence: 1_200,
+        lastSequence: 1_200,
+        lastEventAt: "2026-01-01T00:00:03.000Z",
+      },
+    );
+    const server = createServer(config, undefined, { projectionReader });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/durable-tail-run/transcript?offset=700&limit=500`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(transcriptMessages(body)).toEqual(durableMessages);
+      expect(body).toMatchObject({
+        activeTail: {
+          enabled: true,
+          canAppend: true,
+          runStatus: "running",
+          tailLimit: 500,
+          afterSequence: 1_234,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+          refetchHref: "/cached-refetch",
+          gapFallback: { strategy: "refetch", reason: "tail-gap", href: "/cached-gap" },
+        },
+        recovery: { strategy: "refetch", reason: "tail-gap", href: "/cached-recovery" },
+        source: {
+          runId: "durable-tail-run",
+          sessionId: "durable-tail-session",
+          issueId: null,
+          issueIdentifier: "TEST-1",
+          projectContext: null,
+          workspace: null,
+          cursors: {
+            offset: 700,
+            limit: 500,
+            previousOffset: 200,
+            total: 1200,
+            windowKind: "tail",
+            hasNext: false,
+            hasPrevious: true,
+            eventCount: 1,
+            firstSequence: 1200,
+            lastSequence: 1200,
+            lastEventAt: "2026-01-01T00:00:03.000Z",
+          },
+        },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("backfills issue attribution from durable cursors when run records are unavailable", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const durableMessages = [{ kind: "assistant", text: "durable page event" }];
+    const projectionReader = new StaticProjectionReader(
+      {
+        schemaVersion: 1,
+        messages: durableMessages,
+        page: {
+          offset: 2,
+          limit: 3,
+          size: 1,
+          total: 3,
+          nextOffset: null,
+          previousOffset: 0,
+          hasNext: false,
+          hasPrevious: true,
+          firstSequence: 3,
+          lastSequence: 3,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+        },
+        window: {
+          kind: "page",
+          tailLimit: 3,
+          messageCount: 1,
+          requested: { offset: 2, limit: 3 },
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          runStatus: null,
+          tailLimit: 3,
+          afterSequence: 3,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+          refetchHref: null,
+          gapFallback: { strategy: "refetch", reason: "tail-gap", href: null },
+        },
+        recovery: { strategy: "refetch", reason: "tail-gap", href: null },
+        compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+      },
+      [],
+      {
+        runId: "cursor-fallback-run",
+        sessionId: "cursor-fallback-session",
+        issueKey: "ENG-425",
+        offset: 2,
+        limit: 3,
+        nextOffset: null,
+        previousOffset: 0,
+        total: 3,
+        windowKind: "page",
+        hasNext: false,
+        hasPrevious: true,
+        eventCount: 1,
+        firstSequence: 3,
+        lastSequence: 3,
+        lastEventAt: "2026-01-01T00:00:03.000Z",
+      },
+    );
+    const server = createServer(config, undefined, { projectionReader });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/cursor-fallback-run/transcript?offset=2&limit=3`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(transcriptMessages(body)).toEqual(durableMessages);
+      expect(body).toMatchObject({
+        source: {
+          runId: "cursor-fallback-run",
+          sessionId: "cursor-fallback-session",
+          issueId: null,
+          issueIdentifier: "ENG-425",
+          projectContext: null,
+          workspace: null,
+          cursors: {
+            offset: 2,
+            limit: 3,
+            previousOffset: 0,
+            total: 3,
+            windowKind: "page",
+            hasNext: false,
+            hasPrevious: true,
+            eventCount: 1,
+            firstSequence: 3,
+            lastSequence: 3,
+            lastEventAt: "2026-01-01T00:00:03.000Z",
+          },
+        },
+      });
+      expect(projectionReader.selectors).toEqual([
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "cursor-fallback-run:offset:2:limit:3" },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
 });
 
 interface CreateServerOptions {
@@ -1280,11 +1479,12 @@ class StaticProjectionReader implements WebProjectionPayloadReader {
   constructor(
     private readonly payload: unknown,
     private readonly sourceRevisions: ProjectionPayloadRecord["revision"]["sourceRevisions"] = [],
+    private readonly sourceCursors: ProjectionPayloadRecord["revision"]["sourceCursors"] = {},
   ) {}
 
   async readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null> {
     this.selectors.push({ ...selector });
-    return projectionPayloadRecord(selector, this.payload as TPayload, this.sourceRevisions);
+    return projectionPayloadRecord(selector, this.payload as TPayload, this.sourceRevisions, this.sourceCursors);
   }
 }
 
@@ -1292,6 +1492,7 @@ function projectionPayloadRecord<TPayload>(
   selector: ProjectionRevisionSelector,
   payload: TPayload,
   sourceRevisions: ProjectionPayloadRecord["revision"]["sourceRevisions"],
+  sourceCursors: ProjectionPayloadRecord["revision"]["sourceCursors"] = {},
 ): ProjectionPayloadRecord<TPayload> {
   const generatedAt = "2026-01-01T00:00:00.000Z";
   return {
@@ -1303,7 +1504,7 @@ function projectionPayloadRecord<TPayload>(
       revision: 1,
       buildMode: "bootstrap",
       sourceRevisions,
-      sourceCursors: {},
+      sourceCursors,
       sourceFreshness: [],
       contentSha256: null,
       generatedAt,
