@@ -6624,6 +6624,250 @@ describe("Orchestrator", () => {
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({ reviewRound: 0 });
   });
 
+  it("dispatches concurrent worker and reviewer runs in distinct project contexts without mixing run records or transcripts", async () => {
+    const config = testConfig(root);
+    config.agent.maxConcurrentAgents = 2;
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.reviewLoop.reviewStates = ["Docs Review"];
+
+    const sharedIdentifier = "ENG-123";
+    const defaultWorkspaceKey = sharedIdentifier;
+    const docsWorkspaceKey = `docs__${sharedIdentifier}`;
+    const defaultCandidate = {
+      ...issue({
+        id: "issue-default-1",
+        identifier: sharedIdentifier,
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/ENG-123",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: legacyDefaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const docsReviewerCandidate = trackerIssue({
+      id: "issue-docs-review-1",
+      identifier: sharedIdentifier,
+      state: "Docs Review",
+      branchName: "symphony/docs/ENG-123",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+    });
+    const docsReviewerBranchName = docsReviewerCandidate.branchName;
+    if (!docsReviewerBranchName) {
+      throw new Error("Expected docs reviewer candidate branch name");
+    }
+    const defaultTracker = trackerClientFixture({
+      candidates: [defaultCandidate],
+      issues: [defaultCandidate],
+    });
+    const docsTracker = trackerClientFixture({ issues: [docsReviewerCandidate] });
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const report = {
+      ...completionReportRecord(docsReviewerCandidate),
+      id: `completion-report:${docsReviewerCandidate.id}:docs-reviewer-prior-worker`,
+      idempotencyKey: "docs-reviewer-prior-worker",
+      runId: "docs-worker-prior-run-1",
+    };
+    await lifecycleStore.ensureIssue(docsReviewerCandidate, {
+      phase: "review",
+      projectContext: docsProjectContext,
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      summaryPointers: {
+        branchName: docsReviewerBranchName,
+        gitBranchName: docsReviewerBranchName,
+        workspaceKey: docsWorkspaceKey,
+        workspacePath: path.join(config.workspace.root, docsWorkspaceKey),
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+      },
+    });
+    await runStore.startRun({
+      runId: report.runId,
+      sessionId: "docs-prior-worker-session-1",
+      agentId: "docs-prior-worker-agent-1",
+      role: "worker",
+      issueId: docsReviewerCandidate.id,
+      issueIdentifier: docsReviewerCandidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Docs worker prompt",
+      workspaceKey: docsWorkspaceKey,
+      workspacePath: path.join(config.workspace.root, docsWorkspaceKey),
+      gitBranchName: docsReviewerBranchName,
+      repoPath: root,
+      baseRef: "main",
+      projectContext: docsProjectContext,
+    });
+    await runStore.appendEvent({
+      runId: report.runId,
+      at: "2026-01-01T00:00:02Z",
+      source: "harness",
+      eventType: "progress",
+      message: "Docs review context retained prior worker evidence.",
+    });
+    const harness = new ConcurrentContextDispatchHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    let workerHarnessRun: ConcurrentContextDispatchHarness["runs"][number] | undefined;
+    let reviewerHarnessRun: ConcurrentContextDispatchHarness["runs"][number] | undefined;
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 2, "concurrent worker/reviewer dispatch");
+      await waitFor(() => orchestrator.snapshot().counts.running === 2, "concurrent worker/reviewer active runs");
+
+      workerHarnessRun = harness.runs.find((run) => run.ctx.role === "worker");
+      reviewerHarnessRun = harness.runs.find((run) => run.ctx.role === "reviewer");
+      if (!workerHarnessRun || !reviewerHarnessRun) {
+        throw new Error("Expected both worker and reviewer harness runs");
+      }
+
+      expect(defaultTracker.candidateFetchCount).toBe(1);
+      expect(docsTracker.candidateFetchCount).toBe(1);
+      expect(defaultTracker.requestedStates).toEqual([["In Review"]]);
+      expect(docsTracker.requestedStates).toEqual([["Docs Review"]]);
+      expect(workerHarnessRun.ctx.issue.id).toBe(defaultCandidate.id);
+      expect(workerHarnessRun.ctx.projectContext).toMatchObject(legacyDefaultProjectContext);
+      expect(workerHarnessRun.ctx.workspace).toMatchObject({
+        workspaceKey: defaultWorkspaceKey,
+        path: path.join(config.workspace.root, defaultWorkspaceKey),
+      });
+      expect(reviewerHarnessRun.ctx.issue.id).toBe(docsReviewerCandidate.id);
+      expect(reviewerHarnessRun.ctx.projectContext).toMatchObject(docsProjectContext);
+      expect(reviewerHarnessRun.ctx.workspace).toMatchObject({
+        workspaceKey: docsWorkspaceKey,
+        path: path.join(config.workspace.root, docsWorkspaceKey),
+      });
+
+      await waitForRunRecord(runStore, workerHarnessRun.runId);
+      await waitForRunRecord(runStore, reviewerHarnessRun.runId);
+      await expect(runStore.getRun(workerHarnessRun.runId)).resolves.toMatchObject({
+        runId: workerHarnessRun.runId,
+        sessionId: workerHarnessRun.sessionId,
+        agentId: workerHarnessRun.agentId,
+        role: "worker",
+        issueId: defaultCandidate.id,
+        issueIdentifier: sharedIdentifier,
+        projectContext: legacyDefaultProjectContext,
+        workspaceKey: defaultWorkspaceKey,
+        workspacePath: path.join(config.workspace.root, defaultWorkspaceKey),
+        status: "running",
+      });
+      await expect(runStore.getRun(reviewerHarnessRun.runId)).resolves.toMatchObject({
+        runId: reviewerHarnessRun.runId,
+        sessionId: reviewerHarnessRun.sessionId,
+        agentId: reviewerHarnessRun.agentId,
+        role: "reviewer",
+        issueId: docsReviewerCandidate.id,
+        issueIdentifier: sharedIdentifier,
+        projectContext: docsProjectContext,
+        workspaceKey: docsWorkspaceKey,
+        workspacePath: path.join(config.workspace.root, docsWorkspaceKey),
+        status: "running",
+      });
+
+      harness.releaseAll();
+      await waitFor(() => orchestrator.snapshot().counts.running === 0, "concurrent worker/reviewer completion");
+      await waitForTerminalRunRecord(runStore, workerHarnessRun.runId);
+      await waitForTerminalRunRecord(runStore, reviewerHarnessRun.runId);
+    } finally {
+      harness.releaseAll();
+      await orchestrator.stop();
+    }
+
+    if (!workerHarnessRun || !reviewerHarnessRun) {
+      throw new Error("Expected worker and reviewer harness runs after orchestrator completion");
+    }
+
+    const defaultContextRuns = await runStore.listRunsForIssue(sharedIdentifier, { projectContext: legacyDefaultProjectContext });
+    const docsContextRuns = await runStore.listRunsForIssue(sharedIdentifier, { projectContext: docsProjectContext });
+    expect(defaultContextRuns.map((run) => run.runId)).toEqual([workerHarnessRun.runId]);
+    expect(docsContextRuns).toHaveLength(2);
+    expect(docsContextRuns.map((run) => run.runId)).toEqual(expect.arrayContaining([report.runId, reviewerHarnessRun.runId]));
+    await expect(
+      runStore.latestRunForIssue(sharedIdentifier, { role: "worker", projectContext: legacyDefaultProjectContext }),
+    ).resolves.toMatchObject({
+      runId: workerHarnessRun.runId,
+      sessionId: workerHarnessRun.sessionId,
+      agentId: workerHarnessRun.agentId,
+      issueId: defaultCandidate.id,
+      projectContext: legacyDefaultProjectContext,
+      status: "succeeded",
+    });
+    await expect(
+      runStore.latestRunForIssue(sharedIdentifier, { role: "reviewer", projectContext: docsProjectContext }),
+    ).resolves.toMatchObject({
+      runId: reviewerHarnessRun.runId,
+      sessionId: reviewerHarnessRun.sessionId,
+      agentId: reviewerHarnessRun.agentId,
+      issueId: docsReviewerCandidate.id,
+      projectContext: docsProjectContext,
+      status: "succeeded",
+    });
+
+    const workerTranscript = await runStore.readTranscript(workerHarnessRun.runId);
+    const reviewerTranscript = await runStore.readTranscript(reviewerHarnessRun.runId);
+    expect(workerTranscript.runId).toBe(workerHarnessRun.runId);
+    expect(reviewerTranscript.runId).toBe(reviewerHarnessRun.runId);
+    expect(workerTranscript.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ eventType: "progress", message: workerHarnessRun.progressMessage }),
+        expect.objectContaining({ eventType: "completed" }),
+      ]),
+    );
+    expect(reviewerTranscript.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ eventType: "progress", message: reviewerHarnessRun.progressMessage }),
+        expect.objectContaining({ eventType: "completed" }),
+      ]),
+    );
+    expect(workerTranscript.events.map((event) => event.message)).not.toContain(reviewerHarnessRun.progressMessage);
+    expect(reviewerTranscript.events.map((event) => event.message)).not.toContain(workerHarnessRun.progressMessage);
+    await expect(runStore.rebuildRunFromTranscript(workerHarnessRun.runId)).resolves.toMatchObject({
+      runId: workerHarnessRun.runId,
+      sessionId: workerHarnessRun.sessionId,
+      agentId: workerHarnessRun.agentId,
+      issueId: defaultCandidate.id,
+      projectContext: legacyDefaultProjectContext,
+      status: "succeeded",
+    });
+    await expect(runStore.rebuildRunFromTranscript(reviewerHarnessRun.runId)).resolves.toMatchObject({
+      runId: reviewerHarnessRun.runId,
+      sessionId: reviewerHarnessRun.sessionId,
+      agentId: reviewerHarnessRun.agentId,
+      issueId: docsReviewerCandidate.id,
+      projectContext: docsProjectContext,
+      status: "succeeded",
+    });
+  });
+
   it("instructs default reviewer prompts to leave PR feedback before verdict submission", async () => {
     const config = testConfig(root);
     config.tracker.handoffStates = ["In Review"];
@@ -10411,6 +10655,58 @@ class ManufacturedReviewLoopHarness implements AgentHarness {
         phase: "review",
       },
     );
+  }
+}
+
+class ConcurrentContextDispatchHarness implements AgentHarness {
+  readonly id = "concurrent-context-dispatch";
+  readonly capabilities = { continuation: true, mcpHandoff: true };
+  readonly runs: Array<{
+    ctx: AgentRunContext;
+    prompt: string;
+    runId: string;
+    sessionId: string;
+    agentId: string;
+    progressMessage: string;
+  }> = [];
+
+  private releaseResolver: (() => void) | null = null;
+  private readonly releasePromise = new Promise<void>((resolve) => {
+    this.releaseResolver = resolve;
+  });
+
+  releaseAll(): void {
+    this.releaseResolver?.();
+    this.releaseResolver = null;
+  }
+
+  async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+    const contextId = ctx.projectContext?.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+    const runId = `${contextId}-${ctx.role}-run-1`;
+    const sessionId = `${contextId}-${ctx.role}-session-1`;
+    const agentId = `${contextId}-${ctx.role}-agent-1`;
+    const progressMessage = `${runId}:transcript-marker`;
+    this.runs.push({ ctx, prompt, runId, sessionId, agentId, progressMessage });
+
+    yield { type: "session_started", sessionId, threadId: agentId, runId };
+
+    const gate = await Promise.race([
+      this.releasePromise.then(() => "released" as const),
+      new Promise<"aborted">((resolve) => {
+        if (ctx.abortSignal.aborted) {
+          resolve("aborted");
+          return;
+        }
+        ctx.abortSignal.addEventListener("abort", () => resolve("aborted"), { once: true });
+      }),
+    ]);
+    if (gate === "aborted") {
+      yield { type: "cancelled" };
+      return;
+    }
+
+    yield { type: "progress", message: progressMessage };
+    yield { type: "completed", message: `${runId}:completed` };
   }
 }
 
