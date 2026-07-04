@@ -637,7 +637,7 @@ describe("Orchestrator", () => {
 
     await orchestrator.refreshNow();
     await waitFor(() => harness.runs.length === 1, "run-activity harness dispatched");
-    await waitFor(() => orchestrator.snapshot().counts.running === 0, "run-activity harness exited");
+    await waitFor(() => orchestrator.snapshot().counts.running === 0, "run-activity harness exited", 10_000);
     await settleOrchestratorExit();
     await orchestrator.stop();
 
@@ -3052,6 +3052,115 @@ describe("Orchestrator", () => {
       workspaceKey: `docs__${docsCandidate.identifier}`,
       path: path.join(config.workspace.root, `docs__${docsCandidate.identifier}`),
     });
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
+  it("isolates project-context credential polling failures so a healthy context still dispatches", async () => {
+    const config = testConfig(root);
+    addDocsPollingProjectContext(config);
+    const defaultCandidate = {
+      ...issue({
+        id: "issue-default-isolation-1",
+        identifier: "ENG-123-ISOLATED",
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/ENG-123-ISOLATED",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: legacyDefaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-isolation-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const rawCredentialMessage =
+      "Linear credential capability linear.tracker is owned by worker, but is assigned only to service. Configure credential_profiles.roles.worker.linear.tracker or remove the non-owning assignment to use legacy tracker api key/LINEAR_API_KEY.";
+    const defaultTracker = trackerClientFixture({
+      candidates: [defaultCandidate],
+      issues: [defaultCandidate],
+    });
+    const resolvedProjectContextIds: string[] = [];
+    const logs: string[] = [];
+    const logger = new StructuredLogger((line) => logs.push(line));
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const harness: AgentHarness & {
+      runs: Array<{ ctx: AgentRunContext; prompt: string }>;
+      stoppedRunIds: string[];
+    } = {
+      id: "multi-project-failure-isolation",
+      capabilities: { continuation: true, mcpHandoff: true },
+      runs: [],
+      stoppedRunIds: [],
+      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+        this.runs.push({ ctx, prompt });
+        const runId = `run-${ctx.issue.id}-${ctx.turnNumber}`;
+        yield { type: "session_started", sessionId: `session-${ctx.issue.id}-${ctx.turnNumber}`, runId };
+        if (!ctx.abortSignal.aborted) {
+          await new Promise<void>((resolve) =>
+            ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        }
+        yield { type: "cancelled" };
+      },
+      async stop(runId: string): Promise<void> {
+        this.stoppedRunIds.push(runId);
+      },
+    };
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        const projectContextId = projectContext?.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+        resolvedProjectContextIds.push(projectContextId);
+        if (projectContext?.projectContextId === docsProjectContext.projectContextId) {
+          throw new SymphonyError("config_validation_error", rawCredentialMessage);
+        }
+        return defaultTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 1, "healthy project-scoped candidate dispatched after sibling credential failure");
+      await waitFor(() => orchestrator.snapshot().counts.running === 1, "healthy project-scoped run active after sibling credential failure");
+    } finally {
+      await orchestrator.stop();
+      await settleOrchestratorExit();
+    }
+
+    expect(defaultTracker.candidateFetchCount).toBe(1);
+    expect(resolvedProjectContextIds).toContain(LEGACY_DEFAULT_PROJECT_CONTEXT_ID);
+    expect(resolvedProjectContextIds).toContain(docsProjectContext.projectContextId);
+    expect(harness.runs).toHaveLength(1);
+    expect(harness.runs[0]?.ctx.issue.id).toBe(defaultCandidate.id);
+    expect(harness.runs[0]?.ctx.projectContext).toMatchObject(legacyDefaultProjectContext);
+    await expect(runStore.latestRunForIssue(defaultCandidate.id, { role: "worker", runPhase: "implementation" })).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+    expect(await runStore.listRuns()).toHaveLength(1);
+    expect(
+      logs.some(
+        (line) =>
+          line.includes('message="project-context polling failed"') &&
+          line.includes('operation="candidate_issue_polling"') &&
+          line.includes('projectContextId="docs"') &&
+          line.includes('errorCode="config_validation_error"') &&
+          line.includes('error="project-context tracker credentials unavailable"'),
+      ),
+    ).toBe(true);
+    expect(logs.some((line) => line.includes('message="orchestrator tick failed"'))).toBe(false);
+    expect(logs.some((line) => line.includes(rawCredentialMessage))).toBe(false);
+    expect(logs.some((line) => line.includes("LINEAR_API_KEY"))).toBe(false);
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
@@ -9505,7 +9614,7 @@ async function runTerminalRunActivityScenario(root: string, terminal: "failed" |
 
   await orchestrator.refreshNow();
   await waitFor(() => harness.runs.length === 1, `${terminal} run-activity harness dispatched`);
-  await waitFor(() => orchestrator.snapshot().counts.running === 0, `${terminal} run-activity harness exited`);
+  await waitFor(() => orchestrator.snapshot().counts.running === 0, `${terminal} run-activity harness exited`, 10_000);
   await settleOrchestratorExit();
   await orchestrator.stop();
 
