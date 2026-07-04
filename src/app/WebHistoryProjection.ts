@@ -199,15 +199,18 @@ export interface HistoryModel {
   defaultSessionId: string;
 }
 
-export function isWebHistoryProjectionPayloadCurrent(value: unknown): value is HistoryModel {
-  if (!isObjectRecord(value)) return false;
-  const sessions = value["sessions"];
-  if (!Array.isArray(sessions)) return false;
-  return sessions.every((session) => {
+export function isWebHistorySessionListCurrent(value: unknown): value is HistoryModel["sessions"] {
+  if (!Array.isArray(value)) return false;
+  return value.every((session) => {
     if (!isObjectRecord(session)) return false;
     const runSession = session["runSession"];
     return hasHistoryProjectContext(session["projectContext"]) && isObjectRecord(runSession) && hasHistoryProjectContext(runSession["projectContext"]);
   });
+}
+
+export function isWebHistoryProjectionPayloadCurrent(value: unknown): value is HistoryModel {
+  if (!isObjectRecord(value)) return false;
+  return isWebHistorySessionListCurrent(value["sessions"]);
 }
 
 export interface WebHistoryActivityItem {

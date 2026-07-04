@@ -508,6 +508,81 @@ describe("/api/v1/web route contracts", () => {
     ]);
   });
 
+  it("invalidates stale durable sidebar payloads missing project context attribution", async () => {
+    const runStore = new RecordingRunStore([
+      runRecordFixture({
+        runId: "run-sidebar-current",
+        sessionId: "session-sidebar-current",
+        issueId: "issue-sidebar-current",
+        issueIdentifier: "ENG-424",
+        updatedAt: "2026-05-31T00:03:00.000Z",
+        completedAt: "2026-05-31T00:03:00.000Z",
+        status: "succeeded",
+      }),
+    ]);
+    const staleSession = historySessionFixture({
+      id: "run-sidebar-current",
+      issue: "ENG-424",
+      title: "ENG-424: Durable sidebar",
+      updatedAt: "2026-05-31T00:03:00.000Z",
+      msgCount: 0,
+      lastEvent: "legacy durable sidebar",
+      toolCount: 0,
+    }) as Record<string, unknown>;
+    const staleRunSession = staleSession["runSession"] as Record<string, unknown>;
+    delete staleSession["projectContext"];
+    delete staleRunSession["projectContext"];
+    const staleSidebar = {
+      providerGates: [],
+      runningAgents: [],
+      reviewIssues: [],
+      activity: [],
+      sessions: [staleSession],
+      chat: [],
+      totals: emptyTotals(),
+    };
+    const sourceRevisions = [{ source: "runs", revision: "9", observedAt: null }];
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+        staleSidebar,
+        { sourceRevisions, revision: 7 },
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server } = createStatusServer(root, {
+      projectionReader,
+      projectionWriter,
+      runStore: runStore.asRunTranscriptStore(),
+      webProjectionRevisionProviders: [
+        {
+          source: "runs",
+          getRevision: () => ({ source: "runs", revision: "9", observedAt: null }),
+        },
+      ],
+    });
+    const address = await server.start();
+    try {
+      const sidebar = await getJson(`${baseUrlFor(address)}/api/v1/web/sidebar`);
+      expect(sidebar.response.headers.get("x-symphony-projection-status")).toBe("stale");
+      expect(sidebar.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(sidebar.body).not.toEqual(staleSidebar);
+      expect(sidebar.body).toMatchObject({
+        providerGates: [],
+        runningAgents: [],
+        reviewIssues: [],
+        activity: [],
+        sessions: [],
+        chat: [],
+      });
+    } finally {
+      await server.stop();
+    }
+
+    expect(projectionWriter.writes).toEqual([]);
+    expect(projectionReader.selectors).toEqual([{ projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" }]);
+  });
+
   it("serves large-volume dashboard, issue board, history, sidebar, and transcript API payloads from durable projections without raw hydration or source-index rebuilds", async () => {
     const issues = Array.from({ length: 360 }, (_, index) => {
       const lane = index % 3 === 0 ? "todo" : index % 3 === 1 ? "progress" : "review";

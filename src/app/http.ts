@@ -109,7 +109,12 @@ import {
   type OrchestratorChatCommandResultStatus,
 } from "../core/orchestrator/OrchestratorChatCommand.js";
 
-import { applyWebHistoryRuntimeLiveness, isWebHistoryProjectionPayloadCurrent, projectWebHistory } from "./WebHistoryProjection.js";
+import {
+  applyWebHistoryRuntimeLiveness,
+  isWebHistoryProjectionPayloadCurrent,
+  isWebHistorySessionListCurrent,
+  projectWebHistory,
+} from "./WebHistoryProjection.js";
 import {
   emptyWebTranscriptProjectionPayload,
   isWebTranscriptProjectionPayload,
@@ -2951,6 +2956,9 @@ export class StatusServer {
     if (record.revision.projectionName === "history_projection" && !isWebHistoryProjectionPayloadCurrent(record.payload)) {
       return false;
     }
+    if (record.revision.projectionName === "sidebar_projection" && !isWebSidebarProjectionPayloadCurrent(record.payload)) {
+      return false;
+    }
 
     const currentRevisions = projectionCurrentSourceRevisionsForRead(
       record.revision.projectionName,
@@ -5727,7 +5735,7 @@ function activityItemForWritebackOperation(
     at: operation.updatedAt,
     kind: "writeback_operation",
     source: "writeback",
-    projectContext: activityProjectContext(operation.projectContext ?? run?.projectContext),
+    projectContext: activityProjectContext(run?.projectContext ?? operation.projectContext),
     issue: {
       id: issueId,
       identifier: issueIdentifier,
@@ -5768,6 +5776,11 @@ function activityItemForWritebackOperation(
 
 function activityProjectContext(projectContext: Partial<ProjectContextResolution> | null | undefined): ProjectContextResolution {
   return normalizeProjectContextResolution(projectContext);
+}
+
+function isWebSidebarProjectionPayloadCurrent(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return isWebHistorySessionListCurrent((value as { sessions?: unknown }).sessions);
 }
 
 function writebackSkipReason(operation: WritebackOperation): WritebackSkipReason | null {

@@ -3917,10 +3917,22 @@ describe("StatusServer durable API", () => {
           msgCount: number;
           lastEvent: string;
           toolCount: number;
+          projectContext: {
+            projectContextId: string;
+            projectContextLabel: string;
+            linearProjectSlug: string | null;
+            routingSource: string;
+          };
           runSession: {
             runId: string;
             sessionId: string | null;
             agentId: string | null;
+            projectContext: {
+              projectContextId: string;
+              projectContextLabel: string;
+              linearProjectSlug: string | null;
+              routingSource: string;
+            };
             role: string;
             runPhase: string | null;
             runKind: string | null;
@@ -3947,6 +3959,7 @@ describe("StatusServer durable API", () => {
         "lastEvent",
         "model",
         "msgCount",
+        "projectContext",
         "runSession",
         "startedAt",
         "state",
@@ -3963,10 +3976,22 @@ describe("StatusServer durable API", () => {
         msgCount: 1,
         lastEvent: "TEST-1 not live",
         toolCount: 0,
+        projectContext: {
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+          linearProjectSlug: null,
+          routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+        },
         runSession: {
           runId: "web-run-1",
           sessionId: "cursor-session-1",
           agentId: "agent-1",
+          projectContext: {
+            projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+            projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+            linearProjectSlug: null,
+            routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+          },
           role: "worker",
           runPhase: "implementation",
           runKind: "implementation",
@@ -6244,6 +6269,7 @@ describe("StatusServer durable API", () => {
         (item) => item.kind === "writeback_operation" && item.run?.runId === "run-docs-activity-1",
       );
       expect(runBackedWritebackItem).toMatchObject({
+        projectContext: docsProjectContext,
         issue: { id: docsIssue.id, identifier: docsIssue.identifier },
         run: { runId: "run-docs-activity-1", role: "worker" },
         writeback: { operationKind: "comment", status: "pending" },
