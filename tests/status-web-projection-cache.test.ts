@@ -123,6 +123,75 @@ describe("StatusServer web projection context cache", () => {
     expect(builds).toBe(2);
   });
 
+  it("rebuilds before TTL expiry when the default project context changes", async () => {
+    let builds = 0;
+    const server = createStatusServer({
+      generatedAt: () => "2026-01-01T00:00:00.000Z",
+      clock: () => new Date("2026-01-01T00:00:00.000Z"),
+      builder: (input) => {
+        builds += 1;
+        return contextFixture(input, builds);
+      },
+    });
+    server.setDefaultProjectContextId("symphony");
+    const acquire = acquireFrom(server);
+
+    const first = await acquire(false);
+    expect(first.metadata.fingerprint.defaultProjectContextId).toBe("symphony");
+
+    server.setDefaultProjectContextId("docs");
+    const changed = await acquire(false);
+    expect(changed).not.toBe(first);
+    expect(projectedBuild(changed)).toBe(2);
+    expect(changed.metadata.fingerprint.defaultProjectContextId).toBe("docs");
+
+    await expect(acquire(false)).resolves.toBe(changed);
+    expect(builds).toBe(2);
+  });
+
+  it("does not reuse an in-flight build after the default project context changes", async () => {
+    const pendingBuilds: Array<{
+      build: number;
+      input: StatusServerWebProjectionContextBuildInput;
+      deferred: Deferred<StatusServerWebProjectionContext>;
+    }> = [];
+    let builds = 0;
+    const server = createStatusServer({
+      generatedAt: () => "2026-01-01T00:00:00.000Z",
+      clock: () => new Date("2026-01-01T00:00:00.000Z"),
+      builder: (input) => {
+        builds += 1;
+        const deferredBuild = deferred<StatusServerWebProjectionContext>();
+        pendingBuilds.push({ build: builds, input, deferred: deferredBuild });
+        return deferredBuild.promise;
+      },
+    });
+    server.setDefaultProjectContextId("symphony");
+    const acquire = acquireFrom(server);
+
+    const first = acquire(false);
+    await settleMicrotasks();
+    expect(builds).toBe(1);
+
+    server.setDefaultProjectContextId("docs");
+    const second = acquire(false);
+    await settleMicrotasks();
+    expect(builds).toBe(2);
+
+    const firstPending = pendingBuilds[0];
+    const secondPending = pendingBuilds[1];
+    if (!firstPending || !secondPending) throw new Error("expected pending builds for both default contexts");
+    firstPending.deferred.resolve(contextFixture(firstPending.input, firstPending.build));
+    secondPending.deferred.resolve(contextFixture(secondPending.input, secondPending.build));
+
+    const [firstContext, secondContext] = await Promise.all([first, second]);
+    expect(firstContext).not.toBe(secondContext);
+    expect(firstContext.metadata.fingerprint.defaultProjectContextId).toBe("symphony");
+    expect(secondContext.metadata.fingerprint.defaultProjectContextId).toBe("docs");
+    await expect(acquire(false)).resolves.toBe(secondContext);
+    expect(builds).toBe(2);
+  });
+
   it("coalesces concurrent non-refresh requests onto the same in-flight build", async () => {
     const pendingBuilds: Array<{
       build: number;

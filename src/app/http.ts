@@ -3181,6 +3181,7 @@ export class StatusServer {
     const sourceIndex = await buildWebProjectionSourceIndex({
       snapshot: input.snapshot,
       issueBoardColumns: input.issueBoardColumns,
+      defaultProjectContextId: this.options.defaultProjectContextId,
       ...(this.options.tracker
         ? { fetchTrackerProjection: ({ columns, forceRefresh }) => this.fetchIssueBoardTrackerProjection(columns, forceRefresh, input.clock) }
         : {}),
@@ -3258,6 +3259,7 @@ export class StatusServer {
     ]);
     return createWebProjectionFingerprint({
       runtimeGeneratedAt: statusServerRuntimeFingerprintKey(snapshot),
+      defaultProjectContextId: this.options.defaultProjectContextId,
       issueBoardStates: [issueBoardFetchedStateCacheKey(fetchedStates)],
       issueBoardColumns: issueBoardColumnCacheKeyValues(issueBoardColumns),
       durableSourceRevisions,
