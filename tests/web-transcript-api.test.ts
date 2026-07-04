@@ -415,9 +415,115 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
           strategy: "refetch",
           reason: "tail-gap",
         },
+        source: {
+          runId: "envelope-run",
+          sessionId: "envelope-session",
+          issueId: "test-1",
+          issueIdentifier: "TEST-1",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+          workspace: {
+            key: "TEST-1",
+            path: path.join(config.workspace.root, "TEST-1"),
+          },
+        },
       });
       expect(projectionReader.selectors).toEqual([
         { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "envelope-run:offset:0:limit:1" },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("backfills source metadata for durable transcript window envelopes missing source", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "source-backfill-run", sessionId: "source-backfill-session", issueIdentifier: "TEST-1" });
+    const durableMessages = [{ kind: "assistant", text: "durable page event" }];
+    const projectionReader = new StaticProjectionReader(
+      {
+        schemaVersion: 1,
+        messages: durableMessages,
+        page: {
+          offset: 0,
+          limit: 1,
+          size: 1,
+          total: 1,
+          nextOffset: null,
+          previousOffset: null,
+          hasNext: false,
+          hasPrevious: false,
+          firstSequence: null,
+          lastSequence: null,
+          lastEventAt: null,
+        },
+        window: {
+          kind: "page",
+          tailLimit: 1,
+          messageCount: 1,
+          requested: { offset: 0, limit: 1 },
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          runStatus: "running",
+          tailLimit: 1,
+          afterSequence: null,
+          lastEventAt: null,
+          refetchHref: null,
+          gapFallback: { strategy: "refetch", reason: "tail-gap", href: null },
+        },
+        recovery: { strategy: "refetch", reason: "tail-gap", href: null },
+        compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+      },
+      [{ source: "runStore", revision: runStore.projectionRevision(), observedAt: null }],
+    );
+    const server = createServer(config, runStore, { projectionReader });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/source-backfill-run/transcript?offset=0&limit=1`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(transcriptMessages(body)).toEqual(durableMessages);
+      expect(body).toMatchObject({
+        source: {
+          runId: "source-backfill-run",
+          sessionId: "source-backfill-session",
+          issueId: "test-1",
+          issueIdentifier: "TEST-1",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+          workspace: {
+            key: "TEST-1",
+            path: path.join(config.workspace.root, "TEST-1"),
+          },
+          cursors: {
+            offset: 0,
+            limit: 1,
+            nextOffset: null,
+            previousOffset: null,
+            total: 1,
+            windowKind: "page",
+            hasNext: false,
+            hasPrevious: false,
+            eventCount: 1,
+            firstSequence: null,
+            lastSequence: null,
+            lastEventAt: null,
+          },
+        },
+      });
+      expect(projectionReader.selectors).toEqual([
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "source-backfill-run:offset:0:limit:1" },
       ]);
     } finally {
       await server.stop();
@@ -1105,6 +1211,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
           from: "orchestrator",
           issue: "TEST-1",
           text: "Implement the requested web transcript route",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
         },
         { kind: "status", state: "warming", ts: "2026-01-01T00:00:01.000Z", text: "status public preview" },
         {
@@ -1291,6 +1403,7 @@ function transcriptMessages(body: unknown): Array<Record<string, unknown>> {
     window: expect.any(Object),
     activeTail: expect.any(Object),
     recovery: expect.any(Object),
+    source: expect.any(Object),
     compatibility: { responseShape: "transcript_window", messagesField: "messages" },
   });
   return (body as { messages: Array<Record<string, unknown>> }).messages;
@@ -1338,6 +1451,12 @@ function expectRunPrelude(body: Array<Record<string, unknown>>, expected: { sess
       session: expected.session,
       tools: [],
       note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
+      projectContext: {
+        id: "default",
+        label: "Default",
+        linearProject: null,
+        codebase: null,
+      },
     },
     {
       kind: "user",
@@ -1345,6 +1464,12 @@ function expectRunPrelude(body: Array<Record<string, unknown>>, expected: { sess
       from: "orchestrator",
       issue: expected.issue,
       text: "Implement the requested web transcript route",
+      projectContext: {
+        id: "default",
+        label: "Default",
+        linearProject: null,
+        codebase: null,
+      },
     },
   ]);
 }

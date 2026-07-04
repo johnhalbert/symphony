@@ -583,7 +583,10 @@ function normalizeOptionalNonEmptyString(value: string | null | undefined): stri
   return normalized.length === 0 ? null : normalized;
 }
 
-function publicRepositorySummary(value: string | null | undefined): string | null {
+export function publicRepositorySummary(
+  value: string | null | undefined,
+  options: { allowLocalPath?: boolean } = {},
+): string | null {
   const normalized = normalizeOptionalNonEmptyString(value);
   if (normalized === null) return null;
 
@@ -598,9 +601,9 @@ function publicRepositorySummary(value: string | null | undefined): string | nul
   if (sanitizedAtSign !== null) return sanitizedAtSign;
 
   const strippedSuffix = stripRepositoryQueryAndFragment(normalized);
-  if (strippedSuffix !== normalized) return publicRepositorySummary(strippedSuffix);
+  if (strippedSuffix !== normalized) return publicRepositorySummary(strippedSuffix, options);
 
-  if (looksLikeLocalRepositoryPath(normalized)) return normalized;
+  if (looksLikeLocalRepositoryPath(normalized)) return options.allowLocalPath === false ? null : normalized;
   return sanitizedHostIdentifierRepositorySummary(normalized);
 }
 

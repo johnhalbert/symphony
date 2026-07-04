@@ -1,3 +1,4 @@
+import { publicRepositorySummary } from "../core/config/ProjectContexts.js";
 import { redactTranscriptText, sanitizeCommandPolicyPayloadForPublicOutput, sanitizePublicJson, sanitizedDeltaTextValue, sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
 import { projectWebTranscript as projectSharedWebTranscript } from "./WebTranscriptProjectionCore.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage } from "../core/persistence/RunTranscriptStore.js";
@@ -20,6 +21,43 @@ export interface CommandPolicyStatusDetails {
   permissionOutcome?: string;
 }
 
+export interface WebTranscriptProjectContextModel {
+  id: string;
+  label: string;
+  linearProject: string | null;
+  codebase: string | null;
+}
+
+export interface WebTranscriptWorkspaceIdentityModel {
+  key: string | null;
+  path: string | null;
+}
+
+export interface WebTranscriptSourceCursorModel {
+  offset: number;
+  limit: number;
+  nextOffset: number | null;
+  previousOffset: number | null;
+  total: number | null;
+  windowKind: "page" | "tail";
+  hasNext: boolean;
+  hasPrevious: boolean;
+  eventCount: number;
+  firstSequence: number | null;
+  lastSequence: number | null;
+  lastEventAt: string | null;
+}
+
+export interface WebTranscriptSourceModel {
+  runId: string;
+  sessionId: string | null;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  projectContext: WebTranscriptProjectContextModel | null;
+  workspace: WebTranscriptWorkspaceIdentityModel | null;
+  cursors: WebTranscriptSourceCursorModel;
+}
+
 export type TranscriptMessage =
   | {
       kind: "system";
@@ -30,8 +68,16 @@ export type TranscriptMessage =
       session: string;
       tools: string[];
       note: string;
+      projectContext?: WebTranscriptProjectContextModel | null;
     }
-  | { kind: "user"; ts: string; from: string; issue: string; text: string }
+  | {
+      kind: "user";
+      ts: string;
+      from: string;
+      issue: string;
+      text: string;
+      projectContext?: WebTranscriptProjectContextModel | null;
+    }
   | { kind: "assistant"; ts: string; text: string }
   | { kind: "thinking"; ts: string; text: string }
   | {
@@ -100,6 +146,7 @@ export interface WebTranscriptProjectionPayload {
     reason: "tail-gap";
     href: string | null;
   };
+  source: WebTranscriptSourceModel;
   compatibility: {
     responseShape: "transcript_window";
     messagesField: "messages";
@@ -136,6 +183,7 @@ export function projectWebTranscriptWindow(
   const pageModel = webTranscriptWindowPageModel(page);
   const windowKind = options.kind ?? page.windowKind ?? (options.requestedPage ? "page" : "tail");
   const refetchHref = options.refetchHref ?? webTranscriptRefetchHref(options.run ?? null);
+  const source = projectTranscriptSourceMetadata(options.run ?? null, page, pageModel, windowKind);
   const window: WebTranscriptWindowModel = {
     ...pageModel,
     kind: windowKind,
@@ -164,6 +212,7 @@ export function projectWebTranscriptWindow(
       gapFallback: recovery,
     },
     recovery,
+    source,
     compatibility: {
       responseShape: "transcript_window",
       messagesField: "messages",
@@ -209,12 +258,18 @@ export function isWebTranscriptProjectionPayload(value: unknown): value is WebTr
     isObjectRecord(record.window) &&
     isObjectRecord(record.activeTail) &&
     isObjectRecord(record.recovery) &&
+    isWebTranscriptSourceRecord(record.source) &&
     isObjectRecord(record.compatibility)
   );
 }
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isWebTranscriptSourceRecord(value: unknown): value is WebTranscriptSourceModel {
+  if (!isObjectRecord(value)) return false;
+  return typeof value.runId === "string" && value.runId.length > 0 && isObjectRecord(value.cursors);
 }
 
 function webTranscriptWindowPageModel(page: TranscriptPage): WebTranscriptWindowPageModel {
@@ -595,7 +650,8 @@ function projectTerminalStatusMessage(
 
 function projectRunPreludeMessages(run: RunRecord, existingMessages: readonly TranscriptMessage[]): TranscriptMessage[] {
   const messages: TranscriptMessage[] = [];
-  if (!existingMessages.some((message) => message.kind === "system")) messages.push(projectRunSystemMessage(run));
+  const projectContext = projectRunProjectContext(run);
+  if (!existingMessages.some((message) => message.kind === "system")) messages.push(projectRunSystemMessage(run, projectContext));
   const promptText = publicMultilineText(run.prompt, USER_PROMPT_MAX_LENGTH);
   if (promptText && !existingMessages.some((message) => message.kind === "user")) {
     messages.push({
@@ -604,12 +660,16 @@ function projectRunPreludeMessages(run: RunRecord, existingMessages: readonly Tr
       from: "orchestrator",
       issue: firstCleanString(run.issueIdentifier, run.issueId) ?? "",
       text: promptText,
+      ...(projectContext ? { projectContext } : {}),
     });
   }
   return messages;
 }
 
-function projectRunSystemMessage(run: RunRecord): TranscriptMessage {
+function projectRunSystemMessage(
+  run: RunRecord,
+  projectContext: WebTranscriptProjectContextModel | null = projectRunProjectContext(run),
+): TranscriptMessage {
   const phase = firstCleanString(run.runPhase, run.runKind, run.role) ?? run.role;
   const note = `Initialized ${phase} run from persisted run metadata. System prompt redacted.`;
   return {
@@ -621,6 +681,62 @@ function projectRunSystemMessage(run: RunRecord): TranscriptMessage {
     session: firstCleanString(run.sessionId, run.runId) ?? run.runId,
     tools: [],
     note: firstCleanString(note) ?? note,
+    ...(projectContext ? { projectContext } : {}),
+  };
+}
+
+function projectRunProjectContext(run: RunRecord | null | undefined): WebTranscriptProjectContextModel | null {
+  if (!run) return null;
+  const id = firstCleanString(run.projectContext?.projectContextId, run.projectContext?.projectContextLabel);
+  const label = firstCleanString(run.projectContext?.projectContextLabel, run.projectContext?.projectContextId, id);
+  const linearProject = firstCleanString(run.projectContext?.linearProjectSlug);
+  const codebase = publicRepositorySummary(run.repoPath, { allowLocalPath: false });
+  if (!id && !label && !linearProject) return null;
+  const resolvedId = id ?? label ?? "";
+  const resolvedLabel = label ?? resolvedId;
+  return {
+    id: resolvedId,
+    label: resolvedLabel,
+    linearProject,
+    codebase,
+  };
+}
+
+function projectRunWorkspaceIdentity(run: RunRecord | null | undefined): WebTranscriptWorkspaceIdentityModel | null {
+  if (!run) return null;
+  const key = firstCleanString(run.workspaceKey);
+  const path = firstCleanString(run.workspacePath);
+  if (!key && !path) return null;
+  return { key, path };
+}
+
+function projectTranscriptSourceMetadata(
+  run: RunRecord | null | undefined,
+  page: TranscriptPage,
+  pageModel: WebTranscriptWindowPageModel,
+  windowKind: "page" | "tail",
+): WebTranscriptSourceModel {
+  return {
+    runId: firstCleanString(run?.runId, page.runId) ?? page.runId,
+    sessionId: firstCleanString(run?.sessionId),
+    issueId: firstCleanString(run?.issueId),
+    issueIdentifier: firstCleanString(run?.issueIdentifier),
+    projectContext: projectRunProjectContext(run),
+    workspace: projectRunWorkspaceIdentity(run),
+    cursors: {
+      offset: pageModel.offset,
+      limit: pageModel.limit,
+      nextOffset: pageModel.nextOffset,
+      previousOffset: pageModel.previousOffset,
+      total: pageModel.total,
+      windowKind,
+      hasNext: pageModel.hasNext,
+      hasPrevious: pageModel.hasPrevious,
+      eventCount: pageModel.size,
+      firstSequence: pageModel.firstSequence,
+      lastSequence: pageModel.lastSequence,
+      lastEventAt: pageModel.lastEventAt,
+    },
   };
 }
 
