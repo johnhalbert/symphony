@@ -4017,7 +4017,6 @@ function webTranscriptProjectionResponseBody(
     sourceCursors?: Record<string, unknown> | null;
   },
 ): WebTranscriptProjectionPayload {
-  if (isWebTranscriptProjectionPayload(body)) return body;
   const record = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
   const pageRecord = record?.page && typeof record.page === "object" && !Array.isArray(record.page) ? (record.page as Record<string, unknown>) : null;
   const windowRecord = record?.window && typeof record.window === "object" && !Array.isArray(record.window) ? (record.window as Record<string, unknown>) : null;
@@ -4056,12 +4055,76 @@ function webTranscriptProjectionResponseBody(
     lastSequence: optionalNumber(pageRecord?.lastSequence) ?? optionalNumber(cursor.lastSequence),
     lastEventAt: optionalString(pageRecord?.lastEventAt) ?? optionalString(cursor.lastEventAt),
   };
-  return projectWebTranscriptWindow(page, messages, {
+  const projection = projectWebTranscriptWindow(page, messages, {
     run: input.run,
     requestedPage: input.requestedPage,
     tailLimit: limit,
     kind,
+    sourceIdentity: transcriptSourceIdentityFallback(cursor),
   });
+  if (isWebTranscriptProjectionPayload(body)) {
+    return {
+      ...body,
+      source: mergeWebTranscriptSourceRecord(body.source, projection.source),
+    };
+  }
+  if (isBackfillableWebTranscriptProjectionEnvelope(record)) {
+    return {
+      ...projection,
+      ...record,
+      source: projection.source,
+    };
+  }
+  return projection;
+}
+
+function isBackfillableWebTranscriptProjectionEnvelope(
+  value: Record<string, unknown> | null,
+): value is Omit<WebTranscriptProjectionPayload, "source"> & { source?: unknown } {
+  if (!value) return false;
+  return (
+    value.schemaVersion === 1 &&
+    Array.isArray(value.messages) &&
+    isRecordObject(value.page) &&
+    isRecordObject(value.window) &&
+    isRecordObject(value.activeTail) &&
+    isRecordObject(value.recovery) &&
+    !isWebTranscriptSourceRecordLike(value.source) &&
+    isRecordObject(value.compatibility)
+  );
+}
+
+function isWebTranscriptSourceRecordLike(value: unknown): value is WebTranscriptProjectionPayload["source"] {
+  return isRecordObject(value) && typeof value.runId === "string" && value.runId.length > 0 && isRecordObject(value.cursors);
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function transcriptSourceIdentityFallback(
+  sourceCursors: Record<string, unknown> | null | undefined,
+): { sessionId?: string | null; issueIdentifier?: string | null } | null {
+  if (!sourceCursors) return null;
+  const sessionId = optionalString(sourceCursors.sessionId);
+  const issueIdentifier = optionalString(sourceCursors.issueKey);
+  if (!sessionId && !issueIdentifier) return null;
+  return { sessionId, issueIdentifier };
+}
+
+function mergeWebTranscriptSourceRecord(
+  source: WebTranscriptProjectionPayload["source"],
+  fallback: WebTranscriptProjectionPayload["source"],
+): WebTranscriptProjectionPayload["source"] {
+  return {
+    runId: optionalString(source.runId) ?? fallback.runId,
+    sessionId: optionalString(source.sessionId) ?? fallback.sessionId,
+    issueId: optionalString(source.issueId) ?? fallback.issueId,
+    issueIdentifier: optionalString(source.issueIdentifier) ?? fallback.issueIdentifier,
+    projectContext: isRecordObject(source.projectContext) ? source.projectContext : fallback.projectContext,
+    workspace: isRecordObject(source.workspace) ? source.workspace : fallback.workspace,
+    cursors: isRecordObject(source.cursors) ? source.cursors : fallback.cursors,
+  };
 }
 
 function optionalNumber(value: unknown): number | null {
