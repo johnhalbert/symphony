@@ -3181,6 +3181,7 @@ export class StatusServer {
     const sourceIndex = await buildWebProjectionSourceIndex({
       snapshot: input.snapshot,
       issueBoardColumns: input.issueBoardColumns,
+      defaultProjectContextId: this.options.defaultProjectContextId,
       ...(this.options.tracker
         ? { fetchTrackerProjection: ({ columns, forceRefresh }) => this.fetchIssueBoardTrackerProjection(columns, forceRefresh, input.clock) }
         : {}),

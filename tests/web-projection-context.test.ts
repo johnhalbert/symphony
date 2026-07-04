@@ -402,6 +402,250 @@ describe("WebProjectionContext contracts and cache key utilities", () => {
     ]);
   });
 
+  it("adds context-qualified source aliases when duplicate identifiers appear across project contexts", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const defaultIssue = {
+      id: "issue-id-1",
+      identifier: "ENG-1",
+      title: "Build projection indexes",
+      description: null,
+      priority: null,
+      state: "Todo",
+      branchName: null,
+      url: null,
+      assigneeId: null,
+      delegateId: null,
+      assignedToWorker: true,
+      labels: [],
+      blockedBy: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:03.000Z",
+    };
+    const docsIssue = { ...defaultIssue, id: "issue-id-docs", projectContext: docsProjectContext };
+    const defaultSnapshot = runtimeSnapshotFixture({ runId: "run-shared", sessionId: "session-default" });
+    const defaultRunning = defaultSnapshot.running[0];
+    const docsRunning = {
+      ...runtimeSnapshotFixture({ runId: "run-shared", sessionId: "session-docs" }).running[0],
+      issueId: "issue-id-docs",
+      issueDetails: docsIssue,
+      projectContext: docsProjectContext,
+    };
+    const defaultRun = runRecordFixture({ runId: "run-shared", sessionId: "session-default", updatedAt: "2026-01-01T00:00:01.000Z" });
+    const docsRun = {
+      ...runRecordFixture({ runId: "run-shared", sessionId: "session-docs", updatedAt: "2026-01-01T00:00:02.000Z" }),
+      issueId: "issue-id-docs",
+      projectContext: docsProjectContext,
+    };
+    const defaultWorkspace = {
+      workspaceKey: "workspace-1",
+      issueId: "issue-id-1",
+      issueIdentifier: "ENG-1",
+      path: "/tmp/workspace-default",
+      sourceKind: "git",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:03.000Z",
+    };
+    const docsWorkspace = {
+      ...defaultWorkspace,
+      issueId: "issue-id-docs",
+      path: "/tmp/workspace-docs",
+      projectContext: docsProjectContext,
+      updatedAt: "2026-01-01T00:00:02.000Z",
+    };
+    const defaultLifecycle = lifecycleRecordFixture({ updatedAt: "2026-01-01T00:00:04.000Z" });
+    const docsLifecycle = {
+      ...lifecycleRecordFixture({ updatedAt: "2026-01-01T00:00:03.000Z" }),
+      issueId: "issue-id-docs",
+      projectContext: docsProjectContext,
+    };
+
+    const sourceIndex = await buildWebProjectionSourceIndex({
+      snapshot: {
+        ...defaultSnapshot,
+        counts: { ...defaultSnapshot.counts, running: 2 },
+        running: [defaultRunning, docsRunning],
+      },
+      trackerProjection: {
+        fetchedStates: ["Todo"],
+        trackerIssues: [defaultIssue, docsIssue],
+        fetchedAt: "2026-01-01T00:00:05.000Z",
+        cached: true,
+      },
+      runStore: {
+        async listRuns() {
+          return [docsRun, defaultRun];
+        },
+        async listWorkspaces() {
+          return [defaultWorkspace, docsWorkspace];
+        },
+      },
+      lifecycleStore: {
+        async list() {
+          return [defaultLifecycle, docsLifecycle];
+        },
+      },
+      clock: () => new Date("2026-01-01T00:00:06.000Z"),
+    });
+
+    expect(sourceIndex.trackerIssues.byAlias.get("ENG-1")).toBe(defaultIssue);
+    expect(sourceIndex.trackerIssues.byAlias.get("issue-id-docs")).toBe(docsIssue);
+    expect(sourceIndex.trackerIssues.byAlias.get("docs:ENG-1")).toBe(docsIssue);
+    expect(sourceIndex.runtime.runningByAlias.get("run-shared")?.sessionId).toBe("session-default");
+    expect(sourceIndex.runtime.runningByAlias.get("issue-id-docs")?.sessionId).toBe("session-docs");
+    expect(sourceIndex.runtime.runningByAlias.get("docs:run-shared")?.sessionId).toBe("session-docs");
+    expect(sourceIndex.runs.byAlias.get("run-shared")?.map((run) => run.sessionId)).toEqual(["session-default"]);
+    expect(sourceIndex.runs.byAlias.get("docs:run-shared")?.map((run) => run.sessionId)).toEqual(["session-docs"]);
+    expect(sourceIndex.runs.latestByAlias.get("docs:ENG-1")).toBe(docsRun);
+    expect(sourceIndex.workspaces.byAlias.get("workspace-1")).toBe(defaultWorkspace);
+    expect(sourceIndex.workspaces.byAlias.get("docs:workspace-1")).toBe(docsWorkspace);
+    expect(sourceIndex.lifecycles.byAlias.get("issue-id-1")).toBe(defaultLifecycle);
+    expect(sourceIndex.lifecycles.byAlias.get("issue-id-docs")).toBe(docsLifecycle);
+  });
+
+  it("keeps shared raw issue aliases scoped to the configured default project context when non-default siblings also have contextual aliases", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "SYMPHONY",
+      routingSource: "configured_default",
+    } as const;
+    const defaultIssue = {
+      id: "issue-id-1",
+      identifier: "ENG-1",
+      title: "Build projection indexes",
+      description: null,
+      priority: null,
+      state: "Todo",
+      branchName: null,
+      url: null,
+      assigneeId: null,
+      delegateId: null,
+      assignedToWorker: true,
+      labels: [],
+      blockedBy: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:03.000Z",
+      projectContext: symphonyProjectContext,
+    };
+    const docsIssue = { ...defaultIssue, id: "issue-id-docs", projectContext: docsProjectContext };
+    const defaultSnapshot = runtimeSnapshotFixture({ runId: "run-default", sessionId: "session-default" });
+    const docsSnapshot = runtimeSnapshotFixture({ runId: "run-docs", sessionId: "session-docs" });
+    const defaultRunning = {
+      ...defaultSnapshot.running[0],
+      issueDetails: defaultIssue,
+      projectContext: symphonyProjectContext,
+    };
+    const docsRunning = {
+      ...docsSnapshot.running[0],
+      issueId: "issue-id-docs",
+      workspacePath: "/tmp/workspace-docs",
+      metadata: {
+        ...docsSnapshot.running[0].metadata,
+        workspaceKey: "workspace-docs",
+        workspacePath: "/tmp/workspace-docs",
+      },
+      issueDetails: docsIssue,
+      projectContext: docsProjectContext,
+    };
+    const defaultRun = {
+      ...runRecordFixture({ runId: "run-default", sessionId: "session-default", updatedAt: "2026-01-01T00:00:01.000Z" }),
+      projectContext: symphonyProjectContext,
+    };
+    const docsRun = {
+      ...runRecordFixture({ runId: "run-docs", sessionId: "session-docs", updatedAt: "2026-01-01T00:00:02.000Z" }),
+      issueId: "issue-id-docs",
+      workspaceKey: "workspace-docs",
+      workspacePath: "/tmp/workspace-docs",
+      projectContext: docsProjectContext,
+    };
+    const defaultWorkspace = {
+      workspaceKey: "workspace-1",
+      issueId: null,
+      issueIdentifier: "ENG-1",
+      projectContext: symphonyProjectContext,
+      path: "/tmp/workspace-default",
+      sourceKind: "git",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:03.000Z",
+    };
+    const docsWorkspace = {
+      ...defaultWorkspace,
+      workspaceKey: "workspace-docs",
+      issueId: "issue-id-docs",
+      path: "/tmp/workspace-docs",
+      projectContext: docsProjectContext,
+      updatedAt: "2026-01-01T00:00:04.000Z",
+    };
+    const defaultLifecycle = {
+      ...lifecycleRecordFixture({ updatedAt: "2026-01-01T00:00:04.000Z" }),
+      projectContext: symphonyProjectContext,
+    };
+    const docsLifecycle = {
+      ...lifecycleRecordFixture({ updatedAt: "2026-01-01T00:00:05.000Z" }),
+      issueId: "issue-id-docs",
+      projectContext: docsProjectContext,
+    };
+
+    const sourceIndex = await buildWebProjectionSourceIndex({
+      snapshot: {
+        ...defaultSnapshot,
+        counts: { ...defaultSnapshot.counts, running: 2 },
+        running: [docsRunning, defaultRunning],
+      },
+      trackerProjection: {
+        fetchedStates: ["Todo"],
+        trackerIssues: [docsIssue, defaultIssue],
+        fetchedAt: "2026-01-01T00:00:05.000Z",
+        cached: true,
+      },
+      runStore: {
+        async listRuns() {
+          return [defaultRun, docsRun];
+        },
+        async listWorkspaces() {
+          return [defaultWorkspace, docsWorkspace];
+        },
+      },
+      lifecycleStore: {
+        async list() {
+          return [defaultLifecycle, docsLifecycle];
+        },
+      },
+      clock: () => new Date("2026-01-01T00:00:06.000Z"),
+      defaultProjectContextId: symphonyProjectContext.projectContextId,
+    });
+
+    expect(sourceIndex.trackerIssues.byAlias.get("ENG-1")).toBe(defaultIssue);
+    expect(sourceIndex.trackerIssues.byAlias.get("issue-id-docs")).toBe(docsIssue);
+    expect(sourceIndex.trackerIssues.byAlias.get("docs:ENG-1")).toBe(docsIssue);
+    expect(sourceIndex.runtime.runningByAlias.get("ENG-1")?.runId).toBe("run-default");
+    expect(sourceIndex.runtime.runningByAlias.get("issue-id-docs")?.runId).toBe("run-docs");
+    expect(sourceIndex.runtime.runningByAlias.get("docs:ENG-1")?.runId).toBe("run-docs");
+    expect(sourceIndex.runs.byAlias.get("ENG-1")?.map((run) => run.runId)).toEqual(["run-default"]);
+    expect(sourceIndex.runs.latestByAlias.get("ENG-1")).toBe(defaultRun);
+    expect(sourceIndex.runs.byAlias.get("issue-id-docs")?.map((run) => run.runId)).toEqual(["run-docs"]);
+    expect(sourceIndex.runs.byAlias.get("run-docs")?.map((run) => run.runId)).toEqual(["run-docs"]);
+    expect(sourceIndex.runs.latestByAlias.get("docs:ENG-1")).toBe(docsRun);
+    expect(sourceIndex.workspaces.byAlias.get("ENG-1")).toBe(defaultWorkspace);
+    expect(sourceIndex.workspaces.byAlias.get("issue-id-docs")).toBe(docsWorkspace);
+    expect(sourceIndex.workspaces.byAlias.get("workspace-docs")).toBe(docsWorkspace);
+    expect(sourceIndex.workspaces.byAlias.get("docs:ENG-1")).toBe(docsWorkspace);
+    expect(sourceIndex.lifecycles.byAlias.get("ENG-1")).toBe(defaultLifecycle);
+    expect(sourceIndex.lifecycles.byAlias.get("issue-id-docs")).toBe(docsLifecycle);
+    expect(sourceIndex.lifecycles.byAlias.get("docs:ENG-1")).toBe(docsLifecycle);
+  });
+
   it("records tracker unavailability in the source index while still indexing local durable sources", async () => {
     const sourceIndex = await buildWebProjectionSourceIndex({
       fetchedStates: ["Todo", "In Review"],

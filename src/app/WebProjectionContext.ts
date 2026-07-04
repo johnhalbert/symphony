@@ -1,4 +1,5 @@
 import type { RuntimeSnapshot } from "../core/orchestrator/Orchestrator.js";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID, normalizeProjectContextId, projectContextResolutionFromIssue } from "../core/config/ProjectContexts.js";
 import type { Issue, IssueBoardColumnId, IssueBoardColumnMapping, TrackerStateLists } from "../core/types.js";
 import { errorMessage, SymphonyError } from "../core/errors.js";
 import type { IssueLifecycleRecord, IssueLifecycleStore } from "../core/persistence/IssueLifecycleStore.js";
@@ -26,6 +27,17 @@ export interface WebProjectionIssueKeyAliasInput {
 
 export type WebProjectionIssueKeyAliasField = keyof WebProjectionIssueKeyAliasInput;
 
+interface WebProjectionIssueKeyAliasDescriptor {
+  alias: string;
+  contextual: boolean;
+}
+
+interface WebProjectionContextAwareAliasBundle {
+  projectContextId: string;
+  rawAliases: readonly WebProjectionIssueKeyAliasDescriptor[];
+  contextualAliases: readonly string[];
+}
+
 export const WEB_PROJECTION_ISSUE_KEY_ALIAS_FIELDS: readonly WebProjectionIssueKeyAliasField[] = [
   "issueId",
   "issueIdentifier",
@@ -33,6 +45,15 @@ export const WEB_PROJECTION_ISSUE_KEY_ALIAS_FIELDS: readonly WebProjectionIssueK
   "runId",
   "sessionId",
 ] as const;
+
+const WEB_PROJECTION_CONTEXTUAL_ALIAS_FIELDS: readonly WebProjectionIssueKeyAliasField[] = [
+  "issueId",
+  "issueIdentifier",
+  "workspaceKey",
+  "runId",
+] as const;
+
+const WEB_PROJECTION_CONTEXTUAL_ALIAS_FIELD_SET = new Set<WebProjectionIssueKeyAliasField>(WEB_PROJECTION_CONTEXTUAL_ALIAS_FIELDS);
 
 export interface WebProjectionCacheKeyParts {
   namespace: string;
@@ -183,6 +204,7 @@ export type WebProjectionTrackerProjectionFetcher<TIssue = Issue> = (
 export interface WebProjectionSourceIndexBuildOptions {
   snapshot?: RuntimeSnapshot;
   orchestrator?: { snapshot(): RuntimeSnapshot };
+  defaultProjectContextId?: string | null | undefined;
   tracker?: Pick<TrackerClient, "fetchIssuesByStates"> | null;
   trackerProjection?: WebProjectionIssueTrackerProjection | null;
   fetchTrackerProjection?: WebProjectionTrackerProjectionFetcher;
@@ -232,6 +254,7 @@ export async function buildWebProjectionSourceIndex(
 
   const [trackerIssues, runs, workspaces, lifecycles, writebackOperations] = await Promise.all([
     buildTrackerIssueSourceIndex({
+      defaultProjectContextId: options.defaultProjectContextId,
       tracker: options.tracker ?? null,
       trackerProjection: options.trackerProjection ?? null,
       ...(options.fetchTrackerProjection ? { fetchTrackerProjection: options.fetchTrackerProjection } : {}),
@@ -246,10 +269,10 @@ export async function buildWebProjectionSourceIndex(
     options.writebackOutbox ? options.writebackOutbox.list() : Promise.resolve([]),
   ]);
 
-  const runtime = buildRuntimeSourceIndex(snapshot);
-  const runIndex = buildRunSourceIndex(runs);
-  const workspaceIndex = buildWorkspaceSourceIndex(workspaces);
-  const lifecycleIndex = buildLifecycleSourceIndex(lifecycles);
+  const runtime = buildRuntimeSourceIndex(snapshot, options.defaultProjectContextId);
+  const runIndex = buildRunSourceIndex(runs, options.defaultProjectContextId);
+  const workspaceIndex = buildWorkspaceSourceIndex(workspaces, options.defaultProjectContextId);
+  const lifecycleIndex = buildLifecycleSourceIndex(lifecycles, options.defaultProjectContextId);
   const writebackIndex = buildWritebackSourceIndex(writebackOperations, runIndex, lifecycleIndex);
   const transcriptCounts = runIndex.transcriptEventCountsByRunId;
 
@@ -424,18 +447,125 @@ export function normalizeWebProjectionAlias(value: WebProjectionAliasValue): str
 }
 
 export function webProjectionIssueKeyAliases(...inputs: readonly WebProjectionIssueKeyAliasInput[]): string[] {
+  return webProjectionIssueKeyAliasDescriptors(...inputs).map((descriptor) => descriptor.alias);
+}
+
+function webProjectionIssueKeyAliasDescriptors(...inputs: readonly WebProjectionIssueKeyAliasInput[]): WebProjectionIssueKeyAliasDescriptor[] {
   const aliases: string[] = [];
-  const seen = new Set<string>();
+  const aliasDescriptors = new Map<string, WebProjectionIssueKeyAliasDescriptor>();
   for (const input of inputs) {
     for (const field of WEB_PROJECTION_ISSUE_KEY_ALIAS_FIELDS) {
       const normalized = normalizeWebProjectionAlias(input[field]);
-      if (normalized !== null && !seen.has(normalized)) {
-        seen.add(normalized);
+      if (normalized !== null && !aliasDescriptors.has(normalized)) {
+        aliasDescriptors.set(normalized, {
+          alias: normalized,
+          contextual: WEB_PROJECTION_CONTEXTUAL_ALIAS_FIELD_SET.has(field),
+        });
         aliases.push(normalized);
+        continue;
+      }
+      if (normalized !== null && WEB_PROJECTION_CONTEXTUAL_ALIAS_FIELD_SET.has(field)) {
+        aliasDescriptors.set(normalized, { alias: normalized, contextual: true });
       }
     }
   }
-  return aliases;
+  return aliases.map((alias) => aliasDescriptors.get(alias) ?? { alias, contextual: false });
+}
+
+function webProjectionContextAwareIssueKeyAliases(
+  projectContextSource: unknown,
+  ...inputs: readonly WebProjectionIssueKeyAliasInput[]
+): string[] {
+  const bundle = webProjectionContextAwareIssueKeyAliasBundle(projectContextSource, ...inputs);
+  return [...bundle.rawAliases.map((descriptor) => descriptor.alias), ...bundle.contextualAliases];
+}
+
+function webProjectionContextAwareIssueKeyAliasBundle(
+  projectContextSource: unknown,
+  ...inputs: readonly WebProjectionIssueKeyAliasInput[]
+): WebProjectionContextAwareAliasBundle {
+  const rawAliases = webProjectionIssueKeyAliasDescriptors(...inputs);
+  const projectContextId = projectContextResolutionFromIssue(projectContextSource)?.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+  if (projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+    return { projectContextId, rawAliases, contextualAliases: [] };
+  }
+
+  const contextualAliases: string[] = [];
+  const seen = new Set(rawAliases.map((descriptor) => descriptor.alias));
+  for (const input of inputs) {
+    for (const field of WEB_PROJECTION_CONTEXTUAL_ALIAS_FIELDS) {
+      const normalized = normalizeWebProjectionAlias(input[field]);
+      if (normalized === null) continue;
+      const contextualAlias = `${projectContextId}:${normalized}`;
+      if (seen.has(contextualAlias)) continue;
+      seen.add(contextualAlias);
+      contextualAliases.push(contextualAlias);
+    }
+  }
+  return { projectContextId, rawAliases, contextualAliases };
+}
+
+function normalizeWebProjectionDefaultProjectContextId(defaultProjectContextId: string | null | undefined): string {
+  if (typeof defaultProjectContextId !== "string") return LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+  const trimmed = defaultProjectContextId.trim();
+  if (trimmed.length === 0) return LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+  try {
+    return normalizeProjectContextId(trimmed);
+  } catch {
+    return LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+  }
+}
+
+function webProjectionDefaultContextCompatibilityIds(defaultProjectContextId: string | null | undefined): ReadonlySet<string> {
+  const resolvedDefaultProjectContextId = normalizeWebProjectionDefaultProjectContextId(defaultProjectContextId);
+  return resolvedDefaultProjectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+    ? new Set([LEGACY_DEFAULT_PROJECT_CONTEXT_ID])
+    : new Set([LEGACY_DEFAULT_PROJECT_CONTEXT_ID, resolvedDefaultProjectContextId]);
+}
+
+function webProjectionContextGroupId(projectContextId: string, defaultProjectContextId: string | null | undefined): string {
+  const resolvedDefaultProjectContextId = normalizeWebProjectionDefaultProjectContextId(defaultProjectContextId);
+  return webProjectionDefaultContextCompatibilityIds(resolvedDefaultProjectContextId).has(projectContextId)
+    ? resolvedDefaultProjectContextId
+    : projectContextId;
+}
+
+function rawAliasProjectContextWinners(
+  bundles: readonly WebProjectionContextAwareAliasBundle[],
+  defaultProjectContextId: string | null | undefined,
+): ReadonlyMap<string, string | null> {
+  const resolvedDefaultProjectContextId = normalizeWebProjectionDefaultProjectContextId(defaultProjectContextId);
+  const groupsByAlias = new Map<string, Set<string>>();
+  for (const bundle of bundles) {
+    for (const descriptor of bundle.rawAliases) {
+      if (!descriptor.contextual) continue;
+      const existing = groupsByAlias.get(descriptor.alias) ?? new Set<string>();
+      existing.add(webProjectionContextGroupId(bundle.projectContextId, resolvedDefaultProjectContextId));
+      groupsByAlias.set(descriptor.alias, existing);
+    }
+  }
+
+  const winners = new Map<string, string | null>();
+  for (const [alias, groups] of groupsByAlias) {
+    if (groups.size === 1) {
+      winners.set(alias, groups.values().next().value ?? null);
+      continue;
+    }
+    winners.set(alias, groups.has(resolvedDefaultProjectContextId) ? resolvedDefaultProjectContextId : null);
+  }
+  return winners;
+}
+
+function preferredIndexAliases(
+  bundle: WebProjectionContextAwareAliasBundle,
+  rawWinners: ReadonlyMap<string, string | null>,
+  defaultProjectContextId: string | null | undefined,
+): string[] {
+  const bundleGroupId = webProjectionContextGroupId(bundle.projectContextId, defaultProjectContextId);
+  const rawAliases = bundle.rawAliases
+    .filter((descriptor) => !descriptor.contextual || rawWinners.get(descriptor.alias) === bundleGroupId)
+    .map((descriptor) => descriptor.alias);
+  return [...rawAliases, ...bundle.contextualAliases];
 }
 
 export function webProjectionAliasesFromValues(values: readonly WebProjectionAliasValue[]): string[] {
@@ -538,6 +668,7 @@ export function webProjectionFingerprintCacheKey(fingerprint: WebProjectionCache
 }
 
 async function buildTrackerIssueSourceIndex(input: {
+  defaultProjectContextId: string | null | undefined;
   tracker: Pick<TrackerClient, "fetchIssuesByStates"> | null;
   trackerProjection: WebProjectionIssueTrackerProjection | null;
   fetchTrackerProjection?: WebProjectionTrackerProjectionFetcher;
@@ -546,7 +677,7 @@ async function buildTrackerIssueSourceIndex(input: {
   forceRefresh: boolean;
   clock: WebProjectionClock;
 }): Promise<WebProjectionIssueSourceIndex<Issue>> {
-  if (input.trackerProjection) return trackerIssueSourceIndexFromProjection(input.trackerProjection, "ok", null);
+  if (input.trackerProjection) return trackerIssueSourceIndexFromProjection(input.trackerProjection, "ok", null, input.defaultProjectContextId);
 
   if (input.fetchTrackerProjection) {
     try {
@@ -555,7 +686,7 @@ async function buildTrackerIssueSourceIndex(input: {
         fetchedStates: input.fetchedStates,
         forceRefresh: input.forceRefresh,
       });
-      return trackerIssueSourceIndexFromProjection(projection, "ok", null);
+      return trackerIssueSourceIndexFromProjection(projection, "ok", null, input.defaultProjectContextId);
     } catch (error) {
       return trackerIssueSourceIndexFromFailure(input.fetchedStates, trackerIssueSourceFailureFromError(error));
     }
@@ -579,6 +710,7 @@ async function buildTrackerIssueSourceIndex(input: {
       },
       "ok",
       null,
+      input.defaultProjectContextId,
     );
   } catch (error) {
     return trackerIssueSourceIndexFromFailure(input.fetchedStates, trackerIssueSourceFailureFromError(error));
@@ -602,6 +734,7 @@ function trackerIssueSourceIndexFromProjection(
   projection: WebProjectionIssueTrackerProjection,
   status: WebProjectionTrackerStatus,
   error: WebProjectionTrackerFailure | null,
+  defaultProjectContextId: string | null | undefined,
 ): WebProjectionIssueSourceIndex<Issue> {
   const fetchedStates = uniqueStateNames(projection.fetchedStates);
   return {
@@ -612,7 +745,7 @@ function trackerIssueSourceIndexFromProjection(
     cached: projection.cached,
     error,
     issues: [...projection.trackerIssues],
-    byAlias: buildIssueAliasMap(projection.trackerIssues),
+    byAlias: buildIssueAliasMap(projection.trackerIssues, defaultProjectContextId),
   };
 }
 
@@ -633,10 +766,18 @@ function trackerIssueSourceIndexFromFailure(
   };
 }
 
-function buildIssueAliasMap(issues: readonly Issue[]): ReadonlyMap<string, Issue> {
+function buildIssueAliasMap(
+  issues: readonly Issue[],
+  defaultProjectContextId: string | null | undefined,
+): ReadonlyMap<string, Issue> {
+  const issueBundles = issues.map((issue) => ({
+    issue,
+    aliasBundle: webProjectionContextAwareIssueKeyAliasBundle(issue, { issueId: issue.id, issueIdentifier: issue.identifier }),
+  }));
+  const rawWinners = rawAliasProjectContextWinners(issueBundles.map(({ aliasBundle }) => aliasBundle), defaultProjectContextId);
   const byAlias = new Map<string, Issue>();
-  for (const issue of issues) {
-    for (const alias of webProjectionIssueKeyAliases({ issueId: issue.id, issueIdentifier: issue.identifier })) {
+  for (const { issue, aliasBundle } of issueBundles) {
+    for (const alias of preferredIndexAliases(aliasBundle, rawWinners, defaultProjectContextId)) {
       if (!byAlias.has(alias)) byAlias.set(alias, issue);
     }
   }
@@ -645,15 +786,21 @@ function buildIssueAliasMap(issues: readonly Issue[]): ReadonlyMap<string, Issue
 
 function buildRuntimeSourceIndex(
   snapshot: RuntimeSnapshot,
+  defaultProjectContextId: string | null | undefined,
 ): WebProjectionRuntimeSourceIndex<RuntimeSnapshot, RuntimeSnapshot["running"][number]> {
-  const liveByIssueKey = new Map<string, RuntimeSnapshot["running"][number]>();
-  for (const row of snapshot.running) {
-    for (const alias of webProjectionIssueKeyAliases({
+  const runningBundles = snapshot.running.map((row) => ({
+    row,
+    aliasBundle: webProjectionContextAwareIssueKeyAliasBundle(row, {
       issueId: row.issueId,
       issueIdentifier: row.issueIdentifier,
       runId: row.runId,
       sessionId: row.sessionId,
-    })) {
+    }),
+  }));
+  const rawWinners = rawAliasProjectContextWinners(runningBundles.map(({ aliasBundle }) => aliasBundle), defaultProjectContextId);
+  const liveByIssueKey = new Map<string, RuntimeSnapshot["running"][number]>();
+  for (const { row, aliasBundle } of runningBundles) {
+    for (const alias of preferredIndexAliases(aliasBundle, rawWinners, defaultProjectContextId)) {
       if (!liveByIssueKey.has(alias)) liveByIssueKey.set(alias, row);
     }
   }
@@ -665,20 +812,34 @@ function buildRuntimeSourceIndex(
   };
 }
 
-function buildRunSourceIndex(runs: readonly RunRecord[]): WebProjectionRunSourceIndex<RunRecord> {
+function buildRunSourceIndex(
+  runs: readonly RunRecord[],
+  defaultProjectContextId: string | null | undefined,
+): WebProjectionRunSourceIndex<RunRecord> {
   const sortedRuns = [...runs].sort(compareRunChronology);
+  const runBundles = sortedRuns.map((run) => ({
+    run,
+    aliasBundle: webProjectionContextAwareIssueKeyAliasBundle(run, {
+      issueId: run.issueId,
+      issueIdentifier: run.issueIdentifier,
+      workspaceKey: run.workspaceKey,
+      runId: run.runId,
+      sessionId: run.sessionId,
+    }),
+  }));
+  const rawWinners = rawAliasProjectContextWinners(runBundles.map(({ aliasBundle }) => aliasBundle), defaultProjectContextId);
   const runById = new Map<string, RunRecord>();
   const runBySessionId = new Map<string, RunRecord>();
   const runsByIssueKey = new Map<string, RunRecord[]>();
   const latestRunByIssueKey = new Map<string, RunRecord>();
   const transcriptEventCountsByRunId = new Map<string, number | null>();
 
-  for (const run of sortedRuns) {
+  for (const { run, aliasBundle } of runBundles) {
     runById.set(run.runId, run);
     const sessionAlias = normalizeWebProjectionAlias(run.sessionId);
     if (sessionAlias !== null) runBySessionId.set(sessionAlias, run);
     transcriptEventCountsByRunId.set(run.runId, typeof run.transcriptEventCount === "number" ? run.transcriptEventCount : null);
-    for (const alias of issueAliasesForRun(run)) {
+    for (const alias of preferredIndexAliases(aliasBundle, rawWinners, defaultProjectContextId)) {
       const existing = runsByIssueKey.get(alias) ?? [];
       if (!existing.some((candidate) => candidate.runId === run.runId)) existing.push(run);
       runsByIssueKey.set(alias, existing);
@@ -702,24 +863,40 @@ function buildRunSourceIndex(runs: readonly RunRecord[]): WebProjectionRunSource
   };
 }
 
-function buildWorkspaceSourceIndex(workspaces: readonly WorkspaceRecord[]): WebProjectionWorkspaceSourceIndex<WorkspaceRecord> {
+function buildWorkspaceSourceIndex(
+  workspaces: readonly WorkspaceRecord[],
+  defaultProjectContextId: string | null | undefined,
+): WebProjectionWorkspaceSourceIndex<WorkspaceRecord> {
   const workspaceByIssueKey = new Map<string, WorkspaceRecord>();
-  for (const workspace of [...workspaces].sort(compareWorkspacePreference)) {
-    for (const alias of webProjectionIssueKeyAliases({
+  const workspaceBundles = [...workspaces].sort(compareWorkspacePreference).map((workspace) => ({
+    workspace,
+    aliasBundle: webProjectionContextAwareIssueKeyAliasBundle(workspace, {
       issueId: workspace.issueId,
       issueIdentifier: workspace.issueIdentifier,
       workspaceKey: workspace.workspaceKey,
-    })) {
+    }),
+  }));
+  const rawWinners = rawAliasProjectContextWinners(workspaceBundles.map(({ aliasBundle }) => aliasBundle), defaultProjectContextId);
+  for (const { workspace, aliasBundle } of workspaceBundles) {
+    for (const alias of preferredIndexAliases(aliasBundle, rawWinners, defaultProjectContextId)) {
       if (!workspaceByIssueKey.has(alias)) workspaceByIssueKey.set(alias, workspace);
     }
   }
   return { workspaces: [...workspaces], workspaceByIssueKey, byAlias: workspaceByIssueKey };
 }
 
-function buildLifecycleSourceIndex(lifecycles: readonly IssueLifecycleRecord[]): WebProjectionLifecycleSourceIndex<IssueLifecycleRecord> {
+function buildLifecycleSourceIndex(
+  lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
+): WebProjectionLifecycleSourceIndex<IssueLifecycleRecord> {
   const lifecycleByIssueKey = new Map<string, IssueLifecycleRecord>();
-  for (const lifecycle of [...lifecycles].sort(compareLifecyclePreference)) {
-    for (const alias of webProjectionIssueKeyAliases({ issueId: lifecycle.issueId, issueIdentifier: lifecycle.issueIdentifier })) {
+  const lifecycleBundles = [...lifecycles].sort(compareLifecyclePreference).map((lifecycle) => ({
+    lifecycle,
+    aliasBundle: webProjectionContextAwareIssueKeyAliasBundle(lifecycle, { issueId: lifecycle.issueId, issueIdentifier: lifecycle.issueIdentifier }),
+  }));
+  const rawWinners = rawAliasProjectContextWinners(lifecycleBundles.map(({ aliasBundle }) => aliasBundle), defaultProjectContextId);
+  for (const { lifecycle, aliasBundle } of lifecycleBundles) {
+    for (const alias of preferredIndexAliases(aliasBundle, rawWinners, defaultProjectContextId)) {
       if (!lifecycleByIssueKey.has(alias)) lifecycleByIssueKey.set(alias, lifecycle);
     }
   }
@@ -747,7 +924,7 @@ function buildWritebackSourceIndex(
 }
 
 function issueAliasesForRun(run: RunRecord): string[] {
-  return webProjectionIssueKeyAliases({
+  return webProjectionContextAwareIssueKeyAliases(run, {
     issueId: run.issueId,
     issueIdentifier: run.issueIdentifier,
     workspaceKey: run.workspaceKey,
@@ -761,7 +938,7 @@ function issueAliasesForWriteback(
   runIndex: WebProjectionRunSourceIndex<RunRecord>,
   lifecycleIndex: WebProjectionLifecycleSourceIndex<IssueLifecycleRecord>,
 ): string[] {
-  const aliases = new Set<string>(webProjectionAliasesFromValues([operation.issueId]));
+  const aliases = new Set<string>(webProjectionContextAwareIssueKeyAliases(operation, { issueId: operation.issueId }));
   const addAliases = (values: readonly string[]) => values.forEach((alias) => aliases.add(alias));
   const operationRun = operation.runId ? runIndex.runById.get(operation.runId) : null;
   if (operationRun) addAliases(issueAliasesForRun(operationRun));
@@ -769,7 +946,7 @@ function issueAliasesForWriteback(
 
   const lifecycle = lifecycleIndex.lifecycleByIssueKey.get(operation.issueId);
   if (lifecycle) {
-    addAliases(webProjectionIssueKeyAliases({ issueId: lifecycle.issueId, issueIdentifier: lifecycle.issueIdentifier }));
+    addAliases(webProjectionContextAwareIssueKeyAliases(lifecycle, { issueId: lifecycle.issueId, issueIdentifier: lifecycle.issueIdentifier }));
     for (const run of runIndex.runsByIssueKey.get(lifecycle.issueId) ?? []) addAliases(issueAliasesForRun(run));
     for (const run of runIndex.runsByIssueKey.get(lifecycle.issueIdentifier) ?? []) addAliases(issueAliasesForRun(run));
   }
