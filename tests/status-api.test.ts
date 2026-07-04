@@ -1735,6 +1735,183 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("exposes active-agent project context attribution so clients can group live duplicates by context", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
+    const docsRunning = liveRunningFixture(config, "ENG-123", "In Progress");
+    docsRunning.issueId = "issue-docs-state-live-1";
+    docsRunning.runId = "run-docs-state-live-1";
+    docsRunning.sessionId = "docs-state-live-session-1";
+    docsRunning.projectContext = docsProjectContext;
+    docsRunning.metadata.branchName = "symphony/docs/ENG-123";
+    docsRunning.metadata.gitBranchName = "symphony/docs/ENG-123";
+    docsRunning.metadata.repoPath = "/repo/docs";
+    docsRunning.metadata.baseRef = "origin/main";
+    docsRunning.issueDetails = issueDetailsFixture({
+      id: docsRunning.issueId,
+      identifier: "ENG-123",
+      title: "Docs live duplicate",
+      state: "In Progress",
+      branchName: "symphony/docs/ENG-123",
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      routingSource: docsProjectContext.routingSource,
+    });
+
+    const symphonyRunning = liveRunningFixture(config, "ENG-123", "Blocked");
+    symphonyRunning.issueId = "issue-symphony-state-live-1";
+    symphonyRunning.runId = "run-symphony-state-live-1";
+    symphonyRunning.sessionId = "symphony-state-live-session-1";
+    symphonyRunning.projectContext = symphonyProjectContext;
+    symphonyRunning.metadata.branchName = "symphony/symphony/ENG-123";
+    symphonyRunning.metadata.gitBranchName = "symphony/symphony/ENG-123";
+    symphonyRunning.metadata.repoPath = "/repo/symphony";
+    symphonyRunning.metadata.baseRef = "origin/main";
+    symphonyRunning.issueDetails = issueDetailsFixture({
+      id: symphonyRunning.issueId,
+      identifier: "ENG-123",
+      title: "Symphony live duplicate",
+      state: "Blocked",
+      branchName: "symphony/symphony/ENG-123",
+      projectContextId: symphonyProjectContext.projectContextId,
+      projectContextLabel: symphonyProjectContext.projectContextLabel,
+      linearProjectSlug: symphonyProjectContext.linearProjectSlug,
+      routingSource: symphonyProjectContext.routingSource,
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([docsRunning, symphonyRunning]),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
+      type ProjectContextAttribution = {
+        projectContextId: string;
+        projectContextLabel: string;
+        linearProjectSlug: string | null;
+        routingSource: string | null;
+      };
+      const stateBody = (await stateResponse.json()) as {
+        running: Array<{
+          projectContext?: ProjectContextAttribution | undefined;
+          issueDetails: IssueStatusView;
+        }>;
+        operatorView: {
+          running: Array<{
+            projectContext?: ProjectContextAttribution | undefined;
+            issueDetails: IssueDetailsEnvelope;
+          }>;
+        };
+      };
+
+      const groupActiveAgentsByContext = (
+        rows: Array<{
+          projectContext?: ProjectContextAttribution | undefined;
+          issueDetails: Pick<IssueStatusView, "id" | "identifier" | "title"> & {
+            projectContextId?: string | null;
+            projectContextLabel?: string | null;
+            linearProjectSlug?: string | null;
+            routingSource?: string | null;
+          };
+        }>,
+      ) =>
+        rows.reduce<
+          Record<
+            string,
+            Array<{
+              issueId: string;
+              issueIdentifier: string;
+              title: string;
+              projectContextId: string | null | undefined;
+              projectContextLabel: string | null | undefined;
+              linearProjectSlug: string | null | undefined;
+              routingSource: string | null | undefined;
+            }>
+          >
+        >((groups, row) => {
+          const contextId = row.projectContext?.projectContextId ?? "unattributed";
+          const issue = row.issueDetails;
+          (groups[contextId] ??= []).push({
+            issueId: issue.id ?? "",
+            issueIdentifier: issue.identifier ?? "",
+            title: issue.title ?? "",
+            projectContextId: issue.projectContextId,
+            projectContextLabel: issue.projectContextLabel,
+            linearProjectSlug: issue.linearProjectSlug,
+            routingSource: issue.routingSource,
+          });
+          return groups;
+        }, {});
+
+      const groupedRunning = groupActiveAgentsByContext(stateBody.running);
+      const groupedOperatorRunning = groupActiveAgentsByContext(
+        stateBody.operatorView.running.map((row) => ({
+          ...(row.projectContext === undefined ? {} : { projectContext: row.projectContext }),
+          issueDetails: row.issueDetails.issue,
+        })),
+      );
+
+      expect(stateResponse.status).toBe(200);
+      expect(stateBody.running).toHaveLength(2);
+      expect(stateBody.operatorView.running).toHaveLength(2);
+      expect(stateBody.running.map((row) => row.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
+      expect(stateBody.operatorView.running.map((row) => row.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
+      expect(groupedRunning).toEqual({
+        docs: [
+          {
+            issueId: "issue-docs-state-live-1",
+            issueIdentifier: "ENG-123",
+            title: "Docs live duplicate",
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+            linearProjectSlug: "DOCS",
+            routingSource: "candidate_poll",
+          },
+        ],
+        symphony: [
+          {
+            issueId: "issue-symphony-state-live-1",
+            issueIdentifier: "ENG-123",
+            title: "Symphony live duplicate",
+            projectContextId: "symphony",
+            projectContextLabel: "Symphony",
+            linearProjectSlug: "ENG",
+            routingSource: "candidate_poll",
+          },
+        ],
+      });
+      expect(groupedOperatorRunning).toEqual(groupedRunning);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("preserves both exact-id siblings on tracker-backed board cards and rejects ambiguous board detail identifiers", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const docsIssue = trackerIssue({
