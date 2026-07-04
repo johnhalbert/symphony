@@ -646,6 +646,124 @@ describe("WebProjectionContext contracts and cache key utilities", () => {
     expect(sourceIndex.lifecycles.byAlias.get("docs:ENG-1")).toBe(docsLifecycle);
   });
 
+  it("keeps docs-only local records contextual when tracker duplicates reserve the raw default alias", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "SYMPHONY",
+      routingSource: "configured_default",
+    } as const;
+    const defaultIssue = {
+      id: "issue-id-symphony",
+      identifier: "ENG-1",
+      title: "Default tracker duplicate",
+      description: null,
+      priority: null,
+      state: "Todo",
+      branchName: null,
+      url: null,
+      assigneeId: null,
+      delegateId: null,
+      assignedToWorker: true,
+      labels: [],
+      blockedBy: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:03.000Z",
+      projectContext: symphonyProjectContext,
+    };
+    const docsIssue = {
+      ...defaultIssue,
+      id: "issue-id-docs",
+      title: "Docs tracker duplicate",
+      projectContext: docsProjectContext,
+    };
+    const docsSnapshot = runtimeSnapshotFixture({ runId: "run-docs-only", sessionId: "session-docs-only" });
+    const docsRunning = {
+      ...docsSnapshot.running[0],
+      issueId: docsIssue.id,
+      workspacePath: "/tmp/workspace-docs",
+      metadata: {
+        ...docsSnapshot.running[0].metadata,
+        workspaceKey: "workspace-docs",
+        workspacePath: "/tmp/workspace-docs",
+      },
+      issueDetails: docsIssue,
+      projectContext: docsProjectContext,
+    };
+    const docsRun = {
+      ...runRecordFixture({ runId: "run-docs-only", sessionId: "session-docs-only", updatedAt: "2026-01-01T00:00:02.000Z" }),
+      issueId: docsIssue.id,
+      workspaceKey: "workspace-docs",
+      workspacePath: "/tmp/workspace-docs",
+      projectContext: docsProjectContext,
+    };
+    const docsWorkspace = {
+      workspaceKey: "workspace-docs",
+      issueId: null,
+      issueIdentifier: "ENG-1",
+      projectContext: docsProjectContext,
+      path: "/tmp/workspace-docs",
+      sourceKind: "git",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:03.000Z",
+    };
+    const docsLifecycle = {
+      ...lifecycleRecordFixture({ updatedAt: "2026-01-01T00:00:04.000Z" }),
+      issueId: docsIssue.id,
+      projectContext: docsProjectContext,
+    };
+
+    const sourceIndex = await buildWebProjectionSourceIndex({
+      snapshot: {
+        ...docsSnapshot,
+        counts: { ...docsSnapshot.counts, running: 1 },
+        running: [docsRunning],
+      },
+      trackerProjection: {
+        fetchedStates: ["Todo"],
+        trackerIssues: [defaultIssue, docsIssue],
+        fetchedAt: "2026-01-01T00:00:05.000Z",
+        cached: true,
+      },
+      runStore: {
+        async listRuns() {
+          return [docsRun];
+        },
+        async listWorkspaces() {
+          return [docsWorkspace];
+        },
+      },
+      lifecycleStore: {
+        async list() {
+          return [docsLifecycle];
+        },
+      },
+      clock: () => new Date("2026-01-01T00:00:06.000Z"),
+      defaultProjectContextId: symphonyProjectContext.projectContextId,
+    });
+
+    expect(sourceIndex.trackerIssues.byAlias.get("ENG-1")).toBe(defaultIssue);
+    expect(sourceIndex.trackerIssues.byAlias.get("docs:ENG-1")).toBe(docsIssue);
+    expect(sourceIndex.runtime.runningByAlias.get("ENG-1")).toBeUndefined();
+    expect(sourceIndex.runtime.runningByAlias.get("issue-id-docs")?.runId).toBe("run-docs-only");
+    expect(sourceIndex.runtime.runningByAlias.get("docs:ENG-1")?.runId).toBe("run-docs-only");
+    expect(sourceIndex.runs.byAlias.get("ENG-1")).toBeUndefined();
+    expect(sourceIndex.runs.byAlias.get("issue-id-docs")?.map((run) => run.runId)).toEqual(["run-docs-only"]);
+    expect(sourceIndex.runs.byAlias.get("docs:ENG-1")?.map((run) => run.runId)).toEqual(["run-docs-only"]);
+    expect(sourceIndex.workspaces.byAlias.get("ENG-1")).toBeUndefined();
+    expect(sourceIndex.workspaces.byAlias.get("workspace-docs")).toBe(docsWorkspace);
+    expect(sourceIndex.workspaces.byAlias.get("docs:ENG-1")).toBe(docsWorkspace);
+    expect(sourceIndex.lifecycles.byAlias.get("ENG-1")).toBeUndefined();
+    expect(sourceIndex.lifecycles.byAlias.get("issue-id-docs")).toBe(docsLifecycle);
+    expect(sourceIndex.lifecycles.byAlias.get("docs:ENG-1")).toBe(docsLifecycle);
+  });
+
   it("records tracker unavailability in the source index while still indexing local durable sources", async () => {
     const sourceIndex = await buildWebProjectionSourceIndex({
       fetchedStates: ["Todo", "In Review"],

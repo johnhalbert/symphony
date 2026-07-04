@@ -3259,6 +3259,7 @@ export class StatusServer {
     ]);
     return createWebProjectionFingerprint({
       runtimeGeneratedAt: statusServerRuntimeFingerprintKey(snapshot),
+      defaultProjectContextId: this.options.defaultProjectContextId,
       issueBoardStates: [issueBoardFetchedStateCacheKey(fetchedStates)],
       issueBoardColumns: issueBoardColumnCacheKeyValues(issueBoardColumns),
       durableSourceRevisions,
