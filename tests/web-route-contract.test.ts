@@ -1803,8 +1803,11 @@ describe("/api/v1/web route contracts", () => {
         const ambiguousIssue = await getJson(`${baseUrl}/api/v1/issues/TEST-1`);
         const ambiguousWorkspace = await getJson(`${baseUrl}/api/v1/workspaces/TEST-1`);
         const ambiguousTranscript = await getJson(`${baseUrl}/api/v1/web/sessions/TEST-1/transcript`);
+        const ambiguousWebIssue = await getJson(`${baseUrl}/api/v1/web/issues/TEST-1`);
+        const ambiguousIssueRuns = await getJson(`${baseUrl}/api/v1/issues/TEST-1/runs`);
         const qualifiedIssue = await getJson(`${baseUrl}/api/v1/issues/${encodeURIComponent("docs:TEST-1")}`);
         const qualifiedWebIssue = await getJson(`${baseUrl}/api/v1/web/issues/${encodeURIComponent("docs:TEST-1")}`);
+        const qualifiedIssueRuns = await getJson(`${baseUrl}/api/v1/issues/${encodeURIComponent("docs:TEST-1")}/runs`);
         const qualifiedWorkspace = await getJson(`${baseUrl}/api/v1/workspaces/${encodeURIComponent("docs:TEST-1")}`);
         const qualifiedTranscript = await getJson(`${baseUrl}/api/v1/web/sessions/${encodeURIComponent("docs:TEST-1")}/transcript`);
         const qualifiedRun = await getJson(`${baseUrl}/api/v1/runs/run-docs-1`);
@@ -1813,6 +1816,8 @@ describe("/api/v1/web route contracts", () => {
         const ambiguousIssueBody = ambiguousIssue.body as { error: { message: string } };
         const ambiguousWorkspaceBody = ambiguousWorkspace.body as { error: { message: string } };
         const ambiguousTranscriptBody = ambiguousTranscript.body as { error: { message: string } };
+        const ambiguousWebIssueBody = ambiguousWebIssue.body as { error: { message: string } };
+        const ambiguousIssueRunsBody = ambiguousIssueRuns.body as { error: { message: string } };
         const issueBody = qualifiedIssue.body as {
           issue: string;
           workspace: {
@@ -1843,6 +1848,22 @@ describe("/api/v1/web route contracts", () => {
           issue: { id: string; title: string; workspace: string; session: string; desc: string[] };
           runs: Array<{ id: string; issue: string; title: string }>;
           transcript: unknown[];
+        };
+        const issueRunsBody = qualifiedIssueRuns.body as {
+          issue: string;
+          issueDetails: {
+            workspace: {
+              workspaceKey: string;
+              path: string | null;
+            } | null;
+            latestRun: { runId: string | null } | null;
+          };
+          runs: Array<{
+            runId: string;
+            issueId: string;
+            issueIdentifier: string;
+            projectContext?: { projectContextId: string };
+          }>;
         };
         const workspaceBody = qualifiedWorkspace.body as {
           workspaceKey: string;
@@ -1882,6 +1903,16 @@ describe("/api/v1/web route contracts", () => {
         expect(ambiguousWorkspaceBody.error.message).toContain("[symphony]");
         expect(ambiguousTranscript.response.status).toBe(404);
         expect(ambiguousTranscriptBody.error.message).toContain("context-qualified alias");
+        expect(ambiguousWebIssue.response.status).toBe(409);
+        expect(ambiguousWebIssueBody.error.message).toContain("Ambiguous issue identifier: TEST-1");
+        expect(ambiguousWebIssueBody.error.message).toContain("Use exact issue id");
+        expect(ambiguousWebIssueBody.error.message).toContain("[docs]");
+        expect(ambiguousWebIssueBody.error.message).toContain("[symphony]");
+        expect(ambiguousIssueRuns.response.status).toBe(409);
+        expect(ambiguousIssueRunsBody.error.message).toContain("Ambiguous issue identifier: TEST-1");
+        expect(ambiguousIssueRunsBody.error.message).toContain("Use exact issue id");
+        expect(ambiguousIssueRunsBody.error.message).toContain("[docs]");
+        expect(ambiguousIssueRunsBody.error.message).toContain("[symphony]");
 
         expect(qualifiedIssue.response.status).toBe(200);
         expect(issueBody.issue).toBe("issue-docs-1");
@@ -1925,6 +1956,28 @@ describe("/api/v1/web route contracts", () => {
         expect(webIssueBody.runs).toEqual(expect.arrayContaining([expect.objectContaining({ id: "session-docs-1", issue: "TEST-1", title: "TEST-1" })]));
         expect(webIssueBody.runs.some((run) => run.id === "session-symphony-1")).toBe(false);
         expect(webIssueBody.transcript).toEqual([]);
+
+        expect(qualifiedIssueRuns.response.status).toBe(200);
+        expect(issueRunsBody.issue).toBe("issue-docs-1");
+        expect(issueRunsBody.issueDetails.workspace).toMatchObject({
+          workspaceKey: docsWorkspaceKey,
+          path: docsPath,
+        });
+        expect(issueRunsBody.issueDetails.latestRun).toMatchObject({
+          runId: "run-docs-1",
+        });
+        expect(issueRunsBody.runs).toHaveLength(1);
+        expect(issueRunsBody.runs).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              runId: "run-docs-1",
+              issueId: "issue-docs-1",
+              issueIdentifier: "TEST-1",
+              projectContext: expect.objectContaining({ projectContextId: "docs" }),
+            }),
+          ]),
+        );
+
 
         expect(qualifiedWorkspace.response.status).toBe(200);
         expect(workspaceBody).toMatchObject({
