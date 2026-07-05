@@ -10,7 +10,20 @@ import {
   type StatusServerWebProjectionContextBuilder,
 } from "../src/app/http.js";
 import type { WebProjectionRevisionProvider } from "../src/app/WebProjectionContext.js";
+import { PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON } from "../src/core/CompletionReportService.js";
+import { FileOperatorApprovalStore, OperatorApprovalService } from "../src/core/approval/OperatorApprovalService.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  FileOrchestratorConversationStore,
+  type OrchestratorConversationStore,
+} from "../src/core/persistence/OrchestratorConversationStore.js";
 import type {
   DurableProjectionName,
   ProjectionPayloadRecord,
@@ -20,23 +33,19 @@ import type {
   ProjectionSourceRevision,
   ProjectionWriteResult,
 } from "../src/core/persistence/ProjectionTransactionService.js";
-import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
-import type { RunRecord, RunTranscriptStore, TranscriptEvent, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
-import type { TrackerStateLists } from "../src/core/types.js";
+import { projectOrchestratorChatProjectionPayload } from "../src/core/persistence/OrchestratorChatProjectionReducer.js";
+import {
+  FileRunTranscriptStore,
+  type RunRecord,
+  type RunTranscriptStore,
+  type TranscriptEvent,
+  type TranscriptPage,
+} from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
+import type { TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { webRouteContractGetFixtureCases, webRouteContractPaths } from "../web/tests/fixtures/webRouteContractFixtures.js";
-import {
-  FileOrchestratorConversationStore,
-  type OrchestratorConversationStore,
-} from "../src/core/persistence/OrchestratorConversationStore.js";
-import {
-  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
-  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
-  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
-} from "../src/core/config/ProjectContexts.js";
-import { projectOrchestratorChatProjectionPayload } from "../src/core/persistence/OrchestratorChatProjectionReducer.js";
-import { testConfig } from "./helpers.js";
+import { issue, testConfig, trackerIssue } from "./helpers.js";
 
 describe("/api/v1/web route contracts", () => {
   let root: string;
@@ -1501,9 +1510,475 @@ describe("/api/v1/web route contracts", () => {
 
     expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(runStore.transcriptReadCount).toBe(1);
-  });
+    });
 
-  it("returns explicit stale responses without rebuilding canonical web projection sources", async () => {
+    it("resolves context-qualified issue, run, workspace, transcript, and approval routes safely across project-context siblings", async () => {
+      const config = testConfig(path.join(root, "workspaces"));
+      config.github.publishPullRequests = true;
+      config.github.operatorApproval!.requiredForPublication = true;
+      config.github.operatorApproval!.rejectPolicy = "cancel";
+
+      const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const approvalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
+      const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+      const docsProjectContext = {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      } as const;
+      const symphonyProjectContext = {
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        linearProjectSlug: "ENG",
+        routingSource: "candidate_poll",
+      } as const;
+      const docsTrackerIssue = trackerIssue({
+        id: "issue-docs-1",
+        identifier: "TEST-1",
+        title: "Docs detail title",
+        description: "Documentation context detail.",
+        state: "Blocked",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        branchName: "symphony/docs/TEST-1",
+      });
+      const symphonyTrackerIssue = trackerIssue({
+        id: "issue-symphony-1",
+        identifier: "TEST-1",
+        title: "Symphony detail title",
+        description: "Symphony context detail.",
+        state: "Blocked",
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        linearProjectSlug: "ENG",
+        branchName: "symphony/TEST-1",
+      });
+      const docsWorkspaceKey = "docs__TEST-1";
+      const symphonyWorkspaceKey = "symphony__TEST-1";
+      const docsPath = path.join(config.workspace.root, docsWorkspaceKey);
+      const symphonyPath = path.join(config.workspace.root, symphonyWorkspaceKey);
+      await mkdir(docsPath, { recursive: true });
+      await mkdir(symphonyPath, { recursive: true });
+
+      await runStore.upsertWorkspace({
+        workspaceKey: docsWorkspaceKey,
+        issueId: "issue-docs-1",
+        issueIdentifier: "TEST-1",
+        projectContext: docsProjectContext,
+        path: docsPath,
+        sourceKind: "git_worktree",
+        gitBranchName: "symphony/docs/TEST-1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      await runStore.upsertWorkspace({
+        workspaceKey: symphonyWorkspaceKey,
+        issueId: "issue-symphony-1",
+        issueIdentifier: "TEST-1",
+        projectContext: symphonyProjectContext,
+        path: symphonyPath,
+        sourceKind: "git_worktree",
+        gitBranchName: "symphony/TEST-1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      await runStore.startRun({
+        runId: "run-docs-1",
+        sessionId: "session-docs-1",
+        agentId: "agent-docs-1",
+        role: "worker",
+        issueId: "issue-docs-1",
+        issueIdentifier: "TEST-1",
+        attempt: null,
+        turnNumber: 1,
+        prompt: "docs work",
+        workspaceKey: docsWorkspaceKey,
+        workspacePath: docsPath,
+        gitBranchName: "symphony/docs/TEST-1",
+        repoPath: "/repo/docs",
+        baseRef: "origin/main",
+        projectContext: docsProjectContext,
+      });
+      await runStore.appendEvent({
+        runId: "run-docs-1",
+        at: "2026-01-01T00:00:01.000Z",
+        source: "harness",
+        eventType: "progress",
+        message: "docs transcript",
+      });
+      await runStore.startRun({
+        runId: "run-symphony-1",
+        sessionId: "session-symphony-1",
+        agentId: "agent-symphony-1",
+        role: "worker",
+        issueId: "issue-symphony-1",
+        issueIdentifier: "TEST-1",
+        attempt: null,
+        turnNumber: 1,
+        prompt: "symphony work",
+        workspaceKey: symphonyWorkspaceKey,
+        workspacePath: symphonyPath,
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo/symphony",
+        baseRef: "origin/main",
+        projectContext: symphonyProjectContext,
+      });
+      await runStore.appendEvent({
+        runId: "run-symphony-1",
+        at: "2026-01-01T00:00:02.000Z",
+        source: "harness",
+        eventType: "progress",
+        message: "symphony transcript",
+      });
+
+      const docsEvidenceCursor = "idem-context-qualified-web-route-contract-docs";
+      const docsPending = (
+        await approvalStore.requestOrGetPending(
+          {
+            issueId: "issue-docs-1",
+            issueIdentifier: "TEST-1",
+            runId: "run-docs-1",
+            evidenceCursor: docsEvidenceCursor,
+            action: {
+              kind: "push_and_pr",
+              branchName: "symphony/docs/TEST-1",
+              baseBranch: "origin/main",
+              workspacePath: docsPath,
+              title: "TEST-1: Docs work",
+              evidenceCursor: docsEvidenceCursor,
+              summaryPreview: "Implemented the documentation-context service contract.",
+              changedFiles: ["tests/web-route-contract.test.ts"],
+              plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+            },
+          },
+          null,
+        )
+      ).record;
+      await runStore.updateRun("run-docs-1", {
+        metadata: {
+          pendingApprovalRequestId: docsPending.requestId,
+          pendingApprovalRequestedAt: docsPending.requestedAt,
+        },
+      });
+      const symphonyEvidenceCursor = "idem-context-qualified-web-route-contract-symphony";
+      const symphonyPending = (
+        await approvalStore.requestOrGetPending(
+          {
+            issueId: "issue-symphony-1",
+            issueIdentifier: "TEST-1",
+            runId: "run-symphony-1",
+            evidenceCursor: symphonyEvidenceCursor,
+            action: {
+              kind: "push_and_pr",
+              branchName: "symphony/TEST-1",
+              baseBranch: "origin/main",
+              workspacePath: symphonyPath,
+              title: "TEST-1: Symphony work",
+              evidenceCursor: symphonyEvidenceCursor,
+              summaryPreview: "Implemented the symphony sibling service contract.",
+              changedFiles: ["tests/web-route-contract.test.ts"],
+              plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+            },
+          },
+          null,
+        )
+      ).record;
+      await runStore.updateRun("run-symphony-1", {
+        metadata: {
+          pendingApprovalRequestId: symphonyPending.requestId,
+          pendingApprovalRequestedAt: symphonyPending.requestedAt,
+        },
+      });
+      await lifecycleStore.ensureIssue(
+        issue({
+          id: "issue-docs-1",
+          identifier: "TEST-1",
+          title: docsTrackerIssue.title,
+          description: docsTrackerIssue.description,
+          state: "Blocked",
+          branchName: "symphony/docs/TEST-1",
+        }),
+        {
+          phase: "blocked",
+          blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          projectContext: docsProjectContext,
+          lastCompletionReportId: `completion-report:issue-docs-1:${docsEvidenceCursor}`,
+          completionReports: [
+            {
+              id: `completion-report:issue-docs-1:${docsEvidenceCursor}`,
+              idempotencyKey: docsEvidenceCursor,
+              runId: "run-docs-1",
+              issueId: "issue-docs-1",
+              issueIdentifier: "TEST-1",
+              summary: "Implemented the documentation-context service contract.",
+              validationEvidence: ["vitest web-route-contract"],
+              acceptanceChecklist: [{ text: "approval linked", satisfied: true, evidence: "web route contract fixture" }],
+              changedFiles: ["tests/web-route-contract.test.ts"],
+              branchName: "symphony/docs/TEST-1",
+              pullRequest: null,
+              risks: [],
+              acceptedAt: "2026-01-01T00:00:00.000Z",
+              writebackOperationKeys: [],
+            },
+          ],
+          summaryPointers: {
+            workspaceKey: docsWorkspaceKey,
+            workspacePath: docsPath,
+            branchName: "symphony/docs/TEST-1",
+            gitBranchName: "symphony/docs/TEST-1",
+            repoPath: "/repo/docs",
+            baseRef: "origin/main",
+          },
+        },
+      );
+      await lifecycleStore.ensureIssue(
+        issue({
+          id: "issue-symphony-1",
+          identifier: "TEST-1",
+          title: symphonyTrackerIssue.title,
+          description: symphonyTrackerIssue.description,
+          state: "Blocked",
+          branchName: "symphony/TEST-1",
+        }),
+        {
+          phase: "blocked",
+          blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          projectContext: symphonyProjectContext,
+          lastCompletionReportId: `completion-report:issue-symphony-1:${symphonyEvidenceCursor}`,
+          completionReports: [
+            {
+              id: `completion-report:issue-symphony-1:${symphonyEvidenceCursor}`,
+              idempotencyKey: symphonyEvidenceCursor,
+              runId: "run-symphony-1",
+              issueId: "issue-symphony-1",
+              issueIdentifier: "TEST-1",
+              summary: "Implemented the symphony sibling service contract.",
+              validationEvidence: ["vitest web-route-contract"],
+              acceptanceChecklist: [{ text: "approval linked", satisfied: true, evidence: "web route contract fixture" }],
+              changedFiles: ["tests/web-route-contract.test.ts"],
+              branchName: "symphony/TEST-1",
+              pullRequest: null,
+              risks: [],
+              acceptedAt: "2026-01-01T00:00:00.000Z",
+              writebackOperationKeys: [],
+            },
+          ],
+          summaryPointers: {
+            workspaceKey: symphonyWorkspaceKey,
+            workspacePath: symphonyPath,
+            branchName: "symphony/TEST-1",
+            gitBranchName: "symphony/TEST-1",
+            repoPath: "/repo/symphony",
+            baseRef: "origin/main",
+          },
+        },
+      );
+
+      const { orchestrator, calls } = instrumentedOrchestrator();
+      const server = new StatusServer({
+        orchestrator,
+        workspaceManager: new WorkspaceManager({
+          workspace: config.workspace,
+          hooks: config.hooks,
+          logger: new StructuredLogger(() => undefined),
+        }),
+        workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+        runStore,
+        lifecycleStore,
+        operatorApproval,
+        tracker: trackerClient(async () => [symphonyTrackerIssue, docsTrackerIssue]),
+        defaultProjectContextId: "symphony",
+        host: "127.0.0.1",
+        port: 0,
+        openWorkspaceToken: "secret",
+        trackerStateLists: testTrackerStateLists(),
+        staleThresholdMs: 300_000,
+      });
+      const address = await server.start();
+      const baseUrl = baseUrlFor(address);
+      try {
+        const ambiguousIssue = await getJson(`${baseUrl}/api/v1/issues/TEST-1`);
+        const ambiguousWorkspace = await getJson(`${baseUrl}/api/v1/workspaces/TEST-1`);
+        const ambiguousTranscript = await getJson(`${baseUrl}/api/v1/web/sessions/TEST-1/transcript`);
+        const qualifiedIssue = await getJson(`${baseUrl}/api/v1/issues/${encodeURIComponent("docs:TEST-1")}`);
+        const qualifiedWebIssue = await getJson(`${baseUrl}/api/v1/web/issues/${encodeURIComponent("docs:TEST-1")}`);
+        const qualifiedWorkspace = await getJson(`${baseUrl}/api/v1/workspaces/${encodeURIComponent("docs:TEST-1")}`);
+        const qualifiedTranscript = await getJson(`${baseUrl}/api/v1/web/sessions/${encodeURIComponent("docs:TEST-1")}/transcript`);
+        const qualifiedRun = await getJson(`${baseUrl}/api/v1/runs/run-docs-1`);
+        const approvalRoute = await getJson(`${baseUrl}/api/v1/approval-requests/${docsPending.requestId}`);
+
+        const ambiguousIssueBody = ambiguousIssue.body as { error: { message: string } };
+        const ambiguousWorkspaceBody = ambiguousWorkspace.body as { error: { message: string } };
+        const ambiguousTranscriptBody = ambiguousTranscript.body as { error: { message: string } };
+        const issueBody = qualifiedIssue.body as {
+          issue: string;
+          workspace: {
+            workspaceKey: string;
+            issueId: string;
+            issueIdentifier: string;
+            projectContext?: { projectContextId: string };
+          } | null;
+          latestRun: { runId: string; projectContext?: { projectContextId: string } } | null;
+          lifecycle: { projectContext?: { projectContextId: string } } | null;
+          capabilities: {
+            continuationSummary: { path: string; requiresToken: boolean };
+            pendingApproval: {
+              active: boolean;
+              requestId: string | null;
+              projectContext?: { projectContextId: string };
+              resolve: { method: string; path: string; header: string } | null;
+              requiresToken: boolean;
+            };
+          };
+          pendingApproval: {
+            requestId: string;
+            projectContext?: { projectContextId: string };
+            capabilities: { resolve: { path: string } };
+          } | null;
+        };
+        const webIssueBody = qualifiedWebIssue.body as {
+          issue: { id: string; title: string; workspace: string; session: string; desc: string[] };
+          runs: Array<{ id: string; issue: string; title: string }>;
+          transcript: unknown[];
+        };
+        const workspaceBody = qualifiedWorkspace.body as {
+          workspaceKey: string;
+          issueId: string;
+          issueIdentifier: string;
+          projectContext?: { projectContextId: string };
+        };
+        const transcriptBody = qualifiedTranscript.body as {
+          messages: Array<{ kind: string; text?: string; issue?: string; session?: string }>;
+          window: { kind: string; limit: number };
+          activeTail: { refetchHref: string | null };
+        };
+        const runBody = qualifiedRun.body as {
+          runId: string;
+          issueId: string;
+          issueIdentifier: string;
+          projectContext?: { projectContextId: string };
+          pendingApproval: { requestId: string; projectContext?: { projectContextId: string } } | null;
+        };
+        const approvalBody = approvalRoute.body as {
+          requestId: string;
+          issueId: string;
+          issueIdentifier: string;
+          projectContext?: { projectContextId: string };
+          capabilities: { resolve: { method: string; path: string; header: string } };
+        };
+
+        expect(ambiguousIssue.response.status).toBe(409);
+        expect(ambiguousIssueBody.error.message).toContain("Ambiguous issue identifier: TEST-1");
+        expect(ambiguousIssueBody.error.message).toContain("Use exact issue id");
+        expect(ambiguousIssueBody.error.message).toContain("[docs]");
+        expect(ambiguousIssueBody.error.message).toContain("[symphony]");
+        expect(ambiguousWorkspace.response.status).toBe(409);
+        expect(ambiguousWorkspaceBody.error.message).toContain("Ambiguous issue identifier: TEST-1");
+        expect(ambiguousWorkspaceBody.error.message).toContain("Use exact issue id");
+        expect(ambiguousWorkspaceBody.error.message).toContain("[docs]");
+        expect(ambiguousWorkspaceBody.error.message).toContain("[symphony]");
+        expect(ambiguousTranscript.response.status).toBe(404);
+        expect(ambiguousTranscriptBody.error.message).toContain("context-qualified alias");
+
+        expect(qualifiedIssue.response.status).toBe(200);
+        expect(issueBody.issue).toBe("issue-docs-1");
+        expect(issueBody.workspace).toMatchObject({
+          workspaceKey: docsWorkspaceKey,
+          issueId: "issue-docs-1",
+          issueIdentifier: "TEST-1",
+          projectContext: { projectContextId: "docs" },
+        });
+        expect(issueBody.latestRun).toMatchObject({ runId: "run-docs-1", projectContext: { projectContextId: "docs" } });
+        expect(issueBody.lifecycle?.projectContext).toMatchObject({ projectContextId: "docs" });
+        expect(issueBody.capabilities.continuationSummary).toMatchObject({
+          path: "/api/v1/issues/docs%3ATEST-1/continuation-summary",
+          requiresToken: true,
+        });
+        expect(issueBody.capabilities.pendingApproval).toMatchObject({
+          active: true,
+          requestId: docsPending.requestId,
+          projectContext: { projectContextId: "docs" },
+          resolve: {
+            method: "POST",
+            path: `/api/v1/approval-requests/${docsPending.requestId}`,
+            header: "X-Symphony-Token",
+          },
+          requiresToken: true,
+        });
+        expect(issueBody.capabilities.pendingApproval.requestId).not.toBe(symphonyPending.requestId);
+        expect(issueBody.pendingApproval).toMatchObject({
+          requestId: docsPending.requestId,
+          projectContext: { projectContextId: "docs" },
+          capabilities: { resolve: { path: `/api/v1/approval-requests/${docsPending.requestId}` } },
+        });
+        expect(issueBody.pendingApproval?.requestId).not.toBe(symphonyPending.requestId);
+
+        expect(qualifiedWebIssue.response.status).toBe(200);
+        expect(webIssueBody.issue).toMatchObject({
+          id: "TEST-1",
+          workspace: docsPath,
+          session: "session-docs-1",
+        });
+        expect(webIssueBody.runs).toEqual(expect.arrayContaining([expect.objectContaining({ id: "session-docs-1", issue: "TEST-1", title: "TEST-1" })]));
+        expect(webIssueBody.runs.some((run) => run.id === "session-symphony-1")).toBe(false);
+        expect(webIssueBody.transcript).toEqual([]);
+
+        expect(qualifiedWorkspace.response.status).toBe(200);
+        expect(workspaceBody).toMatchObject({
+          workspaceKey: docsWorkspaceKey,
+          issueId: "issue-docs-1",
+          issueIdentifier: "TEST-1",
+          projectContext: { projectContextId: "docs" },
+        });
+
+        expect(qualifiedTranscript.response.status).toBe(200);
+        expect(transcriptBody.window).toMatchObject({ kind: "tail", limit: 500 });
+        expect(transcriptBody.messages).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ kind: "user", issue: "TEST-1", text: "docs work" }),
+            expect.objectContaining({ kind: "assistant", text: "docs transcript" }),
+          ]),
+        );
+        expect(transcriptBody.activeTail.refetchHref).toBe("/api/v1/web/sessions/session-docs-1/transcript?refresh=1");
+
+        expect(qualifiedRun.response.status).toBe(200);
+        expect(runBody).toMatchObject({
+          runId: "run-docs-1",
+          issueId: "issue-docs-1",
+          issueIdentifier: "TEST-1",
+          projectContext: { projectContextId: "docs" },
+          pendingApproval: {
+            requestId: docsPending.requestId,
+            projectContext: { projectContextId: "docs" },
+          },
+        });
+        expect(runBody.pendingApproval?.requestId).not.toBe(symphonyPending.requestId);
+
+        expect(approvalRoute.response.status).toBe(200);
+        expect(approvalBody).toMatchObject({
+          requestId: docsPending.requestId,
+          issueId: "issue-docs-1",
+          issueIdentifier: "TEST-1",
+          projectContext: { projectContextId: "docs" },
+          capabilities: {
+            resolve: {
+              method: "POST",
+              path: `/api/v1/approval-requests/${docsPending.requestId}`,
+              header: "X-Symphony-Token",
+            },
+          },
+        });
+      } finally {
+        await server.stop();
+      }
+
+      expect(calls).toMatchObject({ refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    });
+
+    it("returns explicit stale responses without rebuilding canonical web projection sources", async () => {
     const staleDashboard = {
       projectName: "Stale durable dashboard",
       repoLabel: "",
