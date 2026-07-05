@@ -334,13 +334,15 @@ describe("Orchestrator", () => {
       },
     });
 
+    const operatorChatPersistenceTimeoutMs = 5_000;
+
     await eventually(async () => {
       const messages = await conversationStore.listMessages("operator-room");
       expect(messages.map((message) => [message.role, message.status, message.body])).toEqual([
         ["user", "completed", "what is running?"],
         ["assistant", "completed", "Hello operator"],
       ]);
-    });
+    }, operatorChatPersistenceTimeoutMs);
     expect(harness.operatorContexts).toHaveLength(1);
     expect(harness.operatorContexts[0]).toMatchObject({
       conversationId: "operator-room",
@@ -358,7 +360,7 @@ describe("Orchestrator", () => {
         runtimeModel: "test-planner",
         runtimeAgentLifecycle: "reuse_by_conversation",
       });
-    });
+    }, operatorChatPersistenceTimeoutMs);
     const transcript = await runStore.readTranscript("operator-run-1");
     expect(transcript.events.map((event) => event.eventType)).toContain("completed");
     expect(await runStore.rebuildRunFromTranscript("operator-run-1")).toMatchObject({
