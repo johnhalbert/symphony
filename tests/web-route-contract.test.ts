@@ -19,7 +19,7 @@ import {
 } from "../src/core/config/ProjectContexts.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
-import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import { FileIssueLifecycleStore, type IssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import {
   FileOrchestratorConversationStore,
   type OrchestratorConversationStore,
@@ -1374,6 +1374,115 @@ describe("/api/v1/web route contracts", () => {
     ]);
   });
 
+  it("infers contextual durable-detail runs from lifecycle-backed issue ids when legacy run records lack project context", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    await runStore.startRun({
+      runId: "run-docs-legacy-1",
+      sessionId: "session-docs-legacy-1",
+      agentId: "agent-docs-legacy-1",
+      role: "worker",
+      issueId: "issue-docs-179",
+      issueIdentifier: "ENG-179",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      workspaceKey: "ENG-179",
+      workspacePath: path.join(config.workspace.root, "docs", "ENG-179"),
+      gitBranchName: "symphony/docs/ENG-179",
+      repoPath: "/repo-docs",
+      baseRef: "origin/main",
+      cursorModel: "gpt-5-legacy-docs",
+    });
+    await runStore.appendEvent({
+      runId: "run-docs-legacy-1",
+      at: "2026-05-31T00:00:31.000Z",
+      source: "runtime",
+      eventType: "assistant_complete",
+      message: "legacy contextual durable transcript",
+    });
+    await runStore.updateRun("run-docs-legacy-1", {
+      status: "succeeded",
+      completedAt: "2026-05-31T00:01:00.000Z",
+    });
+    await lifecycleStore.ensureIssue(
+      trackerIssue({ id: "issue-docs-179", identifier: "ENG-179", title: "Tracker-backed docs issue", projectContext: docsProjectContext }),
+      { phase: "implementation", projectContext: docsProjectContext },
+    );
+
+    const durableIssue = {
+      ...issueModelFixture(),
+      id: "docs:ENG-179",
+      title: "Serve contextual durable web projections",
+      project: "Documentation Site",
+    };
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [durableIssue], review: [] },
+      cycleLabel: "Docs cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "docs:ENG-179",
+    };
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: String(runStore.projectionRevision()), observedAt: null },
+            { source: "lifecycleStore", revision: String(lifecycleStore.projectionRevision()), observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+    ]);
+    const { server, calls } = createStatusServer(root, {
+      projectionReader,
+      runStore,
+      lifecycleStore,
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179`);
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect((detail.body as { runs: unknown[] }).runs).toEqual([
+        expect.objectContaining({ id: "session-docs-legacy-1", issue: "ENG-179", state: "succeeded", model: "gpt-5-legacy-docs", msgCount: 1 }),
+      ]);
+      expect((detail.body as { activity: unknown[] }).activity).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ verb: "run_started", id: "ENG-179", extra: "succeeded", who: "agent-docs-legacy-1" }),
+          expect.objectContaining({ verb: "run_completed", id: "ENG-179", extra: "succeeded", who: "agent-docs-legacy-1" }),
+        ]),
+      );
+
+      const detailWithTranscript = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179?includeTranscript=1`);
+      expect(detailWithTranscript.response.status).toBe(200);
+      expect(detailWithTranscript.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect((detailWithTranscript.body as { transcript: unknown[] }).transcript).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "system", model: "gpt-5-legacy-docs", workspace: "ENG-179", session: "session-docs-legacy-1" }),
+          expect.objectContaining({ kind: "assistant", text: "legacy contextual durable transcript" }),
+        ]),
+      );
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+  });
+
   it("keeps unresolved contextual durable detail aliases isolated from raw runs in other project contexts", async () => {
     const durableIssue = {
       ...issueModelFixture(),
@@ -2137,7 +2246,7 @@ describe("/api/v1/web route contracts", () => {
 
         expect(qualifiedWebIssue.response.status).toBe(200);
         expect(webIssueBody.issue).toMatchObject({
-          id: "TEST-1",
+          id: "docs:TEST-1",
           workspace: docsPath,
           session: "session-docs-1",
         });
@@ -2270,12 +2379,9 @@ describe("/api/v1/web route contracts", () => {
       description: "Tracker-backed docs issue detail.",
       priority: 2,
       state: "In Progress",
-      projectContext: {
-        projectContextId: "docs",
-        projectContextLabel: "Documentation Site",
-        linearProjectSlug: "DOCS",
-        routingSource: "candidate_poll",
-      },
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
     });
     const { server, calls } = createStatusServer(root, {
       tracker: trackerClient(async () => [docsIssue]),
@@ -2308,6 +2414,47 @@ describe("/api/v1/web route contracts", () => {
       await server.stop();
     }
 
+    expect(calls.snapshot).toBeGreaterThanOrEqual(2);
+  });
+
+  it("refreshes cached tracker-backed contextual alias lookups before serving stale web issue details", async () => {
+    const docsIssue = trackerIssue({
+      id: "issue-docs-179",
+      identifier: "ENG-179",
+      title: "Tracker-backed docs issue",
+      description: "Tracker-backed docs issue detail.",
+      priority: 2,
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+    let fetchCount = 0;
+    const { server, calls } = createStatusServer(root, {
+      tracker: trackerClient(async () => {
+        fetchCount += 1;
+        return fetchCount === 1 ? [docsIssue] : [];
+      }),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const board = await getJson(`${baseUrl}/api/v1/web/issues`);
+      expect(board.response.status).toBe(200);
+      expect(board.body).toMatchObject({
+        selectedIssueId: "docs:ENG-179",
+        issues: [expect.objectContaining({ id: "docs:ENG-179", title: "Tracker-backed docs issue", project: "Documentation Site" })],
+      });
+
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179`);
+      expect(detail.response.status).toBe(200);
+      expect(detail.body).toBeNull();
+    } finally {
+      await server.stop();
+    }
+
+    expect(fetchCount).toBe(2);
     expect(calls.snapshot).toBeGreaterThanOrEqual(2);
   });
 
@@ -3186,6 +3333,7 @@ interface CreateStatusServerOptions {
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
   defaultProjectContextId?: string | null;
   runStore?: RunTranscriptStore;
+  lifecycleStore?: IssueLifecycleStore;
   tracker?: TrackerClient;
   webProjectionContextClock?: () => Date;
   webProjectionContextBuilder?: StatusServerWebProjectionContextBuilder;
@@ -3658,6 +3806,7 @@ function createStatusServer(
       staleThresholdMs: 300_000,
       webAssetsRoot: options.webAssetsRoot,
       ...(options.runStore ? { runStore: options.runStore } : {}),
+      ...(options.lifecycleStore ? { lifecycleStore: options.lifecycleStore } : {}),
       ...(options.tracker ? { tracker: options.tracker } : {}),
       ...(options.webProjectionContextClock ? { webProjectionContextClock: options.webProjectionContextClock } : {}),
       ...(options.webProjectionContextBuilder ? { webProjectionContextBuilder: options.webProjectionContextBuilder } : {}),

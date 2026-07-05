@@ -1034,6 +1034,78 @@ describe("web projection foundation", () => {
     expect(JSON.stringify(dashboard)).not.toContain("mock");
   });
 
+  it("dedupes contextual board issues against durable totals by raw issue id without collapsing same-identifier sibling contexts", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+    const dashboard = projectWebDashboard({
+      generatedAt: "2026-01-01T00:15:00.000Z",
+      board: {
+        issues: [
+          contextualBoardCard({
+            issueId: "issue-docs-179",
+            identifier: "ENG-179",
+            title: "Docs issue",
+            lane: "todo",
+            state: "Todo",
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+            linearProjectSlug: "DOCS",
+          }),
+        ],
+      },
+      runtime: null,
+      runs: [
+        run({
+          runId: "run-docs-179",
+          issueId: "issue-docs-179",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+          status: "running",
+          completedAt: null,
+          updatedAt: "2026-01-01T00:14:00.000Z",
+          projectContext: docsProjectContext,
+        }),
+      ],
+      lifecycleRecords: [
+        lifecycle({
+          issueId: "issue-docs-179",
+          issueIdentifier: "ENG-179",
+          phase: "implementation",
+          projectContext: docsProjectContext,
+        }),
+        lifecycle({
+          issueId: "issue-symphony-179",
+          issueIdentifier: "ENG-179",
+          phase: "review",
+          projectContext: symphonyProjectContext,
+        }),
+      ],
+      config: { concurrencyCap: 2 },
+    });
+
+    expect(dashboard.totals).toEqual({
+      backlog: 0,
+      todo: 1,
+      progress: 0,
+      review: 1,
+      done: 0,
+      cancelled: 0,
+      open: 2,
+      all: 2,
+      completeness: 0,
+    });
+  });
+
   it("prefers live runtime agent rows over matching durable running records without double-counting usage", () => {
     const dashboard = projectWebDashboard({
       generatedAt: "2026-01-01T00:15:00.000Z",

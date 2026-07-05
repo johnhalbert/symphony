@@ -3097,6 +3097,7 @@ export class StatusServer {
         issueId: contextualCandidates[0]?.issueId ?? null,
         ambiguousCandidates: [],
         resolutionKind: "contextual_alias",
+        refreshTrackerCache: resolution.matches.some((candidate) => candidate.kind === "tracker"),
       };
     }
 
@@ -3110,13 +3111,18 @@ export class StatusServer {
   private async fetchBoardIssueDetail(issueId: string, forceRefresh: boolean) {
     let { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
     let lookup = this.resolveBoardIssueLookup(issueId, sourceIndex);
-    const refreshedIdentifierLookup = lookup.resolutionKind === "issue_identifier" && this.options.tracker && sourceIndex.trackerIssues.cached;
-    if (refreshedIdentifierLookup) {
+    const refreshTrackerLookup =
+      Boolean(this.options.tracker) && sourceIndex.trackerIssues.cached && (lookup.resolutionKind === "issue_identifier" || lookup.refreshTrackerCache === true);
+    if (refreshTrackerLookup) {
       ({ sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(true));
       lookup = this.resolveBoardIssueLookup(issueId, sourceIndex);
     }
     if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
-    if (this.options.tracker && sourceIndex.trackerIssues.error && (lookup.resolutionKind === "issue_identifier" || refreshedIdentifierLookup)) {
+    if (
+      this.options.tracker &&
+      sourceIndex.trackerIssues.error &&
+      (lookup.resolutionKind === "issue_identifier" || lookup.refreshTrackerCache === true || refreshTrackerLookup)
+    ) {
       throw trackerFailureFromSourceIndex(sourceIndex);
     }
     const lookupIssueId = lookup.issueId ?? issueId;
@@ -6711,15 +6717,44 @@ async function resolveIssueAliasData(input: {
         ...(workspaceCandidate.projectContext ? { projectContext: workspaceCandidate.projectContext } : {}),
       }
     : null;
+  const inferredRuns = inferResolvedIssueRunsFromStrongIssueId({
+    runs,
+    resolvedRuns,
+    lifecycle,
+    workspace,
+    live,
+    resolvedGroupId,
+    defaultProjectContextId: input.defaultProjectContextId,
+  });
+  const contextualRuns = [...resolvedRuns, ...inferredRuns].sort(compareRunChronology);
   return {
     status: "resolved",
-    requestKey: lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? resolvedRuns.at(-1)?.issueIdentifier ?? live?.issueIdentifier ?? input.requestKey,
+    requestKey: lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? contextualRuns.at(-1)?.issueIdentifier ?? live?.issueIdentifier ?? input.requestKey,
     live,
     workspace,
-    latestRun: resolvedRuns.at(-1) ?? null,
-    runs: resolvedRuns,
+    latestRun: contextualRuns.at(-1) ?? null,
+    runs: contextualRuns,
     lifecycle,
   };
+}
+
+function inferResolvedIssueRunsFromStrongIssueId(input: {
+  runs: readonly RunRecord[];
+  resolvedRuns: readonly RunRecord[];
+  lifecycle: IssueLifecycleRecord | null;
+  workspace: WorkspaceRecord | null;
+  live: RunningRow | null;
+  resolvedGroupId: string;
+  defaultProjectContextId: string | null | undefined;
+}): RunRecord[] {
+  const strongIssueId = input.lifecycle?.issueId ?? input.workspace?.issueId ?? input.live?.issueId ?? null;
+  if (!strongIssueId) return [];
+  const resolvedRunIds = new Set(input.resolvedRuns.map((record) => record.runId));
+  return input.runs.filter((record) => {
+    if (resolvedRunIds.has(record.runId)) return false;
+    if (record.issueId !== strongIssueId) return false;
+    return projectContextGroupId(projectContextIdForAliasMatching(record), input.defaultProjectContextId) !== input.resolvedGroupId;
+  });
 }
 
 async function resolveIssueActionTarget(input: {
@@ -8368,6 +8403,7 @@ interface IssueLookupResult {
   issueId: string | null;
   ambiguousCandidates: IssueLookupCandidate[];
   resolutionKind: "exact_issue_id" | "issue_identifier" | "contextual_alias" | "unresolved";
+  refreshTrackerCache?: boolean;
 }
 
 async function resolveIssueLookupKey(

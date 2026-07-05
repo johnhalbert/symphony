@@ -63,6 +63,12 @@ export interface IssueModel {
   desc?: string[];
 }
 
+const RAW_DASHBOARD_ISSUE_ID_ALIASES = Symbol("rawDashboardIssueIdAliases");
+
+type IssueModelWithRawDashboardIssueIdAliases = IssueModel & {
+  [RAW_DASHBOARD_ISSUE_ID_ALIASES]?: readonly string[];
+};
+
 export interface IssueActivityModel {
   t: string;
   verb: string;
@@ -721,6 +727,7 @@ export function projectIssueModel(
         details.latestRun.runId,
       ) ?? null,
   };
+  attachRawDashboardIssueIdAliases(model, [issue.id, card?.issueId]);
   const description = projectIssueDescription(details, card?.reviewLoop ?? null);
   if (description.length > 0) model.desc = description;
   return model;
@@ -1180,7 +1187,7 @@ function dashboardTotalsFromDurableState(
   const latestRunByAlias = buildLatestRunByAlias(runs);
 
   for (const issue of board.issues) {
-    addDashboardIssueStatus(totals, representedAliases, issue.status, [issue.id], `board:${issue.id}`);
+    addDashboardIssueStatus(totals, representedAliases, issue.status, [issue.id, ...rawDashboardIssueIdAliases(issue)], `board:${issue.id}`);
   }
 
   for (const lifecycle of lifecycleRecords) {
@@ -1463,12 +1470,30 @@ function cloneWebIssueBoardModel(input: WebIssueBoardModel): WebIssueBoardModel 
 }
 
 function cloneIssueModel(input: IssueModel): IssueModel {
-  return {
+  const cloned: IssueModel = {
     ...input,
     labels: [...input.labels],
     activity: input.activity.map((item) => ({ ...item })),
     ...(input.desc === undefined ? {} : { desc: [...input.desc] }),
   };
+  const rawAliases = rawDashboardIssueIdAliases(input);
+  return rawAliases.length > 0 ? attachRawDashboardIssueIdAliases(cloned, rawAliases) : cloned;
+}
+
+function attachRawDashboardIssueIdAliases(model: IssueModel, aliases: readonly (string | null | undefined)[]): IssueModel {
+  const normalized = dashboardAliases(...aliases);
+  if (normalized.length === 0) return model;
+  Object.defineProperty(model, RAW_DASHBOARD_ISSUE_ID_ALIASES, {
+    value: normalized,
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+  return model;
+}
+
+function rawDashboardIssueIdAliases(model: IssueModel): readonly string[] {
+  return (model as IssueModelWithRawDashboardIssueIdAliases)[RAW_DASHBOARD_ISSUE_ID_ALIASES] ?? [];
 }
 
 function cloneReferenceData(input: ReferenceData): ReferenceData {
