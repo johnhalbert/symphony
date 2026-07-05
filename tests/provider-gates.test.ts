@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -204,6 +204,10 @@ describe("provider gate project-context attribution", () => {
         source: {
           issueIdentifier: "ENG-123",
           runId: "provider-limit-run",
+          projectContextId: docsProjectContext.projectContextId,
+          projectContextLabel: docsProjectContext.projectContextLabel,
+          linearProjectSlug: docsProjectContext.linearProjectSlug,
+          routingSource: docsProjectContext.routingSource,
           projectContext: docsProjectContext,
         },
       });
@@ -213,6 +217,10 @@ describe("provider gate project-context attribution", () => {
         source: {
           issueIdentifier: "ENG-123",
           runId: "provider-limit-run",
+          projectContextId: docsProjectContext.projectContextId,
+          projectContextLabel: docsProjectContext.projectContextLabel,
+          linearProjectSlug: docsProjectContext.linearProjectSlug,
+          routingSource: docsProjectContext.routingSource,
           projectContext: docsProjectContext,
         },
       });
@@ -222,6 +230,10 @@ describe("provider gate project-context attribution", () => {
         source: {
           issueIdentifier: "ENG-123",
           runId: "provider-limit-run",
+          projectContextId: docsProjectContext.projectContextId,
+          projectContextLabel: docsProjectContext.projectContextLabel,
+          linearProjectSlug: docsProjectContext.linearProjectSlug,
+          routingSource: docsProjectContext.routingSource,
           projectContext: docsProjectContext,
         },
       });
@@ -251,6 +263,10 @@ describe("provider gate project-context attribution", () => {
       source: {
         issueIdentifier: "ENG-123",
         runId: "run-docs",
+        projectContextId: docsProjectContext.projectContextId,
+        projectContextLabel: docsProjectContext.projectContextLabel,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+        routingSource: docsProjectContext.routingSource,
         projectContext: docsProjectContext,
       },
     });
@@ -260,6 +276,56 @@ describe("provider gate project-context attribution", () => {
       source: {
         issueIdentifier: "ENG-123",
         runId: "run-docs",
+        projectContextId: docsProjectContext.projectContextId,
+        projectContextLabel: docsProjectContext.projectContextLabel,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+        routingSource: docsProjectContext.routingSource,
+        projectContext: docsProjectContext,
+      },
+    });
+  });
+
+  it("rehydrates project-context source metadata when reloading legacy provider gate records", async () => {
+    const store = new FileProviderGateStore(root);
+    const created = await store.upsert(
+      providerGateSignal("openai-codex", "ENG-123", docsProjectContext, "2026-01-01T00:00:00.000Z"),
+    );
+
+    const providerGatesDir = path.join(root, "provider-gates");
+    const [entry] = await readdir(providerGatesDir);
+    const legacyRecord = JSON.parse(await readFile(path.join(providerGatesDir, entry!), "utf8")) as RuntimeProviderGate & {
+      source?: Record<string, unknown> | null;
+    };
+
+    expect(legacyRecord.source).toMatchObject({
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      routingSource: docsProjectContext.routingSource,
+      projectContext: docsProjectContext,
+    });
+
+    if (legacyRecord.source && typeof legacyRecord.source === "object") {
+      delete legacyRecord.source.projectContextId;
+      delete legacyRecord.source.projectContextLabel;
+      delete legacyRecord.source.linearProjectSlug;
+      delete legacyRecord.source.routingSource;
+    }
+
+    await writeFile(path.join(providerGatesDir, entry!), `${JSON.stringify(legacyRecord, null, 2)}\n`, "utf8");
+
+    const reloaded = await new FileProviderGateStore(root).listActive();
+
+    expect(reloaded).toHaveLength(1);
+    expect(reloaded[0]).toMatchObject({
+      id: created.id,
+      source: {
+        issueIdentifier: "ENG-123",
+        runId: "run-docs",
+        projectContextId: docsProjectContext.projectContextId,
+        projectContextLabel: docsProjectContext.projectContextLabel,
+        linearProjectSlug: docsProjectContext.linearProjectSlug,
+        routingSource: docsProjectContext.routingSource,
         projectContext: docsProjectContext,
       },
     });
