@@ -40,6 +40,7 @@ import {
   type RunTranscriptStore,
   type TranscriptEvent,
   type TranscriptPage,
+  type WorkspaceRecord,
 } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { TrackerStateLists } from "../src/core/types.js";
@@ -422,7 +423,7 @@ describe("/api/v1/web route contracts", () => {
       await server.stop();
     }
 
-    expect(calls.snapshot).toBe(3);
+    expect(calls.snapshot).toBe(4);
     expect(projectionWriter.writes).toEqual([]);
     expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
       { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
@@ -1258,13 +1259,200 @@ describe("/api/v1/web route contracts", () => {
       await server.stop();
     }
 
-    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(runStore.transcriptReadCount).toBe(1);
     expect(projectionWriter.writes).toEqual([]);
     expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
       { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
+    ]);
+  });
+
+  it("serves contextual issue-detail payloads from durable board projections without losing raw run associations", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const durableIssue = {
+      ...issueModelFixture(),
+      id: "docs:ENG-179",
+      title: "Serve contextual durable web projections",
+      project: "Documentation Site",
+    };
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [durableIssue], review: [] },
+      cycleLabel: "Docs cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "docs:ENG-179",
+    };
+    const transcriptEvents: TranscriptEvent[] = [
+      {
+        runId: "run-docs-1",
+        sequence: 1,
+        at: "2026-05-31T00:00:31.000Z",
+        source: "runtime",
+        eventType: "assistant_complete",
+        message: "served from contextual durable issue detail transcript",
+      },
+    ];
+    const run = runRecordFixture({
+      runId: "run-docs-1",
+      sessionId: "session-docs-1",
+      issueId: "issue-docs-179",
+      issueIdentifier: "ENG-179",
+      workspaceKey: "ENG-179",
+      projectContext: docsProjectContext,
+      cursorModel: "gpt-5-durable-docs",
+      transcriptEventCount: transcriptEvents.length,
+    });
+    const durableTranscript = [
+      { kind: "assistant" as const, ts: "2026-05-31T00:00:00.000Z", text: "served from contextual durable transcript" },
+    ];
+    const runStore = new RecordingRunStore([run], { "run-docs-1": transcriptEvents });
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+            { source: "lifecycleStore", revision: "lifecycle-current", observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-docs-1:offset:0:limit:500" },
+        durableTranscript,
+      ),
+    ]);
+    const { server, calls } = createStatusServer(root, {
+      projectionReader,
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179`);
+      expect(detail.body).toMatchObject({ issue: durableIssue, transcript: [] });
+      expect((detail.body as { activity: unknown[] }).activity).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ verb: "run_started", id: "ENG-179", extra: "succeeded", who: "agent-1" }),
+          expect.objectContaining({ verb: "run_completed", id: "ENG-179", extra: "succeeded", who: "agent-1" }),
+        ]),
+      );
+      expect((detail.body as { runs: unknown[] }).runs).toEqual([
+        expect.objectContaining({ id: "session-docs-1", issue: "ENG-179", state: "succeeded", model: "gpt-5-durable-docs", msgCount: 1 }),
+      ]);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+
+      const detailWithTranscript = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179?includeTranscript=1`);
+      expect((detailWithTranscript.body as { runs: unknown[] }).runs).toEqual((detail.body as { runs: unknown[] }).runs);
+      expect((detailWithTranscript.body as { transcript: unknown[] }).transcript).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "system", model: "gpt-5-durable-docs", workspace: "ENG-179", session: "session-docs-1" }),
+          expect.objectContaining({ kind: "assistant", text: "served from contextual durable issue detail transcript" }),
+        ]),
+      );
+      expect(detailWithTranscript.response.headers.get("x-symphony-projection-status")).toBe("hit");
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(1);
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    ]);
+  });
+
+  it("keeps unresolved contextual durable detail aliases isolated from raw runs in other project contexts", async () => {
+    const durableIssue = {
+      ...issueModelFixture(),
+      id: "docs:ENG-179",
+      title: "Serve contextual durable web projections",
+      project: "Documentation Site",
+    };
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [durableIssue], review: [] },
+      cycleLabel: "Docs cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "docs:ENG-179",
+    };
+    const otherContextRun = runRecordFixture({
+      runId: "run-default-1",
+      sessionId: "session-default-1",
+      issueId: "issue-default-179",
+      issueIdentifier: "ENG-179",
+      workspaceKey: "ENG-179",
+      cursorModel: "gpt-5-default",
+      transcriptEventCount: 1,
+    });
+    const runStore = new RecordingRunStore(
+      [otherContextRun],
+      {
+        "run-default-1": [
+          {
+            runId: "run-default-1",
+            sequence: 1,
+            at: "2026-05-31T00:00:30.000Z",
+            source: "runtime",
+            eventType: "assistant_complete",
+            message: "must not leak across project contexts",
+          },
+        ],
+      },
+    );
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+            { source: "lifecycleStore", revision: "lifecycle-current", observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+    ]);
+    const { server, calls } = createStatusServer(root, {
+      projectionReader,
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179`);
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(detail.body).toMatchObject({ issue: durableIssue, activity: [], runs: [], transcript: [] });
+
+      const detailWithTranscript = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179?includeTranscript=1`);
+      expect(detailWithTranscript.response.status).toBe(200);
+      expect(detailWithTranscript.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(detailWithTranscript.body).toMatchObject({ issue: durableIssue, activity: [], runs: [], transcript: [] });
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(0);
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
     ]);
   });
 
@@ -2031,7 +2219,99 @@ describe("/api/v1/web route contracts", () => {
       expect(calls).toMatchObject({ refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     });
 
-    it("returns explicit stale responses without rebuilding canonical web projection sources", async () => {
+  it("resolves context-qualified web issue detail lookups during refresh bypasses", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const runStore = new RecordingRunStore([
+      runRecordFixture({
+        runId: "run-docs-refresh-1",
+        sessionId: "session-docs-refresh-1",
+        issueId: "issue-docs-refresh-1",
+        issueIdentifier: "ENG-179",
+        workspaceKey: "ENG-179",
+        projectContext: docsProjectContext,
+        cursorModel: "gpt-5-refresh-docs",
+      }),
+    ]);
+    const { server, calls } = createStatusServer(root, {
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179?refresh=1`);
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(detail.body).toMatchObject({
+        issue: {
+          id: "docs:ENG-179",
+          title: "ENG-179",
+          project: "Documentation Site",
+        },
+        runs: [expect.objectContaining({ id: "session-docs-refresh-1", issue: "ENG-179", model: "gpt-5-refresh-docs" })],
+      });
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls.snapshot).toBeGreaterThanOrEqual(1);
+  });
+
+  it("resolves tracker-backed context-qualified web issue details during refresh bypasses", async () => {
+    const docsIssue = trackerIssue({
+      id: "issue-docs-179",
+      identifier: "ENG-179",
+      title: "Tracker-backed docs issue",
+      description: "Tracker-backed docs issue detail.",
+      priority: 2,
+      state: "In Progress",
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+    });
+    const { server, calls } = createStatusServer(root, {
+      tracker: trackerClient(async () => [docsIssue]),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const board = await getJson(`${baseUrl}/api/v1/web/issues?refresh=1`);
+      expect(board.response.status).toBe(200);
+      expect(board.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(board.body).toMatchObject({
+        selectedIssueId: "docs:ENG-179",
+        issues: [expect.objectContaining({ id: "docs:ENG-179", title: "Tracker-backed docs issue", project: "Documentation Site" })],
+      });
+
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179?refresh=1`);
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(detail.body).toMatchObject({
+        issue: {
+          id: "docs:ENG-179",
+          title: "Tracker-backed docs issue",
+          project: "Documentation Site",
+        },
+        runs: [],
+        transcript: [],
+      });
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls.snapshot).toBeGreaterThanOrEqual(2);
+  });
+
+  it("returns explicit stale responses without rebuilding canonical web projection sources", async () => {
     const staleDashboard = {
       projectName: "Stale durable dashboard",
       repoLabel: "",
@@ -3026,6 +3306,10 @@ class RecordingRunStore {
 
   async listRuns(): Promise<RunRecord[]> {
     return [...this.runsById.values()].map((run) => cloneJson(run));
+  }
+
+  async listWorkspaces(): Promise<WorkspaceRecord[]> {
+    return [];
   }
 
   async readTranscript(runId: string, page: { offset: number; limit: number }): Promise<TranscriptPage> {
