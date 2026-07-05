@@ -1912,6 +1912,213 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("normalizes non-secret project context attribution across running agents, provider gates, workspaces, and runs", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const expectedProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const injectedProjectContext = {
+      ...expectedProjectContext,
+      repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+      path: "packages/site",
+      token: "workspace-secret",
+      source: { profile: "profile-secret" },
+    };
+
+    await runStore.upsertWorkspace({
+      workspaceKey: "DOCS-CTX-HTTP",
+      issueId: "issue-docs-http-ctx-1",
+      issueIdentifier: "DOCS-CTX-HTTP",
+      projectContext: expectedProjectContext,
+      path: path.join(config.workspace.root, "DOCS-CTX-HTTP"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/docs/DOCS-CTX-HTTP",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await runStore.startRun({
+      runId: "run-docs-http-ctx-1",
+      sessionId: "session-docs-http-ctx-1",
+      agentId: "agent-docs-http-ctx-1",
+      role: "worker",
+      issueId: "issue-docs-http-ctx-1",
+      issueIdentifier: "DOCS-CTX-HTTP",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "DOCS-CTX-HTTP",
+      workspacePath: path.join(config.workspace.root, "DOCS-CTX-HTTP"),
+      gitBranchName: "symphony/docs/DOCS-CTX-HTTP",
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+      projectContext: expectedProjectContext,
+    });
+    await lifecycleStore.ensureIssue(issue({ id: "issue-docs-http-ctx-1", identifier: "DOCS-CTX-HTTP" }), {
+      phase: "implementation",
+      projectContext: expectedProjectContext,
+    } as IssueLifecyclePatch);
+
+    const rawWorkspacePath = path.join(config.workspace.stateDir, "workspaces", "DOCS-CTX-HTTP.json");
+    const rawWorkspace = JSON.parse(await readFile(rawWorkspacePath, "utf8")) as Record<string, unknown>;
+    rawWorkspace.projectContext = injectedProjectContext;
+    await writeFile(rawWorkspacePath, `${JSON.stringify(rawWorkspace, null, 2)}\n`, "utf8");
+
+    const rawRunPath = path.join(config.workspace.stateDir, "runs", "run-docs-http-ctx-1", "meta.json");
+    const rawRun = JSON.parse(await readFile(rawRunPath, "utf8")) as Record<string, unknown>;
+    rawRun.projectContext = injectedProjectContext;
+    await writeFile(rawRunPath, `${JSON.stringify(rawRun, null, 2)}\n`, "utf8");
+
+    const running = liveRunningFixture(config, "DOCS-CTX-HTTP", "In Progress");
+    running.issueId = "issue-docs-http-ctx-1";
+    running.runId = "run-docs-http-ctx-1";
+    running.sessionId = "session-docs-http-ctx-1";
+    running.projectContext = injectedProjectContext;
+    running.metadata.branchName = "symphony/docs/DOCS-CTX-HTTP";
+    running.metadata.gitBranchName = "symphony/docs/DOCS-CTX-HTTP";
+    running.metadata.repoPath = "/repo/docs";
+    running.metadata.baseRef = "origin/main";
+    running.issueDetails = issueDetailsFixture({
+      id: running.issueId,
+      identifier: running.issueIdentifier,
+      title: "Docs live context route",
+      state: "In Progress",
+      branchName: "symphony/docs/DOCS-CTX-HTTP",
+      projectContextId: expectedProjectContext.projectContextId,
+      projectContextLabel: expectedProjectContext.projectContextLabel,
+      linearProjectSlug: expectedProjectContext.linearProjectSlug,
+      routingSource: expectedProjectContext.routingSource,
+    });
+
+    const injectedProviderGateSource = {
+      issueId: running.issueId,
+      issueIdentifier: running.issueIdentifier,
+      runId: running.runId,
+      sessionId: running.sessionId,
+      role: running.role,
+      runPhase: running.runPhase,
+      projectContext: injectedProjectContext,
+      token: "provider-gate-source-secret",
+      repository: "https://x-access-token:gate-source-secret@example.com/org/docs.git",
+    } as NonNullable<ReturnType<Orchestrator["snapshot"]>["providerGates"][number]["source"]>;
+
+    const providerGate: ReturnType<Orchestrator["snapshot"]>["providerGates"][number] = {
+      id: "gate-docs-http-ctx-1",
+      scope: {
+        harnessId: "cursor",
+        providerId: "openai-codex",
+        model: "gpt-5",
+        accountScopeKey: null,
+      },
+      kind: "windowed_bucket_exhausted",
+      window: null,
+      resumePolicy: "manual",
+      message: "Docs weekly allotment exhausted",
+      observedAt: "2026-01-01T00:03:00.000Z",
+      createdAt: "2026-01-01T00:03:00.000Z",
+      updatedAt: "2026-01-01T00:03:00.000Z",
+      affectedRoles: ["worker"],
+      affectedRunPhases: [running.runPhase],
+      source: injectedProviderGateSource,
+      raw: { retryAfterMs: 60_000 },
+    };
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator([running], { providerGates: [providerGate] }),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const stateResponse = await fetch(`${baseUrl}/api/v1/state`);
+      const workspacesResponse = await fetch(`${baseUrl}/api/v1/workspaces`);
+      const issueRunsResponse = await fetch(`${baseUrl}/api/v1/issues/DOCS-CTX-HTTP/runs`);
+      const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-docs-http-ctx-1`);
+
+      const stateBody = (await stateResponse.json()) as {
+        running: Array<{ projectContext?: typeof expectedProjectContext }>;
+        providerGates: Array<{ source: { projectContext?: typeof expectedProjectContext | null } | null }>;
+        operatorView: {
+          running: Array<{ projectContext?: typeof expectedProjectContext }>;
+          providerGates: Array<{ source: { projectContext?: typeof expectedProjectContext | null } | null }>;
+        };
+      };
+      const workspacesBody = (await workspacesResponse.json()) as {
+        workspaces: Array<{ workspaceKey: string; projectContext?: typeof expectedProjectContext }>;
+      };
+      const issueRunsBody = (await issueRunsResponse.json()) as {
+        runs: Array<{ runId: string; projectContext?: typeof expectedProjectContext }>;
+      };
+      const runBody = (await runResponse.json()) as { runId: string; projectContext?: typeof expectedProjectContext };
+      const providerGateSource = stateBody.providerGates[0]?.source as
+        | ({ projectContext?: typeof expectedProjectContext | null } & Record<string, unknown>)
+        | null
+        | undefined;
+      const operatorProviderGateSource = stateBody.operatorView.providerGates[0]?.source as
+        | ({ projectContext?: typeof expectedProjectContext | null } & Record<string, unknown>)
+        | null
+        | undefined;
+      const serializedBodies = JSON.stringify({ stateBody, workspacesBody, issueRunsBody, runBody });
+
+      expect(stateResponse.status).toBe(200);
+      expect(workspacesResponse.status).toBe(200);
+      expect(issueRunsResponse.status).toBe(200);
+      expect(runResponse.status).toBe(200);
+      expect(stateBody.running[0]?.projectContext).toEqual(expectedProjectContext);
+      expect(stateBody.operatorView.running[0]?.projectContext).toEqual(expectedProjectContext);
+      expect(providerGateSource?.projectContext).toEqual(expectedProjectContext);
+      expect(operatorProviderGateSource?.projectContext).toEqual(expectedProjectContext);
+      expect(providerGateSource).toMatchObject({
+        token: "[redacted]",
+        repository: "https://[redacted]@example.com/org/docs.git",
+      });
+      expect(operatorProviderGateSource).toMatchObject({
+        token: "[redacted]",
+        repository: "https://[redacted]@example.com/org/docs.git",
+      });
+      expect(workspacesBody.workspaces).toMatchObject([
+        {
+          workspaceKey: "DOCS-CTX-HTTP",
+          projectContext: expectedProjectContext,
+        },
+      ]);
+      expect(issueRunsBody.runs).toMatchObject([
+        {
+          runId: "run-docs-http-ctx-1",
+          projectContext: expectedProjectContext,
+        },
+      ]);
+      expect(runBody).toMatchObject({
+        runId: "run-docs-http-ctx-1",
+        projectContext: expectedProjectContext,
+      });
+      expect(serializedBodies).not.toContain("repo-secret");
+      expect(serializedBodies).not.toContain("gate-source-secret");
+      expect(serializedBodies).not.toContain("provider-gate-source-secret");
+      expect(serializedBodies).not.toContain("workspace-secret");
+      expect(serializedBodies).not.toContain("profile-secret");
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("preserves both exact-id siblings on tracker-backed board cards and rejects ambiguous board detail identifiers", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const docsIssue = trackerIssue({
@@ -9599,8 +9806,15 @@ async function waitForStatusApiAsync(predicate: () => Promise<boolean>, descript
 
 function fakeOrchestrator(
   running: ReturnType<Orchestrator["snapshot"]>["running"] = [],
-  overrides: Partial<Pick<ReturnType<Orchestrator["snapshot"]>, "paused" | "retrying">> = {},
+  overrides: Partial<Pick<ReturnType<Orchestrator["snapshot"]>, "paused" | "retrying" | "providerGates" | "providerGateCounts">> = {},
 ): Orchestrator {
+  const providerGates = overrides.providerGates ?? [];
+  const providerGateCounts =
+    overrides.providerGateCounts ?? {
+      active: providerGates.length,
+      manual: providerGates.filter((gate) => gate.resumePolicy === "manual").length,
+      autoResume: providerGates.filter((gate) => gate.resumePolicy === "auto_at_window_close").length,
+    };
   return {
     snapshot() {
       return {
@@ -9609,10 +9823,10 @@ function fakeOrchestrator(
           running: running.length,
           retrying: overrides.retrying?.length ?? 0,
           paused: overrides.paused?.length ?? 0,
-          providerGates: 0,
+          providerGates: providerGates.length,
         },
-        providerGates: [],
-        providerGateCounts: { active: 0, manual: 0, autoResume: 0 },
+        providerGates,
+        providerGateCounts,
         running,
         retrying: overrides.retrying ?? [],
         paused: overrides.paused ?? [],

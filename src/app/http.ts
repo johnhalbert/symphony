@@ -950,7 +950,7 @@ export class StatusServer {
       }
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
         sendJson(response, 200, {
-          workspaces: (await this.options.runStore?.listWorkspaces()) ?? [],
+          workspaces: ((await this.options.runStore?.listWorkspaces()) ?? []).map(publicWorkspaceRecord),
         });
         return;
       }
@@ -1550,7 +1550,7 @@ export class StatusServer {
         const workspaceKey = decodeURIComponent(workspaceMatch[1] ?? "").trim();
         const directWorkspace = await this.options.runStore?.getWorkspace(workspaceKey);
         if (directWorkspace && (directWorkspace.workspaceKey !== directWorkspace.issueIdentifier || !this.options.defaultProjectContextId)) {
-          sendJson(response, 200, directWorkspace);
+          sendJson(response, 200, publicWorkspaceRecord(directWorkspace));
           return;
         }
         const parsedWorkspaceAlias = parseContextualAlias(workspaceKey);
@@ -1559,7 +1559,7 @@ export class StatusServer {
           if (lookup.resolutionKind === "exact_issue_id" && lookup.issueId) {
             const exactWorkspace = await this.options.runStore?.findWorkspace(lookup.issueId);
             if (exactWorkspace) {
-              sendJson(response, 200, exactWorkspace);
+              sendJson(response, 200, publicWorkspaceRecord(exactWorkspace));
               return;
             }
           }
@@ -1579,7 +1579,7 @@ export class StatusServer {
           throw statusAliasResolutionError("Workspace", workspaceKey, resolvedIssue.status);
         }
         if (!resolvedIssue.workspace) throw new SymphonyError("not_found", `Workspace not found: ${workspaceKey}`);
-        sendJson(response, 200, resolvedIssue.workspace);
+        sendJson(response, 200, publicWorkspaceRecord(resolvedIssue.workspace));
         return;
       }
 
@@ -7321,7 +7321,7 @@ function providerGateOperatorSummary(gate: RuntimeSnapshot["providerGates"][numb
     windowKind: gate.window?.windowKind ?? null,
     affectedRoles: gate.affectedRoles,
     affectedRunPhases: gate.affectedRunPhases,
-    source: gate.source,
+    source: gate.source === null ? null : gate.source === undefined ? undefined : publicProviderLimitSource(gate.source),
     controls: {
       clear: true,
       resume: true,
@@ -7602,13 +7602,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function publicRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
-  return sanitizePublicJson(snapshot) as RuntimeSnapshot;
+  const publicSnapshot = sanitizePublicJson(snapshot) as RuntimeSnapshot;
+  return {
+    ...publicSnapshot,
+    providerGates: snapshot.providerGates.map(publicProviderGate),
+    running: snapshot.running.map(publicLiveRow),
+  };
 }
 
 function publicRunRecord(run: RunRecord): RunRecord {
+  const projectContext = publicProjectContext(run.projectContext);
   const record: RunRecord = {
     ...run,
     error: publicDiagnosticText(run.error),
+    ...(projectContext === undefined ? {} : { projectContext }),
+    ...(run.providerLimit === undefined
+      ? {}
+      : { providerLimit: run.providerLimit === null ? null : publicProviderLimitSignal(run.providerLimit) }),
     ...(run.commandPolicy === undefined
       ? {}
       : { commandPolicy: sanitizeCommandPolicyReplayStateForPublicOutput(run.commandPolicy) }),
@@ -7626,12 +7636,66 @@ function publicDiagnosticText(value: string | null | undefined): string | null {
   return sanitizedPreviewValue(value).preview;
 }
 
-function publicLiveRow(row: RunningRow): RunningRow {
+function publicProjectContext(
+  projectContext: Partial<ProjectContextResolution> | undefined,
+): ProjectContextResolution | undefined {
+  if (projectContext === undefined) return undefined;
+  const publicProjectContext = sanitizePublicJson(projectContext) as Partial<ProjectContextResolution>;
+  return normalizeProjectContextResolution(publicProjectContext);
+}
+
+function publicNullableProjectContext(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+): ProjectContextResolution | null | undefined {
+  if (projectContext === null) return null;
+  return publicProjectContext(projectContext);
+}
+
+function publicProviderLimitSource(
+  source: NonNullable<RuntimeSnapshot["providerGates"][number]["source"]>,
+): RuntimeSnapshot["providerGates"][number]["source"] {
+  const publicSource = sanitizePublicJson(source) as NonNullable<RuntimeSnapshot["providerGates"][number]["source"]>;
+  const projectContext = publicNullableProjectContext(publicSource.projectContext);
   return {
-    ...row,
+    ...publicSource,
+    ...(projectContext === undefined ? {} : { projectContext }),
+  };
+}
+
+function publicProviderLimitSignal(signal: NonNullable<RunRecord["providerLimit"]>): NonNullable<RunRecord["providerLimit"]> {
+  return {
+    ...signal,
+    ...(signal.source === undefined ? {} : { source: signal.source === null ? null : publicProviderLimitSource(signal.source) }),
+  };
+}
+
+function publicProviderGate(gate: RuntimeSnapshot["providerGates"][number]): RuntimeSnapshot["providerGates"][number] {
+  const publicGate = sanitizePublicJson(gate) as RuntimeSnapshot["providerGates"][number];
+  return {
+    ...publicGate,
+    ...(gate.source === undefined ? {} : { source: gate.source === null ? null : publicProviderLimitSource(gate.source) }),
+  };
+}
+
+function publicWorkspaceRecord(workspace: WorkspaceRecord): WorkspaceRecord {
+  const projectContext = publicProjectContext(workspace.projectContext);
+  return {
+    ...workspace,
+    ...(projectContext === undefined ? {} : { projectContext }),
+  };
+}
+
+function publicLiveRow(row: RunningRow): RunningRow {
+  const publicRow = sanitizePublicJson(row) as RunningRow;
+  const projectContext = publicProjectContext(
+    row.projectContext ?? projectContextResolutionFromIssue(publicRow.issueDetails) ?? row.lifecycle?.projectContext,
+  );
+  return {
+    ...publicRow,
     lastEvent: publicDiagnosticText(row.lastEvent),
     lastMessage: publicDiagnosticText(row.lastMessage),
-    cancellation: publicLiveCancellation(row.cancellation),
+    ...(projectContext === undefined ? {} : { projectContext }),
+    cancellation: publicLiveCancellation(publicRow.cancellation),
   };
 }
 
