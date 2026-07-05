@@ -2828,6 +2828,7 @@ export class Orchestrator {
           sessionId: signal.source?.sessionId ?? entry.sessionId,
           role: signal.source?.role ?? entry.role,
           runPhase: signal.source?.runPhase ?? entry.runPhase,
+          projectContext: signal.source?.projectContext ?? this.resolvedProjectContext(entry) ?? null,
         },
       },
       {

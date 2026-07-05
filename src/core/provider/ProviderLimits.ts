@@ -1,3 +1,4 @@
+import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { AgentRunPhase, AgentRunRole } from "../types.js";
 
 export type ProviderLimitKind =
@@ -38,6 +39,7 @@ export interface ProviderLimitSource {
   sessionId?: string | null;
   role?: AgentRunRole | null;
   runPhase?: AgentRunPhase | null;
+  projectContext?: ProjectContextResolution | null;
 }
 
 export interface ProviderLimitSignal {
