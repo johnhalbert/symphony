@@ -6868,9 +6868,190 @@ describe("Orchestrator", () => {
       projectContext: docsProjectContext,
       status: "succeeded",
     });
-  });
+    });
 
-  it("instructs default reviewer prompts to leave PR feedback before verdict submission", async () => {
+    it("keeps a healthy default context dispatchable when another context reaches its maxConcurrentAgents cap", async () => {
+    const config = testConfig(root);
+    config.agent.maxConcurrentAgents = 2;
+    addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.agent.maxConcurrentAgents = 1;
+
+    const defaultCandidate = {
+      ...issue({
+        id: "issue-default-context-cap-1",
+        identifier: "ZZZ-1",
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        createdAt: "2026-01-01T00:00:02Z",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: legacyDefaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-context-cap-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:02Z",
+    };
+    const docsCandidateOne = trackerIssue({
+      id: "issue-docs-context-cap-1",
+      identifier: "AAA-1",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    const docsCandidateTwo = trackerIssue({
+      id: "issue-docs-context-cap-2",
+      identifier: "AAA-2",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      createdAt: "2026-01-01T00:00:01Z",
+    });
+    const defaultTracker = trackerClientFixture({
+      candidates: [defaultCandidate],
+      issues: [defaultCandidate],
+    });
+    const docsTracker = trackerClientFixture({
+      candidates: [docsCandidateOne, docsCandidateTwo],
+      issues: [docsCandidateOne, docsCandidateTwo],
+    });
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new ConcurrentContextDispatchHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 2, "context maxConcurrentAgents dispatches");
+      await waitFor(() => orchestrator.snapshot().counts.running === 2, "context maxConcurrentAgents active runs");
+
+      expect(defaultTracker.candidateFetchCount).toBe(1);
+      expect(docsTracker.candidateFetchCount).toBe(1);
+      expect(harness.runs.map((run) => run.ctx.issue.id)).toEqual(
+        expect.arrayContaining([defaultCandidate.id, docsCandidateOne.id]),
+      );
+      expect(harness.runs.map((run) => run.ctx.issue.id)).not.toContain(docsCandidateTwo.id);
+      expect(harness.runs.filter((run) => run.ctx.projectContext?.projectContextId === docsProjectContext.projectContextId)).toHaveLength(1);
+      expect(harness.runs.map((run) => run.ctx.projectContext?.projectContextId)).toEqual(
+        expect.arrayContaining([legacyDefaultProjectContext.projectContextId, docsProjectContext.projectContextId]),
+      );
+
+      harness.releaseAll();
+      await waitFor(() => orchestrator.snapshot().counts.running === 0, "context maxConcurrentAgents completion");
+    } finally {
+      harness.releaseAll();
+      await orchestrator.stop();
+    }
+    });
+
+    it("applies context-specific maxConcurrentAgentsByState caps without blocking other contexts", async () => {
+    const config = testConfig(root);
+    config.agent.maxConcurrentAgents = 2;
+    addDocsPollingProjectContext(config);
+    const docsContext = requireDocsPollingContext(config);
+    docsContext.agent.maxConcurrentAgents = 2;
+    docsContext.agent.maxConcurrentAgentsByState = new Map([["todo", 1]]);
+
+    const defaultCandidate = {
+      ...issue({
+        id: "issue-default-state-cap-1",
+        identifier: "ZZZ-2",
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        createdAt: "2026-01-01T00:00:02Z",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: legacyDefaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-state-cap-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:02Z",
+    };
+    const docsCandidateOne = trackerIssue({
+      id: "issue-docs-state-cap-1",
+      identifier: "AAA-3",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    const docsCandidateTwo = trackerIssue({
+      id: "issue-docs-state-cap-2",
+      identifier: "AAA-4",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      createdAt: "2026-01-01T00:00:01Z",
+    });
+    const defaultTracker = trackerClientFixture({
+      candidates: [defaultCandidate],
+      issues: [defaultCandidate],
+    });
+    const docsTracker = trackerClientFixture({
+      candidates: [docsCandidateOne, docsCandidateTwo],
+      issues: [docsCandidateOne, docsCandidateTwo],
+    });
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new ConcurrentContextDispatchHarness();
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 2, "context maxConcurrentAgentsByState dispatches");
+      await waitFor(() => orchestrator.snapshot().counts.running === 2, "context maxConcurrentAgentsByState active runs");
+
+      expect(defaultTracker.candidateFetchCount).toBe(1);
+      expect(docsTracker.candidateFetchCount).toBe(1);
+      expect(harness.runs.map((run) => run.ctx.issue.id)).toEqual(
+        expect.arrayContaining([defaultCandidate.id, docsCandidateOne.id]),
+      );
+      expect(harness.runs.map((run) => run.ctx.issue.id)).not.toContain(docsCandidateTwo.id);
+      expect(harness.runs.filter((run) => run.ctx.projectContext?.projectContextId === docsProjectContext.projectContextId)).toHaveLength(1);
+      expect(harness.runs.map((run) => run.ctx.projectContext?.projectContextId)).toEqual(
+        expect.arrayContaining([legacyDefaultProjectContext.projectContextId, docsProjectContext.projectContextId]),
+      );
+
+      harness.releaseAll();
+      await waitFor(() => orchestrator.snapshot().counts.running === 0, "context maxConcurrentAgentsByState completion");
+    } finally {
+      harness.releaseAll();
+      await orchestrator.stop();
+    }
+    });
+
+    it("instructs default reviewer prompts to leave PR feedback before verdict submission", async () => {
     const config = testConfig(root);
     config.tracker.handoffStates = ["In Review"];
     config.reviewLoop.reviewStates = ["In Review"];

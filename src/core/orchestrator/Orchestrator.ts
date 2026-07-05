@@ -975,7 +975,7 @@ export class Orchestrator {
     if (this.isMergeConflictState(issue.state)) {
       throw new SymphonyError("conflict", "Merge conflict states are only eligible for conflict-fix workers");
     }
-    if (!this.shouldDispatchWorker(issue, false, "issue_breakdown")) {
+    if (!this.shouldDispatchWorker(issue, false, "issue_breakdown", projectContext)) {
       throw new SymphonyError("conflict", "Issue is not currently eligible for worker dispatch");
     }
     if (!(await this.lifecycleAllowsDispatch(issue, "worker", "issue_breakdown", projectContext))) {
@@ -1778,6 +1778,7 @@ export class Orchestrator {
         await this.tryDispatchReviewerIssue(issue);
       }
       await this.reconcileMergePolicyIssues();
+
     } catch (error) {
       this.options.logger.warn("orchestrator tick failed", { error: errorMessage(error) });
     } finally {
@@ -1979,8 +1980,10 @@ export class Orchestrator {
     issue: Issue,
     allowExistingClaim = false,
     runPhase: AgentRunPhase = "implementation",
+    requestedProjectContext?: ProjectContextResolution,
   ): boolean {
-    const config = this.serviceConfigForIssue(issue);
+    const config = this.serviceConfigForIssue(issue, requestedProjectContext);
+    const dispatchProjectContext = this.requestedProjectContextForIssue(issue, requestedProjectContext);
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
@@ -1994,7 +1997,8 @@ export class Orchestrator {
     if (issue.state.toLowerCase() === "todo") {
       if (hasOpenBlocker(issue, config.tracker.terminalStates)) return false;
     }
-    return this.hasStateSlot(issue.state);
+    if (!this.hasProjectContextSlot(dispatchProjectContext)) return false;
+    return this.hasStateSlot(issue.state, dispatchProjectContext);
   }
 
   private isWorkerStateActiveForRunPhase(
@@ -2007,8 +2011,13 @@ export class Orchestrator {
     return isStateIn(issue.state, config.tracker.activeStates);
   }
 
-  private shouldDispatchReviewer(issue: Issue, allowExistingClaim = false): boolean {
-    const config = this.serviceConfigForIssue(issue);
+  private shouldDispatchReviewer(
+    issue: Issue,
+    allowExistingClaim = false,
+    requestedProjectContext?: ProjectContextResolution,
+  ): boolean {
+    const config = this.serviceConfigForIssue(issue, requestedProjectContext);
+    const dispatchProjectContext = this.requestedProjectContextForIssue(issue, requestedProjectContext);
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
@@ -2017,7 +2026,8 @@ export class Orchestrator {
     if (isStateIn(issue.state, config.tracker.terminalStates)) return false;
     if (!this.passesLabelGuardrails(issue, config)) return false;
     if (hasOpenBlocker(issue, config.tracker.terminalStates)) return false;
-    return this.hasStateSlot(issue.state);
+    if (!this.hasProjectContextSlot(dispatchProjectContext)) return false;
+    return this.hasStateSlot(issue.state, dispatchProjectContext);
   }
 
   private async lifecycleAllowsDispatch(
@@ -2130,9 +2140,8 @@ export class Orchestrator {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     const initialRunPhase = this.isMergeConflictState(issue.state) ? "merge_conflict_resolution" : "implementation";
-    if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase)) return false;
-
     const requestedProjectContext = this.requestedProjectContextForIssue(issue);
+    if (!this.shouldDispatchWorker(issue, allowExistingClaim, initialRunPhase, requestedProjectContext)) return false;
     const initialRoutingProblem = await this.workerDispatchRoutingProblem(issue, requestedProjectContext);
     if (initialRoutingProblem) {
       await this.recordWorkerDispatchRoutingFailure(issue, initialRoutingProblem);
@@ -2162,8 +2171,8 @@ export class Orchestrator {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     const latestRunPhase = this.isMergeConflictState(latest.state) ? "merge_conflict_resolution" : "implementation";
-    if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase)) return false;
     const latestProjectContext = this.requestedProjectContextForIssue(latest, requestedProjectContext);
+    if (!this.shouldDispatchWorker(latest, allowExistingClaim, latestRunPhase, latestProjectContext)) return false;
     const latestRoutingProblem = await this.workerDispatchRoutingProblem(latest, latestProjectContext);
     if (latestRoutingProblem) {
       await this.recordWorkerDispatchRoutingFailure(latest, latestRoutingProblem);
@@ -2222,18 +2231,19 @@ export class Orchestrator {
       }
       runPhase = postWritebackDecision.runPhase;
     }
-    if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim, runPhase)) return false;
+    if (!this.shouldDispatchWorker(afterWriteback, allowExistingClaim, runPhase, afterWritebackProjectContext)) return false;
     if (!(await this.lifecycleAllowsDispatch(afterWriteback, "worker", runPhase, afterWritebackProjectContext))) return false;
 
     this.dispatchIssue(afterWriteback, attempt, "worker", null, runPhase, afterWritebackProjectContext ?? null);
     return true;
+
   }
 
   private async tryDispatchReviewerIssue(issue: Issue, allowExistingClaim = false): Promise<boolean> {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     const requestedProjectContext = this.requestedProjectContextForIssue(issue);
-    if (!this.shouldDispatchReviewer(issue, allowExistingClaim)) return false;
+    if (!this.shouldDispatchReviewer(issue, allowExistingClaim, requestedProjectContext)) return false;
     if (!(await this.lifecycleAllowsDispatch(issue, "reviewer", "review", requestedProjectContext))) return false;
 
     let refreshed: Issue[];
@@ -2253,7 +2263,7 @@ export class Orchestrator {
     if (this.availableSlots() <= 0) return false;
     if (await this.activeProviderDispatchGate()) return false;
     const latestProjectContext = this.requestedProjectContextForIssue(latest, requestedProjectContext);
-    if (!this.shouldDispatchReviewer(latest, allowExistingClaim)) return false;
+    if (!this.shouldDispatchReviewer(latest, allowExistingClaim, latestProjectContext)) return false;
     if (!(await this.lifecycleAllowsDispatch(latest, "reviewer", "review", latestProjectContext))) return false;
 
     const reviewEvidence = await this.loadReviewerDispatchEvidence(latest);
@@ -3314,7 +3324,8 @@ export class Orchestrator {
     const latest = refreshed[0];
     if (!latest) return false;
     entry.issue = latest;
-    return this.shouldDispatchWorker(latest, true, entry.runPhase);
+    const projectContext = this.requestedProjectContextForIssue(latest, this.resolvedProjectContext(entry));
+    return this.shouldDispatchWorker(latest, true, entry.runPhase, projectContext);
   }
 
   private scheduleRetry(
@@ -4537,10 +4548,23 @@ export class Orchestrator {
     return Math.max(this.config.agent.maxConcurrentAgents - this.running.size, 0);
   }
 
-  private hasStateSlot(state: string): boolean {
-    const stateLimit = this.config.agent.maxConcurrentAgentsByState.get(state.toLowerCase());
+  private runningEntriesForProjectContext(projectContext?: ProjectContextResolution): RunningEntry[] {
+    if (!projectContext) return [...this.running.values()];
+    const projectContextKey = this.pollingProjectContextKey(projectContext);
+    return [...this.running.values()].filter(
+      (entry) => this.pollingProjectContextKey(this.resolvedProjectContext(entry)) === projectContextKey,
+    );
+  }
+
+  private hasProjectContextSlot(projectContext?: ProjectContextResolution): boolean {
+    const contextLimit = this.configForProjectContext(projectContext).agent.maxConcurrentAgents;
+    return this.runningEntriesForProjectContext(projectContext).length < contextLimit;
+  }
+
+  private hasStateSlot(state: string, projectContext?: ProjectContextResolution): boolean {
+    const stateLimit = this.configForProjectContext(projectContext).agent.maxConcurrentAgentsByState.get(state.toLowerCase());
     if (!stateLimit) return true;
-    const runningInState = [...this.running.values()].filter(
+    const runningInState = this.runningEntriesForProjectContext(projectContext).filter(
       (entry) => entry.issue.state.toLowerCase() === state.toLowerCase(),
     ).length;
     return runningInState < stateLimit;
