@@ -9,6 +9,7 @@ import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/Tr
 import type { RunRecord, TranscriptEvent, TranscriptPage, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 import type { HistoryModel as WebHistoryModel } from "./WebHistoryProjection.js";
 import { projectWebTranscript, type TranscriptMessage as WebTranscriptMessage } from "./WebTranscriptProjection.js";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID, projectContextResolutionFromIssue } from "../core/config/ProjectContexts.js";
 import type {
   AgentRunKind,
   AgentRunPhase,
@@ -61,6 +62,12 @@ export interface IssueModel {
   session: string | null;
   desc?: string[];
 }
+
+const RAW_DASHBOARD_ISSUE_ID_ALIASES = Symbol("rawDashboardIssueIdAliases");
+
+type IssueModelWithRawDashboardIssueIdAliases = IssueModel & {
+  [RAW_DASHBOARD_ISSUE_ID_ALIASES]?: readonly string[];
+};
 
 export interface IssueActivityModel {
   t: string;
@@ -684,13 +691,12 @@ export function projectIssueModel(
     details = source;
   }
   const issue = details.issue;
-  const id =
-    firstNonEmpty(issue.identifier, card?.issueIdentifier, issue.id, card?.issueId, card?.key, options.requestKey) ?? "";
+  const id = contextualIssueIdentifier(issue, card) ?? firstNonEmpty(issue.id, card?.issueId, card?.key, options.requestKey) ?? "";
   const operatorLiveness = options.operatorLiveness ?? card?.operatorLiveness ?? null;
   const pullRequest = details.pullRequest;
   const model: IssueModel = {
     id,
-    title: firstNonEmpty(issue.title) ?? id,
+    title: firstNonEmpty(issue.title, issue.identifier, card?.issueIdentifier, issue.id, card?.issueId, card?.key, options.requestKey) ?? id,
     status: deriveIssueStatus({
       lane: options.lane ?? card?.lane ?? null,
       state: issue.state,
@@ -702,7 +708,7 @@ export function projectIssueModel(
     labels: Array.isArray(issue.labels) ? [...issue.labels] : [],
     assignee: firstNonEmpty(issue.assigneeId) ?? "unassigned",
     agent: agentIdFromInputs(card, operatorLiveness),
-    project: "",
+    project: projectLabelForIssue(issue),
     cycle: "",
     activity: projectIssueActivity(details, card, operatorLiveness),
     pr: formatPullRequest(pullRequest, card?.metadata ?? null),
@@ -721,6 +727,7 @@ export function projectIssueModel(
         details.latestRun.runId,
       ) ?? null,
   };
+  attachRawDashboardIssueIdAliases(model, [issue.id, card?.issueId]);
   const description = projectIssueDescription(details, card?.reviewLoop ?? null);
   if (description.length > 0) model.desc = description;
   return model;
@@ -1180,7 +1187,7 @@ function dashboardTotalsFromDurableState(
   const latestRunByAlias = buildLatestRunByAlias(runs);
 
   for (const issue of board.issues) {
-    addDashboardIssueStatus(totals, representedAliases, issue.status, [issue.id], `board:${issue.id}`);
+    addDashboardIssueStatus(totals, representedAliases, issue.status, [issue.id, ...rawDashboardIssueIdAliases(issue)], `board:${issue.id}`);
   }
 
   for (const lifecycle of lifecycleRecords) {
@@ -1372,7 +1379,7 @@ function uniqueIssueCards(input: IssueBoardResponseProjectionInput | null | unde
   const seen = new Set<string>();
   const cards: IssueBoardCardProjectionInput[] = [];
   for (const card of candidateIssueCards(input)) {
-    const key = firstNonEmpty(card.issueIdentifier, card.issueId, card.key);
+    const key = issueCardIdentityKey(card);
     if (!key || seen.has(key)) continue;
     seen.add(key);
     cards.push(card);
@@ -1463,12 +1470,30 @@ function cloneWebIssueBoardModel(input: WebIssueBoardModel): WebIssueBoardModel 
 }
 
 function cloneIssueModel(input: IssueModel): IssueModel {
-  return {
+  const cloned: IssueModel = {
     ...input,
     labels: [...input.labels],
     activity: input.activity.map((item) => ({ ...item })),
     ...(input.desc === undefined ? {} : { desc: [...input.desc] }),
   };
+  const rawAliases = rawDashboardIssueIdAliases(input);
+  return rawAliases.length > 0 ? attachRawDashboardIssueIdAliases(cloned, rawAliases) : cloned;
+}
+
+function attachRawDashboardIssueIdAliases(model: IssueModel, aliases: readonly (string | null | undefined)[]): IssueModel {
+  const normalized = dashboardAliases(...aliases);
+  if (normalized.length === 0) return model;
+  Object.defineProperty(model, RAW_DASHBOARD_ISSUE_ID_ALIASES, {
+    value: normalized,
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+  return model;
+}
+
+function rawDashboardIssueIdAliases(model: IssueModel): readonly string[] {
+  return (model as IssueModelWithRawDashboardIssueIdAliases)[RAW_DASHBOARD_ISSUE_ID_ALIASES] ?? [];
 }
 
 function cloneReferenceData(input: ReferenceData): ReferenceData {
@@ -1656,6 +1681,38 @@ function formatPullRequest(pullRequest: IssuePullRequestSummary, metadata?: Issu
   if (pullRequest.url !== null) return pullRequest.url;
   if (metadata?.prNumber !== null && metadata?.prNumber !== undefined) return "#" + String(metadata.prNumber);
   return metadata?.prUrl ?? null;
+}
+
+function projectContextForIssueProjection(issue: IssueStatusView): ReturnType<typeof projectContextResolutionFromIssue> {
+  if (issue.projectContext) return projectContextResolutionFromIssue(issue);
+  if (firstNonEmpty(issue.projectContextId, issue.projectContextLabel) !== null) {
+    return projectContextResolutionFromIssue(issue);
+  }
+  return null;
+}
+
+function projectLabelForIssue(issue: IssueStatusView): string {
+  const projectContext = projectContextForIssueProjection(issue);
+  if (!projectContext || projectContext.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return "";
+  return projectContext.projectContextLabel;
+}
+
+function contextualIssueIdentifier(issue: IssueStatusView, card: IssueBoardCardProjectionInput | null = null): string | null {
+  const identifier = firstNonEmpty(issue.identifier, card?.issueIdentifier);
+  if (!identifier) return null;
+  const projectContextId = projectContextForIssueProjection(issue)?.projectContextId;
+  if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return identifier;
+  return `${projectContextId}:${identifier}`;
+}
+
+function issueCardIdentityKey(card: IssueBoardCardProjectionInput): string | null {
+  const issue = card.issueDetails.issue;
+  const issueId = firstNonEmpty(card.issueId, issue.id);
+  if (issueId) return `issue:${issueId}`;
+  const identifier = contextualIssueIdentifier(issue, card);
+  if (identifier) return `identifier:${identifier}`;
+  const key = firstNonEmpty(card.key);
+  return key ? `key:${key}` : null;
 }
 
 function firstNonEmpty(...values: Array<string | null | undefined>): string | null {

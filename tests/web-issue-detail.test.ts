@@ -8,11 +8,16 @@ import {
   type BoardIssueDetailProjectionInput,
   type IssueBoardCardProjectionInput,
 } from "../src/app/webProjection.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
-import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore, type RunRecord, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { Issue, IssueDetailsEnvelope, TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
@@ -715,15 +720,22 @@ describe("GET /api/v1/web/issues/:issueId", () => {
     }
   });
 
-  it("returns a durable-only web issue detail through the HTTP route when tracker data is unavailable", async () => {
+  it("returns a durable-only context-qualified web issue detail through the HTTP route when tracker data is unavailable and legacy lifecycle defaults are present", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "explicit",
+    } as const;
     await runStore.upsertWorkspace({
-      workspaceKey: "TEST-DURABLE",
+      workspaceKey: "docs:TEST-DURABLE",
       issueId: "issue-durable",
       issueIdentifier: "TEST-DURABLE",
+      projectContext: docsProjectContext,
       path: path.join(config.workspace.root, "TEST-DURABLE"),
       sourceKind: "git_worktree",
       gitBranchName: "symphony/TEST-DURABLE",
@@ -737,15 +749,27 @@ describe("GET /api/v1/web/issues/:issueId", () => {
       role: "worker",
       issueId: "issue-durable",
       issueIdentifier: "TEST-DURABLE",
+      projectContext: docsProjectContext,
       attempt: null,
       turnNumber: 1,
       prompt: "work",
-      workspaceKey: "TEST-DURABLE",
+      workspaceKey: "docs:TEST-DURABLE",
       workspacePath: path.join(config.workspace.root, "TEST-DURABLE"),
       gitBranchName: "symphony/TEST-DURABLE",
       repoPath: "/repo",
       baseRef: "main",
     });
+    await lifecycleStore.ensureIssue(
+      { id: "issue-durable", identifier: "TEST-DURABLE" },
+      {
+        projectContext: {
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+          linearProjectSlug: null,
+          routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+        },
+      },
+    );
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
       workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
@@ -760,20 +784,20 @@ describe("GET /api/v1/web/issues/:issueId", () => {
     });
     const address = await server.start();
     try {
-      const response = await fetch(`http://${address.host}:${address.port}/api/v1/web/issues/TEST-DURABLE`);
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/web/issues/docs:TEST-DURABLE`);
       const body = (await response.json()) as { issue: Record<string, unknown> };
 
       expect(response.status).toBe(200);
       expect(body).toMatchObject({
         issue: {
-          id: "TEST-DURABLE",
+          id: "docs:TEST-DURABLE",
           title: "TEST-DURABLE",
           status: "progress",
           priority: 0,
           labels: [],
           assignee: "unassigned",
           agent: "agent-durable",
-          project: "",
+          project: "Documentation Site",
           cycle: "",
           activity: [],
           pr: null,

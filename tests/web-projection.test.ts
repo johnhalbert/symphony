@@ -162,6 +162,57 @@ function webCard(
   });
 }
 
+function contextualIssueDetails(input: {
+  issueId: string;
+  identifier: string;
+  title: string;
+  state: string;
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string;
+}): IssueDetailsEnvelope {
+  const base = issueDetails();
+  return issueDetails({
+    issue: {
+      ...base.issue,
+      id: input.issueId,
+      identifier: input.identifier,
+      title: input.title,
+      state: input.state,
+      labels: [],
+      projectContext: {
+        projectContextId: input.projectContextId,
+        projectContextLabel: input.projectContextLabel,
+        linearProjectSlug: input.linearProjectSlug,
+        routingSource: "explicit",
+      },
+    },
+  });
+}
+
+function contextualBoardCard(
+  input: {
+    issueId: string;
+    identifier: string;
+    title: string;
+    lane: IssueBoardCardProjectionInput["lane"];
+    state: string;
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string;
+  },
+): IssueBoardCardProjectionInput {
+  return card({
+    key: input.issueId,
+    issueId: input.issueId,
+    issueIdentifier: input.identifier,
+    lane: input.lane,
+    issueDetails: contextualIssueDetails(input),
+    live: null,
+    operatorLiveness: null,
+  });
+}
+
 function run(overrides: Partial<RunRecord> = {}): RunRecord {
   return {
     runId: "run-1",
@@ -455,6 +506,46 @@ describe("web projection foundation", () => {
     expect(board.lanes.review.map((issue) => issue.id)).toEqual(["TEST-REVIEW"]);
   });
 
+  it("projects project attribution for duplicate issue identifiers on the React issue board", () => {
+    const board = projectWebIssueBoard({
+      issues: [
+        contextualBoardCard({
+          issueId: "issue-docs-179",
+          identifier: "ENG-179",
+          title: "Docs issue",
+          lane: "todo",
+          state: "Todo",
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectSlug: "DOCS",
+        }),
+        contextualBoardCard({
+          issueId: "issue-symphony-179",
+          identifier: "ENG-179",
+          title: "Symphony issue",
+          lane: "progress",
+          state: "In Progress",
+          projectContextId: "symphony",
+          projectContextLabel: "Symphony",
+          linearProjectSlug: "ENG",
+        }),
+      ],
+    });
+
+    expect(board).toMatchObject({ selectedIssueId: "symphony:ENG-179" });
+    expect(board.issues).toHaveLength(2);
+    expect(board.issues.map(({ id, title, project, status }) => ({ id, title, project, status }))).toEqual([
+      { id: "docs:ENG-179", title: "Docs issue", project: "Documentation Site", status: "todo" },
+      { id: "symphony:ENG-179", title: "Symphony issue", project: "Symphony", status: "progress" },
+    ]);
+    expect(board.lanes.todo.map(({ id, title, project }) => ({ id, title, project }))).toEqual([
+      { id: "docs:ENG-179", title: "Docs issue", project: "Documentation Site" },
+    ]);
+    expect(board.lanes.progress.map(({ id, title, project }) => ({ id, title, project }))).toEqual([
+      { id: "symphony:ENG-179", title: "Symphony issue", project: "Symphony" },
+    ]);
+  });
+
   it("normalizes canceled backend board cards to cancelled for the React issue board", () => {
     const board = projectWebIssueBoard({
       issues: [webCard("TEST-CANCELED", { lane: "canceled", state: "Canceled", title: "Canceled issue" })],
@@ -593,6 +684,66 @@ describe("web projection foundation", () => {
     expect(clampIssuePriority(null)).toBe(0);
     expect(clampIssuePriority(10)).toBe(3);
     expect(normalizeDescription(" one  two \n\n three ")).toEqual(["one two", "three"]);
+  });
+
+  it("projects issue detail project attribution for duplicate issue identifiers", () => {
+    const docsCard = contextualBoardCard({
+      issueId: "issue-docs-179",
+      identifier: "ENG-179",
+      title: "Docs issue",
+      lane: "todo",
+      state: "Todo",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+    const symphonyCard = contextualBoardCard({
+      issueId: "issue-symphony-179",
+      identifier: "ENG-179",
+      title: "Symphony issue",
+      lane: "progress",
+      state: "In Progress",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+    });
+
+    const docsDetail = projectIssueDetailModel({
+      issue: "docs:ENG-179",
+      boardCard: docsCard,
+      issueDetails: docsCard.issueDetails,
+      latestRun: run({ issueId: "issue-docs-179", issueIdentifier: "ENG-179" }),
+      runs: [],
+      operatorLiveness: null,
+    });
+    const symphonyDetail = projectIssueDetailModel({
+      issue: "symphony:ENG-179",
+      boardCard: symphonyCard,
+      issueDetails: symphonyCard.issueDetails,
+      latestRun: run({ issueId: "issue-symphony-179", issueIdentifier: "ENG-179" }),
+      runs: [],
+      operatorLiveness: null,
+    });
+
+    expect([docsDetail.issue, symphonyDetail.issue].map(({ id, title, project }) => ({ id, title, project }))).toEqual([
+      { id: "docs:ENG-179", title: "Docs issue", project: "Documentation Site" },
+      { id: "symphony:ENG-179", title: "Symphony issue", project: "Symphony" },
+    ]);
+  });
+
+  it("keeps legacy default tracker attribution out of the web project label", () => {
+    const legacyDefaultIssue = projectIssueModel(
+      issueDetails({
+        issue: {
+          ...issueDetails().issue,
+          linearProjectIdentity: { kind: "linear", slug: "ENG" },
+          linearProjectSlug: "ENG",
+          routingSource: "legacy_default",
+        },
+      }),
+    );
+
+    expect(legacyDefaultIssue).toMatchObject({ id: "TEST-1", project: "" });
   });
 
   it("projects dashboard, detail, history, activity, and transcript models without runtime side effects", () => {
@@ -881,6 +1032,78 @@ describe("web projection foundation", () => {
     ]);
     expect(dashboard.agentUsageLabel).toBe("1/3 agents");
     expect(JSON.stringify(dashboard)).not.toContain("mock");
+  });
+
+  it("dedupes contextual board issues against durable totals by raw issue id without collapsing same-identifier sibling contexts", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+    const dashboard = projectWebDashboard({
+      generatedAt: "2026-01-01T00:15:00.000Z",
+      board: {
+        issues: [
+          contextualBoardCard({
+            issueId: "issue-docs-179",
+            identifier: "ENG-179",
+            title: "Docs issue",
+            lane: "todo",
+            state: "Todo",
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+            linearProjectSlug: "DOCS",
+          }),
+        ],
+      },
+      runtime: null,
+      runs: [
+        run({
+          runId: "run-docs-179",
+          issueId: "issue-docs-179",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+          status: "running",
+          completedAt: null,
+          updatedAt: "2026-01-01T00:14:00.000Z",
+          projectContext: docsProjectContext,
+        }),
+      ],
+      lifecycleRecords: [
+        lifecycle({
+          issueId: "issue-docs-179",
+          issueIdentifier: "ENG-179",
+          phase: "implementation",
+          projectContext: docsProjectContext,
+        }),
+        lifecycle({
+          issueId: "issue-symphony-179",
+          issueIdentifier: "ENG-179",
+          phase: "review",
+          projectContext: symphonyProjectContext,
+        }),
+      ],
+      config: { concurrencyCap: 2 },
+    });
+
+    expect(dashboard.totals).toEqual({
+      backlog: 0,
+      todo: 1,
+      progress: 0,
+      review: 1,
+      done: 0,
+      cancelled: 0,
+      open: 2,
+      all: 2,
+      completeness: 0,
+    });
   });
 
   it("prefers live runtime agent rows over matching durable running records without double-counting usage", () => {
