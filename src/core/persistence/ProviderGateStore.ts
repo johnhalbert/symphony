@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { projectContextResolutionFromIssue } from "../config/ProjectContexts.js";
 import { sanitizePublicJson } from "../transcript/TranscriptProjection.js";
 import {
   normalizeProviderLimitSignal,
@@ -38,7 +39,7 @@ export class FileProviderGateStore implements ProviderGateStore {
       updatedAt: now,
       affectedRoles: ["worker", "reviewer"],
       affectedRunPhases: ["issue_breakdown", "implementation", "merge_conflict_resolution", "review"],
-      source: normalized.source ?? null,
+      source: persistableProviderGateSource(normalized.source),
       ...(normalized.raw === undefined ? {} : { raw: sanitizePublicJson(normalized.raw, 1_000) }),
     };
     await writeJson(this.providerGatePath(id), gate);
@@ -70,7 +71,7 @@ export class FileProviderGateStore implements ProviderGateStore {
       const entries = await fs.readdir(this.providerGatesDir());
       const records = await mapWithFileReadConcurrency(
         entries.filter((entry) => entry.endsWith(".json")).map((entry) => path.join(this.providerGatesDir(), entry)),
-        (filePath) => readJsonIfExists<RuntimeProviderGate>(filePath),
+        (filePath) => readJsonIfExists<RuntimeProviderGate>(filePath, normalizeStoredProviderGate),
       );
       return records.filter((record): record is RuntimeProviderGate => record !== null && typeof record.id === "string");
     } catch (error) {
@@ -80,7 +81,7 @@ export class FileProviderGateStore implements ProviderGateStore {
   }
 
   private async readGate(gateId: string): Promise<RuntimeProviderGate | null> {
-    return readJsonIfExists<RuntimeProviderGate>(this.providerGatePath(gateId));
+    return readJsonIfExists<RuntimeProviderGate>(this.providerGatePath(gateId), normalizeStoredProviderGate);
   }
 
   private providerGatesDir(): string {
@@ -117,9 +118,38 @@ function safeFileName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "record";
 }
 
-async function readJsonIfExists<T>(filePath: string): Promise<T | null> {
+function persistableProviderGateSource(source: ProviderLimitSignal["source"]): RuntimeProviderGate["source"] {
+  if (!source) return null;
+  if (!isRecord(source)) return source;
+  const projectContext = projectContextResolutionFromIssue(source);
+  if (!projectContext) return source;
+  return {
+    ...source,
+    projectContext,
+    projectContextId: projectContext.projectContextId,
+    projectContextLabel: projectContext.projectContextLabel,
+    linearProjectSlug: projectContext.linearProjectSlug,
+    routingSource: projectContext.routingSource,
+  } as RuntimeProviderGate["source"];
+}
+
+function normalizeStoredProviderGate(record: RuntimeProviderGate): RuntimeProviderGate {
+  if (!isRecord(record)) return record;
+  const source = persistableProviderGateSource(record.source);
+  if (source === record.source) return record;
+  return {
+    ...record,
+    source,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function readJsonIfExists<T>(filePath: string, normalize: (value: T) => T = (value) => value): Promise<T | null> {
   try {
-    return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
+    return normalize(JSON.parse(await fs.readFile(filePath, "utf8")) as T);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
