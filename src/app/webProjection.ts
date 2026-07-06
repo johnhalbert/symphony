@@ -9,7 +9,11 @@ import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/Tr
 import type { RunRecord, TranscriptEvent, TranscriptPage, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 import type { HistoryModel as WebHistoryModel } from "./WebHistoryProjection.js";
 import { projectWebTranscript, type TranscriptMessage as WebTranscriptMessage } from "./WebTranscriptProjection.js";
-import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID, projectContextResolutionFromIssue } from "../core/config/ProjectContexts.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../core/config/ProjectContexts.js";
 import type {
   AgentRunKind,
   AgentRunPhase,
@@ -126,6 +130,7 @@ export interface RunningAgentModel {
   step: string;
   duration: string;
   tokens: string;
+  projectContext?: ProjectContextResolution | undefined;
 }
 
 export interface ProviderGateModel {
@@ -941,7 +946,12 @@ function shouldUseCursorRuntimeFallback(run: RunRecord): boolean {
 
 export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefined, generatedAt: string | null | undefined = snapshot?.generatedAt ?? null): RunningAgentModel[] {
   return (snapshot?.running ?? []).map((row) => {
-    const id = firstNonEmpty(row.runId, row.issueIdentifier, row.issueId) ?? "";
+    const id = runningAgentProjectionId({
+      runId: row.runId,
+      issueId: row.issueId,
+      issueIdentifier: row.issueIdentifier,
+      projectContext: row.projectContext,
+    });
     const issue = firstNonEmpty(row.issueIdentifier, row.issueId) ?? "";
     const totalTokens = row.tokens?.totalTokens ?? 0;
     return {
@@ -952,6 +962,7 @@ export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefine
       step: firstNonEmpty(row.lastMessage, row.lastEvent) ?? "",
       duration: formatRunDuration(row.startedAt, generatedAt),
       tokens: Number.isFinite(totalTokens) && totalTokens > 0 ? String(totalTokens) : "",
+      ...(row.projectContext === undefined ? {} : { projectContext: row.projectContext }),
     };
   });
 }
@@ -961,7 +972,13 @@ function projectDurableRunningAgents(runs: readonly RunRecord[], generatedAt: st
     .filter((run) => run.status === "running")
     .sort((left, right) => compareDashboardRunRecency(right, left))
     .map((run) => {
-      const id = firstNonEmpty(run.runId, run.issueIdentifier, run.issueId, run.workspaceKey) ?? "";
+      const id = runningAgentProjectionId({
+        runId: run.runId,
+        issueId: run.issueId,
+        issueIdentifier: run.issueIdentifier,
+        workspaceKey: run.workspaceKey,
+        projectContext: run.projectContext,
+      });
       const issue = firstNonEmpty(run.issueIdentifier, run.issueId, run.workspaceKey) ?? "";
       const totalTokens = run.tokens?.totalTokens ?? 0;
       return {
@@ -972,6 +989,7 @@ function projectDurableRunningAgents(runs: readonly RunRecord[], generatedAt: st
         step: firstNonEmpty(run.runPhase, run.runKind, run.role) ?? "",
         duration: formatRunDuration(run.startedAt, generatedAt ?? run.updatedAt),
         tokens: Number.isFinite(totalTokens) && totalTokens > 0 ? String(totalTokens) : "",
+        ...(run.projectContext === undefined ? {} : { projectContext: run.projectContext }),
       };
     });
 }
@@ -1720,6 +1738,25 @@ function firstNonEmpty(...values: Array<string | null | undefined>): string | nu
     if (typeof value === "string" && value.trim().length > 0) return value;
   }
   return null;
+}
+
+function runningAgentProjectionId(input: {
+  runId?: string | null;
+  issueId?: string | null;
+  issueIdentifier?: string | null;
+  workspaceKey?: string | null;
+  projectContext?: ProjectContextResolution | null | undefined;
+}): string {
+  const runId = firstNonEmpty(input.runId);
+  if (runId) return runId;
+  const issueId = firstNonEmpty(input.issueId);
+  if (issueId) return issueId;
+  const issueIdentifier = firstNonEmpty(input.issueIdentifier);
+  if (issueIdentifier) {
+    const projectContextId = firstNonEmpty(input.projectContext?.projectContextId);
+    return projectContextId ? `${projectContextId}:${issueIdentifier}` : issueIdentifier;
+  }
+  return firstNonEmpty(input.workspaceKey) ?? "";
 }
 
 function activityActor(item: ActivityItemProjectionInput): string | null {
