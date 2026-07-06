@@ -8693,8 +8693,134 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("retains legacy/default-compatible runless writebacks in context-qualified web issue detail activity feeds", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const docsIssue = trackerIssue({
+      id: "issue-docs-web-activity-1",
+      identifier: "ENG-456",
+      title: "Docs web activity detail",
+      description: "Docs web activity detail.\n\nSecond paragraph.",
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      branchName: "symphony/docs/ENG-456",
+    });
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const legacyDefaultProjectContext = {
+      projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      linearProjectSlug: null,
+      routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+    } as const;
+    const tracker = new FakeTracker([docsIssue]);
+
+    await runStore.startRun({
+      runId: "run-docs-web-activity-1",
+      sessionId: "session-docs-web-activity-1",
+      agentId: "agent-docs-web-activity-1",
+      role: "worker",
+      issueId: docsIssue.id,
+      issueIdentifier: docsIssue.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs web issue detail",
+      workspaceKey: "docs__ENG-456",
+      workspacePath: path.join(config.workspace.root, "docs__ENG-456"),
+      ...(docsIssue.branchName ? { gitBranchName: docsIssue.branchName } : {}),
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+    });
+    await lifecycleStore.ensureIssue(docsIssue, {
+      phase: "implementation",
+      projectContext: legacyDefaultProjectContext,
+    });
+    await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-docs-web-activity-1:runless-contextual-report",
+      kind: "comment",
+      issueId: docsIssue.identifier,
+      projectContext: docsProjectContext,
+      payload: {
+        body: "WEB_ISSUE_DETAIL_CONTEXTUAL_WRITEBACK_BODY",
+        dedupeKey: "web-issue-detail-contextual-report",
+      },
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      tracker,
+      defaultProjectContextId: "docs",
+      runStore,
+      lifecycleStore,
+      writebackOutbox,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      type WebIssueDetailBody = {
+        activity: Array<{
+          verb: string;
+          id: string;
+          extra: string;
+        }>;
+      } | null;
+
+      const liveDetailResponse = await fetch(`${baseUrl}/api/v1/web/issues/${encodeURIComponent("docs:ENG-456")}`);
+      const liveDetailBody = (await liveDetailResponse.json()) as WebIssueDetailBody;
+
+      expect(liveDetailResponse.status).toBe(200);
+      expect(liveDetailBody).not.toBeNull();
+      expect(liveDetailBody?.activity).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ verb: "run_started", id: "ENG-456" }),
+          expect.objectContaining({ verb: "comment", id: "ENG-456", extra: "pending" }),
+        ]),
+      );
+
+      const primedBoardResponse = await fetch(`${baseUrl}/api/v1/web/issues?refresh=1`);
+      const primedBoardBody = (await primedBoardResponse.json()) as {
+        issues: Array<{ id: string }>;
+      };
+      expect(primedBoardResponse.status).toBe(200);
+      const primedIssueId = primedBoardBody.issues.find((item) => item.id.includes("ENG-456"))?.id ?? "docs:ENG-456";
+
+      const durableDetailResponse = await fetch(`${baseUrl}/api/v1/web/issues/${encodeURIComponent(primedIssueId)}`);
+      const durableDetailBody = (await durableDetailResponse.json()) as WebIssueDetailBody;
+
+      expect(durableDetailResponse.status).toBe(200);
+      expect(durableDetailBody).not.toBeNull();
+      expect(durableDetailBody?.activity).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ verb: "run_started", id: "ENG-456" }),
+          expect.objectContaining({ verb: "comment", id: "ENG-456", extra: "pending" }),
+        ]),
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("fails the issue board clearly when no tracker is configured", async () => {
     const config = testConfig(path.join(root, "workspaces"));
+
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
       workspaceManager: new WorkspaceManager({

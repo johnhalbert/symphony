@@ -2397,6 +2397,7 @@ export class StatusServer {
         writebackOutbox: this.options.writebackOutbox,
         query: { issue: issueActivityKey, offset: 0, limit: 50 },
         includeTranscriptEvents: false,
+        defaultProjectContextId: this.options.defaultProjectContextId,
       });
       const transcript =
         options.includeTranscript === true && this.options.runStore && latestRunId
@@ -2454,6 +2455,7 @@ export class StatusServer {
       writebackOutbox: this.options.writebackOutbox,
       query: { issue: issueActivityKey, offset: 0, limit: 50 },
       includeTranscriptEvents: false,
+      defaultProjectContextId: this.options.defaultProjectContextId,
     });
     const transcript =
       options.includeTranscript === true && this.options.runStore && latestRun
