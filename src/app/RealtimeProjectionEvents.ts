@@ -603,10 +603,30 @@ function realtimePayloadBase(
 function realtimeProjectContextDetail(detail: RealtimeProjectionEventDetail | null): RealtimeProjectContextMetadata | null {
   const directProjectContext = readRecordDetail(detail, "projectContext");
   const sourceCursors = readRecordDetail(detail, "sourceCursors");
-  const projectContext = directProjectContext ?? readRecordField(sourceCursors, "projectContext");
+  const projectContext =
+    directProjectContext ??
+    readRecordField(sourceCursors, "projectContext") ??
+    realtimeProjectContextMetadataDetail(detail);
   if (!projectContext) return null;
   const sanitized = sanitizePublicJson(projectContext);
   return isRecord(sanitized) ? sanitized : null;
+}
+
+function realtimeProjectContextMetadataDetail(
+  detail: RealtimeProjectionEventDetail | null,
+): RealtimeProjectContextMetadata | null {
+  if (!detail) return null;
+  const projectContextId = readStringDetail(detail, "projectContextId");
+  const projectContextLabel = readStringDetail(detail, "projectContextLabel");
+  const linearProjectSlug = readStringDetail(detail, "linearProjectSlug");
+  const routingSource = readStringDetail(detail, "routingSource");
+  if (!projectContextId && !projectContextLabel && !linearProjectSlug && !routingSource) return null;
+  return {
+    ...(projectContextId ? { projectContextId } : {}),
+    ...(projectContextLabel ? { projectContextLabel } : {}),
+    ...(linearProjectSlug ? { linearProjectSlug } : {}),
+    ...(routingSource ? { routingSource } : {}),
+  };
 }
 
 function publicRealtimeDetailForEvent(
