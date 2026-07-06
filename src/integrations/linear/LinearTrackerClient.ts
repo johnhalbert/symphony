@@ -373,6 +373,36 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     );
   }
 
+  async fetchIssuesByIdentifiersAndStates(
+    identifiers: string[],
+    stateNames: string[],
+    options: FetchIssuesByStatesOptions = {},
+  ): Promise<Issue[]> {
+    const uniqueIdentifiers = uniqueStrings(
+      identifiers.map((identifier) => identifier.trim()).filter((identifier) => identifier.length > 0),
+    );
+    const uniqueStates = uniqueStrings(
+      stateNames.map((stateName) => stateName.trim()).filter((stateName) => stateName.length > 0),
+    );
+    if (uniqueIdentifiers.length === 0 || uniqueStates.length === 0) return [];
+    const identifierFilter = linearFilterForIssueIdentifiers(uniqueIdentifiers);
+    if (identifierFilter === null) return [];
+    const assigneeFilter = options.applyRouting === true ? await this.routingAssigneeFilter() : null;
+    return this.fetchPagedIssues(
+      TICK_ISSUE_CANDIDATES_QUERY,
+      {
+        filter: {
+          and: [
+            { project: { slugId: { eq: this.config.projectSlug } } },
+            { state: { name: { in: uniqueStates } } },
+            identifierFilter,
+          ],
+        },
+      },
+      assigneeFilter,
+    );
+  }
+
   async fetchIssueCandidatesByFilter(input: TrackerIssueCandidateFilterInput): Promise<Issue[]> {
     const filter = buildLinearIssueCandidateFilter(input, {
       projectSlug: this.config.projectSlug,
@@ -823,6 +853,36 @@ function linearFilterForCandidateBranch(
   }
 
   return filters.length === 1 ? filters[0] ?? null : { and: filters };
+}
+
+function linearFilterForIssueIdentifiers(identifiers: string[]): LinearIssueFilter | null {
+  const numbersByTeam = new Map<string, Set<number>>();
+  for (const identifier of identifiers) {
+    const parsed = parseLinearIssueIdentifier(identifier);
+    if (!parsed) continue;
+    const numbers = numbersByTeam.get(parsed.teamKey) ?? new Set<number>();
+    numbers.add(parsed.issueNumber);
+    numbersByTeam.set(parsed.teamKey, numbers);
+  }
+  const filters = [...numbersByTeam.entries()].map(([teamKey, numbers]) => ({
+    and: [
+      { team: { key: { eq: teamKey } } },
+      { number: { in: [...numbers].sort((left, right) => left - right) } },
+    ],
+  }));
+  if (filters.length === 0) return null;
+  return filters.length === 1 ? filters[0] ?? null : { or: filters };
+}
+
+function parseLinearIssueIdentifier(identifier: string): { teamKey: string; issueNumber: number } | null {
+  const match = /^([A-Za-z0-9]+)-([0-9]+)$/.exec(identifier.trim());
+  if (!match) return null;
+  const teamKey = match[1];
+  const issueNumberText = match[2];
+  if (teamKey === undefined || issueNumberText === undefined) return null;
+  const issueNumber = Number(issueNumberText);
+  if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) return null;
+  return { teamKey: teamKey.toUpperCase(), issueNumber };
 }
 
 function requiredLabelFilters(labels: string[] | undefined): LinearIssueFilter[] {

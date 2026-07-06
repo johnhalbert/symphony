@@ -29,6 +29,14 @@ export interface WorkspaceMetadata {
   gitBranchName?: string;
 }
 
+export interface IssueWorkspaceRecord {
+  workspaceKey: string;
+  issueId: string | null;
+  issueIdentifier: string;
+  path: string;
+  metadata: WorkspaceRecord | null;
+}
+
 export class WorkspaceManager {
   private readonly branchRenderer = new Liquid({ strictVariables: true });
   private readonly store: FileRunTranscriptStore;
@@ -240,7 +248,7 @@ export class WorkspaceManager {
     await this.runHook("after_run", this.options.hooks.afterRun, workspacePath, false);
   }
 
-  async removeForIssue(issueInput: WorkspaceIssueInput): Promise<void> {
+  async removeForIssue(issueInput: WorkspaceIssueInput): Promise<boolean> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
     const workspaceKey = sanitizeWorkspaceKey(issueIdentifier);
@@ -249,7 +257,7 @@ export class WorkspaceManager {
 
     if (!(await pathExists(workspacePath))) {
       await this.store.deleteWorkspace(workspaceKey);
-      return;
+      return false;
     }
     await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
     await this.runHook("before_remove", this.options.hooks.beforeRemove, workspacePath, false);
@@ -279,6 +287,7 @@ export class WorkspaceManager {
       issue_identifier: issueIdentifier,
       workspace_path: workspacePath,
     });
+    return true;
   }
 
   private async removePlanningWorkspace(
@@ -323,6 +332,38 @@ export class WorkspaceManager {
 
   async getWorkspaceRecord(workspaceKeyOrIssue: string): Promise<WorkspaceRecord | null> {
     return this.store.findWorkspace(workspaceKeyOrIssue);
+  }
+
+  async listIssueWorkspaces(): Promise<IssueWorkspaceRecord[]> {
+    await fs.mkdir(this.options.workspace.root, { recursive: true });
+    const root = path.resolve(this.options.workspace.root);
+    const stateDir = path.resolve(this.options.workspace.stateDir);
+    const metadata = await this.store.listWorkspaces();
+    const metadataByKey = new Map(metadata.map((record) => [record.workspaceKey, record]));
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    const records: IssueWorkspaceRecord[] = [];
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const workspacePath = path.resolve(root, entry.name);
+      if (workspacePath === stateDir) continue;
+      if (entry.name === path.basename(stateDir)) continue;
+      if (entry.name.endsWith("-planning")) continue;
+      assertPathInsideRoot(workspacePath, root);
+
+      const record = metadataByKey.get(entry.name) ?? null;
+      records.push({
+        workspaceKey: entry.name,
+        issueId: record?.issueId ?? null,
+        issueIdentifier: record?.issueIdentifier ?? entry.name,
+        path: workspacePath,
+        metadata: record,
+      });
+    }
+
+    return records.sort((left, right) =>
+      left.workspaceKey.localeCompare(right.workspaceKey),
+    );
   }
 
   isInsideRoot(workspacePath: string): boolean {

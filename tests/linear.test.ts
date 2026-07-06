@@ -170,6 +170,55 @@ describe("LinearTrackerClient", () => {
     expect(requests[1]?.variables.after).toBe("next-page");
   });
 
+  it("fetches terminal issues by bounded identifiers and states", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return jsonResponse({
+        data: {
+          issues: {
+            nodes: [
+              {
+                id: "id-1",
+                identifier: "T-1",
+                title: "Title",
+                state: { name: "Done" },
+              },
+            ],
+            pageInfo: pageInfo(),
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const issues = await client.fetchIssuesByIdentifiersAndStates(
+      ["T-1", "t-1", "T-2"],
+      ["Done", "done", "Canceled"],
+    );
+
+    expect(issues.map((item) => item.identifier)).toEqual(["T-1"]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.query).toContain("SymphonyTickIssueCandidates");
+    expect(requests[0]?.variables).toMatchObject({
+      first: 250,
+      after: null,
+      filter: {
+        and: [
+          { project: { slugId: { eq: "TEST" } } },
+          { state: { name: { in: ["Done", "Canceled"] } } },
+          {
+            and: [
+              { team: { key: { eq: "T" } } },
+              { number: { in: [1, 2] } },
+            ],
+          },
+        ],
+      },
+    });
+  });
+
   it("builds filtered tick candidate filters with safe label exclusion semantics", () => {
     const filter = buildLinearIssueCandidateFilter(
       {

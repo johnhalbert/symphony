@@ -36,6 +36,11 @@ export interface TrackerIssueCandidatePage {
 export interface TrackerClient {
   fetchCandidateIssues(): Promise<Issue[]>;
   fetchIssuesByStates(stateNames: string[], options?: FetchIssuesByStatesOptions): Promise<Issue[]>;
+  fetchIssuesByIdentifiersAndStates?(
+    identifiers: string[],
+    stateNames: string[],
+    options?: FetchIssuesByStatesOptions,
+  ): Promise<Issue[]>;
   fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]>;
   fetchIssueCandidatesByFilter?(input: TrackerIssueCandidateFilterInput): Promise<Issue[]>;
   fetchIssueCandidatePageByFilter?(input: TrackerIssueCandidatePageInput): Promise<TrackerIssueCandidatePage>;

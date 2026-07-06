@@ -50,7 +50,10 @@ import {
   type TokenCounts,
   type Workspace,
 } from "../types.js";
-import type { WorkspaceManager } from "../workspace/WorkspaceManager.js";
+import type {
+  IssueWorkspaceRecord,
+  WorkspaceManager,
+} from "../workspace/WorkspaceManager.js";
 import {
   CompletionReportService,
   isFinalizedCompletionReport,
@@ -828,6 +831,7 @@ const PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER =
 const EPHEMERAL_SYSTEM_PROMPT_MAX_CHARS = 12_000;
 const PROMPT_SUMMARY_BLOCK_MAX_CHARS = 1_600;
 const ORCHESTRATOR_RULESET_VERSION = "2026-06-21.issue-history-v1";
+const STARTUP_TERMINAL_CLEANUP_CONCURRENCY = 4;
 
 const DEFAULT_EPHEMERAL_SYSTEM_PROMPT_TEMPLATE = `
 # Symphony Current Run Directive
@@ -938,6 +942,19 @@ interface TickIssueCandidateLane {
   id: string;
   branch: TrackerIssueCandidateFilterBranch;
   requiresAgentSlot: boolean;
+}
+
+interface StartupTerminalCleanupTarget {
+  issue: Issue;
+  workspace: IssueWorkspaceRecord;
+}
+
+interface StartupTerminalCleanupResult {
+  workspaceRemoved: boolean;
+  workspaceFailed: boolean;
+  transcriptsDeleted: number;
+  transcriptBytesRemoved: number;
+  transcriptFailed: boolean;
 }
 
 export class Orchestrator {
@@ -3018,39 +3035,7 @@ export class Orchestrator {
       } while (after);
     }
 
-    if (this.availableSlots() > 0) {
-      await this.processKnownTickIssueCandidates({
-        processedIssueIds,
-        excludedIssueIds,
-      });
-    }
     return true;
-  }
-
-  private async processKnownTickIssueCandidates(input: {
-    processedIssueIds: Set<string>;
-    excludedIssueIds: Set<string>;
-  }): Promise<void> {
-    const byId = new Map<string, Issue>();
-    await this.addKnownTickIssueCandidates(byId, {
-      excludeIssueIds: [
-        ...input.processedIssueIds,
-        ...input.excludedIssueIds,
-      ],
-    });
-    for (const issue of sortIssuesForDispatch([...byId.values()])) {
-      if (this.availableSlots() <= 0) return;
-      if (
-        input.processedIssueIds.has(issue.id) ||
-        input.excludedIssueIds.has(issue.id)
-      ) {
-        continue;
-      }
-      input.processedIssueIds.add(issue.id);
-      await this.processTickIssueCandidate(issue, {
-        refreshBeforeTransition: false,
-      });
-    }
   }
 
   private async tickIssueCandidateExcludedIssueIds(): Promise<Set<string>> {
@@ -3122,11 +3107,6 @@ export class Orchestrator {
           });
         }
       }
-    }
-    if (fetchedWithFilter) {
-      await this.addKnownTickIssueCandidates(byId, {
-        excludeIssueIds: [...excludedIssueIds],
-      });
     }
     return [...byId.values()];
   }
@@ -3260,47 +3240,10 @@ export class Orchestrator {
     return lanes;
   }
 
-  private async addKnownTickIssueCandidates(
-    byId: Map<string, Issue>,
-    options: { excludeIssueIds?: readonly string[] } = {},
-  ): Promise<void> {
-    const states = this.tickIssueCandidateStates();
-    if (states.length === 0) return;
-    const excludedIssueIds = new Set(options.excludeIssueIds ?? []);
-    let records: IssueCurrentFields[];
-    try {
-      records = await this.listIssueCurrentFields();
-    } catch (error) {
-      this.options.logger.warn("known tick issue candidate list failed", {
-        error: errorMessage(error),
-      });
-      return;
-    }
-    const candidateIds = records
-      .filter((record) => !byId.has(record.issueId))
-      .filter((record) => !excludedIssueIds.has(record.issueId))
-      .filter((record) => isStateIn(record.trackerState, states))
-      .map((record) => record.issueId);
-    if (candidateIds.length === 0) return;
-    try {
-      for (const issue of await this.options.tracker.fetchIssueStatesByIds(
-        candidateIds,
-      )) {
-        if (excludedIssueIds.has(issue.id)) continue;
-        byId.set(issue.id, issue);
-      }
-    } catch (error) {
-      this.options.logger.warn("known tick issue candidate refresh failed", {
-        issue_count: candidateIds.length,
-        error: errorMessage(error),
-      });
-    }
-  }
-
   /*
    * Keep this method as the single source of all tracker states the tick may
-   * need. The paged fast path queries them lane-by-lane; fallback and known
-   * candidate recovery still need the compact state list.
+   * need. The paged fast path queries them lane-by-lane; the legacy tracker
+   * fallback still needs the compact state list.
    */
   private tickIssueCandidateStates(): string[] {
     const states = [
@@ -9657,14 +9600,56 @@ export class Orchestrator {
   }
 
   private async startupCleanup(): Promise<void> {
+    const startedAt = Date.now();
+    let workspaces: IssueWorkspaceRecord[];
+    try {
+      workspaces = await this.options.workspaceManager.listIssueWorkspaces();
+    } catch (error) {
+      this.options.logger.warn("startup workspace directory scan failed", {
+        error: errorMessage(error),
+      });
+      return;
+    }
+
+    this.options.logger.info("startup terminal cleanup started", {
+      workspace_count: workspaces.length,
+      terminal_states: this.config.tracker.terminalStates,
+      concurrency: STARTUP_TERMINAL_CLEANUP_CONCURRENCY,
+    });
+    const progress = createStartupTerminalCleanupProgressLine();
+    progress(`scanning ${workspaces.length} workspace directories`);
+
     let terminalIssues: Issue[];
     try {
-      terminalIssues = await this.options.tracker.fetchIssuesByStates(
-        this.config.tracker.terminalStates,
-      );
+      terminalIssues = await this.fetchStartupTerminalIssuesForWorkspaces(workspaces);
     } catch (error) {
+      progress("failed during Linear terminal issue lookup", true);
       this.options.logger.warn("startup terminal issue fetch failed", {
+        workspace_count: workspaces.length,
         error: errorMessage(error),
+      });
+      return;
+    }
+
+    const targets = this.matchStartupTerminalCleanupTargets(workspaces, terminalIssues);
+    this.options.logger.info("startup terminal cleanup targets selected", {
+      workspace_count: workspaces.length,
+      terminal_issue_count: terminalIssues.length,
+      cleanup_target_count: targets.length,
+    });
+
+    if (targets.length === 0) {
+      progress(`complete: ${workspaces.length} workspaces, 0 terminal targets`, true);
+      this.options.logger.info("startup terminal cleanup completed", {
+        workspace_count: workspaces.length,
+        terminal_issue_count: terminalIssues.length,
+        cleanup_target_count: targets.length,
+        workspace_removed_count: 0,
+        workspace_failed_count: 0,
+        transcript_deleted_count: 0,
+        transcript_bytes_removed: 0,
+        transcript_failed_count: 0,
+        duration_ms: Date.now() - startedAt,
       });
       return;
     }
@@ -9673,9 +9658,136 @@ export class Orchestrator {
       this.options.runStore && this.config.transcriptCleanup.terminalStartup.enabled
         ? new RunTranscriptCleanupService({ runStore: this.options.runStore })
         : null;
+    let completedCount = 0;
+    let workspaceRemovedCount = 0;
+    let workspaceFailedCount = 0;
+    let transcriptDeletedCount = 0;
+    let transcriptBytesRemoved = 0;
+    let transcriptFailedCount = 0;
+    const renderProgress = () => {
+      progress(
+        `${completedCount}/${targets.length} targets, removed=${workspaceRemovedCount}, transcripts=${transcriptDeletedCount}, failed=${
+          workspaceFailedCount + transcriptFailedCount
+        }`,
+      );
+    };
+
+    renderProgress();
+    await mapWithConcurrency(
+      targets,
+      STARTUP_TERMINAL_CLEANUP_CONCURRENCY,
+      async (target) => {
+        const result = await this.cleanupStartupTerminalTarget(
+          target,
+          transcriptCleanup,
+        );
+        completedCount += 1;
+        if (result.workspaceRemoved) workspaceRemovedCount += 1;
+        if (result.workspaceFailed) workspaceFailedCount += 1;
+        transcriptDeletedCount += result.transcriptsDeleted;
+        transcriptBytesRemoved += result.transcriptBytesRemoved;
+        if (result.transcriptFailed) transcriptFailedCount += 1;
+        renderProgress();
+      },
+    );
+    progress(
+      `complete: ${completedCount}/${targets.length} targets, removed=${workspaceRemovedCount}, transcripts=${transcriptDeletedCount}, failed=${
+        workspaceFailedCount + transcriptFailedCount
+      }`,
+      true,
+    );
+    this.options.logger.info("startup terminal cleanup completed", {
+      workspace_count: workspaces.length,
+      terminal_issue_count: terminalIssues.length,
+      cleanup_target_count: targets.length,
+      workspace_removed_count: workspaceRemovedCount,
+      workspace_failed_count: workspaceFailedCount,
+      transcript_deleted_count: transcriptDeletedCount,
+      transcript_bytes_removed: transcriptBytesRemoved,
+      transcript_failed_count: transcriptFailedCount,
+      duration_ms: Date.now() - startedAt,
+    });
+  }
+
+  private async fetchStartupTerminalIssuesForWorkspaces(
+    workspaces: IssueWorkspaceRecord[],
+  ): Promise<Issue[]> {
+    if (workspaces.length === 0) return [];
+    const terminalStates = uniqueStateNames(this.config.tracker.terminalStates);
+    const identifiers = uniqueCaseInsensitiveStrings(
+      workspaces.map((workspace) => workspace.issueIdentifier),
+    );
+    if (
+      identifiers.length > 0 &&
+      this.options.tracker.fetchIssuesByIdentifiersAndStates
+    ) {
+      return this.options.tracker.fetchIssuesByIdentifiersAndStates(
+        identifiers,
+        terminalStates,
+      );
+    }
+
+    const issueIds = uniqueCaseInsensitiveStrings(
+      workspaces
+        .map((workspace) => workspace.issueId)
+        .filter((issueId): issueId is string => issueId !== null),
+    );
+    if (issueIds.length === 0) return [];
+    const refreshed = await this.options.tracker.fetchIssueStatesByIds(issueIds);
+    return refreshed.filter((issue) =>
+      isStateIn(issue.state, terminalStates),
+    );
+  }
+
+  private matchStartupTerminalCleanupTargets(
+    workspaces: IssueWorkspaceRecord[],
+    terminalIssues: Issue[],
+  ): StartupTerminalCleanupTarget[] {
+    const workspaceByIssueId = new Map<string, IssueWorkspaceRecord>();
+    const workspaceByIdentifier = new Map<string, IssueWorkspaceRecord>();
+    for (const workspace of workspaces) {
+      if (workspace.issueId) {
+        workspaceByIssueId.set(workspace.issueId.toLowerCase(), workspace);
+      }
+      workspaceByIdentifier.set(
+        workspace.issueIdentifier.toLowerCase(),
+        workspace,
+      );
+      workspaceByIdentifier.set(workspace.workspaceKey.toLowerCase(), workspace);
+    }
+
+    const seen = new Set<string>();
+    const targets: StartupTerminalCleanupTarget[] = [];
     for (const issue of terminalIssues) {
-      try {
-        await this.options.workspaceManager.removeForIssue(issue);
+      const workspace =
+        workspaceByIssueId.get(issue.id.toLowerCase()) ??
+        workspaceByIdentifier.get(issue.identifier.toLowerCase()) ??
+        null;
+      if (!workspace) continue;
+      const key = issue.id.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push({ issue, workspace });
+    }
+    return targets;
+  }
+
+  private async cleanupStartupTerminalTarget(
+    target: StartupTerminalCleanupTarget,
+    transcriptCleanup: RunTranscriptCleanupService | null,
+  ): Promise<StartupTerminalCleanupResult> {
+    const { issue } = target;
+    const result: StartupTerminalCleanupResult = {
+      workspaceRemoved: false,
+      workspaceFailed: false,
+      transcriptsDeleted: 0,
+      transcriptBytesRemoved: 0,
+      transcriptFailed: false,
+    };
+    try {
+      const removed = await this.options.workspaceManager.removeForIssue(issue);
+      if (removed) {
+        result.workspaceRemoved = true;
         await this.recordIssueEvidenceSnapshot({
           issue,
           evidenceKind: "workspace",
@@ -9688,62 +9800,69 @@ export class Orchestrator {
             trackerState: issue.state,
           },
         });
-      } catch (error) {
-        this.options.logger.warn("startup terminal workspace cleanup failed", {
-          issue_id: issue.id,
-          issue_identifier: issue.identifier,
-          error: errorMessage(error),
-        });
       }
-
-      if (!transcriptCleanup) continue;
-      try {
-        const result = await transcriptCleanup.cleanup({
-          targets: [
-            {
-              issueIdOrIdentifier: issue.id,
-              issueId: issue.id,
-              issueIdentifier: issue.identifier,
-            },
-          ],
-          keepLatestRuns: this.config.transcriptCleanup.terminalStartup.keepLatestRuns,
-          apply: true,
-          reason: "startup_terminal_cleanup",
-        });
-        if (result.totals.deleted > 0) {
-          this.options.logger.info("startup terminal transcript cleanup completed", {
-            issue_id: issue.id,
-            issue_identifier: issue.identifier,
-            kept_count: result.totals.kept,
-            deleted_count: result.totals.deleted,
-            bytes_removed: result.totals.bytesRemoved,
-          });
-          await this.recordIssueEvidenceSnapshot({
-            issue,
-            evidenceKind: "workspace",
-            eventType: "startup_terminal_transcripts_removed",
-            sourceId: issue.id,
-            reason: "startup_terminal_cleanup",
-            payload: {
-              issueId: issue.id,
-              issueIdentifier: issue.identifier,
-              trackerState: issue.state,
-              keepLatestRuns: result.keepLatestRuns,
-              considered: result.totals.considered,
-              kept: result.totals.kept,
-              deleted: result.totals.deleted,
-              bytesRemoved: result.totals.bytesRemoved,
-            },
-          });
-        }
-      } catch (error) {
-        this.options.logger.warn("startup terminal transcript cleanup failed", {
-          issue_id: issue.id,
-          issue_identifier: issue.identifier,
-          error: errorMessage(error),
-        });
-      }
+    } catch (error) {
+      result.workspaceFailed = true;
+      this.options.logger.warn("startup terminal workspace cleanup failed", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        workspace_key: target.workspace.workspaceKey,
+        workspace_path: target.workspace.path,
+        error: errorMessage(error),
+      });
     }
+
+    if (!transcriptCleanup) return result;
+    try {
+      const cleanup = await transcriptCleanup.cleanup({
+        targets: [
+          {
+            issueIdOrIdentifier: issue.id,
+            issueId: issue.id,
+            issueIdentifier: issue.identifier,
+          },
+        ],
+        keepLatestRuns: this.config.transcriptCleanup.terminalStartup.keepLatestRuns,
+        apply: true,
+        reason: "startup_terminal_cleanup",
+      });
+      result.transcriptsDeleted = cleanup.totals.deleted;
+      result.transcriptBytesRemoved = cleanup.totals.bytesRemoved;
+      if (cleanup.totals.deleted > 0) {
+        this.options.logger.info("startup terminal transcript cleanup completed", {
+          issue_id: issue.id,
+          issue_identifier: issue.identifier,
+          kept_count: cleanup.totals.kept,
+          deleted_count: cleanup.totals.deleted,
+          bytes_removed: cleanup.totals.bytesRemoved,
+        });
+        await this.recordIssueEvidenceSnapshot({
+          issue,
+          evidenceKind: "workspace",
+          eventType: "startup_terminal_transcripts_removed",
+          sourceId: issue.id,
+          reason: "startup_terminal_cleanup",
+          payload: {
+            issueId: issue.id,
+            issueIdentifier: issue.identifier,
+            trackerState: issue.state,
+            keepLatestRuns: cleanup.keepLatestRuns,
+            considered: cleanup.totals.considered,
+            kept: cleanup.totals.kept,
+            deleted: cleanup.totals.deleted,
+            bytesRemoved: cleanup.totals.bytesRemoved,
+          },
+        });
+      }
+    } catch (error) {
+      result.transcriptFailed = true;
+      this.options.logger.warn("startup terminal transcript cleanup failed", {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        error: errorMessage(error),
+      });
+    }
+    return result;
   }
 
   private async cleanupOrphanedRunningRuns(): Promise<void> {
@@ -15734,6 +15853,56 @@ function uniqueStateNames(states: string[]): string[] {
     unique.push(state);
   }
   return unique;
+}
+
+function uniqueCaseInsensitiveStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(trimmed);
+  }
+  return unique;
+}
+
+async function mapWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  let nextIndex = 0;
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const item = items[index];
+        if (item === undefined) return;
+        await worker(item, index);
+      }
+    }),
+  );
+}
+
+function createStartupTerminalCleanupProgressLine(): (
+  message: string,
+  done?: boolean,
+) => void {
+  const enabled = process.stderr.isTTY === true;
+  let previousLength = 0;
+  return (message: string, done = false) => {
+    if (!enabled) return;
+    const line = `startup terminal cleanup: ${message}`;
+    previousLength = Math.max(previousLength, line.length);
+    process.stderr.write(`\r${line.padEnd(previousLength)}`);
+    if (done) process.stderr.write("\n");
+  };
 }
 
 function isTerminalSdkRunStatus(status: AgentRunSdkStatus): boolean {

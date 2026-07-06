@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -225,12 +225,25 @@ describe("Orchestrator", () => {
   it("cleans terminal issue transcripts during startup even when workspace cleanup fails", async () => {
     const config = testConfig(root);
     const candidate = issue({ state: "Done" });
+    await mkdir(path.join(config.workspace.root, candidate.identifier), {
+      recursive: true,
+    });
+    let broadStateFetches = 0;
+    let identifierStateFetches = 0;
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
         return [];
       },
       async fetchIssuesByStates(states) {
+        broadStateFetches += 1;
         return issuesInStates([candidate], states);
+      },
+      async fetchIssuesByIdentifiersAndStates(identifiers, states) {
+        identifierStateFetches += 1;
+        expect(identifiers).toEqual([candidate.identifier]);
+        return issuesInStates([candidate], states).filter((item) =>
+          identifiers.includes(item.identifier),
+        );
       },
       async fetchIssueStatesByIds() {
         return [candidate];
@@ -261,6 +274,8 @@ describe("Orchestrator", () => {
     await orchestrator.start();
     await orchestrator.stop();
 
+    expect(broadStateFetches).toBe(0);
+    expect(identifierStateFetches).toBe(1);
     expect(workspaceManager.removeForIssue).toHaveBeenCalledWith(candidate);
     await expect(runStore.getRun("terminal-run-old")).resolves.toBeNull();
     await expect(runStore.getRun("terminal-run-middle")).resolves.toBeNull();
@@ -644,6 +659,85 @@ describe("Orchestrator", () => {
         { state: "In Review", refreshBeforeTransition: false },
       ]);
       expect(refreshes).toBe(0);
+    } finally {
+      await orchestrator.stop();
+    }
+  });
+
+  it("does not recover tick candidates from local issue state after paged lanes", async () => {
+    const config = testConfig(root);
+    config.postMortem.enabled = true;
+    config.postMortem.doneStates = ["Done"];
+    config.postMortem.requireLabels = ["post_mortem"];
+    const issueStateStore = new SqliteIssueStateStore(config.workspace.stateDir);
+    const cachedDone = issue({
+      id: "issue-cached-done",
+      identifier: "TEST-CACHED-DONE",
+      state: "Done",
+      labels: ["dogfood-ready"],
+    });
+    await issueStateStore.ensureIssue(
+      issueCurrentSnapshotForTest(cachedDone, {
+        trackerState: "Done",
+        phase: "terminal",
+      }),
+    );
+
+    let idFetches = 0;
+    const pageInputs: TrackerIssueCandidatePageInput[] = [];
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        idFetches += 1;
+        return [cachedDone];
+      },
+      async fetchIssueCandidatePageByFilter(input) {
+        pageInputs.push(input);
+        return {
+          issues: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        };
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      issueStateStore,
+    });
+
+    const internals = orchestrator as unknown as {
+      processTickIssueCandidates(): Promise<void>;
+      processTickIssueCandidate(
+        candidate: Issue,
+        options?: { refreshBeforeTransition?: boolean },
+      ): Promise<boolean>;
+    };
+    const processed: string[] = [];
+    internals.processTickIssueCandidate = async (candidate) => {
+      processed.push(candidate.identifier);
+      return true;
+    };
+
+    try {
+      await internals.processTickIssueCandidates();
+
+      expect(pageInputs.length).toBeGreaterThan(0);
+      expect(idFetches).toBe(0);
+      expect(processed).toEqual([]);
     } finally {
       await orchestrator.stop();
     }
