@@ -33,6 +33,15 @@ export class FileIssueStateStore implements IssueStateStore {
     );
   }
 
+  async getCurrent(
+    issueIdOrIdentifier: string,
+  ): Promise<IssueCurrentFields | null> {
+    const record = await this.get(issueIdOrIdentifier);
+    if (record === null) return null;
+    const { history: _history, ...current } = record;
+    return normalizeIssueCurrentFields(current as IssueCurrentFields);
+  }
+
   async getHistory(
     issueIdOrIdentifier: string,
   ): Promise<IssueHistorySnapshot[] | null> {
@@ -65,6 +74,17 @@ export class FileIssueStateStore implements IssueStateStore {
   }
 
   async ensureIssue(current: IssueCurrentFields): Promise<IssueStateRecord> {
+    await this.ensureCurrent(current);
+    const record = await this.get(current.issueId);
+    if (record === null) {
+      throw new Error(
+        `Issue state was not persisted for ${current.issueIdentifier}`,
+      );
+    }
+    return record;
+  }
+
+  async ensureCurrent(current: IssueCurrentFields): Promise<IssueCurrentFields> {
     const existing = await this.find(current.issueId, current.issueIdentifier);
     const now = new Date().toISOString();
     const record: IssueStateRecord = {
@@ -77,13 +97,26 @@ export class FileIssueStateStore implements IssueStateStore {
       history: existing?.history ?? [],
     };
     await this.write(record);
-    return record;
+    const { history: _history, ...persisted } = record;
+    return normalizeIssueCurrentFields(persisted as IssueCurrentFields);
   }
 
   async updateCurrent(
     issue: Pick<Issue, "id" | "identifier">,
     patch: Partial<IssueCurrentFields>,
   ): Promise<IssueStateRecord> {
+    await this.patchCurrent(issue, patch);
+    const record = await this.get(issue.id);
+    if (!record) {
+      throw new Error(`Issue state does not exist for ${issue.identifier}`);
+    }
+    return record;
+  }
+
+  async patchCurrent(
+    issue: Pick<Issue, "id" | "identifier">,
+    patch: Partial<IssueCurrentFields>,
+  ): Promise<IssueCurrentFields> {
     const existing = await this.find(issue.id, issue.identifier);
     if (!existing) {
       throw new Error(`Issue state does not exist for ${issue.identifier}`);
@@ -98,13 +131,26 @@ export class FileIssueStateStore implements IssueStateStore {
       history: existing.history,
     };
     await this.write(record);
-    return record;
+    const { history: _history, ...current } = record;
+    return normalizeIssueCurrentFields(current as IssueCurrentFields);
   }
 
   async appendSnapshot(
     issue: Pick<Issue, "id" | "identifier">,
     snapshot: IssueHistorySnapshot,
   ): Promise<IssueStateRecord> {
+    await this.appendSnapshotOnly(issue, snapshot);
+    const record = await this.get(issue.id);
+    if (!record) {
+      throw new Error(`Issue state does not exist for ${issue.identifier}`);
+    }
+    return record;
+  }
+
+  async appendSnapshotOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    snapshot: IssueHistorySnapshot,
+  ): Promise<void> {
     const existing = await this.find(issue.id, issue.identifier);
     if (!existing) {
       throw new Error(`Issue state does not exist for ${issue.identifier}`);
@@ -115,7 +161,6 @@ export class FileIssueStateStore implements IssueStateStore {
       history: [...existing.history, snapshot],
     };
     await this.write(record);
-    return record;
   }
 
   async updateSnapshotActions(
@@ -126,8 +171,20 @@ export class FileIssueStateStore implements IssueStateStore {
       errors?: readonly TransitionErrorRecord[];
     },
   ): Promise<IssueStateRecord | null> {
+    await this.updateSnapshotActionsOnly(issue, historySnapshotId, patch);
+    return this.get(issue.id);
+  }
+
+  async updateSnapshotActionsOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    historySnapshotId: string,
+    patch: {
+      actions?: readonly TransitionActionRecord[];
+      errors?: readonly TransitionErrorRecord[];
+    },
+  ): Promise<boolean> {
     const existing = await this.find(issue.id, issue.identifier);
-    if (!existing) return null;
+    if (!existing) return false;
     let found = false;
     const history = existing.history.map((snapshot) => {
       if (snapshot.historySnapshotId !== historySnapshotId) return snapshot;
@@ -140,14 +197,14 @@ export class FileIssueStateStore implements IssueStateStore {
           patch.errors === undefined ? snapshot.errors : [...patch.errors],
       };
     });
-    if (!found) return existing;
+    if (!found) return false;
     const record: IssueStateRecord = {
       ...existing,
       recordUpdatedAt: new Date().toISOString(),
       history,
     };
     await this.write(record);
-    return record;
+    return true;
   }
 
   async appendSnapshotAction(
@@ -155,13 +212,22 @@ export class FileIssueStateStore implements IssueStateStore {
     historySnapshotId: string,
     action: TransitionActionRecord,
   ): Promise<IssueStateRecord | null> {
+    await this.appendSnapshotActionOnly(issue, historySnapshotId, action);
+    return this.get(issue.id);
+  }
+
+  async appendSnapshotActionOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    historySnapshotId: string,
+    action: TransitionActionRecord,
+  ): Promise<boolean> {
     const existing = await this.find(issue.id, issue.identifier);
-    if (!existing) return null;
+    if (!existing) return false;
     const snapshot = existing.history.find(
       (candidate) => candidate.historySnapshotId === historySnapshotId,
     );
-    if (!snapshot) return existing;
-    return this.updateSnapshotActions(issue, historySnapshotId, {
+    if (!snapshot) return false;
+    return this.updateSnapshotActionsOnly(issue, historySnapshotId, {
       actions: [...snapshot.actions, action],
     });
   }
@@ -171,13 +237,22 @@ export class FileIssueStateStore implements IssueStateStore {
     historySnapshotId: string,
     error: TransitionErrorRecord,
   ): Promise<IssueStateRecord | null> {
+    await this.appendSnapshotErrorOnly(issue, historySnapshotId, error);
+    return this.get(issue.id);
+  }
+
+  async appendSnapshotErrorOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    historySnapshotId: string,
+    error: TransitionErrorRecord,
+  ): Promise<boolean> {
     const existing = await this.find(issue.id, issue.identifier);
-    if (!existing) return null;
+    if (!existing) return false;
     const snapshot = existing.history.find(
       (candidate) => candidate.historySnapshotId === historySnapshotId,
     );
-    if (!snapshot) return existing;
-    return this.updateSnapshotActions(issue, historySnapshotId, {
+    if (!snapshot) return false;
+    return this.updateSnapshotActionsOnly(issue, historySnapshotId, {
       errors: [...snapshot.errors, error],
     });
   }

@@ -95,6 +95,87 @@ describe("SqliteIssueStateStore", () => {
     expect(record?.history[0]).not.toHaveProperty("transitionRequest");
   });
 
+  it("supports current-only writes and targeted snapshot updates", async () => {
+    const store = new SqliteIssueStateStore(root);
+    stores.push(store);
+    const current = currentFields();
+    await expect(store.ensureCurrent(current)).resolves.toMatchObject({
+      issueId: current.issueId,
+      issueIdentifier: current.issueIdentifier,
+    });
+    await expect(
+      store.patchCurrent(
+        { id: current.issueId, identifier: current.issueIdentifier },
+        { title: "Projected title" },
+      ),
+    ).resolves.toMatchObject({
+      title: "Projected title",
+    });
+    await expect(store.getCurrent(current.issueIdentifier)).resolves.toMatchObject({
+      issueId: current.issueId,
+      title: "Projected title",
+    });
+
+    const snapshot = new IssueOrchestrationEngine([
+      {
+        id: "dispatch.worker",
+        priority: 100,
+        evaluate: () => ({
+          transitionKind: "dispatch_worker",
+          role: "worker",
+          runPhase: "implementation",
+        }),
+      },
+    ]).decide(currentSnapshot(current), []);
+    expect(snapshot).not.toBeNull();
+    await expect(
+      store.appendSnapshotOnly(
+        { id: current.issueId, identifier: current.issueIdentifier },
+        snapshot!,
+      ),
+    ).resolves.toBeUndefined();
+
+    const pending = transitionAction({
+      actionType: "render_prompt",
+      status: "pending",
+      completedAt: null,
+    });
+    await expect(
+      store.appendSnapshotActionOnly(
+        { id: current.issueId, identifier: current.issueIdentifier },
+        snapshot!.historySnapshotId,
+        pending,
+      ),
+    ).resolves.toBe(true);
+    const completed = transitionAction({
+      actionId: pending.actionId,
+      actionType: "render_prompt",
+      status: "succeeded",
+    });
+    await expect(
+      store.updateSnapshotActionsOnly(
+        { id: current.issueId, identifier: current.issueIdentifier },
+        snapshot!.historySnapshotId,
+        { actions: [completed] },
+      ),
+    ).resolves.toBe(true);
+    await expect(
+      store.appendSnapshotErrorOnly(
+        { id: current.issueId, identifier: current.issueIdentifier },
+        snapshot!.historySnapshotId,
+        transitionErrorFromUnknown(new Error("targeted")),
+      ),
+    ).resolves.toBe(true);
+
+    await expect(store.getHistory(current.issueId)).resolves.toMatchObject([
+      {
+        transitionKind: "dispatch_worker",
+        actions: [{ actionId: pending.actionId, status: "succeeded" }],
+        errors: [{ message: "targeted" }],
+      },
+    ]);
+  });
+
   it("imports legacy flat-file issue state into sqlite on first open", async () => {
     const legacy = new FileIssueStateStore(root);
     const current = currentFields();

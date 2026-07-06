@@ -122,7 +122,6 @@ import {
   type MergeQueueStore,
 } from "../orchestration/SqliteMergeQueueStore.js";
 import {
-  HISTORY_BACKED_FIELD_GROUPS,
   IssueCurrentStateBuilder,
   type IssueCurrentStateRuntimeState,
 } from "../orchestration/IssueCurrentStateBuilder.js";
@@ -1010,7 +1009,6 @@ export class Orchestrator {
       runStore: options.runStore,
       issueStateStore: this.issueStateStore,
       logger: options.logger,
-      historyBackedFieldGroups: HISTORY_BACKED_FIELD_GROUPS,
     });
     this.transitionRulesets = this.createTransitionRulesets();
     this.transitionEngine = new IssueOrchestrationEngine(
@@ -3589,6 +3587,12 @@ export class Orchestrator {
                 fingerprint,
               );
               context.mergePolicy.observation = observation;
+              await this.issueStateStore.patchCurrent(context.issue, {
+                lastMergePolicyObservation: observation,
+                lastMergePolicyObservationFingerprint:
+                  observation.inputFingerprint,
+                lastMergePolicyObservationStatus: observation.status,
+              });
               return {
                 status:
                   observation.status === "skipped" ? "skipped" : "succeeded",
@@ -8884,14 +8888,19 @@ export class Orchestrator {
           },
         },
       );
-      const record = await this.issueStateStore.ensureIssue(snapshot);
-      const transition = this.transitionEngine.decide(snapshot, record.history);
+      await this.issueStateStore.ensureCurrent(snapshot);
+      const transition = this.transitionEngine.decide(snapshot, []);
       if (transition === null) return null;
       const patchedTransition =
         input.transitionPatch === undefined
           ? transition
           : { ...transition, ...input.transitionPatch };
-      await this.issueStateStore.appendSnapshot(input.issue, patchedTransition);
+      if (patchedTransition.transitionKind !== "noop") {
+        await this.issueStateStore.appendSnapshotOnly(
+          input.issue,
+          patchedTransition,
+        );
+      }
       return patchedTransition;
     } catch (error) {
       this.options.logger.warn("issue transition decision failed", {
@@ -8983,7 +8992,7 @@ export class Orchestrator {
           manualIgnoreState: input.manualIgnoreState ?? false,
         },
       );
-      const record = await this.issueStateStore.ensureIssue(snapshot);
+      await this.issueStateStore.ensureCurrent(snapshot);
       const rulesetId =
         input.rulesetId ?? `orchestrator.${input.request.transitionKind}`;
       const rulesetPriority =
@@ -8998,14 +9007,18 @@ export class Orchestrator {
       };
       const decided = new IssueOrchestrationEngine([ruleset]).decide(
         snapshot,
-        record.history,
+        [],
       );
       if (!decided) return null;
       const historySnapshot = {
         ...decided,
         actions: input.actions ?? [],
       };
-      await this.issueStateStore.appendSnapshot(input.issue, historySnapshot);
+      if (historySnapshot.transitionKind === "noop") return null;
+      await this.issueStateStore.appendSnapshotOnly(
+        input.issue,
+        historySnapshot,
+      );
       return historySnapshot.historySnapshotId;
     } catch (error) {
       this.options.logger.warn("issue transition snapshot recording failed", {
@@ -9126,8 +9139,8 @@ export class Orchestrator {
       });
     }
     try {
-      const record = await this.issueStateStore.get(issueId);
-      return record === null ? null : currentFieldsAsIssue(record);
+      const current = await this.issueStateStore.getCurrent(issueId);
+      return current === null ? null : currentFieldsAsIssue(current);
     } catch (error) {
       this.options.logger.warn("runtime evidence durable issue lookup failed", {
         issue_id: issueId,
@@ -9307,7 +9320,7 @@ export class Orchestrator {
   ): Promise<void> {
     if (entry.issueHistorySnapshotId === null) return;
     try {
-      await this.issueStateStore.appendSnapshotError(
+      await this.issueStateStore.appendSnapshotErrorOnly(
         entry.issue,
         entry.issueHistorySnapshotId,
         transitionErrorFromUnknown(error, {
@@ -9486,16 +9499,17 @@ export class Orchestrator {
           startedAt,
           completedAt: null,
         });
-        await this.issueStateStore.appendSnapshotAction(
+        await this.issueStateStore.appendSnapshotActionOnly(
           issue,
           transition.historySnapshotId,
           pendingAction,
         );
+        transition.actions = [...transition.actions, pendingAction];
         try {
           if (action.shouldExecute && !(await action.shouldExecute(context))) {
             await this.replaceIssueSnapshotAction(
               issue,
-              transition.historySnapshotId,
+              transition,
               transitionAction({
                 actionId,
                 actionType: action.id,
@@ -9510,7 +9524,7 @@ export class Orchestrator {
           const normalized = normalizeTransitionActionExecutionResult(result);
           await this.replaceIssueSnapshotAction(
             issue,
-            transition.historySnapshotId,
+            transition,
             transitionAction({
               actionId,
               actionType: action.id,
@@ -9525,7 +9539,7 @@ export class Orchestrator {
         } catch (error) {
           await this.replaceIssueSnapshotAction(
             issue,
-            transition.historySnapshotId,
+            transition,
             transitionAction({
               actionId,
               actionType: action.id,
@@ -9534,15 +9548,17 @@ export class Orchestrator {
               message: errorMessage(error),
             }),
           );
-          await this.issueStateStore.appendSnapshotError(
+          const transitionError = transitionErrorFromUnknown(error, {
+            actionId,
+            errorType: transitionErrorTypeFor(error),
+            details: { actionType: action.id },
+          });
+          await this.issueStateStore.appendSnapshotErrorOnly(
             issue,
             transition.historySnapshotId,
-            transitionErrorFromUnknown(error, {
-              actionId,
-              errorType: transitionErrorTypeFor(error),
-              details: { actionType: action.id },
-            }),
+            transitionError,
           );
+          transition.errors = [...transition.errors, transitionError];
           this.options.logger.warn("issue transition action failed", {
             issue_id: issue.id,
             issue_identifier: issue.identifier,
@@ -9579,24 +9595,24 @@ export class Orchestrator {
 
   private async replaceIssueSnapshotAction(
     issue: Issue,
-    historySnapshotId: string,
+    transition: IssueHistorySnapshot,
     action: TransitionActionRecord,
   ): Promise<void> {
-    const record = await this.issueStateStore.get(issue.id);
-    const snapshot =
-      record?.history.find(
-        (candidate) => candidate.historySnapshotId === historySnapshotId,
-      ) ?? null;
-    if (!snapshot) return;
     let replaced = false;
-    const actions = snapshot.actions.map((candidate) => {
+    const actions = transition.actions.map((candidate) => {
       if (candidate.actionId !== action.actionId) return candidate;
       replaced = true;
       return action;
     });
-    await this.issueStateStore.updateSnapshotActions(issue, historySnapshotId, {
-      actions: replaced ? actions : [...actions, action],
-    });
+    const nextActions = replaced ? actions : [...actions, action];
+    transition.actions = nextActions;
+    await this.issueStateStore.updateSnapshotActionsOnly(
+      issue,
+      transition.historySnapshotId,
+      {
+        actions: nextActions,
+      },
+    );
   }
 
   private async startupCleanup(): Promise<void> {

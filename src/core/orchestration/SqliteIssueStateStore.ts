@@ -80,6 +80,14 @@ export class SqliteIssueStateStore implements IssueStateStore {
     });
   }
 
+  async getCurrent(
+    issueIdOrIdentifier: string,
+  ): Promise<IssueCurrentFields | null> {
+    return this.withStore((database) =>
+      this.currentByIdOrIdentifierUnlocked(database, issueIdOrIdentifier),
+    );
+  }
+
   async getHistory(
     issueIdOrIdentifier: string,
   ): Promise<IssueHistorySnapshot[] | null> {
@@ -133,8 +141,19 @@ export class SqliteIssueStateStore implements IssueStateStore {
   }
 
   async ensureIssue(current: IssueCurrentFields): Promise<IssueStateRecord> {
+    await this.ensureCurrent(current);
+    const record = await this.get(current.issueId);
+    if (!record)
+      throw new Error(
+        `Issue state was not persisted for ${current.issueIdentifier}`,
+      );
+    return record;
+  }
+
+  async ensureCurrent(current: IssueCurrentFields): Promise<IssueCurrentFields> {
+    let persisted: IssueCurrentFields | null = null;
     await this.withWrite(current.issueId, async (database) => {
-      const existing = await this.findUnlocked(
+      const existing = await this.findCurrentUnlocked(
         database,
         current.issueId,
         current.issueIdentifier,
@@ -165,21 +184,33 @@ export class SqliteIssueStateStore implements IssueStateStore {
           record.recordUpdatedAt,
         ],
       );
+      persisted = record;
     });
-    const record = await this.get(current.issueId);
-    if (!record)
+    if (!persisted)
       throw new Error(
         `Issue state was not persisted for ${current.issueIdentifier}`,
       );
-    return record;
+    return persisted;
   }
 
   async updateCurrent(
     issue: Pick<Issue, "id" | "identifier">,
     patch: Partial<IssueCurrentFields>,
   ): Promise<IssueStateRecord> {
+    await this.patchCurrent(issue, patch);
+    const record = await this.get(issue.id);
+    if (!record)
+      throw new Error(`Issue state does not exist for ${issue.identifier}`);
+    return record;
+  }
+
+  async patchCurrent(
+    issue: Pick<Issue, "id" | "identifier">,
+    patch: Partial<IssueCurrentFields>,
+  ): Promise<IssueCurrentFields> {
+    let persisted: IssueCurrentFields | null = null;
     await this.withWrite(issue.id, async (database) => {
-      const existing = await this.findUnlocked(
+      const existing = await this.findCurrentUnlocked(
         database,
         issue.id,
         issue.identifier,
@@ -204,19 +235,30 @@ export class SqliteIssueStateStore implements IssueStateStore {
         `,
         [JSON.stringify(current), current.recordUpdatedAt, current.issueId],
       );
+      persisted = current;
     });
-    const record = await this.get(issue.id);
-    if (!record)
+    if (!persisted)
       throw new Error(`Issue state does not exist for ${issue.identifier}`);
-    return record;
+    return persisted;
   }
 
   async appendSnapshot(
     issue: Pick<Issue, "id" | "identifier">,
     snapshot: IssueHistorySnapshot,
   ): Promise<IssueStateRecord> {
+    await this.appendSnapshotOnly(issue, snapshot);
+    const record = await this.get(issue.id);
+    if (!record)
+      throw new Error(`Issue state does not exist for ${issue.identifier}`);
+    return record;
+  }
+
+  async appendSnapshotOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    snapshot: IssueHistorySnapshot,
+  ): Promise<void> {
     await this.withWrite(issue.id, async (database) => {
-      const existing = await this.findUnlocked(
+      const existing = await this.findStateRowUnlocked(
         database,
         issue.id,
         issue.identifier,
@@ -226,22 +268,18 @@ export class SqliteIssueStateStore implements IssueStateStore {
       const row = await this.getRow<{ max_sequence: number }>(
         database,
         "SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM issue_history WHERE issue_id = ?",
-        [existing.issueId],
+        [existing.issue_id],
       );
       const sequence = (row?.max_sequence ?? 0) + 1;
       await this.insertSnapshotUnlocked(
         database,
-        existing.issueId,
-        existing.issueIdentifier,
+        existing.issue_id,
+        existing.issue_identifier,
         sequence,
         normalizeIssueHistorySnapshot(snapshot),
       );
-      await this.touchIssue(database, existing.issueId);
+      await this.touchIssue(database, existing.issue_id);
     });
-    const record = await this.get(issue.id);
-    if (!record)
-      throw new Error(`Issue state does not exist for ${issue.identifier}`);
-    return record;
   }
 
   async updateSnapshotActions(
@@ -252,8 +290,21 @@ export class SqliteIssueStateStore implements IssueStateStore {
       errors?: readonly TransitionErrorRecord[];
     },
   ): Promise<IssueStateRecord | null> {
+    await this.updateSnapshotActionsOnly(issue, historySnapshotId, patch);
+    return this.get(issue.id);
+  }
+
+  async updateSnapshotActionsOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    historySnapshotId: string,
+    patch: {
+      actions?: readonly TransitionActionRecord[];
+      errors?: readonly TransitionErrorRecord[];
+    },
+  ): Promise<boolean> {
+    let updated = false;
     await this.withWrite(issue.id, async (database) => {
-      const existing = await this.findUnlocked(
+      const existing = await this.findStateRowUnlocked(
         database,
         issue.id,
         issue.identifier,
@@ -261,7 +312,7 @@ export class SqliteIssueStateStore implements IssueStateStore {
       if (!existing) return;
       const snapshot = await this.findSnapshotUnlocked(
         database,
-        existing.issueId,
+        existing.issue_id,
         historySnapshotId,
       );
       if (!snapshot) return;
@@ -274,12 +325,13 @@ export class SqliteIssueStateStore implements IssueStateStore {
       };
       await this.updateSnapshotUnlocked(
         database,
-        existing.issueId,
+        existing.issue_id,
         historySnapshotId,
         next,
       );
+      updated = true;
     });
-    return this.get(issue.id);
+    return updated;
   }
 
   async appendSnapshotAction(
@@ -287,8 +339,18 @@ export class SqliteIssueStateStore implements IssueStateStore {
     historySnapshotId: string,
     action: TransitionActionRecord,
   ): Promise<IssueStateRecord | null> {
+    await this.appendSnapshotActionOnly(issue, historySnapshotId, action);
+    return this.get(issue.id);
+  }
+
+  async appendSnapshotActionOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    historySnapshotId: string,
+    action: TransitionActionRecord,
+  ): Promise<boolean> {
+    let updated = false;
     await this.withWrite(issue.id, async (database) => {
-      const existing = await this.findUnlocked(
+      const existing = await this.findStateRowUnlocked(
         database,
         issue.id,
         issue.identifier,
@@ -296,21 +358,22 @@ export class SqliteIssueStateStore implements IssueStateStore {
       if (!existing) return;
       const snapshot = await this.findSnapshotUnlocked(
         database,
-        existing.issueId,
+        existing.issue_id,
         historySnapshotId,
       );
       if (!snapshot) return;
       await this.updateSnapshotUnlocked(
         database,
-        existing.issueId,
+        existing.issue_id,
         historySnapshotId,
         {
           ...snapshot,
           actions: [...snapshot.actions, action],
         },
       );
+      updated = true;
     });
-    return this.get(issue.id);
+    return updated;
   }
 
   async appendSnapshotError(
@@ -318,8 +381,18 @@ export class SqliteIssueStateStore implements IssueStateStore {
     historySnapshotId: string,
     error: TransitionErrorRecord,
   ): Promise<IssueStateRecord | null> {
+    await this.appendSnapshotErrorOnly(issue, historySnapshotId, error);
+    return this.get(issue.id);
+  }
+
+  async appendSnapshotErrorOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    historySnapshotId: string,
+    error: TransitionErrorRecord,
+  ): Promise<boolean> {
+    let updated = false;
     await this.withWrite(issue.id, async (database) => {
-      const existing = await this.findUnlocked(
+      const existing = await this.findStateRowUnlocked(
         database,
         issue.id,
         issue.identifier,
@@ -327,21 +400,22 @@ export class SqliteIssueStateStore implements IssueStateStore {
       if (!existing) return;
       const snapshot = await this.findSnapshotUnlocked(
         database,
-        existing.issueId,
+        existing.issue_id,
         historySnapshotId,
       );
       if (!snapshot) return;
       await this.updateSnapshotUnlocked(
         database,
-        existing.issueId,
+        existing.issue_id,
         historySnapshotId,
         {
           ...snapshot,
           errors: [...snapshot.errors, error],
         },
       );
+      updated = true;
     });
-    return this.get(issue.id);
+    return updated;
   }
 
   private async db(): Promise<SqliteDatabase> {
@@ -462,6 +536,71 @@ export class SqliteIssueStateStore implements IssueStateStore {
         throw error;
       }
     });
+  }
+
+  private async findCurrentUnlocked(
+    database: SqliteDatabase,
+    issueId: string,
+    issueIdentifier: string,
+  ): Promise<IssueCurrentFields | null> {
+    const row = await this.getRow<IssueCurrentCacheRow>(
+      database,
+      `
+        SELECT current_json
+        FROM issue_state
+        WHERE issue_id = ? OR issue_identifier = ?
+        ORDER BY CASE WHEN issue_id = ? THEN 0 ELSE 1 END
+        LIMIT 1
+      `,
+      [issueId, issueIdentifier, issueId],
+    );
+    return row
+      ? normalizeIssueCurrentFields(
+          JSON.parse(row.current_json) as IssueCurrentFields,
+        )
+      : null;
+  }
+
+  private async currentByIdOrIdentifierUnlocked(
+    database: SqliteDatabase,
+    issueIdOrIdentifier: string,
+  ): Promise<IssueCurrentFields | null> {
+    const row = await this.getRow<IssueCurrentCacheRow>(
+      database,
+      `
+        SELECT current_json
+        FROM issue_state
+        WHERE issue_id = ? OR issue_identifier = ?
+        ORDER BY CASE WHEN issue_id = ? THEN 0 ELSE 1 END
+        LIMIT 1
+      `,
+      [issueIdOrIdentifier, issueIdOrIdentifier, issueIdOrIdentifier],
+    );
+    return row
+      ? normalizeIssueCurrentFields(
+          JSON.parse(row.current_json) as IssueCurrentFields,
+        )
+      : null;
+  }
+
+  private async findStateRowUnlocked(
+    database: SqliteDatabase,
+    issueId: string,
+    issueIdentifier: string,
+  ): Promise<IssueStateRow | null> {
+    return (
+      (await this.getRow<IssueStateRow>(
+      database,
+      `
+        SELECT issue_id, issue_identifier
+        FROM issue_state
+        WHERE issue_id = ? OR issue_identifier = ?
+        ORDER BY CASE WHEN issue_id = ? THEN 0 ELSE 1 END
+        LIMIT 1
+      `,
+      [issueId, issueIdentifier, issueId],
+      )) ?? null
+    );
   }
 
   private async findUnlocked(

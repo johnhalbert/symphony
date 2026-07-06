@@ -273,7 +273,42 @@ describe("IssueCurrentStateBuilder", () => {
     expect("current" in snapshot).toBe(false);
   });
 
-  it("reuses a fresh merge policy observation from issue history", async () => {
+  it("does not read issue history during default snapshot builds", async () => {
+    const issueStateStore = new MemoryIssueStateStore();
+    issueStateStore.getHistory = async () => {
+      throw new Error("history should not be read");
+    };
+    const builder = new IssueCurrentStateBuilder({
+      config: builderConfig(root),
+      lifecycleStore: undefined,
+      runStore: undefined,
+      issueStateStore,
+      logger: silentLogger(),
+    });
+
+    const snapshot = await builder.buildSnapshot(
+      issueFixture(),
+      emptyRuntime(),
+      {
+        triggerType: "orchestrator.tick",
+        triggerSource: "orchestrator",
+        candidateSource: "tick_candidates",
+        transitionRequestContext: null,
+        availableSlots: 1,
+        providerDispatchGateActive: false,
+        stateSlotAvailable: true,
+        allowExistingClaim: false,
+        manualStage: null,
+        manualForceLabels: false,
+        manualIgnoreState: false,
+      },
+    );
+
+    expect(snapshot.candidateSource).toBe("tick_candidates");
+    expect(issueStateStore.getHistoryCalls).toBe(0);
+  });
+
+  it("reuses a fresh merge policy observation from current state", async () => {
     const config = builderConfig(root);
     const issue = issueFixture({
       state: "Ready to Merge",
@@ -354,18 +389,11 @@ describe("IssueCurrentStateBuilder", () => {
     };
     historyStore.record = {
       ...withoutObservation,
-      history: [
-        {
-          transitionKind: "merge_policy_observe",
-          actions: [
-            transitionAction({
-              actionType: "record_merge_policy_observation",
-              status: "succeeded",
-              details: observation,
-            }),
-          ],
-        } as IssueHistorySnapshot,
-      ],
+      lastMergePolicyObservationFingerprint: observation.inputFingerprint,
+      lastMergePolicyObservationStatus: observation.status,
+      lastMergePolicyObservation:
+        observation as unknown as IssueCurrentFields["lastMergePolicyObservation"],
+      history: [],
     };
 
     const withObservation = await builderWithoutHistory.build(
@@ -3147,12 +3175,20 @@ async function updateSqliteCurrentJson(
 
 class MemoryIssueStateStore implements IssueStateStore {
   record: IssueStateRecord | null = null;
+  getHistoryCalls = 0;
 
   async get(): Promise<IssueStateRecord | null> {
     return this.record;
   }
 
+  async getCurrent(): Promise<IssueCurrentFields | null> {
+    if (!this.record) return null;
+    const { history: _history, ...current } = this.record;
+    return current as IssueCurrentFields;
+  }
+
   async getHistory(): Promise<IssueHistorySnapshot[] | null> {
+    this.getHistoryCalls += 1;
     return this.record?.history ?? null;
   }
 
@@ -3161,29 +3197,54 @@ class MemoryIssueStateStore implements IssueStateStore {
   }
 
   async ensureIssue(current: IssueCurrentFields): Promise<IssueStateRecord> {
-    this.record = { ...current, history: this.record?.history ?? [] };
+    await this.ensureCurrent(current);
+    if (!this.record) throw new Error("missing record");
     return this.record;
+  }
+
+  async ensureCurrent(current: IssueCurrentFields): Promise<IssueCurrentFields> {
+    this.record = { ...current, history: this.record?.history ?? [] };
+    return current;
   }
 
   async updateCurrent(
     _issue: Pick<Issue, "id" | "identifier">,
     patch: Partial<IssueCurrentFields>,
   ): Promise<IssueStateRecord> {
+    await this.patchCurrent(_issue, patch);
     if (!this.record) throw new Error("missing record");
-    this.record = { ...this.record, ...patch };
     return this.record;
+  }
+
+  async patchCurrent(
+    _issue: Pick<Issue, "id" | "identifier">,
+    patch: Partial<IssueCurrentFields>,
+  ): Promise<IssueCurrentFields> {
+    if (!this.record) throw new Error("missing record");
+    const history = this.record.history;
+    this.record = { ...this.record, ...patch, history };
+    const { history: _history, ...current } = this.record;
+    return current as IssueCurrentFields;
   }
 
   async appendSnapshot(
     _issue: Pick<Issue, "id" | "identifier">,
     snapshot: IssueHistorySnapshot,
   ): Promise<IssueStateRecord> {
+    await this.appendSnapshotOnly(_issue, snapshot);
+    if (!this.record) throw new Error("missing record");
+    return this.record;
+  }
+
+  async appendSnapshotOnly(
+    _issue: Pick<Issue, "id" | "identifier">,
+    snapshot: IssueHistorySnapshot,
+  ): Promise<void> {
     if (!this.record) throw new Error("missing record");
     this.record = {
       ...this.record,
       history: [...this.record.history, snapshot],
     };
-    return this.record;
   }
 
   async updateSnapshotActions(): Promise<IssueStateRecord> {
@@ -3191,13 +3252,25 @@ class MemoryIssueStateStore implements IssueStateStore {
     return this.record;
   }
 
+  async updateSnapshotActionsOnly(): Promise<boolean> {
+    return this.record !== null;
+  }
+
   async appendSnapshotAction(): Promise<IssueStateRecord> {
     if (!this.record) throw new Error("missing record");
     return this.record;
   }
 
+  async appendSnapshotActionOnly(): Promise<boolean> {
+    return this.record !== null;
+  }
+
   async appendSnapshotError(): Promise<IssueStateRecord> {
     if (!this.record) throw new Error("missing record");
     return this.record;
+  }
+
+  async appendSnapshotErrorOnly(): Promise<boolean> {
+    return this.record !== null;
   }
 }

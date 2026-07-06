@@ -493,9 +493,13 @@ export class IssueCurrentStateBuilder {
     issue: Issue,
     runtime: IssueCurrentStateRuntimeState,
   ): Promise<IssueCurrentFields> {
-    const context = await this.loadBuildContext(issue, runtime);
+    const useHistoryBackedFields = this.shouldUseHistoryBackedFields();
+    const context = await this.loadBuildContext(issue, runtime, {
+      includeHistory: useHistoryBackedFields,
+    });
     const now = new Date().toISOString();
     const storeBuilt = this.buildFromStores(context, now);
+    if (!useHistoryBackedFields) return storeBuilt;
     const historyBuilt = this.buildFromHistory(context);
     this.compareHistoryBackedFields(storeBuilt, historyBuilt);
     return this.applyHistoryBackedFields(storeBuilt, historyBuilt);
@@ -506,9 +510,18 @@ export class IssueCurrentStateBuilder {
     runtime: IssueCurrentStateRuntimeState,
     groups: readonly IssueCurrentStateHistoryFieldGroup[] = HISTORY_BACKED_FIELD_GROUPS,
   ): Promise<IssueCurrentStateHistoryRebuildResult> {
-    const context = await this.loadBuildContext(issue, runtime);
+    const context = await this.loadBuildContext(issue, runtime, {
+      includeHistory: true,
+    });
     const historyBuilt = this.buildFromHistory(context);
     return selectHistoryBackedGroups(historyBuilt, groups);
+  }
+
+  private shouldUseHistoryBackedFields(): boolean {
+    return (
+      (this.options.historyBackedFieldGroups?.length ?? 0) > 0 ||
+      (this.options.compareHistoryBackedFieldGroups?.length ?? 0) > 0
+    );
   }
 
   async rebuildHistoryBackedFieldsFromStoredHistory(
@@ -1375,6 +1388,7 @@ export class IssueCurrentStateBuilder {
   private async loadBuildContext(
     issue: Issue,
     runtime: IssueCurrentStateRuntimeState,
+    options: { includeHistory: boolean },
   ): Promise<IssueCurrentStateBuildContext> {
     const lifecycle =
       (await this.options.lifecycleStore?.get(issue.id)) ?? null;
@@ -1455,15 +1469,24 @@ export class IssueCurrentStateBuilder {
         verdict: mergePolicyLatestApprovalVerdict,
         configFingerprint: mergePolicyConfigHash,
       });
-    const history =
+    const currentProjection =
       (await this.options.issueStateStore
-        .getHistory(issue.id)
-        .catch(() => null)) ?? [];
+        .getCurrent(issue.id)
+        .catch(() => null)) ?? null;
+    const projectedMergePolicyObservation = mergePolicyObservationFromUnknown(
+      currentProjection?.lastMergePolicyObservation,
+    );
     const lastMergePolicyObservation =
-      latestMergePolicyObservationForFingerprint(
-        history,
-        mergePolicyObservationFingerprint,
-      );
+      projectedMergePolicyObservation !== null &&
+      projectedMergePolicyObservation.inputFingerprint ===
+        mergePolicyObservationFingerprint
+        ? projectedMergePolicyObservation
+        : null;
+    const history = options.includeHistory
+      ? ((await this.options.issueStateStore
+          .getHistory(issue.id)
+          .catch(() => null)) ?? [])
+      : [];
     const mergePolicyLatestCompletionRun =
       mergePolicyLatestCompletionReport === null
         ? null

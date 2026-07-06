@@ -1023,18 +1023,28 @@ export interface IssueTransition<Context> {
 export interface IssueStateStore {
   close?(): Promise<void>;
   get(issueIdOrIdentifier: string): Promise<IssueStateRecord | null>;
+  getCurrent(issueIdOrIdentifier: string): Promise<IssueCurrentFields | null>;
   getHistory(issueIdOrIdentifier: string): Promise<IssueHistorySnapshot[] | null>;
   listCurrent?(): Promise<IssueCurrentFields[]>;
   list(): Promise<IssueStateRecord[]>;
   ensureIssue(current: IssueCurrentFields): Promise<IssueStateRecord>;
+  ensureCurrent(current: IssueCurrentFields): Promise<IssueCurrentFields>;
   updateCurrent(
     issue: Pick<Issue, "id" | "identifier">,
     patch: Partial<IssueCurrentFields>,
   ): Promise<IssueStateRecord>;
+  patchCurrent(
+    issue: Pick<Issue, "id" | "identifier">,
+    patch: Partial<IssueCurrentFields>,
+  ): Promise<IssueCurrentFields>;
   appendSnapshot(
     issue: Pick<Issue, "id" | "identifier">,
     snapshot: IssueHistorySnapshot,
   ): Promise<IssueStateRecord>;
+  appendSnapshotOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    snapshot: IssueHistorySnapshot,
+  ): Promise<void>;
   updateSnapshotActions(
     issue: Pick<Issue, "id" | "identifier">,
     historySnapshotId: string,
@@ -1043,16 +1053,34 @@ export interface IssueStateStore {
       errors?: readonly TransitionErrorRecord[];
     },
   ): Promise<IssueStateRecord | null>;
+  updateSnapshotActionsOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    historySnapshotId: string,
+    patch: {
+      actions?: readonly TransitionActionRecord[];
+      errors?: readonly TransitionErrorRecord[];
+    },
+  ): Promise<boolean>;
   appendSnapshotAction(
     issue: Pick<Issue, "id" | "identifier">,
     historySnapshotId: string,
     action: TransitionActionRecord,
   ): Promise<IssueStateRecord | null>;
+  appendSnapshotActionOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    historySnapshotId: string,
+    action: TransitionActionRecord,
+  ): Promise<boolean>;
   appendSnapshotError(
     issue: Pick<Issue, "id" | "identifier">,
     historySnapshotId: string,
     error: TransitionErrorRecord,
   ): Promise<IssueStateRecord | null>;
+  appendSnapshotErrorOnly(
+    issue: Pick<Issue, "id" | "identifier">,
+    historySnapshotId: string,
+    error: TransitionErrorRecord,
+  ): Promise<boolean>;
 }
 
 export function createIssueSnapshotId(): string {

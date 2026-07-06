@@ -952,6 +952,72 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("does not hydrate issue history or persist noop transitions during tick decisions", async () => {
+    const config = testConfig(root);
+    const candidate = issue({
+      id: "issue-noop",
+      identifier: "TEST-NOOP",
+      state: "Archived",
+      assignedToWorker: false,
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const issueStateStore = new NoFullHistorySqliteIssueStateStore(
+      config.workspace.stateDir,
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      issueStateStore,
+    });
+    const internals = orchestrator as unknown as {
+      processIssueTransitionCandidateEvent(input: {
+        issue: Issue;
+        candidateSource: string;
+        refreshBeforeTransition?: boolean;
+      }): Promise<{ transition: IssueHistorySnapshot | null; acted: boolean }>;
+    };
+
+    const result = await internals.processIssueTransitionCandidateEvent({
+      issue: candidate,
+      candidateSource: "tick_candidates",
+      refreshBeforeTransition: false,
+    });
+    await orchestrator.stop();
+
+    expect(result).toMatchObject({
+      transition: { transitionKind: "noop" },
+      acted: false,
+    });
+    expect(issueStateStore.getCalls).toBe(0);
+    expect(issueStateStore.getHistoryCalls).toBe(0);
+    const issueState = await readIssueState(
+      config.workspace.stateDir,
+      candidate.id,
+    );
+    expect(issueState?.history.map((snapshot) => snapshot.transitionKind)).toEqual([
+      "record_evidence",
+    ]);
+  });
+
   it("runs dashboard operator chat through the configured harness and persists assistant output", async () => {
     const config = testConfig(root);
     const logger = new StructuredLogger(() => undefined);
@@ -5599,14 +5665,11 @@ describe("Orchestrator", () => {
       ],
     });
     expect(
-      secondState?.history.find(
-        (snapshot) => snapshot.reason === "merge_queue_active_issue",
-      ),
-    ).toMatchObject({
-      transitionKind: "noop",
-      mergeQueueStatus: "active_other_issue",
-      mergeQueueActiveIssueId: first.id,
-    });
+      secondState?.history.some((snapshot) => snapshot.transitionKind === "noop"),
+    ).toBe(false);
+    expect(secondState?.history.map((snapshot) => snapshot.transitionKind)).toEqual([
+      "record_evidence",
+    ]);
   });
 
   it("releases the active merge queue lease after a successful merge", async () => {
@@ -5738,6 +5801,21 @@ describe("Orchestrator", () => {
       });
     } finally {
       await mergeQueueStore.close();
+    }
+    const currentStore = new SqliteIssueStateStore(config.workspace.stateDir);
+    try {
+      const current = await currentStore.getCurrent(candidate.id);
+      expect(current).toMatchObject({
+        lastMergePolicyObservationFingerprint:
+          current?.currentMergePolicyObservationInputFingerprint,
+        lastMergePolicyObservationStatus: "ready",
+        lastMergePolicyObservation: {
+          status: "ready",
+          observationKind: "merge_ready",
+        },
+      });
+    } finally {
+      await currentStore.close();
     }
     const issueState = await readIssueState(
       config.workspace.stateDir,
@@ -14273,6 +14351,21 @@ async function runAcceptedIssueBreakdownHandoffScenario(
   ).toHaveLength(1);
 
   return { runStore, planRunId, stateDir: config.workspace.stateDir };
+}
+
+class NoFullHistorySqliteIssueStateStore extends SqliteIssueStateStore {
+  getCalls = 0;
+  getHistoryCalls = 0;
+
+  async get(): Promise<never> {
+    this.getCalls += 1;
+    throw new Error("full issue state should not be read");
+  }
+
+  async getHistory(): Promise<never> {
+    this.getHistoryCalls += 1;
+    throw new Error("issue history should not be read");
+  }
 }
 
 async function readIssueState(stateDir: string, issueIdOrIdentifier: string) {
