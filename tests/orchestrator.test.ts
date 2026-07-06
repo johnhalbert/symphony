@@ -3166,6 +3166,164 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
+  it("isolates project-context credential running refresh failures so a healthy context still reconciles", async () => {
+    const config = testConfig(root);
+    addDocsPollingProjectContext(config);
+    const defaultCandidate = {
+      ...issue({
+        id: "issue-default-running-isolation-1",
+        identifier: "ENG-123-RUNNING-ISOLATED",
+        state: "Todo",
+        labels: ["dogfood-ready"],
+        branchName: "symphony/ENG-123-RUNNING-ISOLATED",
+      }),
+      linearProjectIdentity: {
+        kind: "linear" as const,
+        slug: legacyDefaultProjectContext.linearProjectSlug,
+        id: "linear-project-default-running-isolation-1",
+      },
+      routingSource: "candidate_poll" as const,
+      resolvedAt: "2026-01-01T00:00:00Z",
+    };
+    const docsCandidate = trackerIssue({
+      id: "issue-docs-running-isolation-1",
+      identifier: "DOCS-123-RUNNING-ISOLATED",
+      state: "Todo",
+      labels: ["dogfood-ready"],
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      branchName: "symphony/docs/DOCS-123-RUNNING-ISOLATED",
+    });
+    const defaultTerminalIssue = { ...defaultCandidate, state: "Done", assignedToWorker: false };
+    const rawCredentialMessage =
+      "Linear credential capability linear.tracker is owned by worker, but is assigned only to service. Configure credential_profiles.roles.worker.linear.tracker or remove the non-owning assignment to use legacy tracker api key/LINEAR_API_KEY.";
+    let defaultRefreshCount = 0;
+    const defaultTracker: TrackerClient & {
+      candidateFetchCount: number;
+      requestedIds: string[][];
+    } = {
+      candidateFetchCount: 0,
+      requestedIds: [],
+      async fetchCandidateIssues() {
+        defaultTracker.candidateFetchCount += 1;
+        return [defaultCandidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        defaultTracker.requestedIds.push([...issueIds]);
+        defaultRefreshCount += 1;
+        if (!issueIds.includes(defaultCandidate.id)) return [];
+        return defaultRefreshCount === 1 ? [defaultCandidate] : [defaultTerminalIssue];
+      },
+    };
+    let docsRefreshCount = 0;
+    const docsTracker: TrackerClient & { requestedIds: string[][] } = {
+      requestedIds: [],
+      async fetchCandidateIssues() {
+        return [docsCandidate];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(issueIds) {
+        docsTracker.requestedIds.push([...issueIds]);
+        docsRefreshCount += 1;
+        if (docsRefreshCount === 1) {
+          return issueIds.includes(docsCandidate.id) ? [docsCandidate] : [];
+        }
+        throw new SymphonyError("config_validation_error", rawCredentialMessage);
+      },
+    };
+    const logs: string[] = [];
+    const logger = new StructuredLogger((line) => logs.push(line));
+    const stateDir = path.join(root, "state");
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const harness: AgentHarness & {
+      runs: Array<{ ctx: AgentRunContext; prompt: string }>;
+      stoppedRunIds: string[];
+    } = {
+      id: "multi-project-running-failure-isolation",
+      capabilities: { continuation: true, mcpHandoff: true },
+      runs: [],
+      stoppedRunIds: [],
+      async *run(ctx: AgentRunContext, prompt: string): AsyncIterable<AgentEvent> {
+        this.runs.push({ ctx, prompt });
+        const runId = `run-${ctx.issue.id}-${ctx.turnNumber}`;
+        yield { type: "session_started", sessionId: `session-${ctx.issue.id}-${ctx.turnNumber}`, runId };
+        if (!ctx.abortSignal.aborted) {
+          await new Promise<void>((resolve) =>
+            ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        }
+        yield { type: "cancelled" };
+      },
+      async stop(runId: string): Promise<void> {
+        this.stoppedRunIds.push(runId);
+      },
+    };
+    const workspaceManager = new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: defaultTracker,
+      trackerResolver(projectContext) {
+        return projectContext?.projectContextId === docsProjectContext.projectContextId ? docsTracker : defaultTracker;
+      },
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    let defaultRunRecord: Awaited<ReturnType<typeof runStore.getRun>> | null = null;
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 2, "two context-scoped runs dispatched before isolated refresh failure");
+      await waitFor(() => orchestrator.snapshot().counts.running === 2, "two context-scoped runs active before isolated refresh failure");
+
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => orchestrator.snapshot().counts.running === 1,
+        "healthy running context reconciled after sibling credential failure",
+      );
+      defaultRunRecord = await waitForTerminalRunRecord(runStore, `run-${defaultCandidate.id}-1`);
+    } finally {
+      await orchestrator.stop();
+      await settleOrchestratorExit();
+    }
+
+    expect(harness.runs).toHaveLength(2);
+    expect(defaultTracker.requestedIds).toContainEqual([defaultCandidate.id]);
+    expect(docsTracker.requestedIds).toContainEqual([docsCandidate.id]);
+    expect(defaultRunRecord).toMatchObject({
+      issueId: defaultCandidate.id,
+      issueIdentifier: defaultCandidate.identifier,
+      projectContext: legacyDefaultProjectContext,
+      status: "cancelled",
+    });
+    expect(
+      logs.some(
+        (line) =>
+          line.includes('message="project-context polling failed"') &&
+          line.includes('operation="running_issue_refresh"') &&
+          line.includes('projectContextId="docs"') &&
+          line.includes('errorCode="config_validation_error"') &&
+          line.includes('error="project-context tracker credentials unavailable"'),
+      ),
+    ).toBe(true);
+    expect(logs.some((line) => line.includes('message="running issue terminated"') && line.includes(defaultCandidate.id))).toBe(true);
+    expect(logs.some((line) => line.includes('message="running issue refresh failed"'))).toBe(false);
+    expect(logs.some((line) => line.includes('message="orchestrator tick failed"'))).toBe(false);
+    expect(logs.some((line) => line.includes(rawCredentialMessage))).toBe(false);
+    expect(logs.some((line) => line.includes("LINEAR_API_KEY"))).toBe(false);
+    expect(orchestrator.snapshot().counts.retrying).toBe(0);
+  });
+
   it("routes duplicate identifiers from distinct project contexts into distinct workspaces and persisted state", async () => {
     const config = testConfig(root);
     addDocsPollingProjectContext(config);
