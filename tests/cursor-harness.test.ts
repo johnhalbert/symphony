@@ -20,7 +20,7 @@ import {
   transcriptRecallContextFilePath,
   transcriptRecallMcpServerConfig,
 } from "../cursor/src/CursorHarness.js";
-import { issue, multiProjectWorkflowConfig, testConfig, trackerIssue } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, projectContextFixture, testConfig, trackerIssue } from "./helpers.js";
 
 const cursorSdk = vi.hoisted(() => ({
   create: vi.fn(),
@@ -545,7 +545,7 @@ describe("Cursor event mapping", () => {
   });
 
   it("context-qualifies project-scoped Cursor sessions and preserves issue-derived project context metadata", async () => {
-    const config = testConfig("/tmp/symphony-cursor-harness");
+    const config = multiProjectCursorHarnessConfig();
     const send = vi.fn(async () => completedSdkRun("sdk-run-docs"));
     cursorSdk.create.mockResolvedValue({
       agentId: "agent-docs",
@@ -687,7 +687,23 @@ describe("Cursor event mapping", () => {
   });
 
   it("does not collide project-scoped Cursor session ids across projects with the same issue identifier", async () => {
-    const config = testConfig("/tmp/symphony-cursor-harness");
+    const config = multiProjectCursorHarnessConfig({
+      projectContexts: [
+        projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+        projectContextFixture({
+          id: "docs",
+          label: "Documentation Site",
+          projectSlug: "DOCS",
+          repository: "../docs-site",
+        }),
+        projectContextFixture({
+          id: "platform",
+          label: "Platform Services",
+          projectSlug: "PLATFORM",
+          repository: "../platform-services",
+        }),
+      ],
+    });
     cursorSdk.create
       .mockResolvedValueOnce({
         agentId: "agent-overlap",
@@ -920,7 +936,7 @@ describe("Cursor event mapping", () => {
   });
 
   it("only resumes worker agents when resume_by_issue compatibility mode is explicit", async () => {
-    const config = testConfig("/tmp/symphony-cursor-harness");
+    const config = multiProjectCursorHarnessConfig();
     config.cursor.workerAgentLifecycle = "resume_by_issue";
     const agent = {
       agentId: "agent-reused",
@@ -1190,6 +1206,16 @@ function agentContext(config: ReturnType<typeof parseServiceConfig>, role: "work
     abortSignal: new AbortController().signal,
     logger: new StructuredLogger(() => undefined),
   };
+}
+
+function multiProjectCursorHarnessConfig(
+  overrides: Parameters<typeof multiProjectWorkflowConfig>[0] = {},
+): ReturnType<typeof parseServiceConfig> {
+  return parseServiceConfig(
+    multiProjectWorkflowConfig(overrides),
+    "/tmp/symphony-cursor-harness/WORKFLOW.md",
+    { LINEAR_API_KEY: "linear-test-key" },
+  );
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {

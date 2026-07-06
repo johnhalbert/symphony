@@ -10,7 +10,7 @@ import type { GatewayEvent, HermesGatewayClient, HermesGatewayEnvironment } from
 import { parseServiceConfig } from "../src/core/config/Config.js";
 import type { AgentEvent, AgentRunContext } from "../src/core/harness/AgentHarness.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
-import { issue } from "./helpers.js";
+import { issue, projectContextFixture } from "./helpers.js";
 
 let root: string;
 
@@ -152,7 +152,17 @@ describe("HermesHarness", () => {
       } as any,
     });
 
-    const config = configForHarness();
+    const config = multiProjectConfigForHarness({
+      project_contexts: [
+        projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+        projectContextFixture({
+          id: "platform",
+          label: "Platform Services",
+          projectSlug: "PLAT",
+          repository: "../platform-services",
+        }),
+      ],
+    });
     const workspacePath = path.join(root, "workspace");
     await mkdir(workspacePath, { recursive: true });
     const docsProjectContext = {
@@ -834,6 +844,41 @@ function configForHarness() {
           reviewer: { "runtime.hermes": "reviewer-hermes" },
         },
       },
+    },
+    path.join(root, "WORKFLOW.md"),
+    {
+      LINEAR_API_KEY: "linear-secret",
+      WORKER_HERMES_TOKEN: "worker-hermes-secret",
+      REVIEWER_HERMES_TOKEN: "reviewer-hermes-secret",
+    },
+  );
+}
+
+function multiProjectConfigForHarness(input: {
+  project_contexts: Array<ReturnType<typeof projectContextFixture>>;
+}) {
+  return parseServiceConfig(
+    {
+      tracker: { kind: "linear", api_key: "$LINEAR_API_KEY" },
+      workspace: { root, state_dir: path.join(root, "state") },
+      agent: { harness: "hermes" },
+      hermes: {
+        upstream_root: path.join(root, "upstream"),
+        templates_dir: path.join(root, "templates"),
+        state_dir: path.join(root, "state", "hermes"),
+        keep_profiles: "always",
+      },
+      credential_profiles: {
+        profiles: {
+          "worker-hermes": { value: "$WORKER_HERMES_TOKEN", capabilities: ["runtime.hermes"] },
+          "reviewer-hermes": { value: "$REVIEWER_HERMES_TOKEN", capabilities: ["runtime.hermes"] },
+        },
+        roles: {
+          worker: { "runtime.hermes": "worker-hermes" },
+          reviewer: { "runtime.hermes": "reviewer-hermes" },
+        },
+      },
+      project_contexts: input.project_contexts,
     },
     path.join(root, "WORKFLOW.md"),
     {
