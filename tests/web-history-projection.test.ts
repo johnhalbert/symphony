@@ -262,6 +262,69 @@ describe("projectWebHistory", () => {
     expect(model.defaultSessionId).toBe("run-docs-session");
   });
 
+  it("falls back to the linked run context when activity rows carry legacy partial project metadata", () => {
+    const docsProjectContext: TestProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    };
+    const apiProjectContext: TestProjectContext = {
+      projectContextId: "api",
+      projectContextLabel: "API Service",
+      linearProjectSlug: "API",
+      routingSource: "explicit",
+    };
+
+    const docsRun = run({
+      runId: "run-docs-history",
+      issueIdentifier: "ENG-123",
+      status: "succeeded",
+      updatedAt: "2026-01-01T00:00:02.000Z",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      projectContext: docsProjectContext,
+    });
+    const apiRun = run({
+      runId: "run-api-active",
+      issueIdentifier: "ENG-123",
+      status: "running",
+      updatedAt: "2026-01-01T00:00:01.000Z",
+      projectContext: apiProjectContext,
+    });
+
+    const model = projectWebHistory(
+      [docsRun, apiRun],
+      [
+        activity({
+          id: "docs-legacy-partial",
+          at: "2026-01-01T00:00:02.000Z",
+          kind: "run_completed",
+          runId: docsRun.runId,
+          issueIdentifier: docsRun.issueIdentifier,
+          status: docsRun.status,
+          projectContext: { projectContextLabel: "Documentation Site" },
+        }),
+        activity({
+          id: "api-active",
+          at: "2026-01-01T00:00:01.000Z",
+          runId: apiRun.runId,
+          issueIdentifier: apiRun.issueIdentifier,
+          status: apiRun.status,
+          projectContext: apiProjectContext,
+        }),
+      ],
+      { projectContext: docsProjectContext },
+    );
+
+    expect(
+      model.sessions.map((session) => ({ id: session.id, projectContextId: session.projectContext.projectContextId })),
+    ).toEqual([{ id: "run-docs-history", projectContextId: "docs" }]);
+    expect(model.timeline).toEqual([
+      { t: "2026-01-01T00:00:02.000Z", sess: "run-docs-history", kind: "status", text: "ENG-123 run finished", state: "finished" },
+    ]);
+    expect(model.defaultSessionId).toBe("run-docs-history");
+  });
+
   it("keeps runless writeback timeline entries for the matching project context", () => {
     const docsProjectContext: TestProjectContext = {
       projectContextId: "docs",
@@ -692,7 +755,7 @@ function activity(input: {
   issueIdentifier: string;
   kind?: "run_started" | "run_completed";
   status?: TestRunRecord["status"];
-  projectContext?: TestProjectContext;
+  projectContext?: Partial<TestProjectContext>;
 }) {
   const kind = input.kind ?? "run_started";
   return {
