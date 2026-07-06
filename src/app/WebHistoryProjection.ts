@@ -441,9 +441,18 @@ function filterHistoryActivityByProjectContext(
   if (projectContext === null || projectContext === undefined) return activity;
   const runsById = new Map(runs.map((run) => [run.runId, run]));
   return activity.filter((item) => {
-    const itemProjectContext = item.projectContext ?? (item.run?.runId ? runsById.get(item.run.runId)?.projectContext : undefined);
+    const runProjectContext = item.run?.runId ? runsById.get(item.run.runId)?.projectContext : undefined;
+    const itemProjectContext = historyActivityProjectContextForFilter(item.projectContext, runProjectContext);
     return sameProjectContextIdentity(itemProjectContext, projectContext);
   });
+}
+
+function historyActivityProjectContextForFilter(
+  itemProjectContext: Partial<ProjectContextResolution> | null | undefined,
+  runProjectContext: Partial<ProjectContextResolution> | null | undefined,
+): Partial<ProjectContextResolution> | null | undefined {
+  if (cleanString(itemProjectContext?.projectContextId)) return itemProjectContext;
+  return runProjectContext ?? itemProjectContext;
 }
 
 function projectContextForHistory(projectContext: Partial<ProjectContextResolution> | null | undefined): ProjectContextResolution {
