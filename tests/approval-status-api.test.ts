@@ -253,6 +253,77 @@ describe("approval status API", () => {
     }
   });
 
+  it("resolves approval alias POSTs through the matched approval request id when project-context siblings collide", async () => {
+    const docsPending = await createPending("idem-project-context-collision-post-docs");
+    await runStore.startRun({
+      runId: "run-2",
+      sessionId: "session-2",
+      agentId: "agent-2",
+      role: "worker",
+      issueId: "issue-2",
+      issueIdentifier: "TEST-1",
+      projectContext: symphonyProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "other work",
+      workspaceKey: "TEST-1",
+      workspacePath: path.join(root, "workspace-2"),
+    });
+    const symphonyEvidenceCursor = "idem-project-context-collision-post-symphony";
+    const { record: symphonyPending } = await store.requestOrGetPending(
+      {
+        issueId: "issue-2",
+        issueIdentifier: "TEST-1",
+        runId: "run-2",
+        evidenceCursor: symphonyEvidenceCursor,
+        action: action(symphonyEvidenceCursor),
+      },
+      null,
+    );
+    await runStore.updateRun("run-2", {
+      metadata: {
+        pendingApprovalRequestId: symphonyPending.requestId,
+        pendingApprovalRequestedAt: symphonyPending.requestedAt,
+      },
+    });
+    const resumed: OperatorApprovalRecord[] = [];
+    const server = statusServer({ resumed });
+    const address = await server.start();
+
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${encodeURIComponent("docs:TEST-1")}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as {
+        request: {
+          requestId: string;
+          status: string;
+          projectContext: typeof docsProjectContext;
+        };
+        replayed: boolean;
+      };
+      const storedDocsPending = await store.get(docsPending.requestId);
+      const storedSymphonyPending = await store.get(symphonyPending.requestId);
+
+      expect(response.status).toBe(200);
+      expect(body.request).toMatchObject({
+        requestId: docsPending.requestId,
+        status: "approved",
+        projectContext: docsProjectContext,
+      });
+      expect(body.request.requestId).not.toBe(symphonyPending.requestId);
+      expect(body.replayed).toBe(false);
+      expect(storedDocsPending?.status).toBe("approved");
+      expect(storedSymphonyPending?.status).toBe("pending");
+      expect(resumed).toHaveLength(1);
+      expect(resumed[0]?.requestId).toBe(docsPending.requestId);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("redacts command-policy metadata from public run status responses", async () => {
     await runStore.updateRun("run-1", {
       metadata: {
