@@ -103,6 +103,7 @@ describe("StatusServer realtime SSE API", () => {
       observedAt: "2026-01-01T00:00:01.000Z",
       detail: {
         source: "run_activity",
+        projectContextId: "docs",
         runId: "run-activity-1",
         sessionId: "session-activity-1",
         afterSequence: 2,
@@ -111,27 +112,49 @@ describe("StatusServer realtime SSE API", () => {
         resourcesChanged: ["history", "session-transcript"],
       },
     });
-    expect(requireEvent(runActivityEvents.find((event) => event.type === "run.updated"))).toMatchObject({
+    const runActivityProjectionEvent = requireEvent(runActivityEvents.find((event) => event.type === "projection.updated"));
+    const runActivitySourceEvent = requireEvent(runActivityEvents.find((event) => event.type === "source.status"));
+    const runActivityRunEvent = requireEvent(runActivityEvents.find((event) => event.type === "run.updated"));
+    const runActivityTranscriptEvent = requireEvent(runActivityEvents.find((event) => event.type === "transcript.delta"));
+    expect(runActivityProjectionEvent).toMatchObject({
+      type: "projection.updated",
+      payload: {
+        projectContext: { projectContextId: "docs" },
+        resourcesChanged: ["history", "session-transcript"],
+      },
+    });
+    expect(runActivitySourceEvent).toMatchObject({
+      type: "source.status",
+      scope: "source",
+      key: "run_activity",
+      source: { source: "run_activity", revision: 8 },
+      payload: { projectContext: { projectContextId: "docs" } },
+    });
+    expect(runActivityRunEvent).toMatchObject({
       type: "run.updated",
       scope: "run",
       key: "run-activity-1",
-      payload: { source: "run_activity", sourceRevision: 8, runId: "run-activity-1", status: "running" },
+      payload: {
+        source: "run_activity",
+        sourceRevision: 8,
+        projectContext: { projectContextId: "docs" },
+        runId: "run-activity-1",
+        status: "running",
+      },
     });
-    expect(requireEvent(runActivityEvents.find((event) => event.type === "transcript.delta"))).toMatchObject({
+    expect(runActivityTranscriptEvent).toMatchObject({
       type: "transcript.delta",
       scope: "session",
       key: "session-activity-1",
       payload: {
         source: "run_activity",
         sourceRevision: 8,
+        projectContext: { projectContextId: "docs" },
         runId: "run-activity-1",
         sessionId: "session-activity-1",
         afterSequence: 2,
         eventCount: 3,
       },
-    });
-    expect(requireEvent(runActivityEvents.find((event) => event.type === "projection.updated"))).toMatchObject({
-      payload: { resourcesChanged: ["history", "session-transcript"] },
     });
 
     for (const chatSource of [
@@ -416,20 +439,24 @@ describe("StatusServer realtime SSE API", () => {
       expect(projection.data).toMatchObject({
         type: "projection.updated",
         source: { source: "run_activity", revision: 1 },
-        payload: { resourcesChanged: ["history", "session-transcript", "dashboard", "sidebar"] },
+        payload: {
+          projectContext: { projectContextId: "default" },
+          resourcesChanged: ["history", "session-transcript", "dashboard", "sidebar"],
+        },
       });
       expect(source.data).toMatchObject({
         type: "source.status",
         scope: "source",
         key: "run_activity",
         source: { source: "run_activity", revision: 1 },
+        payload: { projectContext: { projectContextId: "default" } },
       });
       expect(run.data).toMatchObject({
         type: "run.updated",
         scope: "run",
         key: "run-realtime-activity",
         source: { source: "run_activity", revision: 1 },
-        payload: { runId: "run-realtime-activity", status: null },
+        payload: { projectContext: { projectContextId: "default" }, runId: "run-realtime-activity", status: null },
       });
       expect(transcript.data).toMatchObject({
         type: "transcript.delta",
@@ -437,6 +464,7 @@ describe("StatusServer realtime SSE API", () => {
         key: "session-realtime-activity",
         source: { source: "run_activity", revision: 1 },
         payload: {
+          projectContext: { projectContextId: "default" },
           runId: "run-realtime-activity",
           sessionId: "session-realtime-activity",
           afterSequence: 0,
@@ -450,6 +478,7 @@ describe("StatusServer realtime SSE API", () => {
   });
 
   it("suppresses realtime events for duplicate run activity appends", async () => {
+
     const runActivitySourceStore = new InMemoryRunActivityAppendStore();
     const server = createRealtimeServer({ runActivitySourceStore });
     const address = await server.start();

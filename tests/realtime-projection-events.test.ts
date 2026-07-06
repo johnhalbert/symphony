@@ -4,7 +4,17 @@ import {
   type StatusServerOptions,
   type StatusServerProjectionWriter,
 } from "../src/app/http.js";
-import type { RealtimeProjectionEvent, RealtimeProjectionEventType } from "../src/app/RealtimeProjectionEvents.js";
+import {
+  RealtimeProjectionEventBus,
+  serializeRealtimeEventData,
+  type RealtimeProjectionEvent,
+  type RealtimeProjectionEventType,
+} from "../src/app/RealtimeProjectionEvents.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import type {
   ProjectionPayloadWriteInput,
@@ -164,6 +174,10 @@ describe("StatusServer realtime projection events", () => {
           },
         });
 
+        expect(projectContextFromPayload(projectionEvent)).toEqual(expectedPublicProjectContext);
+        expect(projectContextFromPayload(sourceStatusEvent)).toEqual(expectedPublicProjectContext);
+        expect(projectContextFromPayload(runEvent)).toEqual(expectedPublicProjectContext);
+        expect(projectContextFromPayload(transcriptEvent)).toEqual(expectedPublicProjectContext);
         expect(projectContextFromPayloadDetail(projectionEvent)).toEqual(expectedPublicProjectContext);
         expect(projectContextFromSourceStatusPayload(sourceStatusEvent)).toEqual(expectedPublicProjectContext);
         expect(projectContextFromPayloadDetail(runEvent)).toEqual(expectedPublicProjectContext);
@@ -295,6 +309,10 @@ describe("StatusServer realtime projection events", () => {
           },
         });
 
+        expect(projectContextFromPayload(projectionEvent)).toEqual(expectedPublicProjectContext);
+        expect(projectContextFromPayload(sourceStatusEvent)).toEqual(expectedPublicProjectContext);
+        expect(projectContextFromPayload(runEvent)).toEqual(expectedPublicProjectContext);
+        expect(projectContextFromPayload(transcriptEvent)).toEqual(expectedPublicProjectContext);
         expect(projectContextFromPayloadDetail(projectionEvent)).toEqual(expectedPublicProjectContext);
         expect(projectContextFromSourceStatusPayload(sourceStatusEvent)).toEqual(expectedPublicProjectContext);
         expect(projectContextFromPayloadDetail(runEvent)).toEqual(expectedPublicProjectContext);
@@ -312,6 +330,154 @@ describe("StatusServer realtime projection events", () => {
       await server.stop();
     }
   });
+
+
+  it("redacts raw project context metadata everywhere in published realtime event payloads", () => {
+    const bus = new RealtimeProjectionEventBus({ clock: () => new Date("2026-01-01T00:00:00.000Z") });
+    const secretUrl = "https://token:secret@example.com/org/docs.git";
+    const expectedPublicProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+      repository: "https://[redacted]@example.com/org/docs.git",
+      path: "packages/site",
+    } as const;
+
+    const event = bus.publish({
+      type: "source.status",
+      source: {
+        source: "trackerIssues",
+        revision: 1,
+        observedAt: "2026-01-01T00:00:00.000Z",
+      },
+      detail: {
+        status: "fresh",
+        projectContext: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectSlug: "DOCS",
+          routingSource: "candidate_poll",
+          repository: secretUrl,
+          path: "packages/site",
+        },
+        sourceCursors: {
+          projectContext: {
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+            linearProjectSlug: "DOCS",
+            routingSource: "candidate_poll",
+            repository: secretUrl,
+            path: "packages/site",
+          },
+        },
+      },
+    });
+
+    expect(event.payload).toMatchObject({
+      projectContext: expectedPublicProjectContext,
+      detail: {
+        projectContext: expectedPublicProjectContext,
+        sourceCursors: {
+          projectContext: expectedPublicProjectContext,
+        },
+      },
+      sourceCursors: {
+        projectContext: expectedPublicProjectContext,
+      },
+    });
+    expect(event.detail).toMatchObject({
+      projectContext: expectedPublicProjectContext,
+      sourceCursors: {
+        projectContext: expectedPublicProjectContext,
+      },
+    });
+
+    const serialized = serializeRealtimeEventData(event);
+    expect(serialized).not.toContain(secretUrl);
+    expect(serialized).not.toContain("token:secret");
+    expect(serialized).toContain("https://[redacted]@example.com/org/docs.git");
+  });
+
+  it("preserves duplicate identifier separation by carrying legacy/default project context on typed realtime projection events", () => {
+    const bus = new RealtimeProjectionEventBus({ clock: () => new Date("2026-01-01T00:00:00.000Z") });
+    const legacyDefaultProjectContext = {
+      projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      linearProjectSlug: null,
+      routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+    } as const;
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    const legacyDefaultEvents = bus.publishProjectionRevision({
+      source: "projection:transcript_projection:run_page",
+      revision: 1,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      detail: {
+        projectionName: "transcript_projection",
+        runId: "run-default-duplicate",
+        sessionId: "session-default-duplicate",
+        issueIdentifier: "ENG-428",
+        sourceCursors: {
+          runId: "run-default-duplicate",
+          sessionId: "session-default-duplicate",
+          issueKey: "ENG-428",
+          projectContext: legacyDefaultProjectContext,
+        },
+      },
+    });
+    const docsEvents = bus.publishProjectionRevision({
+      source: "projection:transcript_projection:run_page",
+      revision: 2,
+      observedAt: "2026-01-01T00:00:01.000Z",
+      detail: {
+        projectionName: "transcript_projection",
+        runId: "run-docs-duplicate",
+        sessionId: "session-docs-duplicate",
+        issueIdentifier: "ENG-428",
+        sourceCursors: {
+          runId: "run-docs-duplicate",
+          sessionId: "session-docs-duplicate",
+          issueKey: "ENG-428",
+          projectContext: docsProjectContext,
+        },
+      },
+    });
+
+    for (const type of ["projection.updated", "source.status", "run.updated", "transcript.delta"] as const) {
+      expect(projectContextFromPayload(eventOfType(legacyDefaultEvents, type))).toEqual(legacyDefaultProjectContext);
+      expect(projectContextFromPayload(eventOfType(docsEvents, type))).toEqual(docsProjectContext);
+    }
+
+    const legacyDefaultRunEvent = eventOfType(legacyDefaultEvents, "run.updated");
+    const docsRunEvent = eventOfType(docsEvents, "run.updated");
+    expect(legacyDefaultRunEvent.payload).toMatchObject({
+      issueIdentifier: "ENG-428",
+      projectContext: legacyDefaultProjectContext,
+    });
+    expect(docsRunEvent.payload).toMatchObject({
+      issueIdentifier: "ENG-428",
+      projectContext: docsProjectContext,
+    });
+    expect(projectContextFromPayload(legacyDefaultRunEvent)).not.toEqual(projectContextFromPayload(docsRunEvent));
+
+    expect(eventOfType(legacyDefaultEvents, "transcript.delta").payload).toMatchObject({
+      runId: "run-default-duplicate",
+      sessionId: "session-default-duplicate",
+      projectContext: legacyDefaultProjectContext,
+    });
+    expect(eventOfType(docsEvents, "transcript.delta").payload).toMatchObject({
+      runId: "run-docs-duplicate",
+      sessionId: "session-docs-duplicate",
+      projectContext: docsProjectContext,
+    });
+  });
+
 });
 
 type ProjectionWriterForTest = StatusServerProjectionWriter & {
@@ -709,6 +875,20 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, descriptio
   } finally {
     if (timeout) clearTimeout(timeout);
   }
+}
+
+function eventOfType<TType extends RealtimeProjectionEventType>(
+  events: readonly RealtimeProjectionEvent[],
+  type: TType,
+): RealtimeProjectionEvent<TType> {
+  const event = events.find((candidate) => candidate.type === type);
+  if (!event) throw new Error(`Expected realtime event of type ${type}`);
+  return event as RealtimeProjectionEvent<TType>;
+}
+
+function projectContextFromPayload(event: RealtimeProjectionEvent): Readonly<Record<string, unknown>> | null {
+  const payload = asRecord(event.payload);
+  return asRecord(payload?.projectContext);
 }
 
 function projectContextFromPayloadDetail(event: RealtimeProjectionEvent): Readonly<Record<string, unknown>> | null {
