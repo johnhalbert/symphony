@@ -217,7 +217,7 @@ describe("generateLargeHistoryFixture", () => {
       expect.objectContaining({
         kind: "status",
         state: "tokens",
-        text: `Tokens: input ${run?.tokens.inputTokens} · output ${run?.tokens.outputTokens} · total ${run?.tokens.totalTokens}`,
+        text: `Tokens: input ${run?.tokens.inputTokens} · output ${run?.tokens.outputTokens} · total ${run?.tokens.totalTokens} · Project context: Default`,
       }),
     );
 

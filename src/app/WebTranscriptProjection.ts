@@ -98,7 +98,14 @@ export type TranscriptMessage =
       error?: string | null;
       truncated?: boolean;
     }
-  | { kind: "status"; state: string; ts: string; text: string; policy?: CommandPolicyStatusDetails }
+  | {
+      kind: "status";
+      state: string;
+      ts: string;
+      text: string;
+      policy?: CommandPolicyStatusDetails;
+      projectContext?: WebTranscriptProjectContextModel | null;
+    }
   | { kind: "task"; ts: string; title: string; desc: string }
   | { kind: "request"; ts: string; reason: string; q: string; actions: string[] };
 
@@ -161,6 +168,7 @@ export interface WebTranscriptProjectionPayload {
 
 export interface WebTranscriptProjectionOptions {
   run?: RunRecord | null;
+  projectContext?: WebTranscriptProjectContextModel | null;
   includeRunPrelude?: boolean;
 }
 
@@ -177,9 +185,10 @@ export function projectWebTranscript(
   events: readonly TranscriptEvent[],
   options: WebTranscriptProjectionOptions = {},
 ): TranscriptMessage[] {
-  const messages = projectSharedWebTranscript(events);
+  const projectContext = projectRunProjectContext(options.run) ?? projectWebTranscriptProjectContext(options.projectContext);
+  const messages = applyWebTranscriptProjectContextAttribution(projectSharedWebTranscript(events), projectContext);
   if (!options.run || options.includeRunPrelude === false) return messages;
-  return [...projectRunPreludeMessages(options.run, messages), ...messages];
+  return [...projectRunPreludeMessages(options.run, messages, projectContext), ...messages];
 }
 
 export function projectWebTranscriptWindow(
@@ -655,9 +664,12 @@ function projectTerminalStatusMessage(
   };
 }
 
-function projectRunPreludeMessages(run: RunRecord, existingMessages: readonly TranscriptMessage[]): TranscriptMessage[] {
+function projectRunPreludeMessages(
+  run: RunRecord,
+  existingMessages: readonly TranscriptMessage[],
+  projectContext: WebTranscriptProjectContextModel | null = projectRunProjectContext(run),
+): TranscriptMessage[] {
   const messages: TranscriptMessage[] = [];
-  const projectContext = projectRunProjectContext(run);
   if (!existingMessages.some((message) => message.kind === "system")) messages.push(projectRunSystemMessage(run, projectContext));
   const promptText = publicMultilineText(run.prompt, USER_PROMPT_MAX_LENGTH);
   if (promptText && !existingMessages.some((message) => message.kind === "user")) {
@@ -678,7 +690,11 @@ function projectRunSystemMessage(
   projectContext: WebTranscriptProjectContextModel | null = projectRunProjectContext(run),
 ): TranscriptMessage {
   const phase = firstCleanString(run.runPhase, run.runKind, run.role) ?? run.role;
-  const note = `Initialized ${phase} run from persisted run metadata. System prompt redacted.`;
+  const note = appendProjectContextSentence(
+    `Initialized ${phase} run from persisted run metadata. System prompt redacted.`,
+    projectContext,
+    { includeDetails: true },
+  );
   return {
     kind: "system",
     ts: run.startedAt,
@@ -692,12 +708,46 @@ function projectRunSystemMessage(
   };
 }
 
-function projectRunProjectContext(run: RunRecord | null | undefined): WebTranscriptProjectContextModel | null {
+export function applyWebTranscriptProjectContextAttribution(
+  messages: readonly TranscriptMessage[],
+  projectContext: WebTranscriptProjectContextModel | null,
+): TranscriptMessage[] {
+  if (!projectContext) return [...messages];
+  return messages.map((message) => {
+    if (message.kind === "system") {
+      return {
+        ...message,
+        note: appendProjectContextSentence(message.note, projectContext),
+        projectContext,
+      };
+    }
+    if (message.kind === "status") {
+      return {
+        ...message,
+        text: appendProjectContextInline(message.text, projectContext),
+        projectContext,
+      };
+    }
+    return message;
+  });
+}
+
+export function projectRunProjectContext(run: RunRecord | null | undefined): WebTranscriptProjectContextModel | null {
   if (!run) return null;
-  const id = firstCleanString(run.projectContext?.projectContextId, run.projectContext?.projectContextLabel);
-  const label = firstCleanString(run.projectContext?.projectContextLabel, run.projectContext?.projectContextId, id);
-  const linearProject = firstCleanString(run.projectContext?.linearProjectSlug);
-  const codebase = publicRepositorySummary(run.repoPath, { allowLocalPath: false });
+  return projectWebTranscriptProjectContext({
+    projectContextId: run.projectContext?.projectContextId,
+    projectContextLabel: run.projectContext?.projectContextLabel,
+    linearProjectSlug: run.projectContext?.linearProjectSlug,
+    codebase: publicRepositorySummary(run.repoPath, { allowLocalPath: false }),
+  });
+}
+
+export function projectWebTranscriptProjectContext(value: unknown): WebTranscriptProjectContextModel | null {
+  if (!isObjectRecord(value)) return null;
+  const id = firstCleanString(value.id, value.projectContextId, value.label, value.projectContextLabel);
+  const label = firstCleanString(value.label, value.projectContextLabel, value.id, value.projectContextId, id);
+  const linearProject = firstCleanString(value.linearProject, value.linearProjectSlug);
+  const codebase = firstCleanString(value.codebase) ?? projectWebTranscriptProjectContextCodebase(value);
   if (!id && !label && !linearProject) return null;
   const resolvedId = id ?? label ?? "";
   const resolvedLabel = label ?? resolvedId;
@@ -707,6 +757,13 @@ function projectRunProjectContext(run: RunRecord | null | undefined): WebTranscr
     linearProject,
     codebase,
   };
+}
+
+function projectWebTranscriptProjectContextCodebase(value: Record<string, unknown>): string | null {
+  const repository = typeof value.repository === "string" ? publicRepositorySummary(value.repository, { allowLocalPath: false }) : null;
+  const path = firstCleanString(value.path);
+  const parts = compactStrings([repository, path]);
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function projectRunWorkspaceIdentity(run: RunRecord | null | undefined): WebTranscriptWorkspaceIdentityModel | null {
@@ -1235,6 +1292,48 @@ function publicMultilineText(value: string, maxLength: number): string | null {
   if (redacted.length === 0) return null;
   if (redacted.length <= maxLength) return redacted;
   return `${redacted.slice(0, Math.max(maxLength - 15, 0))}...[truncated]`;
+}
+
+function appendProjectContextSentence(
+  text: string,
+  projectContext: WebTranscriptProjectContextModel | null,
+  options: { includeDetails?: boolean } = {},
+): string {
+  const clause = projectContextAttributionClause(projectContext, options);
+  if (!clause) return text;
+  if (text.includes(clause)) return text;
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return `${clause}.`;
+  return /[.!?]$/.test(trimmed) ? `${trimmed} ${clause}.` : `${trimmed}. ${clause}.`;
+}
+
+function appendProjectContextInline(text: string, projectContext: WebTranscriptProjectContextModel | null): string {
+  const clause = projectContextAttributionClause(projectContext);
+  if (!clause) return text;
+  if (text.includes(clause)) return text;
+  const trimmed = text.trim();
+  return trimmed.length > 0 ? `${trimmed} · ${clause}` : clause;
+}
+
+function projectContextAttributionClause(
+  projectContext: WebTranscriptProjectContextModel | null,
+  options: { includeDetails?: boolean } = {},
+): string | null {
+  if (!projectContext) return null;
+  const parts = compactStrings([
+    projectContextIdentity(projectContext),
+    options.includeDetails === true && projectContext.linearProject ? `Linear ${projectContext.linearProject}` : null,
+    options.includeDetails === true ? firstCleanString(projectContext.codebase) : null,
+  ]);
+  if (parts.length === 0) return null;
+  return `Project context: ${parts.join(" · ")}`;
+}
+
+function projectContextIdentity(projectContext: WebTranscriptProjectContextModel): string | null {
+  const label = firstCleanString(projectContext.label, projectContext.id);
+  const id = firstCleanString(projectContext.id);
+  if (label && id && normalizeToken(label) !== normalizeToken(id)) return `${label} [${id}]`;
+  return label ?? id;
 }
 
 

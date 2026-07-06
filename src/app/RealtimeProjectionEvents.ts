@@ -1,5 +1,9 @@
 import type { ServerResponse } from "node:http";
-import { projectWebTranscript, type TranscriptMessage } from "./WebTranscriptProjection.js";
+import {
+  projectWebTranscript,
+  projectWebTranscriptProjectContext,
+  type TranscriptMessage,
+} from "./WebTranscriptProjection.js";
 import { projectWebOrchestratorChat, type ChatMessage } from "./webProjection.js";
 import type { WebProjectionSourceRevision } from "./WebProjectionContext.js";
 import type { TranscriptEvent } from "../core/persistence/RunTranscriptStore.js";
@@ -701,13 +705,20 @@ function readTranscriptPatchMessages(
   if (explicit) return explicit;
   const events = readTranscriptEventsDetail(detail, "events");
   if (events.length === 0) return null;
-  return projectRealtimeTranscriptPatchMessages(events, readNumberDetail(detail, "afterSequence"), options.transcriptPatchStateByRunId);
+  const projectContext = projectWebTranscriptProjectContext(readRecordField(readRecordDetail(detail, "sourceCursors"), "projectContext"));
+  return projectRealtimeTranscriptPatchMessages(
+    events,
+    readNumberDetail(detail, "afterSequence"),
+    options.transcriptPatchStateByRunId,
+    projectContext,
+  );
 }
 
 function projectRealtimeTranscriptPatchMessages(
   events: readonly TranscriptEvent[],
   afterSequence: number | null,
   stateByRunId: Map<string, RealtimeTranscriptPatchProjectionState> | undefined,
+  projectContext: ReturnType<typeof projectWebTranscriptProjectContext> = null,
 ): readonly RealtimeTranscriptPatchMessage[] | null {
   const runId = events[0]?.runId;
   if (!runId) return null;
@@ -719,7 +730,7 @@ function projectRealtimeTranscriptPatchMessages(
   const patches: RealtimeTranscriptPatchMessage[] = [];
   for (const event of events) {
     if (event.runId !== runId) return null;
-    const message = projectWebTranscript([event], { includeRunPrelude: false })[0] ?? null;
+    const message = projectWebTranscript([event], { includeRunPrelude: false, projectContext })[0] ?? null;
     if (message === null) {
       patches.push({ sequence: event.sequence, message: null });
       continue;

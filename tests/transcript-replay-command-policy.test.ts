@@ -189,12 +189,12 @@ describe("command policy transcript replay and persistence", () => {
         expect.objectContaining({
           kind: "status",
           state: "command_policy_decision",
-          text: "Command policy allow: local_only_inspection (worker · implementation · terminal_execute)",
+          text: "Command policy allow: local_only_inspection (worker · implementation · terminal_execute) · Project context: Default",
         }),
         expect.objectContaining({
           kind: "status",
           state: "command_policy_decision",
-          text: "Command policy deny: upstream_github (worker · implementation · terminal_execute)",
+          text: "Command policy deny: upstream_github (worker · implementation · terminal_execute) · Project context: Default",
         }),
       ]),
     );
