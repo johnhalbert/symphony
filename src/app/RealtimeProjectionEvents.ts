@@ -5,6 +5,7 @@ import {
   type TranscriptMessage,
 } from "./WebTranscriptProjection.js";
 import { projectWebOrchestratorChat, type ChatMessage } from "./webProjection.js";
+import { sanitizePublicJson } from "./WebTranscriptProjectionCore.js";
 import type { WebProjectionSourceRevision } from "./WebProjectionContext.js";
 import type { TranscriptEvent } from "../core/persistence/RunTranscriptStore.js";
 
@@ -40,6 +41,8 @@ export type RealtimeProjectionEventScope = (typeof REALTIME_EVENT_SCOPES)[number
 
 export type RealtimeProjectionEventDetail = Record<string, unknown>;
 
+export type RealtimeProjectContextMetadata = Readonly<Record<string, unknown>>;
+
 export interface RealtimeProjectionResource {
   kind: RealtimeResourceKind;
   href: string;
@@ -68,6 +71,7 @@ interface RealtimePayloadBase {
   source: string;
   sourceRevision: string | number;
   detail: RealtimeProjectionEventDetail | null;
+  projectContext: RealtimeProjectContextMetadata | null;
 }
 
 export interface RealtimeProjectionUpdatedPayload extends RealtimePayloadBase {
@@ -505,32 +509,33 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
   detail: RealtimeProjectionEventDetail | null,
   options: RealtimePayloadOptions = {},
 ): RealtimeProjectionEventPayloadByType[TType] {
-  const base = realtimePayloadBase(source, options.payloadDetail ?? detail);
+  const publicDetail = options.payloadDetail ?? detail;
+  const base = realtimePayloadBase(source, publicDetail);
   switch (type) {
     case "projection.updated": {
       const resourceKinds = realtimeResourceKinds(resources);
       return {
         ...base,
         resourceKinds,
-        resourcesChanged: readResourceKinds(detail, "resourcesChanged") ?? resourceKinds,
+        resourcesChanged: readResourceKinds(publicDetail, "resourcesChanged") ?? resourceKinds,
       } as RealtimeProjectionEventPayloadByType[TType];
     }
     case "run.updated":
       return {
         ...base,
-        runId: readStringDetail(detail, "runId") ?? readStringDetail(detail, "id"),
-        issueId: readStringDetail(detail, "issueId"),
-        issueIdentifier: readStringDetail(detail, "issueIdentifier"),
-        status: readStringDetail(detail, "status"),
+        runId: readStringDetail(publicDetail, "runId") ?? readStringDetail(publicDetail, "id"),
+        issueId: readStringDetail(publicDetail, "issueId"),
+        issueIdentifier: readStringDetail(publicDetail, "issueIdentifier"),
+        status: readStringDetail(publicDetail, "status"),
       } as RealtimeProjectionEventPayloadByType[TType];
     case "transcript.delta": {
-      const messages = readTranscriptPatchMessages(detail, options);
+      const messages = readTranscriptPatchMessages(publicDetail, options);
       return {
         ...base,
-        runId: readStringDetail(detail, "runId"),
-        sessionId: readStringDetail(detail, "sessionId"),
-        afterSequence: readNumberDetail(detail, "afterSequence"),
-        eventCount: readNumberDetail(detail, "eventCount"),
+        runId: readStringDetail(publicDetail, "runId"),
+        sessionId: readStringDetail(publicDetail, "sessionId"),
+        afterSequence: readNumberDetail(publicDetail, "afterSequence"),
+        eventCount: readNumberDetail(publicDetail, "eventCount"),
         ...(messages ? { messages } : {}),
       } as RealtimeProjectionEventPayloadByType[TType];
     }
@@ -563,21 +568,21 @@ function realtimePayloadForEvent<TType extends RealtimeProjectionEventType>(
       } as RealtimeProjectionEventPayloadByType[TType];
     }
     case "source.status": {
-      const primaryFreshness = primarySourceFreshness(detail);
+      const primaryFreshness = primarySourceFreshness(publicDetail);
       return {
         ...base,
-        status: readStringDetail(detail, "status") ?? readStringRecordField(primaryFreshness, "status"),
-        fetchedStates: readStringArrayDetail(detail, "fetchedStates"),
+        status: readStringDetail(publicDetail, "status") ?? readStringRecordField(primaryFreshness, "status"),
+        fetchedStates: readStringArrayDetail(publicDetail, "fetchedStates"),
         fetchedAt:
-          readStringDetail(detail, "fetchedAt") ??
-          readStringDetail(detail, "checkedAt") ??
+          readStringDetail(publicDetail, "fetchedAt") ??
+          readStringDetail(publicDetail, "checkedAt") ??
           readStringRecordField(primaryFreshness, "checkedAt"),
-        cached: readBooleanDetail(detail, "cached"),
-        error: readErrorDetail(detail, "error"),
-        issueCount: readNumberDetail(detail, "issueCount"),
-        sourceRevisions: readRecordArrayDetail(detail, "sourceRevisions"),
-        sourceCursors: readRecordDetail(detail, "sourceCursors"),
-        sourceFreshness: readRecordArrayDetail(detail, "sourceFreshness"),
+        cached: readBooleanDetail(publicDetail, "cached"),
+        error: readErrorDetail(publicDetail, "error"),
+        issueCount: readNumberDetail(publicDetail, "issueCount"),
+        sourceRevisions: readRecordArrayDetail(publicDetail, "sourceRevisions"),
+        sourceCursors: readRecordDetail(publicDetail, "sourceCursors"),
+        sourceFreshness: readRecordArrayDetail(publicDetail, "sourceFreshness"),
       } as RealtimeProjectionEventPayloadByType[TType];
     }
   }
@@ -587,7 +592,21 @@ function realtimePayloadBase(
   source: WebProjectionSourceRevision,
   detail: RealtimeProjectionEventDetail | null,
 ): RealtimePayloadBase {
-  return { source: source.source, sourceRevision: source.revision, detail };
+  return {
+    source: source.source,
+    sourceRevision: source.revision,
+    detail,
+    projectContext: realtimeProjectContextDetail(detail),
+  };
+}
+
+function realtimeProjectContextDetail(detail: RealtimeProjectionEventDetail | null): RealtimeProjectContextMetadata | null {
+  const directProjectContext = readRecordDetail(detail, "projectContext");
+  const sourceCursors = readRecordDetail(detail, "sourceCursors");
+  const projectContext = directProjectContext ?? readRecordField(sourceCursors, "projectContext");
+  if (!projectContext) return null;
+  const sanitized = sanitizePublicJson(projectContext);
+  return isRecord(sanitized) ? sanitized : null;
 }
 
 function publicRealtimeDetailForEvent(
@@ -597,22 +616,45 @@ function publicRealtimeDetailForEvent(
   if (!detail) return null;
   switch (type) {
     case "orchestrator.message":
-      return omitRealtimeDetailKeys(detail, [
-        "chat",
-        "conversation",
-        "statusSummary",
-        "statusCounts",
-        "sourceSummary",
-        "message",
-        "messages",
-      ]);
+      return sanitizeRealtimeDetailProjectContext(
+        omitRealtimeDetailKeys(detail, [
+          "chat",
+          "conversation",
+          "statusSummary",
+          "statusCounts",
+          "sourceSummary",
+          "message",
+          "messages",
+        ]),
+      );
     case "projection.updated":
     case "run.updated":
     case "transcript.delta":
     case "source.status":
     default:
-      return detail;
+      return sanitizeRealtimeDetailProjectContext(detail);
   }
+}
+
+function sanitizeRealtimeDetailProjectContext(detail: RealtimeProjectionEventDetail): RealtimeProjectionEventDetail {
+  let next: RealtimeProjectionEventDetail | null = null;
+
+  if (Object.prototype.hasOwnProperty.call(detail, "projectContext")) {
+    next = { ...(next ?? detail), projectContext: sanitizePublicJson(detail.projectContext) };
+  }
+
+  const sourceCursors = readRecordDetail(detail, "sourceCursors");
+  if (sourceCursors && Object.prototype.hasOwnProperty.call(sourceCursors, "projectContext")) {
+    next = {
+      ...(next ?? detail),
+      sourceCursors: {
+        ...sourceCursors,
+        projectContext: sanitizePublicJson(sourceCursors.projectContext),
+      },
+    };
+  }
+
+  return next ?? detail;
 }
 
 function omitRealtimeDetailKeys(
