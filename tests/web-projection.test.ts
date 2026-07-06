@@ -229,6 +229,24 @@ function displayProjectContext(
   };
 }
 
+function runningAgentProjectContext(
+  input: {
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string | null;
+    routingSource?: string | null;
+  },
+  options: { codebase?: string | null } = {},
+) {
+  return {
+    ...displayProjectContext(input, options),
+    projectContextId: input.projectContextId,
+    projectContextLabel: input.projectContextLabel,
+    linearProjectSlug: input.linearProjectSlug,
+    routingSource: input.routingSource ?? null,
+  };
+}
+
 function run(overrides: Partial<RunRecord> = {}): RunRecord {
   return {
     runId: "run-1",
@@ -955,7 +973,7 @@ describe("web projection foundation", () => {
       step: "Implementing dashboard route",
       duration: "10m",
       tokens: "12",
-      projectContext: displayProjectContext(runtimeProjectContext),
+      projectContext: runningAgentProjectContext(runtimeProjectContext),
     });
     expect(dashboard.providerGates[0]).toMatchObject({
       provider: "openai-codex",
@@ -1046,8 +1064,8 @@ describe("web projection foundation", () => {
     expect(dashboard.runningAgents.map((agent) => agent.id)).toEqual(["issue-docs-123", "issue-symphony-123"]);
     expect(new Set(dashboard.runningAgents.map((agent) => agent.id)).size).toBe(2);
     expect(dashboard.runningAgents.map((agent) => agent.projectContext)).toEqual([
-      displayProjectContext(docsProjectContext),
-      displayProjectContext(symphonyProjectContext),
+      runningAgentProjectContext(docsProjectContext),
+      runningAgentProjectContext(symphonyProjectContext),
     ]);
   });
 
@@ -1179,7 +1197,7 @@ describe("web projection foundation", () => {
         step: "implementation",
         duration: "15m",
         tokens: "25",
-        projectContext: displayProjectContext(durableProjectContext),
+        projectContext: runningAgentProjectContext(durableProjectContext),
       },
     ]);
     expect(dashboard.agentUsageLabel).toBe("1/3 agents");
@@ -1235,8 +1253,8 @@ describe("web projection foundation", () => {
     expect(dashboard.runningAgents.map((agent) => agent.id)).toEqual(["issue-docs-123", "issue-symphony-123"]);
     expect(new Set(dashboard.runningAgents.map((agent) => agent.id)).size).toBe(2);
     expect(dashboard.runningAgents.map((agent) => agent.projectContext)).toEqual([
-      displayProjectContext(docsProjectContext),
-      displayProjectContext(symphonyProjectContext),
+      runningAgentProjectContext(docsProjectContext),
+      runningAgentProjectContext(symphonyProjectContext),
     ]);
   });
 
@@ -1368,7 +1386,7 @@ describe("web projection foundation", () => {
         step: "runtime heartbeat",
         duration: "10m",
         tokens: "10",
-        projectContext: displayProjectContext(runtimeProjectContext),
+        projectContext: runningAgentProjectContext(runtimeProjectContext),
       },
     ]);
     expect(dashboard.agentUsageLabel).toBe("1/2 agents");

@@ -58,6 +58,13 @@ export interface ProjectContextDisplayModel {
   codebase: string | null;
 }
 
+export interface RunningAgentProjectContextModel extends ProjectContextDisplayModel {
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
+  routingSource: string | null;
+}
+
 export interface IssueModel {
   id: string;
   title: string;
@@ -140,7 +147,7 @@ export interface RunningAgentModel {
   step: string;
   duration: string;
   tokens: string;
-  projectContext?: ProjectContextDisplayModel | undefined;
+  projectContext?: RunningAgentProjectContextModel | undefined;
 }
 
 export interface ProviderGateModel {
@@ -976,7 +983,7 @@ export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefine
     });
     const issue = firstNonEmpty(row.issueIdentifier, row.issueId) ?? "";
     const totalTokens = row.tokens?.totalTokens ?? 0;
-    const projectContext = projectContextDisplayFromResolution(row.projectContext);
+    const projectContext = runningAgentProjectContextFromResolution(row.projectContext);
     return {
       id,
       issue,
@@ -1004,7 +1011,9 @@ function projectDurableRunningAgents(runs: readonly RunRecord[], generatedAt: st
       });
       const issue = firstNonEmpty(run.issueIdentifier, run.issueId, run.workspaceKey) ?? "";
       const totalTokens = run.tokens?.totalTokens ?? 0;
-      const projectContext = projectContextDisplayForRun(run);
+      const projectContext = runningAgentProjectContextFromResolution(run.projectContext, {
+        codebase: publicRepositorySummary(run.repoPath, { allowLocalPath: false }),
+      });
       return {
         id,
         issue,
@@ -1741,12 +1750,34 @@ function projectContextDisplayFromResolution(
 ): ProjectContextDisplayModel | null {
   if (projectContext === null || projectContext === undefined) return null;
   const normalized = normalizeProjectContextResolution(projectContext);
+  return projectContextDisplayFromNormalizedResolution(normalized, options);
+}
+
+function projectContextDisplayFromNormalizedResolution(
+  normalized: ProjectContextResolution,
+  options: { codebase?: string | null } = {},
+): ProjectContextDisplayModel {
   const codebase = typeof options.codebase === "string" && options.codebase.trim().length > 0 ? options.codebase : null;
   return {
     id: normalized.projectContextId,
     label: normalized.projectContextLabel,
     linearProject: normalized.linearProjectSlug,
     codebase,
+  };
+}
+
+function runningAgentProjectContextFromResolution(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  options: { codebase?: string | null } = {},
+): RunningAgentProjectContextModel | null {
+  if (projectContext === null || projectContext === undefined) return null;
+  const normalized = normalizeProjectContextResolution(projectContext);
+  return {
+    ...projectContextDisplayFromNormalizedResolution(normalized, options),
+    projectContextId: normalized.projectContextId,
+    projectContextLabel: normalized.projectContextLabel,
+    linearProjectSlug: normalized.linearProjectSlug,
+    routingSource: normalized.routingSource ?? null,
   };
 }
 
