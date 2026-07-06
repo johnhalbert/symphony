@@ -793,7 +793,13 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
           kind: "status",
           state: "approved",
           ts: "2026-01-01T00:00:05.000Z",
-          text: "Operator approval approved: branch -> main",
+          text: "Operator approval approved: branch -> main · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
         },
       ]);
       const serialized = JSON.stringify(body);
@@ -908,7 +914,18 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expectRunPrelude(body, { session: "hermes-acp-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
-        { kind: "status", state: "cancelled", ts: "2026-01-01T00:00:04.000Z", text: "Run cancelled" },
+        {
+          kind: "status",
+          state: "cancelled",
+          ts: "2026-01-01T00:00:04.000Z",
+          text: "Run cancelled · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
       ]);
       expect(JSON.stringify(body)).not.toContain("SECRET_TOOL_PROGRESS");
     } finally {
@@ -967,7 +984,18 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expectRunPrelude(body, { session: "mapped-acp-delta-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello world token=[redacted]" },
-        { kind: "status", state: "failed", ts: "2026-01-01T00:00:07.000Z", text: "Run failed before message.complete" },
+        {
+          kind: "status",
+          state: "failed",
+          ts: "2026-01-01T00:00:07.000Z",
+          text: "Run failed before message.complete · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
       ]);
       const serialized = JSON.stringify(body);
       expect(serialized).not.toContain("api-delta-value");
@@ -1045,7 +1073,18 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expectRunPrelude(body, { session: "hermes-dual-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
-        { kind: "status", state: "failed", ts: "2026-01-01T00:00:03.000Z", text: "Run failed before message.complete" },
+        {
+          kind: "status",
+          state: "failed",
+          ts: "2026-01-01T00:00:03.000Z",
+          text: "Run failed before message.complete · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
       ]);
     } finally {
       await server.stop();
@@ -1160,7 +1199,18 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "hello from stream" },
         { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "legacy progress text" },
-        { kind: "status", state: "warming", ts: "2026-01-01T00:00:03.000Z", text: "Workspace warming" },
+        {
+          kind: "status",
+          state: "warming",
+          ts: "2026-01-01T00:00:03.000Z",
+          text: "Workspace warming · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
       ]);
     } finally {
       await server.stop();
@@ -1218,7 +1268,18 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
             codebase: null,
           },
         },
-        { kind: "status", state: "warming", ts: "2026-01-01T00:00:01.000Z", text: "status public preview" },
+        {
+          kind: "status",
+          state: "warming",
+          ts: "2026-01-01T00:00:01.000Z",
+          text: "status public preview · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
         {
           kind: "system",
           ts: "2026-01-01T00:00:02.000Z",
@@ -1227,13 +1288,25 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
           workspace: "",
           session: "cursor-nonassistant-run",
           tools: [],
-          note: "system public preview",
+          note: "system public preview. Project context: Default.",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
         },
         {
           kind: "status",
           state: "novel_cursor_event",
           ts: "2026-01-01T00:00:03.000Z",
-          text: "novel_cursor_event",
+          text: "novel_cursor_event · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
         },
       ]);
       expect(body.map((message) => message.kind)).not.toContain("assistant");
@@ -1651,7 +1724,7 @@ function expectRunPrelude(body: Array<Record<string, unknown>>, expected: { sess
       workspace: expected.issue,
       session: expected.session,
       tools: [],
-      note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
+      note: "Initialized implementation run from persisted run metadata. System prompt redacted. Project context: Default.",
       projectContext: {
         id: "default",
         label: "Default",

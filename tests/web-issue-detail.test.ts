@@ -589,7 +589,7 @@ describe("GET /api/v1/web/issues/:issueId", () => {
         model: "gpt-5-test",
         workspace: "TEST-1",
         session: "session-1",
-        note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
+        note: "Initialized implementation run from persisted run metadata. System prompt redacted. Project context: Default.",
       });
       expect(explicitMessages[1]).toMatchObject({
         kind: "user",

@@ -664,6 +664,79 @@ describe("projectWebTranscript", () => {
     expect(messages.map((message) => message.kind)).not.toContain("assistant");
   });
 
+  it("adds service-owned project context attribution to projected system and status messages", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "status",
+        source: "cursor",
+        message: "Cursor status running",
+        payload: { kind: "status", status: "running", messagePreview: "workspace ready" },
+      }),
+      event({
+        eventType: "system",
+        source: "cursor",
+        message: "Cursor system event: startup",
+        payload: { kind: "system", subtype: "startup", messagePreview: "system public preview", truncated: false },
+      }),
+      event({ eventType: "some_new_cursor_kind", source: "cursor" }),
+    ], {
+      run: runRecord({
+        repoPath: "https://buildbot:ghp_SECRET_REPO_TOKEN@github.com/acme/symphony",
+        projectContext: {
+          projectContextId: "red",
+          projectContextLabel: "Red Team",
+          linearProjectSlug: "ENG",
+          routingSource: "candidate_poll",
+        },
+      }),
+      includeRunPrelude: false,
+    });
+
+    expect(messages).toEqual([
+      {
+        kind: "status",
+        state: "running",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "workspace ready · Project context: Red Team [red]",
+        projectContext: {
+          id: "red",
+          label: "Red Team",
+          linearProject: "ENG",
+          codebase: "https://github.com/acme/symphony",
+        },
+      },
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.000Z",
+        model: "",
+        cwd: "",
+        workspace: "",
+        session: "run-1",
+        tools: [],
+        note: "system public preview. Project context: Red Team [red].",
+        projectContext: {
+          id: "red",
+          label: "Red Team",
+          linearProject: "ENG",
+          codebase: "https://github.com/acme/symphony",
+        },
+      },
+      {
+        kind: "status",
+        state: "some_new_cursor_kind",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "some_new_cursor_kind · Project context: Red Team [red]",
+        projectContext: {
+          id: "red",
+          label: "Red Team",
+          linearProject: "ENG",
+          codebase: "https://github.com/acme/symphony",
+        },
+      },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain("ghp_SECRET_REPO_TOKEN");
+  });
+
   it("groups display taxonomy events while surfacing tool/token/rate telemetry and hiding metadata", () => {
     const messages = projectWebTranscript([
       event({
@@ -1535,7 +1608,7 @@ describe("projectWebTranscript", () => {
         workspace: "TEST-1",
         session: "session-1",
         tools: [],
-        note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
+        note: "Initialized implementation run from persisted run metadata. System prompt redacted. Project context: Red Team [red] · Linear ENG · https://github.com/acme/symphony.",
         projectContext: {
           id: "red",
           label: "Red Team",
@@ -1581,7 +1654,7 @@ describe("projectWebTranscript", () => {
         workspace: "TEST-1",
         session: "session-1",
         tools: [],
-        note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
+        note: "Initialized implementation run from persisted run metadata. System prompt redacted. Project context: Default.",
         projectContext: {
           id: "default",
           label: "Default",
