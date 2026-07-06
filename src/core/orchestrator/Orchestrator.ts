@@ -1226,6 +1226,7 @@ export class Orchestrator {
 
   private async fetchIssueStatesByIdsGroupedByProjectContext(
     requests: Array<{ issueId: string; projectContext: ProjectContextResolution | undefined }>,
+    operation = "issue_state_refresh",
   ): Promise<Map<string, Issue>> {
     if (requests.length === 0) return new Map();
     if (!this.options.trackerResolver) {
@@ -1253,7 +1254,14 @@ export class Orchestrator {
 
     const issues = new Map<string, Issue>();
     for (const { issueIds, projectContext } of groupedRequests.values()) {
-      for (const issue of await this.fetchIssueStatesByIdsForProjectContext(issueIds, projectContext)) {
+      let projectContextIssues: Issue[];
+      try {
+        projectContextIssues = await this.fetchIssueStatesByIdsForProjectContext(issueIds, projectContext);
+      } catch (error) {
+        this.reportProjectContextPollingFailure(projectContext, operation, error);
+        continue;
+      }
+      for (const issue of projectContextIssues) {
         const dispatchIssue = this.issueWithDispatchProjectContext(
           issue,
           this.requestedProjectContextForIssue(issue, projectContext),
@@ -1853,6 +1861,7 @@ export class Orchestrator {
           issueId: lifecycle.issueId,
           projectContext: this.currentProjectContext(lifecycle.projectContext) ?? undefined,
         })),
+        "pending_publication_approval_recovery",
       );
     } catch (error) {
       this.options.logger.warn("pending publication approval recovery issue refresh failed", { error: errorMessage(error) });
@@ -1906,6 +1915,7 @@ export class Orchestrator {
           issueId,
           projectContext: this.resolvedProjectContext(entry) ?? undefined,
         })),
+        "running_issue_refresh",
       );
     } catch (error) {
       this.options.logger.warn("running issue refresh failed", { error: errorMessage(error) });
