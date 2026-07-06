@@ -217,6 +217,135 @@ describe("MergeConflictResolutionService", () => {
     });
   });
 
+  it("turns a pending preserved stash conflict into a stash-apply repair after squash finalization", async () => {
+    const preservedStash = preservedStashRecord();
+    const applyCalls: unknown[] = [];
+    const { service, lifecycleStore } = await fixture({
+      servicePreparation: servicePreparationRecord({ preservedStash }),
+      finalizer: {
+        async finalize() {
+          return { newHeadSha: "head-sha-2" };
+        },
+        async applyPreservedStash(input) {
+          applyCalls.push(input);
+          return {
+            status: "conflicted" as const,
+            stash: {
+              ...input.preservedStash,
+              status: "apply_conflicted" as const,
+              conflictedFiles: ["src/local.ts"],
+              appliedAt: "2026-01-01T00:00:02.000Z",
+            },
+            changedFiles: ["src/local.ts"],
+            conflictedFiles: ["src/local.ts"],
+            headSha: "head-sha-2",
+          };
+        },
+      },
+    });
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({ resolutionStatus: "resolved", omitNewHeadSha: true }),
+      context({ workspacePath: "/tmp/service-prepared-workspace" }),
+    );
+
+    expect(result.report.resolutionStatus).toBe("still_conflicted");
+    expect(applyCalls).toEqual([expect.objectContaining({ preservedStash })]);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "merge_conflict_resolution",
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "pending",
+        currentHeadSha: "head-sha-2",
+        reason: "Preserved local changes conflicted while restoring after service-owned repair",
+        servicePreparation: {
+          strategy: "stash_apply",
+          status: "conflicted",
+          originalHeadSha: "head-sha-2",
+          currentHeadSha: "head-sha-2",
+          conflictedFiles: ["src/local.ts"],
+          allowedFiles: ["src/local.ts"],
+          preservedStash: {
+            status: "apply_conflicted",
+            stashRef: "refs/symphony/preserved-stashes/test/stash-1",
+          },
+        },
+      },
+      preservedWorktreeStashes: [
+        expect.objectContaining({
+          status: "apply_conflicted",
+          conflictedFiles: ["src/local.ts"],
+        }),
+      ],
+    });
+  });
+
+  it("finalizes stash-apply conflicts through service-owned git and routes back to implementation", async () => {
+    const finalizerCalls: unknown[] = [];
+    const { service, lifecycleStore } = await fixture({
+      servicePreparation: stashApplyServicePreparationRecord(),
+      finalizer: {
+        async finalize() {
+          throw new Error("squash finalizer should not be called for stash_apply");
+        },
+        async finalizeStashApply(input) {
+          finalizerCalls.push(input);
+          return {
+            newHeadSha: "head-sha-3",
+            preservedStash: {
+              ...input.preservedStash,
+              status: "dropped" as const,
+              droppedAt: "2026-01-01T00:00:03.000Z",
+            },
+          };
+        },
+      },
+    });
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({ resolutionStatus: "resolved", omitNewHeadSha: true, changedFiles: ["src/local.ts"] }),
+      context({ workspacePath: "/tmp/stash-apply-workspace" }),
+    );
+
+    expect(result.report.newHeadSha).toBe("head-sha-3");
+    expect(finalizerCalls).toEqual([
+      expect.objectContaining({
+        workspacePath: "/tmp/stash-apply-workspace",
+        branchName: "symphony/TEST-1",
+        previousRemoteHeadSha: "head-sha-1",
+        allowedFiles: ["src/local.ts"],
+        conflictedFiles: ["src/local.ts"],
+        changedFiles: ["src/local.ts"],
+      }),
+    ]);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "implementation",
+      summaryPointers: {
+        prHeadSha: "head-sha-3",
+        ciStatus: null,
+      },
+      mergeConflict: {
+        status: "resolved",
+        resolutionStatus: "resolved",
+        currentHeadSha: "head-sha-3",
+        resolvedHeadSha: "head-sha-3",
+        servicePreparation: {
+          strategy: "stash_apply",
+          status: "finalized",
+          finalizedHeadSha: "head-sha-3",
+          preservedStash: {
+            status: "dropped",
+          },
+        },
+      },
+      preservedWorktreeStashes: [
+        expect.objectContaining({
+          status: "dropped",
+        }),
+      ],
+    });
+  });
+
   it("re-prepares a service-owned conflict instead of blocking when the prepared base drifted", async () => {
     const finalizerCalls: unknown[] = [];
     const reprepareCalls: unknown[] = [];
@@ -344,7 +473,10 @@ describe("MergeConflictResolutionService", () => {
 
   async function fixture(input: {
     fixTurnCount?: number;
-    servicePreparation?: ReturnType<typeof servicePreparationRecord> | null;
+    servicePreparation?:
+      | ReturnType<typeof servicePreparationRecord>
+      | ReturnType<typeof stashApplyServicePreparationRecord>
+      | null;
     finalizer?: ConstructorParameters<typeof MergeConflictResolutionService>[0]["finalizer"];
   } = {}) {
     const config = testConfig(root);
@@ -399,6 +531,7 @@ function resolutionReport(input: {
   baseHeadSha?: string;
   blockedReason?: string;
   omitNewHeadSha?: boolean;
+  changedFiles?: string[];
 }) {
   const headSha = input.headSha ?? "head-sha-1";
   return {
@@ -407,7 +540,7 @@ function resolutionReport(input: {
     resolutionStatus: input.resolutionStatus,
     summary: "Resolved merge conflicts.",
     validationEvidence: ["npm test"],
-    changedFiles: ["src/index.ts"],
+    changedFiles: input.changedFiles ?? ["src/index.ts"],
     pullRequest: {
       url: "https://github.com/acme/symphony/pull/42",
       number: 42,
@@ -424,7 +557,13 @@ function resolutionReport(input: {
   };
 }
 
-function mergeConflictRecord(input: { fixTurnCount: number; servicePreparation?: ReturnType<typeof servicePreparationRecord> | null }) {
+function mergeConflictRecord(input: {
+  fixTurnCount: number;
+  servicePreparation?:
+    | ReturnType<typeof servicePreparationRecord>
+    | ReturnType<typeof stashApplyServicePreparationRecord>
+    | null;
+}) {
   return {
     id: "merge-conflict:issue-1:head-sha-1",
     status: "open" as const,
@@ -458,7 +597,7 @@ function mergeConflictRecord(input: { fixTurnCount: number; servicePreparation?:
   };
 }
 
-function servicePreparationRecord() {
+function servicePreparationRecord(input: { preservedStash?: ReturnType<typeof preservedStashRecord> | null } = {}) {
   return {
     strategy: "squash_rebase" as const,
     status: "conflicted" as const,
@@ -472,5 +611,49 @@ function servicePreparationRecord() {
     preparedAt: "2026-01-01T00:00:01.000Z",
     finalizedAt: null,
     finalizedHeadSha: null,
+    preservedStash: input.preservedStash ?? null,
+  };
+}
+
+function stashApplyServicePreparationRecord() {
+  return {
+    strategy: "stash_apply" as const,
+    status: "conflicted" as const,
+    originalHeadSha: "head-sha-1",
+    currentHeadSha: "head-sha-1",
+    conflictedFiles: ["src/local.ts"],
+    allowedFiles: ["src/local.ts"],
+    preservedStash: {
+      ...preservedStashRecord(),
+      status: "apply_conflicted" as const,
+      conflictedFiles: ["src/local.ts"],
+      appliedAt: "2026-01-01T00:00:02.000Z",
+    },
+    preparedAt: "2026-01-01T00:00:02.000Z",
+    finalizedAt: null,
+    finalizedHeadSha: null,
+  };
+}
+
+function preservedStashRecord() {
+  return {
+    version: 1 as const,
+    id: "preserved-stash:issue-1:stash-1",
+    operationId: "base-ref:issue-1:head-sha-1:base-sha-1",
+    source: "base_ref_repair" as const,
+    stashRef: "refs/symphony/preserved-stashes/test/stash-1",
+    stashSha: "stash-sha-1",
+    message: "Symphony preserved local changes",
+    workspacePath: "/tmp/workspace",
+    branchName: "symphony/TEST-1",
+    baseBranch: "main",
+    originalHeadSha: "head-sha-1",
+    dirtyFiles: ["src/local.ts"],
+    status: "created" as const,
+    conflictedFiles: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    appliedAt: null,
+    droppedAt: null,
+    dropError: null,
   };
 }

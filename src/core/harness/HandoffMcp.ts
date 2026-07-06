@@ -251,7 +251,8 @@ export function renderMergeConflictResolutionMcpHandoffPrompt(input: RuntimeHand
     "- Before ending the run, call the submit_merge_conflict_resolution MCP tool with resolutionStatus, summary, validationEvidence, changedFiles, pullRequest, previousHeadSha, baseBranch, baseHeadSha, risks, idempotencyKey, and newHeadSha when known.",
     "- Use resolutionStatus=\"resolved\" only after the conflicted file contents are repaired; use resolutionStatus=\"still_conflicted\" when conflicts remain; use resolutionStatus=\"blocked\" when human intervention is required now.",
     "- Do not run git fetch, pull, merge, rebase, commit, push, or continue/abort/skip a rebase. Symphony owns the git choreography around this worktree.",
-    "- previousHeadSha must match the current conflict head from the prompt. For service-prepared conflicts, omit newHeadSha or set it to null; otherwise newHeadSha must match pullRequest.headSha after your attempt.",
+    "- previousHeadSha must match the current conflict head from the prompt. For service-prepared rebase or stash-apply conflicts, omit newHeadSha or set it to null; Symphony finalizes the git operation and fills the final head SHA.",
+    "- When the prompt says the conflict source is preserved local changes, resolve only those stash-apply conflicts and keep edits within the listed allowed repair files.",
     "- The MCP server is scoped to this issue and current conflict-fix run; Symphony injects runId and issueId for you.",
   ].join("\n");
 }

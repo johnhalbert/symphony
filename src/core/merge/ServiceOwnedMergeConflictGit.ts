@@ -1,8 +1,13 @@
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fetchAndVerifyLocalRemoteBaseRef } from "../BaseRefVerification.js";
 import { SymphonyError } from "../errors.js";
+import type {
+  IssuePreservedWorktreeStash,
+  IssuePreservedWorktreeStashSource,
+} from "../persistence/IssueLifecycleStore.js";
 
 const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 const SERVICE_GIT_NAME = "Symphony";
@@ -56,6 +61,46 @@ export interface ServiceOwnedMergeConflictFinalizationResult {
   newHeadSha: string;
 }
 
+export interface ServiceOwnedPreserveWorktreeInput {
+  workspacePath: string;
+  branchName: string;
+  baseBranch: string | null;
+  operationId: string;
+  source: IssuePreservedWorktreeStashSource;
+  message?: string;
+}
+
+export type ServiceOwnedPreservedStashApplyResult =
+  | {
+      status: "clean";
+      stash: IssuePreservedWorktreeStash;
+      changedFiles: string[];
+      headSha: string;
+    }
+  | {
+      status: "conflicted";
+      stash: IssuePreservedWorktreeStash;
+      changedFiles: string[];
+      conflictedFiles: string[];
+      headSha: string;
+    };
+
+export interface ServiceOwnedStashApplyFinalizationInput {
+  workspacePath: string;
+  branchName: string;
+  previousRemoteHeadSha: string;
+  allowedFiles: string[];
+  conflictedFiles: string[];
+  changedFiles: string[];
+  preservedStash: IssuePreservedWorktreeStash;
+  authHeader: string;
+}
+
+export interface ServiceOwnedStashApplyFinalizationResult {
+  newHeadSha: string;
+  preservedStash: IssuePreservedWorktreeStash;
+}
+
 export interface PreparedBaseRefDriftDetails {
   kind: "prepared_base_ref_drift";
   refName: string;
@@ -65,6 +110,120 @@ export interface PreparedBaseRefDriftDetails {
 }
 
 export class ServiceOwnedMergeConflictGit {
+  async preserveDirtyWorktree(
+    input: ServiceOwnedPreserveWorktreeInput,
+  ): Promise<IssuePreservedWorktreeStash | null> {
+    validateRefName(input.branchName, "PR branch");
+    if (input.baseBranch !== null) validateRefName(input.baseBranch, "base branch");
+    const git = new ServiceGit(input.workspacePath);
+    await git.assertCurrentBranch(input.branchName);
+    const dirtyFiles = await git.statusFiles();
+    if (dirtyFiles.length === 0) return null;
+    const originalHeadSha = await git.headSha();
+    const stashId = `preserved-stash:${input.operationId}:${randomUUID()}`;
+    const refName = `refs/symphony/preserved-stashes/${safeRefSegment(input.operationId)}/${randomUUID()}`;
+    const message =
+      input.message ??
+      `Symphony preserved local changes for ${input.operationId}`;
+    await git.stashPush(message);
+    const stashSha = await git.refSha("refs/stash");
+    await git.updateRef(refName, stashSha);
+    await git.dropLatestStashStackEntry();
+    await git.assertClean();
+    return {
+      version: 1,
+      id: stashId,
+      operationId: input.operationId,
+      source: input.source,
+      stashRef: refName,
+      stashSha,
+      message,
+      workspacePath: input.workspacePath,
+      branchName: input.branchName,
+      baseBranch: input.baseBranch,
+      originalHeadSha,
+      dirtyFiles,
+      status: "created",
+      conflictedFiles: [],
+      createdAt: new Date().toISOString(),
+      appliedAt: null,
+      droppedAt: null,
+      dropError: null,
+    };
+  }
+
+  async applyPreservedStash(input: {
+    workspacePath: string;
+    branchName: string;
+    preservedStash: IssuePreservedWorktreeStash;
+  }): Promise<ServiceOwnedPreservedStashApplyResult> {
+    validateRefName(input.branchName, "PR branch");
+    const git = new ServiceGit(input.workspacePath);
+    await git.assertCurrentBranch(input.branchName);
+    const appliedAt = new Date().toISOString();
+    const apply = await git.applyStash(input.preservedStash.stashRef);
+    const conflictedFiles = await git.conflictedFiles();
+    const changedFiles = await git.workerTouchedFiles();
+    const headSha = await git.headSha();
+    if (apply.code === 0 && conflictedFiles.length === 0) {
+      return {
+        status: "clean",
+        stash: {
+          ...input.preservedStash,
+          status: "applied_clean",
+          appliedAt,
+          conflictedFiles: [],
+          dropError: null,
+        },
+        changedFiles,
+        headSha,
+      };
+    }
+    if (conflictedFiles.length === 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `Preserved worktree stash apply failed without file conflicts: ${apply.stderr.trim() || apply.stdout.trim()}`,
+      );
+    }
+    return {
+      status: "conflicted",
+      stash: {
+        ...input.preservedStash,
+        status: "apply_conflicted",
+        appliedAt,
+        conflictedFiles,
+        dropError: null,
+      },
+      changedFiles,
+      conflictedFiles,
+      headSha,
+    };
+  }
+
+  async dropPreservedStash(input: {
+    workspacePath: string;
+    preservedStash: IssuePreservedWorktreeStash;
+  }): Promise<IssuePreservedWorktreeStash> {
+    const git = new ServiceGit(input.workspacePath);
+    const droppedAt = new Date().toISOString();
+    try {
+      await git.deleteRef(input.preservedStash.stashRef);
+      return {
+        ...input.preservedStash,
+        status: "dropped",
+        droppedAt,
+        dropError: null,
+      };
+    } catch (error) {
+      return {
+        ...input.preservedStash,
+        status: "drop_failed",
+        droppedAt: null,
+        dropError: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
   async prepare(
     input: ServiceOwnedMergeConflictPreparationInput,
   ): Promise<ServiceOwnedMergeConflictPreparationResult> {
@@ -153,6 +312,58 @@ export class ServiceOwnedMergeConflictGit {
     await git.pushForceWithLease(input.branchName, input.previousRemoteHeadSha, input.authHeader);
     return { newHeadSha };
   }
+
+  async finalizeStashApply(
+    input: ServiceOwnedStashApplyFinalizationInput,
+  ): Promise<ServiceOwnedStashApplyFinalizationResult> {
+    validateRefName(input.branchName, "PR branch");
+    const allowed = new Set(input.allowedFiles.map(normalizeRepoPath));
+    const changed = input.changedFiles.map(normalizeRepoPath);
+    const outside = changed.filter((file) => !allowed.has(file));
+    if (outside.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `Stash-apply repair changed files outside the preserved local changes set: ${outside.join(", ")}`,
+      );
+    }
+
+    const git = new ServiceGit(input.workspacePath);
+    await git.assertCurrentBranch(input.branchName);
+    await git.fetchBranch(input.branchName, input.authHeader);
+    await git.assertRefSha(`refs/remotes/origin/${input.branchName}`, input.previousRemoteHeadSha, "expected PR head");
+    const actualTouchedFiles = await git.workerTouchedFiles();
+    const actualOutside = actualTouchedFiles.filter((file) => !allowed.has(file));
+    if (actualOutside.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `Stash-apply repair touched files outside the preserved local changes set: ${actualOutside.join(", ")}`,
+      );
+    }
+    for (const file of input.conflictedFiles) await assertNoConflictMarkers(path.join(input.workspacePath, file));
+    await git.add(actualTouchedFiles.filter((file) => allowed.has(file)));
+    if ((await git.unmergedEntries()).length > 0) {
+      throw new SymphonyError("invalid_request", "Stash-apply repair still has unmerged index entries");
+    }
+    if (await git.hasStagedDiff()) {
+      await git.commit(
+        "Symphony preserved local changes repair",
+        "Finalize preserved local changes after service-owned base-ref repair.",
+      );
+      await git.pushForceWithLease(input.branchName, input.previousRemoteHeadSha, input.authHeader);
+    }
+    const newHeadSha = await git.headSha();
+    const dropped = await this.dropPreservedStash({
+      workspacePath: input.workspacePath,
+      preservedStash: {
+        ...input.preservedStash,
+        status: "finalized",
+      },
+    });
+    return {
+      newHeadSha,
+      preservedStash: dropped.status === "drop_failed" ? dropped : { ...dropped, status: "dropped" },
+    };
+  }
 }
 
 class ServiceGit {
@@ -169,6 +380,30 @@ class ServiceGit {
   async assertClean(): Promise<void> {
     const status = (await this.git(["status", "--porcelain=v1", "-uall"])).stdout.trim();
     if (status.length > 0) throw new SymphonyError("invalid_request", "Service-owned conflict preparation requires a clean worktree");
+  }
+
+  async statusFiles(): Promise<string[]> {
+    return normalizeGitPathLines((await this.git(["status", "--porcelain=v1", "-uall"])).stdout);
+  }
+
+  async stashPush(message: string): Promise<void> {
+    await this.git(["stash", "push", "--include-untracked", "-m", message]);
+  }
+
+  async dropLatestStashStackEntry(): Promise<void> {
+    await this.git(["stash", "drop", "stash@{0}"]);
+  }
+
+  async applyStash(stashRef: string): Promise<GitResult> {
+    return this.git(["stash", "apply", stashRef], { allowFailure: true });
+  }
+
+  async updateRef(refName: string, sha: string): Promise<void> {
+    await this.git(["update-ref", refName, sha]);
+  }
+
+  async deleteRef(refName: string): Promise<void> {
+    await this.git(["update-ref", "-d", refName]);
   }
 
   async fetchBranch(branchName: string, authHeader: string): Promise<void> {
@@ -496,6 +731,17 @@ function sortedUnique(values: string[]): string[] {
 function normalizeBranchRef(value: string | null): string | null {
   if (value === null) return null;
   return value.replace(/^refs\/heads\//u, "");
+}
+
+function safeRefSegment(value: string): string {
+  const safe = value
+    .replace(/\\/g, "/")
+    .replace(/[^A-Za-z0-9._/-]+/g, "-")
+    .replace(/\/+/g, "/")
+    .replace(/\.\.+/g, ".")
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/\.lock$/u, "-lock");
+  return safe.length > 0 ? safe : "operation";
 }
 
 async function assertNoConflictMarkers(filePath: string): Promise<void> {

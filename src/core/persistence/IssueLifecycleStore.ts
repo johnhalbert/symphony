@@ -498,7 +498,42 @@ export interface IssueMergeGateResultRecord extends LifecycleSupersessionFields 
 
 export type IssueMergeConflictResolutionStatus = "pending" | "still_conflicted" | "resolved" | "blocked";
 
-export interface IssueMergeConflictServicePreparation {
+export type IssuePreservedWorktreeStashSource =
+  | "base_ref_repair"
+  | "service_conflict_prepare"
+  | "service_conflict_base_refresh"
+  | "prepared_base_drift";
+
+export type IssuePreservedWorktreeStashStatus =
+  | "created"
+  | "applied_clean"
+  | "apply_conflicted"
+  | "finalized"
+  | "dropped"
+  | "drop_failed";
+
+export interface IssuePreservedWorktreeStash {
+  version: 1;
+  id: string;
+  operationId: string;
+  source: IssuePreservedWorktreeStashSource;
+  stashRef: string;
+  stashSha: string;
+  message: string;
+  workspacePath: string;
+  branchName: string;
+  baseBranch: string | null;
+  originalHeadSha: string;
+  dirtyFiles: string[];
+  status: IssuePreservedWorktreeStashStatus;
+  conflictedFiles: string[];
+  createdAt: string;
+  appliedAt: string | null;
+  droppedAt: string | null;
+  dropError: string | null;
+}
+
+export interface IssueSquashRebaseMergeConflictServicePreparation {
   strategy: "squash_rebase";
   status: "conflicted" | "clean" | "finalized";
   originalHeadSha: string;
@@ -511,7 +546,25 @@ export interface IssueMergeConflictServicePreparation {
   preparedAt: string;
   finalizedAt: string | null;
   finalizedHeadSha: string | null;
+  preservedStash?: IssuePreservedWorktreeStash | null;
 }
+
+export interface IssueStashApplyMergeConflictServicePreparation {
+  strategy: "stash_apply";
+  status: "conflicted" | "finalized";
+  originalHeadSha: string;
+  currentHeadSha: string;
+  conflictedFiles: string[];
+  allowedFiles: string[];
+  preservedStash: IssuePreservedWorktreeStash;
+  preparedAt: string;
+  finalizedAt: string | null;
+  finalizedHeadSha: string | null;
+}
+
+export type IssueMergeConflictServicePreparation =
+  | IssueSquashRebaseMergeConflictServicePreparation
+  | IssueStashApplyMergeConflictServicePreparation;
 
 export interface IssueMergeConflictResolutionReportRecord {
   id: string;
@@ -653,6 +706,7 @@ export interface IssueLifecycleRecord {
   merge: IssueMergeMetadata | null;
   mergeConflict: IssueMergeConflictMetadata | null;
   mergeConflictResolutionReports: IssueMergeConflictResolutionReportRecord[];
+  preservedWorktreeStashes?: IssuePreservedWorktreeStash[];
   handoff: IssueHandoffState;
   createdAt: string;
   updatedAt: string;
@@ -690,6 +744,7 @@ export interface IssueLifecyclePatch {
   merge?: IssueMergeMetadata | null;
   mergeConflict?: IssueMergeConflictMetadata | null;
   mergeConflictResolutionReports?: IssueMergeConflictResolutionReportRecord[];
+  preservedWorktreeStashes?: IssuePreservedWorktreeStash[];
   handoff?: IssueHandoffState;
 }
 
@@ -770,6 +825,8 @@ export class FileIssueLifecycleStore {
       mergeConflict: patchValue(patch, "mergeConflict", existing?.mergeConflict ?? null),
       mergeConflictResolutionReports:
         patch.mergeConflictResolutionReports ?? existing?.mergeConflictResolutionReports ?? [],
+      preservedWorktreeStashes:
+        patch.preservedWorktreeStashes ?? existing?.preservedWorktreeStashes ?? [],
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
@@ -1285,6 +1342,10 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     mergeConflict: normalizeMergeConflictMetadata(value.mergeConflict, filePath),
     mergeConflictResolutionReports: normalizeMergeConflictResolutionReports(
       value.mergeConflictResolutionReports,
+      filePath,
+    ),
+    preservedWorktreeStashes: normalizePreservedWorktreeStashes(
+      value.preservedWorktreeStashes,
       filePath,
     ),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
@@ -2560,9 +2621,8 @@ function normalizeMergeConflictServicePreparation(
 ): IssueMergeConflictServicePreparation | null {
   if (value === undefined || value === null) return null;
   if (!isRecord(value)) throw corruptLifecycle(filePath, "mergeConflict.servicePreparation is invalid");
-  if (value.strategy !== "squash_rebase") {
-    throw corruptLifecycle(filePath, "mergeConflict.servicePreparation.strategy is invalid");
-  }
+  if (value.strategy === "stash_apply") return normalizeStashApplyServicePreparation(value, filePath);
+  if (value.strategy !== "squash_rebase") throw corruptLifecycle(filePath, "mergeConflict.servicePreparation.strategy is invalid");
   const status = value.status;
   if (status !== "conflicted" && status !== "clean" && status !== "finalized") {
     throw corruptLifecycle(filePath, "mergeConflict.servicePreparation.status is invalid");
@@ -2600,6 +2660,118 @@ function normalizeMergeConflictServicePreparation(
       filePath,
       "mergeConflict.servicePreparation.finalizedHeadSha",
     ),
+    preservedStash: normalizePreservedWorktreeStash(
+      value.preservedStash,
+      filePath,
+      "mergeConflict.servicePreparation.preservedStash",
+    ),
+  };
+}
+
+function normalizeStashApplyServicePreparation(
+  value: Record<string, unknown>,
+  filePath: string,
+): IssueStashApplyMergeConflictServicePreparation {
+  const status = value.status;
+  if (status !== "conflicted" && status !== "finalized") {
+    throw corruptLifecycle(filePath, "mergeConflict.servicePreparation.status is invalid");
+  }
+  return {
+    strategy: "stash_apply",
+    status,
+    originalHeadSha: requiredString(value.originalHeadSha, filePath, "mergeConflict.servicePreparation.originalHeadSha"),
+    currentHeadSha: requiredString(value.currentHeadSha, filePath, "mergeConflict.servicePreparation.currentHeadSha"),
+    conflictedFiles: requiredStringArray(
+      value.conflictedFiles,
+      filePath,
+      "mergeConflict.servicePreparation.conflictedFiles",
+    ),
+    allowedFiles: requiredStringArray(
+      value.allowedFiles,
+      filePath,
+      "mergeConflict.servicePreparation.allowedFiles",
+    ),
+    preservedStash: requiredPreservedWorktreeStash(
+      value.preservedStash,
+      filePath,
+      "mergeConflict.servicePreparation.preservedStash",
+    ),
+    preparedAt: requiredString(value.preparedAt, filePath, "mergeConflict.servicePreparation.preparedAt"),
+    finalizedAt: optionalNullableString(value.finalizedAt, filePath, "mergeConflict.servicePreparation.finalizedAt"),
+    finalizedHeadSha: optionalNullableString(
+      value.finalizedHeadSha,
+      filePath,
+      "mergeConflict.servicePreparation.finalizedHeadSha",
+    ),
+  };
+}
+
+function normalizePreservedWorktreeStashes(
+  value: unknown,
+  filePath: string,
+): IssuePreservedWorktreeStash[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "preservedWorktreeStashes is invalid");
+  return value.map((item, index) =>
+    requiredPreservedWorktreeStash(item, filePath, `preservedWorktreeStashes[${index}]`),
+  );
+}
+
+function normalizePreservedWorktreeStash(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssuePreservedWorktreeStash | null {
+  if (value === undefined || value === null) return null;
+  return requiredPreservedWorktreeStash(value, filePath, field);
+}
+
+function requiredPreservedWorktreeStash(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssuePreservedWorktreeStash {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `${field} is invalid`);
+  if (value.version !== 1) throw corruptLifecycle(filePath, `${field}.version is invalid`);
+  const source = value.source;
+  if (
+    source !== "base_ref_repair" &&
+    source !== "service_conflict_prepare" &&
+    source !== "service_conflict_base_refresh" &&
+    source !== "prepared_base_drift"
+  ) {
+    throw corruptLifecycle(filePath, `${field}.source is invalid`);
+  }
+  const status = value.status;
+  if (
+    status !== "created" &&
+    status !== "applied_clean" &&
+    status !== "apply_conflicted" &&
+    status !== "finalized" &&
+    status !== "dropped" &&
+    status !== "drop_failed"
+  ) {
+    throw corruptLifecycle(filePath, `${field}.status is invalid`);
+  }
+  return {
+    version: 1,
+    id: requiredString(value.id, filePath, `${field}.id`),
+    operationId: requiredString(value.operationId, filePath, `${field}.operationId`),
+    source,
+    stashRef: requiredString(value.stashRef, filePath, `${field}.stashRef`),
+    stashSha: requiredString(value.stashSha, filePath, `${field}.stashSha`),
+    message: requiredString(value.message, filePath, `${field}.message`),
+    workspacePath: requiredString(value.workspacePath, filePath, `${field}.workspacePath`),
+    branchName: requiredString(value.branchName, filePath, `${field}.branchName`),
+    baseBranch: optionalNullableString(value.baseBranch, filePath, `${field}.baseBranch`),
+    originalHeadSha: requiredString(value.originalHeadSha, filePath, `${field}.originalHeadSha`),
+    dirtyFiles: requiredStringArray(value.dirtyFiles, filePath, `${field}.dirtyFiles`),
+    status,
+    conflictedFiles: requiredStringArray(value.conflictedFiles, filePath, `${field}.conflictedFiles`),
+    createdAt: requiredString(value.createdAt, filePath, `${field}.createdAt`),
+    appliedAt: optionalNullableString(value.appliedAt, filePath, `${field}.appliedAt`),
+    droppedAt: optionalNullableString(value.droppedAt, filePath, `${field}.droppedAt`),
+    dropError: optionalNullableString(value.dropError, filePath, `${field}.dropError`),
   };
 }
 

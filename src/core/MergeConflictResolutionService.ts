@@ -8,6 +8,9 @@ import {
   type ServiceOwnedMergeConflictFinalizationResult,
   type ServiceOwnedMergeConflictPreparationInput,
   type ServiceOwnedMergeConflictPreparationResult,
+  type ServiceOwnedPreservedStashApplyResult,
+  type ServiceOwnedStashApplyFinalizationInput,
+  type ServiceOwnedStashApplyFinalizationResult,
   isPreparedBaseRefDriftError,
 } from "./merge/ServiceOwnedMergeConflictGit.js";
 import type {
@@ -15,6 +18,7 @@ import type {
   IssueLifecycleStore,
   IssueMergeConflictMetadata,
   IssueMergeConflictResolutionReportRecord,
+  IssuePreservedWorktreeStash,
 } from "./persistence/IssueLifecycleStore.js";
 import type { Issue, Workspace } from "./types.js";
 import { planBlockedEscalationWritebacks } from "./writeback/TransitionPolicy.js";
@@ -60,6 +64,18 @@ export interface MergeConflictResolutionFinalizer {
     previousRemoteHeadSha: string;
     authHeader: string;
   }): Promise<void>;
+  applyPreservedStash?(input: {
+    workspacePath: string;
+    branchName: string;
+    preservedStash: IssuePreservedWorktreeStash;
+  }): Promise<ServiceOwnedPreservedStashApplyResult>;
+  dropPreservedStash?(input: {
+    workspacePath: string;
+    preservedStash: IssuePreservedWorktreeStash;
+  }): Promise<IssuePreservedWorktreeStash>;
+  finalizeStashApply?(
+    input: ServiceOwnedStashApplyFinalizationInput,
+  ): Promise<ServiceOwnedStashApplyFinalizationResult>;
 }
 
 export interface MergeConflictResolutionActiveContext {
@@ -149,28 +165,51 @@ export class MergeConflictResolutionService {
             now,
             reportId: storedReport.id,
           })
-        : {
-            ...mergeConflict,
-            status: blocked ? "blocked" : finalReport.resolutionStatus === "resolved" ? "resolved" : "open",
-            resolutionStatus: blocked ? "blocked" : finalReport.resolutionStatus,
-            pullRequest: { ...finalReport.pullRequest },
-            currentHeadSha: finalReport.newHeadSha,
-            resolvedHeadSha: finalReport.resolutionStatus === "resolved" ? finalReport.newHeadSha : mergeConflict.resolvedHeadSha,
-            baseBranch: finalReport.baseBranch,
-            baseHeadSha: finalReport.baseHeadSha,
-            servicePreparation: servicePreparationAfterReport(mergeConflict, finalReport, now),
-            updatedAt: now,
-            fixTurnCount,
-            lastConflictFixRunId: finalReport.runId,
-            lastConflictResolutionReportId: storedReport.id,
-            attemptRunIds: [...countedRunIds],
-            blockedAt: blocked ? now : mergeConflict.blockedAt,
-            blockedReason,
-          };
+        : finalReport.serviceRemediation?.kind === "preserved_stash_apply_conflicted"
+          ? mergeConflictAfterPreservedStashApplyConflict({
+              issueId: context.issue.id,
+              mergeConflict,
+              report: finalReport,
+              now,
+            })
+          : {
+              ...mergeConflict,
+              status: blocked ? "blocked" : finalReport.resolutionStatus === "resolved" ? "resolved" : "open",
+              resolutionStatus: blocked ? "blocked" : finalReport.resolutionStatus,
+              pullRequest: { ...finalReport.pullRequest },
+              currentHeadSha: finalReport.newHeadSha,
+              resolvedHeadSha: finalReport.resolutionStatus === "resolved" ? finalReport.newHeadSha : mergeConflict.resolvedHeadSha,
+              baseBranch: finalReport.baseBranch,
+              baseHeadSha: finalReport.baseHeadSha,
+              servicePreparation: servicePreparationAfterReport(mergeConflict, finalReport, now),
+              updatedAt: now,
+              fixTurnCount,
+              lastConflictFixRunId: finalReport.runId,
+              lastConflictResolutionReportId: storedReport.id,
+              attemptRunIds: [...countedRunIds],
+              blockedAt: blocked ? now : mergeConflict.blockedAt,
+              blockedReason,
+            };
 
     const writebackOperations = blocked ? await this.enqueueBlockedWritebacks(context, nextConflict) : [];
+    const implementationPhase =
+      !blocked &&
+      finalReport.resolutionStatus === "resolved" &&
+      (finalReport.serviceRemediation?.kind === "preserved_stash_applied_clean" ||
+        finalReport.serviceRemediation?.kind === "stash_apply_finalized");
+    const activeStash = preservedStashFromReport(finalReport);
+    const preservedWorktreeStashes =
+      activeStash === null
+        ? preservedWorktreeStashesOf(lifecycle)
+        : upsertPreservedWorktreeStash(preservedWorktreeStashesOf(lifecycle), activeStash);
     const updated = await this.options.lifecycleStore.updateIssue(context.issue, {
-      phase: blocked ? "blocked" : nextConflict.resolutionStatus === "resolved" ? "passed" : "merge_conflict_resolution",
+      phase: blocked
+        ? "blocked"
+        : implementationPhase
+          ? "implementation"
+          : nextConflict.resolutionStatus === "resolved"
+            ? "passed"
+            : "merge_conflict_resolution",
       blockedReason: blocked ? nextConflict.blockedReason : null,
       mergeConflict: {
         ...nextConflict,
@@ -183,6 +222,7 @@ export class MergeConflictResolutionService {
         lifecycle.mergeConflictResolutionReports,
         storedReport,
       ),
+      preservedWorktreeStashes,
       summaryPointers: {
         lastRunId: finalReport.runId,
         prUrl: finalReport.pullRequest.url,
@@ -190,6 +230,7 @@ export class MergeConflictResolutionService {
         prHeadSha: finalReport.pullRequest.headSha,
         prBranch: finalReport.pullRequest.branch,
         lastEvidenceCursor: finalReport.idempotencyKey,
+        ...(implementationPhase ? { ciStatus: null } : {}),
       },
     });
 
@@ -287,6 +328,31 @@ export class MergeConflictResolutionService {
     const baseBranch = requireValue(mergeConflict.baseBranch, "Merge conflict finalization requires the PR base branch");
     const finalizer = this.options.finalizer ?? new ServiceOwnedMergeConflictGit();
     const authHeader = await this.gitAuthHeader();
+    if (servicePreparation.strategy === "stash_apply") {
+      const finalizeStashApply = finalizer.finalizeStashApply?.bind(finalizer);
+      if (!finalizeStashApply) {
+        throw new SymphonyError("invalid_request", "Stash-apply conflict finalization requires service-owned stash finalization");
+      }
+      const finalized = await finalizeStashApply({
+        workspacePath,
+        branchName,
+        previousRemoteHeadSha: mergeConflict.currentHeadSha,
+        allowedFiles: servicePreparation.allowedFiles,
+        conflictedFiles: servicePreparation.conflictedFiles,
+        changedFiles: report.changedFiles,
+        preservedStash: servicePreparation.preservedStash,
+        authHeader,
+      });
+      return {
+        ...report,
+        pullRequest: { ...report.pullRequest, headSha: finalized.newHeadSha },
+        newHeadSha: finalized.newHeadSha,
+        serviceRemediation: {
+          kind: "stash_apply_finalized",
+          preservedStash: finalized.preservedStash,
+        },
+      };
+    }
     let finalized: ServiceOwnedMergeConflictFinalizationResult;
     try {
       finalized = await finalizer.finalize({
@@ -311,6 +377,48 @@ export class MergeConflictResolutionService {
         liveBaseHeadSha: error.details.actualSha,
         finalizer,
       });
+    }
+    const preservedStash = servicePreparation.preservedStash ?? null;
+    if (preservedStash !== null) {
+      const applyPreservedStash = finalizer.applyPreservedStash?.bind(finalizer);
+      if (!applyPreservedStash) {
+        throw new SymphonyError("invalid_request", "Preserved stash restoration requires service-owned stash apply support");
+      }
+      const stashApply = await applyPreservedStash({
+        workspacePath,
+        branchName,
+        preservedStash,
+      });
+      if (stashApply.status === "conflicted") {
+        return {
+          ...report,
+          resolutionStatus: "still_conflicted",
+          pullRequest: { ...report.pullRequest, headSha: finalized.newHeadSha },
+          newHeadSha: finalized.newHeadSha,
+          blockedReason: null,
+          serviceRemediation: {
+            kind: "preserved_stash_apply_conflicted",
+            applyResult: stashApply,
+          },
+        };
+      }
+      const dropPreservedStash = finalizer.dropPreservedStash?.bind(finalizer);
+      if (!dropPreservedStash) {
+        throw new SymphonyError("invalid_request", "Preserved stash cleanup requires service-owned stash drop support");
+      }
+      const dropped = await dropPreservedStash({
+        workspacePath,
+        preservedStash: stashApply.stash,
+      });
+      return {
+        ...report,
+        pullRequest: { ...report.pullRequest, headSha: finalized.newHeadSha },
+        newHeadSha: finalized.newHeadSha,
+        serviceRemediation: {
+          kind: "preserved_stash_applied_clean",
+          preservedStash: dropped,
+        },
+      };
     }
     return {
       ...report,
@@ -394,6 +502,15 @@ type NormalizedMergeConflictResolutionInput = MergeConflictResolutionInput & {
   serviceRemediation?: {
     kind: "prepared_base_ref_drift";
     preparation: ServiceOwnedMergeConflictPreparationResult;
+  } | {
+    kind: "preserved_stash_applied_clean";
+    preservedStash: IssuePreservedWorktreeStash;
+  } | {
+    kind: "preserved_stash_apply_conflicted";
+    applyResult: ServiceOwnedPreservedStashApplyResult & { status: "conflicted" };
+  } | {
+    kind: "stash_apply_finalized";
+    preservedStash: IssuePreservedWorktreeStash;
   };
 };
 
@@ -521,7 +638,8 @@ function canOmitNewHeadShaForServicePreparation(
   mergeConflict: IssueMergeConflictMetadata,
 ): boolean {
   return (
-    mergeConflict.servicePreparation?.strategy === "squash_rebase" &&
+    (mergeConflict.servicePreparation?.strategy === "squash_rebase" ||
+      mergeConflict.servicePreparation?.strategy === "stash_apply") &&
     (mergeConflict.servicePreparation.status === "conflicted" || mergeConflict.servicePreparation.status === "finalized") &&
     report.previousHeadSha === mergeConflict.servicePreparation.originalHeadSha
   );
@@ -534,9 +652,29 @@ function servicePreparationAfterReport(
 ): IssueMergeConflictMetadata["servicePreparation"] {
   const servicePreparation = mergeConflict.servicePreparation;
   if (servicePreparation === null || report.resolutionStatus !== "resolved") return servicePreparation;
+  if (servicePreparation.strategy === "stash_apply") {
+    const remediation = report.serviceRemediation;
+    const preservedStash =
+      remediation?.kind === "stash_apply_finalized"
+        ? remediation.preservedStash
+        : servicePreparation.preservedStash;
+    return {
+      ...servicePreparation,
+      status: "finalized",
+      preservedStash,
+      finalizedAt: now,
+      finalizedHeadSha: report.newHeadSha,
+    };
+  }
+  const remediation = report.serviceRemediation;
+  const preservedStash =
+    remediation?.kind === "preserved_stash_applied_clean"
+      ? remediation.preservedStash
+      : servicePreparation.preservedStash ?? null;
   return {
     ...servicePreparation,
     status: "finalized",
+    preservedStash,
     finalizedAt: now,
     finalizedHeadSha: report.newHeadSha,
   };
@@ -577,6 +715,10 @@ function mergeConflictAfterPreparedBaseDrift(input: {
       preparedAt: input.now,
       finalizedAt: resolved ? input.now : null,
       finalizedHeadSha: resolved ? input.report.newHeadSha : null,
+      preservedStash:
+        input.mergeConflict.servicePreparation?.strategy === "squash_rebase"
+          ? input.mergeConflict.servicePreparation.preservedStash ?? null
+          : null,
     },
     updatedAt: input.now,
     fixTurnCount: 0,
@@ -586,6 +728,92 @@ function mergeConflictAfterPreparedBaseDrift(input: {
     blockedAt: null,
     blockedReason: null,
   };
+}
+
+function mergeConflictAfterPreservedStashApplyConflict(input: {
+  issueId: string;
+  mergeConflict: IssueMergeConflictMetadata;
+  report: NormalizedMergeConflictResolutionInput;
+  now: string;
+}): IssueMergeConflictMetadata {
+  const remediation = input.report.serviceRemediation;
+  if (remediation?.kind !== "preserved_stash_apply_conflicted") {
+    throw new SymphonyError("invalid_request", "Preserved stash apply conflict metadata is missing");
+  }
+  const applyResult = remediation.applyResult;
+  const allowedFiles = sortedUnique([
+    ...applyResult.stash.dirtyFiles,
+    ...applyResult.changedFiles,
+    ...applyResult.conflictedFiles,
+  ]);
+  return {
+    ...input.mergeConflict,
+    id: `merge-conflict:${input.issueId}:stash-apply:${input.report.newHeadSha}:${applyResult.stash.stashSha}`,
+    status: "open",
+    resolutionStatus: "pending",
+    pullRequest: { ...input.report.pullRequest },
+    approvedHeadSha: input.report.newHeadSha,
+    currentHeadSha: input.report.newHeadSha,
+    resolvedHeadSha: null,
+    baseBranch: input.report.baseBranch,
+    baseHeadSha: input.report.baseHeadSha,
+    reason: "Preserved local changes conflicted while restoring after service-owned repair",
+    mergeableState: "dirty",
+    servicePreparation: {
+      strategy: "stash_apply",
+      status: "conflicted",
+      originalHeadSha: input.report.newHeadSha,
+      currentHeadSha: input.report.newHeadSha,
+      conflictedFiles: applyResult.conflictedFiles,
+      allowedFiles,
+      preservedStash: applyResult.stash,
+      preparedAt: input.now,
+      finalizedAt: null,
+      finalizedHeadSha: null,
+    },
+    updatedAt: input.now,
+    fixTurnCount: 0,
+    lastConflictFixRunId: null,
+    lastConflictResolutionReportId: null,
+    attemptRunIds: [],
+    blockedAt: null,
+    blockedReason: null,
+  };
+}
+
+function preservedStashFromReport(
+  report: NormalizedMergeConflictResolutionInput,
+): IssuePreservedWorktreeStash | null {
+  const remediation = report.serviceRemediation;
+  if (
+    remediation?.kind === "preserved_stash_applied_clean" ||
+    remediation?.kind === "stash_apply_finalized"
+  ) {
+    return remediation.preservedStash;
+  }
+  if (remediation?.kind === "preserved_stash_apply_conflicted") {
+    return remediation.applyResult.stash;
+  }
+  return null;
+}
+
+function upsertPreservedWorktreeStash(
+  stashes: IssuePreservedWorktreeStash[],
+  stash: IssuePreservedWorktreeStash,
+): IssuePreservedWorktreeStash[] {
+  const index = stashes.findIndex((item) => item.id === stash.id);
+  if (index === -1) return [...stashes, stash];
+  return stashes.map((item, itemIndex) => (itemIndex === index ? stash : item));
+}
+
+function preservedWorktreeStashesOf(lifecycle: {
+  preservedWorktreeStashes?: IssuePreservedWorktreeStash[];
+}): IssuePreservedWorktreeStash[] {
+  return lifecycle.preservedWorktreeStashes ?? [];
+}
+
+function sortedUnique(values: string[]): string[] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
 }
 
 function requireValue<T>(value: T | null | undefined, message: string): T {

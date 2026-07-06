@@ -24,6 +24,7 @@ import type {
   IssueMergeGateCheckOutcome,
   IssueMergeGateMergeabilityState,
   IssueMergeConflictMetadata,
+  IssuePreservedWorktreeStash,
   IssueMergeMetadata,
   IssueMergeGateState,
   IssueMergeGateResultRecord,
@@ -53,6 +54,7 @@ import {
 } from "./MergeGateLifecycle.js";
 import {
   ServiceOwnedMergeConflictGit,
+  type ServiceOwnedPreservedStashApplyResult,
   type ServiceOwnedMergeConflictPreparationResult,
 } from "./ServiceOwnedMergeConflictGit.js";
 
@@ -255,6 +257,9 @@ export interface MergePolicyConflictPreparationExecution {
   authHeader: string;
   resolvedHeadSha: string | null;
   pullRequestHeadSha: string;
+  preservedStash: IssuePreservedWorktreeStash | null;
+  stashApplyResult: ServiceOwnedPreservedStashApplyResult | null;
+  finalPreservedStash: IssuePreservedWorktreeStash | null;
 }
 
 export interface MergePolicyConflictWritebackPlan {
@@ -814,9 +819,10 @@ export class MergePolicyService {
   async refreshConflictBase(issue: Issue, observation: MergePolicyObservation): Promise<MergePolicyResult> {
     const plan = await this.planRefreshConflictBase(issue, observation);
     if (!plan) return { status: "skipped", reason: "merge conflict base no longer requires refresh" };
-    const execution = await this.prepareServiceConflictBranch(plan);
+    const execution = await this.prepareServiceConflictBranch(issue, plan);
     if (execution.preparation.status === "clean") {
       await this.publishPreparedConflictHead(plan, execution);
+      await this.restorePreservedStashAfterPreparedHead(issue, plan, execution);
     }
     const writebackPlan = this.planServiceConflictWritebacks(issue, plan, execution);
     await this.applyServiceConflictWritebacks(issue, plan, writebackPlan);
@@ -936,9 +942,10 @@ export class MergePolicyService {
 
   async prepareConflict(issue: Issue, observation: MergePolicyObservation): Promise<MergePolicyResult> {
     const plan = await this.planServicePreparedMergeConflict(issue, observation);
-    const execution = await this.prepareServiceConflictBranch(plan);
+    const execution = await this.prepareServiceConflictBranch(issue, plan);
     if (execution.preparation.status === "clean") {
       await this.publishPreparedConflictHead(plan, execution);
+      await this.restorePreservedStashAfterPreparedHead(issue, plan, execution);
     }
     const writebackPlan = this.planServiceConflictWritebacks(issue, plan, execution);
     await this.applyServiceConflictWritebacks(issue, plan, writebackPlan);
@@ -981,6 +988,23 @@ export class MergePolicyService {
     const github = this.options.client ?? createGitHubPullRequestClientForCapability(this.options.config, "github.merge");
     const authHeader = await github.gitAuthHeader();
     const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const operationId = `base-ref:${issue.id}:${requiredOriginalHeadSha}:${requiredLiveBaseHeadSha}`;
+    const preservedStash = await conflictGit.preserveDirtyWorktree({
+      workspacePath,
+      branchName: requiredBranchName,
+      baseBranch: requiredBaseBranch,
+      operationId,
+      source: "base_ref_repair",
+      message: `Symphony preserved local changes before base-ref repair for ${issue.identifier}`,
+    });
+    if (preservedStash !== null) {
+      await this.options.lifecycleStore.updateIssue(latestIssue, {
+        preservedWorktreeStashes: upsertPreservedWorktreeStash(
+          preservedWorktreeStashesOf(lifecycle),
+          preservedStash,
+        ),
+      });
+    }
     const preparation = await conflictGit.prepare({
       workspacePath,
       branchName: requiredBranchName,
@@ -991,7 +1015,6 @@ export class MergePolicyService {
       authHeader,
     });
 
-    const operationId = `base-ref:${issue.id}:${requiredOriginalHeadSha}:${requiredLiveBaseHeadSha}`;
     if (preparation.status === "clean") {
       await conflictGit.publishPreparedHead({
         workspacePath,
@@ -999,6 +1022,81 @@ export class MergePolicyService {
         previousRemoteHeadSha: requiredOriginalHeadSha,
         authHeader,
       });
+      let finalPreservedStash = preservedStash;
+      if (preservedStash !== null) {
+        const stashApply = await conflictGit.applyPreservedStash({
+          workspacePath,
+          branchName: requiredBranchName,
+          preservedStash,
+        });
+        if (stashApply.status === "conflicted") {
+          const conflictsState = this.options.config.mergePolicy.conflictsState;
+          if (conflictsState === null) {
+            throw new SymphonyError("invalid_request", "merge_policy.conflicts_state is required before Symphony can repair preserved local change conflicts");
+          }
+          const operations = planMergeConflictsWritebacks(
+            {
+              issue: latestIssue,
+              mergeId: `stash-apply:${issue.id}:${preparation.rebasedHeadSha}:${stashApply.stash.stashSha}`,
+              fromState: sourceState,
+              conflictsState,
+              pullRequest: { ...pullRequest, headSha: preparation.rebasedHeadSha },
+              mergeableState: "dirty",
+              reason: "Preserved local changes conflicted while restoring after base-ref repair",
+            },
+            this.options.config,
+          );
+          await this.requireMergeGateWritebacksSucceeded(latestIssue, operations, conflictsState);
+          const now = new Date().toISOString();
+          const conflict = buildStashApplyMergeConflict({
+            issue: latestIssue,
+            pullRequest: { ...pullRequest, headSha: preparation.rebasedHeadSha },
+            sourceState,
+            conflictsState,
+            baseBranch: requiredBaseBranch,
+            baseHeadSha: requiredLiveBaseHeadSha,
+            currentHeadSha: preparation.rebasedHeadSha,
+            preservedStash: stashApply.stash,
+            changedFiles: stashApply.changedFiles,
+            conflictedFiles: stashApply.conflictedFiles,
+            reason: "Preserved local changes conflicted while restoring after base-ref repair",
+            maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
+            now,
+          });
+          const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
+            phase: "merge_conflict_resolution",
+            blockedReason: null,
+            mergeGate: null,
+            mergeConflict: {
+              ...conflict,
+              writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
+            },
+            preservedWorktreeStashes: upsertPreservedWorktreeStash(
+              preservedWorktreeStashesOf(lifecycle),
+              stashApply.stash,
+            ),
+            summaryPointers: {
+              ciStatus: "conflicted",
+              workspacePath,
+              gitBranchName: requiredBranchName,
+              prUrl: pullRequest.url,
+              prNumber: pullRequest.number,
+              prHeadSha: preparation.rebasedHeadSha,
+              prBranch: requiredBranchName,
+              baseRef: requiredBaseBranch,
+            },
+          });
+          return {
+            status: "conflict_dispatched",
+            gate: emptyGateStatus(operationId, pullRequest, preparation.rebasedHeadSha, this.options.config.mergePolicy.requiredChecks),
+            conflict: updated.mergeConflict ?? conflict,
+          };
+        }
+        finalPreservedStash = await conflictGit.dropPreservedStash({
+          workspacePath,
+          preservedStash: stashApply.stash,
+        });
+      }
       const operations = planBaseRefRepairWritebacks(
         {
           issue: latestIssue,
@@ -1028,6 +1126,12 @@ export class MergePolicyService {
           prBranch: requiredBranchName,
           baseRef: requiredBaseBranch,
         },
+        preservedWorktreeStashes: finalPreservedStash
+          ? upsertPreservedWorktreeStash(
+              preservedWorktreeStashesOf(lifecycle),
+              finalPreservedStash,
+            )
+          : preservedWorktreeStashesOf(lifecycle),
       });
       return { status: "base_ref_repaired", headSha: preparation.rebasedHeadSha };
     }
@@ -1068,8 +1172,18 @@ export class MergePolicyService {
       mergeGate: null,
       mergeConflict: {
         ...conflict,
+        servicePreparation:
+          conflict.servicePreparation?.strategy === "squash_rebase"
+            ? { ...conflict.servicePreparation, preservedStash }
+            : conflict.servicePreparation,
         writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
       },
+      preservedWorktreeStashes: preservedStash
+        ? upsertPreservedWorktreeStash(
+            preservedWorktreeStashesOf(lifecycle),
+            preservedStash,
+          )
+        : preservedWorktreeStashesOf(lifecycle),
       summaryPointers: {
         ciStatus: "conflicted",
         workspacePath,
@@ -1127,11 +1241,29 @@ export class MergePolicyService {
   }
 
   async prepareServiceConflictBranch(
+    issue: Issue,
     plan: MergePolicyConflictPreparationPlan,
   ): Promise<MergePolicyConflictPreparationExecution> {
     const github = this.options.client ?? createGitHubPullRequestClientForCapability(this.options.config, "github.merge");
     const authHeader = await github.gitAuthHeader();
     const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const operationId = `${plan.mode === "base_refresh" ? "service-conflict-base-refresh" : "service-conflict"}:${issue.id}:${plan.expectedHeadSha}:${plan.baseObservation.liveBaseHeadSha}`;
+    const preservedStash = await conflictGit.preserveDirtyWorktree({
+      workspacePath: plan.workspacePath,
+      branchName: plan.branchName,
+      baseBranch: plan.baseBranch,
+      operationId,
+      source: plan.mode === "base_refresh" ? "service_conflict_base_refresh" : "service_conflict_prepare",
+      message: `Symphony preserved local changes before service conflict repair for ${issue.identifier}`,
+    });
+    if (preservedStash !== null) {
+      await this.options.lifecycleStore.updateIssue(issue, {
+        preservedWorktreeStashes: upsertPreservedWorktreeStash(
+          preservedWorktreeStashesOf(plan.lifecycle),
+          preservedStash,
+        ),
+      });
+    }
     const preparation =
       plan.mode === "base_refresh"
         ? await conflictGit.reprepareAfterBaseDrift({
@@ -1157,6 +1289,9 @@ export class MergePolicyService {
       authHeader,
       resolvedHeadSha: preparation.status === "clean" ? preparation.rebasedHeadSha : null,
       pullRequestHeadSha: preparation.status === "clean" ? preparation.rebasedHeadSha : plan.expectedHeadSha,
+      preservedStash,
+      stashApplyResult: null,
+      finalPreservedStash: preservedStash,
     };
   }
 
@@ -1175,25 +1310,71 @@ export class MergePolicyService {
     return { published: true, headSha: execution.preparation.rebasedHeadSha };
   }
 
+  async restorePreservedStashAfterPreparedHead(
+    issue: Issue,
+    plan: MergePolicyConflictPreparationPlan,
+    execution: MergePolicyConflictPreparationExecution,
+  ): Promise<void> {
+    if (execution.preservedStash === null || execution.preparation.status !== "clean") return;
+    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const stashApply = await conflictGit.applyPreservedStash({
+      workspacePath: plan.workspacePath,
+      branchName: plan.branchName,
+      preservedStash: execution.preservedStash,
+    });
+    execution.stashApplyResult = stashApply;
+    if (stashApply.status === "clean") {
+      execution.finalPreservedStash = await conflictGit.dropPreservedStash({
+        workspacePath: plan.workspacePath,
+        preservedStash: stashApply.stash,
+      });
+      await this.options.lifecycleStore.updateIssue(issue, {
+        preservedWorktreeStashes: upsertPreservedWorktreeStash(
+          preservedWorktreeStashesOf(plan.lifecycle),
+          execution.finalPreservedStash,
+        ),
+      });
+      return;
+    }
+    execution.finalPreservedStash = stashApply.stash;
+    await this.options.lifecycleStore.updateIssue(issue, {
+      preservedWorktreeStashes: upsertPreservedWorktreeStash(
+        preservedWorktreeStashesOf(plan.lifecycle),
+        stashApply.stash,
+      ),
+    });
+  }
+
   planServiceConflictWritebacks(
     issue: Issue,
     plan: MergePolicyConflictPreparationPlan,
     execution: MergePolicyConflictPreparationExecution,
   ): MergePolicyConflictWritebackPlan {
-    if (execution.preparation.status !== "conflicted") return { operations: [] };
+    const stashApplyConflict =
+      execution.stashApplyResult?.status === "conflicted"
+        ? execution.stashApplyResult
+        : null;
+    if (plan.mode === "base_refresh") return { operations: [] };
+    if (execution.preparation.status !== "conflicted" && stashApplyConflict === null) return { operations: [] };
     return {
       operations: planMergeConflictsWritebacks(
         {
           issue,
-          mergeId: `merge:${issue.id}:${plan.gate.headSha}`,
+          mergeId:
+            stashApplyConflict === null
+              ? `merge:${issue.id}:${plan.gate.headSha}`
+              : `stash-apply:${issue.id}:${execution.pullRequestHeadSha}:${stashApplyConflict.stash.stashSha}`,
           fromState: plan.sourceState,
           conflictsState: plan.conflictsState,
           pullRequest: {
             ...plan.gate.pullRequest,
             headSha: execution.pullRequestHeadSha,
           },
-          mergeableState: plan.livePullRequest.mergeableState,
-          reason: plan.gate.mergeability?.reason ?? "Pull request has merge conflicts with the base branch",
+          mergeableState: stashApplyConflict === null ? plan.livePullRequest.mergeableState : "dirty",
+          reason:
+            stashApplyConflict === null
+              ? plan.gate.mergeability?.reason ?? "Pull request has merge conflicts with the base branch"
+              : "Preserved local changes conflicted while restoring after service-owned repair",
         },
         this.options.config,
       ),
@@ -1222,32 +1403,75 @@ export class MergePolicyService {
     writebackPlan: MergePolicyConflictWritebackPlan,
   ): Promise<MergePolicyResult> {
     const now = new Date().toISOString();
-    const conflict = buildServicePreparedMergeConflict({
-      issue,
-      gate: plan.gate,
-      sourceState: plan.sourceState,
-      conflictsState: plan.conflictsState,
-      mergeableState: plan.mergeableState,
-      preparation: execution.preparation,
-      resolvedHeadSha: execution.resolvedHeadSha,
-      pullRequestHeadSha: execution.pullRequestHeadSha,
-      maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
-      now,
-    });
+    const stashApplyConflict =
+      execution.stashApplyResult?.status === "conflicted"
+        ? execution.stashApplyResult
+        : null;
+    const conflict =
+      stashApplyConflict === null
+        ? buildServicePreparedMergeConflict({
+            issue,
+            gate: plan.gate,
+            sourceState: plan.sourceState,
+            conflictsState: plan.conflictsState,
+            mergeableState: plan.mergeableState,
+            preparation: withPreservedStash(
+              execution.preparation,
+              execution.finalPreservedStash,
+            ),
+            resolvedHeadSha: execution.resolvedHeadSha,
+            pullRequestHeadSha: execution.pullRequestHeadSha,
+            maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
+            now,
+          })
+        : buildStashApplyMergeConflict({
+            issue,
+            pullRequest: { ...plan.gate.pullRequest, headSha: execution.pullRequestHeadSha },
+            sourceState: plan.sourceState,
+            conflictsState: plan.conflictsState,
+            baseBranch: plan.baseBranch,
+            baseHeadSha: plan.baseObservation.liveBaseHeadSha,
+            currentHeadSha: execution.pullRequestHeadSha,
+            preservedStash: stashApplyConflict.stash,
+            changedFiles: stashApplyConflict.changedFiles,
+            conflictedFiles: stashApplyConflict.conflictedFiles,
+            reason: "Preserved local changes conflicted while restoring after service-owned repair",
+            maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
+            now,
+          });
     const operationKeys =
       writebackPlan.operations.length > 0
         ? writebackPlan.operations.map((operation) => operation.idempotencyKey)
         : plan.existingWritebackOperationKeys;
+    const phase =
+      stashApplyConflict !== null
+        ? "merge_conflict_resolution"
+        : execution.preparation.status === "clean" && execution.finalPreservedStash !== null
+          ? "implementation"
+          : execution.preparation.status === "clean"
+            ? "passed"
+            : "merge_conflict_resolution";
     const updated = await this.options.lifecycleStore.updateIssue(issue, {
-      phase: execution.preparation.status === "clean" ? "passed" : "merge_conflict_resolution",
+      phase,
       blockedReason: null,
       mergeGate: null,
       mergeConflict: {
         ...conflict,
         writebackOperationKeys: operationKeys,
       },
+      preservedWorktreeStashes: execution.finalPreservedStash
+        ? upsertPreservedWorktreeStash(
+            preservedWorktreeStashesOf(plan.lifecycle),
+            execution.finalPreservedStash,
+          )
+        : preservedWorktreeStashesOf(plan.lifecycle),
       summaryPointers: {
-        ciStatus: execution.preparation.status === "clean" ? "success" : "conflicted",
+        ciStatus:
+          phase === "implementation"
+            ? null
+            : execution.preparation.status === "clean" && stashApplyConflict === null
+              ? "success"
+              : "conflicted",
         prUrl: plan.gate.pullRequest.url,
         prNumber: plan.gate.pullRequest.number,
         prHeadSha: execution.pullRequestHeadSha,
@@ -1586,7 +1810,6 @@ export class MergePolicyService {
         livePullRequest,
         baseObservation,
         workerRun,
-        github,
       );
     }
     if (decision.kind === "passed") {
@@ -1891,66 +2114,34 @@ export class MergePolicyService {
     const baseObservation = await resolveLiveBaseObservation(github, livePullRequest);
     if (baseObservation.liveBaseHeadSha === servicePreparation.preparedBaseHeadSha) return null;
 
-    const authHeader = await github.gitAuthHeader();
-    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
-    const preparation = await conflictGit.reprepareAfterBaseDrift({
-      workspacePath,
-      branchName,
-      expectedHeadSha: conflict.currentHeadSha,
-      baseBranch,
-      observedPrBaseHeadSha: baseObservation.observedPrBaseHeadSha,
-      liveBaseHeadSha: baseObservation.liveBaseHeadSha,
-      authHeader,
-    });
-    let resolvedHeadSha: string | null = null;
-    let pullRequestHeadSha = conflict.currentHeadSha;
-    if (preparation.status === "clean") {
-      resolvedHeadSha = preparation.rebasedHeadSha;
-      pullRequestHeadSha = preparation.rebasedHeadSha;
-      await conflictGit.publishPreparedHead({
-        workspacePath,
-        branchName,
-        previousRemoteHeadSha: conflict.currentHeadSha,
-        authHeader,
-      });
-    }
-
-    const pullRequest = { ...conflict.pullRequest, headSha: pullRequestHeadSha };
     const gate = gateWithMergeability(
       emptyGateStatus(mergeGateId(issue.id, conflict.pullRequest, conflict.currentHeadSha), conflict.pullRequest, conflict.currentHeadSha, this.options.config.mergePolicy.requiredChecks),
       mergeabilityStateFromPullRequest(livePullRequest, conflict.pullRequest, conflict.currentHeadSha, baseObservation),
     );
-    const now = new Date().toISOString();
-    const refreshedConflict = buildServicePreparedMergeConflict({
-      issue,
+    const plan: MergePolicyConflictPreparationPlan = {
+      mode: "base_refresh",
+      lifecycle,
       gate,
       sourceState: conflict.sourceState,
       conflictsState,
+      livePullRequest,
+      baseObservation,
+      workspacePath,
+      branchName,
+      expectedHeadSha: conflict.currentHeadSha,
+      previousRemoteHeadSha: conflict.currentHeadSha,
+      baseBranch,
       mergeableState: livePullRequest.mergeableState,
-      preparation,
-      resolvedHeadSha,
-      pullRequestHeadSha,
-      maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
-      now,
-    });
-    const updated = await this.options.lifecycleStore.updateIssue(issue, {
-      phase: preparation.status === "clean" ? "passed" : "merge_conflict_resolution",
-      blockedReason: null,
-      mergeGate: null,
-      mergeConflict: {
-        ...refreshedConflict,
-        writebackOperationKeys: conflict.writebackOperationKeys,
-      },
-      summaryPointers: {
-        ciStatus: preparation.status === "clean" ? "success" : "conflicted",
-        prUrl: pullRequest.url,
-        prNumber: pullRequest.number,
-        prHeadSha: pullRequest.headSha,
-        prBranch: pullRequest.branch,
-        workspacePath,
-      },
-    });
-    return { status: "conflict_dispatched", gate, conflict: updated.mergeConflict ?? refreshedConflict };
+      existingWritebackOperationKeys: conflict.writebackOperationKeys,
+    };
+    const execution = await this.prepareServiceConflictBranch(issue, plan);
+    if (execution.preparation.status === "clean") {
+      await this.publishPreparedConflictHead(plan, execution);
+      await this.restorePreservedStashAfterPreparedHead(issue, plan, execution);
+    }
+    const writebackPlan = this.planServiceConflictWritebacks(issue, plan, execution);
+    await this.applyServiceConflictWritebacks(issue, plan, writebackPlan);
+    return this.recordServicePreparedMergeConflict(issue, plan, execution, writebackPlan);
   }
 
   private async handleServicePreparedMergeConflict(
@@ -1962,7 +2153,6 @@ export class MergePolicyService {
     livePullRequest: PullRequestDetails,
     baseObservation: LiveBaseObservation,
     workerRun: RunRecord | null,
-    github: MergePolicyGitHubClient,
   ): Promise<MergePolicyResult> {
     const conflictsState = this.options.config.mergePolicy.conflictsState;
     if (conflictsState === null) {
@@ -1974,82 +2164,30 @@ export class MergePolicyService {
     if (!workspacePath) {
       throw new SymphonyError("invalid_request", "Service-owned conflict preparation requires the worker workspace path");
     }
-    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
-    const authHeader = await github.gitAuthHeader();
-    const preparation = await conflictGit.prepare({
-      workspacePath,
-      branchName,
-      expectedHeadSha: gate.headSha,
-      baseBranch: livePullRequest.baseBranch,
-      observedPrBaseHeadSha: baseObservation.observedPrBaseHeadSha,
-      liveBaseHeadSha: baseObservation.liveBaseHeadSha,
-      authHeader,
-    });
-    let resolvedHeadSha: string | null = null;
-    let pullRequestHeadSha = gate.headSha;
-    if (preparation.status === "clean") {
-      resolvedHeadSha = preparation.rebasedHeadSha;
-      pullRequestHeadSha = preparation.rebasedHeadSha;
-      await conflictGit.publishPreparedHead({
-        workspacePath,
-        branchName,
-        previousRemoteHeadSha: gate.headSha,
-        authHeader,
-      });
-    }
-
-    const operations =
-      preparation.status === "conflicted"
-        ? planMergeConflictsWritebacks(
-            {
-              issue,
-              mergeId: `merge:${issue.id}:${gate.headSha}`,
-              fromState: sourceState,
-              conflictsState,
-              pullRequest: {
-                ...pullRequest,
-                headSha: pullRequestHeadSha,
-              },
-              mergeableState: livePullRequest.mergeableState,
-              reason: gate.mergeability?.reason ?? "Pull request has merge conflicts with the base branch",
-            },
-            this.options.config,
-          )
-        : [];
-    await this.requireMergeGateWritebacksSucceeded(issue, operations, preparation.status === "conflicted" ? conflictsState : null);
-
-    const now = new Date().toISOString();
-    const conflict = buildServicePreparedMergeConflict({
-      issue,
+    const plan: MergePolicyConflictPreparationPlan = {
+      mode: "initial",
+      lifecycle,
       gate,
       sourceState,
       conflictsState,
+      livePullRequest,
+      baseObservation,
+      workspacePath,
+      branchName,
+      expectedHeadSha: gate.headSha,
+      previousRemoteHeadSha: gate.headSha,
+      baseBranch: livePullRequest.baseBranch,
       mergeableState: livePullRequest.mergeableState,
-      preparation,
-      resolvedHeadSha,
-      pullRequestHeadSha,
-      maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
-      now,
-    });
-    const updated = await this.options.lifecycleStore.updateIssue(issue, {
-      phase: preparation.status === "clean" ? "passed" : "merge_conflict_resolution",
-      blockedReason: null,
-      mergeGate: null,
-      mergeConflict: {
-        ...conflict,
-        writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
-      },
-      summaryPointers: {
-        ciStatus: preparation.status === "clean" ? "success" : "conflicted",
-        prUrl: pullRequest.url,
-        prNumber: pullRequest.number,
-        prHeadSha: pullRequestHeadSha,
-        prBranch: pullRequest.branch,
-        workspacePath,
-      },
-    });
-    const storedConflict = updated.mergeConflict ?? conflict;
-    return { status: "conflict_dispatched", gate, conflict: storedConflict };
+      existingWritebackOperationKeys: [],
+    };
+    const execution = await this.prepareServiceConflictBranch(issue, plan);
+    if (execution.preparation.status === "clean") {
+      await this.publishPreparedConflictHead(plan, execution);
+      await this.restorePreservedStashAfterPreparedHead(issue, plan, execution);
+    }
+    const writebackPlan = this.planServiceConflictWritebacks(issue, plan, execution);
+    await this.applyServiceConflictWritebacks(issue, plan, writebackPlan);
+    return this.recordServicePreparedMergeConflict(issue, plan, execution, writebackPlan);
   }
 
   private mergeGateWritebackContext(issue: Issue, gate: MergeGateStatus, sourceState: string, reviewRound: number) {
@@ -2461,7 +2599,9 @@ function buildServicePreparedMergeConflict(input: {
   sourceState: string;
   conflictsState: string;
   mergeableState: string | null;
-  preparation: ServiceOwnedMergeConflictPreparationResult;
+  preparation: ServiceOwnedMergeConflictPreparationResult & {
+    preservedStash?: IssuePreservedWorktreeStash | null;
+  };
   resolvedHeadSha: string | null;
   pullRequestHeadSha: string;
   maxFixTurns: number;
@@ -2498,6 +2638,7 @@ function buildServicePreparedMergeConflict(input: {
       preparedAt: input.now,
       finalizedAt: resolved ? input.now : null,
       finalizedHeadSha: input.resolvedHeadSha,
+      preservedStash: input.preparation.preservedStash ?? null,
     },
     detectedAt: input.now,
     updatedAt: input.now,
@@ -2510,6 +2651,93 @@ function buildServicePreparedMergeConflict(input: {
     blockedAt: null,
     blockedReason: null,
   };
+}
+
+function buildStashApplyMergeConflict(input: {
+  issue: Issue;
+  pullRequest: CompletionReportPullRequestRef;
+  sourceState: string;
+  conflictsState: string;
+  baseBranch: string | null;
+  baseHeadSha: string | null;
+  currentHeadSha: string;
+  preservedStash: IssuePreservedWorktreeStash;
+  changedFiles: string[];
+  conflictedFiles: string[];
+  reason: string;
+  maxFixTurns: number;
+  now: string;
+}): IssueMergeConflictMetadata {
+  const allowedFiles = sortedUnique([
+    ...input.preservedStash.dirtyFiles,
+    ...input.changedFiles,
+    ...input.conflictedFiles,
+  ]);
+  return {
+    id: `merge-conflict:${input.issue.id}:stash-apply:${input.currentHeadSha}:${input.preservedStash.stashSha}`,
+    status: "open",
+    resolutionStatus: "pending",
+    pullRequest: { ...input.pullRequest, headSha: input.currentHeadSha },
+    approvedHeadSha: input.currentHeadSha,
+    currentHeadSha: input.currentHeadSha,
+    resolvedHeadSha: null,
+    baseBranch: input.baseBranch,
+    baseHeadSha: input.baseHeadSha,
+    sourceState: input.sourceState,
+    conflictsState: input.conflictsState,
+    reason: input.reason,
+    mergeableState: "dirty",
+    servicePreparation: {
+      strategy: "stash_apply",
+      status: "conflicted",
+      originalHeadSha: input.currentHeadSha,
+      currentHeadSha: input.currentHeadSha,
+      conflictedFiles: input.conflictedFiles,
+      allowedFiles,
+      preservedStash: input.preservedStash,
+      preparedAt: input.now,
+      finalizedAt: null,
+      finalizedHeadSha: null,
+    },
+    detectedAt: input.now,
+    updatedAt: input.now,
+    fixTurnCount: 0,
+    maxFixTurns: input.maxFixTurns,
+    lastConflictFixRunId: null,
+    lastConflictResolutionReportId: null,
+    attemptRunIds: [],
+    writebackOperationKeys: [],
+    blockedAt: null,
+    blockedReason: null,
+  };
+}
+
+function withPreservedStash(
+  preparation: ServiceOwnedMergeConflictPreparationResult,
+  preservedStash: IssuePreservedWorktreeStash | null,
+): ServiceOwnedMergeConflictPreparationResult & {
+  preservedStash?: IssuePreservedWorktreeStash | null;
+} {
+  return preservedStash === null ? preparation : { ...preparation, preservedStash };
+}
+
+function upsertPreservedWorktreeStash(
+  stashes: IssuePreservedWorktreeStash[],
+  stash: IssuePreservedWorktreeStash,
+): IssuePreservedWorktreeStash[] {
+  const index = stashes.findIndex((item) => item.id === stash.id);
+  if (index === -1) return [...stashes, stash];
+  return stashes.map((item, itemIndex) => (itemIndex === index ? stash : item));
+}
+
+function preservedWorktreeStashesOf(
+  lifecycle: Pick<IssueLifecycleRecord, "preservedWorktreeStashes">,
+): IssuePreservedWorktreeStash[] {
+  return lifecycle.preservedWorktreeStashes ?? [];
+}
+
+function sortedUnique(values: string[]): string[] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
 }
 
 async function validateConflictApprovalCarryForward(

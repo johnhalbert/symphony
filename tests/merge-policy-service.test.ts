@@ -14,6 +14,7 @@ import {
   FileIssueLifecycleStore,
   latestCurrentApprovalPassVerdict,
   type IssueMergeGateState,
+  type IssuePreservedWorktreeStash,
   type IssueReviewVerdictRecord,
 } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
@@ -785,6 +786,104 @@ describe("MergePolicyService", () => {
         prBranch: "symphony/TEST-1",
         baseRef: "main",
       },
+    });
+  });
+
+  it("routes preserved local-change conflicts after clean base-ref repair to a stash-apply conflict worker", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "In Review", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const conflictGit = new FakeConflictGit({
+      status: "clean",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      rebasedHeadSha: "rebased-head-sha",
+      conflictedFiles: [],
+    });
+    conflictGit.preservedStash = preservedStashRecord(path.join(root, currentIssue.identifier));
+    conflictGit.stashApplyResult = {
+      status: "conflicted",
+      stash: {
+        ...conflictGit.preservedStash,
+        status: "apply_conflicted",
+        conflictedFiles: ["src/local.ts"],
+        appliedAt: "2026-01-01T00:00:02.000Z",
+      },
+      changedFiles: ["src/local.ts"],
+      conflictedFiles: ["src/local.ts"],
+      headSha: "rebased-head-sha",
+    };
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient(),
+      conflictGit,
+    });
+
+    const result = await service.repairBaseRefDrift(currentIssue, baseRefObservation());
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result.status).toBe("conflict_dispatched");
+    expect(conflictGit.publishInput).toMatchObject({
+      previousRemoteHeadSha: "head-sha-1",
+    });
+    expect(conflictGit.applyInput).toMatchObject({
+      preservedStash: conflictGit.preservedStash,
+    });
+    expect(conflictGit.dropInput).toBeNull();
+    expect(currentIssue.state).toBe("Approved with Conflicts");
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["In Review"],
+        toState: "Approved with Conflicts",
+        reason: "Symphony gated merge blocked: Preserved local changes conflicted while restoring after base-ref repair",
+      },
+    ]);
+    expect(lifecycle).toMatchObject({
+      phase: "merge_conflict_resolution",
+      mergeConflict: {
+        status: "open",
+        resolutionStatus: "pending",
+        currentHeadSha: "rebased-head-sha",
+        reason: "Preserved local changes conflicted while restoring after base-ref repair",
+        servicePreparation: {
+          strategy: "stash_apply",
+          status: "conflicted",
+          originalHeadSha: "rebased-head-sha",
+          currentHeadSha: "rebased-head-sha",
+          conflictedFiles: ["src/local.ts"],
+          allowedFiles: ["src/local.ts"],
+          preservedStash: {
+            status: "apply_conflicted",
+            stashRef: "refs/symphony/preserved-stashes/test/stash-1",
+          },
+        },
+      },
+      preservedWorktreeStashes: [
+        expect.objectContaining({
+          status: "apply_conflicted",
+          conflictedFiles: ["src/local.ts"],
+        }),
+      ],
     });
   });
 
@@ -3876,6 +3975,11 @@ class FakeConflictGit extends ServiceOwnedMergeConflictGit {
   prepareInput: Parameters<ServiceOwnedMergeConflictGit["prepare"]>[0] | null = null;
   reprepareInput: Parameters<ServiceOwnedMergeConflictGit["reprepareAfterBaseDrift"]>[0] | null = null;
   publishInput: Parameters<ServiceOwnedMergeConflictGit["publishPreparedHead"]>[0] | null = null;
+  preserveInput: Parameters<ServiceOwnedMergeConflictGit["preserveDirtyWorktree"]>[0] | null = null;
+  applyInput: Parameters<ServiceOwnedMergeConflictGit["applyPreservedStash"]>[0] | null = null;
+  dropInput: Parameters<ServiceOwnedMergeConflictGit["dropPreservedStash"]>[0] | null = null;
+  preservedStash: IssuePreservedWorktreeStash | null = null;
+  stashApplyResult: Awaited<ReturnType<ServiceOwnedMergeConflictGit["applyPreservedStash"]>> | null = null;
 
   constructor(private readonly result: ServiceOwnedMergeConflictPreparationResult) {
     super();
@@ -3894,6 +3998,52 @@ class FakeConflictGit extends ServiceOwnedMergeConflictGit {
   override async publishPreparedHead(input: Parameters<ServiceOwnedMergeConflictGit["publishPreparedHead"]>[0]) {
     this.publishInput = input;
   }
+
+  override async preserveDirtyWorktree(input: Parameters<ServiceOwnedMergeConflictGit["preserveDirtyWorktree"]>[0]) {
+    this.preserveInput = input;
+    return this.preservedStash;
+  }
+
+  override async applyPreservedStash(input: Parameters<ServiceOwnedMergeConflictGit["applyPreservedStash"]>[0]) {
+    this.applyInput = input;
+    if (this.stashApplyResult === null) {
+      return {
+        status: "clean" as const,
+        stash: { ...input.preservedStash, status: "applied_clean" as const, appliedAt: "2026-01-01T00:00:00.000Z" },
+        changedFiles: input.preservedStash.dirtyFiles,
+        headSha: this.result.status === "clean" ? this.result.rebasedHeadSha : input.preservedStash.originalHeadSha,
+      };
+    }
+    return this.stashApplyResult;
+  }
+
+  override async dropPreservedStash(input: Parameters<ServiceOwnedMergeConflictGit["dropPreservedStash"]>[0]) {
+    this.dropInput = input;
+    return { ...input.preservedStash, status: "dropped" as const, droppedAt: "2026-01-01T00:00:01.000Z", dropError: null };
+  }
+}
+
+function preservedStashRecord(workspacePath: string): IssuePreservedWorktreeStash {
+  return {
+    version: 1,
+    id: "preserved-stash:issue-1:stash-1",
+    operationId: "base-ref:issue-1:head-sha-1:base-sha-2",
+    source: "base_ref_repair",
+    stashRef: "refs/symphony/preserved-stashes/test/stash-1",
+    stashSha: "stash-sha-1",
+    message: "Symphony preserved local changes",
+    workspacePath,
+    branchName: "symphony/TEST-1",
+    baseBranch: "main",
+    originalHeadSha: "head-sha-1",
+    dirtyFiles: ["src/local.ts"],
+    status: "created",
+    conflictedFiles: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    appliedAt: null,
+    droppedAt: null,
+    dropError: null,
+  };
 }
 
 class MemoryWriter implements TrackerWriter {

@@ -164,7 +164,7 @@ function mergeConflictResolutionInputSchema(): Record<string, unknown> {
       newHeadSha: {
         anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
         description:
-          "PR head SHA after this conflict-fix attempt when known. Omit or set null for Symphony service-prepared conflicts; Symphony finalizes the rebase and fills the final head SHA.",
+          "PR head SHA after this conflict-fix attempt when known. Omit or set null for Symphony service-prepared rebase or stash-apply conflicts; Symphony finalizes the git operation and fills the final head SHA.",
       },
       baseBranch: {
         type: "string",

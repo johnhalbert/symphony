@@ -3438,7 +3438,7 @@ export class Orchestrator {
               "Merge conflict preparation requires a plan",
             );
           const execution =
-            await service.prepareServiceConflictBranch(preparationPlan);
+            await service.prepareServiceConflictBranch(context.issue, preparationPlan);
           context.mergePolicy.conflictPreparationExecution = execution;
           return {
             details: {
@@ -3470,6 +3470,11 @@ export class Orchestrator {
             };
           }
           const result = await service.publishPreparedConflictHead(
+            preparationPlan,
+            execution,
+          );
+          await service.restorePreservedStashAfterPreparedHead(
+            context.issue,
             preparationPlan,
             execution,
           );
@@ -16648,12 +16653,30 @@ function formatMergeConflictServicePreparationPrompt(
 ): string[] {
   const servicePreparation = conflict?.servicePreparation ?? null;
   if (servicePreparation === null) return [];
+  if (servicePreparation.strategy === "stash_apply") {
+    return [
+      `- Service preparation: ${servicePreparation.strategy} (${servicePreparation.status})`,
+      "- Conflict source: preserved local changes restored after service-owned git repair",
+      `- Current PR head SHA: ${servicePreparation.currentHeadSha}`,
+      `- Stash ref: ${servicePreparation.preservedStash.stashRef}`,
+      `- Stash status: ${servicePreparation.preservedStash.status}`,
+      `- Preserved local-change files: ${servicePreparation.preservedStash.dirtyFiles.length === 0 ? "none" : servicePreparation.preservedStash.dirtyFiles.join(", ")}`,
+      `- Stash-apply conflicted files: ${servicePreparation.conflictedFiles.length === 0 ? "none" : servicePreparation.conflictedFiles.join(", ")}`,
+      `- Allowed repair files: ${servicePreparation.allowedFiles.length === 0 ? "none" : servicePreparation.allowedFiles.join(", ")}`,
+    ];
+  }
   return [
     `- Service preparation: ${servicePreparation.strategy} (${servicePreparation.status})`,
     `- Service observed PR base head SHA: ${servicePreparation.observedPrBaseHeadSha ?? "n/a"}`,
     `- Service live base head SHA: ${servicePreparation.liveBaseHeadSha}`,
     `- Service prepared base head SHA: ${servicePreparation.preparedBaseHeadSha}`,
     `- Service-prepared conflicted files: ${servicePreparation.conflictedFiles.length === 0 ? "none" : servicePreparation.conflictedFiles.join(", ")}`,
+    ...(servicePreparation.preservedStash
+      ? [
+          `- Pending preserved local changes stash: ${servicePreparation.preservedStash.stashRef}`,
+          `- Preserved local-change files: ${servicePreparation.preservedStash.dirtyFiles.length === 0 ? "none" : servicePreparation.preservedStash.dirtyFiles.join(", ")}`,
+        ]
+      : []),
   ];
 }
 

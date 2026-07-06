@@ -132,6 +132,44 @@ describe("ServiceOwnedMergeConflictGit", () => {
       },
     });
   });
+
+  it("preserves dirty worktree changes in a custom stash ref, reapplies them, and drops the ref", async () => {
+    const { workspace, branchName } = await conflictedRepo(root);
+    const serviceGit = new ServiceOwnedMergeConflictGit();
+    await writeFile(path.join(workspace, "local.txt"), "local edits\n", "utf8");
+
+    const stash = await serviceGit.preserveDirtyWorktree({
+      workspacePath: workspace,
+      branchName,
+      baseBranch: "main",
+      operationId: "base-ref:issue-1:head-sha:base-sha",
+      source: "base_ref_repair",
+    });
+
+    expect(stash).toMatchObject({
+      status: "created",
+      dirtyFiles: ["local.txt"],
+      branchName,
+      baseBranch: "main",
+    });
+    expect((await git(["status", "--porcelain=v1", "-uall"], workspace)).trim()).toBe("");
+    expect((await git(["rev-parse", stash!.stashRef], workspace)).trim()).toBe(stash!.stashSha);
+
+    const applied = await serviceGit.applyPreservedStash({
+      workspacePath: workspace,
+      branchName,
+      preservedStash: stash!,
+    });
+
+    expect(applied.status).toBe("clean");
+    expect((await readFile(path.join(workspace, "local.txt"), "utf8")).replace(/\r\n/g, "\n")).toBe("local edits\n");
+    const dropped = await serviceGit.dropPreservedStash({
+      workspacePath: workspace,
+      preservedStash: applied.stash,
+    });
+    expect(dropped.status).toBe("dropped");
+    await expect(git(["rev-parse", stash!.stashRef], workspace)).rejects.toThrow(/git exited/);
+  });
 });
 
 async function conflictedRepo(root: string): Promise<{
