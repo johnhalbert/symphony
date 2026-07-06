@@ -1752,8 +1752,9 @@ describe("StatusServer durable API", () => {
 
     const docsRunning = liveRunningFixture(config, "ENG-123", "In Progress");
     docsRunning.issueId = "issue-docs-state-live-1";
-    docsRunning.runId = "run-docs-state-live-1";
-    docsRunning.sessionId = "docs-state-live-session-1";
+    docsRunning.runId = null;
+    docsRunning.sessionId = null;
+    docsRunning.liveness.activeRunId = null;
     docsRunning.projectContext = docsProjectContext;
     docsRunning.metadata.branchName = "symphony/docs/ENG-123";
     docsRunning.metadata.gitBranchName = "symphony/docs/ENG-123";
@@ -1773,8 +1774,9 @@ describe("StatusServer durable API", () => {
 
     const symphonyRunning = liveRunningFixture(config, "ENG-123", "Blocked");
     symphonyRunning.issueId = "issue-symphony-state-live-1";
-    symphonyRunning.runId = "run-symphony-state-live-1";
-    symphonyRunning.sessionId = "symphony-state-live-session-1";
+    symphonyRunning.runId = null;
+    symphonyRunning.sessionId = null;
+    symphonyRunning.liveness.activeRunId = null;
     symphonyRunning.projectContext = symphonyProjectContext;
     symphonyRunning.metadata.branchName = "symphony/symphony/ENG-123";
     symphonyRunning.metadata.gitBranchName = "symphony/symphony/ENG-123";
@@ -1829,6 +1831,24 @@ describe("StatusServer durable API", () => {
           }>;
         };
       };
+      const dashboardResponse = await fetch(`${baseUrl}/api/v1/web/dashboard`);
+      const dashboardBody = (await dashboardResponse.json()) as {
+        runningAgents: Array<{
+          id: string;
+          issue: string;
+          title: string;
+          projectContext?: ProjectContextAttribution | undefined;
+        }>;
+      };
+      const sidebarResponse = await fetch(`${baseUrl}/api/v1/web/sidebar`);
+      const sidebarBody = (await sidebarResponse.json()) as {
+        runningAgents: Array<{
+          id: string;
+          issue: string;
+          title: string;
+          projectContext?: ProjectContextAttribution | undefined;
+        }>;
+      };
 
       const groupActiveAgentsByContext = (
         rows: Array<{
@@ -1876,12 +1896,55 @@ describe("StatusServer durable API", () => {
           issueDetails: row.issueDetails.issue,
         })),
       );
+      const groupProjectedRunningAgentsByContext = (
+        rows: Array<{
+          issue: string;
+          title: string;
+          projectContext?: ProjectContextAttribution | undefined;
+        }>,
+      ) =>
+        rows.reduce<
+          Record<
+            string,
+            Array<{
+              issue: string;
+              title: string;
+              projectContextId: string | null | undefined;
+              projectContextLabel: string | null | undefined;
+              linearProjectSlug: string | null | undefined;
+              routingSource: string | null | undefined;
+            }>
+          >
+        >((groups, row) => {
+          const contextId = row.projectContext?.projectContextId ?? "unattributed";
+          (groups[contextId] ??= []).push({
+            issue: row.issue,
+            title: row.title,
+            projectContextId: row.projectContext?.projectContextId,
+            projectContextLabel: row.projectContext?.projectContextLabel,
+            linearProjectSlug: row.projectContext?.linearProjectSlug,
+            routingSource: row.projectContext?.routingSource,
+          });
+          return groups;
+        }, {});
+      const groupedDashboardRunning = groupProjectedRunningAgentsByContext(dashboardBody.runningAgents);
+      const groupedSidebarRunning = groupProjectedRunningAgentsByContext(sidebarBody.runningAgents);
 
       expect(stateResponse.status).toBe(200);
+      expect(dashboardResponse.status).toBe(200);
+      expect(sidebarResponse.status).toBe(200);
       expect(stateBody.running).toHaveLength(2);
       expect(stateBody.operatorView.running).toHaveLength(2);
+      expect(dashboardBody.runningAgents).toHaveLength(2);
+      expect(sidebarBody.runningAgents).toHaveLength(2);
       expect(stateBody.running.map((row) => row.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
       expect(stateBody.operatorView.running.map((row) => row.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
+      expect(dashboardBody.runningAgents.map((row) => row.id)).toEqual(["issue-docs-state-live-1", "issue-symphony-state-live-1"]);
+      expect(sidebarBody.runningAgents.map((row) => row.id)).toEqual(["issue-docs-state-live-1", "issue-symphony-state-live-1"]);
+      expect(new Set(dashboardBody.runningAgents.map((row) => row.id)).size).toBe(2);
+      expect(new Set(sidebarBody.runningAgents.map((row) => row.id)).size).toBe(2);
+      expect(dashboardBody.runningAgents.map((row) => row.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
+      expect(sidebarBody.runningAgents.map((row) => row.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
       expect(groupedRunning).toEqual({
         docs: [
           {
@@ -1907,6 +1970,29 @@ describe("StatusServer durable API", () => {
         ],
       });
       expect(groupedOperatorRunning).toEqual(groupedRunning);
+      expect(groupedDashboardRunning).toEqual({
+        docs: [
+          {
+            issue: "ENG-123",
+            title: "Docs live duplicate",
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+            linearProjectSlug: "DOCS",
+            routingSource: "candidate_poll",
+          },
+        ],
+        symphony: [
+          {
+            issue: "ENG-123",
+            title: "Symphony live duplicate",
+            projectContextId: "symphony",
+            projectContextLabel: "Symphony",
+            linearProjectSlug: "ENG",
+            routingSource: "candidate_poll",
+          },
+        ],
+      });
+      expect(groupedSidebarRunning).toEqual(groupedDashboardRunning);
     } finally {
       await server.stop();
     }

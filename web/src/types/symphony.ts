@@ -49,6 +49,13 @@ export interface IssueModel {
   session?: string | null;
 }
 
+export interface RunningAgentProjectContextModel {
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
+  routingSource: string;
+}
+
 export interface RunningAgentModel {
   id: string;
   issue: string;
@@ -57,6 +64,7 @@ export interface RunningAgentModel {
   step: string;
   duration: string;
   tokens: string;
+  projectContext?: RunningAgentProjectContextModel | undefined;
 }
 
 export interface ProviderGateModel {

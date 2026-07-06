@@ -778,6 +778,13 @@ describe("web projection foundation", () => {
     ];
     const transcriptPage: TranscriptPage = { runId: "run-1", offset: 0, limit: 10, nextOffset: null, events: transcriptEvents };
 
+    const runtimeProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
     const runtime = {
       generatedAt: "2026-01-01T00:11:00.000Z",
       counts: { running: 1, retrying: 0, paused: 0, providerGates: 1 },
@@ -803,6 +810,7 @@ describe("web projection foundation", () => {
           issueId: "issue-1",
           issueIdentifier: "TEST-1",
           runId: "run-1",
+          projectContext: runtimeProjectContext,
           startedAt: "2026-01-01T00:01:00.000Z",
           lastEvent: "progress",
           lastMessage: "Implementing dashboard route",
@@ -882,6 +890,7 @@ describe("web projection foundation", () => {
       step: "Implementing dashboard route",
       duration: "10m",
       tokens: "12",
+      projectContext: runtimeProjectContext,
     });
     expect(dashboard.providerGates[0]).toMatchObject({
       provider: "openai-codex",
@@ -906,6 +915,60 @@ describe("web projection foundation", () => {
       args: {},
       result: null,
     });
+  });
+
+  it("uses issue ids as context-safe fallback ids for live same-identifier siblings before run ids exist", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
+    const dashboard = projectWebDashboard({
+      generatedAt: "2026-01-01T00:15:00.000Z",
+      runtime: {
+        generatedAt: "2026-01-01T00:15:00.000Z",
+        running: [
+          {
+            issueId: "issue-docs-123",
+            issueIdentifier: "ENG-123",
+            runId: null,
+            projectContext: docsProjectContext,
+            startedAt: "2026-01-01T00:05:00.000Z",
+            issueDetails: { title: "Docs live duplicate" },
+            liveness: { status: "active" },
+            lastMessage: "docs heartbeat",
+            state: "running",
+            tokens: { totalTokens: 10 },
+          },
+          {
+            issueId: "issue-symphony-123",
+            issueIdentifier: "ENG-123",
+            runId: null,
+            projectContext: symphonyProjectContext,
+            startedAt: "2026-01-01T00:06:00.000Z",
+            issueDetails: { title: "Symphony live duplicate" },
+            liveness: { status: "active" },
+            lastMessage: "symphony heartbeat",
+            state: "running",
+            tokens: { totalTokens: 12 },
+          },
+        ],
+        providerGates: [],
+      } as any,
+      config: { concurrencyCap: 2 },
+    });
+
+    expect(dashboard.runningAgents.map((agent) => agent.id)).toEqual(["issue-docs-123", "issue-symphony-123"]);
+    expect(new Set(dashboard.runningAgents.map((agent) => agent.id)).size).toBe(2);
+    expect(dashboard.runningAgents.map((agent) => agent.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
   });
 
   it("does not project stale Cursor model as legacy session model for explicit Hermes ACP runs", () => {
@@ -957,6 +1020,13 @@ describe("web projection foundation", () => {
   });
 
   it("derives dashboard totals and active agents from durable run and lifecycle state when board/runtime data is incomplete", () => {
+    const durableProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
     const dashboard = projectWebDashboard({
       generatedAt: "2026-01-01T00:15:00.000Z",
       board: {
@@ -972,6 +1042,7 @@ describe("web projection foundation", () => {
           issueId: "issue-running",
           issueIdentifier: "TEST-RUNNING",
           workspaceKey: "TEST-RUNNING",
+          projectContext: durableProjectContext,
           status: "running",
           completedAt: null,
           startedAt: "2026-01-01T00:00:00.000Z",
@@ -1028,10 +1099,62 @@ describe("web projection foundation", () => {
         step: "implementation",
         duration: "15m",
         tokens: "25",
+        projectContext: durableProjectContext,
       },
     ]);
     expect(dashboard.agentUsageLabel).toBe("1/3 agents");
     expect(JSON.stringify(dashboard)).not.toContain("mock");
+  });
+
+  it("uses issue ids as context-safe fallback ids for durable same-identifier siblings when run ids are unavailable", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
+    const dashboard = projectWebDashboard({
+      generatedAt: "2026-01-01T00:15:00.000Z",
+      runtime: null,
+      runs: [
+        run({
+          runId: "",
+          issueId: "issue-docs-123",
+          issueIdentifier: "ENG-123",
+          workspaceKey: "docs-ENG-123",
+          projectContext: docsProjectContext,
+          status: "running",
+          completedAt: null,
+          startedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:14:00.000Z",
+          tokens: { inputTokens: 10, outputTokens: 15, totalTokens: 25 },
+        }),
+        run({
+          runId: "",
+          issueId: "issue-symphony-123",
+          issueIdentifier: "ENG-123",
+          workspaceKey: "symphony-ENG-123",
+          projectContext: symphonyProjectContext,
+          status: "running",
+          completedAt: null,
+          startedAt: "2026-01-01T00:01:00.000Z",
+          updatedAt: "2026-01-01T00:13:00.000Z",
+          tokens: { inputTokens: 9, outputTokens: 9, totalTokens: 18 },
+        }),
+      ],
+      config: { concurrencyCap: 2 },
+    });
+
+    expect(dashboard.runningAgents.map((agent) => agent.id)).toEqual(["issue-docs-123", "issue-symphony-123"]);
+    expect(new Set(dashboard.runningAgents.map((agent) => agent.id)).size).toBe(2);
+    expect(dashboard.runningAgents.map((agent) => agent.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
   });
 
   it("dedupes contextual board issues against durable totals by raw issue id without collapsing same-identifier sibling contexts", () => {
@@ -1107,6 +1230,19 @@ describe("web projection foundation", () => {
   });
 
   it("prefers live runtime agent rows over matching durable running records without double-counting usage", () => {
+    const runtimeProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const durableProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
     const dashboard = projectWebDashboard({
       generatedAt: "2026-01-01T00:15:00.000Z",
       runtime: {
@@ -1116,6 +1252,7 @@ describe("web projection foundation", () => {
             issueId: "issue-running",
             issueIdentifier: "TEST-RUNNING",
             runId: "run-running",
+            projectContext: runtimeProjectContext,
             startedAt: "2026-01-01T00:05:00.000Z",
             lastMessage: "runtime heartbeat",
             state: "running",
@@ -1130,6 +1267,7 @@ describe("web projection foundation", () => {
           issueId: "issue-running",
           issueIdentifier: "TEST-RUNNING",
           workspaceKey: "TEST-RUNNING",
+          projectContext: durableProjectContext,
           status: "running",
           completedAt: null,
           tokens: { inputTokens: 9, outputTokens: 9, totalTokens: 18 },
@@ -1147,6 +1285,7 @@ describe("web projection foundation", () => {
         step: "runtime heartbeat",
         duration: "10m",
         tokens: "10",
+        projectContext: runtimeProjectContext,
       },
     ]);
     expect(dashboard.agentUsageLabel).toBe("1/2 agents");
