@@ -11,6 +11,12 @@ import { writeOperatorChatMcpContext } from "./OperatorChatMcpServer.js";
 import { writeReviewFeedbackMcpContext } from "./ReviewFeedbackMcpServer.js";
 import { writeReviewVerdictMcpContext } from "./ReviewVerdictMcpServer.js";
 import { writeTranscriptRecallMcpContext } from "./TranscriptRecallMcpServer.js";
+import {
+  resolveProjectContextForIssue,
+  sameProjectContextIdentity,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
+import { SymphonyError } from "../errors.js";
 import type { AgentRunPhase, AgentRunRole, Issue } from "../types.js";
 
 export interface RuntimeHandoffPromptInput {
@@ -221,9 +227,11 @@ async function writeHandoffMcpContexts(
     });
   }
   if (ctx.role === "worker" && phase === "implementation") {
+    const projectContext = resolveValidatedHandoffProjectContext(ctx, "Completion report");
+    const issue = sanitizeHandoffIssueProjectContext(ctx.issue, projectContext);
     await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
-      issue: ctx.issue,
-      projectContext: ctx.projectContext,
+      issue,
+      projectContext,
       activeRunId: input.activeRunId,
       role: "worker",
       token: null,
@@ -263,9 +271,11 @@ async function writeHandoffMcpContexts(
     return;
   }
   if (ctx.role !== "reviewer") return;
+  const reviewProjectContext = resolveValidatedHandoffProjectContext(ctx, "Review");
+  const reviewIssue = sanitizeHandoffIssueProjectContext(ctx.issue, reviewProjectContext);
   await writeReviewVerdictMcpContext(reviewVerdictContextFilePath(ctx), {
-    issue: ctx.issue,
-    projectContext: ctx.projectContext,
+    issue: reviewIssue,
+    projectContext: reviewProjectContext,
     activeRunId: input.activeRunId,
     role: "reviewer",
     token: null,
@@ -273,9 +283,13 @@ async function writeHandoffMcpContexts(
     reviewer: input.sessionId,
     phase: "review",
   });
+  const reviewFeedbackProjectContext = resolveValidatedHandoffProjectContext(ctx, "Review feedback", {
+    preserveActiveProjectContextOnSafeMetadataDrift: true,
+  });
+  const reviewFeedbackIssue = sanitizeHandoffIssueProjectContext(ctx.issue, reviewFeedbackProjectContext);
   await writeReviewFeedbackMcpContext(reviewFeedbackContextFilePath(ctx), {
-    issue: ctx.issue,
-    projectContext: ctx.projectContext,
+    issue: reviewFeedbackIssue,
+    projectContext: reviewFeedbackProjectContext,
     activeRunId: input.activeRunId,
     role: "reviewer",
     token: null,
@@ -302,13 +316,14 @@ export function completionReportMcpServerConfig(
   contextFile: string,
   options: { cliPath: string },
 ): McpSubprocessServerConfig {
+  const projectContext = resolveValidatedHandoffProjectContext(ctx, "Completion report");
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
     command: "completion-report-mcp",
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
-    projectContext: ctx.projectContext,
+    projectContext,
   });
 }
 
@@ -347,13 +362,14 @@ export function reviewVerdictMcpServerConfig(
   contextFile: string,
   options: { cliPath: string },
 ): McpSubprocessServerConfig {
+  const projectContext = resolveValidatedHandoffProjectContext(ctx, "Review verdict");
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
     command: "review-verdict-mcp",
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
-    projectContext: ctx.projectContext,
+    projectContext,
   });
 }
 
@@ -362,13 +378,16 @@ export function reviewFeedbackMcpServerConfig(
   contextFile: string,
   options: { cliPath: string },
 ): McpSubprocessServerConfig {
+  const projectContext = resolveValidatedHandoffProjectContext(ctx, "Review feedback", {
+    preserveActiveProjectContextOnSafeMetadataDrift: true,
+  });
   return buildMcpSubprocessServerConfig({
     config: ctx.config,
     command: "review-feedback-mcp",
     cliPath: options.cliPath,
     workflowPath: ctx.config.workflowPath,
     contextFile,
-    projectContext: ctx.projectContext,
+    projectContext,
   });
 }
 
@@ -459,6 +478,87 @@ export function operatorChatContextFilePath(ctx: OperatorChatRunContext): string
 
 export function currentRunPhase(ctx: AgentRunContext): AgentRunPhase {
   return ctx.runPhase ?? (ctx.role === "reviewer" ? "review" : "implementation");
+}
+
+function resolveValidatedHandoffProjectContext(
+  ctx: AgentRunContext,
+  handoffSurface: string,
+  options: { preserveActiveProjectContextOnSafeMetadataDrift?: boolean } = {},
+): ProjectContextResolution | undefined {
+  const resolvedIssueProjectContext = resolveServiceOwnedIssueProjectContext(ctx, handoffSurface);
+  if (
+    ctx.projectContext &&
+    resolvedIssueProjectContext &&
+    !sameProjectContextIdentity(ctx.projectContext, resolvedIssueProjectContext)
+  ) {
+    throw new SymphonyError(
+      "invalid_request",
+      `${handoffSurface} MCP handoff project context does not match the service-owned resolved issue context`,
+    );
+  }
+
+  if (
+    options.preserveActiveProjectContextOnSafeMetadataDrift &&
+    ctx.projectContext &&
+    resolvedIssueProjectContext &&
+    shouldPreserveActiveProjectContextOnSafeMetadataDrift(ctx.projectContext, resolvedIssueProjectContext)
+  ) {
+    return ctx.projectContext;
+  }
+
+  return resolvedIssueProjectContext ?? ctx.projectContext;
+}
+
+function shouldPreserveActiveProjectContextOnSafeMetadataDrift(
+  activeProjectContext: ProjectContextResolution,
+  resolvedIssueProjectContext: ProjectContextResolution,
+): boolean {
+  return (
+    sameProjectContextIdentity(activeProjectContext, resolvedIssueProjectContext) &&
+    activeProjectContext.projectContextLabel === resolvedIssueProjectContext.projectContextLabel &&
+    activeProjectContext.linearProjectSlug === resolvedIssueProjectContext.linearProjectSlug
+  );
+}
+
+function sanitizeHandoffIssueProjectContext(
+  issue: Issue,
+  projectContext: ProjectContextResolution | undefined,
+): Issue {
+  if (!projectContext) return issue;
+  return {
+    ...issue,
+    projectContext,
+  };
+}
+
+function resolveServiceOwnedIssueProjectContext(
+  ctx: AgentRunContext,
+  handoffSurface: string,
+): ProjectContextResolution | undefined {
+  const { projectContext: _ignoredInjectedProjectContext, ...serviceOwnedIssueRouting } = ctx.issue;
+  const resolution = resolveProjectContextForIssue(serviceOwnedIssueRouting, ctx.config.projectContexts);
+  if (resolution.kind === "resolved") {
+    return resolution.projectContext;
+  }
+
+  if (issueHasServiceOwnedRoutingFields(serviceOwnedIssueRouting)) {
+    throw new SymphonyError(
+      "invalid_request",
+      `${handoffSurface} MCP handoff project context could not be resolved from the service-owned issue context: ${resolution.problem.safeMessage}`,
+    );
+  }
+
+  return undefined;
+}
+
+function issueHasServiceOwnedRoutingFields(issue: Issue): boolean {
+  return (
+    issue.projectContextId !== undefined ||
+    issue.projectContextLabel !== undefined ||
+    issue.linearProjectSlug !== undefined ||
+    issue.linearProjectIdentity !== undefined ||
+    issue.routingSource !== undefined
+  );
 }
 
 function operatorChatRunContextFromAgentContext(ctx: AgentRunContext): OperatorChatRunContext {
