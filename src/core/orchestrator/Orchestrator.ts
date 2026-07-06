@@ -112,6 +112,12 @@ import {
 } from "../persistence/ProviderGateStore.js";
 import { SqliteIssueStateStore } from "../orchestration/SqliteIssueStateStore.js";
 import {
+  SqliteMergeQueueStore,
+  type MergeQueueReleaseResult,
+  type MergeQueueSnapshot,
+  type MergeQueueStore,
+} from "../orchestration/SqliteMergeQueueStore.js";
+import {
   HISTORY_BACKED_FIELD_GROUPS,
   IssueCurrentStateBuilder,
   type IssueCurrentStateRuntimeState,
@@ -257,6 +263,7 @@ export interface OrchestratorOptions {
     Partial<Pick<OperatorApprovalService, "get" | "getByDedupe">>;
   providerGateStore?: ProviderGateStore;
   issueStateStore?: IssueStateStore;
+  mergeQueueStore?: MergeQueueStore;
   orchestratorConversationStore?: OrchestratorConversationStore;
   statusServerBaseUrl?: () => string | null;
   statusMutationToken?: string | null;
@@ -950,6 +957,7 @@ export class Orchestrator {
   };
   private readonly providerGateStore: ProviderGateStore;
   private readonly issueStateStore: IssueStateStore;
+  private readonly mergeQueueStore: MergeQueueStore;
   private readonly issueCurrentStateBuilder: IssueCurrentStateBuilder;
   private readonly transitionRulesets: TransitionRuleset[];
   private readonly transitionEngine: IssueOrchestrationEngine;
@@ -969,6 +977,9 @@ export class Orchestrator {
     this.issueStateStore =
       options.issueStateStore ??
       new SqliteIssueStateStore(options.config.workspace.stateDir);
+    this.mergeQueueStore =
+      options.mergeQueueStore ??
+      new SqliteMergeQueueStore(options.config.workspace.stateDir);
     this.issueCurrentStateBuilder = new IssueCurrentStateBuilder({
       config: this.config,
       lifecycleStore: options.lifecycleStore,
@@ -1064,6 +1075,7 @@ export class Orchestrator {
     ]);
     await Promise.allSettled([...workers]);
     await this.issueStateStore.close?.();
+    await this.mergeQueueStore.close?.();
   }
 
   updateConfig(config: ServiceConfig, promptTemplate: string): void {
@@ -2842,6 +2854,7 @@ export class Orchestrator {
     this.ticking = true;
     try {
       await this.reconcileRunningIssues();
+      await this.reconcileMergeQueueLease();
       const providerGate = await this.activeProviderDispatchGate();
       if (providerGate) {
         this.options.logger.warn("agent dispatch paused by provider limit", {
@@ -2873,6 +2886,71 @@ export class Orchestrator {
     for (const issue of sortIssuesForDispatch(candidates)) {
       await this.processTickIssueCandidate(issue);
     }
+  }
+
+  private async reconcileMergeQueueLease(): Promise<void> {
+    if (this.config.mergePolicy.mode !== "gated") return;
+    let current: MergeQueueSnapshot;
+    try {
+      current = await this.mergeQueueStore.getCurrent();
+    } catch (error) {
+      this.options.logger.warn("merge queue lease read failed", {
+        error: errorMessage(error),
+      });
+      return;
+    }
+    if (current.activeIssueId === null) return;
+
+    const leaseIssue = {
+      id: current.activeIssueId,
+      identifier: current.activeIssueIdentifier ?? current.activeIssueId,
+    };
+    let issue: Issue | null = null;
+    try {
+      issue =
+        (await this.options.tracker.fetchIssueStatesByIds([
+          current.activeIssueId,
+        ]))[0] ?? null;
+    } catch (error) {
+      this.options.logger.warn("merge queue active issue refresh failed", {
+        issue_id: current.activeIssueId,
+        issue_identifier: current.activeIssueIdentifier,
+        error: errorMessage(error),
+      });
+      return;
+    }
+
+    if (issue === null) {
+      await this.releaseMergeQueueLease(
+        leaseIssue,
+        "merge_queue_active_issue_missing",
+      );
+      return;
+    }
+    if (!this.issueStateCanRetainMergeQueueLease(issue)) {
+      await this.releaseMergeQueueLease(
+        leaseIssue,
+        "merge_queue_active_issue_not_eligible",
+      );
+    }
+  }
+
+  private issueStateCanRetainMergeQueueLease(issue: Issue): boolean {
+    if (isStateIn(issue.state, this.config.tracker.terminalStates))
+      return false;
+    if (
+      this.config.mergePolicy.conflictsState !== null &&
+      statesEqual(issue.state, this.config.mergePolicy.conflictsState)
+    ) {
+      return false;
+    }
+    if (isStateIn(issue.state, this.config.reviewLoop.blockedStates))
+      return false;
+    if (isStateIn(issue.state, this.config.mergePolicy.sourceStates))
+      return true;
+    if (isStateIn(issue.state, this.config.reviewLoop.reviewStates))
+      return true;
+    return isStateIn(issue.state, this.config.tracker.activeStates);
   }
 
   private async fetchTickIssueCandidates(): Promise<Issue[]> {
@@ -3472,6 +3550,14 @@ export class Orchestrator {
               return { details: { ...result, mergeId: plan.merge.id } };
             },
           },
+          {
+            id: "release_merge_queue_after_done_writeback",
+            execute: (context) =>
+              this.releaseMergeQueueAction(
+                context,
+                "merge_policy_done_writeback_verified",
+              ),
+          },
         ],
       },
       {
@@ -3599,14 +3685,24 @@ export class Orchestrator {
       },
       {
         kind: "merge_policy_prepare_conflict",
-        actions: conflictPreparationActions(
-          "plan_service_owned_conflict_preparation",
-          (service, context, observation) =>
-            service.planServicePreparedMergeConflict(
-              context.issue,
-              observation,
-            ),
-        ),
+        actions: [
+          ...conflictPreparationActions(
+            "plan_service_owned_conflict_preparation",
+            (service, context, observation) =>
+              service.planServicePreparedMergeConflict(
+                context.issue,
+                observation,
+              ),
+          ),
+          {
+            id: "release_merge_queue_after_conflict_preparation",
+            execute: (context) =>
+              this.releaseMergeQueueAction(
+                context,
+                "merge_policy_conflict_prepared",
+              ),
+          },
+        ],
       },
       {
         kind: "merge_policy_dispatch_repair",
@@ -3736,6 +3832,14 @@ export class Orchestrator {
               return { details: result };
             },
           },
+          {
+            id: "release_merge_queue_after_merge_policy_block",
+            execute: (context) =>
+              this.releaseMergeQueueAction(
+                context,
+                "merge_policy_block_failure",
+              ),
+          },
         ],
       },
       {
@@ -3857,6 +3961,14 @@ export class Orchestrator {
               };
               return { details: { ...result, mergeId: recorded.merge.id } };
             },
+          },
+          {
+            id: "release_merge_queue_after_pull_request_merge",
+            execute: (context) =>
+              this.releaseMergeQueueAction(
+                context,
+                "merge_policy_merge_verified",
+              ),
           },
         ],
       },
@@ -3986,6 +4098,14 @@ export class Orchestrator {
               return { details: { ...result, mergeId: recorded.merge.id } };
             },
           },
+          {
+            id: "release_merge_queue_after_already_merged_recovery",
+            execute: (context) =>
+              this.releaseMergeQueueAction(
+                context,
+                "merge_policy_already_merged_verified",
+              ),
+          },
         ],
       },
     ];
@@ -4044,8 +4164,75 @@ export class Orchestrator {
     return observation;
   }
 
+  private async claimMergeQueueAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const result = await this.mergeQueueStore.claim(
+      context.issue,
+      context.transition.reason ?? "merge_queue_claim",
+    );
+    const details = {
+      status: result.status,
+      activeIssueId: result.snapshot.activeIssueId,
+      activeIssueIdentifier: result.snapshot.activeIssueIdentifier,
+      leaseId: result.snapshot.leaseId,
+      sequence: result.snapshot.sequence,
+    };
+    if (result.status === "blocked_by_active_issue") {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Merge queue is active for another issue",
+        details,
+      };
+    }
+    return { details };
+  }
+
+  private async releaseMergeQueueAction(
+    context: OrchestratorTransitionContext,
+    reason: string,
+  ) {
+    return this.releaseMergeQueueLease(context.issue, reason);
+  }
+
+  private async releaseMergeQueueLease(
+    issue: Pick<Issue, "id" | "identifier">,
+    reason: string,
+  ) {
+    const result = await this.mergeQueueStore.releaseIfActive(issue, reason);
+    return this.mergeQueueReleaseActionResult(result);
+  }
+
+  private mergeQueueReleaseActionResult(result: MergeQueueReleaseResult) {
+    const details = {
+      status: result.status,
+      activeIssueId: result.snapshot.activeIssueId,
+      activeIssueIdentifier: result.snapshot.activeIssueIdentifier,
+      leaseId: result.snapshot.leaseId,
+      sequence: result.snapshot.sequence,
+    };
+    if (result.status !== "released") {
+      return {
+        status: "skipped" as const,
+        message: "Issue does not own the active merge queue lease",
+        details,
+      };
+    }
+    return { details };
+  }
+
   private createTransitions(): IssueTransition<OrchestratorTransitionContext>[] {
     return [
+      {
+        kind: "merge_queue_claim",
+        actions: [
+          {
+            id: "claim_merge_queue",
+            execute: (context) => this.claimMergeQueueAction(context),
+          },
+        ],
+      },
       {
         kind: "base_ref_observe",
         actions: [
@@ -4083,6 +4270,11 @@ export class Orchestrator {
           {
             id: "record_block_issue",
             execute: (context) => this.recordBlockIssueAction(context),
+          },
+          {
+            id: "release_merge_queue_after_base_ref_block",
+            execute: (context) =>
+              this.releaseMergeQueueAction(context, "base_ref_blocked"),
           },
         ],
       },
@@ -4445,6 +4637,16 @@ export class Orchestrator {
             id: "process_review_verdict_handoff_writebacks",
             execute: (context) =>
               this.processReviewVerdictHandoffWritebacksAction(context),
+          },
+          {
+            id: "release_merge_queue_after_failed_review_verdict",
+            shouldExecute: (context) =>
+              context.handoffReconciliation.reviewVerdict?.verdict !== "pass",
+            execute: (context) =>
+              this.releaseMergeQueueAction(
+                context,
+                "review_verdict_failed",
+              ),
           },
           {
             id: "request_merge_policy_after_pass_verdict",
@@ -7555,7 +7757,10 @@ export class Orchestrator {
 
   private createMergePolicyTransitionRulesets(): TransitionRuleset[] {
     const transitionKinds: Array<
-      Exclude<IssueTransitionKind, "merge_policy" | "record_evidence" | "noop">
+      Exclude<
+        IssueTransitionKind,
+        "merge_queue_claim" | "merge_policy" | "record_evidence" | "noop"
+      >
     > = [
       "merge_policy_wait_conflict_state",
       "merge_policy_retire_stale_gate",
@@ -7573,6 +7778,24 @@ export class Orchestrator {
       "merge_policy_recover_already_merged_pull_request",
     ];
     return [
+      {
+        id: "orchestrator.merge_queue.claim",
+        priority: issueTransitionRulesetPriority("merge_queue_claim"),
+        evaluate: (snapshot) => {
+          if (this.rulesetShouldWaitForMergeQueue(snapshot)) {
+            return {
+              transitionKind: "noop",
+              reason: "merge_queue_active_issue",
+            };
+          }
+          return this.rulesetShouldClaimMergeQueue(snapshot)
+            ? {
+                transitionKind: "merge_queue_claim",
+                reason: "merge_queue_claim",
+              }
+            : null;
+        },
+      },
       {
         id: "orchestrator.merge_policy.reset_operator_resume",
         priority: issueTransitionRulesetPriority(
@@ -8131,8 +8354,56 @@ export class Orchestrator {
     if (!triggerAllowed) return false;
     if (snapshot.mergePolicyMode !== "gated") return false;
     if (!this.rulesetIsMergePolicyTrackedState(snapshot)) return false;
+    if (
+      this.rulesetIsMergePolicySourceState(snapshot) &&
+      snapshot.mergeQueueStatus !== "active_current_issue"
+    ) {
+      return false;
+    }
     if (snapshot.running || snapshot.paused) return false;
     return this.rulesetPassesLabelGuardrails(snapshot, "merge_policy");
+  }
+
+  private rulesetCanEnterMergeQueue(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    const triggerAllowed =
+      snapshot.triggerType === "orchestrator.tick" ||
+      (snapshot.triggerType === "runtime.requested" &&
+        snapshot.triggerSource === "transition" &&
+        snapshot.transitionRequestContext?.kind === "merge_policy_chain");
+    if (!triggerAllowed) return false;
+    if (snapshot.mergePolicyMode !== "gated") return false;
+    if (!this.rulesetIsMergePolicySourceState(snapshot)) return false;
+    if (snapshot.running || snapshot.paused) return false;
+    return this.rulesetPassesLabelGuardrails(snapshot, "merge_policy");
+  }
+
+  private rulesetShouldClaimMergeQueue(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    return (
+      this.rulesetCanEnterMergeQueue(snapshot) &&
+      snapshot.mergeQueueStatus === "inactive"
+    );
+  }
+
+  private rulesetShouldWaitForMergeQueue(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    return (
+      this.rulesetCanEnterMergeQueue(snapshot) &&
+      snapshot.mergeQueueStatus === "active_other_issue"
+    );
+  }
+
+  private rulesetIsMergePolicySourceState(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    return (
+      snapshot.mergePolicyMode === "gated" &&
+      isStateIn(snapshot.trackerState, snapshot.mergePolicySourceStates)
+    );
   }
 
   private rulesetIsMergePolicyTrackedState(
@@ -8448,6 +8719,8 @@ export class Orchestrator {
     transitionPatch?: Partial<IssueTransitionRequest>;
   }): Promise<IssueHistorySnapshot | null> {
     try {
+      const mergeQueueSnapshotPatch =
+        await this.mergeQueueSnapshotPatchForIssue(input.issue);
       const snapshot = await this.issueCurrentStateBuilder.buildSnapshot(
         input.issue,
         this.issueRuntimeState(input.issue.id),
@@ -8465,9 +8738,10 @@ export class Orchestrator {
           manualStage: input.manualStage ?? null,
           manualForceLabels: input.manualForceLabels ?? false,
           manualIgnoreState: input.manualIgnoreState ?? false,
-          ...(input.snapshotPatch === undefined
-            ? {}
-            : { snapshotPatch: input.snapshotPatch }),
+          snapshotPatch: {
+            ...mergeQueueSnapshotPatch,
+            ...(input.snapshotPatch ?? {}),
+          },
         },
       );
       const record = await this.issueStateStore.ensureIssue(snapshot);
@@ -8488,6 +8762,14 @@ export class Orchestrator {
       });
       return null;
     }
+  }
+
+  private async mergeQueueSnapshotPatchForIssue(
+    issue: Issue,
+  ): Promise<Partial<IssueCurrentStateSnapshot>> {
+    if (this.config.mergePolicy.mode !== "gated") return {};
+    const snapshot = await this.mergeQueueStore.getCurrent();
+    return mergeQueueProjectionForIssue(issue, snapshot);
   }
 
   private async recordTrackerObservationSnapshot(input: {
@@ -10238,7 +10520,7 @@ export class Orchestrator {
           break;
         if (
           entry.lifecycle?.phase === "blocked" ||
-          entry.lifecycle?.blockedReason !== null
+          (entry.lifecycle?.blockedReason ?? null) !== null
         )
           break;
 
@@ -11481,7 +11763,7 @@ export class Orchestrator {
         }
         if (
           entry.lifecycle?.phase === "blocked" ||
-          entry.lifecycle?.blockedReason !== null
+          (entry.lifecycle?.blockedReason ?? null) !== null
         ) {
           await this.releaseIssueClaim(
             entry.issue,
@@ -11635,7 +11917,7 @@ export class Orchestrator {
           );
           if (
             entry.lifecycle?.phase === "blocked" ||
-            entry.lifecycle?.blockedReason !== null
+            (entry.lifecycle?.blockedReason ?? null) !== null
           ) {
             await this.releaseIssueClaim(
               entry.issue,
@@ -11703,7 +11985,7 @@ export class Orchestrator {
           await this.recordIncompleteTurn(entry);
           if (
             entry.lifecycle?.phase === "blocked" ||
-            entry.lifecycle?.blockedReason !== null
+            (entry.lifecycle?.blockedReason ?? null) !== null
           ) {
             await this.releaseIssueClaim(
               entry.issue,
@@ -14853,6 +15135,29 @@ export function sortIssuesForDispatch(issues: Issue[]): Issue[] {
   });
 }
 
+function mergeQueueProjectionForIssue(
+  issue: Pick<Issue, "id">,
+  snapshot: MergeQueueSnapshot,
+): Pick<
+  IssueCurrentStateSnapshot,
+  | "mergeQueueActiveIssueId"
+  | "mergeQueueActiveIssueIdentifier"
+  | "mergeQueueLeaseId"
+  | "mergeQueueStatus"
+> {
+  return {
+    mergeQueueActiveIssueId: snapshot.activeIssueId,
+    mergeQueueActiveIssueIdentifier: snapshot.activeIssueIdentifier,
+    mergeQueueLeaseId: snapshot.leaseId,
+    mergeQueueStatus:
+      snapshot.activeIssueId === null
+        ? "inactive"
+        : snapshot.activeIssueId === issue.id
+          ? "active_current_issue"
+          : "active_other_issue",
+  };
+}
+
 const BASE_REF_GUARDED_TRANSITION_KINDS = new Set<IssueTransitionKind>([
   "dispatch_worker",
   "dispatch_reviewer",
@@ -14898,6 +15203,8 @@ function issueTransitionRulesetPriority(kind: IssueTransitionKind): number {
     case "dispatch_triage":
     case "dispatch_post_mortem":
       return 100;
+    case "merge_queue_claim":
+      return 180;
     case "merge_policy":
       return 200;
     case "merge_policy_reset_operator_resume":
@@ -15020,6 +15327,7 @@ function mergePolicyTransitionShouldContinue(
   kind: IssueTransitionKind,
 ): boolean {
   return (
+    kind === "merge_queue_claim" ||
     kind === "merge_policy_reset_operator_resume" ||
     kind === "merge_policy_observe" ||
     kind === "merge_policy_retire_stale_gate" ||

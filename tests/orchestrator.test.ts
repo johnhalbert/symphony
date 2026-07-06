@@ -53,6 +53,7 @@ import type {
   IssueHistorySnapshot,
 } from "../src/core/orchestration/IssueOrchestrationState.js";
 import { SqliteIssueStateStore } from "../src/core/orchestration/SqliteIssueStateStore.js";
+import { SqliteMergeQueueStore } from "../src/core/orchestration/SqliteMergeQueueStore.js";
 import {
   FileIssueLifecycleStore,
   type IssueCompletionReportRecord,
@@ -563,6 +564,7 @@ describe("Orchestrator", () => {
         "orchestrator.dispatch.worker.implementation",
         "orchestrator.dispatch.reviewer.review",
         "orchestrator.handoff_repair",
+        "orchestrator.merge_queue.claim",
         "orchestrator.merge_policy.observe",
         "orchestrator.merge_policy_dispatch_repair",
         "orchestrator.merge_policy_merge_pull_request",
@@ -5126,6 +5128,18 @@ describe("Orchestrator", () => {
       config.workspace.stateDir,
       candidate.id,
     );
+    const mergeQueueClaimSnapshot = issueState?.history.find(
+      (snapshot) => snapshot.transitionKind === "merge_queue_claim",
+    );
+    expect(mergeQueueClaimSnapshot).toMatchObject({
+      transitionKind: "merge_queue_claim",
+      actions: [
+        expect.objectContaining({
+          actionType: "claim_merge_queue",
+          status: "succeeded",
+        }),
+      ],
+    });
     const mergePolicySnapshots =
       issueState?.history.filter((snapshot) =>
         snapshot.transitionKind.startsWith("merge_policy_"),
@@ -5153,13 +5167,6 @@ describe("Orchestrator", () => {
       }),
     ).toEqual([
       {
-        triggerType: "orchestrator.tick",
-        triggerSource: "orchestrator",
-        contextKind: null,
-        iteration: null,
-        maxIterations: null,
-      },
-      {
         triggerType: "runtime.requested",
         triggerSource: "transition",
         contextKind: "merge_policy_chain",
@@ -5173,11 +5180,18 @@ describe("Orchestrator", () => {
         iteration: 2,
         maxIterations: 6,
       },
+      {
+        triggerType: "runtime.requested",
+        triggerSource: "transition",
+        contextKind: "merge_policy_chain",
+        iteration: 3,
+        maxIterations: 6,
+      },
     ]);
     const firstContext =
-      mergePolicySnapshots[1]?.transitionRequestContext?.kind ===
+      mergePolicySnapshots[0]?.transitionRequestContext?.kind ===
       "merge_policy_chain"
-        ? mergePolicySnapshots[1].transitionRequestContext
+        ? mergePolicySnapshots[0].transitionRequestContext
         : null;
     const chainId = firstContext?.payload.chainId;
     expect(typeof chainId).toBe("string");
@@ -5187,7 +5201,11 @@ describe("Orchestrator", () => {
           ? snapshot.transitionRequestContext.payload.chainId
           : null,
       ),
-    ).toEqual([null, chainId, chainId]);
+    ).toEqual([chainId, chainId, chainId]);
+    expect(mergePolicySnapshots[0]?.transitionRequestContext).toMatchObject({
+      parentHistorySnapshotId: mergeQueueClaimSnapshot?.historySnapshotId,
+      parentTransitionKind: "merge_queue_claim",
+    });
     expect(mergePolicySnapshots[1]?.transitionRequestContext).toMatchObject({
       parentHistorySnapshotId: mergePolicySnapshots[0]?.historySnapshotId,
       parentTransitionKind: "merge_policy_reset_operator_resume",
@@ -5196,6 +5214,253 @@ describe("Orchestrator", () => {
       parentHistorySnapshotId: mergePolicySnapshots[1]?.historySnapshotId,
       parentTransitionKind: "merge_policy_observe",
     });
+  });
+
+  it("serializes Ready to Merge issues behind the active merge queue lease", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    const first = issue({
+      id: "issue-1",
+      identifier: "TEST-1",
+      state: "Ready to Merge",
+      branchName: "symphony/TEST-1",
+      labels: ["dogfood-ready"],
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    const second = issue({
+      id: "issue-2",
+      identifier: "TEST-2",
+      state: "Ready to Merge",
+      branchName: "symphony/TEST-2",
+      labels: ["dogfood-ready"],
+      createdAt: "2026-01-01T00:00:02.000Z",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([first, second], states);
+      },
+      async fetchIssueStatesByIds(ids) {
+        return [first, second].filter((candidate) => ids.includes(candidate.id));
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    await lifecycleStore.ensureIssue(first, { phase: "passed" });
+    await lifecycleStore.ensureIssue(second, { phase: "passed" });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    const mergeQueueStore = new SqliteMergeQueueStore(
+      config.workspace.stateDir,
+    );
+    try {
+      await expect(mergeQueueStore.getCurrent()).resolves.toMatchObject({
+        activeIssueId: first.id,
+        activeIssueIdentifier: first.identifier,
+      });
+    } finally {
+      await mergeQueueStore.close();
+    }
+    const firstState = await readIssueState(config.workspace.stateDir, first.id);
+    const secondState = await readIssueState(
+      config.workspace.stateDir,
+      second.id,
+    );
+    expect(firstState?.history.map((snapshot) => snapshot.transitionKind)).toEqual(
+      expect.arrayContaining(["merge_queue_claim", "merge_policy_observe"]),
+    );
+    expect(
+      firstState?.history.find(
+        (snapshot) => snapshot.transitionKind === "merge_queue_claim",
+      ),
+    ).toMatchObject({
+      mergeQueueStatus: "inactive",
+      actions: [
+        expect.objectContaining({
+          actionType: "claim_merge_queue",
+          status: "succeeded",
+        }),
+      ],
+    });
+    expect(
+      secondState?.history.find(
+        (snapshot) => snapshot.reason === "merge_queue_active_issue",
+      ),
+    ).toMatchObject({
+      transitionKind: "noop",
+      mergeQueueStatus: "active_other_issue",
+      mergeQueueActiveIssueId: first.id,
+    });
+  });
+
+  it("releases the active merge queue lease after a successful merge", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    let state = "Ready to Merge";
+    const branchName = "symphony/TEST-1";
+    const candidate = issue({
+      state,
+      branchName,
+      labels: ["dogfood-ready"],
+    });
+    const currentIssue = (): Issue => ({ ...candidate, state });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([currentIssue()], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [currentIssue()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((nextState) => {
+      state = nextState;
+    });
+    const report = completionReportRecord(candidate);
+    const verdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(candidate),
+      id: "review-verdict:issue-1:approval-pass",
+      idempotencyKey: "approval-pass",
+      runId: "review-run-pass",
+      verdict: "pass",
+      findings: [],
+      acceptanceResults: [
+        { text: "Approved", satisfied: true, evidence: "review passed" },
+      ],
+      evidence: ["https://github.com/acme/symphony/pull/42#discussion_r1"],
+      submittedAt: "2026-01-01T00:00:02.000Z",
+    };
+    await runStore.startRun({
+      runId: report.runId,
+      sessionId: "worker-session-1",
+      agentId: "worker-agent-1",
+      role: "worker",
+      runPhase: "implementation",
+      runKind: "implementation",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "Worker prompt",
+      workspaceKey: candidate.identifier,
+      workspacePath: path.join(root, "not-a-git-worktree"),
+      gitBranchName: branchName,
+      repoPath: root,
+      baseRef: "main",
+    });
+    await runStore.updateRun(report.runId, {
+      status: "succeeded",
+      completedAt: "2026-01-01T00:00:03.000Z",
+      metadata: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: branchName,
+      },
+    });
+    await lifecycleStore.ensureIssue(currentIssue(), {
+      phase: "passed",
+      lastCompletionReportId: report.id,
+      lastReviewVerdictId: verdict.id,
+      completionReports: [report],
+      reviewVerdicts: [verdict],
+      reviewFeedback: [approvalFeedbackRecord(candidate, verdict.runId)],
+      summaryPointers: {
+        workspaceKey: candidate.identifier,
+        workspacePath: path.join(root, "not-a-git-worktree"),
+        branchName,
+        gitBranchName: branchName,
+        repoPath: root,
+        baseRef: "main",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "abc123",
+        prBranch: branchName,
+      },
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        outboxStore,
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
+      pullRequestMergeClient: new SuccessfulMergeClient(),
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    expect(state).toBe("Done");
+    const mergeQueueStore = new SqliteMergeQueueStore(
+      config.workspace.stateDir,
+    );
+    try {
+      await expect(mergeQueueStore.getCurrent()).resolves.toMatchObject({
+        activeIssueId: null,
+        leaseId: null,
+        reason: "merge_policy_merge_verified",
+      });
+    } finally {
+      await mergeQueueStore.close();
+    }
+    const issueState = await readIssueState(
+      config.workspace.stateDir,
+      candidate.id,
+    );
+    const mergeSnapshot = issueState?.history.find(
+      (snapshot) =>
+        snapshot.transitionKind === "merge_policy_merge_pull_request",
+    );
+    expect(mergeSnapshot?.actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actionType: "merge_pull_request",
+          status: "succeeded",
+        }),
+        expect.objectContaining({
+          actionType: "release_merge_queue_after_pull_request_merge",
+          status: "succeeded",
+        }),
+      ]),
+    );
   });
 
   it("keeps merge-policy observations fresh across an ok base-ref guard before repair dispatch", async () => {
@@ -5347,6 +5612,18 @@ describe("Orchestrator", () => {
         reviewRound: 1,
       },
     });
+    const mergeQueueStore = new SqliteMergeQueueStore(
+      config.workspace.stateDir,
+    );
+    try {
+      await expect(mergeQueueStore.getCurrent()).resolves.toMatchObject({
+        activeIssueId: candidate.id,
+        activeIssueIdentifier: candidate.identifier,
+        reason: "merge_queue_claim",
+      });
+    } finally {
+      await mergeQueueStore.close();
+    }
     const issueState = await readIssueState(
       config.workspace.stateDir,
       candidate.id,
@@ -9118,6 +9395,8 @@ describe("Orchestrator", () => {
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
     config.writeback.enabled = true;
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.sourceStates = ["Ready to Merge"];
     const candidate = issue({
       state: "In Review",
       branchName: "symphony/TEST-1",
@@ -9138,6 +9417,9 @@ describe("Orchestrator", () => {
     const lifecycleStore = new FileIssueLifecycleStore(stateDir);
     const runStore = new FileRunTranscriptStore(stateDir);
     const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const mergeQueueStore = new SqliteMergeQueueStore(stateDir);
+    await mergeQueueStore.claim(candidate, "test_active_review");
+    await mergeQueueStore.close();
     const report = completionReportRecord(candidate);
     await lifecycleStore.ensureIssue(candidate, {
       phase: "review",
@@ -9301,9 +9583,20 @@ describe("Orchestrator", () => {
         "load_review_verdict_handoff",
         "mark_review_verdict_handoff_accepted",
         "process_review_verdict_handoff_writebacks",
+        "release_merge_queue_after_failed_review_verdict",
         "request_merge_policy_after_pass_verdict",
       ]),
     );
+    const releasedMergeQueueStore = new SqliteMergeQueueStore(stateDir);
+    try {
+      await expect(releasedMergeQueueStore.getCurrent()).resolves.toMatchObject({
+        activeIssueId: null,
+        leaseId: null,
+        reason: "review_verdict_failed",
+      });
+    } finally {
+      await releasedMergeQueueStore.close();
+    }
   });
 
   it("skips handoff repair when the source run is not resumable", async () => {
@@ -13908,6 +14201,10 @@ function mergePolicyRulesetSnapshot(
     triggerSource: "orchestrator",
     candidateSource: "merge_policy_candidates",
     transitionRequestContext: null,
+    mergeQueueActiveIssueId: candidate.id,
+    mergeQueueActiveIssueIdentifier: candidate.identifier,
+    mergeQueueLeaseId: "merge-queue-lease:test",
+    mergeQueueStatus: "active_current_issue",
     availableSlots: 1,
     providerDispatchGateActive: false,
     stateSlotAvailable: true,
@@ -14403,6 +14700,66 @@ class FailingRequiredCheckMergeClient implements MergePolicyGitHubClient {
 
   async mergePullRequest(): Promise<never> {
     throw new Error("merge should not be called while required checks fail");
+  }
+
+  async getAuthenticatedLogin() {
+    return "symphony-bot";
+  }
+
+  async isAncestor() {
+    return true;
+  }
+
+  async gitAuthHeader() {
+    return "x-access-token:token";
+  }
+}
+
+class SuccessfulMergeClient implements MergePolicyGitHubClient {
+  mergeCalls = 0;
+
+  async getPullRequest() {
+    return {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:02.000Z",
+      state: "open",
+      merged: false,
+      mergeCommitSha: null,
+      mergedAt: null,
+      mergedBy: null,
+      mergeable: true,
+      mergeableState: "clean",
+      baseBranch: "main",
+      baseHeadSha: "base-sha-1",
+    };
+  }
+
+  async getBranchHeadSha() {
+    return "base-sha-1";
+  }
+
+  async getRequiredCheckResults() {
+    return [
+      {
+        name: "test",
+        status: "success" as const,
+        conclusion: "success",
+        url: "https://ci.test/test",
+      },
+    ];
+  }
+
+  async mergePullRequest() {
+    this.mergeCalls += 1;
+    return {
+      merged: true,
+      mergeCommitSha: "merge-sha-1",
+      mergedAt: "2026-01-01T00:00:04.000Z",
+      mergedBy: "symphony-bot",
+    };
   }
 
   async getAuthenticatedLogin() {

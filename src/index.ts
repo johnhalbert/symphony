@@ -18,6 +18,7 @@ export * from "./core/merge/MergePolicyService.js";
 export * from "./core/orchestration/IssueOrchestrationEngine.js";
 export * from "./core/orchestration/IssueOrchestrationState.js";
 export * from "./core/orchestration/SqliteIssueStateStore.js";
+export * from "./core/orchestration/SqliteMergeQueueStore.js";
 export * from "./core/orchestrator/Orchestrator.js";
 export * from "./core/persistence/IssueLifecycleStore.js";
 export * from "./core/persistence/OrchestratorChatProjectionReducer.js";

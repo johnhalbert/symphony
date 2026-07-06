@@ -34,6 +34,7 @@ export type IssueTriggerSource = "orchestrator" | "manual_cli" | "transition";
 
 export type IssueTransitionKind =
   | "record_evidence"
+  | "merge_queue_claim"
   | "base_ref_observe"
   | "base_ref_repair"
   | "base_ref_block"
@@ -304,6 +305,13 @@ export interface IssueCurrentStateSnapshot extends IssueCurrentFields {
   retryAttempt?: number | null;
   retryDelayMs?: number | null;
   retryError?: string | null;
+  mergeQueueActiveIssueId?: string | null;
+  mergeQueueActiveIssueIdentifier?: string | null;
+  mergeQueueLeaseId?: string | null;
+  mergeQueueStatus?:
+    | "inactive"
+    | "active_current_issue"
+    | "active_other_issue";
 }
 
 export interface IssueTransitionRequest {
