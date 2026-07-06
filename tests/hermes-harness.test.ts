@@ -133,6 +133,122 @@ describe("HermesHarness", () => {
     expect(clients[1]?.killed).toContain("hermes.run_finished");
   });
 
+  it("qualifies reusable worker profile and session metadata by project context", async () => {
+    const clients: FakeGatewayClient[] = [];
+    const runtimeEvents: Record<string, unknown>[] = [];
+    const harness = new HermesHarness({
+      cliPath: path.join(root, "cli.js"),
+      commandPolicyHookVerifier: acceptingCommandPolicyHookVerifier,
+      gatewayFactory: (env) => {
+        const client = new FakeGatewayClient(env, `gw-${clients.length + 1}`);
+        clients.push(client);
+        return client;
+      },
+      runStore: {
+        appendEvent: async (event: any) => {
+          runtimeEvents.push(event as Record<string, unknown>);
+          return { sequence: runtimeEvents.length, ...event };
+        },
+      } as any,
+    });
+
+    const config = configForHarness();
+    const workspacePath = path.join(root, "workspace");
+    await mkdir(workspacePath, { recursive: true });
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const platformProjectContext = {
+      projectContextId: "platform",
+      projectContextLabel: "Platform Services",
+      linearProjectSlug: "PLAT",
+      routingSource: "candidate_poll",
+    } as const;
+    const docsIssue = issue({
+      projectContext: docsProjectContext,
+      projectContextId: docsProjectContext.projectContextId,
+      projectContextLabel: docsProjectContext.projectContextLabel,
+      linearProjectSlug: docsProjectContext.linearProjectSlug,
+      routingSource: docsProjectContext.routingSource,
+    });
+    const platformIssue = issue({
+      projectContext: platformProjectContext,
+      projectContextId: platformProjectContext.projectContextId,
+      projectContextLabel: platformProjectContext.projectContextLabel,
+      linearProjectSlug: platformProjectContext.linearProjectSlug,
+      routingSource: platformProjectContext.routingSource,
+    });
+
+    const docsOne = await collect(
+      harness.run(context(config, { issue: docsIssue, workspaceKey: "workspace-1", workspacePath, turnNumber: 1 }), "docs worker prompt"),
+    );
+    const docsTwo = await collect(
+      harness.run(context(config, { issue: docsIssue, workspaceKey: "workspace-1", workspacePath, turnNumber: 2 }), "docs follow-up"),
+    );
+    const platform = await collect(
+      harness.run(
+        context(config, { issue: platformIssue, workspaceKey: "workspace-1", workspacePath, turnNumber: 3 }),
+        "platform worker prompt",
+      ),
+    );
+
+    expect(docsOne.map((event) => event.type)).toContain("completed");
+    expect(docsTwo.map((event) => event.type)).toContain("completed");
+    expect(platform.map((event) => event.type)).toContain("completed");
+    expect(clients).toHaveLength(3);
+    expect(clients[1]?.requests).toContainEqual({
+      method: "session.resume",
+      params: { cols: 120, session_id: "hermes-gw-1" },
+    });
+    expect(clients[2]?.requests.find((request) => request.method === "session.resume")).toBeUndefined();
+    expect(clients[0]?.env.hermesHome).toBe(clients[1]?.env.hermesHome);
+    expect(clients[2]?.env.hermesHome).not.toBe(clients[0]?.env.hermesHome);
+
+    const docsStarted = docsOne.find((event): event is Extract<AgentEvent, { type: "session_started" }> => event.type === "session_started");
+    const platformStarted = platform.find(
+      (event): event is Extract<AgentEvent, { type: "session_started" }> => event.type === "session_started",
+    );
+    const docsProfile = JSON.parse(await readFile(path.join(clients[0]!.env.hermesHome, ".symphony-hermes-profile.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    const platformProfile = JSON.parse(
+      await readFile(path.join(clients[2]!.env.hermesHome, ".symphony-hermes-profile.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(docsStarted?.sessionId?.startsWith(`${String(docsProfile.profileKey)}:gw-1:hermes-`)).toBe(true);
+    expect(platformStarted?.sessionId?.startsWith(`${String(platformProfile.profileKey)}:gw-3:hermes-`)).toBe(true);
+    expect(docsProfile).toMatchObject({
+      profileKey: "sym_docs_workspace-1_worker_test-1_implementation_reuse_by_issue",
+      workspaceKey: "docs__workspace-1",
+    });
+    expect(platformProfile).toMatchObject({ workspaceKey: "platform__workspace-1" });
+    const docsSessionState = JSON.parse(
+      await readFile(path.join(clients[0]!.env.hermesHome, ".symphony-hermes-session.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(docsSessionState).toMatchObject({
+      hermesSessionKey: "hermes-gw-2",
+      profileKey: docsProfile.profileKey,
+      workspaceKey: "docs__workspace-1",
+      projectContext: docsProjectContext,
+    });
+
+    expect(runtimeEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "hermes_profile",
+          payload: expect.objectContaining({ workspaceKey: "docs__workspace-1", projectContext: docsProjectContext }),
+        }),
+        expect.objectContaining({
+          eventType: "hermes_profile",
+          payload: expect.objectContaining({ workspaceKey: "platform__workspace-1", projectContext: platformProjectContext }),
+        }),
+      ]),
+    );
+  });
+
   it("uses managed Hermes auth for openai-codex without injecting API-key credentials", async () => {
     const clients: FakeGatewayClient[] = [];
     const harness = new HermesHarness({
@@ -731,18 +847,22 @@ function configForHarness() {
 function context(
   config: ReturnType<typeof configForHarness>,
   input: {
+    issue?: AgentRunContext["issue"];
+    projectContext?: AgentRunContext["projectContext"];
     workspacePath: string;
+    workspaceKey?: string;
     role?: "worker" | "reviewer";
     runPhase?: "implementation" | "review";
     turnNumber: number;
   },
 ): AgentRunContext {
   return {
-    issue: issue(),
+    issue: input.issue ?? issue(),
+    projectContext: input.projectContext,
     role: input.role ?? "worker",
     runPhase: input.runPhase ?? "implementation",
     attempt: null,
-    workspace: { path: input.workspacePath, workspaceKey: "workspace-1", createdNow: true },
+    workspace: { path: input.workspacePath, workspaceKey: input.workspaceKey ?? "workspace-1", createdNow: true },
     config,
     turnNumber: input.turnNumber,
     runModeOverride: null,
