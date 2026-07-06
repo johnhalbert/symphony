@@ -331,7 +331,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(projectionWriter.writes.at(-1)).toMatchObject({
         projectionName: "transcript_projection",
         scopeKind: "run_page",
-        scopeKey: "active-run:offset:0:limit:500",
+        scopeKey: "pc=default|active-run:offset:0:limit:500",
         fields: { runId: "active-run", sessionId: "active-session", offsetStart: 0, offsetLimit: 500 },
       });
 
@@ -353,12 +353,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        {
-          projectionName: "transcript_projection",
-          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
-          scopeKind: "run_page",
-          scopeKey: "active-run:offset:0:limit:1",
-        },
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=default|active-run:offset:0:limit:1" },
       ]);
     } finally {
       await server.stop();
@@ -439,12 +434,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        {
-          projectionName: "transcript_projection",
-          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
-          scopeKind: "run_page",
-          scopeKey: "envelope-run:offset:0:limit:1",
-        },
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=default|envelope-run:offset:0:limit:1" },
       ]);
     } finally {
       await server.stop();
@@ -577,12 +567,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        {
-          projectionName: "transcript_projection",
-          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
-          scopeKind: "run_page",
-          scopeKey: "source-backfill-run:offset:0:limit:1",
-        },
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=default|source-backfill-run:offset:0:limit:1" },
       ]);
     } finally {
       await server.stop();
@@ -679,7 +664,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(projectionWriter.writes[0]).toMatchObject({
         projectionName: "transcript_projection",
         scopeKind: "run_page",
-        scopeKey: "query-run:offset:2:limit:1000",
+        scopeKey: "pc=default|query-run:offset:2:limit:1000",
         fields: {
           issueKey: "TEST-1",
           runId: "query-run",
@@ -1612,9 +1597,8 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(projectionReader.selectors).toEqual([
         {
           projectionName: "transcript_projection",
-          projectContextId: "docs",
           scopeKind: "run_page",
-          scopeKey: "docs-run:offset:0:limit:500",
+          scopeKey: "pc=docs|docs-run:offset:0:limit:500",
         },
       ]);
     } finally {
@@ -1700,13 +1684,6 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(projectionReader.selectors).toEqual([
         {
           projectionName: "transcript_projection",
-          projectContextId: "docs",
-          scopeKind: "run_page",
-          scopeKey: "legacy-context-run:offset:0:limit:500",
-        },
-        {
-          projectionName: "transcript_projection",
-          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
           scopeKind: "run_page",
           scopeKey: "legacy-context-run:offset:0:limit:500",
         },
@@ -1807,7 +1784,6 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(projectionReader.selectors).toEqual([
         {
           projectionName: "transcript_projection",
-          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
           scopeKind: "run_page",
           scopeKey: "cursor-fallback-run:offset:2:limit:3",
         },
