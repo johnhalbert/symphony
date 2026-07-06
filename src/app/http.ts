@@ -764,13 +764,25 @@ export class StatusServer {
             );
             return;
           }
+          const defaultProjectContextId = this.options.defaultProjectContextId;
           const durableTranscript = requestedTranscriptPage
             ? await this.webProjectionRepositories.transcript.readRunPage(
-                { runId: sessionIdOrRunId, offset: requestedTranscriptPage.offset, limit: requestedTranscriptPage.limit },
+                {
+                  runId: sessionIdOrRunId,
+                  offset: requestedTranscriptPage.offset,
+                  limit: requestedTranscriptPage.limit,
+                  projectContextId: defaultProjectContextId,
+                  defaultProjectContextId,
+                },
                 { forceRefresh },
               )
             : await this.webProjectionRepositories.transcript.readRunDefaultPage(
-                { runId: sessionIdOrRunId, limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT },
+                {
+                  runId: sessionIdOrRunId,
+                  limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT,
+                  projectContextId: defaultProjectContextId,
+                  defaultProjectContextId,
+                },
                 { forceRefresh },
               );
           if (durableTranscript.status === "hit" && durableTranscript.record) {
