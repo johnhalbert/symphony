@@ -27,6 +27,10 @@ import {
   type LifecycleReconciliationResult,
 } from "./core/LifecycleReconciliationService.js";
 import {
+  LifecyclePrHeadRebindService,
+  type LifecyclePrHeadRebindResult,
+} from "./core/LifecyclePrHeadRebindService.js";
+import {
   RunTranscriptCleanupService,
   type RunTranscriptCleanupResult,
 } from "./core/RunTranscriptCleanupService.js";
@@ -39,6 +43,7 @@ import {
   type ProjectionSqlPool,
 } from "./core/persistence/ProjectionTransactionService.js";
 import { FileRunTranscriptStore } from "./core/persistence/RunTranscriptStore.js";
+import { SqliteIssueStateStore } from "./core/orchestration/SqliteIssueStateStore.js";
 import {
   PostgresRunActivityAppendStore,
   type PostgresRunActivityAppendClient,
@@ -76,6 +81,7 @@ import {
   type PostgresMigrationApplyResult,
   type PostgresMigrationValidationResult,
 } from "./core/database/PostgresMigrations.js";
+import { createGitHubPullRequestClientForCapability } from "./integrations/github/GitHubCredentialResolver.js";
 
 const program = new Command();
 
@@ -626,6 +632,61 @@ issueCommand
     },
   );
 
+issueCommand
+  .command("rebind-pr-head")
+  .description("Preview or apply an audited manual repair for lifecycle PR head metadata drift")
+  .argument("<issue>", "issue id or identifier")
+  .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
+  .option("--apply", "write lifecycle changes and record a manual admin audit snapshot; default is dry-run")
+  .option("--head <sha>", "explicit target PR head SHA; otherwise read the lifecycle-bound PR from GitHub")
+  .option("--force", "allow rebind when the observed/local worktree head differs from the target head")
+  .option("--json", "print JSON result")
+  .action(
+    async (
+      issue: string,
+      workflow: string,
+      options: { apply?: boolean; head?: string; force?: boolean; json?: boolean },
+    ) => {
+      const logger = new StructuredLogger();
+      const workflowPath = path.resolve(process.cwd(), workflow);
+      const loader = new WorkflowLoader(workflowPath);
+      const loaded = await loader.load();
+      const config = loaded.serviceConfig;
+      const tracker = createRuntimeTrackerClient(config);
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const issueStateStore = new SqliteIssueStateStore(config.workspace.stateDir);
+      const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+      const service = new LifecyclePrHeadRebindService({
+        config,
+        tracker,
+        lifecycleStore,
+        issueStateStore,
+        runStore,
+        logger,
+        ...(options.head === undefined
+          ? { pullRequestClient: createGitHubPullRequestClientForCapability(config, "github.merge") }
+          : {}),
+      });
+      try {
+        const result = await service.rebind({
+          issueIdOrIdentifier: issue,
+          apply: options.apply === true,
+          headSha: options.head ?? null,
+          force: options.force === true,
+        });
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(formatLifecyclePrHeadRebindResult(result));
+        }
+        if (result.status === "not_found" || result.status === "blocked") process.exitCode = 2;
+      } finally {
+        await issueStateStore.close?.();
+        await loader.close();
+      }
+    },
+  );
+
 program
   .argument("[workflow]", "path to WORKFLOW.md", "WORKFLOW.md")
   .option("--port <port>", "enable local HTTP status server on this port")
@@ -983,6 +1044,37 @@ function formatLifecycleReconciliationResult(
       lines.push(`    ${oneLineCli(action.detail)}`);
     }
   }
+  return lines.join("\n");
+}
+
+function formatLifecyclePrHeadRebindResult(result: LifecyclePrHeadRebindResult): string {
+  if (result.status === "not_found") {
+    return `No issue/lifecycle record found for PR head rebind: ${result.blockingReason ?? "not_found"}.`;
+  }
+  const issue = result.issue ? `${result.issue.identifier} (${result.issue.id})` : "unknown issue";
+  const mode = result.applied ? "apply" : "dry-run";
+  const lines = [
+    `Lifecycle PR head rebind ${mode} for ${issue}`,
+    `  Status: ${result.status}`,
+    `  Target head: ${result.targetHeadSha ?? "n/a"} (${result.targetHeadSource ?? "n/a"})`,
+    `  PR: ${result.pullRequestNumber ?? "n/a"}`,
+    `  Branch: ${result.branchName ?? "n/a"}`,
+    `  Summary head: ${result.oldSummaryPrHeadSha ?? "n/a"} -> ${result.targetHeadSha ?? "n/a"}`,
+    `  Latest report head: ${result.oldLatestCompletionReportPrHeadSha ?? "n/a"} -> ${result.targetHeadSha ?? "n/a"}`,
+    `  Handoff head: ${result.oldHandoffPrHeadSha ?? "n/a"} -> ${result.targetHeadSha ?? "n/a"}`,
+    `  Local worktree head: ${result.localWorktreeHeadSha ?? "n/a"}`,
+    `  Local worktree branch: ${result.localWorktreeBranch ?? "n/a"}`,
+    `  Observed worktree head: ${result.observedWorktreeHeadSha ?? "n/a"}`,
+    `  Clear base-ref observation: ${result.clearedBaseRefObservation ? "yes" : "no"}`,
+  ];
+  if (result.blockingReason) lines.push(`  Blocking reason: ${result.blockingReason}`);
+  if (result.auditHistorySnapshotId) lines.push(`  Audit history snapshot: ${result.auditHistorySnapshotId}`);
+  if (result.warnings.length > 0) {
+    lines.push("  Warnings:");
+    for (const warning of result.warnings) lines.push(`    - ${warning}`);
+  }
+  if (result.status === "preview") lines.push("  No changes written. Re-run with --apply to persist and record audit history.");
+  if (result.status === "no_change") lines.push("  No lifecycle metadata changes needed.");
   return lines.join("\n");
 }
 

@@ -29,6 +29,7 @@ import type {
 export type IssueTriggerType =
   | "orchestrator.tick"
   | "manual.cli_agent_run"
+  | "manual.cli_admin_action"
   | "runtime.requested";
 export type IssueTriggerSource = "orchestrator" | "manual_cli" | "transition";
 
