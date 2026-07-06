@@ -2108,19 +2108,23 @@ describe("/api/v1/web route contracts", () => {
         const ambiguousTranscript = await getJson(`${baseUrl}/api/v1/web/sessions/TEST-1/transcript`);
         const ambiguousWebIssue = await getJson(`${baseUrl}/api/v1/web/issues/TEST-1`);
         const ambiguousIssueRuns = await getJson(`${baseUrl}/api/v1/issues/TEST-1/runs`);
+        const ambiguousRun = await getJson(`${baseUrl}/api/v1/runs/TEST-1`);
+        const ambiguousApproval = await getJson(`${baseUrl}/api/v1/approval-requests/TEST-1`);
         const qualifiedIssue = await getJson(`${baseUrl}/api/v1/issues/${encodeURIComponent("docs:TEST-1")}`);
         const qualifiedWebIssue = await getJson(`${baseUrl}/api/v1/web/issues/${encodeURIComponent("docs:TEST-1")}`);
         const qualifiedIssueRuns = await getJson(`${baseUrl}/api/v1/issues/${encodeURIComponent("docs:TEST-1")}/runs`);
         const qualifiedWorkspace = await getJson(`${baseUrl}/api/v1/workspaces/${encodeURIComponent("docs:TEST-1")}`);
         const qualifiedTranscript = await getJson(`${baseUrl}/api/v1/web/sessions/${encodeURIComponent("docs:TEST-1")}/transcript`);
-        const qualifiedRun = await getJson(`${baseUrl}/api/v1/runs/run-docs-1`);
-        const approvalRoute = await getJson(`${baseUrl}/api/v1/approval-requests/${docsPending.requestId}`);
+        const qualifiedRun = await getJson(`${baseUrl}/api/v1/runs/${encodeURIComponent("docs:run-docs-1")}`);
+        const approvalRoute = await getJson(`${baseUrl}/api/v1/approval-requests/${encodeURIComponent("docs:TEST-1")}`);
 
         const ambiguousIssueBody = ambiguousIssue.body as { error: { message: string } };
         const ambiguousWorkspaceBody = ambiguousWorkspace.body as { error: { message: string } };
         const ambiguousTranscriptBody = ambiguousTranscript.body as { error: { message: string } };
         const ambiguousWebIssueBody = ambiguousWebIssue.body as { error: { message: string } };
         const ambiguousIssueRunsBody = ambiguousIssueRuns.body as { error: { message: string } };
+        const ambiguousRunBody = ambiguousRun.body as { error: { message: string } };
+        const ambiguousApprovalBody = ambiguousApproval.body as { error: { message: string } };
         const issueBody = qualifiedIssue.body as {
           issue: string;
           workspace: {
@@ -2216,6 +2220,12 @@ describe("/api/v1/web route contracts", () => {
         expect(ambiguousIssueRunsBody.error.message).toContain("Use exact issue id");
         expect(ambiguousIssueRunsBody.error.message).toContain("[docs]");
         expect(ambiguousIssueRunsBody.error.message).toContain("[symphony]");
+        expect(ambiguousRun.response.status).toBe(404);
+        expect(ambiguousRunBody.error.message).toContain("ambiguous across project contexts");
+        expect(ambiguousRunBody.error.message).toContain("context-qualified alias");
+        expect(ambiguousApproval.response.status).toBe(404);
+        expect(ambiguousApprovalBody.error.message).toContain("ambiguous across project contexts");
+        expect(ambiguousApprovalBody.error.message).toContain("context-qualified alias");
 
         expect(qualifiedIssue.response.status).toBe(200);
         expect(issueBody.issue).toBe("issue-docs-1");
