@@ -481,15 +481,15 @@ CREATE INDEX IF NOT EXISTS sidebar_projection_revision_reads_idx
 CREATE INDEX IF NOT EXISTS history_projection_revision_reads_idx
   ON symphony.history_projection (project_context_id, scope_key, revision DESC, updated_at DESC, generated_at DESC);
 CREATE INDEX IF NOT EXISTS history_projection_run_lookup_idx
-  ON symphony.history_projection (project_context_id, run_id, session_id, revision DESC)
+  ON symphony.history_projection (project_context_id, run_id, session_id, revision DESC, updated_at DESC)
   WHERE run_id IS NOT NULL OR session_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS transcript_projection_revision_reads_idx
   ON symphony.transcript_projection (project_context_id, run_id, revision DESC, updated_at DESC, generated_at DESC);
 CREATE INDEX IF NOT EXISTS transcript_projection_session_reads_idx
-  ON symphony.transcript_projection (project_context_id, session_id, revision DESC)
+  ON symphony.transcript_projection (project_context_id, session_id, revision DESC, updated_at DESC)
   WHERE session_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS orchestrator_chat_projection_revision_reads_idx
   ON symphony.orchestrator_chat_projection (project_context_id, scope_key, conversation_key, revision DESC, updated_at DESC, generated_at DESC);
 CREATE INDEX IF NOT EXISTS orchestrator_chat_projection_issue_idx
-  ON symphony.orchestrator_chat_projection (project_context_id, issue_key, revision DESC)
+  ON symphony.orchestrator_chat_projection (project_context_id, issue_key, revision DESC, updated_at DESC)
   WHERE issue_key IS NOT NULL;
