@@ -729,6 +729,7 @@ export class StatusServer {
             lifecycleStore: this.options.lifecycleStore,
             writebackOutbox: this.options.writebackOutbox,
             query: parseActivityQuery(url),
+            defaultProjectContextId: this.options.defaultProjectContextId,
           }),
         );
         return;
@@ -976,9 +977,20 @@ export class StatusServer {
 
       const approvalMatch = /^\/api\/v1\/approval-requests\/([^/]+)$/.exec(url.pathname);
       if (approvalMatch) {
-        const requestId = decodeURIComponent(approvalMatch[1] ?? "");
+        const requestId = decodeURIComponent(approvalMatch[1] ?? "").trim();
         if (request.method === "GET") {
-          const approval = await this.options.operatorApproval?.get(requestId);
+          const resolvedApproval = await resolveApprovalRouteFromAlias({
+            operatorApproval: this.options.operatorApproval,
+            requestKey: requestId,
+            snapshot: this.options.orchestrator.snapshot(),
+            runStore: this.options.runStore,
+            lifecycleStore: this.options.lifecycleStore,
+            defaultProjectContextId: this.options.defaultProjectContextId,
+          });
+          if (resolvedApproval.status === "ambiguous" || resolvedApproval.status === "wrong_context") {
+            throw statusAliasResolutionError("Approval", requestId, resolvedApproval.status);
+          }
+          const approval = resolvedApproval.approval;
           if (!approval) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
           sendJson(response, 200, approvalResponse(approval, this.options.operatorApproval?.isRequired() ?? false));
           return;
@@ -986,12 +998,23 @@ export class StatusServer {
         if (request.method === "POST") {
           this.requireApprovalMutationToken(request);
           const decision = parseApprovalDecision(await readJsonBody(request));
-          let existingApproval: OperatorApprovalRecord | null = null;
+          let resolvedApproval: ApprovalRouteResolution = { status: "none", approval: null };
           try {
-            existingApproval = (await this.options.operatorApproval?.get(requestId)) ?? null;
+            resolvedApproval = await resolveApprovalRouteFromAlias({
+              operatorApproval: this.options.operatorApproval,
+              requestKey: requestId,
+              snapshot: this.options.orchestrator.snapshot(),
+              runStore: this.options.runStore,
+              lifecycleStore: this.options.lifecycleStore,
+              defaultProjectContextId: this.options.defaultProjectContextId,
+            });
           } catch {
-            existingApproval = null;
+            resolvedApproval = { status: "none", approval: null };
           }
+          if (resolvedApproval.status === "ambiguous" || resolvedApproval.status === "wrong_context") {
+            throw statusAliasResolutionError("Approval", requestId, resolvedApproval.status);
+          }
+          const existingApproval = resolvedApproval.approval;
           if (existingApproval?.status === "pending") {
             const currentApproval = await currentPendingPublicationApproval({
               approval: existingApproval,
@@ -1003,11 +1026,12 @@ export class StatusServer {
               throw new SymphonyError("conflict", "Approval request is not current pending publication approval");
             }
           }
+          const resolvedRequestId = existingApproval?.requestId ?? requestId;
           let result;
           try {
-            result = await this.options.operatorApproval?.resolve(requestId, decision);
+            result = await this.options.operatorApproval?.resolve(resolvedRequestId, decision);
           } catch (error) {
-            await this.recordPublicationApprovalTerminalConflict(requestId, error);
+            await this.recordPublicationApprovalTerminalConflict(resolvedRequestId, error);
             throw error;
           }
           if (!result) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
@@ -1527,8 +1551,17 @@ export class StatusServer {
 
       const runMatch = /^\/api\/v1\/runs\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && runMatch) {
-        const runId = decodeURIComponent(runMatch[1] ?? "");
-        const run = await this.options.runStore?.getRun(runId);
+        const runId = decodeURIComponent(runMatch[1] ?? "").trim();
+        if (!this.options.runStore) throw new SymphonyError("not_found", `Run not found: ${runId}`);
+        const resolvedRun = await resolveTranscriptRunFromAlias({
+          runStore: this.options.runStore,
+          requestKey: runId,
+          defaultProjectContextId: this.options.defaultProjectContextId,
+        });
+        if (resolvedRun.status === "ambiguous" || resolvedRun.status === "wrong_context") {
+          throw statusAliasResolutionError("Run", runId, resolvedRun.status);
+        }
+        const run = resolvedRun.run;
         if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
         const issueLookupOptions = run.projectContext ? { projectContext: run.projectContext } : {};
         const issueRunsByIdentifier = (await this.options.runStore?.listRunsForIssue(run.issueIdentifier, issueLookupOptions)) ?? [];
@@ -1540,7 +1573,7 @@ export class StatusServer {
           (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
           ...publicRunRecord(run),
-          pendingApproval: (await this.options.operatorApproval?.findPendingForRun(runId)) ?? null,
+          pendingApproval: (await this.options.operatorApproval?.findPendingForRun(run.runId)) ?? null,
           telemetry: await runTelemetrySummary(run.runId, this.options.runStore),
           operatorLiveness: await runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns, this.options.runStore),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
@@ -5403,6 +5436,7 @@ interface IssueBoardTrackerCache {
 
 interface ActivityQuery {
   issue: string | null;
+  projectContextId?: string | null;
   offset: number;
   limit: number;
 }
@@ -5751,13 +5785,25 @@ async function buildActivityFeed(input: {
   writebackOperations?: readonly WritebackOperation[];
   query: ActivityQuery;
   includeTranscriptEvents?: boolean;
+  defaultProjectContextId?: string | null | undefined;
 }) {
   const allRuns = input.runs ?? (input.runStore ? await input.runStore.listRuns() : []);
   const includeTranscriptEvents = input.includeTranscriptEvents ?? true;
   const lifecycleRecords = input.lifecycleRecords ?? (await input.lifecycleStore?.list()) ?? [];
+  const requestedProjectContextId = input.query.projectContextId ?? null;
+  const scopedRuns = requestedProjectContextId
+    ? allRuns.filter((run) => matchesActivityProjectContext(run.projectContext, requestedProjectContextId, input.defaultProjectContextId))
+    : allRuns;
+  const scopedLifecycleRecords = requestedProjectContextId
+    ? lifecycleRecords.filter((lifecycle) =>
+        matchesActivityProjectContext(lifecycle.projectContext, requestedProjectContextId, input.defaultProjectContextId),
+      )
+    : lifecycleRecords;
   const requestedIssueFilter = input.query.issue;
-  const resolvedIssueFilter = requestedIssueFilter ? resolveActivityIssueFilter(requestedIssueFilter, allRuns, lifecycleRecords) : null;
-  const runs = resolvedIssueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, resolvedIssueFilter)) : allRuns;
+  const resolvedIssueFilter = requestedIssueFilter
+    ? resolveActivityIssueFilter(requestedIssueFilter, scopedRuns, scopedLifecycleRecords, input.defaultProjectContextId)
+    : null;
+  const runs = resolvedIssueFilter ? scopedRuns.filter((run) => activityRunMatchesIssue(run, resolvedIssueFilter)) : scopedRuns;
   const activity: ActivityItem[] = [];
   let transcriptEventsConsidered = 0;
   let transcriptEventsTotal = 0;
@@ -5788,11 +5834,34 @@ async function buildActivityFeed(input: {
   }
 
   const writebackOperations = input.writebackOperations ?? (await input.writebackOutbox?.list()) ?? [];
-  const filteredWritebackOperations = resolvedIssueFilter
-    ? writebackOperations.filter((operation) => writebackOperationMatchesIssue(operation, resolvedIssueFilter, allRuns, lifecycleRecords))
+  const projectScopedWritebackOperations = requestedProjectContextId
+    ? writebackOperations.filter((operation) =>
+        writebackOperationMatchesProjectContext(
+          operation,
+          requestedProjectContextId,
+          allRuns,
+          lifecycleRecords,
+          input.defaultProjectContextId,
+        ),
+      )
     : writebackOperations;
+  const filteredWritebackOperations = resolvedIssueFilter
+    ? projectScopedWritebackOperations.filter((operation) =>
+        writebackOperationMatchesIssue(
+          operation,
+          resolvedIssueFilter,
+          allRuns,
+          lifecycleRecords,
+          input.defaultProjectContextId,
+        ),
+      )
+    : projectScopedWritebackOperations;
   writebackOperationsConsidered = filteredWritebackOperations.length;
-  activity.push(...filteredWritebackOperations.map((operation) => activityItemForWritebackOperation(operation, allRuns, lifecycleRecords)));
+  activity.push(
+    ...filteredWritebackOperations.map((operation) =>
+      activityItemForWritebackOperation(operation, allRuns, lifecycleRecords, input.defaultProjectContextId),
+    ),
+  );
 
   activity.sort(compareActivityItems);
   const page = activity.slice(input.query.offset, input.query.offset + input.query.limit);
@@ -5821,6 +5890,7 @@ async function buildActivityFeed(input: {
     },
     filter: {
       issue: input.query.issue,
+      projectContextId: requestedProjectContextId,
     },
   };
 }
@@ -5873,10 +5943,10 @@ function activityItemForWritebackOperation(
   operation: WritebackOperation,
   runs: readonly RunRecord[],
   lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
 ): ActivityItem {
   const run = operation.runId ? (runs.find((candidate) => candidate.runId === operation.runId) ?? null) : null;
-  const lifecycle =
-    lifecycles.find((candidate) => candidate.issueId === operation.issueId || candidate.issueIdentifier === operation.issueId) ?? null;
+  const lifecycle = writebackOperationLifecycle(operation, lifecycles, defaultProjectContextId);
   const issueId = run?.issueId ?? lifecycle?.issueId ?? operation.issueId;
   const issueIdentifier = run?.issueIdentifier ?? lifecycle?.issueIdentifier ?? operation.issueId;
   return {
@@ -5884,7 +5954,7 @@ function activityItemForWritebackOperation(
     at: operation.updatedAt,
     kind: "writeback_operation",
     source: "writeback",
-    projectContext: activityProjectContext(run?.projectContext ?? operation.projectContext),
+    projectContext: activityProjectContext(run?.projectContext ?? lifecycle?.projectContext ?? operation.projectContext),
     issue: {
       id: issueId,
       identifier: issueIdentifier,
@@ -6348,6 +6418,11 @@ interface ResolvedIssueActionTarget {
 interface TranscriptRunResolution {
   status: AliasResolutionStatus;
   run: RunRecord | null;
+}
+
+interface ApprovalRouteResolution {
+  status: AliasResolutionStatus;
+  approval: OperatorApprovalRecord | null;
 }
 
 function parseContextualAlias(requestKey: string): ParsedContextualAlias {
@@ -6948,6 +7023,88 @@ function statusAliasResolutionError(
   );
 }
 
+function approvalAliasLookupKeys(requestKey: string, resolvedIssue: ResolvedIssueAliasData): string[] {
+  return [
+    requestKey,
+    resolvedIssue.live?.issueId,
+    resolvedIssue.live?.issueIdentifier,
+    resolvedIssue.workspace?.issueId,
+    resolvedIssue.workspace?.issueIdentifier,
+    resolvedIssue.latestRun?.issueId,
+    resolvedIssue.latestRun?.issueIdentifier,
+    resolvedIssue.lifecycle?.issueId,
+    resolvedIssue.lifecycle?.issueIdentifier,
+  ].filter((value, index, values): value is string => value !== null && value !== undefined && values.indexOf(value) === index);
+}
+
+async function resolveCurrentPendingApprovalAlias(input: {
+  approval: OperatorApprovalRecord | null;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  runStore: RunTranscriptStore | undefined;
+}): Promise<OperatorApprovalRecord | null> {
+  if (!input.approval) return null;
+  if (!input.lifecycleStore || !input.runStore) return input.approval;
+  return currentPendingPublicationApproval({
+    approval: input.approval,
+    lifecycleStore: input.lifecycleStore,
+    runStore: input.runStore,
+  });
+}
+
+async function resolveApprovalRouteFromAlias(input: {
+  operatorApproval: StatusServerOptions["operatorApproval"];
+  requestKey: string;
+  snapshot: RuntimeSnapshot;
+  runStore: RunTranscriptStore | undefined;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  defaultProjectContextId: string | null | undefined;
+}): Promise<ApprovalRouteResolution> {
+  const directApproval = await input.operatorApproval?.get(input.requestKey);
+  if (directApproval) return { status: "resolved", approval: directApproval };
+  if (!input.operatorApproval) return { status: "none", approval: null };
+
+  if (input.runStore) {
+    const resolvedRun = await resolveTranscriptRunFromAlias({
+      runStore: input.runStore,
+      requestKey: input.requestKey,
+      defaultProjectContextId: input.defaultProjectContextId,
+    });
+    if (resolvedRun.status === "ambiguous" || resolvedRun.status === "wrong_context") {
+      return { status: resolvedRun.status, approval: null };
+    }
+    if (resolvedRun.run) {
+      const approval = await resolveCurrentPendingApprovalAlias({
+        approval: await input.operatorApproval.findPendingForRun(resolvedRun.run.runId),
+        lifecycleStore: input.lifecycleStore,
+        runStore: input.runStore,
+      });
+      if (approval) return { status: "resolved", approval };
+    }
+  }
+
+  const resolvedIssue = await resolveIssueAliasData({
+    requestKey: input.requestKey,
+    snapshot: input.snapshot,
+    runStore: input.runStore,
+    lifecycleStore: input.lifecycleStore,
+    defaultProjectContextId: input.defaultProjectContextId,
+  });
+  if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+    return { status: resolvedIssue.status, approval: null };
+  }
+  if (resolvedIssue.status !== "resolved") return { status: "none", approval: null };
+
+  const approval = await resolveCurrentPendingApprovalAlias({
+    approval: await input.operatorApproval.findPendingForIssue(
+      approvalAliasLookupKeys(input.requestKey, resolvedIssue),
+      resolvedIssueActionProjectContext(resolvedIssue) ?? projectContextResolutionFromParsedAlias(parseContextualAlias(input.requestKey)),
+    ),
+    lifecycleStore: input.lifecycleStore,
+    runStore: input.runStore,
+  });
+  return approval ? { status: "resolved", approval } : { status: "none", approval: null };
+}
+
 async function resolveTranscriptRunFromAlias(input: {
   runStore: RunTranscriptStore;
   requestKey: string;
@@ -7005,21 +7162,101 @@ function boardCardKeys(card: IssueBoardCard): string[] {
   return [card.key, card.issueId, card.issueIdentifier].filter((value): value is string => value !== null && value !== undefined);
 }
 
-function resolveActivityIssueFilter(issue: string, runs: readonly RunRecord[], lifecycles: readonly IssueLifecycleRecord[]): string {
-  const lookup = resolveIssueLookupFromCandidates(
-    issue,
-    dedupeIssueLookupCandidates(
-      [...runs.map(issueLookupCandidateFromRun), ...lifecycles.map(issueLookupCandidateFromLifecycle)].filter(
-        (candidate): candidate is IssueLookupCandidate => candidate !== null,
-      ),
+function resolveActivityIssueFilter(
+  issue: string,
+  runs: readonly RunRecord[],
+  lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
+): string {
+  const lookupCandidates = dedupeIssueLookupCandidates(
+    [...runs.map(issueLookupCandidateFromRun), ...lifecycles.map(issueLookupCandidateFromLifecycle)].filter(
+      (candidate): candidate is IssueLookupCandidate => candidate !== null,
     ),
   );
+  const lookup = resolveIssueLookupFromCandidates(issue, lookupCandidates);
   if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issue, lookup.ambiguousCandidates);
-  return lookup.issueId ?? issue;
+  if (lookup.issueId) return lookup.issueId;
+
+  const parsed = parseContextualAlias(issue);
+  if (parsed.projectContextId === null) return issue;
+
+  const resolution = resolveContextualAliasMatches({
+    requestKey: issue,
+    candidates: [
+      ...runs.map((record) => ({ kind: "run" as const, record })),
+      ...lifecycles.map((record) => ({ kind: "lifecycle" as const, record })),
+    ],
+    aliasValues: issueAliasValuesForCandidate,
+    projectContextId: issueAliasCandidateProjectContextId,
+    defaultProjectContextId,
+  });
+  if (resolution.status !== "resolved" || resolution.matches.length === 0) return issue;
+
+  const contextualCandidates = dedupeIssueLookupCandidates(
+    resolution.matches
+      .map(issueLookupCandidateFromAliasCandidate)
+      .filter((candidate): candidate is IssueLookupCandidate => candidate !== null),
+  );
+  if (contextualCandidates.length > 1) throw ambiguousIssueLookupError(issue, contextualCandidates);
+  return contextualCandidates[0]?.issueId ?? issue;
+}
+
+function writebackOperationLifecycle(
+  operation: WritebackOperation,
+  lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
+): IssueLifecycleRecord | null {
+  const candidateLifecycles = lifecycles.filter(
+    (candidate) => candidate.issueId === operation.issueId || candidate.issueIdentifier === operation.issueId,
+  );
+  const explicitProjectContextId = normalizeOptionalProjectContextId(operation.projectContext?.projectContextId);
+  if (explicitProjectContextId !== null) {
+    const explicitProjectContextGroupId = projectContextGroupId(explicitProjectContextId, defaultProjectContextId);
+    return candidateLifecycles.find(
+      (candidate) => projectContextGroupId(projectContextIdForAliasMatching(candidate), defaultProjectContextId) === explicitProjectContextGroupId,
+    ) ?? null;
+  }
+  return candidateLifecycles[0] ?? null;
 }
 
 function activityRunMatchesIssue(run: RunRecord, issueKey: string): boolean {
   return run.issueId === issueKey || run.issueIdentifier === issueKey;
+}
+
+function matchesActivityProjectContext(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  projectContextId: string | null | undefined,
+  defaultProjectContextId: string | null | undefined,
+): boolean {
+  if (!projectContextId) return true;
+  const candidateProjectContextId = normalizeProjectContextResolution(projectContext).projectContextId;
+  return projectContextGroupId(candidateProjectContextId, defaultProjectContextId) === projectContextGroupId(projectContextId, defaultProjectContextId);
+}
+
+function writebackOperationProjectContext(
+  operation: WritebackOperation,
+  runs: readonly RunRecord[],
+  lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
+): Partial<ProjectContextResolution> | null | undefined {
+  const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
+  if (run?.projectContext) return run.projectContext;
+  const lifecycle = writebackOperationLifecycle(operation, lifecycles, defaultProjectContextId);
+  return lifecycle?.projectContext ?? operation.projectContext;
+}
+
+function writebackOperationMatchesProjectContext(
+  operation: WritebackOperation,
+  projectContextId: string | null | undefined,
+  runs: readonly RunRecord[],
+  lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
+): boolean {
+  return matchesActivityProjectContext(
+    writebackOperationProjectContext(operation, runs, lifecycles, defaultProjectContextId),
+    projectContextId,
+    defaultProjectContextId,
+  );
 }
 
 function writebackOperationMatchesIssue(
@@ -7027,15 +7264,13 @@ function writebackOperationMatchesIssue(
   issueId: string,
   runs: readonly RunRecord[],
   lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
 ): boolean {
   if (operation.issueId === issueId) return true;
   const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
   if (run && activityRunMatchesIssue(run, issueId)) return true;
-  return lifecycles.some(
-    (lifecycle) =>
-      lifecycle.issueId === issueId &&
-      (lifecycle.issueId === operation.issueId || lifecycle.issueIdentifier === operation.issueId),
-  );
+  const lifecycle = writebackOperationLifecycle(operation, lifecycles, defaultProjectContextId);
+  return lifecycle ? lifecycle.issueId === issueId || lifecycle.issueIdentifier === issueId : false;
 }
 
 function uniqueStateNames(states: readonly string[]): string[] {
@@ -8766,8 +9001,18 @@ function parseActivityQuery(url: URL): ActivityQuery {
   const offset = Number(url.searchParams.get("offset") ?? "0");
   const limit = Number(url.searchParams.get("limit") ?? "50");
   const issue = url.searchParams.get("issue");
+  const rawProjectContextId = url.searchParams.get("projectContextId")?.trim() ?? "";
+  let projectContextId: string | null = null;
+  if (rawProjectContextId.length > 0) {
+    try {
+      projectContextId = normalizeProjectContextId(rawProjectContextId);
+    } catch {
+      throw new SymphonyError("invalid_request", `Invalid project context filter: ${rawProjectContextId}`);
+    }
+  }
   return {
     issue: issue && issue.length > 0 ? issue : null,
+    projectContextId,
     offset: Number.isFinite(offset) ? Math.max(Math.floor(offset), 0) : 0,
     limit: Number.isFinite(limit) ? Math.min(Math.max(Math.floor(limit), 1), 100) : 50,
   };

@@ -6396,7 +6396,7 @@ describe("StatusServer durable API", () => {
     }
   });
 
-  it("rejects ambiguous duplicate-identifier activity filters and emits exact-id activity links", async () => {
+  it("accepts context-qualified activity filters and project context filters while rejecting ambiguous duplicate identifiers and emitting exact-id activity links", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
@@ -6510,6 +6510,16 @@ describe("StatusServer durable API", () => {
         dedupeKey: "symphony-report",
       },
     });
+    await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-symphony-activity-1:runless-contextual-report",
+      kind: "comment",
+      issueId: symphonyIssue.identifier,
+      projectContext: symphonyProjectContext,
+      payload: {
+        body: "SYMPHONY_RUNLESS_WRITEBACK_BODY",
+        dedupeKey: "symphony-runless-contextual-report",
+      },
+    });
 
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
@@ -6532,12 +6542,19 @@ describe("StatusServer durable API", () => {
     try {
       const baseUrl = `http://${address.host}:${address.port}`;
       const ambiguousResponse = await fetch(`${baseUrl}/api/v1/activity?issue=${encodeURIComponent(docsIssue.identifier)}&limit=100`);
+      const qualifiedAliasResponse = await fetch(`${baseUrl}/api/v1/activity?issue=${encodeURIComponent("docs:ENG-123")}&limit=100`);
+      const scopedAliasResponse = await fetch(
+        `${baseUrl}/api/v1/activity?issue=${encodeURIComponent(docsIssue.identifier)}&projectContextId=docs&limit=100`,
+      );
+      const scopedResponse = await fetch(`${baseUrl}/api/v1/activity?projectContextId=docs&limit=100`);
+      const symphonyScopedResponse = await fetch(`${baseUrl}/api/v1/activity?projectContextId=symphony&limit=100`);
       const docsResponse = await fetch(`${baseUrl}/api/v1/activity?issue=${encodeURIComponent(docsIssue.id)}&limit=100`);
       const ambiguousBody = (await ambiguousResponse.json()) as { error: { code: string; message: string } };
-      const docsBody = (await docsResponse.json()) as {
+
+      type ActivityResponseBody = {
         activity: Array<{
           kind: string;
-          projectContext: typeof docsProjectContext | null;
+          projectContext: { projectContextId: string } | null;
           issue: { id: string; identifier: string };
           run: { runId: string; role: string } | null;
           transcript: { sequence: number; eventType: string; message: string | null } | null;
@@ -6548,13 +6565,59 @@ describe("StatusServer durable API", () => {
           distinctRunsConsidered: number;
           writebackOperationsConsidered: number;
         };
+        filter: { issue: string | null; projectContextId: string | null };
       };
+      const qualifiedAliasBody = (await qualifiedAliasResponse.json()) as ActivityResponseBody;
+      const scopedAliasBody = (await scopedAliasResponse.json()) as ActivityResponseBody;
+      const scopedBody = (await scopedResponse.json()) as ActivityResponseBody;
+      const symphonyScopedBody = (await symphonyScopedResponse.json()) as ActivityResponseBody;
+      const docsBody = (await docsResponse.json()) as ActivityResponseBody;
 
       expect(ambiguousResponse.status).toBe(409);
       expect(ambiguousBody.error).toMatchObject({
         code: "conflict",
         message: expect.stringContaining("Ambiguous issue identifier: ENG-123"),
       });
+
+      expect(qualifiedAliasResponse.status).toBe(200);
+      expect(qualifiedAliasBody.filter).toMatchObject({ issue: "docs:ENG-123", projectContextId: null });
+      expect(qualifiedAliasBody.counts).toMatchObject({
+        distinctRunsConsidered: 1,
+        writebackOperationsConsidered: 2,
+      });
+      expect(qualifiedAliasBody.activity).not.toHaveLength(0);
+      expect(qualifiedAliasBody.activity.every((item) => item.issue.id === docsIssue.id)).toBe(true);
+      expect(qualifiedAliasBody.activity.map((item) => item.run?.runId ?? null)).not.toContain("run-symphony-activity-1");
+
+      expect(scopedAliasResponse.status).toBe(200);
+      expect(scopedAliasBody.filter).toMatchObject({ issue: docsIssue.identifier, projectContextId: "docs" });
+      expect(scopedAliasBody.counts).toMatchObject({
+        distinctRunsConsidered: 1,
+        writebackOperationsConsidered: 2,
+      });
+      expect(scopedAliasBody.activity).not.toHaveLength(0);
+      expect(scopedAliasBody.activity.every((item) => item.issue.id === docsIssue.id)).toBe(true);
+      expect(scopedAliasBody.activity.map((item) => item.run?.runId ?? null)).not.toContain("run-symphony-activity-1");
+
+      expect(scopedResponse.status).toBe(200);
+      expect(scopedBody.filter).toMatchObject({ issue: null, projectContextId: "docs" });
+      expect(scopedBody.counts).toMatchObject({
+        distinctRunsConsidered: 1,
+        writebackOperationsConsidered: 2,
+      });
+      expect(scopedBody.activity).not.toHaveLength(0);
+      expect(scopedBody.activity.every((item) => item.projectContext?.projectContextId === "docs")).toBe(true);
+      expect(scopedBody.activity.map((item) => item.run?.runId ?? null)).not.toContain("run-symphony-activity-1");
+
+      expect(symphonyScopedResponse.status).toBe(200);
+      expect(symphonyScopedBody.filter).toMatchObject({ issue: null, projectContextId: "symphony" });
+      expect(symphonyScopedBody.counts).toMatchObject({
+        distinctRunsConsidered: 1,
+        writebackOperationsConsidered: 2,
+      });
+      expect(symphonyScopedBody.activity).not.toHaveLength(0);
+      expect(symphonyScopedBody.activity.every((item) => item.projectContext?.projectContextId === "symphony")).toBe(true);
+      expect(symphonyScopedBody.activity.map((item) => item.run?.runId ?? null)).not.toContain("run-docs-activity-1");
 
       expect(docsResponse.status).toBe(200);
       expect(docsBody.counts).toMatchObject({
@@ -6605,6 +6668,226 @@ describe("StatusServer durable API", () => {
           transcript: null,
         },
       });
+
+      const symphonyRunlessWritebackItem = symphonyScopedBody.activity.find(
+        (item) => item.kind === "writeback_operation" && item.run === null,
+      );
+      expect(symphonyRunlessWritebackItem).toMatchObject({
+        projectContext: {
+          projectContextId: "symphony",
+          projectContextLabel: "Symphony",
+        },
+        issue: { id: symphonyIssue.id, identifier: symphonyIssue.identifier },
+        run: null,
+        writeback: { operationKind: "comment", status: "pending" },
+        links: {
+          issue: `/api/v1/board/issues/${symphonyIssue.id}`,
+          run: null,
+          transcript: null,
+        },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("treats legacy default-context activity as compatible with the configured default project context filter", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const writebackOutbox = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const legacyDocsIssue = trackerIssue({
+      id: "issue-legacy-default-activity-1",
+      identifier: "ENG-456",
+      state: "In Progress",
+      branchName: "symphony/docs/ENG-456",
+    });
+    const symphonyIssue = trackerIssue({
+      id: "issue-symphony-default-activity-1",
+      identifier: "ENG-789",
+      state: "In Progress",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      branchName: "symphony/symphony/ENG-789",
+    });
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const legacyDefaultProjectContext = {
+      projectContextId: "default",
+      projectContextLabel: "Default",
+      linearProjectSlug: null,
+      routingSource: "legacy_default",
+    } as const;
+
+    await runStore.startRun({
+      runId: "run-legacy-default-activity-1",
+      sessionId: "legacy-default-activity-session-1",
+      agentId: "legacy-default-activity-agent-1",
+      role: "worker",
+      issueId: legacyDocsIssue.id,
+      issueIdentifier: legacyDocsIssue.identifier,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "legacy default activity work",
+      workspaceKey: "docs__ENG-456",
+      workspacePath: path.join(config.workspace.root, "docs__ENG-456"),
+      ...(legacyDocsIssue.branchName ? { gitBranchName: legacyDocsIssue.branchName } : {}),
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+    });
+    await runStore.startRun({
+      runId: "run-symphony-default-activity-1",
+      sessionId: "symphony-default-activity-session-1",
+      agentId: "symphony-default-activity-agent-1",
+      role: "reviewer",
+      issueId: symphonyIssue.id,
+      issueIdentifier: symphonyIssue.identifier,
+      projectContext: symphonyProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "symphony default activity work",
+      workspaceKey: "symphony__ENG-789",
+      workspacePath: path.join(config.workspace.root, "symphony__ENG-789"),
+      ...(symphonyIssue.branchName ? { gitBranchName: symphonyIssue.branchName } : {}),
+      repoPath: "/repo/symphony",
+      baseRef: "origin/main",
+    });
+    await runStore.appendEvent({
+      runId: "run-legacy-default-activity-1",
+      at: "2030-01-01T00:04:00.000Z",
+      source: "orchestrator",
+      eventType: "progress",
+      message: "legacy default progress",
+    });
+    await lifecycleStore.ensureIssue(legacyDocsIssue, {
+      phase: "implementation",
+      projectContext: legacyDefaultProjectContext,
+    });
+    await lifecycleStore.ensureIssue(symphonyIssue, { phase: "implementation" });
+    await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-legacy-default-activity-1:runless-contextual-report",
+      kind: "comment",
+      issueId: legacyDocsIssue.identifier,
+      projectContext: docsProjectContext,
+      payload: {
+        body: "LEGACY_DEFAULT_CONTEXTUAL_WRITEBACK_BODY",
+        dedupeKey: "legacy-default-contextual-report",
+      },
+    });
+    await writebackOutbox.enqueueOnce({
+      idempotencyKey: "comment:issue-symphony-default-activity-1:report",
+      kind: "comment",
+      issueId: symphonyIssue.id,
+      runId: "run-symphony-default-activity-1",
+      payload: {
+        body: "SYMPHONY_DEFAULT_WRITEBACK_BODY",
+        dedupeKey: "symphony-default-report",
+      },
+    });
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: "docs",
+      runStore,
+      lifecycleStore,
+      writebackOutbox,
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: null,
+      trackerStateLists: testTrackerStateLists(),
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const aliasResponse = await fetch(`${baseUrl}/api/v1/activity?issue=${encodeURIComponent("docs:ENG-456")}&limit=100`);
+      const docsResponse = await fetch(
+        `${baseUrl}/api/v1/activity?projectContextId=docs&issue=${encodeURIComponent(legacyDocsIssue.id)}&limit=100`,
+      );
+      const symphonyResponse = await fetch(
+        `${baseUrl}/api/v1/activity?projectContextId=symphony&issue=${encodeURIComponent(legacyDocsIssue.id)}&limit=100`,
+      );
+      type ActivityResponseBody = {
+        activity: Array<{
+          kind: string;
+          issue: { id: string; identifier: string };
+          run: { runId: string; role: string } | null;
+          links: { issue: string; run: string | null; transcript: string | null };
+        }>;
+        counts: {
+          distinctRunsConsidered: number;
+          writebackOperationsConsidered: number;
+        };
+        filter: { issue: string | null; projectContextId: string | null };
+      };
+      const aliasBody = (await aliasResponse.json()) as ActivityResponseBody;
+      const docsBody = (await docsResponse.json()) as ActivityResponseBody;
+      const symphonyBody = (await symphonyResponse.json()) as ActivityResponseBody;
+
+      expect(aliasResponse.status).toBe(200);
+      expect(aliasBody.filter).toMatchObject({ issue: "docs:ENG-456", projectContextId: null });
+      expect(aliasBody.counts).toMatchObject({
+        distinctRunsConsidered: 1,
+        writebackOperationsConsidered: 1,
+      });
+      expect(aliasBody.activity).not.toHaveLength(0);
+      expect(aliasBody.activity.every((item) => item.issue.id === legacyDocsIssue.id)).toBe(true);
+      expect(aliasBody.activity.every((item) => item.links.issue === `/api/v1/board/issues/${legacyDocsIssue.id}`)).toBe(true);
+
+      expect(docsResponse.status).toBe(200);
+      expect(docsBody.filter).toMatchObject({ issue: legacyDocsIssue.id, projectContextId: "docs" });
+      expect(docsBody.counts).toMatchObject({
+        distinctRunsConsidered: 1,
+        writebackOperationsConsidered: 1,
+      });
+      expect(docsBody.activity).not.toHaveLength(0);
+      expect(docsBody.activity.some((item) => item.run?.runId === "run-legacy-default-activity-1")).toBe(true);
+      expect(docsBody.activity.every((item) => item.links.issue === `/api/v1/board/issues/${legacyDocsIssue.id}`)).toBe(true);
+      expect(
+        docsBody.activity.some(
+          (item) =>
+            item.kind === "writeback_operation" &&
+            item.run === null &&
+            item.issue.id === legacyDocsIssue.id &&
+            item.links.issue === `/api/v1/board/issues/${legacyDocsIssue.id}`,
+        ),
+      ).toBe(true);
+      const legacyRunlessWritebackItem = docsBody.activity.find(
+        (item) => item.kind === "writeback_operation" && item.run === null,
+      );
+      expect(legacyRunlessWritebackItem).toMatchObject({
+        issue: { id: legacyDocsIssue.id },
+        run: null,
+        links: {
+          issue: `/api/v1/board/issues/${legacyDocsIssue.id}`,
+          run: null,
+          transcript: null,
+        },
+      });
+
+      expect(symphonyResponse.status).toBe(200);
+      expect(symphonyBody.filter).toMatchObject({ issue: legacyDocsIssue.id, projectContextId: "symphony" });
+      expect(symphonyBody.counts).toMatchObject({
+        distinctRunsConsidered: 0,
+        writebackOperationsConsidered: 0,
+      });
+      expect(symphonyBody.activity).toEqual([]);
     } finally {
       await server.stop();
     }
