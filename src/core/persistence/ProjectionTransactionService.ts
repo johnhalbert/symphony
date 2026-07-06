@@ -143,7 +143,8 @@ export interface ProjectionPayloadRecord<TPayload = unknown> {
 export interface ProjectionTranscriptDefaultPayloadSelector {
   runId: string;
   limit: number;
-  projectContextId?: string | null;
+  scopeKey?: string | null | undefined;
+  projectContextId?: string | null | undefined;
 }
 
 export interface ProjectionTransactionPayloadStore extends ProjectionTransactionStore {
@@ -233,7 +234,7 @@ export interface NormalizedProjectionRevisionSelector {
 interface NormalizedProjectionTranscriptDefaultPayloadSelector {
   runId: string;
   limit: number;
-  projectContextId: string;
+  projectContextId: string | null;
 }
 
 export interface NormalizedProjectionPayloadFields {
@@ -590,20 +591,22 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
        FROM ${this.table("projection_revision")} revision
        JOIN ${this.table("transcript_projection")} payload
          ON payload.projection_revision_id = revision.projection_revision_id
-       WHERE revision.project_context_id = $1
-         AND payload.project_context_id = $1
-         AND revision.projection_name = 'transcript_projection'
+       WHERE revision.projection_name = 'transcript_projection'
          AND revision.scope_kind = 'run_page'
          AND revision.superseded_at IS NULL
-         AND payload.run_id = $2
-         AND payload.offset_limit = $3
+         AND payload.run_id = $1
+         AND payload.offset_limit = $2
+         AND (
+           ($3::text IS NULL AND revision.scope_key NOT LIKE 'pc=%|%')
+           OR ($3::text IS NOT NULL AND revision.scope_key LIKE ('pc=' || $3 || '|%'))
+         )
        ORDER BY (payload.next_offset IS NULL) DESC,
                 payload.message_count DESC,
                 payload.offset_start DESC,
                 revision.revision DESC,
                 payload.generated_at DESC
        LIMIT 1`,
-      [selector.projectContextId, selector.runId, selector.limit],
+      [selector.runId, selector.limit, selector.projectContextId],
     );
     return mapProjectionPayloadRow<TPayload>(rows.rows[0]);
   }
@@ -720,11 +723,23 @@ function normalizeProjectionRevisionSelector(selector: ProjectionRevisionSelecto
 function normalizeProjectionTranscriptDefaultPayloadSelector(
   selector: ProjectionTranscriptDefaultPayloadSelector,
 ): NormalizedProjectionTranscriptDefaultPayloadSelector {
+  const runId = normalizeNonEmptyString(selector.runId, null, "transcript projection runId");
+  const limit = normalizeInteger(selector.limit, { minimum: 1, name: "transcript projection limit" });
+  const scopeKey = normalizeNonEmptyString(selector.scopeKey, `${runId}:tail:limit:${limit}`, "transcript projection scopeKey");
+  const projectContextId =
+    typeof selector.projectContextId === "string" && selector.projectContextId.trim().length > 0
+      ? selector.projectContextId.trim()
+      : transcriptProjectionScopeKeyProjectContextId(scopeKey);
   return {
-    runId: normalizeNonEmptyString(selector.runId, null, "transcript projection runId"),
-    limit: normalizeInteger(selector.limit, { minimum: 1, name: "transcript projection limit" }),
-    projectContextId: normalizeProjectionContextSelectorValue(selector.projectContextId),
+    runId,
+    limit,
+    projectContextId,
   };
+}
+
+function transcriptProjectionScopeKeyProjectContextId(scopeKey: string): string | null {
+  const match = /^pc=([^|]+)\|/.exec(scopeKey);
+  return match?.[1] ?? null;
 }
 
 function normalizeProjectionPayloadWrite(input: ProjectionPayloadWriteInput, clock: () => Date): NormalizedProjectionPayloadWrite {

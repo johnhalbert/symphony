@@ -227,7 +227,17 @@ describe("web history/transcript durable projection writes", () => {
 
   it("persists transcript page projections with run/session/page fields and sanitized payload", async () => {
     const projectionWriter = recordingProjectionWriter();
-    const run = runFixture({ runId: "run-1", sessionId: "session-1", transcriptEventCount: 3 });
+    const run = runFixture({
+      runId: "run-1",
+      sessionId: "session-1",
+      transcriptEventCount: 3,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "docs",
+        routingSource: "issue_record",
+      },
+    });
     const server = createStatusServer({
       runStore: runStoreFixture({
         runs: [run],
@@ -259,11 +269,17 @@ describe("web history/transcript durable projection writes", () => {
         projectionName: "transcript_projection",
         buildMode: "incremental",
         scopeKind: "run_page",
-        scopeKey: "run-1:offset:1:limit:1",
+        scopeKey: "pc=docs|run-1:offset:1:limit:1",
         sourceCursors: {
           runId: "run-1",
           sessionId: "session-1",
           issueKey: "TEST-1",
+          projectContext: {
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+            linearProjectSlug: "docs",
+            routingSource: "issue_record",
+          },
           offset: 1,
           limit: 1,
           nextOffset: 2,

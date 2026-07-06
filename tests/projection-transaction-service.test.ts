@@ -629,7 +629,7 @@ describe("ProjectionTransactionService", () => {
     expect(runner.sqls[0]).toContain("revision.superseded_at IS NULL");
   });
 
-  it("reads the current Postgres transcript default page by run id and bounded tail limit", async () => {
+  it("reads the current Postgres transcript default page by run id, bounded tail limit, and scope-key compatibility", async () => {
     const runner = new RecordingProjectionSqlRunner({
       currentPayloadRow: {
         projection_revision_id: 43,
@@ -659,10 +659,11 @@ describe("ProjectionTransactionService", () => {
     expect(payload?.revision.projectContextId).toBe(LEGACY_DEFAULT_PROJECT_CONTEXT_ID);
     expect(payload?.revision.scopeKey).toBe("run-1:offset:700:limit:500");
     expect(payload?.payload).toEqual([{ text: "tail event 701" }, { text: "tail event 1200" }]);
-    expect(runner.values[0]).toEqual([LEGACY_DEFAULT_PROJECT_CONTEXT_ID, "run-1", 500]);
+    expect(runner.values[0]).toEqual(["run-1", 500, null]);
     expect(runner.sqls[0]).toContain('JOIN "symphony"."transcript_projection" payload');
-    expect(runner.sqls[0]).toContain("payload.run_id = $2");
-    expect(runner.sqls[0]).toContain("payload.offset_limit = $3");
+    expect(runner.sqls[0]).toContain("payload.run_id = $1");
+    expect(runner.sqls[0]).toContain("payload.offset_limit = $2");
+    expect(runner.sqls[0]).toContain("$3::text IS NULL AND revision.scope_key NOT LIKE 'pc=%|%'");
     expect(runner.sqls[0]).toContain("ORDER BY (payload.next_offset IS NULL) DESC, payload.message_count DESC, payload.offset_start DESC");
   });
 
