@@ -397,7 +397,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/envelope-run/transcript?offset=0&limit=1`);
       expect(response.status).toBe(200);
       const body = await response.json();
-      expect(transcriptMessages(body)).toEqual(durableMessages);
+      expect(transcriptMessages(body)).toEqual([{ kind: "assistant", text: "durable page event" }]);
       expect(body).toMatchObject({
         window: {
           kind: "page",
@@ -440,11 +440,24 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
-  it("backfills source metadata for durable transcript window envelopes missing source", async () => {
+  it("backfills source metadata and project-context attribution for durable transcript window envelopes missing source", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await startRun(runStore, config, { runId: "source-backfill-run", sessionId: "source-backfill-session", issueIdentifier: "TEST-1" });
-    const durableMessages = [{ kind: "assistant", text: "durable page event" }];
+    const durableMessages = [
+      { kind: "status", state: "running", ts: "2026-01-01T00:00:00.000Z", text: "workspace ready" },
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.100Z",
+        model: "",
+        cwd: "",
+        workspace: "",
+        session: "source-backfill-run",
+        tools: [],
+        note: "system public preview",
+      },
+      { kind: "assistant", text: "durable page event" },
+    ];
     const projectionReader = new StaticProjectionReader(
       {
         schemaVersion: 1,
@@ -489,7 +502,37 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/source-backfill-run/transcript?offset=0&limit=1`);
       expect(response.status).toBe(200);
       const body = await response.json();
-      expect(transcriptMessages(body)).toEqual(durableMessages);
+      expect(transcriptMessages(body)).toEqual([
+        {
+          kind: "status",
+          state: "running",
+          ts: "2026-01-01T00:00:00.000Z",
+          text: "workspace ready · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
+        {
+          kind: "system",
+          ts: "2026-01-01T00:00:00.100Z",
+          model: "",
+          cwd: "",
+          workspace: "",
+          session: "source-backfill-run",
+          tools: [],
+          note: "system public preview. Project context: Default.",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
+        { kind: "assistant", text: "durable page event" },
+      ]);
       expect(body).toMatchObject({
         source: {
           runId: "source-backfill-run",
@@ -1315,9 +1358,22 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
-  it("preserves cached tail metadata while backfilling source for durable-only transcript envelopes", async () => {
+  it("preserves cached tail metadata while backfilling source and project-context attribution for durable-only transcript envelopes", async () => {
     const config = testConfig(path.join(root, "workspaces"));
-    const durableMessages = [{ kind: "assistant", text: "durable tail event" }];
+    const durableMessages = [
+      { kind: "status", state: "running", ts: "2026-01-01T00:00:03.000Z", text: "status public preview" },
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:03.100Z",
+        model: "",
+        cwd: "",
+        workspace: "",
+        session: "durable-tail-run",
+        tools: [],
+        note: "system public preview",
+      },
+      { kind: "assistant", text: "durable tail event" },
+    ];
     const projectionReader = new StaticProjectionReader(
       {
         schemaVersion: 1,
@@ -1371,6 +1427,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         firstSequence: 1_200,
         lastSequence: 1_200,
         lastEventAt: "2026-01-01T00:00:03.000Z",
+        projectContext: {
+          projectContextId: "default",
+          projectContextLabel: "Default",
+          linearProjectSlug: null,
+          routingSource: "legacy_default",
+        },
       },
     );
     const server = createServer(config, undefined, { projectionReader });
@@ -1379,7 +1441,37 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/durable-tail-run/transcript?offset=700&limit=500`);
       expect(response.status).toBe(200);
       const body = await response.json();
-      expect(transcriptMessages(body)).toEqual(durableMessages);
+      expect(transcriptMessages(body)).toEqual([
+        {
+          kind: "status",
+          state: "running",
+          ts: "2026-01-01T00:00:03.000Z",
+          text: "status public preview · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
+        {
+          kind: "system",
+          ts: "2026-01-01T00:00:03.100Z",
+          model: "",
+          cwd: "",
+          workspace: "",
+          session: "durable-tail-run",
+          tools: [],
+          note: "system public preview. Project context: Default.",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
+        { kind: "assistant", text: "durable tail event" },
+      ]);
       expect(body).toMatchObject({
         activeTail: {
           enabled: true,
@@ -1397,7 +1489,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
           sessionId: "durable-tail-session",
           issueId: null,
           issueIdentifier: "TEST-1",
-          projectContext: null,
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
           workspace: null,
           cursors: {
             offset: 700,

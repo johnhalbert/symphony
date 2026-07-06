@@ -116,9 +116,12 @@ import {
   projectWebHistory,
 } from "./WebHistoryProjection.js";
 import {
+  applyWebTranscriptProjectContextAttribution,
   emptyWebTranscriptProjectionPayload,
   isWebTranscriptProjectionPayload,
+  projectRunProjectContext,
   projectWebTranscript,
+  projectWebTranscriptProjectContext,
   projectWebTranscriptWindow,
   type TranscriptMessage as WebTranscriptMessage,
   type WebTranscriptProjectionPayload,
@@ -4091,6 +4094,13 @@ function webTranscriptProjectionResponseBody(
       ? (record.messages as WebTranscriptMessage[])
       : [];
   const cursor = input.sourceCursors ?? {};
+  const sourceProjectContext =
+    isRecordObject(record?.source) && Object.prototype.hasOwnProperty.call(record.source, "projectContext")
+      ? projectWebTranscriptProjectContext(record.source.projectContext)
+      : null;
+  const resolvedProjectContext =
+    projectRunProjectContext(input.run) ?? sourceProjectContext ?? projectWebTranscriptProjectContext(cursor.projectContext);
+  const projectedMessages = applyWebTranscriptProjectContextAttribution(messages, resolvedProjectContext);
   const offset = optionalNumber(pageRecord?.offset) ?? optionalNumber(cursor.offset) ?? input.requestedPage?.offset ?? 0;
   const limit = optionalNumber(pageRecord?.limit) ?? optionalNumber(cursor.limit) ?? input.limit;
   const nextOffset = optionalNumber(pageRecord?.nextOffset) ?? optionalNumber(cursor.nextOffset);
@@ -4111,7 +4121,7 @@ function webTranscriptProjectionResponseBody(
     nextOffset,
     events: [],
     total: optionalNumber(pageRecord?.total) ?? optionalNumber(cursor.total),
-    eventCount: optionalNumber(pageRecord?.size) ?? optionalNumber(cursor.eventCount) ?? messages.length,
+    eventCount: optionalNumber(pageRecord?.size) ?? optionalNumber(cursor.eventCount) ?? projectedMessages.length,
     previousOffset,
     hasNext: optionalBoolean(pageRecord?.hasNext) ?? optionalBoolean(cursor.hasNext) ?? nextOffset !== null,
     hasPrevious: optionalBoolean(pageRecord?.hasPrevious) ?? optionalBoolean(cursor.hasPrevious) ?? previousOffset !== null,
@@ -4120,16 +4130,26 @@ function webTranscriptProjectionResponseBody(
     lastSequence: optionalNumber(pageRecord?.lastSequence) ?? optionalNumber(cursor.lastSequence),
     lastEventAt: optionalString(pageRecord?.lastEventAt) ?? optionalString(cursor.lastEventAt),
   };
-  const projection = projectWebTranscriptWindow(page, messages, {
+  let projection = projectWebTranscriptWindow(page, projectedMessages, {
     run: input.run,
     requestedPage: input.requestedPage,
     tailLimit: limit,
     kind,
     sourceIdentity: transcriptSourceIdentityFallback(cursor),
   });
+  if (projection.source.projectContext === null && resolvedProjectContext !== null) {
+    projection = {
+      ...projection,
+      source: {
+        ...projection.source,
+        projectContext: resolvedProjectContext,
+      },
+    };
+  }
   if (isWebTranscriptProjectionPayload(body)) {
     return {
       ...body,
+      messages: projectedMessages,
       source: mergeWebTranscriptSourceRecord(body.source, projection.source),
     };
   }
@@ -4137,6 +4157,7 @@ function webTranscriptProjectionResponseBody(
     return {
       ...projection,
       ...record,
+      messages: projectedMessages,
       source: projection.source,
     };
   }

@@ -168,6 +168,7 @@ export interface WebTranscriptProjectionPayload {
 
 export interface WebTranscriptProjectionOptions {
   run?: RunRecord | null;
+  projectContext?: WebTranscriptProjectContextModel | null;
   includeRunPrelude?: boolean;
 }
 
@@ -184,8 +185,8 @@ export function projectWebTranscript(
   events: readonly TranscriptEvent[],
   options: WebTranscriptProjectionOptions = {},
 ): TranscriptMessage[] {
-  const projectContext = projectRunProjectContext(options.run);
-  const messages = projectProjectContextAttribution(projectSharedWebTranscript(events), projectContext);
+  const projectContext = projectRunProjectContext(options.run) ?? projectWebTranscriptProjectContext(options.projectContext);
+  const messages = applyWebTranscriptProjectContextAttribution(projectSharedWebTranscript(events), projectContext);
   if (!options.run || options.includeRunPrelude === false) return messages;
   return [...projectRunPreludeMessages(options.run, messages, projectContext), ...messages];
 }
@@ -707,7 +708,7 @@ function projectRunSystemMessage(
   };
 }
 
-function projectProjectContextAttribution(
+export function applyWebTranscriptProjectContextAttribution(
   messages: readonly TranscriptMessage[],
   projectContext: WebTranscriptProjectContextModel | null,
 ): TranscriptMessage[] {
@@ -731,12 +732,22 @@ function projectProjectContextAttribution(
   });
 }
 
-function projectRunProjectContext(run: RunRecord | null | undefined): WebTranscriptProjectContextModel | null {
+export function projectRunProjectContext(run: RunRecord | null | undefined): WebTranscriptProjectContextModel | null {
   if (!run) return null;
-  const id = firstCleanString(run.projectContext?.projectContextId, run.projectContext?.projectContextLabel);
-  const label = firstCleanString(run.projectContext?.projectContextLabel, run.projectContext?.projectContextId, id);
-  const linearProject = firstCleanString(run.projectContext?.linearProjectSlug);
-  const codebase = publicRepositorySummary(run.repoPath, { allowLocalPath: false });
+  return projectWebTranscriptProjectContext({
+    projectContextId: run.projectContext?.projectContextId,
+    projectContextLabel: run.projectContext?.projectContextLabel,
+    linearProjectSlug: run.projectContext?.linearProjectSlug,
+    codebase: publicRepositorySummary(run.repoPath, { allowLocalPath: false }),
+  });
+}
+
+export function projectWebTranscriptProjectContext(value: unknown): WebTranscriptProjectContextModel | null {
+  if (!isObjectRecord(value)) return null;
+  const id = firstCleanString(value.id, value.projectContextId, value.label, value.projectContextLabel);
+  const label = firstCleanString(value.label, value.projectContextLabel, value.id, value.projectContextId, id);
+  const linearProject = firstCleanString(value.linearProject, value.linearProjectSlug);
+  const codebase = firstCleanString(value.codebase) ?? projectWebTranscriptProjectContextCodebase(value);
   if (!id && !label && !linearProject) return null;
   const resolvedId = id ?? label ?? "";
   const resolvedLabel = label ?? resolvedId;
@@ -746,6 +757,13 @@ function projectRunProjectContext(run: RunRecord | null | undefined): WebTranscr
     linearProject,
     codebase,
   };
+}
+
+function projectWebTranscriptProjectContextCodebase(value: Record<string, unknown>): string | null {
+  const repository = typeof value.repository === "string" ? publicRepositorySummary(value.repository, { allowLocalPath: false }) : null;
+  const path = firstCleanString(value.path);
+  const parts = compactStrings([repository, path]);
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function projectRunWorkspaceIdentity(run: RunRecord | null | undefined): WebTranscriptWorkspaceIdentityModel | null {

@@ -1202,6 +1202,109 @@ describe("StatusServer realtime SSE API", () => {
     }
   });
 
+  it("adds service-owned project context attribution to store-driven realtime transcript status and system patches", async () => {
+    const runStore = new FileRunTranscriptStore(root);
+    const expectedPublicProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const expectedTranscriptProjectContext = {
+      id: "docs",
+      label: "Documentation Site",
+      linearProject: "DOCS",
+      codebase: null,
+    } as const;
+
+    await runStore.startRun({
+      runId: "run-transcript-context-patch-1",
+      sessionId: "session-transcript-context-patch-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      projectContext: expectedPublicProjectContext,
+    });
+    const server = createRealtimeServer({ runStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      await runStore.appendEvent({
+        runId: "run-transcript-context-patch-1",
+        at: "2026-01-01T00:00:01.000Z",
+        source: "cursor",
+        eventType: "status",
+        message: "Cursor status running",
+        payload: { kind: "status", status: "running", messagePreview: "workspace ready" },
+      });
+      const statusDelta = await client.nextEventOfType("transcript.delta");
+      expect(statusDelta.data).toMatchObject({
+        type: "transcript.delta",
+        payload: {
+          detail: {
+            sourceCursors: {
+              projectContext: expectedPublicProjectContext,
+            },
+          },
+          messages: [
+            {
+              sequence: 1,
+              message: {
+                kind: "status",
+                state: "running",
+                text: "workspace ready · Project context: Documentation Site [docs]",
+                projectContext: expectedTranscriptProjectContext,
+              },
+            },
+          ],
+        },
+      });
+
+      await runStore.appendEvent({
+        runId: "run-transcript-context-patch-1",
+        at: "2026-01-01T00:00:02.000Z",
+        source: "cursor",
+        eventType: "system",
+        message: "Cursor system event: startup",
+        payload: { kind: "system", subtype: "startup", messagePreview: "system public preview", truncated: false },
+      });
+      const systemDelta = await client.nextEventOfType("transcript.delta");
+      expect(systemDelta.data).toMatchObject({
+        type: "transcript.delta",
+        payload: {
+          detail: {
+            sourceCursors: {
+              projectContext: expectedPublicProjectContext,
+            },
+          },
+          messages: [
+            {
+              sequence: 2,
+              message: {
+                kind: "system",
+                note: "system public preview. Project context: Documentation Site [docs].",
+                projectContext: expectedTranscriptProjectContext,
+              },
+            },
+          ],
+        },
+      });
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
   it("bounds realtime assistant delta patch state without retaining raw delta text", () => {
     const bus = new RealtimeProjectionEventBus({ clock: () => new Date("2026-01-01T00:00:00.000Z") });
     const stateByRunId = (

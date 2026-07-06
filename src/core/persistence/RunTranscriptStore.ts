@@ -516,12 +516,26 @@ export class FileRunTranscriptStore {
       if (reduced) {
         await this.writeRun(reduced);
       }
+      const projectionRecord = reduced ?? record;
       this.notifyProjectionChanged("runs", {
         runId: event.runId,
-        sessionId: (reduced ?? record)?.sessionId ?? event.runId,
+        sessionId: projectionRecord?.sessionId ?? event.runId,
         afterSequence: count,
         eventCount: 1,
         events: [projectTranscriptEventForPublicRead(event)],
+        sourceCursors: {
+          runId: event.runId,
+          sessionId: projectionRecord?.sessionId ?? event.runId,
+          issueKey: projectionRecord?.issueIdentifier ?? projectionRecord?.issueId ?? null,
+          afterSequence: count,
+          eventCount: 1,
+          firstSequence: event.sequence,
+          lastSequence: event.sequence,
+          lastEventAt: event.at,
+          ...(projectionRecord?.projectContext
+            ? { projectContext: normalizeProjectContextResolution(projectionRecord.projectContext) }
+            : {}),
+        },
       });
       return event;
     });
