@@ -456,11 +456,11 @@ describe("Postgres Symphony-owned state migration", () => {
       "on symphony.issue_board_projection (project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
       "on symphony.sidebar_projection (project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
       "on symphony.history_projection (project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
-      "on symphony.history_projection (project_context_id, run_id, session_id, revision desc)",
+      "on symphony.history_projection (project_context_id, run_id, session_id, revision desc, updated_at desc)",
       "on symphony.transcript_projection (project_context_id, run_id, revision desc, updated_at desc, generated_at desc)",
-      "on symphony.transcript_projection (project_context_id, session_id, revision desc)",
+      "on symphony.transcript_projection (project_context_id, session_id, revision desc, updated_at desc)",
       "on symphony.orchestrator_chat_projection (project_context_id, scope_key, conversation_key, revision desc, updated_at desc, generated_at desc)",
-      "on symphony.orchestrator_chat_projection (project_context_id, issue_key, revision desc)",
+      "on symphony.orchestrator_chat_projection (project_context_id, issue_key, revision desc, updated_at desc)",
       ]) {
         expect(normalized, `missing projection context index fragment: ${fragment}`).toContain(fragment);
       }
@@ -2008,12 +2008,12 @@ async function expectLegacyProjectContextAttributionMigrated(containerName: stri
     issue_board_projection_revision_reads_idx: "(project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
     sidebar_projection_revision_reads_idx: "(project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
     history_projection_revision_reads_idx: "(project_context_id, scope_key, revision desc, updated_at desc, generated_at desc)",
-    history_projection_run_lookup_idx: "(project_context_id, run_id, session_id, revision desc)",
+    history_projection_run_lookup_idx: "(project_context_id, run_id, session_id, revision desc, updated_at desc)",
     transcript_projection_revision_reads_idx: "(project_context_id, run_id, revision desc, updated_at desc, generated_at desc)",
-    transcript_projection_session_reads_idx: "(project_context_id, session_id, revision desc)",
+    transcript_projection_session_reads_idx: "(project_context_id, session_id, revision desc, updated_at desc)",
     orchestrator_chat_projection_revision_reads_idx:
       "(project_context_id, scope_key, conversation_key, revision desc, updated_at desc, generated_at desc)",
-    orchestrator_chat_projection_issue_idx: "(project_context_id, issue_key, revision desc)",
+    orchestrator_chat_projection_issue_idx: "(project_context_id, issue_key, revision desc, updated_at desc)",
   })) {
     expect(indexes[indexName]?.toLowerCase(), `missing project-context read index ${indexName}`).toContain(fragment);
   }
