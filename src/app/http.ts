@@ -4056,6 +4056,7 @@ function transcriptProjectionSourceCursors(run: RunRecord, page: TranscriptPage)
     runId: run.runId,
     sessionId: run.sessionId,
     issueKey: run.issueIdentifier || run.issueId,
+    ...(run.projectContext ? { projectContext: { ...run.projectContext } } : {}),
     offset: page.offset,
     limit: page.limit,
     nextOffset: page.nextOffset,
