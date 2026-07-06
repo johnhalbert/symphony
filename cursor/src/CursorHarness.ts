@@ -18,7 +18,7 @@ import {
   writeInitialOperatorChatMcpContext,
 } from "../../src/core/harness/HandoffMcp.js";
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
-import { projectContextResolutionFromIssue } from "../../src/core/config/ProjectContexts.js";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID, projectContextResolutionFromIssue } from "../../src/core/config/ProjectContexts.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import { resolveCursorRuntimeApiKey, resolveScopedCursorRuntimeApiKey } from "../../src/app/RuntimeDependencies.js";
@@ -928,7 +928,7 @@ function cursorSessionId(
 ): string {
   const sessionId = `${agentId}:${runId}`;
   const projectContext = resolvedProjectContext(ctx);
-  return projectContext && projectContext.projectContextId !== ctx.config.projectContexts.defaultContextId
+  return projectContext && projectContext.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID
     ? `${ctx.workspace.workspaceKey}:${sessionId}`
     : sessionId;
 }

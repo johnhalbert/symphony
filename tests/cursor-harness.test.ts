@@ -20,7 +20,7 @@ import {
   transcriptRecallContextFilePath,
   transcriptRecallMcpServerConfig,
 } from "../cursor/src/CursorHarness.js";
-import { issue, testConfig, trackerIssue } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, testConfig, trackerIssue } from "./helpers.js";
 
 const cursorSdk = vi.hoisted(() => ({
   create: vi.fn(),
@@ -610,6 +610,80 @@ describe("Cursor event mapping", () => {
     };
     expect(activeContext.sessionId).toBe(sessionId);
     expect(activeContext.projectContext?.projectContextId).toBe("docs");
+  });
+
+  it("context-qualifies configured default project-context Cursor sessions", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig(),
+      "/tmp/symphony-cursor-harness/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    expect(config.projectContexts.defaultContextId).toBe("symphony");
+
+    const send = vi.fn(async () => completedSdkRun("sdk-run-symphony"));
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-symphony",
+      send,
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    });
+    const runStore = {
+      latestRunForIssue: vi.fn(),
+      updateRun: vi.fn(),
+      appendEvent: vi.fn(),
+    };
+    const harness = new CursorHarness({ runStore: runStore as never });
+    const ctx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      issue: trackerIssue({
+        id: "issue-symphony-1",
+        identifier: "ENG-123",
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        state: "In Progress",
+      }),
+      workspace: {
+        path: "/tmp/workspace/symphony__ENG-123",
+        workspaceKey: "symphony__ENG-123",
+        createdNow: false,
+        gitBranchName: "symphony/symphony/ENG-123",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    };
+
+    const events: unknown[] = [];
+    for await (const event of harness.run(ctx, "Work on ENG-123")) {
+      events.push(event);
+    }
+
+    const sessionId = "symphony__ENG-123:agent-symphony:sdk-run-symphony";
+    expect(events).toContainEqual({ type: "session_started", sessionId, threadId: "agent-symphony", runId: "sdk-run-symphony" });
+    expect(runStore.updateRun).toHaveBeenCalledWith(
+      "sdk-run-symphony",
+      expect.objectContaining({
+        sessionId,
+        agentId: "agent-symphony",
+        projectContext: expect.objectContaining({ projectContextId: "symphony" }),
+      }),
+    );
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "sdk-run-symphony",
+        eventType: "cursor_agent_lifecycle",
+        payload: expect.objectContaining({
+          sessionId,
+          workspaceKey: "symphony__ENG-123",
+          projectContext: expect.objectContaining({ projectContextId: "symphony" }),
+        }),
+      }),
+    );
+    const activeContext = JSON.parse(await readFile(completionReportContextFilePath(ctx), "utf8")) as {
+      sessionId?: string | null;
+      projectContext?: { projectContextId?: string };
+    };
+    expect(activeContext.sessionId).toBe(sessionId);
+    expect(activeContext.projectContext?.projectContextId).toBe("symphony");
   });
 
   it("does not collide project-scoped Cursor session ids across projects with the same issue identifier", async () => {
