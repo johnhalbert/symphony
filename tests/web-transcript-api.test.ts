@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID } from "../src/core/config/ProjectContexts.js";
 import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http.js";
 import type { WebProjectionPayloadReader } from "../src/app/WebProjectionRepository.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
@@ -352,7 +353,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "active-run:offset:0:limit:1" },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "active-run:offset:0:limit:1",
+        },
       ]);
     } finally {
       await server.stop();
@@ -433,7 +439,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "envelope-run:offset:0:limit:1" },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "envelope-run:offset:0:limit:1",
+        },
       ]);
     } finally {
       await server.stop();
@@ -566,7 +577,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "source-backfill-run:offset:0:limit:1" },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "source-backfill-run:offset:0:limit:1",
+        },
       ]);
     } finally {
       await server.stop();
@@ -1516,6 +1532,190 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("selects durable transcript pages with the run project context when live run metadata is available", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, {
+      runId: "docs-run",
+      sessionId: "docs-session",
+      issueIdentifier: "TEST-1",
+      projectContextId: "docs",
+    });
+    const durableMessages = [{ kind: "assistant", text: "docs scoped durable event" }];
+    const projectionReader = new StaticProjectionReader(
+      {
+        schemaVersion: 1,
+        messages: durableMessages,
+        page: {
+          offset: 0,
+          limit: 500,
+          size: 1,
+          total: 1,
+          nextOffset: null,
+          previousOffset: null,
+          hasNext: false,
+          hasPrevious: false,
+          firstSequence: 1,
+          lastSequence: 1,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+        },
+        window: {
+          kind: "page",
+          tailLimit: 500,
+          messageCount: 1,
+          requested: { offset: 0, limit: 500 },
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          runStatus: "running",
+          tailLimit: 500,
+          afterSequence: 1,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+          refetchHref: null,
+          gapFallback: { strategy: "refetch", reason: "tail-gap", href: null },
+        },
+        recovery: { strategy: "refetch", reason: "tail-gap", href: null },
+        compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+      },
+      [{ source: "runStore", revision: runStore.projectionRevision(), observedAt: null }],
+      {
+        runId: "docs-run",
+        sessionId: "docs-session",
+        issueKey: "TEST-1",
+        offset: 0,
+        limit: 500,
+        nextOffset: null,
+        previousOffset: null,
+        total: 1,
+        windowKind: "page",
+        hasNext: false,
+        hasPrevious: false,
+        eventCount: 1,
+        firstSequence: 1,
+        lastSequence: 1,
+        lastEventAt: "2026-01-01T00:00:03.000Z",
+        projectContext: {
+          projectContextId: "docs",
+          projectContextLabel: "Docs",
+          linearProjectSlug: null,
+          routingSource: "explicit",
+        },
+      },
+    );
+    const server = createServer(config, runStore, { projectionReader });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/docs-run/transcript?offset=0&limit=500`);
+      expect(response.status).toBe(200);
+      expect(transcriptMessages(await response.json())).toEqual(durableMessages);
+      expect(projectionReader.selectors).toEqual([
+        {
+          projectionName: "transcript_projection",
+          projectContextId: "docs",
+          scopeKind: "run_page",
+          scopeKey: "docs-run:offset:0:limit:500",
+        },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("falls back from configured default project contexts to legacy durable transcript rows when run metadata is unavailable", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const durableMessages = [{ kind: "assistant", text: "legacy default durable event" }];
+    const projectionReader = new MapProjectionReader([
+      projectionPayloadRecord(
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "legacy-context-run:offset:0:limit:500",
+        },
+        {
+          schemaVersion: 1,
+          messages: durableMessages,
+          page: {
+            offset: 0,
+            limit: 500,
+            size: 1,
+            total: 1,
+            nextOffset: null,
+            previousOffset: null,
+            hasNext: false,
+            hasPrevious: false,
+            firstSequence: 1,
+            lastSequence: 1,
+            lastEventAt: "2026-01-01T00:00:03.000Z",
+          },
+          window: {
+            kind: "page",
+            tailLimit: 500,
+            messageCount: 1,
+            requested: { offset: 0, limit: 500 },
+          },
+          activeTail: {
+            enabled: false,
+            canAppend: false,
+            runStatus: null,
+            tailLimit: 500,
+            afterSequence: 1,
+            lastEventAt: "2026-01-01T00:00:03.000Z",
+            refetchHref: null,
+            gapFallback: { strategy: "refetch", reason: "tail-gap", href: null },
+          },
+          recovery: { strategy: "refetch", reason: "tail-gap", href: null },
+          compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+        },
+        [],
+        {
+          runId: "legacy-context-run",
+          sessionId: "legacy-context-session",
+          issueKey: "TEST-1",
+          offset: 0,
+          limit: 500,
+          nextOffset: null,
+          previousOffset: null,
+          total: 1,
+          windowKind: "page",
+          hasNext: false,
+          hasPrevious: false,
+          eventCount: 1,
+          firstSequence: 1,
+          lastSequence: 1,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+        },
+      ),
+    ]);
+    const server = createServer(config, undefined, {
+      projectionReader,
+      defaultProjectContextId: "docs",
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/legacy-context-run/transcript?offset=0&limit=500`);
+      expect(response.status).toBe(200);
+      expect(transcriptMessages(await response.json())).toEqual(durableMessages);
+      expect(projectionReader.selectors).toEqual([
+        {
+          projectionName: "transcript_projection",
+          projectContextId: "docs",
+          scopeKind: "run_page",
+          scopeKey: "legacy-context-run:offset:0:limit:500",
+        },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "legacy-context-run:offset:0:limit:500",
+        },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("backfills issue attribution from durable cursors when run records are unavailable", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const durableMessages = [{ kind: "assistant", text: "durable page event" }];
@@ -1605,7 +1805,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "cursor-fallback-run:offset:2:limit:3" },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "cursor-fallback-run:offset:2:limit:3",
+        },
       ]);
     } finally {
       await server.stop();
@@ -1616,6 +1821,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
 interface CreateServerOptions {
   projectionReader?: WebProjectionPayloadReader;
   projectionWriter?: StatusServerProjectionWriter;
+  defaultProjectContextId?: string;
 }
 
 function createServer(
@@ -1640,6 +1846,7 @@ function createServer(
     staleThresholdMs: 300_000,
     ...(options.projectionReader ? { projectionReader: options.projectionReader } : {}),
     ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
+    ...(options.defaultProjectContextId ? { defaultProjectContextId: options.defaultProjectContextId } : {}),
   });
 }
 
@@ -1658,6 +1865,23 @@ class StaticProjectionReader implements WebProjectionPayloadReader {
   }
 }
 
+class MapProjectionReader implements WebProjectionPayloadReader {
+  readonly selectors: ProjectionRevisionSelector[] = [];
+  private readonly records = new Map<string, ProjectionPayloadRecord>();
+
+  constructor(records: readonly ProjectionPayloadRecord[]) {
+    for (const record of records) {
+      this.records.set(projectionSelectorKey(record.revision), cloneJson(record));
+    }
+  }
+
+  async readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    this.selectors.push({ ...selector });
+    const record = this.records.get(projectionSelectorKey(selector));
+    return record ? (cloneJson(record) as ProjectionPayloadRecord<TPayload>) : null;
+  }
+}
+
 function projectionPayloadRecord<TPayload>(
   selector: ProjectionRevisionSelector,
   payload: TPayload,
@@ -1669,6 +1893,7 @@ function projectionPayloadRecord<TPayload>(
     revision: {
       projectionRevisionId: "test-projection-revision",
       projectionName: selector.projectionName,
+      projectContextId: selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
       scopeKind: selector.scopeKind ?? "global",
       scopeKey: selector.scopeKey ?? "global",
       revision: 1,
@@ -1702,6 +1927,7 @@ class RecordingProjectionWriter implements StatusServerProjectionWriter {
       revision: {
         projectionRevisionId: this.writes.length,
         projectionName: input.projectionName,
+        projectContextId: input.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
         scopeKind: input.scopeKind ?? "global",
         scopeKey: input.scopeKey ?? "global",
         revision: this.writes.length,
@@ -1728,7 +1954,7 @@ class RecordingProjectionWriter implements StatusServerProjectionWriter {
 async function startRun(
   runStore: FileRunTranscriptStore,
   config: ReturnType<typeof testConfig>,
-  input: { runId: string; sessionId: string; issueIdentifier: string },
+  input: { runId: string; sessionId: string; issueIdentifier: string; projectContextId?: string },
 ): Promise<void> {
   await runStore.startRun({
     runId: input.runId,
@@ -1747,7 +1973,30 @@ async function startRun(
     gitBranchName: `symphony/${input.issueIdentifier}`,
     repoPath: "/repo",
     baseRef: "main",
+    ...(input.projectContextId
+      ? {
+          projectContext: {
+            projectContextId: input.projectContextId,
+            projectContextLabel: input.projectContextId.charAt(0).toUpperCase() + input.projectContextId.slice(1),
+            linearProjectSlug: null,
+            routingSource: "explicit",
+          },
+        }
+      : {}),
   });
+}
+
+function projectionSelectorKey(selector: ProjectionRevisionSelector): string {
+  return [
+    selector.projectionName,
+    selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    selector.scopeKind ?? "global",
+    selector.scopeKey ?? "global",
+  ].join(":");
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function transcriptEvent(overrides: Partial<TranscriptEvent>): TranscriptEvent {

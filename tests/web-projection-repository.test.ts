@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID } from "../src/core/config/ProjectContexts.js";
 import {
   createWebProjectionReadRepositories,
   webHistoryProjectionScopeKey,
@@ -72,13 +73,13 @@ describe("web projection read repositories", () => {
 
     expect(results.map((result) => result.status)).toEqual(["hit", "hit", "hit", "hit", "hit", "hit"]);
     expect(results.map((result) => result.record?.payload)).toEqual([dashboard, issueBoard, sidebar, history, transcript, chat]);
-    expect(reader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
-      { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
-      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
-      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:7:timeline:9" },
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:10:limit:25" },
-      { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
+    expect(reader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({ projectionName, projectContextId, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "dashboard_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "global", scopeKey: "global" },
+      { projectionName: "issue_board_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "sidebar_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "global", scopeKey: "global" },
+      { projectionName: "history_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "global_collection", scopeKey: "global:session:7:timeline:9" },
+      { projectionName: "transcript_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "run_page", scopeKey: "run-1:offset:10:limit:25" },
+      { projectionName: "orchestrator_chat_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "conversation", scopeKey: "operator-room" },
     ]);
     expect(webHistoryProjectionScopeKey({ sessionLimit: 7, timelineLimit: 9 })).toBe("global:session:7:timeline:9");
     expect(webTranscriptProjectionScopeKey({ runId: "run-1", offset: 10, limit: 25 })).toBe("run-1:offset:10:limit:25");
@@ -105,7 +106,7 @@ describe("web projection read repositories", () => {
       status: "missing",
       selector: { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
     });
-    expect(missingReader.selectors).toEqual([{ projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" }]);
+    expect(missingReader.selectors).toEqual([{ projectionName: "issue_board_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "board", scopeKey: "default-board" }]);
 
     const offsetZeroTranscriptReader = new RecordingWebProjectionPayloadReader([
       projectionPayloadRecordFixture(
@@ -127,7 +128,154 @@ describe("web projection read repositories", () => {
       selector: { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
     });
     expect(failingReader.selectors).toEqual([
-      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
+      { projectionName: "history_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
+    ]);
+  });
+
+  it("retries configured default projection contexts against legacy default rows while preserving explicit scoped selectors", async () => {
+    const legacyIssueBoard = {
+      issues: [],
+      backlog: [],
+      lanes: { todo: [], progress: [], review: [] },
+      cycleLabel: "legacy",
+      cycleDateRange: "legacy-range",
+      selectedIssueId: "legacy-issue",
+    };
+    const docsIssueBoard = {
+      issues: [],
+      backlog: [],
+      lanes: { todo: [], progress: [], review: [] },
+      cycleLabel: "docs",
+      cycleDateRange: "docs-range",
+      selectedIssueId: "docs-issue",
+    };
+    const scopedReader = new RecordingWebProjectionPayloadReader([
+      projectionPayloadRecordFixture(
+        {
+          projectionName: "issue_board_projection",
+          projectContextId: "docs",
+          scopeKind: "board",
+          scopeKey: "default-board",
+        },
+        docsIssueBoard,
+      ),
+      projectionPayloadRecordFixture(
+        {
+          projectionName: "issue_board_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "board",
+          scopeKey: "default-board",
+        },
+        legacyIssueBoard,
+      ),
+      projectionPayloadRecordFixture(
+        {
+          projectionName: "transcript_projection",
+          projectContextId: "docs",
+          scopeKind: "run_page",
+          scopeKey: "run-1:offset:0:limit:500",
+        },
+        [],
+      ),
+    ]);
+    const scopedRepositories = createWebProjectionReadRepositories({
+      reader: scopedReader,
+      isRecordCurrent: () => true,
+      resolveDefaultProjectContextId: () => "docs",
+    });
+
+    await expect(scopedRepositories.issueBoard.readDefaultBoard()).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "issue_board_projection",
+        projectContextId: "docs",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      record: { payload: docsIssueBoard },
+    });
+    await expect(scopedRepositories.issueBoard.readDefaultBoard({}, LEGACY_DEFAULT_PROJECT_CONTEXT_ID)).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      record: { payload: legacyIssueBoard },
+    });
+    await expect(scopedRepositories.transcript.readRunPage({ runId: "run-1", projectContextId: "docs", offset: 0, limit: 500 })).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "transcript_projection",
+        projectContextId: "docs",
+        scopeKind: "run_page",
+        scopeKey: "run-1:offset:0:limit:500",
+      },
+    });
+    expect(scopedReader.selectors).toEqual([
+      { projectionName: "issue_board_projection", projectContextId: "docs", scopeKind: "board", scopeKey: "default-board" },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      { projectionName: "transcript_projection", projectContextId: "docs", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
+    ]);
+
+    const fallbackReader = new RecordingWebProjectionPayloadReader([
+      projectionPayloadRecordFixture(
+        {
+          projectionName: "issue_board_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "board",
+          scopeKey: "default-board",
+        },
+        legacyIssueBoard,
+      ),
+    ]);
+    const fallbackRepositories = createWebProjectionReadRepositories({
+      reader: fallbackReader,
+      isRecordCurrent: () => true,
+      resolveDefaultProjectContextId: () => "docs",
+    });
+
+    await expect(fallbackRepositories.issueBoard.readDefaultBoard()).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      record: { payload: legacyIssueBoard },
+    });
+    await expect(fallbackRepositories.issueBoard.readDefaultBoard({}, "docs")).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      record: { payload: legacyIssueBoard },
+    });
+    expect(fallbackReader.selectors).toEqual([
+      { projectionName: "issue_board_projection", projectContextId: "docs", scopeKind: "board", scopeKey: "default-board" },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      { projectionName: "issue_board_projection", projectContextId: "docs", scopeKind: "board", scopeKey: "default-board" },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
     ]);
   });
 
@@ -177,11 +325,16 @@ describe("web projection read repositories", () => {
 });
 
 function projectionSelectorKey(selector: ProjectionRevisionSelector): string {
-  return [selector.projectionName, selector.scopeKind ?? "global", selector.scopeKey ?? "global"].join(":");
+  return [
+    selector.projectionName,
+    selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    selector.scopeKind ?? "global",
+    selector.scopeKey ?? "global",
+  ].join(":");
 }
 
 function projectionPayloadRecordFixture<TPayload>(
-  selector: { projectionName: DurableProjectionName; scopeKind: string; scopeKey: string },
+  selector: { projectionName: DurableProjectionName; projectContextId?: string; scopeKind: string; scopeKey: string },
   payload: TPayload,
   options: { sourceRevisions?: ProjectionSourceRevision[]; expiresAt?: string | null; revision?: number } = {},
 ): ProjectionPayloadRecord<TPayload> {
@@ -198,7 +351,7 @@ function projectionPayloadRecordFixture<TPayload>(
 }
 
 function projectionRevisionRecordFixture(
-  selector: { projectionName: DurableProjectionName; scopeKind: string; scopeKey: string },
+  selector: { projectionName: DurableProjectionName; projectContextId?: string; scopeKind: string; scopeKey: string },
   revision: number,
   sourceRevisions: readonly ProjectionSourceRevision[],
   expiresAt: string | null,
@@ -207,6 +360,7 @@ function projectionRevisionRecordFixture(
   return {
     projectionRevisionId: revision,
     projectionName: selector.projectionName,
+    projectContextId: selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
     scopeKind: selector.scopeKind,
     scopeKey: selector.scopeKey,
     revision,

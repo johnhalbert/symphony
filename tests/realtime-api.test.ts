@@ -2032,6 +2032,7 @@ interface FakeProjectionWriter extends NonNullable<StatusServerOptions["projecti
 function projectionPublication(overrides: Partial<ProjectionRevisionPublication> = {}): ProjectionRevisionPublication {
   return {
     projectionName: "history_projection",
+    projectContextId: "default",
     scopeKind: "global",
     scopeKey: "global",
     projectionRevisionId: "projection-revision-default",
@@ -2076,6 +2077,7 @@ function fakeProjectionWriterPublishingWrites(): FakeProjectionWriter {
       const generatedAt = normalizeProjectionWriteTimestamp(input.generatedAt, revision);
       const publication = projectionPublication({
         projectionName: input.projectionName,
+        projectContextId: input.projectContextId ?? "default",
         scopeKind: input.scopeKind ?? "global",
         scopeKey: input.scopeKey ?? "global",
         projectionRevisionId: `projection-revision-write-${revision}`,
@@ -2098,6 +2100,7 @@ function fakeProjectionWriterPublishingWrites(): FakeProjectionWriter {
         revision: {
           projectionRevisionId: publication.projectionRevisionId,
           projectionName: publication.projectionName,
+          projectContextId: publication.projectContextId,
           scopeKind: publication.scopeKind,
           scopeKey: publication.scopeKey,
           revision: publication.revision,

@@ -656,6 +656,7 @@ function durableProjectionRevisionReader(revision: () => number, generatedAt: st
       return {
         projectionRevisionId: `${selector.projectionName}:${selector.scopeKind ?? "global"}:${selector.scopeKey ?? "global"}:${currentRevision}`,
         projectionName: selector.projectionName,
+        projectContextId: selector.projectContextId ?? "default",
         scopeKind: selector.scopeKind ?? "global",
         scopeKey: selector.scopeKey ?? "global",
         revision: currentRevision,

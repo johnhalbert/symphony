@@ -345,6 +345,7 @@ export class StatusServer {
     this.webProjectionRepositories = createWebProjectionReadRepositories({
       ...(options.projectionReader ? { reader: options.projectionReader } : {}),
       isRecordCurrent: (record) => this.isDurableProjectionRecordCurrent(record),
+      resolveDefaultProjectContextId: () => this.options.defaultProjectContextId,
     });
   }
 
@@ -2170,6 +2171,7 @@ export class StatusServer {
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "dashboard_projection",
+      projectContextId: this.options.defaultProjectContextId ?? null,
       scopeKind: "global",
       scopeKey: "global",
       payload: dashboard,
@@ -2195,6 +2197,7 @@ export class StatusServer {
     const fetchedStates = webProjectionIssueBoardFetchStates(input.issueBoardColumns);
     return {
       projectionName: "issue_board_projection",
+      projectContextId: this.options.defaultProjectContextId ?? null,
       scopeKind: "board",
       scopeKey: "default-board",
       payload: issues,
@@ -2224,6 +2227,7 @@ export class StatusServer {
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "sidebar_projection",
+      projectContextId: this.options.defaultProjectContextId ?? null,
       scopeKind: "global",
       scopeKey: "global",
       payload: sidebar,
@@ -2252,6 +2256,7 @@ export class StatusServer {
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "history_projection",
+      projectContextId: this.options.defaultProjectContextId ?? null,
       scopeKind: "global_collection",
       scopeKey: historyProjectionScopeKey(input.limits),
       payload: history,
@@ -2279,6 +2284,7 @@ export class StatusServer {
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "transcript_projection",
+      projectContextId: run.projectContext?.projectContextId ?? this.options.defaultProjectContextId ?? null,
       scopeKind: "run_page",
       scopeKey: transcriptProjectionScopeKey(run, page),
       payload: transcript,
@@ -2301,6 +2307,7 @@ export class StatusServer {
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "orchestrator_chat_projection",
+      projectContextId: firstChatMetadataString(chat.chat, "projectContextId") ?? this.options.defaultProjectContextId ?? null,
       scopeKind: "conversation",
       scopeKey: orchestratorChatProjectionScopeKey(chat.conversation.id),
       payload: chat,
@@ -3342,7 +3349,7 @@ export class StatusServer {
     const reader = this.options.projectionReader;
     if (!reader?.readCurrentRevision) return [];
     return Promise.all(
-      statusServerWebProjectionContextDurableRevisionSelectors().map(async (selector) => {
+      statusServerWebProjectionContextDurableRevisionSelectors(this.options.defaultProjectContextId).map(async (selector) => {
         try {
           return durableProjectionRevisionFingerprint(selector, await reader.readCurrentRevision!(selector));
         } catch {
@@ -3617,13 +3624,17 @@ function isStatusServerProjectionRevisionStore(store: unknown): store is StatusS
   );
 }
 
-function statusServerWebProjectionContextDurableRevisionSelectors(): readonly ProjectionRevisionSelector[] {
+function statusServerWebProjectionContextDurableRevisionSelectors(
+  projectContextId: string | null | undefined,
+): readonly ProjectionRevisionSelector[] {
+  const selectorProjectContextId = projectContextId ?? null;
   return [
-    { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
-    { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-    { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+    { projectionName: "dashboard_projection", projectContextId: selectorProjectContextId, scopeKind: "global", scopeKey: "global" },
+    { projectionName: "issue_board_projection", projectContextId: selectorProjectContextId, scopeKind: "board", scopeKey: "default-board" },
+    { projectionName: "sidebar_projection", projectContextId: selectorProjectContextId, scopeKind: "global", scopeKey: "global" },
     {
       projectionName: "history_projection",
+      projectContextId: selectorProjectContextId,
       scopeKind: "global_collection",
       scopeKey: webHistoryProjectionScopeKey({
         sessionLimit: WEB_HISTORY_DEFAULT_SESSION_LIMIT,
@@ -4038,7 +4049,12 @@ function transcriptProjectionPageSelectorForRequest(
 ): WebTranscriptProjectionPageSelector {
   const offset = requestedPage?.offset ?? Math.max(0, (run.transcriptEventCount ?? 0) - WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT);
   const limit = requestedPage?.limit ?? WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT;
-  return { runId: run.runId, offset, limit };
+  return {
+    runId: run.runId,
+    projectContextId: run.projectContext?.projectContextId ?? null,
+    offset,
+    limit,
+  };
 }
 
 function shouldBypassDurableWebTranscriptForActiveTail(

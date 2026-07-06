@@ -2,6 +2,7 @@ import type { projectWebDashboard, projectWebIssueBoard, projectWebSidebar, Chat
 import type { projectWebHistory } from "./WebHistoryProjection.js";
 import type { WebTranscriptProjectionPayload } from "./WebTranscriptProjection.js";
 import { DEFAULT_ORCHESTRATOR_CONVERSATION_ID } from "../core/persistence/OrchestratorConversationStore.js";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID, normalizeProjectContextId } from "../core/config/ProjectContexts.js";
 import type {
   ProjectionPayloadRecord,
   ProjectionRevisionSelector,
@@ -42,6 +43,7 @@ export type WebProjectionRecordCurrentChecker = (
 export interface WebProjectionReadRepositoryOptions {
   reader?: WebProjectionPayloadReader | null;
   isRecordCurrent?: WebProjectionRecordCurrentChecker | null;
+  resolveDefaultProjectContextId?: (() => string | null | undefined) | null;
 }
 
 export interface WebHistoryProjectionLimits {
@@ -53,11 +55,13 @@ export interface WebTranscriptProjectionPageSelector {
   runId: string;
   offset: number;
   limit: number;
+  projectContextId?: string | null;
 }
 
 export interface WebTranscriptProjectionDefaultPageSelector {
   runId: string;
   limit: number;
+  projectContextId?: string | null;
 }
 
 export interface WebProjectionReadRepositories {
@@ -74,17 +78,19 @@ export type WebOrchestratorChatProjectionReadPayload = readonly ChatMessage[] | 
 export class WebProjectionReadRepository {
   private readonly reader: WebProjectionPayloadReader | null;
   private readonly isRecordCurrent: WebProjectionRecordCurrentChecker;
+  private readonly resolveDefaultProjectContextId: () => string | null | undefined;
 
   constructor(options: WebProjectionReadRepositoryOptions = {}) {
     this.reader = options.reader ?? null;
     this.isRecordCurrent = options.isRecordCurrent ?? (() => true);
+    this.resolveDefaultProjectContextId = options.resolveDefaultProjectContextId ?? (() => undefined);
   }
 
   async read<TPayload>(
     selector: ProjectionRevisionSelector,
     options: WebProjectionReadOptions = {},
   ): Promise<WebProjectionReadResult<TPayload>> {
-    return this.readUsing(selector, options, (reader) => reader.readCurrentPayload<TPayload>(selector));
+    return this.readUsing(selector, options, (reader, attemptSelector) => reader.readCurrentPayload<TPayload>(attemptSelector));
   }
 
   async readTranscriptDefaultPage<TPayload>(
@@ -93,12 +99,16 @@ export class WebProjectionReadRepository {
   ): Promise<WebProjectionReadResult<TPayload>> {
     const defaultSelector: ProjectionRevisionSelector = {
       projectionName: "transcript_projection",
+      projectContextId: selector.projectContextId ?? null,
       scopeKind: "run_page",
       scopeKey: webTranscriptDefaultProjectionScopeKey(selector),
     };
-    return this.readUsing<TPayload>(defaultSelector, options, (reader) => {
+    return this.readUsing<TPayload>(defaultSelector, options, (reader, attemptSelector) => {
       if (reader.readCurrentTranscriptDefaultPayload) {
-        return reader.readCurrentTranscriptDefaultPayload<TPayload>(selector);
+        return reader.readCurrentTranscriptDefaultPayload<TPayload>({
+          ...selector,
+          projectContextId: attemptSelector.projectContextId ?? null,
+        });
       }
       return Promise.resolve(null);
     });
@@ -107,12 +117,20 @@ export class WebProjectionReadRepository {
   private async readUsing<TPayload>(
     selector: ProjectionRevisionSelector,
     options: WebProjectionReadOptions,
-    readRecord: (reader: WebProjectionPayloadReader) => Promise<ProjectionPayloadRecord<TPayload> | null>,
+    readRecord: (
+      reader: WebProjectionPayloadReader,
+      selector: ProjectionRevisionSelector,
+    ) => Promise<ProjectionPayloadRecord<TPayload> | null>,
   ): Promise<WebProjectionReadResult<TPayload>> {
     if (options.forceRefresh === true) return { status: "refresh_bypass", selector };
     if (!this.reader) return { status: "unavailable", selector };
+    const selectors = compatibleProjectionRevisionSelectors(selector, this.resolveDefaultProjectContextId());
     try {
-      const record = await readRecord(this.reader);
+      let record: ProjectionPayloadRecord<TPayload> | null = null;
+      for (const attemptSelector of selectors) {
+        record = await readRecord(this.reader, attemptSelector);
+        if (record) break;
+      }
       if (!record) return { status: "missing", selector };
       const resolvedSelector = projectionRevisionSelector(record);
       if (isWebProjectionPayloadExpired(record)) return { status: "expired", selector: resolvedSelector, record };
@@ -137,8 +155,19 @@ export class WebDashboardProjectionRepository {
 export class WebIssueBoardProjectionRepository {
   constructor(private readonly reads: WebProjectionReadRepository) {}
 
-  readDefaultBoard(options: WebProjectionReadOptions = {}): Promise<WebProjectionReadResult<ReturnType<typeof projectWebIssueBoard>>> {
-    return this.reads.read({ projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" }, options);
+  readDefaultBoard(
+    options: WebProjectionReadOptions = {},
+    projectContextId: string | null = null,
+  ): Promise<WebProjectionReadResult<ReturnType<typeof projectWebIssueBoard>>> {
+    return this.reads.read(
+      {
+        projectionName: "issue_board_projection",
+        projectContextId,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      options,
+    );
   }
 }
 
@@ -172,7 +201,12 @@ export class WebTranscriptProjectionRepository {
     options: WebProjectionReadOptions = {},
   ): Promise<WebProjectionReadResult<WebTranscriptProjectionPayload>> {
     return this.reads.read(
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: webTranscriptProjectionScopeKey(page) },
+      {
+        projectionName: "transcript_projection",
+        projectContextId: page.projectContextId ?? null,
+        scopeKind: "run_page",
+        scopeKey: webTranscriptProjectionScopeKey(page),
+      },
       options,
     );
   }
@@ -243,7 +277,57 @@ export function isWebProjectionPayloadExpired(record: Pick<ProjectionPayloadReco
 function projectionRevisionSelector(record: ProjectionPayloadRecord): ProjectionRevisionSelector {
   return {
     projectionName: record.revision.projectionName,
+    projectContextId: record.revision.projectContextId,
     scopeKind: record.revision.scopeKind,
     scopeKey: record.revision.scopeKey,
   };
+}
+
+function compatibleProjectionRevisionSelectors(
+  selector: ProjectionRevisionSelector,
+  defaultProjectContextId: string | null | undefined,
+): ProjectionRevisionSelector[] {
+  const projectContextIds = compatibleProjectionContextIds(selector.projectContextId, defaultProjectContextId);
+  return projectContextIds.map((projectContextId) => ({ ...selector, projectContextId }));
+}
+
+function compatibleProjectionContextIds(
+  requestedProjectContextId: string | null | undefined,
+  defaultProjectContextId: string | null | undefined,
+): string[] {
+  const resolvedDefaultProjectContextId = resolveDefaultProjectionProjectContextId(defaultProjectContextId);
+  const normalizedRequestedProjectContextId = normalizeOptionalProjectContextId(requestedProjectContextId);
+
+  if (normalizedRequestedProjectContextId === null) {
+    return resolvedDefaultProjectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+      ? [LEGACY_DEFAULT_PROJECT_CONTEXT_ID]
+      : [resolvedDefaultProjectContextId, LEGACY_DEFAULT_PROJECT_CONTEXT_ID];
+  }
+
+  if (normalizedRequestedProjectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+    return [LEGACY_DEFAULT_PROJECT_CONTEXT_ID];
+  }
+
+  if (normalizedRequestedProjectContextId === resolvedDefaultProjectContextId) {
+    return resolvedDefaultProjectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+      ? [LEGACY_DEFAULT_PROJECT_CONTEXT_ID]
+      : [resolvedDefaultProjectContextId, LEGACY_DEFAULT_PROJECT_CONTEXT_ID];
+  }
+
+  return [normalizedRequestedProjectContextId];
+}
+
+function resolveDefaultProjectionProjectContextId(defaultProjectContextId: string | null | undefined): string {
+  return normalizeOptionalProjectContextId(defaultProjectContextId) ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+}
+
+function normalizeOptionalProjectContextId(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  try {
+    return normalizeProjectContextId(trimmed);
+  } catch {
+    return null;
+  }
 }

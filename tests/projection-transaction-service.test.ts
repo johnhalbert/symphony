@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID } from "../src/core/config/ProjectContexts.js";
 import {
   PostgresProjectionTransactionStore,
   ProjectionTransactionService,
@@ -116,18 +117,87 @@ describe("ProjectionTransactionService", () => {
 
     expect(publications).toEqual([
       {
-        source: "issue_board_projection:global:default-board",
+        source: `issue_board_projection:${LEGACY_DEFAULT_PROJECT_CONTEXT_ID}:global:default-board`,
         revision: 1,
         observedAt: fixedTime,
       },
     ]);
     await expect(provider.getRevision()).resolves.toEqual({
-      source: "issue_board_projection:global:default-board",
+      source: `issue_board_projection:${LEGACY_DEFAULT_PROJECT_CONTEXT_ID}:global:default-board`,
       revision: 1,
       observedAt: fixedTime,
     });
 
     unsubscribe();
+  });
+
+  it("isolates identical projection scopes by project context while persisting context metadata", async () => {
+    const store = new InMemoryProjectionTransactionStore();
+    const service = new ProjectionTransactionService(store, { clock: () => new Date(fixedTime) });
+
+    const docs = await service.writeProjection({
+      projectionName: "transcript_projection",
+      projectContextId: "docs",
+      scopeKind: "run_page",
+      scopeKey: "run-1:offset:0:limit:500",
+      payload: { messages: [{ text: "docs" }] },
+      fields: { runId: "run-1", offsetStart: 0, offsetLimit: 500, messageCount: 1 },
+    });
+    const api = await service.writeProjection({
+      projectionName: "transcript_projection",
+      projectContextId: "api",
+      scopeKind: "run_page",
+      scopeKey: "run-1:offset:0:limit:500",
+      payload: { messages: [{ text: "api" }] },
+      fields: { runId: "run-1", offsetStart: 0, offsetLimit: 500, messageCount: 1 },
+    });
+
+    expect(docs.revision.revision).toBe(1);
+    expect(api.revision.revision).toBe(1);
+    expect(docs.revision.projectContextId).toBe("docs");
+    expect(api.revision.projectContextId).toBe("api");
+    expect(store.payloadWrites().map((write) => [write.projectContextId, write.scopeKey, write.revision])).toEqual([
+      ["docs", "run-1:offset:0:limit:500", 1],
+      ["api", "run-1:offset:0:limit:500", 1],
+    ]);
+    await expect(
+      service.readCurrentRevision({
+        projectionName: "transcript_projection",
+        projectContextId: "docs",
+        scopeKind: "run_page",
+        scopeKey: "run-1:offset:0:limit:500",
+      }),
+    ).resolves.toMatchObject({ projectContextId: "docs", revision: 1 });
+    await expect(
+      service.readCurrentRevision({
+        projectionName: "transcript_projection",
+        projectContextId: "api",
+        scopeKind: "run_page",
+        scopeKey: "run-1:offset:0:limit:500",
+      }),
+    ).resolves.toMatchObject({ projectContextId: "api", revision: 1 });
+  });
+
+  it("normalizes omitted and blank selector project context ids to the legacy default scope", async () => {
+    const store = new InMemoryProjectionTransactionStore();
+    const service = new ProjectionTransactionService(store, { clock: () => new Date(fixedTime) });
+
+    await service.writeProjection({
+      projectionName: "dashboard_projection",
+      projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      payload: { totals: { open: 1 } },
+    });
+
+    await expect(service.readCurrentRevision({ projectionName: "dashboard_projection" })).resolves.toMatchObject({
+      projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      revision: 1,
+    });
+    await expect(
+      service.readCurrentRevision({ projectionName: "dashboard_projection", projectContextId: "   " }),
+    ).resolves.toMatchObject({
+      projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      revision: 1,
+    });
   });
 
   it("records bootstrap, incremental, and rebuild modes without treating mode-only changes as new content", async () => {
@@ -496,6 +566,7 @@ describe("ProjectionTransactionService", () => {
       currentPayloadRow: {
         projection_revision_id: 42,
         projection_name: "dashboard_projection",
+        project_context_id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
         scope_kind: "global",
         scope_key: "global",
         revision: 3,
@@ -522,6 +593,7 @@ describe("ProjectionTransactionService", () => {
       revision: {
         projectionRevisionId: 42,
         projectionName: "dashboard_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
         scopeKind: "global",
         scopeKey: "global",
         revision: 3,
@@ -552,7 +624,7 @@ describe("ProjectionTransactionService", () => {
       generatedAt: "2026-01-02T03:04:06.000Z",
       expiresAt: null,
     });
-    expect(runner.values[0]).toEqual(["dashboard_projection", "global", "global"]);
+    expect(runner.values[0]).toEqual([LEGACY_DEFAULT_PROJECT_CONTEXT_ID, "dashboard_projection", "global", "global"]);
     expect(runner.sqls[0]).toContain('FROM "symphony"."projection_revision" revision JOIN "symphony"."dashboard_projection" payload');
     expect(runner.sqls[0]).toContain("revision.superseded_at IS NULL");
   });
@@ -562,6 +634,7 @@ describe("ProjectionTransactionService", () => {
       currentPayloadRow: {
         projection_revision_id: 43,
         projection_name: "transcript_projection",
+        project_context_id: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
         scope_kind: "run_page",
         scope_key: "run-1:offset:700:limit:500",
         revision: 4,
@@ -583,12 +656,13 @@ describe("ProjectionTransactionService", () => {
 
     const payload = await service.readCurrentTranscriptDefaultPayload<readonly { text: string }[]>({ runId: "run-1", limit: 500 });
 
+    expect(payload?.revision.projectContextId).toBe(LEGACY_DEFAULT_PROJECT_CONTEXT_ID);
     expect(payload?.revision.scopeKey).toBe("run-1:offset:700:limit:500");
     expect(payload?.payload).toEqual([{ text: "tail event 701" }, { text: "tail event 1200" }]);
-    expect(runner.values[0]).toEqual(["run-1", 500]);
+    expect(runner.values[0]).toEqual([LEGACY_DEFAULT_PROJECT_CONTEXT_ID, "run-1", 500]);
     expect(runner.sqls[0]).toContain('JOIN "symphony"."transcript_projection" payload');
-    expect(runner.sqls[0]).toContain("payload.run_id = $1");
-    expect(runner.sqls[0]).toContain("payload.offset_limit = $2");
+    expect(runner.sqls[0]).toContain("payload.run_id = $2");
+    expect(runner.sqls[0]).toContain("payload.offset_limit = $3");
     expect(runner.sqls[0]).toContain("ORDER BY (payload.next_offset IS NULL) DESC, payload.message_count DESC, payload.offset_start DESC");
   });
 
@@ -711,6 +785,7 @@ class InMemoryProjectionTransaction implements ProjectionTransactionRevisionPort
       this.revisionRecords.some(
         (record) =>
           record.projectionName === input.projectionName &&
+          record.projectContextId === input.projectContextId &&
           record.scopeKind === input.scopeKind &&
           record.scopeKey === input.scopeKey &&
           record.revision === input.revision,
@@ -721,6 +796,7 @@ class InMemoryProjectionTransaction implements ProjectionTransactionRevisionPort
     const record: ProjectionRevisionRecord = {
       projectionRevisionId: this.nextProjectionRevisionId,
       projectionName: input.projectionName,
+      projectContextId: input.projectContextId,
       scopeKind: input.scopeKind,
       scopeKey: input.scopeKey,
       revision: input.revision,
@@ -775,19 +851,20 @@ class RecordingProjectionSqlRunner implements ProjectionSqlQueryRunner {
     if (normalizedSql.startsWith('INSERT INTO "symphony"."projection_revision"')) {
       const row = {
         projection_revision_id: this.nextProjectionRevisionId,
-        projection_name: values[0],
-        scope_kind: values[1],
-        scope_key: values[2],
-        revision: values[3],
-        build_mode: values[4],
-        source_revisions: JSON.parse(String(values[5])) as unknown,
-        source_cursors: JSON.parse(String(values[6])) as unknown,
-        source_freshness: JSON.parse(String(values[7])) as unknown,
-        content_sha256: values[8],
-        generated_at: values[9],
-        expires_at: values[10] ?? null,
+        project_context_id: values[0],
+        projection_name: values[1],
+        scope_kind: values[2],
+        scope_key: values[3],
+        revision: values[4],
+        build_mode: values[5],
+        source_revisions: JSON.parse(String(values[6])) as unknown,
+        source_cursors: JSON.parse(String(values[7])) as unknown,
+        source_freshness: JSON.parse(String(values[8])) as unknown,
+        content_sha256: values[9],
+        generated_at: values[10],
+        expires_at: values[11] ?? null,
         superseded_at: null,
-        created_at: values[9],
+        created_at: values[10],
       };
       this.nextProjectionRevisionId += 1;
       return { rows: [row as TRow] };
@@ -807,6 +884,7 @@ function emptySqlResult<TRow>(): ProjectionSqlQueryResult<TRow> {
 function normalizeSelectorForTest(selector: ProjectionRevisionSelector): NormalizedProjectionRevisionSelector {
   return {
     projectionName: selector.projectionName,
+    projectContextId: normalizeStringForTest(selector.projectContextId, LEGACY_DEFAULT_PROJECT_CONTEXT_ID),
     scopeKind: normalizeStringForTest(selector.scopeKind, "global"),
     scopeKey: normalizeStringForTest(selector.scopeKey, defaultsByProjectionName[selector.projectionName]),
   };
@@ -841,7 +919,12 @@ function compareRevisionDescending(left: ProjectionRevisionRecord, right: Projec
 }
 
 function matchesSelector(record: ProjectionRevisionRecord, selector: NormalizedProjectionRevisionSelector): boolean {
-  return record.projectionName === selector.projectionName && record.scopeKind === selector.scopeKind && record.scopeKey === selector.scopeKey;
+  return (
+    record.projectionName === selector.projectionName &&
+    record.projectContextId === selector.projectContextId &&
+    record.scopeKind === selector.scopeKind &&
+    record.scopeKey === selector.scopeKey
+  );
 }
 
 function cloneRevisionRecord(record: ProjectionRevisionRecord): ProjectionRevisionRecord {

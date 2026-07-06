@@ -521,6 +521,7 @@ function createRealtimeServer(options: {
 function projectionPublication(overrides: Partial<ProjectionRevisionPublication> = {}): ProjectionRevisionPublication {
   return {
     projectionName: "history_projection",
+    projectContextId: "default",
     scopeKind: "global",
     scopeKey: "global",
     projectionRevisionId: "projection-revision-default",
@@ -557,6 +558,7 @@ function publishingProjectionWriter(): ProjectionWriterForTest {
       const generatedAt = normalizeGeneratedAt(stored.generatedAt);
       const publication = projectionPublication({
         projectionName: stored.projectionName,
+        projectContextId: stored.projectContextId ?? "default",
         scopeKind: stored.scopeKind ?? "global",
         scopeKey: stored.scopeKey ?? "global",
         projectionRevisionId: `${key}:${revisionNumber}`,
@@ -595,7 +597,7 @@ function publishingProjectionWriter(): ProjectionWriterForTest {
 }
 
 function projectionRowKey(input: ProjectionPayloadWriteInput): string {
-  return [input.projectionName, input.scopeKind ?? "global", input.scopeKey ?? "global"].join("::");
+  return [input.projectionName, input.projectContextId ?? "default", input.scopeKind ?? "global", input.scopeKey ?? "global"].join("::");
 }
 
 function normalizeGeneratedAt(value: ProjectionPayloadWriteInput["generatedAt"]): string {

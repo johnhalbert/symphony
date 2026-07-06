@@ -808,11 +808,11 @@ function diffSourceCalls(before: SourceCalls, after: SourceCalls): SourceCalls {
 }
 
 function projectionSelectorKey(selector: ProjectionRevisionSelector): string {
-  return `${selector.projectionName} ${selector.scopeKind ?? "global"} ${selector.scopeKey ?? "global"}`;
+  return `${selector.projectionName} ${selector.projectContextId ?? "default"} ${selector.scopeKind ?? "global"} ${selector.scopeKey ?? "global"}`;
 }
 
 function projectionPayloadRecord<TPayload>(
-  selector: { projectionName: string; scopeKind: string; scopeKey: string },
+  selector: { projectionName: string; projectContextId?: string; scopeKind: string; scopeKey: string },
   payload: TPayload,
   sourceRevisions: Array<{ source: string; revision: string | number; observedAt: string | null }> = [],
 ): ProjectionPayloadRecord<TPayload> {
@@ -821,6 +821,7 @@ function projectionPayloadRecord<TPayload>(
     revision: {
       projectionRevisionId: `test:${selector.projectionName}:${selector.scopeKey}`,
       projectionName: selector.projectionName as ProjectionPayloadRecord<TPayload>["revision"]["projectionName"],
+      projectContextId: selector.projectContextId ?? "default",
       scopeKind: selector.scopeKind,
       scopeKey: selector.scopeKey,
       revision: 1,
@@ -911,6 +912,7 @@ function recordingProjectionWriter(): StatusServerProjectionWriter {
         revision: {
           projectionRevisionId: `test-write:${input.projectionName}:${input.scopeKey ?? "global"}`,
           projectionName: input.projectionName,
+          projectContextId: input.projectContextId ?? "default",
           scopeKind: input.scopeKind ?? "global",
           scopeKey: input.scopeKey ?? "global",
           revision: 1,
