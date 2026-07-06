@@ -11,6 +11,8 @@ import type { HistoryModel as WebHistoryModel } from "./WebHistoryProjection.js"
 import { projectWebTranscript, type TranscriptMessage as WebTranscriptMessage } from "./WebTranscriptProjection.js";
 import {
   LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  normalizeProjectContextResolution,
+  publicRepositorySummary,
   projectContextResolutionFromIssue,
   type ProjectContextResolution,
 } from "../core/config/ProjectContexts.js";
@@ -49,6 +51,20 @@ export interface ReferenceData {
   users: Record<string, ReferenceUserModel>;
 }
 
+export interface ProjectContextDisplayModel {
+  id: string;
+  label: string;
+  linearProject: string | null;
+  codebase: string | null;
+}
+
+export interface RunningAgentProjectContextModel extends ProjectContextDisplayModel {
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
+  routingSource: string | null;
+}
+
 export interface IssueModel {
   id: string;
   title: string;
@@ -58,6 +74,7 @@ export interface IssueModel {
   assignee: string;
   agent: string | null;
   project: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
   cycle: string;
   activity: IssueActivityModel[];
   pr: string | null;
@@ -130,7 +147,7 @@ export interface RunningAgentModel {
   step: string;
   duration: string;
   tokens: string;
-  projectContext?: ProjectContextResolution | undefined;
+  projectContext?: RunningAgentProjectContextModel | undefined;
 }
 
 export interface ProviderGateModel {
@@ -143,6 +160,7 @@ export interface ProviderGateModel {
   sourceIssue: string | null;
   sourceRunId: string | null;
   affected: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
 }
 
 export interface ActivityModel {
@@ -151,12 +169,14 @@ export interface ActivityModel {
   verb: string;
   id: string;
   extra: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
 }
 
 export interface SessionModel {
   id: string;
   issue: string;
   title: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
   state: string;
   model: string | null;
   startedAt: string | null;
@@ -386,6 +406,7 @@ export interface ActivityItemProjectionInput {
   at: string;
   kind: string;
   source: string;
+  projectContext?: Partial<ProjectContextResolution> | null;
   issue: { id: string | null; identifier: string | null } | null;
   run: {
     runId?: string | null;
@@ -697,6 +718,7 @@ export function projectIssueModel(
   }
   const issue = details.issue;
   const id = contextualIssueIdentifier(issue, card) ?? firstNonEmpty(issue.id, card?.issueId, card?.key, options.requestKey) ?? "";
+  const projectContext = projectContextDisplayForIssue(issue);
   const operatorLiveness = options.operatorLiveness ?? card?.operatorLiveness ?? null;
   const pullRequest = details.pullRequest;
   const model: IssueModel = {
@@ -714,6 +736,7 @@ export function projectIssueModel(
     assignee: firstNonEmpty(issue.assigneeId) ?? "unassigned",
     agent: agentIdFromInputs(card, operatorLiveness),
     project: projectLabelForIssue(issue),
+    ...(projectContext === null ? {} : { projectContext }),
     cycle: "",
     activity: projectIssueActivity(details, card, operatorLiveness),
     pr: formatPullRequest(pullRequest, card?.metadata ?? null),
@@ -896,13 +919,17 @@ export function projectWebSidebar(
 export function projectActivityModels(input: ActivityFeedResponseProjectionInput | ActivityModel[] | null | undefined): ActivityModel[] {
   if (!input) return [];
   if (Array.isArray(input)) return input.map(cloneActivityModel);
-  return (input.activity ?? []).map((item) => ({
-    t: item.at,
-    who: activityActor(item) ?? "",
-    verb: activityVerb(item),
-    id: activityDisplayId(item),
-    extra: activityExtra(item),
-  }));
+  return (input.activity ?? []).map((item) => {
+    const projectContext = projectContextDisplayFromResolution(item.projectContext);
+    return {
+      t: item.at,
+      who: activityActor(item) ?? "",
+      verb: activityVerb(item),
+      id: activityDisplayId(item),
+      extra: activityExtra(item),
+      ...(projectContext === null ? {} : { projectContext }),
+    };
+  });
 }
 
 export function projectTranscriptMessages(
@@ -914,10 +941,12 @@ export function projectTranscriptMessages(
 }
 
 export function projectSessionModel(run: RunRecord): SessionModel {
+  const projectContext = projectContextDisplayForRun(run);
   return {
     id: run.sessionId ?? run.runId,
     issue: run.issueIdentifier,
     title: run.issueIdentifier,
+    ...(projectContext === null ? {} : { projectContext }),
     state: run.status,
     model: firstNonEmpty(run.runtimeModel, legacyCursorRuntimeFallbackModel(run)),
     startedAt: run.startedAt ?? null,
@@ -954,6 +983,7 @@ export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefine
     });
     const issue = firstNonEmpty(row.issueIdentifier, row.issueId) ?? "";
     const totalTokens = row.tokens?.totalTokens ?? 0;
+    const projectContext = runningAgentProjectContextFromResolution(row.projectContext);
     return {
       id,
       issue,
@@ -962,7 +992,7 @@ export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefine
       step: firstNonEmpty(row.lastMessage, row.lastEvent) ?? "",
       duration: formatRunDuration(row.startedAt, generatedAt),
       tokens: Number.isFinite(totalTokens) && totalTokens > 0 ? String(totalTokens) : "",
-      ...(row.projectContext === undefined ? {} : { projectContext: row.projectContext }),
+      ...(projectContext === null ? {} : { projectContext }),
     };
   });
 }
@@ -981,6 +1011,9 @@ function projectDurableRunningAgents(runs: readonly RunRecord[], generatedAt: st
       });
       const issue = firstNonEmpty(run.issueIdentifier, run.issueId, run.workspaceKey) ?? "";
       const totalTokens = run.tokens?.totalTokens ?? 0;
+      const projectContext = runningAgentProjectContextFromResolution(run.projectContext, {
+        codebase: publicRepositorySummary(run.repoPath, { allowLocalPath: false }),
+      });
       return {
         id,
         issue,
@@ -989,7 +1022,7 @@ function projectDurableRunningAgents(runs: readonly RunRecord[], generatedAt: st
         step: firstNonEmpty(run.runPhase, run.runKind, run.role) ?? "",
         duration: formatRunDuration(run.startedAt, generatedAt ?? run.updatedAt),
         tokens: Number.isFinite(totalTokens) && totalTokens > 0 ? String(totalTokens) : "",
-        ...(run.projectContext === undefined ? {} : { projectContext: run.projectContext }),
+        ...(projectContext === null ? {} : { projectContext }),
       };
     });
 }
@@ -1002,6 +1035,7 @@ export function projectProviderGates(snapshot: RuntimeSnapshot | null | undefine
     ]
       .filter((value) => typeof value === "string" && value.trim().length > 0)
       .join(", ");
+    const projectContext = projectContextDisplayFromResolution(gate.source?.projectContext);
     return {
       id: firstNonEmpty(gate.id) ?? "",
       provider: firstNonEmpty(gate.scope?.providerId, gate.scope?.harnessId) ?? "",
@@ -1012,6 +1046,7 @@ export function projectProviderGates(snapshot: RuntimeSnapshot | null | undefine
       sourceIssue: firstNonEmpty(gate.source?.issueIdentifier, gate.source?.issueId) ?? null,
       sourceRunId: firstNonEmpty(gate.source?.runId) ?? null,
       affected,
+      ...(projectContext === null ? {} : { projectContext }),
     };
   });
 }
@@ -1491,6 +1526,7 @@ function cloneIssueModel(input: IssueModel): IssueModel {
   const cloned: IssueModel = {
     ...input,
     labels: [...input.labels],
+    ...(input.projectContext === undefined ? {} : { projectContext: cloneProjectContextDisplayModel(input.projectContext) }),
     activity: input.activity.map((item) => ({ ...item })),
     ...(input.desc === undefined ? {} : { desc: [...input.desc] }),
   };
@@ -1521,8 +1557,15 @@ function cloneReferenceData(input: ReferenceData): ReferenceData {
   };
 }
 
-function cloneActivityModel(input: ActivityModel): ActivityModel {
+function cloneProjectContextDisplayModel(input: ProjectContextDisplayModel): ProjectContextDisplayModel {
   return { ...input };
+}
+
+function cloneActivityModel(input: ActivityModel): ActivityModel {
+  return {
+    ...input,
+    ...(input.projectContext === undefined ? {} : { projectContext: cloneProjectContextDisplayModel(input.projectContext) }),
+  };
 }
 
 function addReferenceLabel(labels: Map<string, ReferenceLabelModel>, value: string | null | undefined): void {
@@ -1701,12 +1744,55 @@ function formatPullRequest(pullRequest: IssuePullRequestSummary, metadata?: Issu
   return metadata?.prUrl ?? null;
 }
 
+function projectContextDisplayFromResolution(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  options: { codebase?: string | null } = {},
+): ProjectContextDisplayModel | null {
+  if (projectContext === null || projectContext === undefined) return null;
+  const normalized = normalizeProjectContextResolution(projectContext);
+  return projectContextDisplayFromNormalizedResolution(normalized, options);
+}
+
+function projectContextDisplayFromNormalizedResolution(
+  normalized: ProjectContextResolution,
+  options: { codebase?: string | null } = {},
+): ProjectContextDisplayModel {
+  const codebase = typeof options.codebase === "string" && options.codebase.trim().length > 0 ? options.codebase : null;
+  return {
+    id: normalized.projectContextId,
+    label: normalized.projectContextLabel,
+    linearProject: normalized.linearProjectSlug,
+    codebase,
+  };
+}
+
+function runningAgentProjectContextFromResolution(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  options: { codebase?: string | null } = {},
+): RunningAgentProjectContextModel | null {
+  if (projectContext === null || projectContext === undefined) return null;
+  const normalized = normalizeProjectContextResolution(projectContext);
+  return {
+    ...projectContextDisplayFromNormalizedResolution(normalized, options),
+    projectContextId: normalized.projectContextId,
+    projectContextLabel: normalized.projectContextLabel,
+    linearProjectSlug: normalized.linearProjectSlug,
+    routingSource: normalized.routingSource ?? null,
+  };
+}
+
+function projectContextDisplayForIssue(issue: IssueStatusView): ProjectContextDisplayModel | null {
+  return projectContextDisplayFromResolution(projectContextForIssueProjection(issue));
+}
+
+function projectContextDisplayForRun(run: RunRecord): ProjectContextDisplayModel | null {
+  return projectContextDisplayFromResolution(run.projectContext, {
+    codebase: publicRepositorySummary(run.repoPath, { allowLocalPath: false }),
+  });
+}
+
 function projectContextForIssueProjection(issue: IssueStatusView): ReturnType<typeof projectContextResolutionFromIssue> {
-  if (issue.projectContext) return projectContextResolutionFromIssue(issue);
-  if (firstNonEmpty(issue.projectContextId, issue.projectContextLabel) !== null) {
-    return projectContextResolutionFromIssue(issue);
-  }
-  return null;
+  return projectContextResolutionFromIssue(issue);
 }
 
 function projectLabelForIssue(issue: IssueStatusView): string {

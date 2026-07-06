@@ -213,6 +213,40 @@ function contextualBoardCard(
   });
 }
 
+function displayProjectContext(
+  input: {
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string | null;
+  },
+  options: { codebase?: string | null } = {},
+) {
+  return {
+    id: input.projectContextId,
+    label: input.projectContextLabel,
+    linearProject: input.linearProjectSlug,
+    codebase: options.codebase ?? null,
+  };
+}
+
+function runningAgentProjectContext(
+  input: {
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string | null;
+    routingSource?: string | null;
+  },
+  options: { codebase?: string | null } = {},
+) {
+  return {
+    ...displayProjectContext(input, options),
+    projectContextId: input.projectContextId,
+    projectContextLabel: input.projectContextLabel,
+    linearProjectSlug: input.linearProjectSlug,
+    routingSource: input.routingSource ?? null,
+  };
+}
+
 function run(overrides: Partial<RunRecord> = {}): RunRecord {
   return {
     runId: "run-1",
@@ -534,9 +568,29 @@ describe("web projection foundation", () => {
 
     expect(board).toMatchObject({ selectedIssueId: "symphony:ENG-179" });
     expect(board.issues).toHaveLength(2);
-    expect(board.issues.map(({ id, title, project, status }) => ({ id, title, project, status }))).toEqual([
-      { id: "docs:ENG-179", title: "Docs issue", project: "Documentation Site", status: "todo" },
-      { id: "symphony:ENG-179", title: "Symphony issue", project: "Symphony", status: "progress" },
+    expect(board.issues.map(({ id, title, project, projectContext, status }) => ({ id, title, project, projectContext, status }))).toEqual([
+      {
+        id: "docs:ENG-179",
+        title: "Docs issue",
+        project: "Documentation Site",
+        projectContext: displayProjectContext({
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectSlug: "DOCS",
+        }),
+        status: "todo",
+      },
+      {
+        id: "symphony:ENG-179",
+        title: "Symphony issue",
+        project: "Symphony",
+        projectContext: displayProjectContext({
+          projectContextId: "symphony",
+          projectContextLabel: "Symphony",
+          linearProjectSlug: "ENG",
+        }),
+        status: "progress",
+      },
     ]);
     expect(board.lanes.todo.map(({ id, title, project }) => ({ id, title, project }))).toEqual([
       { id: "docs:ENG-179", title: "Docs issue", project: "Documentation Site" },
@@ -725,9 +779,27 @@ describe("web projection foundation", () => {
       operatorLiveness: null,
     });
 
-    expect([docsDetail.issue, symphonyDetail.issue].map(({ id, title, project }) => ({ id, title, project }))).toEqual([
-      { id: "docs:ENG-179", title: "Docs issue", project: "Documentation Site" },
-      { id: "symphony:ENG-179", title: "Symphony issue", project: "Symphony" },
+    expect([docsDetail.issue, symphonyDetail.issue].map(({ id, title, project, projectContext }) => ({ id, title, project, projectContext }))).toEqual([
+      {
+        id: "docs:ENG-179",
+        title: "Docs issue",
+        project: "Documentation Site",
+        projectContext: displayProjectContext({
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectSlug: "DOCS",
+        }),
+      },
+      {
+        id: "symphony:ENG-179",
+        title: "Symphony issue",
+        project: "Symphony",
+        projectContext: displayProjectContext({
+          projectContextId: "symphony",
+          projectContextLabel: "Symphony",
+          linearProjectSlug: "ENG",
+        }),
+      },
     ]);
   });
 
@@ -743,10 +815,25 @@ describe("web projection foundation", () => {
       }),
     );
 
-    expect(legacyDefaultIssue).toMatchObject({ id: "TEST-1", project: "" });
+    expect(legacyDefaultIssue).toMatchObject({
+      id: "TEST-1",
+      project: "",
+      projectContext: displayProjectContext({
+        projectContextId: "default",
+        projectContextLabel: "Default",
+        linearProjectSlug: "ENG",
+      }),
+    });
   });
 
   it("projects dashboard, detail, history, activity, and transcript models without runtime side effects", () => {
+    const runtimeProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
     const activityInput: ActivityFeedResponseProjectionInput = {
       generatedAt: "2026-01-01T00:11:00.000Z",
       activity: [
@@ -755,6 +842,7 @@ describe("web projection foundation", () => {
           at: "2026-01-01T00:00:00.000Z",
           kind: "run_started",
           source: "run",
+          projectContext: runtimeProjectContext,
           issue: { id: "issue-1", identifier: "TEST-1" },
           run: { runId: "run-1", role: "worker", runPhase: "implementation", runKind: "implementation", status: "running", agentId: "agent-1", sessionId: "session-1" },
           transcript: null,
@@ -765,6 +853,7 @@ describe("web projection foundation", () => {
           at: "2026-01-01T00:01:00.000Z",
           kind: "transcript_event",
           source: "cursor",
+          projectContext: runtimeProjectContext,
           issue: { id: "issue-1", identifier: "TEST-1" },
           run: { runId: "run-1", role: "worker", runPhase: "implementation", runKind: "implementation", status: "running", agentId: "agent-1", sessionId: "session-1" },
           transcript: { sequence: 1, eventType: "tool_call", message: "read_file" },
@@ -777,13 +866,6 @@ describe("web projection foundation", () => {
       { runId: "run-1", sequence: 2, at: "2026-01-01T00:02:00.000Z", source: "orchestrator", eventType: "approval_request", message: "Approve publication?" },
     ];
     const transcriptPage: TranscriptPage = { runId: "run-1", offset: 0, limit: 10, nextOffset: null, events: transcriptEvents };
-
-    const runtimeProjectContext = {
-      projectContextId: "docs",
-      projectContextLabel: "Documentation Site",
-      linearProjectSlug: "DOCS",
-      routingSource: "candidate_poll",
-    } as const;
 
     const runtime = {
       generatedAt: "2026-01-01T00:11:00.000Z",
@@ -801,7 +883,7 @@ describe("web projection foundation", () => {
           updatedAt: "2026-01-01T00:00:00.000Z",
           affectedRoles: ["worker", "reviewer"],
           affectedRunPhases: ["implementation", "review"],
-          source: { issueIdentifier: "TEST-1", runId: "run-1" },
+          source: { issueIdentifier: "TEST-1", runId: "run-1", projectContext: runtimeProjectContext },
         },
       ],
       providerGateCounts: { active: 1, manual: 0, autoResume: 1 },
@@ -854,8 +936,9 @@ describe("web projection foundation", () => {
         concurrencyCap: 2,
       },
     });
-    const detail = projectIssueDetailModel({ issue: "TEST-1", boardCard: card(), issueDetails: issueDetails(), latestRun: run(), runs: [run()], operatorLiveness: { agentId: "agent-1", sessionId: "session-1", workspacePath: "/tmp/workspaces/TEST-1", runId: "run-1", activeRunId: "run-1", status: "active" } });
-    const history = projectHistoryModel({ runs: [run()], transcript: transcriptPage, selectedRunId: "run-1" });
+    const detailRun = run({ projectContext: runtimeProjectContext, repoPath: "https://github.com/acme/docs.git" });
+    const detail = projectIssueDetailModel({ issue: "TEST-1", boardCard: card(), issueDetails: issueDetails(), latestRun: detailRun, runs: [detailRun], operatorLiveness: { agentId: "agent-1", sessionId: "session-1", workspacePath: "/tmp/workspaces/TEST-1", runId: "run-1", activeRunId: "run-1", status: "active" } });
+    const history = projectHistoryModel({ runs: [detailRun], transcript: transcriptPage, selectedRunId: "run-1" });
 
     expect(dashboard).toMatchObject({
       projectName: "Symphony",
@@ -890,13 +973,14 @@ describe("web projection foundation", () => {
       step: "Implementing dashboard route",
       duration: "10m",
       tokens: "12",
-      projectContext: runtimeProjectContext,
+      projectContext: runningAgentProjectContext(runtimeProjectContext),
     });
     expect(dashboard.providerGates[0]).toMatchObject({
       provider: "openai-codex",
       kind: "windowed_bucket_exhausted",
       resumeAt: "2026-01-01T05:00:00.000Z",
       sourceIssue: "TEST-1",
+      projectContext: displayProjectContext(runtimeProjectContext),
     });
     expect(dashboard.activity.map((item) => item.verb)).toEqual(["run_started", "tool_call"]);
     expect(JSON.stringify(dashboard)).not.toContain("openai/symphony");
@@ -904,9 +988,20 @@ describe("web projection foundation", () => {
     expect(JSON.stringify(dashboard)).not.toContain("mock");
     expect(detail.issue.id).toBe("TEST-1");
     expect(detail.runs).toHaveLength(1);
+    expect(detail.runs[0]).toMatchObject({
+      projectContext: displayProjectContext(runtimeProjectContext, { codebase: "https://github.com/acme/docs.git" }),
+    });
+    expect(history.sessions[0]).toMatchObject({
+      projectContext: displayProjectContext(runtimeProjectContext, { codebase: "https://github.com/acme/docs.git" }),
+    });
     expect(history.selectedSessionId).toBe("run-1");
     expect(history.transcript.map((message) => message.kind)).toEqual(["tool_call", "request"]);
-    expect(projectActivityModels(activityInput)[1]).toMatchObject({ who: "agent-1", id: "TEST-1", extra: "read_file" });
+    expect(projectActivityModels(activityInput)[1]).toMatchObject({
+      who: "agent-1",
+      id: "TEST-1",
+      extra: "read_file",
+      projectContext: displayProjectContext(runtimeProjectContext),
+    });
     expect(projectTranscriptMessages(transcriptEvents)[0]).toMatchObject({
       kind: "tool_call",
       call_id: "run-1:1",
@@ -968,7 +1063,10 @@ describe("web projection foundation", () => {
 
     expect(dashboard.runningAgents.map((agent) => agent.id)).toEqual(["issue-docs-123", "issue-symphony-123"]);
     expect(new Set(dashboard.runningAgents.map((agent) => agent.id)).size).toBe(2);
-    expect(dashboard.runningAgents.map((agent) => agent.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
+    expect(dashboard.runningAgents.map((agent) => agent.projectContext)).toEqual([
+      runningAgentProjectContext(docsProjectContext),
+      runningAgentProjectContext(symphonyProjectContext),
+    ]);
   });
 
   it("does not project stale Cursor model as legacy session model for explicit Hermes ACP runs", () => {
@@ -1099,7 +1197,7 @@ describe("web projection foundation", () => {
         step: "implementation",
         duration: "15m",
         tokens: "25",
-        projectContext: durableProjectContext,
+        projectContext: runningAgentProjectContext(durableProjectContext),
       },
     ]);
     expect(dashboard.agentUsageLabel).toBe("1/3 agents");
@@ -1154,7 +1252,10 @@ describe("web projection foundation", () => {
 
     expect(dashboard.runningAgents.map((agent) => agent.id)).toEqual(["issue-docs-123", "issue-symphony-123"]);
     expect(new Set(dashboard.runningAgents.map((agent) => agent.id)).size).toBe(2);
-    expect(dashboard.runningAgents.map((agent) => agent.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
+    expect(dashboard.runningAgents.map((agent) => agent.projectContext)).toEqual([
+      runningAgentProjectContext(docsProjectContext),
+      runningAgentProjectContext(symphonyProjectContext),
+    ]);
   });
 
   it("dedupes contextual board issues against durable totals by raw issue id without collapsing same-identifier sibling contexts", () => {
@@ -1285,7 +1386,7 @@ describe("web projection foundation", () => {
         step: "runtime heartbeat",
         duration: "10m",
         tokens: "10",
-        projectContext: runtimeProjectContext,
+        projectContext: runningAgentProjectContext(runtimeProjectContext),
       },
     ]);
     expect(dashboard.agentUsageLabel).toBe("1/2 agents");
@@ -1319,10 +1420,25 @@ describe("web projection foundation", () => {
   });
 
   it("composes the web sidebar model directly from dashboard, issue, history, and chat projections", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
     const issues = projectWebIssueBoard({
       issues: [
         webCard("TEST-TODO", { lane: "todo", state: "Todo" }),
-        webCard("TEST-REVIEW", { lane: "review", state: "In Review" }),
+        contextualBoardCard({
+          issueId: "issue-review",
+          identifier: "TEST-REVIEW",
+          title: "Review issue",
+          lane: "review",
+          state: "In Review",
+          projectContextId: docsProjectContext.projectContextId,
+          projectContextLabel: docsProjectContext.projectContextLabel,
+          linearProjectSlug: docsProjectContext.linearProjectSlug,
+        }),
       ],
     });
     const providerGates = [
@@ -1366,7 +1482,7 @@ describe("web projection foundation", () => {
       totals,
       source: emptyDashboardModel().source,
     };
-    const history = projectWebHistory([run({ runId: "run-sidebar", issueIdentifier: "TEST-REVIEW" })], []);
+    const history = projectWebHistory([run({ runId: "run-sidebar", issueIdentifier: "TEST-REVIEW", projectContext: docsProjectContext })], []);
     const chat = [{ who: "user" as const, text: "show the sidebar" }];
 
     const sidebar = projectWebSidebar(dashboard, issues, history, chat);
@@ -1374,6 +1490,7 @@ describe("web projection foundation", () => {
     expect(sidebar.providerGates).toBe(providerGates);
     expect(sidebar.runningAgents).toBe(runningAgents);
     expect(sidebar.reviewIssues).toEqual(issues.lanes.review);
+    expect(sidebar.reviewIssues[0]).toMatchObject({ projectContext: displayProjectContext(docsProjectContext) });
     expect(sidebar.activity).toBe(activity);
     expect(sidebar.sessions).toBe(history.sessions);
     expect(sidebar.chat).toBe(chat);

@@ -50,10 +50,14 @@ export interface IssueModel {
 }
 
 export interface RunningAgentProjectContextModel {
+  id: string;
+  label: string;
+  linearProject: string | null;
+  codebase: string | null;
   projectContextId: string;
   projectContextLabel: string;
   linearProjectSlug: string | null;
-  routingSource: string;
+  routingSource: string | null;
 }
 
 export interface RunningAgentModel {

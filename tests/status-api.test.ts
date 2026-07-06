@@ -1819,6 +1819,26 @@ describe("StatusServer durable API", () => {
         linearProjectSlug: string | null;
         routingSource: string | null;
       };
+      type RunningAgentProjectContextAttribution = ProjectContextAttribution & {
+        id: string;
+        label: string;
+        linearProject: string | null;
+        codebase: string | null;
+      };
+      const projectedDocsContext: RunningAgentProjectContextAttribution = {
+        ...docsProjectContext,
+        id: docsProjectContext.projectContextId,
+        label: docsProjectContext.projectContextLabel,
+        linearProject: docsProjectContext.linearProjectSlug,
+        codebase: null,
+      };
+      const projectedSymphonyContext: RunningAgentProjectContextAttribution = {
+        ...symphonyProjectContext,
+        id: symphonyProjectContext.projectContextId,
+        label: symphonyProjectContext.projectContextLabel,
+        linearProject: symphonyProjectContext.linearProjectSlug,
+        codebase: null,
+      };
       const stateBody = (await stateResponse.json()) as {
         running: Array<{
           projectContext?: ProjectContextAttribution | undefined;
@@ -1837,7 +1857,7 @@ describe("StatusServer durable API", () => {
           id: string;
           issue: string;
           title: string;
-          projectContext?: ProjectContextAttribution | undefined;
+          projectContext?: RunningAgentProjectContextAttribution | undefined;
         }>;
       };
       const sidebarResponse = await fetch(`${baseUrl}/api/v1/web/sidebar`);
@@ -1846,7 +1866,7 @@ describe("StatusServer durable API", () => {
           id: string;
           issue: string;
           title: string;
-          projectContext?: ProjectContextAttribution | undefined;
+          projectContext?: RunningAgentProjectContextAttribution | undefined;
         }>;
       };
 
@@ -1900,7 +1920,7 @@ describe("StatusServer durable API", () => {
         rows: Array<{
           issue: string;
           title: string;
-          projectContext?: ProjectContextAttribution | undefined;
+          projectContext?: RunningAgentProjectContextAttribution | undefined;
         }>,
       ) =>
         rows.reduce<
@@ -1943,8 +1963,8 @@ describe("StatusServer durable API", () => {
       expect(sidebarBody.runningAgents.map((row) => row.id)).toEqual(["issue-docs-state-live-1", "issue-symphony-state-live-1"]);
       expect(new Set(dashboardBody.runningAgents.map((row) => row.id)).size).toBe(2);
       expect(new Set(sidebarBody.runningAgents.map((row) => row.id)).size).toBe(2);
-      expect(dashboardBody.runningAgents.map((row) => row.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
-      expect(sidebarBody.runningAgents.map((row) => row.projectContext)).toEqual([docsProjectContext, symphonyProjectContext]);
+      expect(dashboardBody.runningAgents.map((row) => row.projectContext)).toEqual([projectedDocsContext, projectedSymphonyContext]);
+      expect(sidebarBody.runningAgents.map((row) => row.projectContext)).toEqual([projectedDocsContext, projectedSymphonyContext]);
       expect(groupedRunning).toEqual({
         docs: [
           {
