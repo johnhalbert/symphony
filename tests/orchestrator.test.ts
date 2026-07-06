@@ -82,6 +82,7 @@ import type {
 import type {
   TrackerClient,
   TrackerIssueCandidateFilterInput,
+  TrackerIssueCandidatePageInput,
 } from "../src/core/tracker/TrackerClient.js";
 import {
   FileWritebackOutboxStore,
@@ -499,19 +500,222 @@ describe("Orchestrator", () => {
       expect(stateFetches).toBe(0);
       expect(filteredInputs).toHaveLength(1);
       expect(filteredInputs[0]?.branches.map((branch) => branch.id)).toEqual([
-        "active_todo_dispatch",
-        "active_non_todo_dispatch",
-        "review_dispatch",
-        "blocked_triage",
-        "merge_policy",
-        "post_mortem",
+        "merge_policy_source:Ready to Merge",
+        "merge_policy_conflicts:Approved with Conflicts",
+        "review_dispatch:In Review",
+        "active_non_todo_dispatch:In Progress",
+        "active_todo_dispatch:Todo",
+        "blocked_triage:Blocked",
+        "post_mortem:Done",
       ]);
-      expect(filteredInputs[0]?.branches.find((branch) => branch.id === "post_mortem")).toMatchObject({
+      expect(filteredInputs[0]?.branches.find((branch) => branch.id === "post_mortem:Done")).toMatchObject({
         stateNames: ["Done"],
         requireLabels: ["dogfood-ready", "post_mortem"],
         excludeLabels: ["dogfood-blocked"],
       });
     } finally {
+      await orchestrator.stop();
+    }
+  });
+
+  it("pages tick candidates by priority lane with exclusions", async () => {
+    const config = testConfig(root);
+    config.agent.maxConcurrentAgents = 1;
+    config.tracker.activeStates = ["Todo", "In Progress"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.sourceStates = ["Ready to Merge"];
+    config.mergePolicy.conflictsState = "Approved with Conflicts";
+    config.postMortem.enabled = true;
+    config.postMortem.doneStates = ["Done"];
+
+    const merge = issue({
+      id: "issue-merge",
+      identifier: "TEST-MERGE",
+      state: "Ready to Merge",
+    });
+    const conflict = issue({
+      id: "issue-conflict",
+      identifier: "TEST-CONFLICT",
+      state: "Approved with Conflicts",
+    });
+    const review = issue({
+      id: "issue-review",
+      identifier: "TEST-REVIEW",
+      state: "In Review",
+    });
+    const progress = issue({
+      id: "issue-progress",
+      identifier: "TEST-PROGRESS",
+      state: "In Progress",
+    });
+    const todo = issue({
+      id: "issue-todo",
+      identifier: "TEST-TODO",
+      state: "Todo",
+    });
+    const byState = new Map(
+      [merge, conflict, review, progress, todo].map((candidate) => [
+        candidate.state,
+        [candidate],
+      ]),
+    );
+    const pageInputs: TrackerIssueCandidatePageInput[] = [];
+    let refreshes = 0;
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        refreshes += 1;
+        return [];
+      },
+      async fetchIssueCandidatePageByFilter(input) {
+        pageInputs.push(input);
+        const state = input.branches[0]?.stateNames[0] ?? "";
+        return {
+          issues: byState.get(state) ?? [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        };
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    const internals = orchestrator as unknown as {
+      processTickIssueCandidates(): Promise<void>;
+      processTickIssueCandidate(
+        candidate: Issue,
+        options?: { refreshBeforeTransition?: boolean },
+      ): Promise<boolean>;
+      tickIssueCandidateExcludedIssueIds(): Promise<Set<string>>;
+      availableSlots(): number;
+    };
+    const processed: Array<{ state: string; refreshBeforeTransition: boolean | undefined }> = [];
+    let availableSlots = 1;
+    internals.tickIssueCandidateExcludedIssueIds = async () =>
+      new Set(["excluded-issue"]);
+    internals.availableSlots = () => availableSlots;
+    internals.processTickIssueCandidate = async (candidate, options) => {
+      processed.push({
+        state: candidate.state,
+        refreshBeforeTransition: options?.refreshBeforeTransition,
+      });
+      if (candidate.state === "In Review") availableSlots = 0;
+      return true;
+    };
+
+    try {
+      await internals.processTickIssueCandidates();
+
+      expect(pageInputs.map((input) => input.branches[0]?.stateNames[0])).toEqual([
+        "Ready to Merge",
+        "Approved with Conflicts",
+        "In Review",
+      ]);
+      expect(pageInputs[0]?.excludeIssueIds).toEqual(["excluded-issue"]);
+      expect(pageInputs[1]?.excludeIssueIds).toEqual([
+        "excluded-issue",
+        "issue-merge",
+      ]);
+      expect(pageInputs[2]?.excludeIssueIds).toEqual([
+        "excluded-issue",
+        "issue-merge",
+        "issue-conflict",
+      ]);
+      expect(processed).toEqual([
+        { state: "Ready to Merge", refreshBeforeTransition: false },
+        { state: "Approved with Conflicts", refreshBeforeTransition: false },
+        { state: "In Review", refreshBeforeTransition: false },
+      ]);
+      expect(refreshes).toBe(0);
+    } finally {
+      await orchestrator.stop();
+    }
+  });
+
+  it("builds tick candidate exclusions from runtime and pending publication state", async () => {
+    const config = testConfig(root);
+    const issueStateStore = new SqliteIssueStateStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const pendingLifecycleIssue = issue({
+      id: "issue-pending-lifecycle",
+      identifier: "TEST-PENDING-LIFECYCLE",
+    });
+    const pendingReport = completionReportRecord(pendingLifecycleIssue);
+    await lifecycleStore.ensureIssue(pendingLifecycleIssue, {
+      phase: "blocked",
+      blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      lastCompletionReportId: pendingReport.id,
+      completionReports: [pendingReport],
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      issueStateStore,
+      lifecycleStore,
+    });
+
+    const internals = orchestrator as unknown as {
+      running: Map<string, unknown>;
+      claimed: Set<string>;
+      pausedIssues: Set<string>;
+      retryAttempts: Map<string, unknown>;
+      tickIssueCandidateExcludedIssueIds(): Promise<Set<string>>;
+    };
+    internals.running.set("issue-running", {});
+    internals.claimed.add("issue-claimed");
+    internals.pausedIssues.add("issue-paused");
+    internals.retryAttempts.set("issue-retrying", {});
+
+    try {
+      const excluded = await internals.tickIssueCandidateExcludedIssueIds();
+
+      expect([...excluded].sort()).toEqual([
+        "issue-claimed",
+        "issue-paused",
+        "issue-pending-lifecycle",
+        "issue-retrying",
+        "issue-running",
+      ]);
+    } finally {
+      internals.running.clear();
+      internals.retryAttempts.clear();
       await orchestrator.stop();
     }
   });

@@ -235,6 +235,24 @@ describe("LinearTrackerClient", () => {
     });
   });
 
+  it("builds filtered tick candidate filters with excluded issue ids", () => {
+    const filter = buildLinearIssueCandidateFilter(
+      {
+        branches: [{ id: "todo", stateNames: ["Todo"] }],
+        excludeIssueIds: ["issue-1", "ISSUE-1", "issue-2"],
+      },
+      { projectSlug: "TEST", assignee: null },
+    );
+
+    expect(filter).toEqual({
+      and: [
+        { project: { slugId: { eq: "TEST" } } },
+        { id: { nin: ["issue-1", "issue-2"] } },
+        { state: { name: { in: ["Todo"] } } },
+      ],
+    });
+  });
+
   it("fetches filtered tick candidates with configured max page size", async () => {
     const config = testConfig("/tmp/symphony");
     const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
@@ -281,6 +299,55 @@ describe("LinearTrackerClient", () => {
       },
     });
     expect(requests[1]?.variables.after).toBe("next-page");
+  });
+
+  it("fetches one filtered tick candidate page", async () => {
+    const config = testConfig("/tmp/symphony");
+    const requests: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return jsonResponse({
+        data: {
+          issues: {
+            nodes: [
+              {
+                id: "id-1",
+                identifier: "T-1",
+                title: "Title",
+                state: { name: "Ready to Merge" },
+              },
+            ],
+            pageInfo: {
+              hasNextPage: true,
+              endCursor: "next-page",
+            },
+          },
+        },
+      });
+    };
+
+    const client = new LinearTrackerClient(config.tracker, fetchImpl);
+    const page = await client.fetchIssueCandidatePageByFilter({
+      branches: [{ id: "merge_policy_source:Ready to Merge", stateNames: ["Ready to Merge"] }],
+      excludeIssueIds: ["issue-running"],
+      first: 50,
+      after: "cursor-1",
+    });
+
+    expect(page.issues.map((item) => item.identifier)).toEqual(["T-1"]);
+    expect(page.pageInfo).toEqual({ hasNextPage: true, endCursor: "next-page" });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.variables).toMatchObject({
+      first: 50,
+      after: "cursor-1",
+      filter: {
+        and: [
+          { project: { slugId: { eq: "TEST" } } },
+          { id: { nin: ["issue-running"] } },
+          { state: { name: { in: ["Ready to Merge"] } } },
+        ],
+      },
+    });
   });
 
   it("fetches bounded project workflow states with team identity", async () => {

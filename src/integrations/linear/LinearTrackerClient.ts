@@ -5,6 +5,8 @@ import type {
   TrackerClient,
   TrackerIssueCandidateFilterBranch,
   TrackerIssueCandidateFilterInput,
+  TrackerIssueCandidatePage,
+  TrackerIssueCandidatePageInput,
 } from "../../core/tracker/TrackerClient.js";
 import type {
   TrackerCommentInput,
@@ -385,6 +387,26 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     );
   }
 
+  async fetchIssueCandidatePageByFilter(input: TrackerIssueCandidatePageInput): Promise<TrackerIssueCandidatePage> {
+    const filter = buildLinearIssueCandidateFilter(input, {
+      projectSlug: this.config.projectSlug,
+      assignee: this.config.assignee,
+    });
+    if (filter === null) {
+      return { issues: [], pageInfo: { hasNextPage: false, endCursor: null } };
+    }
+    const assigneeFilter = await this.routingAssigneeFilter();
+    return this.fetchIssuePage(
+      TICK_ISSUE_CANDIDATES_QUERY,
+      { filter },
+      assigneeFilter,
+      {
+        after: input.after ?? null,
+        ...(input.first === undefined ? {} : { first: input.first }),
+      },
+    );
+  }
+
   async fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]> {
     if (issueIds.length === 0) return [];
     const assigneeFilter = await this.routingAssigneeFilter();
@@ -605,25 +627,42 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     let after: string | null = null;
 
     do {
-      const response: { issues: { nodes: LinearIssueNode[]; pageInfo: LinearPageInfo } } =
-        await this.graphql<{ issues: { nodes: LinearIssueNode[]; pageInfo: LinearPageInfo } }>(
+      const page = await this.fetchIssuePage(
         query,
-        { ...variables, first: linearPageSize(this.config.pageSize), after },
+        variables,
+        assigneeFilter,
+        { after },
       );
-      issues.push(
-        ...response.issues.nodes
-          .map((node) => normalizeIssue(node, assigneeFilter))
-          .filter((issue): issue is Issue => issue !== null),
-      );
-
-      const pageInfo = response.issues.pageInfo;
-      if (pageInfo.hasNextPage && !pageInfo.endCursor) {
-        throw new SymphonyError("tracker_error", "Linear pagination reported next page without endCursor");
-      }
-      after = pageInfo.hasNextPage ? pageInfo.endCursor : null;
+      issues.push(...page.issues);
+      after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
     } while (after);
 
     return issues;
+  }
+
+  private async fetchIssuePage(
+    query: string,
+    variables: Record<string, unknown>,
+    assigneeFilter: AssigneeFilter | null,
+    page: { first?: number; after?: string | null } = {},
+  ): Promise<TrackerIssueCandidatePage> {
+    const response = await this.graphql<{
+      issues: { nodes: LinearIssueNode[]; pageInfo: LinearPageInfoNode };
+    }>(query, {
+      ...variables,
+      first: linearPageSize(page.first ?? this.config.pageSize),
+      after: page.after ?? null,
+    });
+    const pageInfo = normalizePageInfo(
+      response.issues.pageInfo,
+      "Linear issues",
+    );
+    return {
+      issues: response.issues.nodes
+        .map((node) => normalizeIssue(node, assigneeFilter))
+        .filter((issue): issue is Issue => issue !== null),
+      pageInfo,
+    };
   }
 
   private async routingAssigneeFilter(): Promise<AssigneeFilter | null> {
@@ -747,9 +786,11 @@ export function buildLinearIssueCandidateFilter(
   const projectFilter: LinearIssueFilter = {
     project: { slugId: { eq: options.projectSlug } },
   };
+  const excludedIds = uniqueStrings(input.excludeIssueIds ?? []);
   return {
     and: [
       projectFilter,
+      ...(excludedIds.length === 0 ? [] : [{ id: { nin: excludedIds } }]),
       branches.length === 1 ? branches[0] : { or: branches },
     ],
   };

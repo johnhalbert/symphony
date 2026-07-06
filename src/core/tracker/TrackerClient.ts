@@ -16,6 +16,21 @@ export interface TrackerIssueCandidateFilterBranch {
 
 export interface TrackerIssueCandidateFilterInput {
   branches: TrackerIssueCandidateFilterBranch[];
+  excludeIssueIds?: string[];
+}
+
+export interface TrackerIssueCandidatePageInput
+  extends TrackerIssueCandidateFilterInput {
+  first?: number;
+  after?: string | null;
+}
+
+export interface TrackerIssueCandidatePage {
+  issues: Issue[];
+  pageInfo: {
+    hasNextPage: boolean;
+    endCursor: string | null;
+  };
 }
 
 export interface TrackerClient {
@@ -23,4 +38,5 @@ export interface TrackerClient {
   fetchIssuesByStates(stateNames: string[], options?: FetchIssuesByStatesOptions): Promise<Issue[]>;
   fetchIssueStatesByIds(issueIds: string[]): Promise<Issue[]>;
   fetchIssueCandidatesByFilter?(input: TrackerIssueCandidateFilterInput): Promise<Issue[]>;
+  fetchIssueCandidatePageByFilter?(input: TrackerIssueCandidatePageInput): Promise<TrackerIssueCandidatePage>;
 }

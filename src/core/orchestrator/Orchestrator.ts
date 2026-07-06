@@ -36,6 +36,7 @@ import type {
   TrackerClient,
   TrackerIssueCandidateFilterBranch,
   TrackerIssueCandidateFilterInput,
+  TrackerIssueCandidatePage,
 } from "../tracker/TrackerClient.js";
 import {
   runKindForPhase,
@@ -932,6 +933,12 @@ Relevant worker run digest:
 {% else %}- No run digest is available.
 {% endfor %}
 `;
+
+interface TickIssueCandidateLane {
+  id: string;
+  branch: TrackerIssueCandidateFilterBranch;
+  requiresAgentSlot: boolean;
+}
 
 export class Orchestrator {
   private config: ServiceConfig;
@@ -2882,7 +2889,16 @@ export class Orchestrator {
   }
 
   private async processTickIssueCandidates(): Promise<void> {
-    const candidates = await this.fetchTickIssueCandidates();
+    const excludedIssueIds = await this.tickIssueCandidateExcludedIssueIds();
+    if (typeof this.options.tracker.fetchIssueCandidatePageByFilter === "function") {
+      const processedPaged =
+        await this.processPagedTickIssueCandidateLanes(excludedIssueIds);
+      if (processedPaged) return;
+    }
+
+    const candidates = await this.fetchTickIssueCandidates({
+      excludeIssueIds: [...excludedIssueIds],
+    });
     for (const issue of sortIssuesForDispatch(candidates)) {
       await this.processTickIssueCandidate(issue);
     }
@@ -2953,9 +2969,123 @@ export class Orchestrator {
     return isStateIn(issue.state, this.config.tracker.activeStates);
   }
 
-  private async fetchTickIssueCandidates(): Promise<Issue[]> {
+  private async processPagedTickIssueCandidateLanes(
+    excludedIssueIds: Set<string>,
+  ): Promise<boolean> {
+    const processedIssueIds = new Set<string>();
+    let fetchedAnyPage = false;
+    for (const lane of this.tickIssueCandidateLanes()) {
+      if (lane.requiresAgentSlot && this.availableSlots() <= 0) return true;
+      const laneExcludedIssueIds = [
+        ...excludedIssueIds,
+        ...processedIssueIds,
+      ];
+      let after: string | null = null;
+      do {
+        if (lane.requiresAgentSlot && this.availableSlots() <= 0) return true;
+        let page: TrackerIssueCandidatePage;
+        try {
+          page = await this.options.tracker.fetchIssueCandidatePageByFilter!({
+            branches: [lane.branch],
+            excludeIssueIds: laneExcludedIssueIds,
+            after,
+          });
+        } catch (error) {
+          this.options.logger.warn("paged tick issue candidate fetch failed", {
+            lane_id: lane.id,
+            after,
+            error: errorMessage(error),
+          });
+          return fetchedAnyPage;
+        }
+        fetchedAnyPage = true;
+        for (const issue of sortIssuesForDispatch(page.issues)) {
+          if (
+            excludedIssueIds.has(issue.id) ||
+            processedIssueIds.has(issue.id)
+          ) {
+            continue;
+          }
+          processedIssueIds.add(issue.id);
+          await this.processTickIssueCandidate(issue, {
+            refreshBeforeTransition: false,
+          });
+          if (lane.requiresAgentSlot && this.availableSlots() <= 0) {
+            return true;
+          }
+        }
+        after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+      } while (after);
+    }
+
+    if (this.availableSlots() > 0) {
+      await this.processKnownTickIssueCandidates({
+        processedIssueIds,
+        excludedIssueIds,
+      });
+    }
+    return true;
+  }
+
+  private async processKnownTickIssueCandidates(input: {
+    processedIssueIds: Set<string>;
+    excludedIssueIds: Set<string>;
+  }): Promise<void> {
     const byId = new Map<string, Issue>();
-    const filter = this.tickIssueCandidateFilter();
+    await this.addKnownTickIssueCandidates(byId, {
+      excludeIssueIds: [
+        ...input.processedIssueIds,
+        ...input.excludedIssueIds,
+      ],
+    });
+    for (const issue of sortIssuesForDispatch([...byId.values()])) {
+      if (this.availableSlots() <= 0) return;
+      if (
+        input.processedIssueIds.has(issue.id) ||
+        input.excludedIssueIds.has(issue.id)
+      ) {
+        continue;
+      }
+      input.processedIssueIds.add(issue.id);
+      await this.processTickIssueCandidate(issue, {
+        refreshBeforeTransition: false,
+      });
+    }
+  }
+
+  private async tickIssueCandidateExcludedIssueIds(): Promise<Set<string>> {
+    const excluded = new Set<string>([
+      ...this.running.keys(),
+      ...this.claimed,
+      ...this.pausedIssues,
+      ...this.retryAttempts.keys(),
+    ]);
+
+    if (this.options.lifecycleStore) {
+      try {
+        for (const lifecycle of await this.options.lifecycleStore.list()) {
+          if (pendingPublicationHandoffForRun(lifecycle) !== null) {
+            excluded.add(lifecycle.issueId);
+          }
+        }
+      } catch (error) {
+        this.options.logger.warn("tick lifecycle exclusion list failed", {
+          error: errorMessage(error),
+        });
+      }
+    }
+
+    return excluded;
+  }
+
+  private async fetchTickIssueCandidates(
+    options: { excludeIssueIds?: readonly string[] } = {},
+  ): Promise<Issue[]> {
+    const byId = new Map<string, Issue>();
+    const excludedIssueIds = new Set(options.excludeIssueIds ?? []);
+    const filter = this.tickIssueCandidateFilter({
+      excludeIssueIds: [...excludedIssueIds],
+    });
     let fetchedWithFilter = false;
     if (
       filter.branches.length > 0 &&
@@ -2963,6 +3093,7 @@ export class Orchestrator {
     ) {
       try {
         for (const issue of await this.options.tracker.fetchIssueCandidatesByFilter(filter)) {
+          if (excludedIssueIds.has(issue.id)) continue;
           byId.set(issue.id, issue);
         }
         fetchedWithFilter = true;
@@ -2981,6 +3112,7 @@ export class Orchestrator {
             states,
             { applyRouting: true },
           )) {
+            if (excludedIssueIds.has(issue.id)) continue;
             byId.set(issue.id, issue);
           }
         } catch (error) {
@@ -2992,13 +3124,24 @@ export class Orchestrator {
       }
     }
     if (fetchedWithFilter) {
-      await this.addKnownTickIssueCandidates(byId);
+      await this.addKnownTickIssueCandidates(byId, {
+        excludeIssueIds: [...excludedIssueIds],
+      });
     }
     return [...byId.values()];
   }
 
-  private tickIssueCandidateFilter(): TrackerIssueCandidateFilterInput {
-    const branches: TrackerIssueCandidateFilterBranch[] = [];
+  private tickIssueCandidateFilter(
+    options: { excludeIssueIds?: readonly string[] } = {},
+  ): TrackerIssueCandidateFilterInput {
+    return {
+      branches: this.tickIssueCandidateLanes().map((lane) => lane.branch),
+      excludeIssueIds: [...(options.excludeIssueIds ?? [])],
+    };
+  }
+
+  private tickIssueCandidateLanes(): TickIssueCandidateLane[] {
+    const lanes: TickIssueCandidateLane[] = [];
     const globalRequiredLabels = this.config.agent.requireLabels;
     const globalExcludeLabels = this.config.agent.excludeLabels;
     const activeStates = uniqueStateNames(this.config.tracker.activeStates);
@@ -3008,81 +3151,122 @@ export class Orchestrator {
     const nonTodoActiveStates = activeStates.filter(
       (state) => state.trim().toLowerCase() !== "todo",
     );
-    if (todoStates.length > 0) {
-      branches.push({
-        id: "active_todo_dispatch",
-        stateNames: todoStates,
-        requireLabels: globalRequiredLabels,
-        excludeLabels: globalExcludeLabels,
-        requireAssignedToWorker: true,
-        requireNoOpenBlockers: true,
-        requireNoChildren: true,
-      });
-    }
-    if (nonTodoActiveStates.length > 0) {
-      branches.push({
-        id: "active_non_todo_dispatch",
-        stateNames: nonTodoActiveStates,
-        requireLabels: globalRequiredLabels,
-        excludeLabels: globalExcludeLabels,
-        requireAssignedToWorker: true,
-        requireNoChildren: true,
-      });
-    }
-    if (this.config.reviewLoop.reviewStates.length > 0) {
-      branches.push({
-        id: "review_dispatch",
-        stateNames: this.config.reviewLoop.reviewStates,
-        requireLabels: globalRequiredLabels,
-        excludeLabels: globalExcludeLabels,
-        requireNoOpenBlockers: true,
-      });
-    }
-    if (this.config.reviewLoop.blockedStates.length > 0) {
-      branches.push({
-        id: "blocked_triage",
-        stateNames: this.config.reviewLoop.blockedStates,
-        requireLabels: globalRequiredLabels,
-        excludeLabels: globalExcludeLabels,
-      });
-    }
-    const mergeStates = uniqueStateNames([
-      ...(this.config.mergePolicy.mode === "gated"
+    for (const state of uniqueStateNames(
+      this.config.mergePolicy.mode === "gated"
         ? this.config.mergePolicy.sourceStates
-        : []),
-      ...(this.config.mergePolicy.mode === "gated" &&
+        : [],
+    )) {
+      lanes.push({
+        id: `merge_policy_source:${state}`,
+        requiresAgentSlot: false,
+        branch: {
+          id: `merge_policy_source:${state}`,
+          stateNames: [state],
+          requireLabels: globalRequiredLabels,
+          excludeLabels: globalExcludeLabels,
+        },
+      });
+    }
+    if (
+      this.config.mergePolicy.mode === "gated" &&
       this.config.mergePolicy.conflictsState !== null
-        ? [this.config.mergePolicy.conflictsState]
-        : []),
-    ]);
-    if (mergeStates.length > 0) {
-      branches.push({
-        id: "merge_policy",
-        stateNames: mergeStates,
-        requireLabels: globalRequiredLabels,
-        excludeLabels: globalExcludeLabels,
+    ) {
+      const conflictsState = this.config.mergePolicy.conflictsState;
+      lanes.push({
+        id: `merge_policy_conflicts:${conflictsState}`,
+        requiresAgentSlot: false,
+        branch: {
+          id: `merge_policy_conflicts:${conflictsState}`,
+          stateNames: [conflictsState],
+          requireLabels: globalRequiredLabels,
+          excludeLabels: globalExcludeLabels,
+        },
       });
     }
-    if (this.config.postMortem.enabled && this.config.postMortem.doneStates.length > 0) {
-      branches.push({
-        id: "post_mortem",
-        stateNames: this.config.postMortem.doneStates,
-        requireLabels: [
-          ...globalRequiredLabels,
-          ...this.config.postMortem.requireLabels,
-        ],
-        excludeLabels: [
-          ...globalExcludeLabels,
-          ...this.config.postMortem.excludeLabels,
-        ],
+    for (const state of uniqueStateNames(this.config.reviewLoop.reviewStates)) {
+      lanes.push({
+        id: `review_dispatch:${state}`,
+        requiresAgentSlot: true,
+        branch: {
+          id: `review_dispatch:${state}`,
+          stateNames: [state],
+          requireLabels: globalRequiredLabels,
+          excludeLabels: globalExcludeLabels,
+          requireNoOpenBlockers: true,
+        },
       });
     }
-    return { branches };
+    for (const state of nonTodoActiveStates) {
+      lanes.push({
+        id: `active_non_todo_dispatch:${state}`,
+        requiresAgentSlot: true,
+        branch: {
+          id: `active_non_todo_dispatch:${state}`,
+          stateNames: [state],
+          requireLabels: globalRequiredLabels,
+          excludeLabels: globalExcludeLabels,
+          requireAssignedToWorker: true,
+          requireNoChildren: true,
+        },
+      });
+    }
+    for (const state of todoStates) {
+      lanes.push({
+        id: `active_todo_dispatch:${state}`,
+        requiresAgentSlot: true,
+        branch: {
+          id: `active_todo_dispatch:${state}`,
+          stateNames: [state],
+          requireLabels: globalRequiredLabels,
+          excludeLabels: globalExcludeLabels,
+          requireAssignedToWorker: true,
+          requireNoOpenBlockers: true,
+          requireNoChildren: true,
+        },
+      });
+    }
+    for (const state of uniqueStateNames(this.config.reviewLoop.blockedStates)) {
+      lanes.push({
+        id: `blocked_triage:${state}`,
+        requiresAgentSlot: true,
+        branch: {
+          id: `blocked_triage:${state}`,
+          stateNames: [state],
+          requireLabels: globalRequiredLabels,
+          excludeLabels: globalExcludeLabels,
+        },
+      });
+    }
+    if (this.config.postMortem.enabled) {
+      for (const state of uniqueStateNames(this.config.postMortem.doneStates)) {
+        lanes.push({
+          id: `post_mortem:${state}`,
+          requiresAgentSlot: true,
+          branch: {
+            id: `post_mortem:${state}`,
+            stateNames: [state],
+            requireLabels: [
+              ...globalRequiredLabels,
+              ...this.config.postMortem.requireLabels,
+            ],
+            excludeLabels: [
+              ...globalExcludeLabels,
+              ...this.config.postMortem.excludeLabels,
+            ],
+          },
+        });
+      }
+    }
+    return lanes;
   }
 
-  private async addKnownTickIssueCandidates(byId: Map<string, Issue>): Promise<void> {
+  private async addKnownTickIssueCandidates(
+    byId: Map<string, Issue>,
+    options: { excludeIssueIds?: readonly string[] } = {},
+  ): Promise<void> {
     const states = this.tickIssueCandidateStates();
     if (states.length === 0) return;
+    const excludedIssueIds = new Set(options.excludeIssueIds ?? []);
     let records: IssueCurrentFields[];
     try {
       records = await this.listIssueCurrentFields();
@@ -3094,6 +3278,7 @@ export class Orchestrator {
     }
     const candidateIds = records
       .filter((record) => !byId.has(record.issueId))
+      .filter((record) => !excludedIssueIds.has(record.issueId))
       .filter((record) => isStateIn(record.trackerState, states))
       .map((record) => record.issueId);
     if (candidateIds.length === 0) return;
@@ -3101,6 +3286,7 @@ export class Orchestrator {
       for (const issue of await this.options.tracker.fetchIssueStatesByIds(
         candidateIds,
       )) {
+        if (excludedIssueIds.has(issue.id)) continue;
         byId.set(issue.id, issue);
       }
     } catch (error) {
@@ -3111,6 +3297,11 @@ export class Orchestrator {
     }
   }
 
+  /*
+   * Keep this method as the single source of all tracker states the tick may
+   * need. The paged fast path queries them lane-by-lane; fallback and known
+   * candidate recovery still need the compact state list.
+   */
   private tickIssueCandidateStates(): string[] {
     const states = [
       ...this.config.tracker.activeStates,
@@ -3130,12 +3321,18 @@ export class Orchestrator {
     );
   }
 
-  private async processTickIssueCandidate(issue: Issue): Promise<boolean> {
+  private async processTickIssueCandidate(
+    issue: Issue,
+    options: { refreshBeforeTransition?: boolean } = {},
+  ): Promise<boolean> {
     let acted = false;
     for (let iteration = 0; iteration < 3; iteration += 1) {
       const result = await this.processIssueTransitionCandidateEvent({
         issue,
         candidateSource: "tick_candidates",
+        ...(options.refreshBeforeTransition === undefined
+          ? {}
+          : { refreshBeforeTransition: options.refreshBeforeTransition }),
       });
       if (
         result.transition === null ||
