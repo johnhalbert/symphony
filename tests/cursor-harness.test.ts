@@ -20,7 +20,7 @@ import {
   transcriptRecallContextFilePath,
   transcriptRecallMcpServerConfig,
 } from "../cursor/src/CursorHarness.js";
-import { issue, testConfig, trackerIssue } from "./helpers.js";
+import { issue, multiProjectWorkflowConfig, testConfig, trackerIssue } from "./helpers.js";
 
 const cursorSdk = vi.hoisted(() => ({
   create: vi.fn(),
@@ -542,6 +542,213 @@ describe("Cursor event mapping", () => {
       expect.objectContaining({ type: "run_status", runId: "sdk-run-fresh", sdkStatus: "finished", source: "wait" }),
       { type: "completed" },
     ]);
+  });
+
+  it("context-qualifies project-scoped Cursor sessions and preserves issue-derived project context metadata", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const send = vi.fn(async () => completedSdkRun("sdk-run-docs"));
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-docs",
+      send,
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    });
+    const runStore = {
+      latestRunForIssue: vi.fn(),
+      updateRun: vi.fn(),
+      appendEvent: vi.fn(),
+    };
+    const harness = new CursorHarness({ runStore: runStore as never });
+    const ctx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      issue: trackerIssue({
+        id: "issue-docs-1",
+        identifier: "ENG-123",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        state: "In Progress",
+      }),
+      workspace: {
+        path: "/tmp/workspace/docs__ENG-123",
+        workspaceKey: "docs__ENG-123",
+        createdNow: false,
+        gitBranchName: "symphony/docs/ENG-123",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    };
+
+    const events: unknown[] = [];
+    for await (const event of harness.run(ctx, "Work on ENG-123")) {
+      events.push(event);
+    }
+
+    const sessionId = "docs__ENG-123:agent-docs:sdk-run-docs";
+    expect(events).toContainEqual({ type: "session_started", sessionId, threadId: "agent-docs", runId: "sdk-run-docs" });
+    expect(runStore.updateRun).toHaveBeenCalledWith(
+      "sdk-run-docs",
+      expect.objectContaining({
+        sessionId,
+        agentId: "agent-docs",
+        projectContext: expect.objectContaining({ projectContextId: "docs" }),
+      }),
+    );
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "sdk-run-docs",
+        eventType: "cursor_agent_lifecycle",
+        payload: expect.objectContaining({
+          sessionId,
+          workspaceKey: "docs__ENG-123",
+          projectContext: expect.objectContaining({ projectContextId: "docs" }),
+        }),
+      }),
+    );
+    const activeContext = JSON.parse(await readFile(completionReportContextFilePath(ctx), "utf8")) as {
+      sessionId?: string | null;
+      projectContext?: { projectContextId?: string };
+    };
+    expect(activeContext.sessionId).toBe(sessionId);
+    expect(activeContext.projectContext?.projectContextId).toBe("docs");
+  });
+
+  it("context-qualifies configured default project-context Cursor sessions", async () => {
+    const config = parseServiceConfig(
+      multiProjectWorkflowConfig(),
+      "/tmp/symphony-cursor-harness/WORKFLOW.md",
+      { LINEAR_API_KEY: "linear-test-key" },
+    );
+    expect(config.projectContexts.defaultContextId).toBe("symphony");
+
+    const send = vi.fn(async () => completedSdkRun("sdk-run-symphony"));
+    cursorSdk.create.mockResolvedValue({
+      agentId: "agent-symphony",
+      send,
+      reload: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(),
+    });
+    const runStore = {
+      latestRunForIssue: vi.fn(),
+      updateRun: vi.fn(),
+      appendEvent: vi.fn(),
+    };
+    const harness = new CursorHarness({ runStore: runStore as never });
+    const ctx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      issue: trackerIssue({
+        id: "issue-symphony-1",
+        identifier: "ENG-123",
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        state: "In Progress",
+      }),
+      workspace: {
+        path: "/tmp/workspace/symphony__ENG-123",
+        workspaceKey: "symphony__ENG-123",
+        createdNow: false,
+        gitBranchName: "symphony/symphony/ENG-123",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    };
+
+    const events: unknown[] = [];
+    for await (const event of harness.run(ctx, "Work on ENG-123")) {
+      events.push(event);
+    }
+
+    const sessionId = "symphony__ENG-123:agent-symphony:sdk-run-symphony";
+    expect(events).toContainEqual({ type: "session_started", sessionId, threadId: "agent-symphony", runId: "sdk-run-symphony" });
+    expect(runStore.updateRun).toHaveBeenCalledWith(
+      "sdk-run-symphony",
+      expect.objectContaining({
+        sessionId,
+        agentId: "agent-symphony",
+        projectContext: expect.objectContaining({ projectContextId: "symphony" }),
+      }),
+    );
+    expect(runStore.appendEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "sdk-run-symphony",
+        eventType: "cursor_agent_lifecycle",
+        payload: expect.objectContaining({
+          sessionId,
+          workspaceKey: "symphony__ENG-123",
+          projectContext: expect.objectContaining({ projectContextId: "symphony" }),
+        }),
+      }),
+    );
+    const activeContext = JSON.parse(await readFile(completionReportContextFilePath(ctx), "utf8")) as {
+      sessionId?: string | null;
+      projectContext?: { projectContextId?: string };
+    };
+    expect(activeContext.sessionId).toBe(sessionId);
+    expect(activeContext.projectContext?.projectContextId).toBe("symphony");
+  });
+
+  it("does not collide project-scoped Cursor session ids across projects with the same issue identifier", async () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    cursorSdk.create
+      .mockResolvedValueOnce({
+        agentId: "agent-overlap",
+        send: vi.fn(async () => completedSdkRun("sdk-run-overlap")),
+        reload: vi.fn(),
+        [Symbol.asyncDispose]: vi.fn(),
+      })
+      .mockResolvedValueOnce({
+        agentId: "agent-overlap",
+        send: vi.fn(async () => completedSdkRun("sdk-run-overlap")),
+        reload: vi.fn(),
+        [Symbol.asyncDispose]: vi.fn(),
+      });
+    const harness = new CursorHarness();
+    const docsCtx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      issue: trackerIssue({
+        id: "issue-docs-1",
+        identifier: "ENG-123",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        state: "In Progress",
+      }),
+      workspace: {
+        path: "/tmp/workspace/docs__ENG-123",
+        workspaceKey: "docs__ENG-123",
+        createdNow: false,
+        gitBranchName: "symphony/docs/ENG-123",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    };
+    const platformCtx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      issue: trackerIssue({
+        id: "issue-platform-1",
+        identifier: "ENG-123",
+        projectContextId: "platform",
+        projectContextLabel: "Platform Services",
+        state: "In Progress",
+      }),
+      workspace: {
+        path: "/tmp/workspace/platform__ENG-123",
+        workspaceKey: "platform__ENG-123",
+        createdNow: false,
+        gitBranchName: "symphony/platform/ENG-123",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
+    };
+
+    const docsEvents: unknown[] = [];
+    for await (const event of harness.run(docsCtx, "Work on ENG-123")) docsEvents.push(event);
+    const platformEvents: unknown[] = [];
+    for await (const event of harness.run(platformCtx, "Work on ENG-123")) platformEvents.push(event);
+
+    const docsStarted = docsEvents[0] as { type: string; sessionId: string };
+    const platformStarted = platformEvents[0] as { type: string; sessionId: string };
+    expect(docsStarted).toMatchObject({ type: "session_started", sessionId: "docs__ENG-123:agent-overlap:sdk-run-overlap" });
+    expect(platformStarted).toMatchObject({ type: "session_started", sessionId: "platform__ENG-123:agent-overlap:sdk-run-overlap" });
+    expect(docsStarted.sessionId).not.toBe(platformStarted.sessionId);
   });
 
   it("buffers SDK status observations until after session_started", async () => {
