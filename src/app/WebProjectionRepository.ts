@@ -283,7 +283,7 @@ function projectionRevisionSelector(record: ProjectionPayloadRecord): Projection
   };
 }
 
-function compatibleProjectionRevisionSelectors(
+export function compatibleProjectionRevisionSelectors(
   selector: ProjectionRevisionSelector,
   defaultProjectContextId: string | null | undefined,
 ): ProjectionRevisionSelector[] {

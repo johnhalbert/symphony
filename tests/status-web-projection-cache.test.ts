@@ -15,6 +15,7 @@ import {
   type WebProjectionRevisionListener,
   type WebProjectionRevisionProvider,
 } from "../src/app/WebProjectionContext.js";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID } from "../src/core/config/ProjectContexts.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore, type StartRunInput, type WorkspaceRecord } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore, type NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
@@ -118,6 +119,92 @@ describe("StatusServer web projection context cache", () => {
       revision: 2,
       observedAt: generatedAt,
     });
+
+    await expect(acquire(false)).resolves.toBe(revisionChanged);
+    expect(builds).toBe(2);
+  });
+
+  it("fingerprints legacy-compatible durable collection revisions using configured-default fallback", async () => {
+    const generatedAt = "2026-01-01T00:00:00.000Z";
+    let legacyDashboardRevision = 1;
+    let builds = 0;
+    const selectors: Array<{
+      projectionName: string;
+      projectContextId?: string | null;
+      scopeKind?: string | null;
+      scopeKey?: string | null;
+    }> = [];
+    const server = createStatusServer({
+      generatedAt: () => generatedAt,
+      clock: () => new Date(generatedAt),
+      projectionReader: {
+        async readCurrentPayload() {
+          return null;
+        },
+        async readCurrentRevision(selector) {
+          selectors.push({ ...selector });
+          if (
+            selector.projectionName === "dashboard_projection" &&
+            (selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID) === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+          ) {
+            return {
+              projectionRevisionId: `${selector.projectionName}:${selector.scopeKind ?? "global"}:${selector.scopeKey ?? "global"}:${legacyDashboardRevision}`,
+              projectionName: selector.projectionName,
+              projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+              scopeKind: selector.scopeKind ?? "global",
+              scopeKey: selector.scopeKey ?? "global",
+              revision: legacyDashboardRevision,
+              buildMode: legacyDashboardRevision === 1 ? "bootstrap" : "incremental",
+              sourceRevisions: [],
+              sourceCursors: {},
+              sourceFreshness: [],
+              contentSha256: "0".repeat(64),
+              generatedAt,
+              expiresAt: null,
+              supersededAt: null,
+              createdAt: generatedAt,
+            };
+          }
+          return null;
+        },
+      },
+      builder: (input) => {
+        builds += 1;
+        return contextFixture(input, builds);
+      },
+    });
+    server.setDefaultProjectContextId("symphony");
+    const acquire = acquireFrom(server);
+
+    const first = await acquire(false);
+    expect(first.metadata.fingerprint.durableProjectionRevisions).toContainEqual({
+      source: "projection:dashboard_projection:global:global",
+      revision: 1,
+      observedAt: generatedAt,
+    });
+    expect(
+      selectors
+        .filter((selector) => selector.projectionName === "dashboard_projection")
+        .map((selector) => selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID)
+        .slice(0, 2),
+    ).toEqual(["symphony", LEGACY_DEFAULT_PROJECT_CONTEXT_ID]);
+
+    selectors.length = 0;
+    legacyDashboardRevision = 2;
+    const revisionChanged = await acquire(false);
+    expect(revisionChanged).not.toBe(first);
+    expect(projectedBuild(revisionChanged)).toBe(2);
+    expect(revisionChanged.metadata.fingerprint.durableProjectionRevisions).toContainEqual({
+      source: "projection:dashboard_projection:global:global",
+      revision: 2,
+      observedAt: generatedAt,
+    });
+    expect(
+      selectors
+        .filter((selector) => selector.projectionName === "dashboard_projection")
+        .map((selector) => selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID)
+        .slice(0, 2),
+    ).toEqual(["symphony", LEGACY_DEFAULT_PROJECT_CONTEXT_ID]);
 
     await expect(acquire(false)).resolves.toBe(revisionChanged);
     expect(builds).toBe(2);

@@ -148,6 +148,7 @@ import {
 } from "./WebProjectionContext.js";
 import { RealtimeProjectionEventBus, type RealtimeResourceKind } from "./RealtimeProjectionEvents.js";
 import {
+  compatibleProjectionRevisionSelectors,
   createWebProjectionReadRepositories,
   webHistoryProjectionScopeKey,
   webOrchestratorChatProjectionScopeKey,
@@ -3351,7 +3352,11 @@ export class StatusServer {
     return Promise.all(
       statusServerWebProjectionContextDurableRevisionSelectors(this.options.defaultProjectContextId).map(async (selector) => {
         try {
-          return durableProjectionRevisionFingerprint(selector, await reader.readCurrentRevision!(selector));
+          for (const attemptSelector of compatibleProjectionRevisionSelectors(selector, this.options.defaultProjectContextId)) {
+            const record = await reader.readCurrentRevision!(attemptSelector);
+            if (record) return durableProjectionRevisionFingerprint(selector, record);
+          }
+          return durableProjectionRevisionFingerprint(selector, null);
         } catch {
           return durableProjectionRevisionFingerprint(selector, null, "error");
         }
