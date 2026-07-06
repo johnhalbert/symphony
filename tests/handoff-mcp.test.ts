@@ -161,6 +161,102 @@ describe("MCP handoff context files", () => {
     }
   });
 
+  it("sanitizes nested issue.projectContext in completion-report handoff payloads when top-level ctx.projectContext is omitted", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-handoff-mcp-"));
+    try {
+      const config = multiProjectHandoffConfig(root);
+      const ctx = handoffContext(config, {
+        role: "worker",
+        issueState: "In Progress",
+        issueOverrides: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "linear-project-docs" },
+          routingSource: "candidate_poll",
+          projectContext: symphonyProjectContext,
+        },
+      });
+
+      expect(() =>
+        completionReportMcpServerConfig(ctx, "/tmp/completion-context.json", { cliPath: "/repo/dist/cli.js" }),
+      ).not.toThrow();
+      await writeActiveHandoffMcpContexts(ctx, {
+        activeRunId: "worker-run-nested-issue-1",
+        sessionId: "worker-session-nested-issue-1",
+      });
+
+      const payload = JSON.parse(await readFile(completionReportContextFilePath(ctx), "utf8"));
+      expect(payload.projectContext).toEqual(docsProjectContext);
+      expect(payload.issue.projectContext).toEqual(docsProjectContext);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("sanitizes nested issue.projectContext in review-verdict handoff payloads when top-level ctx.projectContext is omitted", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-handoff-mcp-"));
+    try {
+      const config = multiProjectHandoffConfig(root);
+      const ctx = handoffContext(config, {
+        role: "reviewer",
+        issueState: "In Review",
+        issueOverrides: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "linear-project-docs" },
+          routingSource: "candidate_poll",
+          projectContext: symphonyProjectContext,
+        },
+      });
+
+      expect(() =>
+        reviewVerdictMcpServerConfig(ctx, "/tmp/review-verdict-context.json", { cliPath: "/repo/dist/cli.js" }),
+      ).not.toThrow();
+      await writeActiveHandoffMcpContexts(ctx, {
+        activeRunId: "review-run-nested-issue-1",
+        sessionId: "reviewer-agent-nested-issue-1",
+      });
+
+      const payload = JSON.parse(await readFile(reviewVerdictContextFilePath(ctx), "utf8"));
+      expect(payload.projectContext).toEqual(docsProjectContext);
+      expect(payload.issue.projectContext).toEqual(docsProjectContext);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("sanitizes nested issue.projectContext in review-feedback handoff payloads when top-level ctx.projectContext is omitted", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-handoff-mcp-"));
+    try {
+      const config = multiProjectHandoffConfig(root);
+      const ctx = handoffContext(config, {
+        role: "reviewer",
+        issueState: "In Review",
+        issueOverrides: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "linear-project-docs" },
+          routingSource: "candidate_poll",
+          projectContext: symphonyProjectContext,
+        },
+      });
+
+      expect(() =>
+        reviewFeedbackMcpServerConfig(ctx, "/tmp/review-feedback-context.json", { cliPath: "/repo/dist/cli.js" }),
+      ).not.toThrow();
+      await writeActiveHandoffMcpContexts(ctx, {
+        activeRunId: "review-run-nested-issue-2",
+        sessionId: "reviewer-agent-nested-issue-2",
+      });
+
+      const payload = JSON.parse(await readFile(reviewFeedbackContextFilePath(ctx), "utf8"));
+      expect(payload.projectContext).toEqual(docsProjectContext);
+      expect(payload.issue.projectContext).toEqual(docsProjectContext);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("preserves the service-owned resolved project context when completion-report handoff metadata drifts within the same projectContextId", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-handoff-mcp-"));
     try {
@@ -249,6 +345,41 @@ describe("MCP handoff context files", () => {
 
       const payload = JSON.parse(await readFile(reviewFeedbackContextFilePath(ctx), "utf8"));
       expect(payload.projectContext).toEqual(docsProjectContext);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the active review-feedback run context when service-owned routing metadata drifts within the same projectContextId", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-handoff-mcp-"));
+    try {
+      const config = multiProjectHandoffConfig(root);
+      const ctx = handoffContext(config, {
+        role: "reviewer",
+        issueState: "In Review",
+        projectContext: docsProjectContext,
+        issueOverrides: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectIdentity: { kind: "linear", slug: "DOCS", id: "linear-project-docs" },
+          routingSource: "state_refresh",
+        },
+      });
+
+      expect(() =>
+        reviewFeedbackMcpServerConfig(ctx, "/tmp/review-feedback-context.json", { cliPath: "/repo/dist/cli.js" }),
+      ).not.toThrow();
+      await writeActiveHandoffMcpContexts(ctx, {
+        activeRunId: "review-run-feedback-routing-drift-1",
+        sessionId: "reviewer-agent-feedback-routing-drift-1",
+      });
+
+      const verdictPayload = JSON.parse(await readFile(reviewVerdictContextFilePath(ctx), "utf8"));
+      const feedbackPayload = JSON.parse(await readFile(reviewFeedbackContextFilePath(ctx), "utf8"));
+      expect(verdictPayload.projectContext).toEqual(stateRefreshDocsProjectContext);
+      expect(verdictPayload.issue.projectContext).toEqual(stateRefreshDocsProjectContext);
+      expect(feedbackPayload.projectContext).toEqual(docsProjectContext);
+      expect(feedbackPayload.issue.projectContext).toEqual(docsProjectContext);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -375,6 +506,111 @@ describe("MCP handoff context files", () => {
     }
   });
 
+  it("rejects completion-report handoff data when the service-owned issue routing becomes stale", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-handoff-mcp-"));
+    try {
+      const config = multiProjectHandoffConfig(root);
+      const ctx = handoffContext(config, {
+        role: "worker",
+        issueState: "In Progress",
+        projectContext: docsProjectContext,
+        issueOverrides: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectIdentity: { kind: "linear", slug: "SYMPHONY", id: "linear-project-symphony" },
+          routingSource: "state_refresh",
+        },
+      });
+
+      expect(() =>
+        completionReportMcpServerConfig(ctx, "/tmp/completion-context.json", { cliPath: "/repo/dist/cli.js" }),
+      ).toThrow("Completion report MCP handoff project context could not be resolved from the service-owned issue context");
+      await expect(
+        writeActiveHandoffMcpContexts(ctx, {
+          activeRunId: "worker-run-stale-routing-1",
+          sessionId: "worker-session-stale-routing-1",
+        }),
+      ).rejects.toMatchObject({
+        code: "invalid_request",
+        message: expect.stringContaining(
+          "Completion report MCP handoff project context could not be resolved from the service-owned issue context",
+        ),
+      });
+      await expect(readFile(completionReportContextFilePath(ctx), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects review-verdict handoff data when the service-owned issue routing becomes stale", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-handoff-mcp-"));
+    try {
+      const config = multiProjectHandoffConfig(root);
+      const ctx = handoffContext(config, {
+        role: "reviewer",
+        issueState: "In Review",
+        projectContext: docsProjectContext,
+        issueOverrides: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectIdentity: { kind: "linear", slug: "SYMPHONY", id: "linear-project-symphony" },
+          routingSource: "state_refresh",
+        },
+      });
+
+      expect(() =>
+        reviewVerdictMcpServerConfig(ctx, "/tmp/review-verdict-context.json", { cliPath: "/repo/dist/cli.js" }),
+      ).toThrow("Review verdict MCP handoff project context could not be resolved from the service-owned issue context");
+      await expect(
+        writeActiveHandoffMcpContexts(ctx, {
+          activeRunId: "review-run-stale-routing-1",
+          sessionId: "reviewer-agent-stale-routing-1",
+        }),
+      ).rejects.toMatchObject({
+        code: "invalid_request",
+        message: expect.stringContaining("Review MCP handoff project context could not be resolved from the service-owned issue context"),
+      });
+      await expect(readFile(reviewVerdictContextFilePath(ctx), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(reviewFeedbackContextFilePath(ctx), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects review-feedback handoff data when the service-owned issue routing becomes stale", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-handoff-mcp-"));
+    try {
+      const config = multiProjectHandoffConfig(root);
+      const ctx = handoffContext(config, {
+        role: "reviewer",
+        issueState: "In Review",
+        projectContext: docsProjectContext,
+        issueOverrides: {
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectIdentity: { kind: "linear", slug: "SYMPHONY", id: "linear-project-symphony" },
+          routingSource: "state_refresh",
+        },
+      });
+
+      expect(() =>
+        reviewFeedbackMcpServerConfig(ctx, "/tmp/review-feedback-context.json", { cliPath: "/repo/dist/cli.js" }),
+      ).toThrow("Review feedback MCP handoff project context could not be resolved from the service-owned issue context");
+      await expect(
+        writeActiveHandoffMcpContexts(ctx, {
+          activeRunId: "review-run-stale-routing-2",
+          sessionId: "reviewer-agent-stale-routing-2",
+        }),
+      ).rejects.toMatchObject({
+        code: "invalid_request",
+        message: expect.stringContaining("Review MCP handoff project context could not be resolved from the service-owned issue context"),
+      });
+      await expect(readFile(reviewFeedbackContextFilePath(ctx), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("forwards resolved project context into completion-report MCP server env selection", async () => {
     const sourceEnv = {
       LINEAR_API_KEY: "linear-secret",
@@ -492,11 +728,25 @@ const docsProjectContext = {
   routingSource: "candidate_poll",
 } as const;
 
+const symphonyProjectContext = {
+  projectContextId: "symphony",
+  projectContextLabel: "Symphony",
+  linearProjectSlug: "SYMPHONY",
+  routingSource: "candidate_poll",
+} as const;
+
 const tamperedDocsProjectContext = {
   projectContextId: "docs",
   projectContextLabel: "MALICIOUS LABEL",
   linearProjectSlug: "WRONG",
   routingSource: "operator_request",
+} as const;
+
+const stateRefreshDocsProjectContext = {
+  projectContextId: "docs",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "state_refresh",
 } as const;
 
 function multiProjectHandoffConfig(root: string): AgentRunContext["config"] {
