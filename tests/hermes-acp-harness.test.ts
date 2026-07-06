@@ -748,6 +748,72 @@ describe("HermesAcpHarness", () => {
     expect(profileEvent?.runActivity?.eventId).toBe(`${sessionStarted?.runId}:activity:2`);
   });
 
+  it("preserves project context in ACP profile/session keys and runtime metadata", async () => {
+    const projectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Docs",
+      linearProjectSlug: null,
+      routingSource: "explicit",
+    };
+    const scopedWorkspaceKey = "docs__ENG-139";
+    const profileName = `profile-${scopedWorkspaceKey}`;
+    const { harness, ctx, leaseFactory } = await fixture({
+      projectContext,
+      profileNameFactory: ({ nameInput }) => `profile-${nameInput!.workspaceKey}`,
+    });
+
+    const events = await collectEvents(harness.run(ctx, "Do work"));
+    const sessionStarted = events.find(
+      (event): event is Extract<AgentEvent, { type: "session_started" }> => event.type === "session_started",
+    );
+    const runtimeReady = events.find(
+      (event): event is Extract<AgentEvent, { type: "progress" }> =>
+        event.type === "progress" && event.runActivity?.kind === "runtime_ready",
+    );
+    const leaseReuseDiagnostic = events.find(
+      (event): event is Extract<AgentEvent, { type: "run_diagnostic" }> =>
+        event.type === "run_diagnostic" && event.code === "hermes_acp_lease_reuse_decision",
+    );
+
+    expect(leaseFactory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nameInput: expect.objectContaining({ workspaceKey: scopedWorkspaceKey }),
+      }),
+    );
+    expect(sessionStarted).toMatchObject({
+      type: "session_started",
+      sessionId: expect.stringContaining(`${profileName}:acp-session-1:`),
+      runActivity: {
+        payload: expect.objectContaining({
+          workspaceKey: scopedWorkspaceKey,
+          projectContext,
+        }),
+      },
+    });
+    expect(runtimeReady).toMatchObject({
+      type: "progress",
+      message: `Host Hermes ACP profile ${profileName}`,
+      runActivity: {
+        payload: expect.objectContaining({
+          profileName,
+          acpSessionId: "acp-session-1",
+          workspaceKey: scopedWorkspaceKey,
+          projectContext,
+        }),
+      },
+    });
+    expect(leaseReuseDiagnostic).toMatchObject({
+      type: "run_diagnostic",
+      code: "hermes_acp_lease_reuse_decision",
+      payload: expect.objectContaining({
+        key: expect.stringMatching(/^fresh:docs__ENG-139:worker:issue-1:implementation:hermes-acp-/),
+        scopeKey: "docs__ENG-139:worker:issue-1:implementation",
+        workspaceKey: scopedWorkspaceKey,
+        projectContext,
+      }),
+    });
+  });
+
   it("creates fresh leases for fresh_per_run worker turns and only disposes each lease once", async () => {
     const { ctx, harness, leaseFactory, leases } = await fixture({ lifecycle: "fresh_per_run" });
 
@@ -2362,24 +2428,28 @@ async function fixture(
     client?: FakeAcpClient;
     clients?: FakeAcpClient[];
     lifecycle?: HermesWorkerSessionLifecycle;
+    projectContext?: AgentRunContext["projectContext"];
     provider?: string | null;
     sourceProfile?: string | null;
     permissionResolver?: HermesAcpPermissionResolver;
     permissionRequestTimeoutMs?: number;
+    profileNameFactory?: (options: HostHermesAcpProfileLeaseOptions, leaseIndex: number) => string;
   } = {},
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "symphony-hermes-acp-"));
   const config = serviceConfig(root, input.lifecycle ?? "fresh_per_run", {
+    projectContext: input.projectContext,
     provider: input.provider,
     sourceProfile: input.sourceProfile,
   });
-  const ctx = runContext(config, root);
+  const ctx = runContext(config, root, { projectContext: input.projectContext });
   const clients = input.clients ?? [input.client ?? new FakeAcpClient()];
   const client = clients[0] ?? new FakeAcpClient();
   const leases: FakeLeaseRecord[] = [];
   const leaseFactory = vi.fn(async (options: HostHermesAcpProfileLeaseOptions): Promise<HostHermesAcpProfileLease> => {
     const disposeStatuses: HostHermesAcpTerminalStatus[] = [];
-    const profileName = `profile-${leases.length + 1}`;
+    const leaseIndex = leases.length + 1;
+    const profileName = input.profileNameFactory?.(options, leaseIndex) ?? `profile-${leaseIndex}`;
     const lease: HostHermesAcpProfileLease = {
       profileName,
       sourceProfile: options.sourceProfile ?? "host-source",
@@ -2417,7 +2487,11 @@ async function fixture(
 function serviceConfig(
   root: string,
   lifecycle: HermesWorkerSessionLifecycle,
-  options: { provider?: string | null | undefined; sourceProfile?: string | null | undefined } = {},
+  options: {
+    projectContext?: AgentRunContext["projectContext"];
+    provider?: string | null | undefined;
+    sourceProfile?: string | null | undefined;
+  } = {},
 ): ServiceConfig {
   const hermesConfig: Record<string, unknown> = {
     upstream_root: path.join(root, "hermes-src"),
@@ -2441,6 +2515,22 @@ function serviceConfig(
         source: { kind: "none" },
       },
       github: { publish_pull_requests: false },
+      ...(options.projectContext === undefined
+        ? {}
+        : {
+            project_contexts: [
+              {
+                id: options.projectContext.projectContextId,
+                label: options.projectContext.projectContextLabel,
+                workspace: {
+                  source: {
+                    kind: "copy",
+                    path: root,
+                  },
+                },
+              },
+            ],
+          }),
       hermes: hermesConfig,
     },
     path.join(root, "WORKFLOW.md"),
@@ -2448,10 +2538,15 @@ function serviceConfig(
   );
 }
 
-function runContext(config: ServiceConfig, root: string): AgentRunContext {
+function runContext(
+  config: ServiceConfig,
+  root: string,
+  options: { projectContext?: AgentRunContext["projectContext"] } = {},
+): AgentRunContext {
   const workspacePath = path.join(root, "workspace");
   return {
     issue: issue(),
+    ...(options.projectContext === undefined ? {} : { projectContext: options.projectContext }),
     role: "worker",
     runPhase: "implementation",
     attempt: 1,
