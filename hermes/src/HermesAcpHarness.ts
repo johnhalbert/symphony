@@ -14,6 +14,11 @@ import {
   writeActiveHandoffMcpContexts,
   writeInitialHandoffMcpContexts,
 } from "../../src/core/harness/HandoffMcp.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../../src/core/config/ProjectContexts.js";
 import type { McpSubprocessServerConfig } from "../../src/core/harness/McpSubprocessEnvironment.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { ProviderLimitSignal } from "../../src/core/provider/ProviderLimits.js";
@@ -60,6 +65,7 @@ import {
   providerLimitSignalFromHermesPayload,
   type HermesLimitMappingDefaults,
 } from "./HermesHarness.js";
+import { sanitizeWorkspaceKey } from "../../src/core/workspace/WorkspaceManager.js";
 
 export interface AcpEnvVariable {
   name: string;
@@ -191,6 +197,11 @@ interface HermesAcpRuntimeMetadata {
 interface HermesAcpSessionStart {
   sessionId: string;
   runtimeMetadata: HermesAcpRuntimeMetadata;
+}
+
+interface HermesAcpResolvedContextMetadata {
+  workspaceKey: string;
+  projectContext: ProjectContextResolution | null;
 }
 
 type HermesAcpSessionUpdateDiagnosticCode = "hermes_acp_malformed_session_update" | "hermes_acp_unknown_session_update";
@@ -402,6 +413,7 @@ export class HermesAcpHarness implements AgentHarness {
     let activitySequence = 0;
     let runRuntimeMetadata = unknownHermesAcpRuntimeMetadata();
     const toolIdentities = new Map<string, HermesAcpToolIdentity>();
+    const contextMetadata = hermesAcpContextMetadata(ctx);
 
     const runActivityContext = (at: string, sequence: number, idScope?: string): HermesAcpRunActivityContext => ({
       runId,
@@ -479,7 +491,7 @@ export class HermesAcpHarness implements AgentHarness {
           type: "run_diagnostic",
           code: "hermes_acp_run_error",
           message,
-          ...(payload === undefined ? {} : { payload }),
+          ...(payload === undefined ? {} : { payload: mergeHermesAcpContextPayload(contextMetadata, payload) }),
         });
         enqueue({ type: "failed", error: message });
       }
@@ -524,14 +536,30 @@ export class HermesAcpHarness implements AgentHarness {
       activeRun.acpSessionId = acpSessionId;
       activeRun.symphonySessionId = `${lease.profile.profileName}:${acpSessionId}:${runId}`;
       await writeActiveHandoffMcpContexts(ctx, { activeRunId: runId, sessionId: activeRun.symphonySessionId });
-      yield withRunActivity({
-        type: "session_started",
-        sessionId: activeRun.symphonySessionId,
-        threadId: acpSessionId,
-        runId,
-        providerId: runRuntimeMetadata.providerId,
-        model: runRuntimeMetadata.model,
-      });
+      yield withRunActivity(
+        {
+          type: "session_started",
+          sessionId: activeRun.symphonySessionId,
+          threadId: acpSessionId,
+          runId,
+          providerId: runRuntimeMetadata.providerId,
+          model: runRuntimeMetadata.model,
+        },
+        {
+          actor: "harness",
+          channel: "lifecycle",
+          kind: "session_started",
+          text: "ACP session started",
+          payload: {
+            sessionId: activeRun.symphonySessionId,
+            threadId: acpSessionId,
+            runId,
+            providerId: runRuntimeMetadata.providerId,
+            model: runRuntimeMetadata.model,
+            ...contextMetadata,
+          },
+        },
+      );
 
       enqueue(
         { type: "progress", activitySource: "stream", message: `Host Hermes ACP profile ${lease.profile.profileName}` },
@@ -544,12 +572,13 @@ export class HermesAcpHarness implements AgentHarness {
             profileName: lease.profile.profileName,
             sourceProfile: lease.profile.sourceProfile,
             acpSessionId,
+            ...contextMetadata,
             reusable: lease.reusable,
             redacted: true,
           },
         },
       );
-      enqueue(hermesAcpLeaseReuseDecisionDiagnostic(leaseAcquisition.decision, lease));
+      enqueue(hermesAcpLeaseReuseDecisionDiagnostic(leaseAcquisition.decision, lease, contextMetadata));
 
       const promptTask = lease.client
         .request<Record<string, unknown> | null>(
@@ -607,13 +636,13 @@ export class HermesAcpHarness implements AgentHarness {
           type: "run_diagnostic",
           code: "hermes_acp_run_error",
           message: `Host Hermes ACP run failed: ${errorMessage(error)}`,
-          payload: {
+          payload: mergeHermesAcpContextPayload(contextMetadata, {
             runId,
             sessionId: activeRun.symphonySessionId,
             profileName: lease.profile.profileName,
             cwd: ctx.workspace.path,
             acpLogTail: acpLogTailPayload(lease),
-          },
+          }),
         });
         yield withRunActivity({ type: "failed", error: `Host Hermes ACP run failed: ${errorMessage(error)}` });
       }
@@ -746,7 +775,8 @@ export class HermesAcpHarness implements AgentHarness {
   private async getOrCreateLease(ctx: AgentRunContext, runId: string): Promise<HermesAcpLeaseAcquisition> {
     const policy = hermesAcpLeaseReusePolicy(ctx);
     const scopeKey = reusableLeaseScopeKey(ctx);
-    let key = policy.reusable ? reusableLeaseKey(ctx) : `fresh:${runId}`;
+    const contextMetadata = hermesAcpContextMetadata(ctx);
+    let key = policy.reusable ? reusableLeaseKey(ctx) : `fresh:${scopeKey}:${runId}`;
     const binaryPath = await this.resolveBinaryPath(ctx);
     const sourceProfile = await this.resolveSourceProfile(ctx, binaryPath);
     const compatibility = hermesAcpLeaseCompatibility(ctx, {
@@ -787,7 +817,7 @@ export class HermesAcpHarness implements AgentHarness {
         reason = "fresh_incompatible_context";
         if (this.leaseHasActiveRun(existingLease)) {
           reusable = false;
-          key = `fresh:${runId}`;
+          key = `fresh:${scopeKey}:${runId}`;
         } else {
           await this.disposeLease(existingLease, null, "reuse_incompatible");
         }
@@ -807,7 +837,7 @@ export class HermesAcpHarness implements AgentHarness {
       keepProfiles: ctx.config.hermesAcp.keepProfiles,
       reusable,
       nameInput: {
-        workspaceKey: ctx.workspace.workspaceKey,
+        workspaceKey: contextMetadata.workspaceKey,
         issueIdentifier: ctx.issue.identifier,
         role: ctx.role,
         phase,
@@ -1332,6 +1362,40 @@ function requireStringRecord(value: unknown, label: string): Record<string, stri
   return output;
 }
 
+function resolvedHermesAcpProjectContext(
+  ctx: Pick<AgentRunContext, "issue" | "projectContext">,
+): ProjectContextResolution | null {
+  return ctx.projectContext ?? projectContextResolutionFromIssue(ctx.issue) ?? null;
+}
+
+function contextScopedHermesAcpWorkspaceKey(
+  ctx: Pick<AgentRunContext, "workspace" | "issue" | "projectContext">,
+): string {
+  const projectContext = resolvedHermesAcpProjectContext(ctx);
+  if (!projectContext || projectContext.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+    return ctx.workspace.workspaceKey;
+  }
+
+  const prefix = `${sanitizeWorkspaceKey(projectContext.projectContextId)}__`;
+  return ctx.workspace.workspaceKey.startsWith(prefix) ? ctx.workspace.workspaceKey : `${prefix}${ctx.workspace.workspaceKey}`;
+}
+
+function hermesAcpContextMetadata(
+  ctx: Pick<AgentRunContext, "workspace" | "issue" | "projectContext">,
+): HermesAcpResolvedContextMetadata {
+  return {
+    workspaceKey: contextScopedHermesAcpWorkspaceKey(ctx),
+    projectContext: resolvedHermesAcpProjectContext(ctx),
+  };
+}
+
+function mergeHermesAcpContextPayload(
+  contextMetadata: HermesAcpResolvedContextMetadata,
+  payload: unknown,
+): Record<string, unknown> {
+  return isRecord(payload) ? { ...contextMetadata, ...payload } : { ...contextMetadata, payload };
+}
+
 function shouldDisposeLeaseAfterRun(lease: HermesAcpLease, terminalStatus: TerminalStatus): boolean {
   return !lease.reusable || terminalStatus !== "succeeded" || lease.transportExited;
 }
@@ -1347,7 +1411,7 @@ function hermesAcpLeaseReusePolicy(ctx: AgentRunContext): { reusable: boolean; r
 }
 
 function reusableLeaseScopeKey(ctx: AgentRunContext): string {
-  return `${ctx.role}:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
+  return `${contextScopedHermesAcpWorkspaceKey(ctx)}:${ctx.role}:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
 }
 
 function reusableLeaseKey(ctx: AgentRunContext): string {
@@ -1390,6 +1454,7 @@ function incompatibleHermesAcpLeaseFields(
 function hermesAcpLeaseReuseDecisionDiagnostic(
   decision: HermesAcpLeaseReuseDecision,
   lease: HermesAcpLease,
+  contextMetadata: HermesAcpResolvedContextMetadata,
 ): AgentEvent {
   const reused = decision.outcome === "reused";
   const reason = formatHermesAcpLeaseReuseReason(decision.reason);
@@ -1409,6 +1474,7 @@ function hermesAcpLeaseReuseDecisionDiagnostic(
       reason: decision.reason,
       key: decision.key,
       scopeKey: decision.scopeKey,
+      ...contextMetadata,
       existingProfileName: decision.existingProfileName ?? null,
       incompatibleFields: decision.incompatibleFields ?? [],
       compatibility: decision.compatibility,
