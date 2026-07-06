@@ -494,17 +494,31 @@ describe("WebProjectionContext contracts and cache key utilities", () => {
 
     expect(sourceIndex.trackerIssues.byAlias.get("ENG-1")).toBe(defaultIssue);
     expect(sourceIndex.trackerIssues.byAlias.get("issue-id-docs")).toBe(docsIssue);
+    expect(sourceIndex.trackerIssues.byAlias.get("docs:issue-id-docs")).toBe(docsIssue);
     expect(sourceIndex.trackerIssues.byAlias.get("docs:ENG-1")).toBe(docsIssue);
+
     expect(sourceIndex.runtime.runningByAlias.get("run-shared")?.sessionId).toBe("session-default");
     expect(sourceIndex.runtime.runningByAlias.get("issue-id-docs")?.sessionId).toBe("session-docs");
+    expect(sourceIndex.runtime.runningByAlias.get("docs:issue-id-docs")?.sessionId).toBe("session-docs");
+    expect(sourceIndex.runtime.runningByAlias.get("docs:ENG-1")?.sessionId).toBe("session-docs");
     expect(sourceIndex.runtime.runningByAlias.get("docs:run-shared")?.sessionId).toBe("session-docs");
+
     expect(sourceIndex.runs.byAlias.get("run-shared")?.map((run) => run.sessionId)).toEqual(["session-default"]);
+    expect(sourceIndex.runs.byAlias.get("docs:issue-id-docs")?.map((run) => run.sessionId)).toEqual(["session-docs"]);
+    expect(sourceIndex.runs.byAlias.get("docs:ENG-1")?.map((run) => run.sessionId)).toEqual(["session-docs"]);
+    expect(sourceIndex.runs.byAlias.get("docs:workspace-1")?.map((run) => run.sessionId)).toEqual(["session-docs"]);
     expect(sourceIndex.runs.byAlias.get("docs:run-shared")?.map((run) => run.sessionId)).toEqual(["session-docs"]);
     expect(sourceIndex.runs.latestByAlias.get("docs:ENG-1")).toBe(docsRun);
+
     expect(sourceIndex.workspaces.byAlias.get("workspace-1")).toBe(defaultWorkspace);
+    expect(sourceIndex.workspaces.byAlias.get("docs:issue-id-docs")).toBe(docsWorkspace);
+    expect(sourceIndex.workspaces.byAlias.get("docs:ENG-1")).toBe(docsWorkspace);
     expect(sourceIndex.workspaces.byAlias.get("docs:workspace-1")).toBe(docsWorkspace);
+
     expect(sourceIndex.lifecycles.byAlias.get("issue-id-1")).toBe(defaultLifecycle);
     expect(sourceIndex.lifecycles.byAlias.get("issue-id-docs")).toBe(docsLifecycle);
+    expect(sourceIndex.lifecycles.byAlias.get("docs:issue-id-docs")).toBe(docsLifecycle);
+    expect(sourceIndex.lifecycles.byAlias.get("docs:ENG-1")).toBe(docsLifecycle);
   });
 
   it("keeps shared raw issue aliases scoped to the configured default project context when non-default siblings also have contextual aliases", async () => {
