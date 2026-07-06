@@ -3,6 +3,7 @@ import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError } from "./errors.js";
 import type {
   CompletionReportPullRequestRef,
+  IssueLifecyclePatch,
   IssueLifecyclePhase,
   IssueLifecycleRecord,
   IssueMergeGateState,
@@ -10,12 +11,12 @@ import type {
   ReviewDiscoveryFindingRecord,
   ReviewGateFindingRecord,
   IssueReviewVerdictRecord,
+  IssueReviewVerdictSubmissionRecord,
   ReviewVerdictAcceptanceResult,
 } from "./persistence/IssueLifecycleStore.js";
 import { isSupersededLifecycleRecord, phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
 import { isMergeGateVerdict } from "./merge/MergePolicyService.js";
 import { shouldSilentlyRetireMergeGate } from "./merge/MergeGateLifecycle.js";
-import { appendLaneMemoTelemetry } from "./persistence/LaneMemoTelemetry.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 import {
@@ -117,8 +118,15 @@ export interface ReviewVerdictServiceOptions {
 export interface ReviewVerdictResult {
   accepted: true;
   replayed: boolean;
-  verdict: IssueReviewVerdictRecord;
+  verdict: IssueReviewVerdictSubmissionRecord;
   writebackOperations: WritebackOperation[];
+  handoffStatus: "pending" | "applied";
+}
+
+export interface ReviewVerdictApplicationPlan {
+  verdict: IssueReviewVerdictRecord;
+  operations: NewWritebackOperation[];
+  patch: IssueLifecyclePatch;
 }
 
 export type WorkerMergeGatePromptResult =
@@ -137,13 +145,34 @@ export class ReviewVerdictService {
     this.validateCaller(verdict, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
-    const existingScoped = existingLifecycle?.reviewVerdicts.find(
+    const existingSubmission = (existingLifecycle?.reviewVerdictSubmissions ?? []).find(
       (item) => item.runId === context.activeRunId && item.idempotencyKey === verdict.idempotencyKey,
     );
-    if (existingScoped) {
-      return { accepted: true, replayed: true, verdict: existingScoped, writebackOperations: [] };
+    if (existingSubmission) {
+      return {
+        accepted: true,
+        replayed: true,
+        verdict: existingSubmission,
+        writebackOperations: [],
+        handoffStatus: existingSubmission.status === "applied" ? "applied" : "pending",
+      };
     }
-    const existingCrossRun = existingLifecycle?.reviewVerdicts.find(
+    const existingAccepted = existingLifecycle?.reviewVerdicts.find(
+      (item) => item.runId === context.activeRunId && item.idempotencyKey === verdict.idempotencyKey,
+    );
+    if (existingAccepted) {
+      return {
+        accepted: true,
+        replayed: true,
+        verdict: submissionFromAcceptedVerdict(existingAccepted),
+        writebackOperations: [],
+        handoffStatus: "applied",
+      };
+    }
+    const existingCrossRun = [
+      ...(existingLifecycle?.reviewVerdictSubmissions ?? []),
+      ...(existingLifecycle?.reviewVerdicts.map((item) => submissionFromAcceptedVerdict(item)) ?? []),
+    ].find(
       (item) => item.idempotencyKey === verdict.idempotencyKey && item.runId !== context.activeRunId,
     );
     if (existingCrossRun) {
@@ -165,21 +194,12 @@ export class ReviewVerdictService {
         ? verdict.findings.map((finding) => finding.trim()).filter((finding) => finding.length > 0)
         : gateFindings.map((finding) => finding.summary);
 
-    const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, { phase: lifecyclePhase });
+    const lifecycle = await this.options.lifecycleStore.ensureIssue(
+      context.issue,
+      existingLifecycle ? {} : { phase: lifecyclePhase },
+    );
     this.validateReviewFeedbackAlignment(verdict, lifecycle);
-    const writebackDetails = {
-      idempotencyKey: verdict.idempotencyKey,
-      acceptanceResults: normalizeAcceptanceResults(verdict.acceptanceResults),
-      findings: storedFindings,
-      gateFindings,
-      discoveryFindings,
-      evidence: verdict.evidence,
-    };
-    const reviewRound = verdict.verdict === "fail" ? nextReviewRound(lifecycle) : lifecycle.reviewRound;
-    const maxReviewerFailures = this.options.config.reviewLoop.failureLimits.reviewerFailures;
-    const ceilingReached =
-      verdict.verdict === "fail" && reviewRound >= maxReviewerFailures;
-    const provisionalVerdict: IssueReviewVerdictRecord = {
+    const submission: IssueReviewVerdictSubmissionRecord = {
       id: verdictIdFor(context.issue.id, verdict.idempotencyKey),
       idempotencyKey: verdict.idempotencyKey,
       runId: verdict.runId,
@@ -193,67 +213,24 @@ export class ReviewVerdictService {
       evidence: verdict.evidence,
       reviewer: context.reviewer ?? null,
       submittedAt: new Date().toISOString(),
-      writebackOperationKeys: [],
+      status: "pending",
+      ignoreStateGate: context.ignoreStateGate === true,
+      appliedAt: null,
+      acceptedVerdictId: null,
       supersededAt: null,
-      supersededBy: null,
       supersededReason: null,
     };
-    let operations: NewWritebackOperation[];
-    if (ceilingReached) {
-      operations = planBlockedEscalationWritebacks(
-        {
-          issue: context.issue,
-          runId: verdict.runId,
-          reason: `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`,
-          incompleteTurnCount: lifecycle.incompleteTurnCount,
-          maxIncompleteTurns: this.options.config.reviewLoop.maxIncompleteTurns,
-          reviewRound,
-          maxReviewRounds: maxReviewerFailures,
-          lastCompletionReport: latestCompletionReport(lifecycle),
-          lastReviewVerdict: provisionalVerdict,
-          requiredAction:
-            "Review the requested changes, decide whether the worker should continue, and move the issue out of Blocked when it is ready for another implementation pass.",
-        },
-        this.options.config,
-      );
-    } else if (verdict.verdict === "fail") {
-      operations = planReviewFailWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails);
-    } else if (verdict.verdict === "blocked") {
-      operations = planReviewBlockedWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails);
-    } else {
-      operations = planReviewPassWritebacks(reviewWritebackContext(context, verdict.runId), this.options.config, writebackDetails);
-    }
-    if (operations.length === 0) {
-      if (context.ignoreStateGate !== true) {
-        throw new SymphonyError("invalid_request", "Review verdict cannot be accepted for the current issue state");
-      }
-    }
-
-    const storedVerdict: IssueReviewVerdictRecord = {
-      ...provisionalVerdict,
-      writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
-    };
-    const enqueued: WritebackOperation[] = [];
-    for (const operation of operations) {
-      enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
-    }
-
-    const updatedLifecycle = await this.options.lifecycleStore.updateIssue(context.issue, {
-      phase: verdict.verdict === "pass" ? "passed" : verdict.verdict === "blocked" || ceilingReached ? "blocked" : "implementation",
-      ...(verdict.verdict === "fail" ? { reviewRound } : {}),
-      incompleteTurnCount: verdict.verdict === "fail" ? 0 : lifecycle.incompleteTurnCount,
-      blockedReason:
-        verdict.verdict === "blocked"
-          ? `review blocked: ${blockedReasonForVerdict(storedVerdict)}`
-          : ceilingReached
-          ? `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`
-          : null,
-      lastReviewVerdictId: storedVerdict.id,
-      reviewVerdicts: [...lifecycle.reviewVerdicts, storedVerdict],
+    await this.options.lifecycleStore.updateIssue(context.issue, {
+      reviewVerdictSubmissions: [...(lifecycle.reviewVerdictSubmissions ?? []), submission],
     });
-    await appendLaneMemoTelemetry(this.options.runStore, context.activeRunId, updatedLifecycle, "review_verdict");
 
-    return { accepted: true, replayed: false, verdict: storedVerdict, writebackOperations: enqueued };
+    return {
+      accepted: true,
+      replayed: false,
+      verdict: submission,
+      writebackOperations: [],
+      handoffStatus: "pending",
+    };
   }
 
   private validateCaller(verdict: ReviewVerdictInput, context: ReviewVerdictActiveContext): void {
@@ -315,6 +292,140 @@ export class ReviewVerdictService {
       throw new SymphonyError("invalid_request", PASS_REQUIRES_APPROVE_MESSAGE);
     }
   }
+}
+
+export function planReviewVerdictSubmissionApplication(input: {
+  config: ServiceConfig;
+  issue: Issue;
+  lifecycle: IssueLifecycleRecord;
+  submission: IssueReviewVerdictSubmissionRecord;
+  appliedAt?: string;
+}): ReviewVerdictApplicationPlan {
+  const reviewRound = input.submission.verdict === "fail" ? nextReviewRound(input.lifecycle) : input.lifecycle.reviewRound;
+  const maxReviewerFailures = input.config.reviewLoop.failureLimits.reviewerFailures;
+  const ceilingReached = input.submission.verdict === "fail" && reviewRound >= maxReviewerFailures;
+  const provisionalVerdict = acceptedVerdictFromSubmission(input.submission, []);
+  const writebackDetails = {
+    idempotencyKey: input.submission.idempotencyKey,
+    acceptanceResults: input.submission.acceptanceResults,
+    findings: input.submission.findings,
+    gateFindings: input.submission.gateFindings,
+    discoveryFindings: input.submission.discoveryFindings,
+    evidence: input.submission.evidence,
+  };
+  let operations: NewWritebackOperation[];
+  if (ceilingReached) {
+    operations = planBlockedEscalationWritebacks(
+      {
+        issue: input.issue,
+        runId: input.submission.runId,
+        reason: `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`,
+        incompleteTurnCount: input.lifecycle.incompleteTurnCount,
+        maxIncompleteTurns: input.config.reviewLoop.maxIncompleteTurns,
+        reviewRound,
+        maxReviewRounds: maxReviewerFailures,
+        lastCompletionReport: latestCompletionReport(input.lifecycle),
+        lastReviewVerdict: provisionalVerdict,
+        requiredAction:
+          "Review the requested changes, decide whether the worker should continue, and move the issue out of Blocked when it is ready for another implementation pass.",
+      },
+      input.config,
+    );
+  } else if (input.submission.verdict === "fail") {
+    operations = planReviewFailWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
+  } else if (input.submission.verdict === "blocked") {
+    operations = planReviewBlockedWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
+  } else {
+    operations = planReviewPassWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
+  }
+  if (operations.length === 0 && input.submission.ignoreStateGate !== true) {
+    throw new SymphonyError("invalid_request", "Review verdict cannot be accepted for the current issue state");
+  }
+
+  const storedVerdict = acceptedVerdictFromSubmission(
+    input.submission,
+    operations.map((operation) => operation.idempotencyKey),
+  );
+  const appliedAt = input.appliedAt ?? new Date().toISOString();
+  const reviewVerdictSubmissions = (input.lifecycle.reviewVerdictSubmissions ?? []).map((submission) =>
+    submission.id === input.submission.id
+      ? {
+          ...submission,
+          status: "applied" as const,
+          appliedAt,
+          acceptedVerdictId: storedVerdict.id,
+        }
+      : submission,
+  );
+  const patch: IssueLifecyclePatch = {
+    phase:
+      input.submission.verdict === "pass"
+        ? "passed"
+        : input.submission.verdict === "blocked" || ceilingReached
+          ? "blocked"
+          : "implementation",
+    ...(input.submission.verdict === "fail" ? { reviewRound } : {}),
+    incompleteTurnCount: input.submission.verdict === "fail" ? 0 : input.lifecycle.incompleteTurnCount,
+    blockedReason:
+      input.submission.verdict === "blocked"
+        ? `review blocked: ${blockedReasonForVerdict(storedVerdict)}`
+        : ceilingReached
+          ? `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`
+          : null,
+    lastReviewVerdictId: storedVerdict.id,
+    reviewVerdicts: [...input.lifecycle.reviewVerdicts, storedVerdict],
+    reviewVerdictSubmissions,
+  };
+  return { verdict: storedVerdict, operations, patch };
+}
+
+function acceptedVerdictFromSubmission(
+  submission: IssueReviewVerdictSubmissionRecord,
+  writebackOperationKeys: string[],
+): IssueReviewVerdictRecord {
+  return {
+    id: submission.id,
+    idempotencyKey: submission.idempotencyKey,
+    runId: submission.runId,
+    issueId: submission.issueId,
+    issueIdentifier: submission.issueIdentifier,
+    verdict: submission.verdict,
+    acceptanceResults: submission.acceptanceResults,
+    findings: submission.findings,
+    gateFindings: submission.gateFindings,
+    discoveryFindings: submission.discoveryFindings,
+    evidence: submission.evidence,
+    reviewer: submission.reviewer,
+    submittedAt: submission.submittedAt,
+    writebackOperationKeys,
+    supersededAt: null,
+    supersededBy: null,
+    supersededReason: null,
+  };
+}
+
+function submissionFromAcceptedVerdict(verdict: IssueReviewVerdictRecord): IssueReviewVerdictSubmissionRecord {
+  return {
+    id: verdict.id,
+    idempotencyKey: verdict.idempotencyKey,
+    runId: verdict.runId,
+    issueId: verdict.issueId,
+    issueIdentifier: verdict.issueIdentifier,
+    verdict: verdict.verdict,
+    acceptanceResults: verdict.acceptanceResults,
+    findings: verdict.findings,
+    gateFindings: verdict.gateFindings,
+    discoveryFindings: verdict.discoveryFindings,
+    evidence: verdict.evidence,
+    reviewer: verdict.reviewer,
+    submittedAt: verdict.submittedAt,
+    status: "applied",
+    ignoreStateGate: false,
+    appliedAt: verdict.submittedAt,
+    acceptedVerdictId: verdict.id,
+    supersededAt: verdict.supersededAt ?? null,
+    supersededReason: verdict.supersededReason ?? null,
+  };
 }
 
 export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord): string | null {
@@ -525,11 +636,11 @@ function normalizeAcceptanceResults(items: ReviewVerdictInput["acceptanceResults
   }));
 }
 
-function reviewWritebackContext(context: ReviewVerdictActiveContext, runId: string) {
+function reviewWritebackContextForSubmission(issue: Issue, submission: IssueReviewVerdictSubmissionRecord) {
   return {
-    issue: context.issue,
-    runId,
-    reviewer: context.reviewer ?? null,
+    issue,
+    runId: submission.runId,
+    reviewer: submission.reviewer,
   };
 }
 

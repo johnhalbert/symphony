@@ -95,6 +95,21 @@ describe("FileIssueLifecycleStore", () => {
     });
   });
 
+  it("defaults missing review verdict submissions for legacy lifecycle records", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(issue(), { phase: "review" });
+    const recordPath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const raw = JSON.parse(await nodeFs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+    delete raw.reviewVerdictSubmissions;
+    await writeFile(recordPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+
+    const reloaded = new FileIssueLifecycleStore(root);
+
+    await expect(reloaded.get("issue-1")).resolves.toMatchObject({
+      reviewVerdictSubmissions: [],
+    });
+  });
+
 
   it("tracks projection revisions for successful lifecycle writes only", async () => {
     const store = new FileIssueLifecycleStore(root);

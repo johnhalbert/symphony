@@ -174,6 +174,7 @@ import {
   type IssuePostMortemReportRecord,
   type IssueReviewerOutputContract,
   type IssueReviewVerdictRecord,
+  type IssueReviewVerdictSubmissionRecord,
   type IssueTriageBlockerKind,
   type IssueTriageBlockerRecord,
   type IssueTriageReportRecord,
@@ -210,6 +211,7 @@ import {
 import {
   formatWorkerMergeGatePromptResult,
   formatWorkerReviewVerdictPrompt,
+  planReviewVerdictSubmissionApplication,
   type WorkerMergeGatePromptResult,
 } from "../ReviewVerdictService.js";
 import {
@@ -611,6 +613,7 @@ interface HandoffReconciliationTransitionScratch {
   issueTriageReport?: IssueTriageReportRecord;
   postMortemReport?: IssuePostMortemReportRecord;
   reviewVerdict?: IssueReviewVerdictRecord;
+  reviewVerdictSubmission?: IssueReviewVerdictSubmissionRecord;
 }
 
 interface IssueTransitionEventInput {
@@ -6006,22 +6009,28 @@ export class Orchestrator {
           "No active entry exists for review verdict handoff reconciliation",
       };
     const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const submission =
+      (lifecycle?.reviewVerdictSubmissions ?? []).find(
+        (item) => item.runId === loaded.runId && item.status === "pending",
+      ) ?? null;
     const verdict =
       lifecycle?.reviewVerdicts.find((item) => item.runId === loaded.runId) ??
       null;
-    if (!lifecycle || !verdict)
+    if (!lifecycle || (!submission && !verdict))
       return {
         status: "skipped" as const,
         stop: true,
         message: "No review verdict exists for run",
       };
     context.handoffReconciliation.lifecycle = lifecycle;
-    context.handoffReconciliation.reviewVerdict = verdict;
+    if (submission) context.handoffReconciliation.reviewVerdictSubmission = submission;
+    if (verdict) context.handoffReconciliation.reviewVerdict = verdict;
     return {
       details: {
-        verdictId: verdict.id,
+        verdictId: (submission ?? verdict)?.id,
         runId: loaded.runId,
-        verdict: verdict.verdict,
+        verdict: (submission ?? verdict)?.verdict,
+        handoffStatus: submission ? "pending" : "applied",
       },
     };
   }
@@ -6031,7 +6040,9 @@ export class Orchestrator {
   ) {
     const entry = context.handoffReconciliation.entry;
     const lifecycle = context.handoffReconciliation.lifecycle;
-    const verdict = context.handoffReconciliation.reviewVerdict;
+    const verdict =
+      context.handoffReconciliation.reviewVerdict ??
+      context.handoffReconciliation.reviewVerdictSubmission;
     if (!entry || !lifecycle || !verdict)
       return {
         status: "skipped" as const,
@@ -6053,12 +6064,76 @@ export class Orchestrator {
     context: OrchestratorTransitionContext,
   ) {
     const entry = context.handoffReconciliation.entry;
-    const verdict = context.handoffReconciliation.reviewVerdict;
-    if (!entry || !verdict)
+    const loadedVerdict = context.handoffReconciliation.reviewVerdict;
+    const loadedSubmission = context.handoffReconciliation.reviewVerdictSubmission;
+    if (!entry || (!loadedVerdict && !loadedSubmission))
       return {
         status: "skipped" as const,
         stop: true,
         message: "Review verdict handoff was not loaded",
+      };
+    let verdict = loadedVerdict ?? null;
+    let operationKeys: string[] = verdict?.writebackOperationKeys ?? [];
+    if (!verdict && loadedSubmission) {
+      const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+      const existingVerdict =
+        lifecycle?.reviewVerdicts.find(
+          (item) =>
+            item.id === loadedSubmission.acceptedVerdictId ||
+            item.id === loadedSubmission.id ||
+            item.runId === loadedSubmission.runId,
+        ) ?? null;
+      if (existingVerdict) {
+        verdict = existingVerdict;
+        operationKeys = existingVerdict.writebackOperationKeys;
+      } else {
+        const submission =
+          (lifecycle?.reviewVerdictSubmissions ?? []).find(
+            (item) => item.id === loadedSubmission.id && item.status === "pending",
+          ) ?? null;
+        if (!lifecycle || !submission)
+          return {
+            status: "skipped" as const,
+            stop: true,
+            message: "Pending review verdict submission no longer exists",
+          };
+        const plan = planReviewVerdictSubmissionApplication({
+          config: this.config,
+          issue: context.issue,
+          lifecycle,
+          submission,
+        });
+        const updatedLifecycle = await this.updateIssueLifecycleWithEvidence(
+          context.issue,
+          plan.patch,
+          "review_verdict",
+          submission.runId,
+        );
+        if (updatedLifecycle) {
+          context.handoffReconciliation.lifecycle = updatedLifecycle;
+          entry.lifecycle = updatedLifecycle;
+          await appendLaneMemoTelemetry(
+            this.options.runStore,
+            submission.runId,
+            updatedLifecycle,
+            "review_verdict",
+          );
+        }
+        verdict = plan.verdict;
+        operationKeys = plan.operations.map((operation) => operation.idempotencyKey);
+        await this.applyWritebacks(
+          plan.operations,
+          "review verdict accepted",
+          context.issue,
+        );
+      }
+      context.handoffReconciliation.reviewVerdict = verdict;
+    }
+    if (!verdict)
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Review verdict handoff was not applied",
       };
     await this.processDueWritebacksForHandoff(
       entry,
@@ -15499,7 +15574,6 @@ const BASE_REF_GUARDED_TRANSITION_KINDS = new Set<IssueTransitionKind>([
   "dispatch_worker",
   "dispatch_reviewer",
   "reconcile_completion_report_handoff",
-  "reconcile_review_verdict_handoff",
   "reconcile_merge_conflict_resolution_handoff",
   "recover_publication_approval",
   "merge_policy_refresh_conflict_base",

@@ -70,7 +70,8 @@ export async function submitReviewVerdictFromMcp(input: unknown, options: {
       replayed: result.replayed,
       verdictId: result.verdict.id,
       verdict: result.verdict.verdict,
-      writebackOperationKeys: result.verdict.writebackOperationKeys,
+      writebackOperationKeys: result.writebackOperations.map((operation) => operation.idempotencyKey),
+      handoffStatus: result.handoffStatus,
     };
   } finally {
     await writebackOutbox?.close();

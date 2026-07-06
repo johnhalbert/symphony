@@ -261,6 +261,30 @@ export interface IssueReviewVerdictRecord extends LifecycleSupersessionFields {
   writebackOperationKeys: string[];
 }
 
+export type IssueReviewVerdictSubmissionStatus = "pending" | "applied" | "superseded";
+
+export interface IssueReviewVerdictSubmissionRecord {
+  id: string;
+  idempotencyKey: string;
+  runId: string;
+  issueId: string;
+  issueIdentifier: string;
+  verdict: IssueReviewVerdict;
+  acceptanceResults: ReviewVerdictAcceptanceResult[];
+  findings: string[];
+  gateFindings: ReviewGateFindingRecord[];
+  discoveryFindings: ReviewDiscoveryFindingRecord[];
+  evidence: string[];
+  reviewer: string | null;
+  submittedAt: string;
+  status: IssueReviewVerdictSubmissionStatus;
+  ignoreStateGate: boolean;
+  appliedAt: string | null;
+  acceptedVerdictId: string | null;
+  supersededAt: string | null;
+  supersededReason: string | null;
+}
+
 export type PullRequestReviewFeedbackKind = "review" | "review_comment" | "issue_comment";
 export type PullRequestReviewFeedbackEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
 
@@ -696,6 +720,7 @@ export interface IssueLifecycleRecord {
   completionReports: IssueCompletionReportRecord[];
   completionReportRejections: IssueCompletionReportRejectionRecord[];
   reviewVerdicts: IssueReviewVerdictRecord[];
+  reviewVerdictSubmissions?: IssueReviewVerdictSubmissionRecord[];
   mergeGateResults?: IssueMergeGateResultRecord[];
   reviewFeedback: IssueReviewFeedbackRecord[];
   issueTriageReports: IssueTriageReportRecord[];
@@ -734,6 +759,7 @@ export interface IssueLifecyclePatch {
   completionReports?: IssueCompletionReportRecord[];
   completionReportRejections?: IssueCompletionReportRejectionRecord[];
   reviewVerdicts?: IssueReviewVerdictRecord[];
+  reviewVerdictSubmissions?: IssueReviewVerdictSubmissionRecord[];
   mergeGateResults?: IssueMergeGateResultRecord[];
   reviewFeedback?: IssueReviewFeedbackRecord[];
   issueTriageReports?: IssueTriageReportRecord[];
@@ -814,6 +840,8 @@ export class FileIssueLifecycleStore {
       completionReports: patch.completionReports ?? existing?.completionReports ?? [],
       completionReportRejections: patch.completionReportRejections ?? existing?.completionReportRejections ?? [],
       reviewVerdicts: patch.reviewVerdicts ?? existing?.reviewVerdicts ?? [],
+      reviewVerdictSubmissions:
+        patch.reviewVerdictSubmissions ?? existing?.reviewVerdictSubmissions ?? [],
       mergeGateResults: patch.mergeGateResults ?? existing?.mergeGateResults ?? [],
       reviewFeedback: patch.reviewFeedback ?? existing?.reviewFeedback ?? [],
       issueTriageReports: patch.issueTriageReports ?? existing?.issueTriageReports ?? [],
@@ -1331,6 +1359,7 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
     completionReports: normalizeCompletionReports(value.completionReports, filePath),
     completionReportRejections: normalizeCompletionReportRejections(value.completionReportRejections, filePath),
     reviewVerdicts: normalizeReviewVerdicts(value.reviewVerdicts, filePath),
+    reviewVerdictSubmissions: normalizeReviewVerdictSubmissions(value.reviewVerdictSubmissions, filePath),
     mergeGateResults: normalizeMergeGateResults(value.mergeGateResults, filePath),
     reviewFeedback: normalizeReviewFeedback(value.reviewFeedback, filePath),
     issueTriageReports: normalizeIssueTriageReports(value.issueTriageReports, filePath),
@@ -1579,6 +1608,12 @@ function normalizeReviewVerdicts(value: unknown, filePath: string): IssueReviewV
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewVerdicts is invalid");
   return value.map((item, index) => normalizeReviewVerdict(item, filePath, index));
+}
+
+function normalizeReviewVerdictSubmissions(value: unknown, filePath: string): IssueReviewVerdictSubmissionRecord[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "reviewVerdictSubmissions is invalid");
+  return value.map((item, index) => normalizeReviewVerdictSubmission(item, filePath, index));
 }
 
 function normalizeMergeGateResults(value: unknown, filePath: string): IssueMergeGateResultRecord[] {
@@ -1912,6 +1947,74 @@ function normalizeReviewVerdict(value: unknown, filePath: string, index: number)
     submittedAt: requiredString(value.submittedAt, filePath, `reviewVerdicts[${index}].submittedAt`),
     writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, `reviewVerdicts[${index}].writebackOperationKeys`),
     ...normalizeSupersessionFields(value, filePath, `reviewVerdicts[${index}]`),
+  };
+}
+
+function normalizeReviewVerdictSubmission(
+  value: unknown,
+  filePath: string,
+  index: number,
+): IssueReviewVerdictSubmissionRecord {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `reviewVerdictSubmissions[${index}] is invalid`);
+  if (value.verdict !== "pass" && value.verdict !== "fail" && value.verdict !== "blocked") {
+    throw corruptLifecycle(filePath, `reviewVerdictSubmissions[${index}].verdict is invalid`);
+  }
+  const status = value.status === undefined ? "pending" : value.status;
+  if (status !== "pending" && status !== "applied" && status !== "superseded") {
+    throw corruptLifecycle(filePath, `reviewVerdictSubmissions[${index}].status is invalid`);
+  }
+  const findings = requiredStringArray(value.findings, filePath, `reviewVerdictSubmissions[${index}].findings`);
+  const evidence = requiredStringArray(value.evidence, filePath, `reviewVerdictSubmissions[${index}].evidence`);
+  const gateFindings =
+    value.gateFindings === undefined
+      ? value.verdict === "blocked"
+        ? []
+        : legacyGateFindingsFromFindings(findings, evidence)
+      : normalizeReviewGateFindings(value.gateFindings, filePath, index);
+  const discoveryFindings =
+    value.discoveryFindings === undefined
+      ? []
+      : normalizeReviewDiscoveryFindings(value.discoveryFindings, filePath, index);
+  return {
+    id: requiredString(value.id, filePath, `reviewVerdictSubmissions[${index}].id`),
+    idempotencyKey: requiredString(
+      value.idempotencyKey,
+      filePath,
+      `reviewVerdictSubmissions[${index}].idempotencyKey`,
+    ),
+    runId: requiredString(value.runId, filePath, `reviewVerdictSubmissions[${index}].runId`),
+    issueId: requiredString(value.issueId, filePath, `reviewVerdictSubmissions[${index}].issueId`),
+    issueIdentifier: requiredString(
+      value.issueIdentifier,
+      filePath,
+      `reviewVerdictSubmissions[${index}].issueIdentifier`,
+    ),
+    verdict: value.verdict,
+    acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, index),
+    findings,
+    gateFindings,
+    discoveryFindings,
+    evidence,
+    reviewer: nullableString(value.reviewer, filePath, `reviewVerdictSubmissions[${index}].reviewer`),
+    submittedAt: requiredString(value.submittedAt, filePath, `reviewVerdictSubmissions[${index}].submittedAt`),
+    status,
+    ignoreStateGate: value.ignoreStateGate === true,
+    appliedAt: optionalNullableString(value.appliedAt, filePath, `reviewVerdictSubmissions[${index}].appliedAt`),
+    acceptedVerdictId: optionalNullableString(
+      value.acceptedVerdictId,
+      filePath,
+      `reviewVerdictSubmissions[${index}].acceptedVerdictId`,
+    ),
+    supersededAt: optionalNullableString(
+      value.supersededAt,
+      filePath,
+      `reviewVerdictSubmissions[${index}].supersededAt`,
+    ),
+    supersededReason: optionalNullableString(
+      value.supersededReason,
+      filePath,
+      `reviewVerdictSubmissions[${index}].supersededReason`,
+    ),
   };
 }
 

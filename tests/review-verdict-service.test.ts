@@ -29,7 +29,7 @@ describe("ReviewVerdictService", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("accepts a fail verdict, records requested revisions, and routes the issue back to implementation", async () => {
+  it("accepts a fail verdict as a pending handoff submission", async () => {
     const { service, lifecycleStore, outbox } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
       phase: "review",
@@ -39,12 +39,14 @@ describe("ReviewVerdictService", () => {
     const result = await service.submit_review_verdict(failVerdict(), context());
 
     expect(result.replayed).toBe(false);
-    expect(result.writebackOperations).toHaveLength(2);
+    expect(result.handoffStatus).toBe("pending");
+    expect(result.writebackOperations).toHaveLength(0);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "implementation",
-      reviewRound: 1,
-      lastReviewVerdictId: "review-verdict:issue-1:verdict-1",
-      reviewVerdicts: [
+      phase: "review",
+      reviewRound: 0,
+      lastReviewVerdictId: null,
+      reviewVerdicts: [],
+      reviewVerdictSubmissions: [
         {
           id: "review-verdict:issue-1:verdict-1",
           idempotencyKey: "verdict-1",
@@ -52,29 +54,12 @@ describe("ReviewVerdictService", () => {
           verdict: "fail",
           findings: ["Add a regression test for duplicate verdict handling."],
           evidence: ["https://github.com/acme/symphony/pull/42#discussion_r1"],
+          status: "pending",
         },
       ],
     });
 
-    const operations = await outbox.list();
-    const comment = operations.find((operation) => operation.kind === "comment");
-    const transition = operations.find((operation) => operation.kind === "transition");
-    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("## Symphony Review Verdict: Fail");
-    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain(
-      "Add a regression test for duplicate verdict handling.",
-    );
-    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("[ ] Duplicate verdicts are idempotent");
-    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain(
-      "https://github.com/acme/symphony/pull/42#discussion_r1",
-    );
-    expect(transition).toMatchObject({
-      idempotencyKey: "transition:issue-1:review-run-1:review-verdict-fail:In Progress",
-      kind: "transition",
-      payload: {
-        fromStates: ["In Review"],
-        toState: "In Progress",
-      },
-    });
+    expect(await outbox.list()).toHaveLength(0);
   });
 
   it("accepts a blocked verdict without burning reviewer failure budget", async () => {
@@ -94,34 +79,27 @@ describe("ReviewVerdictService", () => {
     );
 
     expect(result.replayed).toBe(false);
-    expect(result.writebackOperations).toHaveLength(2);
+    expect(result.handoffStatus).toBe("pending");
+    expect(result.writebackOperations).toHaveLength(0);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "blocked",
+      phase: "review",
       reviewRound: 1,
-      blockedReason: "review blocked: Focused validation is unavailable to worker and reviewer command surfaces.",
-      lastReviewVerdictId: "review-verdict:issue-1:blocked-verdict-1",
-      reviewVerdicts: [
+      blockedReason: null,
+      lastReviewVerdictId: null,
+      reviewVerdicts: [],
+      reviewVerdictSubmissions: [
         {
           id: "review-verdict:issue-1:blocked-verdict-1",
           idempotencyKey: "blocked-verdict-1",
           runId: "review-run-1",
           verdict: "blocked",
           findings: ["Focused validation is unavailable to worker and reviewer command surfaces."],
+          status: "pending",
         },
       ],
     });
 
-    const operations = await outbox.list();
-    const comment = operations.find((operation) => operation.kind === "comment");
-    const transition = operations.find((operation) => operation.kind === "transition");
-    expect(comment?.kind === "comment" ? comment.payload.body : "").toContain("## Symphony Review Verdict: Blocked");
-    expect(transition).toMatchObject({
-      kind: "transition",
-      payload: {
-        fromStates: ["In Review"],
-        toState: "Blocked",
-      },
-    });
+    expect(await outbox.list()).toHaveLength(0);
   });
 
   it("stores structured gate and discovery findings while deriving legacy findings from gate summaries", async () => {
@@ -154,9 +132,11 @@ describe("ReviewVerdictService", () => {
     );
 
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      reviewVerdicts: [
+      reviewVerdicts: [],
+      reviewVerdictSubmissions: [
         {
           idempotencyKey: "verdict-structured-1",
+          status: "pending",
           findings: ["Preserve explicit project context when resolving workspace fallbacks."],
           gateFindings: [
             {
@@ -177,7 +157,7 @@ describe("ReviewVerdictService", () => {
     });
   });
 
-  it("increments review rounds on each accepted fail verdict", async () => {
+  it("defers review round increments until the handoff transition applies the verdict", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
       phase: "review",
@@ -188,7 +168,13 @@ describe("ReviewVerdictService", () => {
     await service.submitReviewVerdict(failVerdict(), context());
 
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      reviewRound: 2,
+      reviewRound: 1,
+      reviewVerdictSubmissions: [
+        {
+          idempotencyKey: "verdict-1",
+          status: "pending",
+        },
+      ],
     });
   });
 
@@ -209,10 +195,18 @@ describe("ReviewVerdictService", () => {
 
     expect(result.replayed).toBe(false);
     expect(result.writebackOperations).toHaveLength(0);
+    expect(result.handoffStatus).toBe("pending");
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "implementation",
-      reviewRound: 1,
-      lastReviewVerdictId: "review-verdict:issue-1:verdict-1",
+      phase: "review",
+      reviewRound: 0,
+      lastReviewVerdictId: null,
+      reviewVerdictSubmissions: [
+        {
+          idempotencyKey: "verdict-1",
+          ignoreStateGate: true,
+          status: "pending",
+        },
+      ],
     });
     expect(await outbox.list()).toHaveLength(0);
   });
@@ -251,7 +245,7 @@ describe("ReviewVerdictService", () => {
     });
   });
 
-  it("accepts a pass verdict, records verified completion, and applies configured pass behavior", async () => {
+  it("accepts a pass verdict as a pending handoff submission", async () => {
     const { service, lifecycleStore, outbox } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
       phase: "review",
@@ -263,21 +257,21 @@ describe("ReviewVerdictService", () => {
     const result = await service.submitReviewVerdict(passVerdict(), context());
 
     expect(result.replayed).toBe(false);
+    expect(result.handoffStatus).toBe("pending");
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "passed",
-      lastReviewVerdictId: "review-verdict:issue-1:verdict-pass-1",
-      reviewVerdicts: [
+      phase: "review",
+      lastReviewVerdictId: null,
+      reviewVerdicts: [],
+      reviewVerdictSubmissions: [
         {
           id: "review-verdict:issue-1:verdict-pass-1",
           verdict: "pass",
           acceptanceResults: [{ text: "All acceptance criteria satisfied", satisfied: true }],
+          status: "pending",
         },
       ],
     });
-    expect((await outbox.list()).find((operation) => operation.kind === "transition")).toMatchObject({
-      idempotencyKey: "transition:issue-1:review-run-1:review-verdict-pass:Ready to Merge",
-      payload: { toState: "Ready to Merge" },
-    });
+    expect(await outbox.list()).toHaveLength(0);
   });
 
   it("accepts a pass verdict with non-gating discovery findings", async () => {
@@ -304,13 +298,15 @@ describe("ReviewVerdictService", () => {
     );
 
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "passed",
-      reviewVerdicts: [
+      phase: "review",
+      reviewVerdicts: [],
+      reviewVerdictSubmissions: [
         {
           idempotencyKey: "verdict-pass-with-discovery",
           verdict: "pass",
           findings: [],
           gateFindings: [],
+          status: "pending",
           discoveryFindings: [
             {
               summary: "A broader stale-cache matrix would be useful hardening outside this contract.",
@@ -334,8 +330,14 @@ describe("ReviewVerdictService", () => {
 
     expect(result.replayed).toBe(false);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "implementation",
-      reviewRound: 1,
+      phase: "review",
+      reviewRound: 0,
+      reviewVerdictSubmissions: [
+        {
+          idempotencyKey: "verdict-1",
+          status: "pending",
+        },
+      ],
     });
   });
 
@@ -368,8 +370,9 @@ describe("ReviewVerdictService", () => {
     expect(first.replayed).toBe(false);
     expect(second.replayed).toBe(true);
     expect(second.verdict.findings).toEqual(["Add a regression test for duplicate verdict handling."]);
-    expect((await lifecycleStore.get("issue-1"))?.reviewVerdicts).toHaveLength(1);
-    expect(await outbox.list()).toHaveLength(2);
+    expect((await lifecycleStore.get("issue-1"))?.reviewVerdicts).toHaveLength(0);
+    expect((await lifecycleStore.get("issue-1"))?.reviewVerdictSubmissions).toHaveLength(1);
+    expect(await outbox.list()).toHaveLength(0);
   });
 
   it("rejects review verdict idempotency key reuse from another reviewer run", async () => {

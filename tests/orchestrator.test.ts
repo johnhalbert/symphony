@@ -10803,6 +10803,155 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("applies blocked review verdict handoffs without base-ref repair even when base advances during review", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewerPromptTemplate = "Review {{ issue.identifier }}.";
+    config.workspace.source.baseRef = "origin/main";
+    const branchName = "symphony/TEST-1";
+    const repo = await createBaseRefGuardRepo(root, branchName);
+    const branchHeadSha = await gitForTest(["rev-parse", "HEAD"], repo.workspace);
+    const baseHeadSha = await gitForTest(["rev-parse", "origin/main"], repo.workspace);
+    const candidate = issue({
+      state: "In Review",
+      branchName,
+      labels: ["dogfood-ready"],
+    });
+    let currentState = "In Review";
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [{ ...candidate, state: currentState }];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes(currentState)
+          ? [{ ...candidate, state: currentState }]
+          : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [{ ...candidate, state: currentState }];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      300_000,
+    );
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const report: IssueCompletionReportRecord = {
+      ...completionReportRecord(candidate),
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: branchHeadSha,
+        branch: branchName,
+      },
+    };
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      summaryPointers: {
+        workspaceKey: candidate.identifier,
+        workspacePath: repo.workspace,
+        branchName,
+        gitBranchName: branchName,
+        repoPath: repo.workspace,
+        baseRef: "origin/main",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: branchHeadSha,
+        prBranch: branchName,
+      },
+    });
+    const advanceBaseDuringReview = async () => {
+      await gitForTest(["checkout", "main"], repo.workspace);
+      await writeFile(path.join(repo.workspace, "README.md"), "advanced\n", "utf8");
+      await gitForTest(["add", "README.md"], repo.workspace);
+      await commitForTest("advance base during review", repo.workspace);
+      await gitForTest(["push", "origin", "main"], repo.workspace);
+      await gitForTest(["checkout", branchName], repo.workspace);
+    };
+    const harness = new ReviewVerdictSubmittingHarness(
+      "blocked",
+      lifecycleStore,
+      outboxStore,
+      advanceBaseDuringReview,
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback,
+      pullRequestMergeClient: new FailingRequiredCheckMergeClient({
+        baseHeadSha,
+      }),
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(
+      () => currentState === "Blocked" && harness.runs.length === 1,
+      "blocked review verdict handoff",
+    );
+    await orchestrator.stop();
+
+    expect(writer.transitions.map((transition) => transition.toState)).toContain("Blocked");
+    await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
+      phase: "blocked",
+      reviewRound: 0,
+      lastReviewVerdictId: "review-verdict:issue-1:review-verdict-blocked-1",
+      reviewVerdicts: [
+        {
+          idempotencyKey: "review-verdict-blocked-1",
+          verdict: "blocked",
+          writebackOperationKeys: [
+            "comment:issue-1:review-run-1:review-verdict-blocked",
+            "transition:issue-1:review-run-1:review-verdict-blocked:Blocked",
+          ],
+        },
+      ],
+      reviewVerdictSubmissions: [
+        {
+          idempotencyKey: "review-verdict-blocked-1",
+          status: "applied",
+          acceptedVerdictId: "review-verdict:issue-1:review-verdict-blocked-1",
+        },
+      ],
+    });
+    const issueState = await readIssueState(stateDir, candidate.id);
+    const history = issueState?.history ?? [];
+    expect(history.some((snapshot) => snapshot.transitionKind === "reconcile_review_verdict_handoff")).toBe(true);
+    const reviewHandoffBaseRefGuards = history.filter(
+      (snapshot) =>
+        (snapshot.transitionKind === "base_ref_observe" ||
+          snapshot.transitionKind === "base_ref_repair" ||
+          snapshot.transitionKind === "base_ref_block") &&
+        (snapshot.transitionRequestContext as { payload?: { targetTransitionKind?: unknown } } | null | undefined)
+          ?.payload?.targetTransitionKind === "reconcile_review_verdict_handoff",
+    );
+    expect(reviewHandoffBaseRefGuards).toHaveLength(0);
+  });
+
   it("does not treat review-state issues as worker candidates", async () => {
     const config = testConfig(root);
     config.reviewLoop.reviewStates = ["In Review"];
@@ -15815,9 +15964,10 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
   readonly runs: Array<{ role: string; runId: string }> = [];
 
   constructor(
-    private readonly verdict: "fail" | "pass",
+    private readonly verdict: "fail" | "pass" | "blocked",
     private readonly lifecycleStore: FileIssueLifecycleStore,
     private readonly outboxStore: FileWritebackOutboxStore,
+    private readonly beforeSubmit: ((ctx: AgentRunContext, runId: string) => Promise<void>) | null = null,
   ) {}
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
@@ -15827,6 +15977,7 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
     if (this.verdict === "pass") {
       await appendApprovalFeedback(this.lifecycleStore, ctx.issue, runId);
     }
+    await this.beforeSubmit?.(ctx, runId);
     await new ReviewVerdictService({
       config: ctx.config,
       lifecycleStore: this.lifecycleStore,
@@ -15850,6 +16001,24 @@ class ReviewVerdictSubmittingHarness implements AgentHarness {
             ],
             idempotencyKey: "review-verdict-fail-1",
           }
+        : this.verdict === "blocked"
+          ? {
+              runId,
+              issueId: ctx.issue.id,
+              verdict: "blocked",
+              acceptanceResults: [
+                {
+                  text: "Reviewer can complete required validation.",
+                  satisfied: false,
+                  evidence: "Required validation is unavailable to the reviewer.",
+                },
+              ],
+              findings: ["Required validation is unavailable to reviewer command surfaces."],
+              gateFindings: [],
+              discoveryFindings: [],
+              evidence: ["reviewer observed unavailable validation"],
+              idempotencyKey: "review-verdict-blocked-1",
+            }
         : {
             runId,
             issueId: ctx.issue.id,

@@ -68,30 +68,25 @@ describe("review verdict MCP handoff", () => {
       replayed: false,
       verdictId: "review-verdict:issue-1:review-run-1:review-verdict-1",
       verdict: "fail",
+      handoffStatus: "pending",
+      writebackOperationKeys: [],
     });
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
-      phase: "implementation",
-      reviewRound: 1,
-      lastReviewVerdictId: "review-verdict:issue-1:review-run-1:review-verdict-1",
-      reviewVerdicts: [
+      phase: "review",
+      reviewRound: 0,
+      lastReviewVerdictId: null,
+      reviewVerdicts: [],
+      reviewVerdictSubmissions: [
         {
           idempotencyKey: "review-run-1:review-verdict-1",
           runId: "review-run-1",
           verdict: "fail",
           reviewer: "reviewer-agent:review-run-1",
+          status: "pending",
         },
       ],
     });
-    const outbox = await listWritebacks(stateDir);
-    expect(outbox.find((operation) => operation.kind === "comment")).toMatchObject({
-      kind: "comment",
-      runId: "review-run-1",
-    });
-    expect(outbox.find((operation) => operation.kind === "transition")).toMatchObject({
-      kind: "transition",
-      runId: "review-run-1",
-      payload: { toState: "In Progress" },
-    });
+    expect(await listWritebacks(stateDir)).toHaveLength(0);
   });
 
   it("submits a reviewer pass verdict through ReviewVerdictService", async () => {
@@ -138,23 +133,24 @@ describe("review verdict MCP handoff", () => {
       replayed: false,
       verdictId: "review-verdict:issue-1:review-run-2:review-verdict-pass-1",
       verdict: "pass",
+      handoffStatus: "pending",
+      writebackOperationKeys: [],
     });
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
-      phase: "passed",
-      lastReviewVerdictId: "review-verdict:issue-1:review-run-2:review-verdict-pass-1",
-      reviewVerdicts: [
+      phase: "review",
+      lastReviewVerdictId: null,
+      reviewVerdicts: [],
+      reviewVerdictSubmissions: [
         {
           idempotencyKey: "review-run-2:review-verdict-pass-1",
           runId: "review-run-2",
           verdict: "pass",
           reviewer: "reviewer-agent:review-run-2",
+          status: "pending",
         },
       ],
     });
-    expect((await listWritebacks(stateDir)).find((operation) => operation.kind === "transition")).toMatchObject({
-      kind: "transition",
-      payload: { toState: "Ready to Merge" },
-    });
+    expect(await listWritebacks(stateDir)).toHaveLength(0);
   });
 
   it("submits a reviewer blocked verdict through ReviewVerdictService", async () => {
@@ -200,30 +196,25 @@ describe("review verdict MCP handoff", () => {
       replayed: false,
       verdictId: "review-verdict:issue-1:review-run-3:review-blocked-1",
       verdict: "blocked",
+      handoffStatus: "pending",
+      writebackOperationKeys: [],
     });
     await expect(lifecycleStore.get("TEST-1")).resolves.toMatchObject({
-      phase: "blocked",
+      phase: "review",
       reviewRound: 1,
-      lastReviewVerdictId: "review-verdict:issue-1:review-run-3:review-blocked-1",
-      reviewVerdicts: [
+      lastReviewVerdictId: null,
+      reviewVerdicts: [],
+      reviewVerdictSubmissions: [
         {
           idempotencyKey: "review-run-3:review-blocked-1",
           runId: "review-run-3",
           verdict: "blocked",
           reviewer: "reviewer-agent:review-run-3",
+          status: "pending",
         },
       ],
     });
-    const outbox = await listWritebacks(stateDir);
-    expect(outbox.find((operation) => operation.kind === "comment")).toMatchObject({
-      kind: "comment",
-      runId: "review-run-3",
-    });
-    expect(outbox.find((operation) => operation.kind === "transition")).toMatchObject({
-      kind: "transition",
-      runId: "review-run-3",
-      payload: { toState: "Blocked" },
-    });
+    expect(await listWritebacks(stateDir)).toHaveLength(0);
   });
 });
 
