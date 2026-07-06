@@ -108,6 +108,7 @@ export class OrchestratorChatProjectionReducer {
     const scopeKey = normalizeProjectionScopeValue(options.scopeKey, normalizedConversationId);
     const write = await this.projections.writeProjection({
       projectionName: "orchestrator_chat_projection",
+      projectContextId: firstProjectionMetadataString(payload, "projectContextId"),
       scopeKind,
       scopeKey,
       payload,

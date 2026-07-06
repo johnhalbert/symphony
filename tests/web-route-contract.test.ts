@@ -513,7 +513,7 @@ describe("/api/v1/web route contracts", () => {
         defaultSessionId: "run-history-current",
       }),
     );
-    expect(projectionReader.selectors).toEqual([
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
       { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
     ]);
   });
@@ -590,7 +590,9 @@ describe("/api/v1/web route contracts", () => {
     }
 
     expect(projectionWriter.writes).toEqual([]);
-    expect(projectionReader.selectors).toEqual([{ projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" }]);
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+    ]);
   });
 
   it("serves large-volume dashboard, issue board, history, sidebar, and transcript API payloads from durable projections without raw hydration or source-index rebuilds", async () => {
@@ -1368,9 +1370,11 @@ describe("/api/v1/web route contracts", () => {
 
     expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(runStore.transcriptReadCount).toBe(1);
-    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
-      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    expect(projectionReader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({ projectionName, projectContextId, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "issue_board_projection", projectContextId: "symphony", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "issue_board_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "issue_board_projection", projectContextId: "symphony", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "issue_board_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "board", scopeKey: "default-board" },
     ]);
   });
 
@@ -1559,9 +1563,11 @@ describe("/api/v1/web route contracts", () => {
 
     expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(runStore.transcriptReadCount).toBe(0);
-    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
-      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    expect(projectionReader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({ projectionName, projectContextId, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "issue_board_projection", projectContextId: "symphony", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "issue_board_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "issue_board_projection", projectContextId: "symphony", scopeKind: "board", scopeKey: "default-board" },
+      { projectionName: "issue_board_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "board", scopeKey: "default-board" },
     ]);
   });
 
@@ -3401,12 +3407,14 @@ class RecordingProjectionReader implements StatusServerProjectionReader {
   async readCurrentTranscriptDefaultPayload<TPayload = unknown>(selector: {
     runId: string;
     limit: number;
+    projectContextId?: string | null;
   }): Promise<ProjectionPayloadRecord<TPayload> | null> {
     const record = [...this.records.values()]
       .filter((candidate) => {
         const page = transcriptProjectionPageFromScopeKey(candidate.revision.scopeKey);
         return (
           candidate.revision.projectionName === "transcript_projection" &&
+          candidate.revision.projectContextId === (selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID) &&
           candidate.revision.scopeKind === "run_page" &&
           page?.runId === selector.runId &&
           page.limit === selector.limit
@@ -3417,6 +3425,7 @@ class RecordingProjectionReader implements StatusServerProjectionReader {
     else {
       this.selectors.push({
         projectionName: "transcript_projection",
+        projectContextId: selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
         scopeKind: "run_page",
         scopeKey: `${selector.runId}:tail:limit:${selector.limit}`,
       });
@@ -3508,11 +3517,21 @@ class FailingTranscriptRunStore extends RecordingRunStore {
 }
 
 function projectionSelectorKey(selector: ProjectionRevisionSelector): string {
-  return [selector.projectionName, selector.scopeKind ?? "global", selector.scopeKey ?? "global"].join(":");
+  return [
+    selector.projectionName,
+    selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    selector.scopeKind ?? "global",
+    selector.scopeKey ?? "global",
+  ].join(":");
 }
 
 function projectionRevisionSelector(revision: ProjectionRevisionRecord): ProjectionRevisionSelector {
-  return { projectionName: revision.projectionName, scopeKind: revision.scopeKind, scopeKey: revision.scopeKey };
+  return {
+    projectionName: revision.projectionName,
+    projectContextId: revision.projectContextId,
+    scopeKind: revision.scopeKind,
+    scopeKey: revision.scopeKey,
+  };
 }
 
 function transcriptProjectionPageFromScopeKey(scopeKey: string): { runId: string; offset: number; limit: number } | null {
@@ -3545,7 +3564,7 @@ function transcriptProjectionRecordMessageCount(record: ProjectionPayloadRecord)
 }
 
 function projectionPayloadRecordFixture<TPayload>(
-  selector: { projectionName: DurableProjectionName; scopeKind: string; scopeKey: string },
+  selector: { projectionName: DurableProjectionName; projectContextId?: string; scopeKind: string; scopeKey: string },
   payload: TPayload,
   options: {
     sourceRevisions?: ProjectionSourceRevision[];
@@ -3561,6 +3580,7 @@ function projectionPayloadRecordFixture<TPayload>(
     revision: {
       projectionRevisionId: revision,
       projectionName: selector.projectionName,
+      projectContextId: selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
       scopeKind: selector.scopeKind,
       scopeKey: selector.scopeKey,
       revision,
@@ -3777,6 +3797,7 @@ function projectionRevisionRecordFixture(input: ProjectionPayloadWriteInput, rev
   return {
     projectionRevisionId: revision,
     projectionName: input.projectionName,
+    projectContextId: input.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
     scopeKind: input.scopeKind ?? "global",
     scopeKey: input.scopeKey ?? "global",
     revision,
