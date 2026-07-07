@@ -114,6 +114,22 @@ Validated on 2026-07-07 in the assigned `ENG-457` worktree.
 
 Operator note: the Docker-enabled snippets above use PowerShell-compatible `$env:...` assignment so the commands can be pasted directly into the quickstart shell context.
 
+## Promotion notes (ENG-460 / T105)
+
+Use this summary as the operator-facing promotion packet for the multi-project configuration feature:
+
+- ENG-455 / T100: `docs/smoke/eng-455-t100-full-repository-validation.md` records the prerequisite focused validation sequence plus a passing repository-root `npm test` run (`112 passed | 1 skipped` test files, `1883 passed | 5 skipped` tests).
+- ENG-456 / T101: `docs/smoke/eng-456-t101-run-typescript-validation.md` records a passing root `npm run typecheck` invocation (`tsc -p tsconfig.json --noEmit`, exit `0`) with no TypeScript diagnostics.
+- ENG-457 / T102: the validation record above confirms the documented quickstart scenarios passed end-to-end, including the full validation sweep (`716 passed, 2 skipped`) and the Docker-enabled Postgres variant (`718 passed`).
+- ENG-458 / T103: `src/core/harness/McpToolExposureProbe.ts` and `tests/mcp-tool-exposure-probe.test.ts` verify operator-facing harness diagnostics redact bearer/basic auth values, configured secret values, and common runtime/Linear/GitHub token forms including `sk-...`, `sk_...`, `lin_...`, `ghr_...`, `ghs_...`, and `github_pat_...`.
+- ENG-459 / T104: `specs/003-multi-project-config/research.md` records a clean protected-path audit: `git diff --name-only origin/main -- 'hermes/upstream-src'` and `git status --porcelain=v1 --untracked-files=all -- 'hermes/upstream-src'` both returned no output, and the combined guard script reported `RESULT=PASS`.
+
+Remaining risks and promotion blockers:
+
+- Current live dogfood routing still polls and creates worktrees only for the first enabled explicit `project_contexts` entry, so list the primary project first and do not assume one workflow process actively dispatches every configured context yet.
+- Treat any operator-facing raw environment value, token, private key material, or credential-bearing repository URL as a stop-promotion redaction regression; do not promote until the leak is fixed and revalidated.
+- `dogfood-ready`: **not yet**. These notes collect the required validation evidence, but `docs/dogfood-runbook.md` still requires explicit operator review before applying the label.
+
 ## Legacy backfill disposition note (ENG-443 / T088)
 
 Checked-in planning for this legacy/default project-context work lives under `specs/003-multi-project-config/`, even though the ENG-838 issue description points at a non-present `specs/008-eng-443-legacy-backfill-resolution/tasks.md` source path.
