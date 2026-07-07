@@ -144,7 +144,7 @@ workspace:
 
 agent:
   harness: hermes
-  max_concurrent_agents: 1
+  max_concurrent_agents: 5
   max_turns: 1
   max_retry_backoff_ms: 300000
   max_infra_failures: 1
