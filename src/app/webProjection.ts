@@ -853,11 +853,21 @@ export function projectIssueDetailModel(input: BoardIssueDetailProjectionInput |
 function projectIssueDetailWorkspaceSource(
   input: Pick<BoardIssueDetailProjectionInput, "issueDetails" | "live" | "workspace">,
 ): IssueWorkspaceSummary | WorkspaceRecord | null {
-  const workspace = input.workspace ?? null;
-  if (workspace?.workspaceKey?.endsWith("-planning") === true && input.live?.runPhase !== "issue_breakdown") {
-    return input.issueDetails.workspace;
+  const allowPlanningWorkspace = input.live?.runPhase === "issue_breakdown";
+  const candidates = [input.workspace ?? null, input.issueDetails.workspace];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (!allowPlanningWorkspace && isPlanningIssueWorkspace(candidate)) continue;
+    return candidate;
   }
-  return workspace ?? input.issueDetails.workspace;
+  return null;
+}
+
+function isPlanningIssueWorkspace(workspace: Pick<IssueWorkspaceSummary | WorkspaceRecord, "workspaceKey" | "path">): boolean {
+  if (typeof workspace.workspaceKey === "string" && workspace.workspaceKey.trim().endsWith("-planning")) return true;
+  if (typeof workspace.path !== "string") return false;
+  const workspaceName = workspace.path.trim().split(/[\\/]/).pop() ?? "";
+  return workspaceName.endsWith("-planning");
 }
 
 export function projectWebDashboard(input: DashboardProjectionInput = {}): DashboardModel {

@@ -8693,6 +8693,107 @@ describe("StatusServer durable API", () => {
     }
   });
 
+  it("suppresses lifecycle-only planning workspaces from normal board and web issue-detail responses", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    config.tracker.handoffStates = ["In Review"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.reviewLoop.reviewPassState = "Ready to Merge";
+    config.mergePolicy.sourceStates = ["Ready to Merge"];
+
+    const runStore = new CountingRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new CountingIssueLifecycleStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(
+      { id: "issue-1", identifier: "TEST-1" },
+      {
+        phase: "review",
+        reviewRound: 1,
+        blockedReason: null,
+        summaryPointers: {
+          workspaceKey: "TEST-1-planning",
+          workspacePath: path.join(config.workspace.root, "TEST-1-planning"),
+          branchName: "symphony/TEST-1-planning",
+          gitBranchName: "symphony/TEST-1-planning",
+          repoPath: "/repo",
+          baseRef: "main",
+        },
+      },
+    );
+
+    const tracker = new FakeTracker([
+      issue({
+        id: "issue-1",
+        identifier: "TEST-1",
+        title: "Linear review title",
+        description: "Review route description.",
+        state: "In Review",
+        assigneeId: "review-assignee",
+        labels: ["dogfood-ready"],
+        delegateId: "delegate-review",
+      }),
+    ]);
+
+    const server = new StatusServer({
+      orchestrator: fakeOrchestrator(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger: new StructuredLogger(() => undefined),
+      }),
+      workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      runStore,
+      lifecycleStore,
+      tracker,
+      trackerStateLists: testTrackerStateLists(),
+      issueBoardColumns: {
+        backlog: ["Backlog"],
+        todo: ["Todo"],
+        progress: ["In Progress", "Blocked"],
+        review: ["In Review", "Ready to Merge"],
+        done: ["Done"],
+        canceled: ["Canceled"],
+      },
+      dashboard: {
+        repoLabel: "acme/symphony",
+        branch: "main",
+        workflowLabel: "WORKFLOW.md",
+        pollIntervalMs: 60_000,
+        concurrencyCap: 2,
+      },
+      host: "127.0.0.1",
+      port: 0,
+      openWorkspaceToken: "secret",
+      staleThresholdMs: 300_000,
+    });
+    const address = await server.start();
+    try {
+      const boardDetailResponse = await fetch(`http://${address.host}:${address.port}/api/v1/board/issues/TEST-1`);
+      const boardDetail = (await boardDetailResponse.json()) as {
+        issueDetails: { workspace: { workspaceKey: string | null; path: string | null; branchName: string | null; gitBranchName: string | null; repoPath: string | null; baseRef: string | null } };
+      };
+      expect(boardDetailResponse.status).toBe(200);
+      expect(boardDetail.issueDetails.workspace).toMatchObject({
+        workspaceKey: null,
+        path: null,
+        branchName: null,
+        gitBranchName: null,
+        repoPath: null,
+        baseRef: null,
+      });
+
+      const webDetailResponse = await fetch(`http://${address.host}:${address.port}/api/v1/web/issues/TEST-1`);
+      const webDetail = (await webDetailResponse.json()) as {
+        issue: { id: string; workspace: string | null };
+        workspace: unknown;
+      };
+      expect(webDetailResponse.status).toBe(200);
+      expect(webDetail.issue).toMatchObject({ id: "TEST-1", workspace: null });
+      expect(webDetail.workspace).toBeNull();
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("retains legacy/default-compatible runless writebacks in context-qualified web issue detail activity feeds", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);

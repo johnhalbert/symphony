@@ -422,20 +422,20 @@ describe("web issue detail projection", () => {
     expect(JSON.stringify(detail).toLowerCase()).not.toContain("mock");
   });
 
-  it("keeps planning workspaces out of top-level issue detail workspace projection outside issue-breakdown runs", () => {
+  it("keeps planning workspaces and lifecycle-derived workspace fallbacks out of top-level issue detail workspace projection outside issue-breakdown runs", () => {
     const detail = projectWebIssueDetail(
       {
         issue: "TEST-1",
         boardCard: null,
         issueDetails: issueDetails({
           workspace: {
-            workspaceKey: null,
-            path: null,
+            workspaceKey: "TEST-1-planning",
+            path: "/tmp/workspaces/TEST-1-planning",
             sourceKind: null,
-            branchName: null,
-            gitBranchName: null,
-            repoPath: null,
-            baseRef: null,
+            branchName: "symphony/TEST-1-planning",
+            gitBranchName: "symphony/TEST-1-planning",
+            repoPath: "/repo",
+            baseRef: "main",
           },
         }),
         workspace: {
