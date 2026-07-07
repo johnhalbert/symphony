@@ -361,9 +361,11 @@ export function planReviewVerdictSubmissionApplication(input: {
     phase:
       input.submission.verdict === "pass"
         ? "passed"
-        : input.submission.verdict === "blocked" || ceilingReached
+        : ceilingReached
           ? "blocked"
-          : "implementation",
+          : input.submission.verdict === "blocked"
+            ? "review"
+            : "implementation",
     ...(input.submission.verdict === "fail" ? { reviewRound } : {}),
     incompleteTurnCount: input.submission.verdict === "fail" ? 0 : input.lifecycle.incompleteTurnCount,
     blockedReason:
@@ -437,12 +439,12 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
   if (verdict.verdict === "blocked") {
     return [
       "",
-      "Reviewer blocked findings to resolve before submitting another completion report:",
-      "Reviewer verdict: blocked / human action required",
+      "Reviewer blocked findings for recovery triage before another completion report:",
+      "Reviewer verdict: blocked / reviewer unable to proceed",
       `Review run: ${verdict.runId}`,
       "",
-      "Resume condition:",
-      "- Continue only after the blocker has been resolved or an approved validation path is available.",
+      "Recovery condition:",
+      "- Continue implementation only when triage or operator guidance identifies bounded worker-owned repair or confirms the required validation path is available.",
       "",
       "Lifecycle counters:",
       `- Reviewer failures: ${lifecycle.reviewRound}`,

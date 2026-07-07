@@ -4281,6 +4281,110 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("dispatches issue triage for reviewer-blocked issues that remain in review", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.writeback.enabled = true;
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({
+      state: "In Review",
+      branchName: "symphony/TEST-1",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("In Review") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const blockedVerdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(candidate),
+      id: "review-verdict:issue-1:review-verdict-blocked-1",
+      idempotencyKey: "review-verdict-blocked-1",
+      verdict: "blocked",
+      acceptanceResults: [
+        {
+          text: "Reviewer can complete required validation.",
+          satisfied: false,
+          evidence: "Required validation is unavailable to the reviewer.",
+        },
+      ],
+      findings: ["Required validation is unavailable to reviewer command surfaces."],
+      gateFindings: [],
+      evidence: ["reviewer observed unavailable validation"],
+    };
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      blockedReason: "review blocked: Required validation is unavailable to reviewer command surfaces.",
+      lastReviewVerdictId: blockedVerdict.id,
+      reviewVerdicts: [blockedVerdict],
+    });
+    const harness = new IssueTriageAcceptingHarness(
+      lifecycleStore,
+      outboxStore,
+    );
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "review-blocked issue triage dispatch");
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "review-blocked issue triage completion",
+    );
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx.role).toBe("triage");
+    expect(harness.runs[0]?.ctx.runPhase).toBe("issue_triage");
+    expect(harness.runs[0]?.prompt).toContain("needs Symphony recovery routing");
+    expect(harness.runs[0]?.prompt).toContain(
+      "review blocked: Required validation is unavailable to reviewer command surfaces.",
+    );
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "review",
+      blockedReason: "review blocked: Required validation is unavailable to reviewer command surfaces.",
+      lastIssueTriageReportId: "issue-triage-report:issue-1:triage-run-1",
+      issueTriageReports: [
+        {
+          runId: "triage-run-1",
+          blockers: [
+            {
+              kind: "under_specified_needs_decomposition",
+              status: "active",
+              nextActor: "planner",
+            },
+          ],
+        },
+      ],
+    });
+    const writebacks = await outboxStore.list();
+    expect(writebacks.map((item) => item.kind)).toEqual(["comment"]);
+  });
+
   it("keeps blocked issues stopped after triage even when blockers are worker-owned", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
@@ -10936,7 +11040,7 @@ describe("Orchestrator", () => {
     });
   });
 
-  it("applies blocked review verdict handoffs without base-ref repair even when base advances during review", async () => {
+  it("records blocked review verdict handoffs without transitioning Linear even when base advances during review", async () => {
     const config = testConfig(root);
     config.writeback.enabled = true;
     config.writeback.mode = "live";
@@ -11042,16 +11146,22 @@ describe("Orchestrator", () => {
     });
 
     await orchestrator.refreshNow();
-    await waitFor(
-      () => currentState === "Blocked" && harness.runs.length === 1,
+    await waitForAsync(
+      async () =>
+        harness.runs.length === 1 &&
+        ((await lifecycleStore.get(candidate.identifier))?.lastReviewVerdictId ?? null) ===
+          "review-verdict:issue-1:review-verdict-blocked-1",
       "blocked review verdict handoff",
     );
     await orchestrator.stop();
 
-    expect(writer.transitions.map((transition) => transition.toState)).toContain("Blocked");
+    expect(currentState).toBe("In Review");
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([]);
+    expect(writer.comments.map((comment) => comment.dedupeKey)).toContain("review-run-1:review-verdict-blocked");
     await expect(lifecycleStore.get(candidate.identifier)).resolves.toMatchObject({
-      phase: "blocked",
+      phase: "review",
       reviewRound: 0,
+      blockedReason: "review blocked: Required validation is unavailable to reviewer command surfaces.",
       lastReviewVerdictId: "review-verdict:issue-1:review-verdict-blocked-1",
       reviewVerdicts: [
         {
@@ -11059,7 +11169,6 @@ describe("Orchestrator", () => {
           verdict: "blocked",
           writebackOperationKeys: [
             "comment:issue-1:review-run-1:review-verdict-blocked",
-            "transition:issue-1:review-run-1:review-verdict-blocked:Blocked",
           ],
         },
       ],
@@ -12157,13 +12266,13 @@ describe("Orchestrator", () => {
     const prompt = harness.runs[0]?.prompt ?? "";
     const systemPrompt = harness.runs[0]?.ctx.ephemeralSystemPrompt ?? "";
     expect(prompt).toContain(
-      "Reviewer blocked findings to resolve before submitting another completion report:",
+      "Reviewer blocked findings for recovery triage before another completion report:",
     );
     expect(prompt).toContain(
-      "Reviewer verdict: blocked / human action required",
+      "Reviewer verdict: blocked / reviewer unable to proceed",
     );
     expect(prompt).toContain(
-      "Next action: Resume after the blocked review: verify the human/operator blocker is resolved, then complete any remaining implementation or validation and submit a new completion report.",
+      "Next action: Use the blocked reviewer verdict as recovery context; wait for triage or operator guidance before treating it as worker-owned repair.",
     );
     expect(prompt).toContain("Latest blocked reviewer verdict:");
     expect(prompt).toContain(
@@ -12174,7 +12283,7 @@ describe("Orchestrator", () => {
     );
     expect(prompt).toContain("reviewer observed command-policy denial");
     expect(systemPrompt).toContain(
-      "Resume after the blocked review only after the human/operator blocker has been resolved",
+      "Use the blocked reviewer verdict as recovery context; proceed with implementation only when triage or operator guidance identifies bounded worker-owned repair.",
     );
     expect(systemPrompt).toContain("Latest blocked review:");
     expect(systemPrompt).toContain(

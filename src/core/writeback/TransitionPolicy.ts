@@ -599,9 +599,8 @@ export function planReviewBlockedWritebacks(
   if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
 
   const details = reviewVerdictDetailsFromInput(summary);
-  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
   const eventKey = `${context.runId}:review-verdict-blocked`;
-  const operations: NewWritebackOperation[] = [
+  return [
     {
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
@@ -612,9 +611,9 @@ export function planReviewBlockedWritebacks(
         body: [
           "## Symphony Review Verdict: Blocked",
           "",
-          "Status: blocked, human action required",
+          "Status: review blocked, triage required",
           "Symphony review could not complete because the reviewer identified a non-worker-owned blocker.",
-          blockedState === null ? "Next state: unchanged" : `Next state: ${blockedState}`,
+          "Next state: unchanged; Symphony will decide the next action from lifecycle evidence.",
           "",
           `Run: ${context.runId}`,
           `Reviewer: ${context.reviewer ?? "n/a"}`,
@@ -623,28 +622,12 @@ export function planReviewBlockedWritebacks(
           ...listOrFallback(details.findings, "No blocker summary supplied."),
           ...formatReviewBlockedDetails(details),
           "",
-          "Required human action:",
-          "Resolve the review blocker or provide an approved service-owned validation path, then move the issue out of the blocked state when Symphony should continue.",
+          "Next action:",
+          "Symphony will run issue triage when enabled; otherwise inspect the reviewer blocker and choose the appropriate recovery path.",
         ].join("\n"),
       },
     },
   ];
-
-  if (blockedState !== null) {
-    operations.push({
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
-      kind: "transition",
-      issueId: context.issue.id,
-      runId: context.runId,
-      payload: {
-        fromStates: config.reviewLoop.reviewStates,
-        toState: blockedState,
-        reason: "Symphony review blocked",
-      },
-    });
-  }
-
-  return operations;
 }
 
 export function planReviewPassWritebacks(

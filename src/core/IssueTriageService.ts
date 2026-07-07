@@ -286,7 +286,7 @@ export function shouldIssueTriageRun(
   lifecycle: IssueLifecycleRecord | null | undefined,
   config: ServiceConfig,
 ): lifecycle is IssueLifecycleRecord {
-  if (!config.issueTriage.enabled || !lifecycle || lifecycle.phase !== "blocked") return false;
+  if (!config.issueTriage.enabled || !lifecycle || !isIssueTriageLifecyclePhase(lifecycle)) return false;
   if (!isIssueTriageBlockedReason(lifecycle.blockedReason)) return false;
   const fingerprint = issueTriageTriggerFingerprint(lifecycle);
   const attemptsForTrigger = lifecycle.issueTriageReports.filter(
@@ -299,18 +299,28 @@ export function shouldIssueTriageManualRun(
   lifecycle: IssueLifecycleRecord | null | undefined,
   config: ServiceConfig,
 ): lifecycle is IssueLifecycleRecord {
-  if (!config.issueTriage.enabled || !lifecycle || lifecycle.phase !== "blocked") return false;
+  if (!config.issueTriage.enabled || !lifecycle || !isIssueTriageLifecyclePhase(lifecycle)) return false;
   return isIssueTriageBlockedReason(lifecycle.blockedReason);
 }
 
 export function isIssueTriageBlockedReason(reason: string | null | undefined): boolean {
   const normalized = (reason ?? "").toLowerCase();
   return (
+    isReviewerBlockedTriageReason(reason) ||
     normalized.includes("max reviewer failures") ||
     normalized.includes("max review rounds") ||
     normalized.includes("max merge gate failures") ||
     normalized.includes("merge gate required checks failed")
   );
+}
+
+export function isReviewerBlockedTriageReason(reason: string | null | undefined): boolean {
+  return (reason ?? "").toLowerCase().startsWith("review blocked:");
+}
+
+function isIssueTriageLifecyclePhase(lifecycle: IssueLifecycleRecord): boolean {
+  if (lifecycle.phase === "blocked") return true;
+  return lifecycle.phase === "review" && isReviewerBlockedTriageReason(lifecycle.blockedReason);
 }
 
 export function latestIssueTriageReportForFingerprint(

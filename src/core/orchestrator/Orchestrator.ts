@@ -74,6 +74,7 @@ import {
   ISSUE_TRIAGE_BLOCKER_STATUSES,
   issueTriageTriggerFingerprint,
   isIssueTriageBlockedReason,
+  isReviewerBlockedTriageReason,
   latestIssueTriageReport,
   latestIssueTriageReportForFingerprint,
   shouldIssueTriageManualRun,
@@ -8508,7 +8509,13 @@ export class Orchestrator {
     )
       return false;
     if (!this.rulesetCommonDispatchGate(snapshot)) return false;
-    if (!isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
+    const reviewBlockedTriage =
+      isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates) &&
+      isReviewerBlockedTriageReason(snapshot.blockedReason);
+    if (
+      !isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates) &&
+      !reviewBlockedTriage
+    )
       return false;
     if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
       return false;
@@ -8631,6 +8638,7 @@ export class Orchestrator {
   ): boolean {
     if (snapshot.triggerType !== "orchestrator.tick") return false;
     if (!this.rulesetBlockedByLifecycle(snapshot)) return false;
+    if (isReviewerBlockedTriageReason(snapshot.blockedReason)) return false;
     if (isPendingPublicationApprovalReason(snapshot.blockedReason))
       return false;
     if (this.config.reviewLoop.blockedStates.length === 0) return false;
@@ -14930,7 +14938,7 @@ export class Orchestrator {
       return [basePrompt, this.issueTriageMcpPrompt(entry)].join("\n");
     }
     return [
-      `Triage why ${entry.issue.identifier} hit Symphony's max-failure blocked path.`,
+      `Triage why ${entry.issue.identifier} needs Symphony recovery routing.`,
       "",
       "You are a scoped, read-only Symphony issue triage agent. Identify every blocker and recommend the next operator/system action.",
       "Do not edit files, create commits, push branches, transition Linear state, comment on Linear, create subissues, or submit worker/reviewer handoffs.",
@@ -16793,7 +16801,7 @@ function nextWorkerAction(lifecycle: IssueLifecycleRecord): string {
     return "Fix the rejected completion report: satisfy every acceptance checklist item with durable evidence before submitting again.";
   }
   if (lifecycle.handoff.lastReviewerOutput?.verdict === "blocked") {
-    return "Resume after the blocked review: verify the human/operator blocker is resolved, then complete any remaining implementation or validation and submit a new completion report.";
+    return "Use the blocked reviewer verdict as recovery context; wait for triage or operator guidance before treating it as worker-owned repair.";
   }
   if (lifecycle.handoff.lastReviewerOutput?.verdict === "fail")
     return "Address the latest reviewer findings, validate, and submit a new completion report.";
@@ -16930,7 +16938,7 @@ function formatBlockedReviewerVerdictForPrompt(
             `- ${item.satisfied ? "[x]" : "[ ]"} ${item.text}${item.evidence === null ? "" : ` (${item.evidence})`}`,
         )),
     `- Evidence: ${formatList(verdict.evidence)}`,
-    "- Worker instruction: continue only after the blocker has been resolved or an approved validation path is available; then validate and submit a new completion report.",
+    "- Recovery note: classify this as reviewer-unable-to-proceed evidence; do not treat it as worker-owned repair unless triage or operator guidance identifies a bounded worker action.",
   ];
 }
 
@@ -17024,7 +17032,7 @@ function currentObjectiveDirective(
     return "Create a SpecKit-backed decomposition plan and submit proposed blocking Linear child issues for the parent issue.";
   }
   if (entry.runPhase === "issue_triage") {
-    return "Identify every blocker behind this max-failure block and submit a read-only issue triage blocker report.";
+    return "Identify every blocker behind the current recovery trigger and submit a read-only issue triage blocker report.";
   }
   if (entry.runPhase === "post_mortem") {
     return "Perform a read-only post-mortem for the completed issue and submit an exhaustive issue post-mortem report.";
@@ -17053,7 +17061,7 @@ function currentObjectiveDirective(
     return "Fix the rejected completion report by satisfying every acceptance checklist item with durable evidence before submitting again.";
   }
   if (lifecycle?.handoff.lastReviewerOutput?.verdict === "blocked") {
-    return "Resume after the blocked review only after the human/operator blocker has been resolved; verify the required evidence path is now available, complete any remaining implementation or validation, and submit a completion report.";
+    return "Use the blocked reviewer verdict as recovery context; proceed with implementation only when triage or operator guidance identifies bounded worker-owned repair.";
   }
   if (lifecycle?.handoff.lastReviewerOutput?.verdict === "fail") {
     return "Repair the latest reviewer-requested changes while preserving correct completed work.";
