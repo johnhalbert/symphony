@@ -789,6 +789,177 @@ describe("MergePolicyService", () => {
     });
   });
 
+  it("refreshes local-only stale worktree base without fetching or publishing an issue branch", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "In Review", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(currentIssue, {
+      phase: "implementation",
+      summaryPointers: {
+        workspacePath: path.join(root, currentIssue.identifier),
+        gitBranchName: "symphony/TEST-1",
+        baseRef: "main",
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+      },
+    });
+    const conflictGit = new FakeConflictGit({
+      status: "clean",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      rebasedHeadSha: "unused-pr-rebase-sha",
+      conflictedFiles: [],
+    });
+    conflictGit.localRefreshResult = {
+      status: "refreshed",
+      originalHeadSha: "head-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      refreshedHeadSha: "base-sha-2",
+      aheadCommitCount: 0,
+      behindCommitCount: 3,
+    };
+    conflictGit.preservedStash = preservedStashRecord(path.join(root, currentIssue.identifier));
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient(),
+      conflictGit,
+    });
+
+    const result = await service.repairBaseRefDrift(currentIssue, baseRefObservation());
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result).toEqual({ status: "base_ref_repaired", headSha: "base-sha-2" });
+    expect(conflictGit.prepareInput).toBeNull();
+    expect(conflictGit.publishInput).toBeNull();
+    expect(conflictGit.refreshInput).toMatchObject({
+      workspacePath: path.join(root, currentIssue.identifier),
+      branchName: "symphony/TEST-1",
+      expectedHeadSha: "head-sha-1",
+      baseBranch: "main",
+      liveBaseHeadSha: "base-sha-2",
+      authHeader: "AUTHORIZATION: bearer test-token",
+    });
+    expect(conflictGit.applyInput).toMatchObject({
+      preservedStash: conflictGit.preservedStash,
+    });
+    expect(conflictGit.dropInput).toMatchObject({
+      preservedStash: expect.objectContaining({ status: "applied_clean" }),
+    });
+    expect(currentIssue.state).toBe("In Progress");
+    expect(writer.comments[0]?.body).toContain("Status: local worktree base refreshed");
+    expect(writer.comments[0]?.body).toContain("No PR branch was published");
+    expect(lifecycle).toMatchObject({
+      phase: "implementation",
+      summaryPointers: {
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+        gitBranchName: "symphony/TEST-1",
+        baseRef: "main",
+      },
+      preservedWorktreeStashes: [
+        expect.objectContaining({
+          id: conflictGit.preservedStash.id,
+          status: "dropped",
+        }),
+      ],
+    });
+  });
+
+  it("reuses an existing created preserved stash on base-ref repair retry", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "In Review", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const existingStash = preservedStashRecord(path.join(root, currentIssue.identifier));
+    await lifecycleStore.ensureIssue(currentIssue, {
+      phase: "implementation",
+      summaryPointers: {
+        workspacePath: path.join(root, currentIssue.identifier),
+        gitBranchName: "symphony/TEST-1",
+        baseRef: "main",
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+      },
+      preservedWorktreeStashes: [existingStash],
+    });
+    const conflictGit = new FakeConflictGit({
+      status: "clean",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      rebasedHeadSha: "unused-pr-rebase-sha",
+      conflictedFiles: [],
+    });
+    conflictGit.localRefreshResult = {
+      status: "refreshed",
+      originalHeadSha: "head-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      refreshedHeadSha: "base-sha-2",
+      aheadCommitCount: 0,
+      behindCommitCount: 1,
+    };
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient(),
+      conflictGit,
+    });
+
+    await service.repairBaseRefDrift(currentIssue, baseRefObservation());
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(conflictGit.preserveInput).toMatchObject({
+      source: "base_ref_repair",
+    });
+    expect(conflictGit.applyInput).toMatchObject({
+      preservedStash: existingStash,
+    });
+    expect(lifecycle?.preservedWorktreeStashes).toEqual([
+      expect.objectContaining({
+        id: existingStash.id,
+        status: "dropped",
+      }),
+    ]);
+  });
+
   it("routes preserved local-change conflicts after clean base-ref repair to a stash-apply conflict worker", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",
@@ -3974,12 +4145,14 @@ class FakeMergeClient implements MergePolicyGitHubClient {
 class FakeConflictGit extends ServiceOwnedMergeConflictGit {
   prepareInput: Parameters<ServiceOwnedMergeConflictGit["prepare"]>[0] | null = null;
   reprepareInput: Parameters<ServiceOwnedMergeConflictGit["reprepareAfterBaseDrift"]>[0] | null = null;
+  refreshInput: Parameters<ServiceOwnedMergeConflictGit["refreshLocalBranchBase"]>[0] | null = null;
   publishInput: Parameters<ServiceOwnedMergeConflictGit["publishPreparedHead"]>[0] | null = null;
   preserveInput: Parameters<ServiceOwnedMergeConflictGit["preserveDirtyWorktree"]>[0] | null = null;
   applyInput: Parameters<ServiceOwnedMergeConflictGit["applyPreservedStash"]>[0] | null = null;
   dropInput: Parameters<ServiceOwnedMergeConflictGit["dropPreservedStash"]>[0] | null = null;
   preservedStash: IssuePreservedWorktreeStash | null = null;
   stashApplyResult: Awaited<ReturnType<ServiceOwnedMergeConflictGit["applyPreservedStash"]>> | null = null;
+  localRefreshResult: Awaited<ReturnType<ServiceOwnedMergeConflictGit["refreshLocalBranchBase"]>> | null = null;
 
   constructor(private readonly result: ServiceOwnedMergeConflictPreparationResult) {
     super();
@@ -3993,6 +4166,20 @@ class FakeConflictGit extends ServiceOwnedMergeConflictGit {
   override async reprepareAfterBaseDrift(input: Parameters<ServiceOwnedMergeConflictGit["reprepareAfterBaseDrift"]>[0]) {
     this.reprepareInput = input;
     return this.result;
+  }
+
+  override async refreshLocalBranchBase(input: Parameters<ServiceOwnedMergeConflictGit["refreshLocalBranchBase"]>[0]) {
+    this.refreshInput = input;
+    return (
+      this.localRefreshResult ?? {
+        status: "refreshed" as const,
+        originalHeadSha: input.expectedHeadSha,
+        liveBaseHeadSha: input.liveBaseHeadSha,
+        refreshedHeadSha: input.liveBaseHeadSha,
+        aheadCommitCount: 0,
+        behindCommitCount: 0,
+      }
+    );
   }
 
   override async publishPreparedHead(input: Parameters<ServiceOwnedMergeConflictGit["publishPreparedHead"]>[0]) {

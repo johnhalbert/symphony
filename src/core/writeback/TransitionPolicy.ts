@@ -125,6 +125,7 @@ export interface BaseRefRepairWritebackContext {
   previousHeadSha: string;
   rebasedHeadSha: string;
   baseHeadSha: string;
+  mode?: "pr_backed" | "local_only";
 }
 
 export interface MergeGateHeadSupersessionWritebackContext {
@@ -1210,6 +1211,7 @@ export function planBaseRefRepairWritebacks(
 ): NewWritebackOperation[] {
   if (!config.writeback.enabled) return [];
   const eventKey = `base-ref-repair:${safeKeySegment(context.operationId)}:${safeKeySegment(context.rebasedHeadSha)}`;
+  const localOnly = context.mode === "local_only";
   return [
     {
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
@@ -1220,17 +1222,23 @@ export function planBaseRefRepairWritebacks(
         body: [
           "## Symphony Base Ref Repair",
           "",
-          "Status: clean rebase published, worker reverification required",
+          localOnly
+            ? "Status: local worktree base refreshed, worker reverification required"
+            : "Status: clean rebase published, worker reverification required",
           `Next state: ${config.writeback.dispatchState} (worker queue)`,
           "",
           `Branch: ${context.branchName}`,
           `Base branch: ${context.baseBranch}`,
           `Base head SHA: ${context.baseHeadSha}`,
           `Previous worktree head SHA: ${context.previousHeadSha}`,
-          `Rebased worktree head SHA: ${context.rebasedHeadSha}`,
+          localOnly
+            ? `Refreshed worktree head SHA: ${context.rebasedHeadSha}`
+            : `Rebased worktree head SHA: ${context.rebasedHeadSha}`,
           "",
           "Required action:",
-          "Symphony rebased the worktree over the live origin base and published the rebased head to the PR branch. The implementation worker must revalidate the rebased changes and submit a fresh completion report before review continues.",
+          localOnly
+            ? "Symphony refreshed the local worktree base to the live origin base and restored preserved local changes. No PR branch was published. The implementation worker must review the restored changes, validate them, commit if appropriate, and submit a fresh completion report before review continues."
+            : "Symphony rebased the worktree over the live origin base and published the rebased head to the PR branch. The implementation worker must revalidate the rebased changes and submit a fresh completion report before review continues.",
         ].join("\n"),
       },
     },
@@ -1241,7 +1249,9 @@ export function planBaseRefRepairWritebacks(
       payload: {
         fromStates: uniqueStates([context.fromState, config.writeback.dispatchState]),
         toState: config.writeback.dispatchState,
-        reason: "Symphony rebased stale worktree base; worker reverification required",
+        reason: localOnly
+          ? "Symphony refreshed stale local worktree base; worker reverification required"
+          : "Symphony rebased stale worktree base; worker reverification required",
       },
     },
   ];

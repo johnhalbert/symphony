@@ -684,6 +684,7 @@ function currentFields(): IssueCurrentFields {
     lastMergePolicyObservationFingerprint: null,
     lastMergePolicyObservationStatus: null,
     lastMergePolicyObservation: null,
+    activePreservedWorktreeStashes: [],
     mergePolicyMerge: null,
     mergePolicyMergeGate: null,
     mergePolicyMergeGateResults: [],

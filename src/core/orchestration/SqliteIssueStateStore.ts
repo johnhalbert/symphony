@@ -1011,6 +1011,11 @@ function normalizeIssueCurrentFields(
         ? record.lastMergePolicyObservationStatus
         : null,
     lastMergePolicyObservation: record.lastMergePolicyObservation ?? null,
+    activePreservedWorktreeStashes: Array.isArray(
+      record.activePreservedWorktreeStashes,
+    )
+      ? record.activePreservedWorktreeStashes
+      : [],
     mergePolicyMerge: record.mergePolicyMerge ?? null,
     mergePolicyMergeGate: record.mergePolicyMergeGate ?? null,
     mergePolicyMergeGateResults: Array.isArray(

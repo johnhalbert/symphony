@@ -47,6 +47,7 @@ import {
   sortIssuesForDispatch,
   type PullRequestDiscoveryClient,
 } from "../src/core/orchestrator/Orchestrator.js";
+import { IssueOrchestrationEngine } from "../src/core/orchestration/IssueOrchestrationEngine.js";
 import type {
   IssueCurrentFields,
   IssueCurrentStateSnapshot,
@@ -6194,6 +6195,71 @@ describe("Orchestrator", () => {
       role: "worker",
       runPhase: "implementation",
       reason: "worker_dispatch",
+    });
+    await orchestrator.stop();
+  });
+
+  it("restores active preserved stashes before normal worker dispatch", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const restoreRuleset = orchestrator
+      .registeredTransitionRulesets()
+      .find((ruleset) => ruleset.id === "orchestrator.preserved_stash.restore");
+    const base = mergePolicyRulesetSnapshot({
+      trackerState: "Todo",
+      phase: "implementation",
+      latestWorkspacePath: path.join(root, "TEST-1"),
+      latestGitBranchName: "symphony/TEST-1",
+      latestBaseRef: "main",
+      currentMergePolicyObservationInputFingerprint: null,
+      lastBaseRefObservationClassification: "ok",
+      activePreservedWorktreeStashes: [
+        {
+          version: 1,
+          id: "preserved-stash:issue-1:stash-1",
+          operationId: "base-ref:issue-1:head:base",
+          source: "base_ref_repair",
+          stashRef: "refs/symphony/preserved-stashes/test/stash-1",
+          stashSha: "stash-sha-1",
+          message: "Symphony preserved local changes",
+          workspacePath: path.join(root, "TEST-1"),
+          branchName: "symphony/TEST-1",
+          baseBranch: "main",
+          originalHeadSha: "head-sha-1",
+          dirtyFiles: ["src/local.ts"],
+          status: "created",
+          conflictedFiles: [],
+          createdAt: "2026-01-01T00:00:00.000Z",
+          appliedAt: null,
+          droppedAt: null,
+          dropError: null,
+        },
+      ],
+    });
+
+    expect(restoreRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "preserved_stash_restore",
+      reason: "preserved_worktree_stash_restore",
+    });
+    expect(
+      new IssueOrchestrationEngine(
+        orchestrator.registeredTransitionRulesets(),
+      ).decide(base, []),
+    ).toMatchObject({
+      transitionKind: "preserved_stash_restore",
+      reason: "preserved_worktree_stash_restore",
     });
     await orchestrator.stop();
   });
@@ -14757,6 +14823,7 @@ function mergePolicyRulesetSnapshot(
     lastMergePolicyObservationFingerprint: null,
     lastMergePolicyObservationStatus: null,
     lastMergePolicyObservation: null,
+    activePreservedWorktreeStashes: [],
     mergePolicyMerge: null,
     mergePolicyMergeGate: null,
     mergePolicyMergeGateResults: [],

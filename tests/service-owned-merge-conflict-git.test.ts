@@ -170,6 +170,32 @@ describe("ServiceOwnedMergeConflictGit", () => {
     expect(dropped.status).toBe("dropped");
     await expect(git(["rev-parse", stash!.stashRef], workspace)).rejects.toThrow(/git exited/);
   });
+
+  it("refreshes a local-only branch to the live base without fetching the issue branch", async () => {
+    const { workspace, branchName, initialSha, liveBaseHeadSha } = await localOnlyBehindRepo(root);
+    const serviceGit = new ServiceOwnedMergeConflictGit();
+
+    const result = await serviceGit.refreshLocalBranchBase({
+      workspacePath: workspace,
+      branchName,
+      expectedHeadSha: initialSha,
+      baseBranch: "main",
+      liveBaseHeadSha,
+      authHeader: "AUTHORIZATION: bearer test-token",
+    });
+
+    expect(result).toMatchObject({
+      status: "refreshed",
+      originalHeadSha: initialSha,
+      liveBaseHeadSha,
+      refreshedHeadSha: liveBaseHeadSha,
+      aheadCommitCount: 0,
+    });
+    expect((await git(["rev-parse", "HEAD"], workspace)).trim()).toBe(liveBaseHeadSha);
+    await expect(
+      git(["rev-parse", `refs/remotes/origin/${branchName}`], workspace),
+    ).rejects.toThrow(/git exited/);
+  });
 });
 
 async function conflictedRepo(root: string): Promise<{
@@ -212,6 +238,40 @@ async function conflictedRepo(root: string): Promise<{
   await git(["checkout", branchName], workspace);
 
   return { remote, workspace, branchName, initialSha, featureHeadSha, liveBaseHeadSha };
+}
+
+async function localOnlyBehindRepo(root: string): Promise<{
+  remote: string;
+  workspace: string;
+  branchName: string;
+  initialSha: string;
+  liveBaseHeadSha: string;
+}> {
+  const remote = path.join(root, "remote.git");
+  const workspace = path.join(root, "workspace");
+  const updater = path.join(root, "updater");
+  const branchName = "symphony/TEST-LOCAL";
+  await git(["init", "--bare", remote], root);
+  await mkdir(workspace, { recursive: true });
+  await git(["init"], workspace);
+  await git(["checkout", "-b", "main"], workspace);
+  await writeFile(path.join(workspace, "file.txt"), "base\n", "utf8");
+  await git(["add", "file.txt"], workspace);
+  await commit(workspace, "initial");
+  const initialSha = (await git(["rev-parse", "HEAD"], workspace)).trim();
+  await git(["remote", "add", "origin", remote], workspace);
+  await git(["push", "-u", "origin", "main"], workspace);
+  await git(["checkout", "-b", branchName], workspace);
+
+  await git(["clone", remote, updater], root);
+  await git(["checkout", "main"], updater);
+  await writeFile(path.join(updater, "file.txt"), "base\nnew base\n", "utf8");
+  await git(["add", "file.txt"], updater);
+  await commit(updater, "advance base");
+  const liveBaseHeadSha = (await git(["rev-parse", "HEAD"], updater)).trim();
+  await git(["push", "origin", "main"], updater);
+
+  return { remote, workspace, branchName, initialSha, liveBaseHeadSha };
 }
 
 function commit(cwd: string, message: string): Promise<string> {

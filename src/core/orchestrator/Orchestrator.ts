@@ -4431,6 +4431,16 @@ export class Orchestrator {
         ],
       },
       {
+        kind: "preserved_stash_restore",
+        actions: [
+          {
+            id: "restore_preserved_worktree_stashes",
+            execute: (context) =>
+              this.restorePreservedWorktreeStashesAction(context),
+          },
+        ],
+      },
+      {
         kind: "dispatch_worker",
         actions: [
           {
@@ -6937,6 +6947,27 @@ export class Orchestrator {
     };
   }
 
+  private async restorePreservedWorktreeStashesAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const result = await this.mergePolicyServiceForContext(
+      context,
+    ).restorePreservedWorktreeStashes(context.issue);
+    return {
+      details: {
+        resultStatus: result.status,
+        ...(result.status === "skipped" ? { reason: result.reason } : {}),
+        ...(result.status === "conflict_dispatched"
+          ? {
+              mergeConflictId: result.conflict.id,
+              conflictStatus: result.conflict.status,
+              conflictResolutionStatus: result.conflict.resolutionStatus,
+            }
+          : {}),
+      },
+    };
+  }
+
   private async updateLifecycleBlockedAction(
     context: OrchestratorTransitionContext,
   ) {
@@ -7716,6 +7747,17 @@ export class Orchestrator {
         },
       },
       {
+        id: "orchestrator.preserved_stash.restore",
+        priority: issueTransitionRulesetPriority("preserved_stash_restore"),
+        evaluate: (snapshot) =>
+          this.rulesetShouldRestorePreservedStashes(snapshot)
+            ? {
+                transitionKind: "preserved_stash_restore",
+                reason: "preserved_worktree_stash_restore",
+              }
+            : null,
+      },
+      {
         id: "orchestrator.dispatch.merge_conflict_worker",
         priority: 40,
         evaluate: (snapshot) =>
@@ -8164,6 +8206,29 @@ export class Orchestrator {
       nonEmptyString(snapshot.latestBaseRef) !== null ||
       nonEmptyString(this.config.workspace.source.baseRef) !== null
     );
+  }
+
+  private rulesetShouldRestorePreservedStashes(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick") return false;
+    if (!snapshot.lifecyclePersistenceAvailable) return false;
+    if (snapshot.running || snapshot.paused || snapshot.claimed) return false;
+    if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
+      return false;
+    if (!hasRestorablePreservedWorktreeStashes(snapshot)) return false;
+    const targetRequest = dispatchTransitionRequest({
+      role: "worker",
+      runPhase: "implementation",
+      reason: "preserved_worktree_stash_restore_probe",
+      promptScenario: promptScenarioForDispatch(
+        "worker",
+        "implementation",
+        false,
+      ),
+    });
+    if (!this.rulesetShouldGuardBaseRef(snapshot, targetRequest)) return true;
+    return snapshot.lastBaseRefObservationClassification === "ok";
   }
 
   private baseRefObservationFingerprintForSnapshot(
@@ -15567,6 +15632,18 @@ function mergeQueueProjectionForIssue(
   };
 }
 
+function hasRestorablePreservedWorktreeStashes(
+  snapshot: IssueCurrentStateSnapshot,
+): boolean {
+  return snapshot.activePreservedWorktreeStashes.some(
+    (stash) =>
+      stash.status === "created" ||
+      stash.status === "applied_clean" ||
+      stash.status === "finalized" ||
+      stash.status === "drop_failed",
+  );
+}
+
 const BASE_REF_GUARDED_TRANSITION_KINDS = new Set<IssueTransitionKind>([
   "dispatch_worker",
   "dispatch_reviewer",
@@ -15605,6 +15682,8 @@ function issueTransitionRulesetPriority(kind: IssueTransitionKind): number {
       return 38;
     case "rebound_issue_triage_blocked":
       return 39;
+    case "preserved_stash_restore":
+      return 39.5;
     case "dispatch_worker":
     case "dispatch_planner":
     case "dispatch_reviewer":

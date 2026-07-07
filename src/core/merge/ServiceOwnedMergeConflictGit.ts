@@ -23,6 +23,15 @@ export interface ServiceOwnedMergeConflictPreparationInput {
   authHeader: string;
 }
 
+export interface ServiceOwnedLocalBaseRefreshInput {
+  workspacePath: string;
+  branchName: string;
+  expectedHeadSha: string;
+  baseBranch: string;
+  liveBaseHeadSha: string;
+  authHeader: string;
+}
+
 export type ServiceOwnedMergeConflictPreparationResult =
   | {
       status: "clean";
@@ -45,6 +54,15 @@ export type ServiceOwnedMergeConflictPreparationResult =
       squashCommitSha: string | null;
       conflictedFiles: string[];
     };
+
+export interface ServiceOwnedLocalBaseRefreshResult {
+  status: "refreshed";
+  originalHeadSha: string;
+  liveBaseHeadSha: string;
+  refreshedHeadSha: string;
+  aheadCommitCount: number;
+  behindCommitCount: number;
+}
 
 export interface ServiceOwnedMergeConflictFinalizationInput {
   workspacePath: string;
@@ -94,6 +112,7 @@ export interface ServiceOwnedStashApplyFinalizationInput {
   changedFiles: string[];
   preservedStash: IssuePreservedWorktreeStash;
   authHeader: string;
+  remoteBacked?: boolean;
 }
 
 export interface ServiceOwnedStashApplyFinalizationResult {
@@ -262,6 +281,45 @@ export class ServiceOwnedMergeConflictGit {
     await git.pushForceWithLease(input.branchName, input.previousRemoteHeadSha, input.authHeader);
   }
 
+  async refreshLocalBranchBase(
+    input: ServiceOwnedLocalBaseRefreshInput,
+  ): Promise<ServiceOwnedLocalBaseRefreshResult> {
+    validateRefName(input.branchName, "worktree branch");
+    validateRefName(input.baseBranch, "base branch");
+    const git = new ServiceGit(input.workspacePath);
+    await git.assertCurrentBranch(input.branchName);
+    await git.assertClean();
+    await git.assertRefSha("HEAD", input.expectedHeadSha, "expected worktree head");
+    await fetchAndVerifyLocalRemoteBaseRef({
+      workspacePath: input.workspacePath,
+      baseRef: input.baseBranch,
+      expectedBaseHeadSha: input.liveBaseHeadSha,
+      authHeader: input.authHeader,
+      errorMessageLabel: "expected live base",
+    });
+    await git.ensureCommit(input.expectedHeadSha);
+    await git.ensureCommit(input.liveBaseHeadSha);
+    const counts = await git.revListLeftRightCount(
+      input.expectedHeadSha,
+      input.liveBaseHeadSha,
+    );
+    if (counts.left > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        `Local-only base refresh would discard ${counts.left} local commit(s) not in the live base; worker inspection is required`,
+      );
+    }
+    await git.resetHard(input.liveBaseHeadSha);
+    return {
+      status: "refreshed",
+      originalHeadSha: input.expectedHeadSha,
+      liveBaseHeadSha: input.liveBaseHeadSha,
+      refreshedHeadSha: await git.headSha(),
+      aheadCommitCount: counts.left,
+      behindCommitCount: counts.right,
+    };
+  }
+
   async finalize(
     input: ServiceOwnedMergeConflictFinalizationInput,
   ): Promise<ServiceOwnedMergeConflictFinalizationResult> {
@@ -329,8 +387,11 @@ export class ServiceOwnedMergeConflictGit {
 
     const git = new ServiceGit(input.workspacePath);
     await git.assertCurrentBranch(input.branchName);
-    await git.fetchBranch(input.branchName, input.authHeader);
-    await git.assertRefSha(`refs/remotes/origin/${input.branchName}`, input.previousRemoteHeadSha, "expected PR head");
+    const remoteBacked = input.remoteBacked !== false;
+    if (remoteBacked) {
+      await git.fetchBranch(input.branchName, input.authHeader);
+      await git.assertRefSha(`refs/remotes/origin/${input.branchName}`, input.previousRemoteHeadSha, "expected PR head");
+    }
     const actualTouchedFiles = await git.workerTouchedFiles();
     const actualOutside = actualTouchedFiles.filter((file) => !allowed.has(file));
     if (actualOutside.length > 0) {
@@ -349,7 +410,9 @@ export class ServiceOwnedMergeConflictGit {
         "Symphony preserved local changes repair",
         "Finalize preserved local changes after service-owned base-ref repair.",
       );
-      await git.pushForceWithLease(input.branchName, input.previousRemoteHeadSha, input.authHeader);
+      if (remoteBacked) {
+        await git.pushForceWithLease(input.branchName, input.previousRemoteHeadSha, input.authHeader);
+      }
     }
     const newHeadSha = await git.headSha();
     const dropped = await this.dropPreservedStash({
@@ -441,6 +504,28 @@ class ServiceGit {
 
   async mergeBase(left: string, right: string): Promise<string> {
     return (await this.git(["merge-base", left, right])).stdout.trim();
+  }
+
+  async revListLeftRightCount(
+    left: string,
+    right: string,
+  ): Promise<{ left: number; right: number }> {
+    const output = (
+      await this.git(["rev-list", "--left-right", "--count", `${left}...${right}`])
+    ).stdout.trim();
+    const counts = output.split(/\s+/).map((value) => Number(value));
+    const leftCount = counts[0];
+    const rightCount = counts[1];
+    if (
+      !Number.isFinite(leftCount) ||
+      !Number.isFinite(rightCount)
+    ) {
+      throw new SymphonyError(
+        "invalid_request",
+        `Unable to parse local branch divergence: ${output}`,
+      );
+    }
+    return { left: leftCount!, right: rightCount! };
   }
 
   async hasStagedDiff(): Promise<boolean> {

@@ -29,6 +29,7 @@ import {
 import {
   FileIssueLifecycleStore,
   type IssueLifecycleRecord,
+  type IssuePreservedWorktreeStash,
 } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { issueTriageTriggerFingerprint } from "../src/core/IssueTriageService.js";
@@ -112,6 +113,33 @@ describe("IssueCurrentStateBuilder", () => {
       /^[a-f0-9]+$/,
     );
     expect(current.mergePolicyConfigFingerprint).toMatch(/^[a-f0-9]+$/);
+  });
+
+  it("projects only active preserved worktree stashes from lifecycle", async () => {
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const builder = new IssueCurrentStateBuilder({
+      config: builderConfig(root),
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: new MemoryIssueStateStore(),
+      logger: silentLogger(),
+    });
+    const issue = issueFixture();
+    await lifecycleStore.ensureIssue(issue, {
+      preservedWorktreeStashes: [
+        preservedStashFixture({ id: "stash-active", status: "created" }),
+        preservedStashFixture({ id: "stash-dropped", status: "dropped" }),
+      ],
+    });
+
+    const current = await builder.build(issue, emptyRuntime());
+
+    expect(current.activePreservedWorktreeStashes).toEqual([
+      expect.objectContaining({
+        id: "stash-active",
+        status: "created",
+      }),
+    ]);
   });
 
   it("builds tracker, lifecycle, run, and runtime fields from explicit inputs", async () => {
@@ -2456,6 +2484,32 @@ function completionReportFixture(
     risks: [],
     acceptedAt: "2026-01-01T00:00:03.000Z",
     writebackOperationKeys: [],
+    ...overrides,
+  };
+}
+
+function preservedStashFixture(
+  overrides: Partial<IssuePreservedWorktreeStash> = {},
+): IssuePreservedWorktreeStash {
+  return {
+    version: 1,
+    id: "stash-1",
+    operationId: "base-ref:issue-1:head:base",
+    source: "base_ref_repair",
+    stashRef: "refs/symphony/preserved-stashes/test/stash-1",
+    stashSha: "stash-sha-1",
+    message: "Symphony preserved local changes",
+    workspacePath: "/tmp/workspace",
+    branchName: "feature/test-1",
+    baseBranch: "main",
+    originalHeadSha: "head-sha-1",
+    dirtyFiles: ["src/local.ts"],
+    status: "created",
+    conflictedFiles: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    appliedAt: null,
+    droppedAt: null,
+    dropError: null,
     ...overrides,
   };
 }

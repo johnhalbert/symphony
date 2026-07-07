@@ -31,6 +31,7 @@ import {
   type IssueMergeGateResultRecord,
   type IssueMergeGateState,
   type IssueMergeMetadata,
+  type IssuePreservedWorktreeStash,
   type IssueReviewFeedbackRecord,
   type IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
@@ -209,6 +210,7 @@ type LifecycleFields = Pick<
   | "mergeGate"
   | "mergeConflict"
   | "lifecycleSummaryCiStatus"
+  | "activePreservedWorktreeStashes"
   | "mergePolicyMerge"
   | "mergePolicyMergeGate"
   | "mergePolicyMergeGateResults"
@@ -261,6 +263,7 @@ type LifecycleMergePolicyFields = Pick<
   | "mergePolicyMergeGate"
   | "mergePolicyMergeGateResults"
   | "mergePolicyMergeConflict"
+  | "activePreservedWorktreeStashes"
   | "mergePolicyReviewFeedback"
 >;
 
@@ -1070,6 +1073,10 @@ export class IssueCurrentStateBuilder {
     const reviewFeedback = recordArrayFromUnknown<IssueReviewFeedbackRecord>(
       snapshot.lifecycleReviewFeedback,
     );
+    const preservedWorktreeStashes =
+      recordArrayFromUnknown<IssuePreservedWorktreeStash>(
+        snapshot.lifecyclePreservedWorktreeStashes,
+      ) ?? [];
     if (mergeGateResults === null || reviewFeedback === null) {
       return {
         complete: false,
@@ -1087,6 +1094,8 @@ export class IssueCurrentStateBuilder {
         mergePolicyMergeGate: mergeGate,
         mergePolicyMergeGateResults: mergeGateResults,
         mergePolicyMergeConflict: mergeConflict,
+        activePreservedWorktreeStashes:
+          activePreservedWorktreeStashesOfArray(preservedWorktreeStashes),
         mergePolicyReviewFeedback: reviewFeedback,
       },
     };
@@ -1636,6 +1645,8 @@ export class IssueCurrentStateBuilder {
       mergePolicyMergeGate: lifecycle?.mergeGate ?? null,
       mergePolicyMergeGateResults: lifecycle?.mergeGateResults ?? [],
       mergePolicyMergeConflict: lifecycle?.mergeConflict ?? null,
+      activePreservedWorktreeStashes:
+        activePreservedWorktreeStashesOf(lifecycle),
       mergePolicyLatestCompletionReport:
         context.mergePolicyLatestCompletionReport,
       mergePolicyLatestApprovalVerdict:
@@ -2073,6 +2084,10 @@ function lifecycleRecordFromHistorySnapshot(
     recordArrayFromUnknown<IssueReviewFeedbackRecord>(
       snapshot.lifecycleReviewFeedback,
     ) ?? [];
+  const preservedWorktreeStashes =
+    recordArrayFromUnknown<IssuePreservedWorktreeStash>(
+      snapshot.lifecyclePreservedWorktreeStashes,
+    ) ?? [];
   const lifecycle: Omit<IssueLifecycleRecord, "handoff"> = {
     issueId: snapshot.issueId,
     issueIdentifier: snapshot.issueIdentifier,
@@ -2117,6 +2132,7 @@ function lifecycleRecordFromHistorySnapshot(
       latestApprovalPassVerdict === null ? [] : [latestApprovalPassVerdict],
     mergeGateResults,
     reviewFeedback,
+    preservedWorktreeStashes,
     issueTriageReports,
     postMortemReports,
     reviewEvidence: emptyHistoryReviewEvidence(),
@@ -2785,6 +2801,26 @@ function recordArrayFromUnknown<T extends { id: string }>(
     records.push(record);
   }
   return records;
+}
+
+function activePreservedWorktreeStashesOf(
+  lifecycle: Pick<IssueLifecycleRecord, "preservedWorktreeStashes"> | null,
+): IssuePreservedWorktreeStash[] {
+  return activePreservedWorktreeStashesOfArray(
+    lifecycle?.preservedWorktreeStashes ?? [],
+  );
+}
+
+function activePreservedWorktreeStashesOfArray(
+  stashes: readonly IssuePreservedWorktreeStash[],
+): IssuePreservedWorktreeStash[] {
+  return stashes
+    .filter((stash) => stash.status !== "dropped")
+    .map((stash) => ({
+      ...stash,
+      dirtyFiles: [...stash.dirtyFiles],
+      conflictedFiles: [...stash.conflictedFiles],
+    }));
 }
 
 function compareFieldGroup(

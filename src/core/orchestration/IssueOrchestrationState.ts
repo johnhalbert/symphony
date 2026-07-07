@@ -12,6 +12,7 @@ import type {
   IssueMergeGateState,
   IssueMergeMetadata,
   IssuePostMortemReportRecord,
+  IssuePreservedWorktreeStash,
   IssueReviewFeedbackRecord,
   IssueReviewVerdictRecord,
   IssueTriageReportRecord,
@@ -39,6 +40,7 @@ export type IssueTransitionKind =
   | "base_ref_observe"
   | "base_ref_repair"
   | "base_ref_block"
+  | "preserved_stash_restore"
   | "dispatch_worker"
   | "dispatch_planner"
   | "dispatch_reviewer"
@@ -238,6 +240,7 @@ export interface IssueCurrentFields {
   lastBaseRefObservationFingerprint?: string | null;
   lastBaseRefObservationClassification?: IssueBaseRefObservation["classification"] | null;
   lastBaseRefObservation?: IssueBaseRefObservation | null;
+  activePreservedWorktreeStashes: IssuePreservedWorktreeStash[];
   mergePolicyMerge: IssueMergeMetadata | null;
   mergePolicyMergeGate: IssueMergeGateState | null;
   mergePolicyMergeGateResults: IssueMergeGateResultRecord[];
@@ -474,6 +477,7 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   lifecycleMergeConflict: IssueMergeConflictMetadata | null;
   lifecycleReviewFeedback: IssueReviewFeedbackRecord[] | null;
   lifecycleBaseRefObservation: IssueBaseRefObservation | null;
+  lifecyclePreservedWorktreeStashes: IssuePreservedWorktreeStash[] | null;
   lifecycleSummaryCiStatus: string | null;
   lifecycleSummaryPointers: unknown;
 }
@@ -753,6 +757,11 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
           payload,
           "baseRefObservation",
         ),
+        lifecyclePreservedWorktreeStashes:
+          recordArrayField<IssuePreservedWorktreeStash>(
+            payload,
+            "preservedWorktreeStashes",
+          ),
         lifecycleSummaryCiStatus: stringField(
           recordPayload(payload?.summaryPointers),
           "ciStatus",

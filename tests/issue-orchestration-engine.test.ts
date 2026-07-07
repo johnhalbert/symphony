@@ -209,6 +209,7 @@ function snapshot(): IssueCurrentStateSnapshot {
     lastMergePolicyObservationFingerprint: null,
     lastMergePolicyObservationStatus: null,
     lastMergePolicyObservation: null,
+    activePreservedWorktreeStashes: [],
     mergePolicyMerge: null,
     mergePolicyMergeGate: null,
     mergePolicyMergeGateResults: [],

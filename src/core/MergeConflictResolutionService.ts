@@ -342,6 +342,7 @@ export class MergeConflictResolutionService {
         changedFiles: report.changedFiles,
         preservedStash: servicePreparation.preservedStash,
         authHeader,
+        remoteBacked: stashApplyConflictIsRemoteBacked(mergeConflict),
       });
       return {
         ...report,
@@ -810,6 +811,15 @@ function preservedWorktreeStashesOf(lifecycle: {
   preservedWorktreeStashes?: IssuePreservedWorktreeStash[];
 }): IssuePreservedWorktreeStash[] {
   return lifecycle.preservedWorktreeStashes ?? [];
+}
+
+function stashApplyConflictIsRemoteBacked(
+  mergeConflict: IssueMergeConflictMetadata,
+): boolean {
+  return (
+    mergeConflict.pullRequest.number !== null ||
+    mergeConflict.pullRequest.url !== null
+  );
 }
 
 function sortedUnique(values: string[]): string[] {

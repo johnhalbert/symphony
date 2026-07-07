@@ -56,11 +56,23 @@ import {
   ServiceOwnedMergeConflictGit,
   type ServiceOwnedPreservedStashApplyResult,
   type ServiceOwnedMergeConflictPreparationResult,
+  type ServiceOwnedLocalBaseRefreshResult,
 } from "./ServiceOwnedMergeConflictGit.js";
 
 const MERGE_GATE_REVIEWER = "symphony-merge-gate";
 
 type MergeGateFailureRecord = Pick<IssueMergeGateResultRecord | IssueReviewVerdictRecord, "id" | "submittedAt" | "writebackOperationKeys">;
+
+type PreservedStashQueueRestoreResult =
+  | {
+      status: "clean";
+      stashes: IssuePreservedWorktreeStash[];
+    }
+  | {
+      status: "conflicted";
+      stashes: IssuePreservedWorktreeStash[];
+      stashApply: Extract<ServiceOwnedPreservedStashApplyResult, { status: "conflicted" }>;
+    };
 
 export interface MergePolicyGitHubClient {
   getPullRequest(input: { pullRequestNumber: number }): Promise<PullRequestDetails>;
@@ -258,6 +270,7 @@ export interface MergePolicyConflictPreparationExecution {
   resolvedHeadSha: string | null;
   pullRequestHeadSha: string;
   preservedStash: IssuePreservedWorktreeStash | null;
+  preservedStashes: IssuePreservedWorktreeStash[];
   stashApplyResult: ServiceOwnedPreservedStashApplyResult | null;
   finalPreservedStash: IssuePreservedWorktreeStash | null;
 }
@@ -989,6 +1002,7 @@ export class MergePolicyService {
     const authHeader = await github.gitAuthHeader();
     const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
     const operationId = `base-ref:${issue.id}:${requiredOriginalHeadSha}:${requiredLiveBaseHeadSha}`;
+    let preservedStashes = preservedWorktreeStashesOf(lifecycle);
     const preservedStash = await conflictGit.preserveDirtyWorktree({
       workspacePath,
       branchName: requiredBranchName,
@@ -998,13 +1012,31 @@ export class MergePolicyService {
       message: `Symphony preserved local changes before base-ref repair for ${issue.identifier}`,
     });
     if (preservedStash !== null) {
+      preservedStashes = upsertPreservedWorktreeStash(
+        preservedStashes,
+        preservedStash,
+      );
       await this.options.lifecycleStore.updateIssue(latestIssue, {
-        preservedWorktreeStashes: upsertPreservedWorktreeStash(
-          preservedWorktreeStashesOf(lifecycle),
-          preservedStash,
-        ),
+        preservedWorktreeStashes: preservedStashes,
       });
     }
+
+    if (pullRequest === null) {
+      return this.repairLocalOnlyBaseRefDrift({
+        issue: latestIssue,
+        conflictGit,
+        workspacePath,
+        branchName: requiredBranchName,
+        baseBranch: requiredBaseBranch,
+        originalHeadSha: requiredOriginalHeadSha,
+        liveBaseHeadSha: requiredLiveBaseHeadSha,
+        authHeader,
+        operationId,
+        sourceState,
+        preservedStashes,
+      });
+    }
+
     const preparation = await conflictGit.prepare({
       workspacePath,
       branchName: requiredBranchName,
@@ -1022,79 +1054,29 @@ export class MergePolicyService {
         previousRemoteHeadSha: requiredOriginalHeadSha,
         authHeader,
       });
-      let finalPreservedStash = preservedStash;
-      if (preservedStash !== null) {
-        const stashApply = await conflictGit.applyPreservedStash({
+      const restore = await this.restorePreservedStashQueue({
+        issue: latestIssue,
+        conflictGit,
+        workspacePath,
+        branchName: requiredBranchName,
+        stashes: preservedStashes,
+      });
+      preservedStashes = restore.stashes;
+      if (restore.status === "conflicted") {
+        return this.dispatchStashApplyConflict({
+          issue: latestIssue,
+          pullRequest: { ...pullRequest, headSha: preparation.rebasedHeadSha },
+          operationId,
+          sourceState,
+          conflictsState: this.options.config.mergePolicy.conflictsState,
           workspacePath,
           branchName: requiredBranchName,
-          preservedStash,
-        });
-        if (stashApply.status === "conflicted") {
-          const conflictsState = this.options.config.mergePolicy.conflictsState;
-          if (conflictsState === null) {
-            throw new SymphonyError("invalid_request", "merge_policy.conflicts_state is required before Symphony can repair preserved local change conflicts");
-          }
-          const operations = planMergeConflictsWritebacks(
-            {
-              issue: latestIssue,
-              mergeId: `stash-apply:${issue.id}:${preparation.rebasedHeadSha}:${stashApply.stash.stashSha}`,
-              fromState: sourceState,
-              conflictsState,
-              pullRequest: { ...pullRequest, headSha: preparation.rebasedHeadSha },
-              mergeableState: "dirty",
-              reason: "Preserved local changes conflicted while restoring after base-ref repair",
-            },
-            this.options.config,
-          );
-          await this.requireMergeGateWritebacksSucceeded(latestIssue, operations, conflictsState);
-          const now = new Date().toISOString();
-          const conflict = buildStashApplyMergeConflict({
-            issue: latestIssue,
-            pullRequest: { ...pullRequest, headSha: preparation.rebasedHeadSha },
-            sourceState,
-            conflictsState,
-            baseBranch: requiredBaseBranch,
-            baseHeadSha: requiredLiveBaseHeadSha,
-            currentHeadSha: preparation.rebasedHeadSha,
-            preservedStash: stashApply.stash,
-            changedFiles: stashApply.changedFiles,
-            conflictedFiles: stashApply.conflictedFiles,
-            reason: "Preserved local changes conflicted while restoring after base-ref repair",
-            maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
-            now,
-          });
-          const updated = await this.options.lifecycleStore.updateIssue(latestIssue, {
-            phase: "merge_conflict_resolution",
-            blockedReason: null,
-            mergeGate: null,
-            mergeConflict: {
-              ...conflict,
-              writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
-            },
-            preservedWorktreeStashes: upsertPreservedWorktreeStash(
-              preservedWorktreeStashesOf(lifecycle),
-              stashApply.stash,
-            ),
-            summaryPointers: {
-              ciStatus: "conflicted",
-              workspacePath,
-              gitBranchName: requiredBranchName,
-              prUrl: pullRequest.url,
-              prNumber: pullRequest.number,
-              prHeadSha: preparation.rebasedHeadSha,
-              prBranch: requiredBranchName,
-              baseRef: requiredBaseBranch,
-            },
-          });
-          return {
-            status: "conflict_dispatched",
-            gate: emptyGateStatus(operationId, pullRequest, preparation.rebasedHeadSha, this.options.config.mergePolicy.requiredChecks),
-            conflict: updated.mergeConflict ?? conflict,
-          };
-        }
-        finalPreservedStash = await conflictGit.dropPreservedStash({
-          workspacePath,
-          preservedStash: stashApply.stash,
+          baseBranch: requiredBaseBranch,
+          baseHeadSha: requiredLiveBaseHeadSha,
+          currentHeadSha: preparation.rebasedHeadSha,
+          preservedStashes,
+          stashApply: restore.stashApply,
+          reason: "Preserved local changes conflicted while restoring after base-ref repair",
         });
       }
       const operations = planBaseRefRepairWritebacks(
@@ -1107,6 +1089,7 @@ export class MergePolicyService {
           previousHeadSha: requiredOriginalHeadSha,
           rebasedHeadSha: preparation.rebasedHeadSha,
           baseHeadSha: requiredLiveBaseHeadSha,
+          mode: "pr_backed",
         },
         this.options.config,
       );
@@ -1126,12 +1109,7 @@ export class MergePolicyService {
           prBranch: requiredBranchName,
           baseRef: requiredBaseBranch,
         },
-        preservedWorktreeStashes: finalPreservedStash
-          ? upsertPreservedWorktreeStash(
-              preservedWorktreeStashesOf(lifecycle),
-              finalPreservedStash,
-            )
-          : preservedWorktreeStashesOf(lifecycle),
+        preservedWorktreeStashes: preservedStashes,
       });
       return { status: "base_ref_repaired", headSha: preparation.rebasedHeadSha };
     }
@@ -1174,16 +1152,15 @@ export class MergePolicyService {
         ...conflict,
         servicePreparation:
           conflict.servicePreparation?.strategy === "squash_rebase"
-            ? { ...conflict.servicePreparation, preservedStash }
+            ? {
+                ...conflict.servicePreparation,
+                preservedStash:
+                  firstPendingCreatedPreservedStash(preservedStashes),
+              }
             : conflict.servicePreparation,
         writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
       },
-      preservedWorktreeStashes: preservedStash
-        ? upsertPreservedWorktreeStash(
-            preservedWorktreeStashesOf(lifecycle),
-            preservedStash,
-          )
-        : preservedWorktreeStashesOf(lifecycle),
+      preservedWorktreeStashes: preservedStashes,
       summaryPointers: {
         ciStatus: "conflicted",
         workspacePath,
@@ -1198,6 +1175,352 @@ export class MergePolicyService {
     return {
       status: "conflict_dispatched",
       gate: emptyGateStatus(operationId, pullRequest, requiredOriginalHeadSha, this.options.config.mergePolicy.requiredChecks),
+      conflict: updated.mergeConflict ?? conflict,
+    };
+  }
+
+  private async repairLocalOnlyBaseRefDrift(input: {
+    issue: Issue;
+    conflictGit: ServiceOwnedMergeConflictGit;
+    workspacePath: string;
+    branchName: string;
+    baseBranch: string;
+    originalHeadSha: string;
+    liveBaseHeadSha: string;
+    authHeader: string;
+    operationId: string;
+    sourceState: string;
+    preservedStashes: IssuePreservedWorktreeStash[];
+  }): Promise<MergePolicyResult> {
+    let refresh: ServiceOwnedLocalBaseRefreshResult;
+    let preservedStashes = input.preservedStashes;
+    try {
+      refresh = await input.conflictGit.refreshLocalBranchBase({
+        workspacePath: input.workspacePath,
+        branchName: input.branchName,
+        expectedHeadSha: input.originalHeadSha,
+        baseBranch: input.baseBranch,
+        liveBaseHeadSha: input.liveBaseHeadSha,
+        authHeader: input.authHeader,
+      });
+    } catch (error) {
+      const restore = await this.restorePreservedStashQueue({
+        issue: input.issue,
+        conflictGit: input.conflictGit,
+        workspacePath: input.workspacePath,
+        branchName: input.branchName,
+        stashes: preservedStashes,
+      });
+      preservedStashes = restore.stashes;
+      if (restore.status === "conflicted") {
+        return this.dispatchStashApplyConflict({
+          issue: input.issue,
+          pullRequest: {
+            url: null,
+            number: null,
+            headSha: input.originalHeadSha,
+            branch: input.branchName,
+          },
+          operationId: input.operationId,
+          sourceState: input.sourceState,
+          conflictsState: this.options.config.mergePolicy.conflictsState,
+          workspacePath: input.workspacePath,
+          branchName: input.branchName,
+          baseBranch: input.baseBranch,
+          baseHeadSha: input.liveBaseHeadSha,
+          currentHeadSha: input.originalHeadSha,
+          preservedStashes,
+          stashApply: restore.stashApply,
+          reason: "Preserved local changes conflicted while restoring after blocked local-only base refresh",
+        });
+      }
+      const reason = `local-only base refresh blocked: ${messageFromUnknown(error)}`;
+      await this.options.lifecycleStore.updateIssue(input.issue, {
+        phase: "blocked",
+        blockedReason: reason,
+        mergeGate: null,
+        mergeConflict: null,
+        preservedWorktreeStashes: preservedStashes,
+        summaryPointers: {
+          ciStatus: null,
+          workspacePath: input.workspacePath,
+          gitBranchName: input.branchName,
+          prUrl: null,
+          prNumber: null,
+          prHeadSha: null,
+          prBranch: null,
+          baseRef: input.baseBranch,
+        },
+      });
+      return { status: "skipped", reason };
+    }
+
+    const restore = await this.restorePreservedStashQueue({
+      issue: input.issue,
+      conflictGit: input.conflictGit,
+      workspacePath: input.workspacePath,
+      branchName: input.branchName,
+      stashes: preservedStashes,
+    });
+    preservedStashes = restore.stashes;
+    if (restore.status === "conflicted") {
+      return this.dispatchStashApplyConflict({
+        issue: input.issue,
+        pullRequest: {
+          url: null,
+          number: null,
+          headSha: refresh.refreshedHeadSha,
+          branch: input.branchName,
+        },
+        operationId: input.operationId,
+        sourceState: input.sourceState,
+        conflictsState: this.options.config.mergePolicy.conflictsState,
+        workspacePath: input.workspacePath,
+        branchName: input.branchName,
+        baseBranch: input.baseBranch,
+        baseHeadSha: input.liveBaseHeadSha,
+        currentHeadSha: refresh.refreshedHeadSha,
+        preservedStashes,
+        stashApply: restore.stashApply,
+        reason: "Preserved local changes conflicted while restoring after local-only base refresh",
+      });
+    }
+
+    const operations = planBaseRefRepairWritebacks(
+      {
+        issue: input.issue,
+        operationId: input.operationId,
+        fromState: input.sourceState,
+        branchName: input.branchName,
+        baseBranch: input.baseBranch,
+        previousHeadSha: input.originalHeadSha,
+        rebasedHeadSha: refresh.refreshedHeadSha,
+        baseHeadSha: input.liveBaseHeadSha,
+        mode: "local_only",
+      },
+      this.options.config,
+    );
+    await this.requireMergeGateWritebacksSucceeded(
+      input.issue,
+      operations,
+      this.options.config.writeback.dispatchState,
+    );
+    await this.options.lifecycleStore.updateIssue(input.issue, {
+      phase: "implementation",
+      blockedReason: null,
+      mergeGate: null,
+      mergeConflict: null,
+      preservedWorktreeStashes: preservedStashes,
+      summaryPointers: {
+        ciStatus: null,
+        workspacePath: input.workspacePath,
+        gitBranchName: input.branchName,
+        prUrl: null,
+        prNumber: null,
+        prHeadSha: null,
+        prBranch: null,
+        baseRef: input.baseBranch,
+      },
+    });
+    return { status: "base_ref_repaired", headSha: refresh.refreshedHeadSha };
+  }
+
+  async restorePreservedWorktreeStashes(issue: Issue): Promise<MergePolicyResult> {
+    this.requireGatedServiceConfiguration();
+    const latestIssue = (await this.options.tracker.fetchIssueStatesByIds([issue.id]))[0] ?? issue;
+    const lifecycle = await this.options.lifecycleStore.get(issue.id);
+    if (!lifecycle) {
+      throw new SymphonyError("invalid_request", "Preserved stash restore requires an issue lifecycle record");
+    }
+    const activeStashes = restorablePreservedWorktreeStashes(
+      preservedWorktreeStashesOf(lifecycle),
+    );
+    if (activeStashes.length === 0) {
+      return { status: "skipped", reason: "no_restorable_preserved_worktree_stashes" };
+    }
+    const first = activeStashes[0]!;
+    const workspacePath = requireValue(
+      first.workspacePath ?? lifecycle.summaryPointers.workspacePath,
+      "Preserved stash restore requires a workspace path",
+    );
+    const branchName = requireValue(
+      first.branchName ?? lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName,
+      "Preserved stash restore requires a branch name",
+    );
+    const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
+    const restore = await this.restorePreservedStashQueue({
+      issue: latestIssue,
+      conflictGit,
+      workspacePath,
+      branchName,
+      stashes: preservedWorktreeStashesOf(lifecycle),
+    });
+    if (restore.status === "conflicted") {
+      const pullRequest = pullRequestRefForPreservedStashRestore(
+        lifecycle,
+        branchName,
+        restore.stashApply.headSha,
+      );
+      return this.dispatchStashApplyConflict({
+        issue: latestIssue,
+        pullRequest,
+        operationId: restore.stashApply.stash.operationId,
+        sourceState: latestIssue.state,
+        conflictsState: this.options.config.mergePolicy.conflictsState,
+        workspacePath,
+        branchName,
+        baseBranch:
+          restore.stashApply.stash.baseBranch ??
+          lifecycle.summaryPointers.baseRef ??
+          this.options.config.workspace.source.baseRef ??
+          null,
+        baseHeadSha:
+          lifecycle.baseRefObservation?.localBaseHeadShaAfterFetch ??
+          lifecycle.baseRefObservation?.githubBaseHeadSha ??
+          null,
+        currentHeadSha: restore.stashApply.headSha,
+        preservedStashes: restore.stashes,
+        stashApply: restore.stashApply,
+        reason: "Preserved local changes conflicted while restoring before worker dispatch",
+      });
+    }
+    await this.options.lifecycleStore.updateIssue(latestIssue, {
+      preservedWorktreeStashes: restore.stashes,
+      blockedReason: lifecycle.phase === "blocked" ? lifecycle.blockedReason : null,
+      summaryPointers: {
+        workspacePath,
+        gitBranchName: branchName,
+      },
+    });
+    return { status: "skipped", reason: "preserved_worktree_stashes_restored" };
+  }
+
+  private async restorePreservedStashQueue(input: {
+    issue: Issue;
+    conflictGit: ServiceOwnedMergeConflictGit;
+    workspacePath: string;
+    branchName: string;
+    stashes: IssuePreservedWorktreeStash[];
+  }): Promise<PreservedStashQueueRestoreResult> {
+    let stashes = input.stashes;
+    for (const stash of restorablePreservedWorktreeStashes(stashes)) {
+      if (
+        stash.workspacePath !== input.workspacePath ||
+        stash.branchName !== input.branchName
+      ) {
+        continue;
+      }
+      if (stash.status === "created") {
+        const stashApply = await input.conflictGit.applyPreservedStash({
+          workspacePath: input.workspacePath,
+          branchName: input.branchName,
+          preservedStash: stash,
+        });
+        stashes = upsertPreservedWorktreeStash(stashes, stashApply.stash);
+        await this.options.lifecycleStore.updateIssue(input.issue, {
+          preservedWorktreeStashes: stashes,
+        });
+        if (stashApply.status === "conflicted") {
+          return { status: "conflicted", stashes, stashApply };
+        }
+        const dropped = await input.conflictGit.dropPreservedStash({
+          workspacePath: input.workspacePath,
+          preservedStash: stashApply.stash,
+        });
+        stashes = upsertPreservedWorktreeStash(stashes, dropped);
+        await this.options.lifecycleStore.updateIssue(input.issue, {
+          preservedWorktreeStashes: stashes,
+        });
+        continue;
+      }
+      const dropped = await input.conflictGit.dropPreservedStash({
+        workspacePath: input.workspacePath,
+        preservedStash: stash,
+      });
+      stashes = upsertPreservedWorktreeStash(stashes, dropped);
+      await this.options.lifecycleStore.updateIssue(input.issue, {
+        preservedWorktreeStashes: stashes,
+      });
+    }
+    return { status: "clean", stashes };
+  }
+
+  private async dispatchStashApplyConflict(input: {
+    issue: Issue;
+    pullRequest: CompletionReportPullRequestRef;
+    operationId: string;
+    sourceState: string;
+    conflictsState: string | null;
+    workspacePath: string;
+    branchName: string;
+    baseBranch: string | null;
+    baseHeadSha: string | null;
+    currentHeadSha: string;
+    preservedStashes: IssuePreservedWorktreeStash[];
+    stashApply: Extract<ServiceOwnedPreservedStashApplyResult, { status: "conflicted" }>;
+    reason: string;
+  }): Promise<MergePolicyResult> {
+    const conflictsState = input.conflictsState;
+    if (conflictsState === null) {
+      throw new SymphonyError("invalid_request", "merge_policy.conflicts_state is required before Symphony can repair preserved local change conflicts");
+    }
+    const operations = planMergeConflictsWritebacks(
+      {
+        issue: input.issue,
+        mergeId: `stash-apply:${input.issue.id}:${input.currentHeadSha}:${input.stashApply.stash.stashSha}`,
+        fromState: input.sourceState,
+        conflictsState,
+        pullRequest: { ...input.pullRequest, headSha: input.currentHeadSha },
+        mergeableState: "dirty",
+        reason: input.reason,
+      },
+      this.options.config,
+    );
+    await this.requireMergeGateWritebacksSucceeded(input.issue, operations, conflictsState);
+    const now = new Date().toISOString();
+    const conflict = buildStashApplyMergeConflict({
+      issue: input.issue,
+      pullRequest: { ...input.pullRequest, headSha: input.currentHeadSha },
+      sourceState: input.sourceState,
+      conflictsState,
+      baseBranch: input.baseBranch,
+      baseHeadSha: input.baseHeadSha,
+      currentHeadSha: input.currentHeadSha,
+      preservedStash: input.stashApply.stash,
+      changedFiles: input.stashApply.changedFiles,
+      conflictedFiles: input.stashApply.conflictedFiles,
+      reason: input.reason,
+      maxFixTurns: this.options.config.mergePolicy.maxConflictFixTurns,
+      now,
+    });
+    const updated = await this.options.lifecycleStore.updateIssue(input.issue, {
+      phase: "merge_conflict_resolution",
+      blockedReason: null,
+      mergeGate: null,
+      mergeConflict: {
+        ...conflict,
+        writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
+      },
+      preservedWorktreeStashes: input.preservedStashes,
+      summaryPointers: {
+        ciStatus: "conflicted",
+        workspacePath: input.workspacePath,
+        gitBranchName: input.branchName,
+        prUrl: input.pullRequest.url,
+        prNumber: input.pullRequest.number,
+        prHeadSha: input.currentHeadSha,
+        prBranch: input.pullRequest.branch ?? input.branchName,
+        baseRef: input.baseBranch,
+      },
+    });
+    return {
+      status: "conflict_dispatched",
+      gate: emptyGateStatus(
+        input.operationId,
+        input.pullRequest,
+        input.currentHeadSha,
+        this.options.config.mergePolicy.requiredChecks,
+      ),
       conflict: updated.mergeConflict ?? conflict,
     };
   }
@@ -1248,6 +1571,7 @@ export class MergePolicyService {
     const authHeader = await github.gitAuthHeader();
     const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
     const operationId = `${plan.mode === "base_refresh" ? "service-conflict-base-refresh" : "service-conflict"}:${issue.id}:${plan.expectedHeadSha}:${plan.baseObservation.liveBaseHeadSha}`;
+    let preservedStashes = preservedWorktreeStashesOf(plan.lifecycle);
     const preservedStash = await conflictGit.preserveDirtyWorktree({
       workspacePath: plan.workspacePath,
       branchName: plan.branchName,
@@ -1257,11 +1581,12 @@ export class MergePolicyService {
       message: `Symphony preserved local changes before service conflict repair for ${issue.identifier}`,
     });
     if (preservedStash !== null) {
+      preservedStashes = upsertPreservedWorktreeStash(
+        preservedStashes,
+        preservedStash,
+      );
       await this.options.lifecycleStore.updateIssue(issue, {
-        preservedWorktreeStashes: upsertPreservedWorktreeStash(
-          preservedWorktreeStashesOf(plan.lifecycle),
-          preservedStash,
-        ),
+        preservedWorktreeStashes: preservedStashes,
       });
     }
     const preparation =
@@ -1290,8 +1615,10 @@ export class MergePolicyService {
       resolvedHeadSha: preparation.status === "clean" ? preparation.rebasedHeadSha : null,
       pullRequestHeadSha: preparation.status === "clean" ? preparation.rebasedHeadSha : plan.expectedHeadSha,
       preservedStash,
+      preservedStashes,
       stashApplyResult: null,
-      finalPreservedStash: preservedStash,
+      finalPreservedStash:
+        firstPendingCreatedPreservedStash(preservedStashes),
     };
   }
 
@@ -1315,34 +1642,24 @@ export class MergePolicyService {
     plan: MergePolicyConflictPreparationPlan,
     execution: MergePolicyConflictPreparationExecution,
   ): Promise<void> {
-    if (execution.preservedStash === null || execution.preparation.status !== "clean") return;
+    if (execution.preparation.status !== "clean") return;
     const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
-    const stashApply = await conflictGit.applyPreservedStash({
+    const restore = await this.restorePreservedStashQueue({
+      issue,
+      conflictGit,
       workspacePath: plan.workspacePath,
       branchName: plan.branchName,
-      preservedStash: execution.preservedStash,
+      stashes: execution.preservedStashes,
     });
-    execution.stashApplyResult = stashApply;
-    if (stashApply.status === "clean") {
-      execution.finalPreservedStash = await conflictGit.dropPreservedStash({
-        workspacePath: plan.workspacePath,
-        preservedStash: stashApply.stash,
-      });
-      await this.options.lifecycleStore.updateIssue(issue, {
-        preservedWorktreeStashes: upsertPreservedWorktreeStash(
-          preservedWorktreeStashesOf(plan.lifecycle),
-          execution.finalPreservedStash,
-        ),
-      });
+    execution.preservedStashes = restore.stashes;
+    if (restore.status === "clean") {
+      execution.finalPreservedStash =
+        latestRestoredPreservedStash(restore.stashes) ??
+        firstPendingCreatedPreservedStash(restore.stashes);
       return;
     }
-    execution.finalPreservedStash = stashApply.stash;
-    await this.options.lifecycleStore.updateIssue(issue, {
-      preservedWorktreeStashes: upsertPreservedWorktreeStash(
-        preservedWorktreeStashesOf(plan.lifecycle),
-        stashApply.stash,
-      ),
-    });
+    execution.stashApplyResult = restore.stashApply;
+    execution.finalPreservedStash = restore.stashApply.stash;
   }
 
   planServiceConflictWritebacks(
@@ -1459,12 +1776,7 @@ export class MergePolicyService {
         ...conflict,
         writebackOperationKeys: operationKeys,
       },
-      preservedWorktreeStashes: execution.finalPreservedStash
-        ? upsertPreservedWorktreeStash(
-            preservedWorktreeStashesOf(plan.lifecycle),
-            execution.finalPreservedStash,
-          )
-        : preservedWorktreeStashesOf(plan.lifecycle),
+      preservedWorktreeStashes: execution.preservedStashes,
       summaryPointers: {
         ciStatus:
           phase === "implementation"
@@ -2531,14 +2843,90 @@ function pullRequestForBaseRefRepair(
   lifecycle: IssueLifecycleRecord,
   branchName: string,
   headSha: string,
+): CompletionReportPullRequestRef | null {
+  const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+  const url = reportPullRequest?.url ?? lifecycle.summaryPointers.prUrl;
+  const number = reportPullRequest?.number ?? lifecycle.summaryPointers.prNumber;
+  const remoteHeadSha =
+    reportPullRequest?.headSha ?? lifecycle.summaryPointers.prHeadSha;
+  const branch =
+    reportPullRequest?.branch ?? lifecycle.summaryPointers.prBranch ?? null;
+  const hasRemoteMetadata =
+    reportPullRequest !== null ||
+    url !== null ||
+    number !== null ||
+    remoteHeadSha !== null ||
+    branch !== null;
+  if (!hasRemoteMetadata) return null;
+  if (remoteHeadSha === null) {
+    throw new SymphonyError(
+      "invalid_request",
+      "PR-backed base-ref repair requires lifecycle PR head metadata",
+    );
+  }
+  requireMatches("lifecycle PR head SHA", remoteHeadSha, headSha);
+  return {
+    url,
+    number,
+    headSha,
+    branch: branch ?? branchName,
+  };
+}
+
+function pullRequestRefForPreservedStashRestore(
+  lifecycle: IssueLifecycleRecord,
+  branchName: string,
+  headSha: string,
 ): CompletionReportPullRequestRef {
   const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
   return {
     url: reportPullRequest?.url ?? lifecycle.summaryPointers.prUrl,
     number: reportPullRequest?.number ?? lifecycle.summaryPointers.prNumber,
     headSha,
-    branch: reportPullRequest?.branch ?? lifecycle.summaryPointers.prBranch ?? branchName,
+    branch:
+      reportPullRequest?.branch ??
+      lifecycle.summaryPointers.prBranch ??
+      branchName,
   };
+}
+
+function restorablePreservedWorktreeStashes(
+  stashes: readonly IssuePreservedWorktreeStash[],
+): IssuePreservedWorktreeStash[] {
+  return stashes.filter(
+    (stash) =>
+      stash.status === "created" ||
+      stash.status === "applied_clean" ||
+      stash.status === "finalized" ||
+      stash.status === "drop_failed",
+  );
+}
+
+function firstPendingCreatedPreservedStash(
+  stashes: readonly IssuePreservedWorktreeStash[],
+): IssuePreservedWorktreeStash | null {
+  return stashes.find((stash) => stash.status === "created") ?? null;
+}
+
+function latestRestoredPreservedStash(
+  stashes: readonly IssuePreservedWorktreeStash[],
+): IssuePreservedWorktreeStash | null {
+  for (let index = stashes.length - 1; index >= 0; index -= 1) {
+    const stash = stashes[index]!;
+    if (
+      stash.status === "applied_clean" ||
+      stash.status === "finalized" ||
+      stash.status === "dropped" ||
+      stash.status === "drop_failed"
+    ) {
+      return stash;
+    }
+  }
+  return null;
+}
+
+function messageFromUnknown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function buildBaseRefRepairMergeConflict(input: {
