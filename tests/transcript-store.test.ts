@@ -399,7 +399,7 @@ describe("FileRunTranscriptStore", () => {
       source: "harness",
       eventType: "progress",
       message:
-        "assistant token=SECRET_TOKEN access_token=legacy-access refreshToken: legacy-refresh github_token=legacy-github client_secret: legacy-client private_key=legacy-private ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+        "assistant token=SECRET_TOKEN access_token=legacy-access refreshToken: legacy-refresh github_token=legacy-github client_secret: legacy-client private_key=legacy-private ghp_ABCDEFGH1 ghr_ABCDEFGH5 ghs_ABCDEFGH2 github_pat_ABCDEFGH3 lin_ABCDEFGH4 sk-ABCDEFGH1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
       payload: {
         token: "SECRET_PAYLOAD",
         nested: {
@@ -434,6 +434,10 @@ describe("FileRunTranscriptStore", () => {
     expect(JSON.stringify(page)).not.toContain("legacy-client");
     expect(JSON.stringify(page)).not.toContain("legacy-private");
     expect(JSON.stringify(page)).not.toContain("ghp_ABCDEFGH1");
+    expect(JSON.stringify(page)).not.toContain("ghr_ABCDEFGH5");
+    expect(JSON.stringify(page)).not.toContain("ghs_ABCDEFGH2");
+    expect(JSON.stringify(page)).not.toContain("github_pat_ABCDEFGH3");
+    expect(JSON.stringify(page)).not.toContain("lin_ABCDEFGH4");
     expect(JSON.stringify(page)).not.toContain("sk-ABCDEFGH1");
     expect(page.events[0]).toMatchObject({
       message: expect.stringContaining("token=[redacted]"),

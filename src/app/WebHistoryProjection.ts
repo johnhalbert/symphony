@@ -683,7 +683,6 @@ function isSensitiveParamId(id: string): boolean {
 }
 
 function promptPreview(prompt: string): string {
-  const oneLine = prompt.replace(/\s+/g, " ").trim();
-  if (oneLine.length === 0) return "Untitled run";
-  return oneLine.length <= 120 ? oneLine : oneLine.slice(0, 117) + "...";
+  const preview = sanitizedPreviewValue(prompt, 120).preview?.trim() ?? "";
+  return preview.length > 0 ? preview : "Untitled run";
 }

@@ -726,7 +726,7 @@ export function redactSensitiveText(input: string, extraSecrets: string[] = []):
   }
   return redacted
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/-]+=*/gi, "$1 [REDACTED]")
-    .replace(/\b(cursor|sk|ghp|gho|ghu|ghs|github_pat|lin)_[A-Za-z0-9_=-]{12,}/gi, "[REDACTED]")
+    .replace(/\b(?:sk-[A-Za-z0-9_=-]{12,}|(?:cursor|ghp|gho|ghu|ghs|github_pat|lin)_[A-Za-z0-9_=-]{12,})/gi, "[REDACTED]")
     .replace(/\b([A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|AUTH)[A-Z0-9_]*)=([^\s,;]+)/gi, "$1=[REDACTED]")
     .replace(/("?(?:token|api[_-]?key|secret|password|authorization)"?\s*:\s*)"[^"]+"/gi, "$1\"[REDACTED]\"");
 }

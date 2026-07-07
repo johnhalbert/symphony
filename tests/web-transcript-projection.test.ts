@@ -1588,7 +1588,7 @@ describe("projectWebTranscript", () => {
     const messages = projectWebTranscript([], {
       run: runRecord({
         status: "succeeded",
-        prompt: "Replay the completed transcript safely",
+        prompt: "Replay the completed transcript safely with ghr_ABCDEFGH5 ghs_ABCDEFGH2 github_pat_ABCDEFGH3 lin_ABCDEFGH4",
         repoPath: "https://buildbot:ghp_SECRET_REPO_TOKEN@github.com/acme/symphony",
         projectContext: {
           projectContextId: "red",
@@ -1621,7 +1621,7 @@ describe("projectWebTranscript", () => {
         ts: "2026-01-01T00:00:00.000Z",
         from: "orchestrator",
         issue: "TEST-1",
-        text: "Replay the completed transcript safely",
+        text: "Replay the completed transcript safely with [redacted] [redacted] [redacted] [redacted]",
         projectContext: {
           id: "red",
           label: "Red Team",
@@ -1631,6 +1631,10 @@ describe("projectWebTranscript", () => {
       },
     ]);
     expect(JSON.stringify(messages)).not.toContain("ghp_SECRET_REPO_TOKEN");
+    expect(JSON.stringify(messages)).not.toContain("ghr_ABCDEFGH5");
+    expect(JSON.stringify(messages)).not.toContain("ghs_ABCDEFGH2");
+    expect(JSON.stringify(messages)).not.toContain("github_pat_ABCDEFGH3");
+    expect(JSON.stringify(messages)).not.toContain("lin_ABCDEFGH4");
   });
 
   it("preserves legacy default context attribution while omitting local repo paths", () => {

@@ -91,6 +91,23 @@ describe("projectWebHistory", () => {
     expect(JSON.stringify(model.sessions[0])).not.toContain("repo-secret");
   });
 
+  it("redacts prompt-derived fallback titles before projecting history sessions", () => {
+    const model = projectWebHistory([
+      run({
+        issueIdentifier: "",
+        prompt: "Investigate ghr_ABCDEFGH5 ghs_ABCDEFGH2 github_pat_ABCDEFGH3 lin_ABCDEFGH4 during replay",
+      }),
+    ]);
+
+    expect(model.sessions[0]).toMatchObject({
+      title: "Investigate [redacted] [redacted] [redacted] [redacted] during replay",
+    });
+    expect(JSON.stringify(model.sessions[0])).not.toContain("ghr_ABCDEFGH5");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("ghs_ABCDEFGH2");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("github_pat_ABCDEFGH3");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("lin_ABCDEFGH4");
+  });
+
   it("filters sessions and timeline to matching project context records", () => {
     const docsProjectContext: TestProjectContext = {
       projectContextId: "docs",
