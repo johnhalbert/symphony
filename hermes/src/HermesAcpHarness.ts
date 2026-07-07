@@ -745,6 +745,18 @@ export class HermesAcpHarness implements AgentHarness {
     this.retiredReusableLeaseReasons.clear();
   }
 
+  forceDispose(reason: string): void {
+    for (const activeRun of this.activeRuns.values()) this.abortPendingPermissionRequests(activeRun, "force_dispose");
+    for (const lease of this.leases.values()) {
+      lease.client.kill(`hermes_acp.force_dispose.${reason}`);
+      lease.disposed = true;
+    }
+    this.leases.clear();
+    this.activeRuns.clear();
+    this.cancelledRuns.clear();
+    this.retiredReusableLeaseReasons.clear();
+  }
+
   private async getOrCreateLease(ctx: AgentRunContext, runId: string): Promise<HermesAcpLeaseAcquisition> {
     const policy = hermesAcpLeaseReusePolicy(ctx);
     const scopeKey = reusableLeaseScopeKey(ctx);

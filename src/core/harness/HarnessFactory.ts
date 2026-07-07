@@ -9,6 +9,7 @@ import { HermesHarness } from "../../../hermes/src/HermesHarness.js";
 
 export interface DisposableAgentHarness extends AgentHarness {
   dispose?(): Promise<void>;
+  forceDispose?(reason: string): void;
 }
 
 export type AgentHarnessProvider = (

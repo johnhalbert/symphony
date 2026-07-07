@@ -246,6 +246,10 @@ import type {
   OrchestratorChatCommand,
   OrchestratorChatCommandResult,
 } from "./OrchestratorChatCommand.js";
+import {
+  runShutdownAction,
+  type ShutdownProgressObserver,
+} from "../shutdown/ShutdownProgress.js";
 
 export interface OrchestratorOptions {
   config: ServiceConfig;
@@ -272,6 +276,10 @@ export interface OrchestratorOptions {
   orchestratorConversationStore?: OrchestratorConversationStore;
   statusServerBaseUrl?: () => string | null;
   statusMutationToken?: string | null;
+}
+
+export interface OrchestratorStopOptions {
+  progress?: ShutdownProgressObserver | undefined;
 }
 
 export interface IssueHistoryInspectionResult {
@@ -1062,34 +1070,154 @@ export class Orchestrator {
     this.scheduleTick(0);
   }
 
-  async stop(): Promise<void> {
+  async stop(options: OrchestratorStopOptions = {}): Promise<void> {
+    const progress = options.progress;
     this.stopped = true;
-    if (this.pollTimer) clearTimeout(this.pollTimer);
-    for (const retry of this.retryAttempts.values()) clearTimeout(retry.timer);
-    for (const entry of this.operatorChatRuns.values()) {
-      entry.abortController.abort();
+    if (this.pollTimer) {
+      const timer = this.pollTimer;
+      await runShutdownAction({
+        logger: this.options.logger,
+        progress,
+        action: {
+          id: "orchestrator.poll_timer.clear",
+          label: "clearing orchestrator poll timer",
+          component: "orchestrator",
+        },
+        run: () => {
+          clearTimeout(timer);
+          this.pollTimer = null;
+        },
+      });
+    }
+    const retries = [...this.retryAttempts.values()];
+    for (const [index, retry] of retries.entries()) {
+      await runShutdownAction({
+        logger: this.options.logger,
+        progress,
+        action: {
+          id: `orchestrator.retry_timer.clear.${retry.issueId}.${retry.attempt}.${index}`,
+          label: `clearing retry timer ${index + 1}/${retries.length} for ${retry.identifier}`,
+          component: "orchestrator",
+          fields: {
+            index: index + 1,
+            total: retries.length,
+            issue_id: retry.issueId,
+            issue_identifier: retry.identifier,
+            attempt: retry.attempt,
+            run_phase: retry.runPhase,
+            delay_ms: retry.delayMs,
+          },
+        },
+        run: () => clearTimeout(retry.timer),
+      });
+    }
+    const operatorChats = [...this.operatorChatRuns.values()];
+    for (const [index, entry] of operatorChats.entries()) {
+      await runShutdownAction({
+        logger: this.options.logger,
+        progress,
+        action: {
+          id: `orchestrator.operator_chat.abort.${entry.conversationId}.${entry.messageId}.${index}`,
+          label: `aborting operator chat ${index + 1}/${operatorChats.length} for ${entry.conversationId}`,
+          component: "orchestrator",
+          fields: {
+            index: index + 1,
+            total: operatorChats.length,
+            conversation_id: entry.conversationId,
+            message_id: entry.messageId,
+            run_id: entry.runId,
+            session_id: entry.sessionId,
+          },
+        },
+        run: () => entry.abortController.abort(),
+      });
       const stopRunId = entry.runId;
       if (stopRunId) {
-        await this.options.harness.stop?.(stopRunId).catch((error: unknown) => {
-          this.options.logger.warn("operator chat harness stop failed", {
-            run_id: stopRunId,
-            conversation_id: entry.conversationId,
-            error: errorMessage(error),
-          });
+        await runShutdownAction({
+          logger: this.options.logger,
+          progress,
+          action: {
+            id: `orchestrator.operator_chat.harness_stop.${stopRunId}`,
+            label: `requesting harness stop for operator chat ${index + 1}/${operatorChats.length} (${stopRunId})`,
+            component: "orchestrator",
+            fields: {
+              index: index + 1,
+              total: operatorChats.length,
+              conversation_id: entry.conversationId,
+              message_id: entry.messageId,
+              run_id: stopRunId,
+              session_id: entry.sessionId,
+            },
+          },
+          run: async () => {
+            await this.options.harness.stop?.(stopRunId).catch((error: unknown) => {
+              this.options.logger.warn("operator chat harness stop failed", {
+                run_id: stopRunId,
+                conversation_id: entry.conversationId,
+                error: errorMessage(error),
+              });
+            });
+          },
         });
       }
     }
-    for (const [issueId, running] of this.running) {
+    const runningEntries = [...this.running.entries()];
+    for (const [index, [issueId, running]] of runningEntries.entries()) {
       running.suppressRetryOnExit = true;
       const stopRunId = this.harnessStopRunId(running);
-      this.markCancellationRequested(running, {
-        source: "service_stop",
-        reason: "orchestrator stop",
-        abortSignalled: true,
-        harnessStopRequested: stopRunId !== null,
+      await runShutdownAction({
+        logger: this.options.logger,
+        progress,
+        action: {
+          id: `orchestrator.run.abort.${issueId}.${index}`,
+          label: `aborting run ${index + 1}/${runningEntries.length} for ${running.issue.identifier}`,
+          component: "orchestrator",
+          fields: {
+            index: index + 1,
+            total: runningEntries.length,
+            issue_id: issueId,
+            issue_identifier: running.issue.identifier,
+            run_id: running.runId,
+            active_run_id: running.activeRunId,
+            session_id: running.sessionId,
+            role: running.role,
+            run_phase: running.runPhase,
+          },
+        },
+        run: () => {
+          this.markCancellationRequested(running, {
+            source: "service_stop",
+            reason: "orchestrator stop",
+            abortSignalled: true,
+            harnessStopRequested: stopRunId !== null,
+          });
+          running.abortController.abort();
+        },
       });
-      running.abortController.abort();
-      if (stopRunId !== null) await this.requestHarnessStop(running, stopRunId);
+      if (stopRunId !== null) {
+        await runShutdownAction({
+          logger: this.options.logger,
+          progress,
+          action: {
+            id: `orchestrator.run.harness_stop.${issueId}.${stopRunId}`,
+            label: `requesting harness stop for run ${index + 1}/${runningEntries.length} (${running.issue.identifier})`,
+            component: "orchestrator",
+            fields: {
+              index: index + 1,
+              total: runningEntries.length,
+              issue_id: issueId,
+              issue_identifier: running.issue.identifier,
+              run_id: running.runId,
+              active_run_id: running.activeRunId,
+              stop_run_id: stopRunId,
+              session_id: running.sessionId,
+              role: running.role,
+              run_phase: running.runPhase,
+            },
+          },
+          run: () => this.requestHarnessStop(running, stopRunId),
+        });
+      }
     }
     const workers = new Set([
       ...this.activeWorkers,
@@ -1098,9 +1226,44 @@ export class Orchestrator {
       ...[...this.operatorChatRuns.values()].map((entry) => entry.worker),
       ...this.operatorChatQueues.values(),
     ]);
-    await Promise.allSettled([...workers]);
-    await this.issueStateStore.close?.();
-    await this.mergeQueueStore.close?.();
+    await runShutdownAction({
+      logger: this.options.logger,
+      progress,
+      action: {
+        id: "orchestrator.workers.wait",
+        label: `waiting for ${workers.size} orchestrator worker(s) to settle`,
+        component: "orchestrator",
+        fields: {
+          total: workers.size,
+          active_workers: this.activeWorkers.size,
+          active_retry_workers: this.activeRetryWorkers.size,
+          running_entries: this.running.size,
+          operator_chat_runs: this.operatorChatRuns.size,
+          operator_chat_queues: this.operatorChatQueues.size,
+        },
+      },
+      run: () => Promise.allSettled([...workers]),
+    });
+    await runShutdownAction({
+      logger: this.options.logger,
+      progress,
+      action: {
+        id: "orchestrator.issue_state_store.close",
+        label: "closing issue state store",
+        component: "orchestrator",
+      },
+      run: () => this.issueStateStore.close?.(),
+    });
+    await runShutdownAction({
+      logger: this.options.logger,
+      progress,
+      action: {
+        id: "orchestrator.merge_queue_store.close",
+        label: "closing merge queue store",
+        component: "orchestrator",
+      },
+      run: () => this.mergeQueueStore.close?.(),
+    });
   }
 
   updateConfig(config: ServiceConfig, promptTemplate: string): void {

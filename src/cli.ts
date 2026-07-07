@@ -69,6 +69,13 @@ import { runReviewVerdictMcpServer } from "./core/harness/ReviewVerdictMcpServer
 import { runTranscriptRecallMcpServer } from "./core/harness/TranscriptRecallMcpServer.js";
 import { runAgentCommandPolicyHookStdio } from "./core/harness/AgentCommandPolicyHookRunner.js";
 import { FileOperatorApprovalStore, OperatorApprovalService } from "./core/approval/OperatorApprovalService.js";
+import { installCtrlCInterceptor } from "./core/shutdown/CtrlCInterceptor.js";
+import { ShutdownCoordinator } from "./core/shutdown/ShutdownCoordinator.js";
+import { ShutdownStatusLine } from "./core/shutdown/ShutdownStatusLine.js";
+import {
+  runShutdownAction,
+  type ShutdownProgressObserver,
+} from "./core/shutdown/ShutdownProgress.js";
 import {
   createRuntimeTrackerClient,
   createRuntimeWritebackProcessor,
@@ -697,7 +704,14 @@ program
     "serve the built React web asset root under /web (usually web/dist)",
   )
   .action(async (workflow: string, options: { port?: string; host?: string; webAssetsRoot?: string }) => {
-    const logger = new StructuredLogger();
+    let shutdownStatusLine: ShutdownStatusLine | null = null;
+    const logger = new StructuredLogger((line) => {
+      if (shutdownStatusLine) {
+        shutdownStatusLine.writeLogLine(line);
+      } else {
+        process.stderr.write(`${line}\n`);
+      }
+    });
     const workflowPath = path.resolve(process.cwd(), workflow);
     try {
       const auth = await ensureLinearOAuthStartupAuth({ workflowPath, parentEnv: process.env });
@@ -725,6 +739,10 @@ program
             : resolveCliPathOption(options.webAssetsRoot),
       },
     };
+    shutdownStatusLine = new ShutdownStatusLine({
+      stream: process.stderr,
+      graceMs: config.hermes.shutdownGraceMs,
+    });
 
     const configRef = { value: config };
 
@@ -822,19 +840,101 @@ program
     await orchestrator.start();
     logger.info("symphony started", { workflow_path: workflowPath });
 
-    const shutdown = async () => {
-      logger.info("symphony shutting down");
-      await orchestrator.stop();
-      await writeback?.close();
-      await writebackOutbox.close();
-      await statusServer?.stop();
-      await projectionPersistence?.close();
-      await loader.close();
-      await harness.dispose?.();
-      process.exit(0);
-    };
-    process.on("SIGINT", () => void shutdown());
-    process.on("SIGTERM", () => void shutdown());
+    let restoreCtrlCInterceptor: () => void = () => undefined;
+    const shutdownCoordinator = new ShutdownCoordinator({
+      logger,
+      progress: shutdownStatusLine,
+      graceMs: config.hermes.shutdownGraceMs,
+      shutdown: async (progress?: ShutdownProgressObserver) => {
+        await runShutdownAction({
+          logger,
+          progress,
+          action: {
+            id: "cli.orchestrator.stop",
+            label: "stopping orchestrator",
+            component: "cli",
+          },
+          run: () => orchestrator.stop({ progress }),
+        });
+        if (writeback) {
+          await runShutdownAction({
+            logger,
+            progress,
+            action: {
+              id: "cli.writeback.close",
+              label: "closing writeback processor",
+              component: "cli",
+            },
+            run: () => writeback.close(),
+          });
+        }
+        await runShutdownAction({
+          logger,
+          progress,
+          action: {
+            id: "cli.writeback_outbox.close",
+            label: "closing writeback outbox",
+            component: "cli",
+          },
+          run: () => writebackOutbox.close(),
+        });
+        if (statusServer) {
+          await runShutdownAction({
+            logger,
+            progress,
+            action: {
+              id: "cli.status_server.stop",
+              label: "stopping status server",
+              component: "cli",
+            },
+            run: () => statusServer.stop(),
+          });
+        }
+        if (projectionPersistence) {
+          await runShutdownAction({
+            logger,
+            progress,
+            action: {
+              id: "cli.projection_persistence.close",
+              label: "closing projection persistence",
+              component: "cli",
+            },
+            run: () => projectionPersistence.close(),
+          });
+        }
+        await runShutdownAction({
+          logger,
+          progress,
+          action: {
+            id: "cli.workflow_loader.close",
+            label: "closing workflow loader",
+            component: "cli",
+          },
+          run: () => loader.close(),
+        });
+        if (harness.dispose) {
+          await runShutdownAction({
+            logger,
+            progress,
+            action: {
+              id: "cli.harness.dispose",
+              label: "disposing harness",
+              component: "cli",
+              fields: { harness_id: harness.id },
+            },
+            run: () => harness.dispose?.(),
+          });
+        }
+      },
+      forceDispose: (reason) => harness.forceDispose?.(reason),
+      exit: (code) => {
+        restoreCtrlCInterceptor();
+        process.exit(code);
+      },
+    });
+    restoreCtrlCInterceptor = installCtrlCInterceptor(process.stdin, () => shutdownCoordinator.request("stdin_ctrl_c"));
+    process.on("SIGINT", () => shutdownCoordinator.request("sigint"));
+    process.on("SIGTERM", () => shutdownCoordinator.request("sigterm"));
   });
 
 program.parseAsync().catch((error) => {

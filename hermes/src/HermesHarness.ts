@@ -287,6 +287,16 @@ export class HermesHarness implements AgentHarness {
     this.leases.clear();
   }
 
+  forceDispose(reason: string): void {
+    for (const lease of this.leases.values()) {
+      lease.client.kill(`hermes.force_dispose.${reason}`);
+      lease.disposed = true;
+    }
+    this.leases.clear();
+    this.activeRuns.clear();
+    this.cancelledRuns.clear();
+  }
+
   private async getOrCreateLease(ctx: AgentRunContext): Promise<HermesLease> {
     const reusable = shouldReuseLease(ctx);
     const resume = ctx.hermesResume ?? null;

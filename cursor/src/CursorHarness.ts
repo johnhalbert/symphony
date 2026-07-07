@@ -645,6 +645,13 @@ export class CursorHarness implements AgentHarness {
     if (run) await run.cancel();
   }
 
+  forceDispose(reason: string): void {
+    void reason;
+    for (const run of this.activeRuns.values()) {
+      void run.cancel().catch(() => undefined);
+    }
+  }
+
   async dispose(): Promise<void> {
     await Promise.all([...this.agents.values()].map((agent) => this.disposeAgent(agent, null, "harness_dispose")));
     this.agents.clear();

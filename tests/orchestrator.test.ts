@@ -46,6 +46,8 @@ import {
   Orchestrator,
   sortIssuesForDispatch,
   type PullRequestDiscoveryClient,
+  type RetryEntry,
+  type RunningEntry,
 } from "../src/core/orchestrator/Orchestrator.js";
 import { IssueOrchestrationEngine } from "../src/core/orchestration/IssueOrchestrationEngine.js";
 import type {
@@ -13098,6 +13100,80 @@ describe("Orchestrator", () => {
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
   });
 
+  it("logs and reports each orchestrator shutdown action while continuing after harness stop failure", async () => {
+    const config = testConfig(root);
+    const logs: string[] = [];
+    const logger = new StructuredLogger((line) => logs.push(line));
+    const stoppedRunIds: string[] = [];
+    const harness: AgentHarness = {
+      id: "shutdown-recording",
+      async *run(): AsyncIterable<AgentEvent> {
+        return;
+      },
+      async stop(runId: string): Promise<void> {
+        stoppedRunIds.push(runId);
+        throw new Error("planned stop failure");
+      },
+    };
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const internal = orchestrator as unknown as {
+      pollTimer: NodeJS.Timeout | null;
+      retryAttempts: Map<string, RetryEntry>;
+      running: Map<string, RunningEntry>;
+    };
+    const pollTimer = setTimeout(() => undefined, 60_000);
+    const retryTimer = setTimeout(() => undefined, 60_000);
+    pollTimer.unref();
+    retryTimer.unref();
+    internal.pollTimer = pollTimer;
+    internal.retryAttempts.set("retry-1", {
+      issueId: "issue-retry",
+      identifier: "TEST-8",
+      attempt: 2,
+      delayMs: 60_000,
+      dueAtMs: Date.now() + 60_000,
+      timer: retryTimer,
+      error: "retry later",
+      runPhase: "implementation",
+    });
+    const activeIssue = issue({ id: "issue-active", identifier: "TEST-9" });
+    const abortController = new AbortController();
+    internal.running.set("issue-active", shutdownTestRunningEntry(activeIssue, abortController));
+    const progress = new RecordingShutdownProgress();
+
+    await orchestrator.stop({ progress });
+
+    expect(stoppedRunIds).toEqual(["active-run-1"]);
+    expect(abortController.signal.aborted).toBe(true);
+    expect(progress.startedIds()).toEqual(
+      expect.arrayContaining([
+        "orchestrator.poll_timer.clear",
+        "orchestrator.retry_timer.clear.issue-retry.2.0",
+        "orchestrator.run.abort.issue-active.0",
+        "orchestrator.run.harness_stop.issue-active.active-run-1",
+        "orchestrator.workers.wait",
+        "orchestrator.issue_state_store.close",
+        "orchestrator.merge_queue_store.close",
+      ]),
+    );
+    expect(progress.completedIds()).toContain("orchestrator.run.harness_stop.issue-active.active-run-1");
+    expect(logs.some((line) => line.includes("clearing retry timer 1/1 for TEST-8"))).toBe(true);
+    expect(logs.some((line) => line.includes("aborting run 1/1 for TEST-9"))).toBe(true);
+    expect(logs.some((line) => line.includes("harness stop failed") && line.includes("planned stop failure"))).toBe(true);
+    expect(logs.some((line) => line.includes("waiting for 1 orchestrator worker"))).toBe(true);
+  });
+
   it("blocks continuation turns for non-resumable harnesses", async () => {
     const config = testConfig(root);
     config.agent.maxTurns = 2;
@@ -15025,6 +15101,99 @@ function mergePolicyLoopHarness(
     async () => responses[Math.min(responseIndex++, responses.length - 1)],
   );
   return { candidate, orchestrator, requester };
+}
+
+class RecordingShutdownProgress {
+  readonly events: Array<{ type: string; id?: string; reason?: string }> = [];
+
+  started(action: { id: string }): void {
+    this.events.push({ type: "started", id: action.id });
+  }
+
+  completed(action: { id: string }): void {
+    this.events.push({ type: "completed", id: action.id });
+  }
+
+  failed(action: { id: string }): void {
+    this.events.push({ type: "failed", id: action.id });
+  }
+
+  waiting(action: { id: string }): void {
+    this.events.push({ type: "waiting", id: action.id });
+  }
+
+  forced(reason: string): void {
+    this.events.push({ type: "forced", reason });
+  }
+
+  finished(): void {
+    this.events.push({ type: "finished" });
+  }
+
+  startedIds(): string[] {
+    return this.events.filter((event) => event.type === "started").map((event) => event.id ?? "");
+  }
+
+  completedIds(): string[] {
+    return this.events.filter((event) => event.type === "completed").map((event) => event.id ?? "");
+  }
+}
+
+function shutdownTestRunningEntry(activeIssue: Issue, abortController: AbortController): RunningEntry {
+  return {
+    issue: activeIssue,
+    role: "worker",
+    runPhase: "implementation",
+    workspacePath: null,
+    workspace: null,
+    sessionId: "session-active",
+    runId: "service-run-1",
+    activeRunId: "active-run-1",
+    issueHistorySnapshotId: null,
+    lifecycle: null,
+    worker: Promise.resolve(),
+    abortController,
+    startedAt: new Date("2026-01-01T00:00:00.000Z"),
+    lastEventAt: null,
+    lastEvent: null,
+    lastMessage: null,
+    sdkRunStatus: null,
+    sdkRunStatusUpdatedAt: null,
+    sdkRunStatusSource: null,
+    failureKind: null,
+    failureDiagnosticCode: null,
+    failureDiagnosticMessage: null,
+    failureDiagnosticAt: null,
+    failureDiagnosticPayload: undefined,
+    turnCount: 1,
+    retryAttempt: 1,
+    tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    activeRunTokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    cleanupWorkspaceOnExit: false,
+    suppressRetryOnExit: false,
+    completionReportAccepted: false,
+    mergeConflictResolutionAccepted: false,
+    issueBreakdownPlanAccepted: false,
+    issueTriageReportAccepted: false,
+    issuePostMortemReportAccepted: false,
+    pullRequestHandoffAccepted: false,
+    reviewVerdictAccepted: false,
+    reviewEvidence: null,
+    manualDispatch: null,
+    handoffRepair: null,
+    hermesResume: null,
+    cancellationRequestedAt: null,
+    cancellationSource: null,
+    cancellationReason: null,
+    abortSignalledAt: null,
+    harnessStopRequestedAt: null,
+    harnessStopFailedAt: null,
+    harnessStopFailedReason: null,
+    lastStreamActivityAt: null,
+    lastDeltaOrToolActivityAt: null,
+    lastToolActivityAt: null,
+    providerLimitSignal: null,
+  };
 }
 
 class BlockingHarness implements AgentHarness {

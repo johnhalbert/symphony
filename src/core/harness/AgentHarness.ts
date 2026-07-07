@@ -167,4 +167,5 @@ export interface AgentHarness {
   runOperatorChat?(ctx: OperatorChatRunContext, prompt: string): AsyncIterable<AgentEvent>;
   reload?(ctx: AgentRunContext): Promise<void>;
   stop?(runId: string): Promise<void>;
+  forceDispose?(reason: string): void;
 }
