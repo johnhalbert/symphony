@@ -19,6 +19,7 @@ import {
   projectProviderGates,
   projectRunningAgents,
   projectSessionModel,
+  selectIssueDetailWorkspaceSource,
   projectTranscriptMessages,
   projectWorkspaceModel,
   projectWebDashboard,
@@ -2489,12 +2490,13 @@ export class StatusServer {
       options.includeTranscript === true && this.options.runStore && latestRun
         ? await readBoundedWebTranscript(this.options.runStore, latestRun.runId, options.transcriptUrl)
         : [];
+    const workspace =
+      resolvedIssue.status === "resolved"
+        ? selectIssueDetailWorkspaceSource([resolvedIssue.workspace], resolvedIssue.live?.runPhase ?? null)
+        : null;
     return {
       issue: cloneJson(issue),
-      workspace: projectWorkspaceModel(
-        resolvedIssue.status === "resolved" ? resolvedIssue.workspace : null,
-        { issue, latestRun },
-      ),
+      workspace: projectWorkspaceModel(workspace, { issue, latestRun }),
       activity: projectActivityModels(activity),
       runs: detailRuns.map(projectSessionModel),
       transcript: projectTranscriptMessages(transcript, { run: latestRun, includeRunPrelude: transcript.length > 0 }),

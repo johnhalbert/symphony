@@ -853,8 +853,14 @@ export function projectIssueDetailModel(input: BoardIssueDetailProjectionInput |
 function projectIssueDetailWorkspaceSource(
   input: Pick<BoardIssueDetailProjectionInput, "issueDetails" | "live" | "workspace">,
 ): IssueWorkspaceSummary | WorkspaceRecord | null {
-  const allowPlanningWorkspace = input.live?.runPhase === "issue_breakdown";
-  const candidates = [input.workspace ?? null, input.issueDetails.workspace];
+  return selectIssueDetailWorkspaceSource([input.workspace ?? null, input.issueDetails.workspace], input.live?.runPhase ?? null);
+}
+
+export function selectIssueDetailWorkspaceSource<T extends Pick<IssueWorkspaceSummary | WorkspaceRecord, "workspaceKey" | "path">>(
+  candidates: readonly (T | null | undefined)[],
+  liveRunPhase: AgentRunPhase | string | null | undefined,
+): T | null {
+  const allowPlanningWorkspace = liveRunPhase === "issue_breakdown";
   for (const candidate of candidates) {
     if (!candidate) continue;
     if (!allowPlanningWorkspace && isPlanningIssueWorkspace(candidate)) continue;
