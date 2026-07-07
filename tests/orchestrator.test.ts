@@ -10459,6 +10459,71 @@ describe("Orchestrator", () => {
     expect(harness.runs).toEqual([]);
   });
 
+  it("does not block resolved merge-conflict lifecycle metadata in the conflict state", async () => {
+    const config = testConfig(root);
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.conflictsState = "Merge Conflicts";
+    const candidate = issue({
+      state: "Merge Conflicts",
+      branchName: "symphony/TEST-1",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("Merge Conflicts") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "passed",
+      blockedReason: null,
+      mergeConflict: {
+        ...openMergeConflict(candidate),
+        status: "resolved",
+        resolutionStatus: "resolved",
+        currentHeadSha: "resolved-head",
+        resolvedHeadSha: "resolved-head",
+      },
+    });
+    const harness = new ContextRecordingHermesHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await orchestrator.stop();
+
+    expect(harness.runs).toEqual([]);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "passed",
+      blockedReason: null,
+      mergeConflict: {
+        status: "resolved",
+        resolutionStatus: "resolved",
+      },
+    });
+  });
+
   it("does not duplicate conflict dispatch when the same issue is returned by normal worker candidates", async () => {
     const config = testConfig(root);
     config.mergePolicy.mode = "gated";

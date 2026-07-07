@@ -8395,10 +8395,7 @@ export class Orchestrator {
       conflict.resolutionStatus === "blocked"
     )
       return false;
-    return (
-      conflict.status !== "open" ||
-      conflict.fixTurnCount >= conflict.maxFixTurns
-    );
+    return conflict.status === "open" && conflict.fixTurnCount >= conflict.maxFixTurns;
   }
 
   private rulesetShouldResetLifecycleAfterOperatorResume(
