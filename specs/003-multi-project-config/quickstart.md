@@ -76,6 +76,12 @@
    npm test -- tests/postgres-schema.test.ts
    ```
 
+   To exercise the Docker-backed live migration/application checks in this test file, rerun:
+
+   ```powershell
+   SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1 npm test -- tests/postgres-schema.test.ts
+   ```
+
 3. Confirm context columns and indexes exist for state and projection records that need collision-safe lookup.
 
 ## Full Validation
@@ -85,6 +91,8 @@ After the implementation tasks complete, run:
 ```powershell
 npm test -- tests/workflow.test.ts tests/doctor.test.ts tests/orchestrator.test.ts tests/git-worktree.test.ts tests/status-api.test.ts tests/web-projection.test.ts tests/web-history-projection.test.ts tests/web-transcript-projection.test.ts tests/web-route-contract.test.ts tests/web-projection-context.test.ts tests/completion-report-mcp.test.ts tests/review-verdict-mcp.test.ts tests/review-feedback-mcp.test.ts tests/writeback-outbox.test.ts tests/postgres-schema.test.ts tests/mcp-subprocess-environment.test.ts tests/cursor-harness.test.ts tests/hermes-harness.test.ts tests/hermes-acp-harness.test.ts
 ```
+
+Prefix the command above with `SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1` when you need the Docker-backed live Postgres migration/application checks included in the full sweep.
 
 ## Validation record (ENG-457 / T102)
 
