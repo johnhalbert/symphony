@@ -417,6 +417,119 @@ describe("web projection read repositories", () => {
     ).toBe("pc=symphony|legacy-run:tail:limit:500");
   });
 
+  it("uses live default-project-context resolution for named durable reads and history compatibility after reloads", async () => {
+    let defaultProjectContextId = "docs";
+    const reader = new RecordingWebProjectionPayloadReader([
+      projectionPayloadRecordFixture(
+        {
+          projectionName: "dashboard_projection",
+          projectContextId: "docs",
+          scopeKind: "global",
+          scopeKey: "global",
+        },
+        { projectName: "Docs dashboard" },
+      ),
+      projectionPayloadRecordFixture(
+        {
+          projectionName: "dashboard_projection",
+          projectContextId: "symphony",
+          scopeKind: "global",
+          scopeKey: "global",
+        },
+        { projectName: "Symphony dashboard" },
+      ),
+      projectionPayloadRecordFixture(
+        {
+          projectionName: "history_projection",
+          projectContextId: "docs",
+          scopeKind: "global_collection",
+          scopeKey: "global:session:5:timeline:7",
+        },
+        { sessions: [{ id: "docs-session" }], transcriptBySession: {}, timeline: [], defaultSessionId: "docs-session" },
+      ),
+      projectionPayloadRecordFixture(
+        {
+          projectionName: "history_projection",
+          projectContextId: "symphony",
+          scopeKind: "global_collection",
+          scopeKey: "global:session:5:timeline:7",
+        },
+        { sessions: [{ id: "symphony-session" }], transcriptBySession: {}, timeline: [], defaultSessionId: "symphony-session" },
+      ),
+    ]);
+    const repositories = createWebProjectionReadRepositories({
+      reader,
+      defaultProjectContextId: () => defaultProjectContextId,
+      isRecordCurrent: () => true,
+    });
+
+    await expect(repositories.dashboard.readCurrent()).resolves.toMatchObject({
+      status: "hit",
+      record: { revision: { projectContextId: "docs" }, payload: { projectName: "Docs dashboard" } },
+    });
+    await expect(repositories.history.readGlobalCollection({ sessionLimit: 5, timelineLimit: 7 })).resolves.toMatchObject({
+      status: "hit",
+      record: { revision: { projectContextId: "docs" }, payload: { defaultSessionId: "docs-session" } },
+    });
+
+    defaultProjectContextId = "symphony";
+
+    await expect(repositories.dashboard.readCurrent()).resolves.toMatchObject({
+      status: "hit",
+      record: { revision: { projectContextId: "symphony" }, payload: { projectName: "Symphony dashboard" } },
+    });
+    await expect(repositories.history.readGlobalCollection({ sessionLimit: 5, timelineLimit: 7 })).resolves.toMatchObject({
+      status: "hit",
+      record: { revision: { projectContextId: "symphony" }, payload: { defaultSessionId: "symphony-session" } },
+    });
+
+    expect(
+      reader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({
+        projectionName,
+        projectContextId: projectContextId ?? null,
+        scopeKind,
+        scopeKey,
+      })),
+    ).toEqual([
+      {
+        projectionName: "dashboard_projection",
+        projectContextId: "docs",
+        scopeKind: "global",
+        scopeKey: "global",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "docs",
+        scopeKind: "global_collection",
+        scopeKey: "pc=docs|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "docs",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+      {
+        projectionName: "dashboard_projection",
+        projectContextId: "symphony",
+        scopeKind: "global",
+        scopeKey: "global",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "pc=symphony|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+    ]);
+  });
+
   it("reads renamed-default history rows stored under unscoped scope keys through implicit and explicit default-context reads", async () => {
     const reader = new RecordingWebProjectionPayloadReader([
       projectionPayloadRecordFixture(

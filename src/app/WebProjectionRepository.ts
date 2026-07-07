@@ -48,10 +48,16 @@ export type WebProjectionRecordCurrentChecker = (
   record: ProjectionPayloadRecord,
 ) => boolean | Promise<boolean>;
 
+export type WebProjectionDefaultProjectContextIdSource =
+  | string
+  | null
+  | undefined
+  | (() => string | null | undefined);
+
 export interface WebProjectionReadRepositoryOptions {
   reader?: WebProjectionPayloadReader | null;
   isRecordCurrent?: WebProjectionRecordCurrentChecker | null;
-  defaultProjectContextId?: string | null | undefined;
+  defaultProjectContextId?: WebProjectionDefaultProjectContextIdSource;
 }
 
 export interface WebHistoryProjectionLimits extends WebProjectionContextScopeOptions {
@@ -85,19 +91,22 @@ export type WebOrchestratorChatProjectionReadPayload = readonly ChatMessage[] | 
 export class WebProjectionReadRepository {
   private readonly reader: WebProjectionPayloadReader | null;
   private readonly isRecordCurrent: WebProjectionRecordCurrentChecker;
-  private readonly defaultProjectContextId: string;
+  private readonly defaultProjectContextIdResolver: () => string;
 
   constructor(options: WebProjectionReadRepositoryOptions = {}) {
     this.reader = options.reader ?? null;
     this.isRecordCurrent = options.isRecordCurrent ?? (() => true);
-    this.defaultProjectContextId = resolveDefaultProjectContextId(options.defaultProjectContextId);
+    this.defaultProjectContextIdResolver = resolveDefaultProjectContextIdSource(options.defaultProjectContextId);
   }
 
   async read<TPayload>(
     selector: ProjectionRevisionSelector,
     options: WebProjectionReadOptions = {},
   ): Promise<WebProjectionReadResult<TPayload>> {
-    return this.readSelectors([selector], options);
+    return this.readSelectors(
+      legacyCompatibleDefaultProjectionRevisionSelectors(selector, this.defaultProjectContextIdResolver()),
+      options,
+    );
   }
 
   async readHistoryProjection(
@@ -105,9 +114,9 @@ export class WebProjectionReadRepository {
     options: WebProjectionReadOptions = {},
   ): Promise<WebProjectionReadResult<ReturnType<typeof projectWebHistory>>> {
     return this.readSelectors(
-      historyProjectionRevisionSelectors({
+      webHistoryProjectionRevisionSelectors({
         ...limits,
-        defaultProjectContextId: limits.defaultProjectContextId ?? this.defaultProjectContextId,
+        defaultProjectContextId: limits.defaultProjectContextId ?? this.defaultProjectContextIdResolver(),
       }),
       options,
     );
@@ -119,7 +128,7 @@ export class WebProjectionReadRepository {
   ): Promise<WebProjectionReadResult<WebTranscriptProjectionPayload>> {
     const scopeKeys = webProjectionScopeKeyCandidates(webTranscriptProjectionBaseScopeKey(page), {
       projectContextId: page.projectContextId,
-      defaultProjectContextId: page.defaultProjectContextId ?? this.defaultProjectContextId,
+      defaultProjectContextId: page.defaultProjectContextId ?? this.defaultProjectContextIdResolver(),
     });
     return this.readSelectors(
       projectionRevisionSelectorsForScopeKeys("transcript_projection", "run_page", scopeKeys),
@@ -133,7 +142,7 @@ export class WebProjectionReadRepository {
   ): Promise<WebProjectionReadResult<TPayload>> {
     const readSelectors = webTranscriptDefaultProjectionReadCandidates({
       ...selector,
-      defaultProjectContextId: selector.defaultProjectContextId ?? this.defaultProjectContextId,
+      defaultProjectContextId: selector.defaultProjectContextId ?? this.defaultProjectContextIdResolver(),
     });
     return this.readUsingCandidates<TPayload, WebTranscriptProjectionDefaultPageSelector>(
       transcriptDefaultProjectionRevisionSelector(readSelectors[0]!),
@@ -328,7 +337,28 @@ function projectionRevisionSelectorsForScopeKeys(
   });
 }
 
-function historyProjectionRevisionSelectors(limits: WebHistoryProjectionLimits): ProjectionRevisionSelector[] {
+export function legacyCompatibleDefaultProjectionRevisionSelectors(
+  selector: ProjectionRevisionSelector,
+  defaultProjectContextId: string | null | undefined,
+): ProjectionRevisionSelector[] {
+  const normalizedProjectContextId = normalizeOptionalProjectContextId(selector.projectContextId);
+  if (!isLegacyCompatibleDefaultProjectionSelector(selector)) {
+    return normalizedProjectContextId ? [{ ...selector, projectContextId: normalizedProjectContextId }] : [selector];
+  }
+  const compatibilityIds = compatibilityDefaultProjectContextIds(defaultProjectContextId);
+  if (normalizedProjectContextId && !compatibilityIds.has(normalizedProjectContextId)) {
+    return [{ ...selector, projectContextId: normalizedProjectContextId }];
+  }
+  if (!normalizedProjectContextId && resolveDefaultProjectContextId(defaultProjectContextId) === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+    return [selector];
+  }
+  return compatibilityDefaultProjectContextScopeIds(defaultProjectContextId).map((projectContextId) => ({
+    ...selector,
+    projectContextId,
+  }));
+}
+
+export function webHistoryProjectionRevisionSelectors(limits: WebHistoryProjectionLimits): ProjectionRevisionSelector[] {
   const baseScopeKey = webHistoryProjectionBaseScopeKey(limits);
   const projectContextId = normalizeOptionalProjectContextId(limits.projectContextId);
   const defaultProjectContextId = resolveDefaultProjectContextId(limits.defaultProjectContextId);
@@ -372,6 +402,19 @@ function historyProjectionUnscopedRevisionSelector(baseScopeKey: string, project
     scopeKind: "global_collection",
     scopeKey: baseScopeKey,
   };
+}
+
+function isLegacyCompatibleDefaultProjectionSelector(selector: ProjectionRevisionSelector): boolean {
+  switch (selector.projectionName) {
+    case "dashboard_projection":
+      return (selector.scopeKind ?? "global") === "global" && (selector.scopeKey ?? "global") === "global";
+    case "issue_board_projection":
+      return (selector.scopeKind ?? "board") === "board" && (selector.scopeKey ?? "default-board") === "default-board";
+    case "sidebar_projection":
+      return (selector.scopeKind ?? "global") === "global" && (selector.scopeKey ?? "global") === "global";
+    default:
+      return false;
+  }
 }
 
 function transcriptDefaultProjectionRevisionSelector(
@@ -457,6 +500,14 @@ function compatibilityDefaultProjectContextScopeIds(defaultProjectContextId: str
 
 function resolveDefaultProjectContextId(defaultProjectContextId: string | null | undefined): string {
   return normalizeOptionalProjectContextId(defaultProjectContextId) ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+}
+
+function resolveDefaultProjectContextIdSource(
+  defaultProjectContextId: WebProjectionDefaultProjectContextIdSource,
+): () => string {
+  return typeof defaultProjectContextId === "function"
+    ? () => resolveDefaultProjectContextId(defaultProjectContextId())
+    : () => resolveDefaultProjectContextId(defaultProjectContextId);
 }
 
 function normalizeOptionalProjectContextId(projectContextId: string | null | undefined): string | null {

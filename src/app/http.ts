@@ -149,6 +149,8 @@ import {
 import { RealtimeProjectionEventBus, type RealtimeResourceKind } from "./RealtimeProjectionEvents.js";
 import {
   createWebProjectionReadRepositories,
+  legacyCompatibleDefaultProjectionRevisionSelectors,
+  webHistoryProjectionRevisionSelectors,
   webHistoryProjectionScopeKey,
   webOrchestratorChatProjectionScopeKey,
   webTranscriptProjectionScopeKey,
@@ -344,7 +346,7 @@ export class StatusServer {
     this.webProjectionRevisionProviders = createStatusServerWebProjectionRevisionProviders(options);
     this.webProjectionRepositories = createWebProjectionReadRepositories({
       ...(options.projectionReader ? { reader: options.projectionReader } : {}),
-      defaultProjectContextId: options.defaultProjectContextId,
+      defaultProjectContextId: () => this.options.defaultProjectContextId,
       isRecordCurrent: (record) => this.isDurableProjectionRecordCurrent(record),
     });
   }
@@ -3402,9 +3404,14 @@ export class StatusServer {
     const reader = this.options.projectionReader;
     if (!reader?.readCurrentRevision) return [];
     return Promise.all(
-      statusServerWebProjectionContextDurableRevisionSelectors().map(async (selector) => {
+      statusServerWebProjectionContextDurableRevisionSelectorGroups(this.options.defaultProjectContextId).map(async (selectors) => {
+        const selector = selectors[0]!;
         try {
-          return durableProjectionRevisionFingerprint(selector, await reader.readCurrentRevision!(selector));
+          for (const candidate of selectors) {
+            const record = await reader.readCurrentRevision!(candidate);
+            if (record) return durableProjectionRevisionFingerprint(selector, record);
+          }
+          return durableProjectionRevisionFingerprint(selector, null);
         } catch {
           return durableProjectionRevisionFingerprint(selector, null, "error");
         }
@@ -3677,19 +3684,27 @@ function isStatusServerProjectionRevisionStore(store: unknown): store is StatusS
   );
 }
 
-function statusServerWebProjectionContextDurableRevisionSelectors(): readonly ProjectionRevisionSelector[] {
+function statusServerWebProjectionContextDurableRevisionSelectorGroups(
+  defaultProjectContextId: string | null | undefined,
+): readonly (readonly ProjectionRevisionSelector[])[] {
   return [
-    { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
-    { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-    { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
-    {
-      projectionName: "history_projection",
-      scopeKind: "global_collection",
-      scopeKey: webHistoryProjectionScopeKey({
-        sessionLimit: WEB_HISTORY_DEFAULT_SESSION_LIMIT,
-        timelineLimit: WEB_HISTORY_DEFAULT_TIMELINE_LIMIT,
-      }),
-    },
+    legacyCompatibleDefaultProjectionRevisionSelectors(
+      { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+      defaultProjectContextId,
+    ),
+    legacyCompatibleDefaultProjectionRevisionSelectors(
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      defaultProjectContextId,
+    ),
+    legacyCompatibleDefaultProjectionRevisionSelectors(
+      { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+      defaultProjectContextId,
+    ),
+    webHistoryProjectionRevisionSelectors({
+      sessionLimit: WEB_HISTORY_DEFAULT_SESSION_LIMIT,
+      timelineLimit: WEB_HISTORY_DEFAULT_TIMELINE_LIMIT,
+      defaultProjectContextId,
+    }),
   ];
 }
 

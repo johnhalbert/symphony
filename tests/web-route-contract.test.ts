@@ -1370,9 +1370,38 @@ describe("/api/v1/web route contracts", () => {
 
     expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(runStore.transcriptReadCount).toBe(1);
-    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
-      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    expect(
+      projectionReader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({
+        projectionName,
+        projectContextId: projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind,
+        scopeKey,
+      })),
+    ).toEqual([
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
     ]);
   });
 
@@ -1561,9 +1590,38 @@ describe("/api/v1/web route contracts", () => {
 
     expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(runStore.transcriptReadCount).toBe(0);
-    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
-      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    expect(
+      projectionReader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({
+        projectionName,
+        projectContextId: projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind,
+        scopeKey,
+      })),
+    ).toEqual([
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
     ]);
   });
 
