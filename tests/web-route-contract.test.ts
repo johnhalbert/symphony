@@ -1405,10 +1405,157 @@ describe("/api/v1/web route contracts", () => {
     ]);
   });
 
+  it("serves durable issue-detail workspace projectContext from issue metadata when latest runs omit it", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const expectedWorkspaceProjectContext = {
+      ...docsProjectContext,
+      routingSource: "explicit",
+    } as const;
+    const durableIssue = {
+      ...issueModelFixture(),
+      id: "docs:ENG-179",
+      title: "Serve contextual durable workspace attribution",
+      project: "Documentation Site",
+      projectContext: {
+        id: docsProjectContext.projectContextId,
+        label: docsProjectContext.projectContextLabel,
+        linearProject: docsProjectContext.linearProjectSlug,
+        codebase: null,
+      },
+    };
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [durableIssue], review: [] },
+      cycleLabel: "Docs cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "docs:ENG-179",
+    };
+    const run = runRecordFixture({
+      runId: "run-docs-workspace-1",
+      sessionId: "session-docs-workspace-1",
+      issueId: "docs:ENG-179",
+      issueIdentifier: "ENG-179",
+      workspaceKey: "ENG-179",
+      workspacePath: path.join("workspaces", "docs", "ENG-179"),
+      gitBranchName: "symphony/docs/ENG-179",
+      repoPath: "/repo-docs",
+      baseRef: "origin/main",
+    });
+    const runStore = new RecordingRunStore([run]);
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+            { source: "lifecycleStore", revision: "lifecycle-current", observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+    ]);
+    const { server } = createStatusServer(root, {
+      projectionReader,
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179`);
+
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect((detail.body as { workspace: Record<string, unknown> | null }).workspace).toMatchObject({
+        workspaceKey: "ENG-179",
+        path: path.join("workspaces", "docs", "ENG-179"),
+        gitBranchName: "symphony/docs/ENG-179",
+        repoPath: "/repo-docs",
+        baseRef: "origin/main",
+        projectContext: expectedWorkspaceProjectContext,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("suppresses planning workspaces from cached durable issue-detail hits outside issue-breakdown runs", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const durableIssue = {
+      ...issueModelFixture(),
+      id: "TEST-1",
+      title: "Cached review issue",
+      status: "review" as const,
+      workspace: null,
+    };
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [], review: [durableIssue] },
+      cycleLabel: "Review cycle",
+      cycleDateRange: "July 2026",
+      selectedIssueId: "TEST-1",
+    };
+    await runStore.upsertWorkspace({
+      workspaceKey: "TEST-1-planning",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      path: path.join(config.workspace.root, "TEST-1-planning"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/TEST-1-planning",
+      repoPath: "/repo",
+      baseRef: "main",
+      createdAt: "2026-07-07T00:00:00.000Z",
+      updatedAt: "2026-07-07T00:00:00.000Z",
+    });
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: String(runStore.projectionRevision()), observedAt: null },
+            { source: "lifecycleStore", revision: "lifecycle-current", observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+    ]);
+    const { server, calls } = createStatusServer(root, {
+      projectionReader,
+      runStore,
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/TEST-1`);
+
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect((detail.body as { issue: { workspace: string | null }; workspace: unknown }).issue.workspace).toBeNull();
+      expect((detail.body as { workspace: unknown }).workspace).toBeNull();
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 1, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+  });
+
   it("infers contextual durable-detail runs from lifecycle-backed issue ids when legacy run records lack project context", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+
     const docsProjectContext = {
       projectContextId: "docs",
       projectContextLabel: "Documentation Site",

@@ -19,7 +19,9 @@ import {
   projectProviderGates,
   projectRunningAgents,
   projectSessionModel,
+  selectIssueDetailWorkspaceSource,
   projectTranscriptMessages,
+  projectWorkspaceModel,
   projectWebDashboard,
   projectWebIssueBoard,
   projectWebIssueDetail,
@@ -2488,8 +2490,13 @@ export class StatusServer {
       options.includeTranscript === true && this.options.runStore && latestRun
         ? await readBoundedWebTranscript(this.options.runStore, latestRun.runId, options.transcriptUrl)
         : [];
+    const workspace =
+      resolvedIssue.status === "resolved"
+        ? selectIssueDetailWorkspaceSource([resolvedIssue.workspace], resolvedIssue.live?.runPhase ?? null)
+        : null;
     return {
       issue: cloneJson(issue),
+      workspace: projectWorkspaceModel(workspace, { issue, latestRun }),
       activity: projectActivityModels(activity),
       runs: detailRuns.map(projectSessionModel),
       transcript: projectTranscriptMessages(transcript, { run: latestRun, includeRunPrelude: transcript.length > 0 }),
@@ -8492,7 +8499,7 @@ function buildIssueDetailsEnvelope(input: {
       issue,
       tracker: buildIssueTrackerMetadata(issue, input.generatedAt, input.trackerStateLists, input.staleThresholdMs),
       blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists, lifecycle, issue.state),
-      workspace: buildIssueWorkspaceSummary(sanitizedInput, metadata),
+      workspace: buildIssueWorkspaceSummary(sanitizedInput),
       pullRequest: buildIssuePullRequestSummary(metadata),
       mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(metadata)),
       latestRun: buildIssueLatestRunSummary(input.summaryRun),
@@ -8505,7 +8512,7 @@ function buildIssueDetailsEnvelope(input: {
     issue: durableIssueStatusView(sanitizedInput),
     tracker: buildIssueTrackerMetadata(null, null, input.trackerStateLists, input.staleThresholdMs),
     blockers: buildIssueBlockerSummary(null, input.trackerStateLists, lifecycle, null),
-    workspace: buildIssueWorkspaceSummary(sanitizedInput, metadata),
+    workspace: buildIssueWorkspaceSummary(sanitizedInput),
     pullRequest: buildIssuePullRequestSummary(metadata),
     mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(metadata)),
     latestRun: buildIssueLatestRunSummary(input.summaryRun),
@@ -8642,22 +8649,54 @@ function buildIssueWorkspaceSummary(
     latestRun: RunRecord | null | undefined;
     lifecycle: IssueLifecycleRecord | null | undefined;
   },
-  metadata: ReturnType<typeof statusMetadata>,
 ): IssueWorkspaceSummary {
+  const allowPlanningWorkspace = input.live?.runPhase === "issue_breakdown";
   const latestWorkspaceRun = input.latestRun?.runPhase === "issue_breakdown" ? null : input.latestRun;
   const workspaceRecord =
-    input.workspace?.workspaceKey.endsWith("-planning") === true && input.live?.runPhase !== "issue_breakdown"
+    !allowPlanningWorkspace && isPlanningWorkspaceSurface(input.workspace?.workspaceKey, input.workspace?.path)
       ? null
       : input.workspace;
+  const lifecycleWorkspacePointers =
+    !allowPlanningWorkspace &&
+    isPlanningWorkspaceSurface(input.lifecycle?.summaryPointers.workspaceKey, input.lifecycle?.summaryPointers.workspacePath)
+      ? null
+      : input.lifecycle?.summaryPointers;
   return {
-    workspaceKey: workspaceRecord?.workspaceKey ?? latestWorkspaceRun?.workspaceKey ?? input.lifecycle?.summaryPointers.workspaceKey ?? null,
-    path: workspaceRecord?.path ?? input.live?.workspacePath ?? latestWorkspaceRun?.workspacePath ?? input.lifecycle?.summaryPointers.workspacePath ?? null,
+    workspaceKey: workspaceRecord?.workspaceKey ?? latestWorkspaceRun?.workspaceKey ?? lifecycleWorkspacePointers?.workspaceKey ?? null,
+    path: workspaceRecord?.path ?? input.live?.workspacePath ?? latestWorkspaceRun?.workspacePath ?? lifecycleWorkspacePointers?.workspacePath ?? null,
     sourceKind: workspaceRecord?.sourceKind ?? null,
-    branchName: metadata.branchName,
-    gitBranchName: metadata.gitBranchName,
-    repoPath: metadata.repoPath,
-    baseRef: metadata.baseRef,
+    branchName:
+      input.live?.metadata?.branchName ??
+      lifecycleWorkspacePointers?.branchName ??
+      latestWorkspaceRun?.gitBranchName ??
+      workspaceRecord?.gitBranchName ??
+      null,
+    gitBranchName:
+      input.live?.metadata?.gitBranchName ??
+      lifecycleWorkspacePointers?.gitBranchName ??
+      latestWorkspaceRun?.gitBranchName ??
+      workspaceRecord?.gitBranchName ??
+      null,
+    repoPath:
+      input.live?.metadata?.repoPath ??
+      lifecycleWorkspacePointers?.repoPath ??
+      latestWorkspaceRun?.repoPath ??
+      workspaceRecord?.repoPath ??
+      null,
+    baseRef:
+      input.live?.metadata?.baseRef ??
+      lifecycleWorkspacePointers?.baseRef ??
+      latestWorkspaceRun?.baseRef ??
+      workspaceRecord?.baseRef ??
+      null,
   };
+}
+
+function isPlanningWorkspaceSurface(workspaceKey: string | null | undefined, workspacePath: string | null | undefined): boolean {
+  if (typeof workspaceKey === "string" && workspaceKey.trim().endsWith("-planning")) return true;
+  if (typeof workspacePath !== "string") return false;
+  const workspaceName = workspacePath.trim().split(/[\\/]/).pop() ?? "";
+  return workspaceName.endsWith("-planning");
 }
 
 function buildIssuePullRequestSummary(metadata: ReturnType<typeof statusMetadata>): IssuePullRequestSummary {

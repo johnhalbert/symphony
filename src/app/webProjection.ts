@@ -186,6 +186,17 @@ export interface SessionModel {
   toolCount: number;
 }
 
+export interface WorkspaceModel {
+  workspaceKey: string | null;
+  path: string | null;
+  sourceKind: string | null;
+  branchName: string | null;
+  gitBranchName: string | null;
+  repoPath: string | null;
+  baseRef: string | null;
+  projectContext?: ProjectContextResolution | undefined;
+}
+
 export interface ChatMessage {
   id?: string;
   conversationId?: string;
@@ -261,6 +272,7 @@ export interface DashboardModel {
 
 export interface IssueDetailModel {
   issue: IssueModel;
+  workspace: WorkspaceModel | null;
   activity: ActivityModel[];
   runs: SessionModel[];
   transcript: TranscriptMessage[];
@@ -627,6 +639,7 @@ export function emptyDashboardSourceModel(): DashboardSourceModel {
 export function emptyIssueDetailModel(issueId = ""): IssueDetailModel {
   return {
     issue: emptyIssueModel(issueId),
+    workspace: null,
     activity: [],
     runs: [],
     transcript: [],
@@ -783,11 +796,16 @@ export function projectWebIssueDetail(
   if (!input) return null;
   const transcriptEvents = Array.isArray(input.transcript) ? input.transcript : (input.transcript?.events ?? []);
   const includeRunPrelude = transcriptEvents.length > 0;
+  const workspace = projectIssueDetailWorkspaceSource(input);
   return {
     issue: projectIssueModel(input.boardCard ?? input.issueDetails, {
       requestKey,
       lane: input.boardCard?.lane ?? null,
       operatorLiveness: input.operatorLiveness ?? input.boardCard?.operatorLiveness ?? null,
+      latestRun: input.latestRun ?? null,
+    }),
+    workspace: projectWorkspaceModel(workspace, {
+      issue: input.issueDetails.issue,
       latestRun: input.latestRun ?? null,
     }),
     activity: projectActivityModels(input.activity ?? null),
@@ -830,6 +848,32 @@ export function projectWebIssueBoard(
 export function projectIssueDetailModel(input: BoardIssueDetailProjectionInput | null | undefined): IssueDetailModel {
   if (!input) return emptyIssueDetailModel();
   return projectWebIssueDetail(input, input.issue) ?? emptyIssueDetailModel(input.issue);
+}
+
+function projectIssueDetailWorkspaceSource(
+  input: Pick<BoardIssueDetailProjectionInput, "issueDetails" | "live" | "workspace">,
+): IssueWorkspaceSummary | WorkspaceRecord | null {
+  return selectIssueDetailWorkspaceSource([input.workspace ?? null, input.issueDetails.workspace], input.live?.runPhase ?? null);
+}
+
+export function selectIssueDetailWorkspaceSource<T extends Pick<IssueWorkspaceSummary | WorkspaceRecord, "workspaceKey" | "path">>(
+  candidates: readonly (T | null | undefined)[],
+  liveRunPhase: AgentRunPhase | string | null | undefined,
+): T | null {
+  const allowPlanningWorkspace = liveRunPhase === "issue_breakdown";
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (!allowPlanningWorkspace && isPlanningIssueWorkspace(candidate)) continue;
+    return candidate;
+  }
+  return null;
+}
+
+function isPlanningIssueWorkspace(workspace: Pick<IssueWorkspaceSummary | WorkspaceRecord, "workspaceKey" | "path">): boolean {
+  if (typeof workspace.workspaceKey === "string" && workspace.workspaceKey.trim().endsWith("-planning")) return true;
+  if (typeof workspace.path !== "string") return false;
+  const workspaceName = workspace.path.trim().split(/[\\/]/).pop() ?? "";
+  return workspaceName.endsWith("-planning");
 }
 
 export function projectWebDashboard(input: DashboardProjectionInput = {}): DashboardModel {
@@ -1566,6 +1610,75 @@ function cloneActivityModel(input: ActivityModel): ActivityModel {
     ...input,
     ...(input.projectContext === undefined ? {} : { projectContext: cloneProjectContextDisplayModel(input.projectContext) }),
   };
+}
+
+export function projectWorkspaceModel(
+  workspace: IssueWorkspaceSummary | WorkspaceRecord | null | undefined,
+  options: { issue?: IssueStatusView | IssueModel | null; latestRun?: RunRecord | null; allowRunFieldFallback?: boolean } = {},
+): WorkspaceModel | null {
+  const source = (workspace ?? null) as Partial<WorkspaceModel & { projectContext?: Partial<ProjectContextResolution> | null }> | null;
+  const latestRun = options.allowRunFieldFallback === false || options.latestRun?.runPhase === "issue_breakdown" ? null : options.latestRun;
+  const workspaceKey = firstNonEmpty(source?.workspaceKey, latestRun?.workspaceKey) ?? null;
+  const path = firstNonEmpty(source?.path, latestRun?.workspacePath) ?? null;
+  const sourceKind = firstNonEmpty(source?.sourceKind) ?? null;
+  const branchName = firstNonEmpty(source?.branchName) ?? null;
+  const gitBranchName = firstNonEmpty(source?.gitBranchName, latestRun?.gitBranchName) ?? null;
+  const repoPath = firstNonEmpty(source?.repoPath, latestRun?.repoPath) ?? null;
+  const baseRef = firstNonEmpty(source?.baseRef, latestRun?.baseRef) ?? null;
+
+  if ([workspaceKey, path, sourceKind, branchName, gitBranchName, repoPath, baseRef].every((value) => value === null)) return null;
+
+  const projectContext = projectWorkspaceProjectContext(source?.projectContext, options.issue ?? null, options.latestRun ?? null);
+
+  return {
+    workspaceKey,
+    path,
+    sourceKind,
+    branchName,
+    gitBranchName,
+    repoPath,
+    baseRef,
+    ...(projectContext === undefined ? {} : { projectContext }),
+  };
+}
+
+function projectWorkspaceProjectContext(
+  workspaceProjectContext: Partial<ProjectContextResolution> | null | undefined,
+  issue: IssueStatusView | IssueModel | null | undefined,
+  latestRun: RunRecord | null | undefined,
+): ProjectContextResolution | undefined {
+  const candidates = [
+    workspaceProjectContext ? normalizeProjectContextResolution(workspaceProjectContext) : undefined,
+    projectWorkspaceIssueProjectContext(issue),
+    latestRun?.projectContext ? normalizeProjectContextResolution(latestRun.projectContext) : undefined,
+  ];
+  let legacyFallback: ProjectContextResolution | undefined;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (candidate.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return candidate;
+    legacyFallback ??= candidate;
+  }
+  return legacyFallback;
+}
+
+function projectWorkspaceIssueProjectContext(
+  issue: IssueStatusView | IssueModel | null | undefined,
+): ProjectContextResolution | undefined {
+  if (!issue) return undefined;
+  if (isProjectedIssueModel(issue)) {
+    if (!issue.projectContext) return undefined;
+    return {
+      projectContextId: issue.projectContext.id,
+      projectContextLabel: issue.projectContext.label,
+      linearProjectSlug: issue.projectContext.linearProject,
+      routingSource: issue.projectContext.id === LEGACY_DEFAULT_PROJECT_CONTEXT_ID ? "legacy_default" : "explicit",
+    };
+  }
+  return projectContextResolutionFromIssue(issue) ?? undefined;
+}
+
+function isProjectedIssueModel(issue: IssueStatusView | IssueModel): issue is IssueModel {
+  return "project" in issue && "cycle" in issue && !("state" in issue);
 }
 
 function addReferenceLabel(labels: Map<string, ReferenceLabelModel>, value: string | null | undefined): void {

@@ -406,11 +406,64 @@ describe("web issue detail projection", () => {
           result: "read_file result",
         },
       ],
+      workspace: {
+        workspaceKey: "TEST-1",
+        path: "/tmp/workspaces/TEST-1",
+        sourceKind: "git_worktree",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
     });
-    expect(Object.keys(detail ?? {})).toEqual(["issue", "activity", "runs", "transcript"]);
+    expect(Object.keys(detail ?? {})).toEqual(["issue", "workspace", "activity", "runs", "transcript"]);
     expect(detail?.transcript[2]).not.toHaveProperty("payload");
     expect(detail?.transcript[2]).not.toHaveProperty("runId");
     expect(JSON.stringify(detail).toLowerCase()).not.toContain("mock");
+  });
+
+  it("keeps planning workspaces and lifecycle-derived workspace fallbacks out of top-level issue detail workspace projection outside issue-breakdown runs", () => {
+    const detail = projectWebIssueDetail(
+      {
+        issue: "TEST-1",
+        boardCard: null,
+        issueDetails: issueDetails({
+          workspace: {
+            workspaceKey: "TEST-1-planning",
+            path: "/tmp/workspaces/TEST-1-planning",
+            sourceKind: null,
+            branchName: "symphony/TEST-1-planning",
+            gitBranchName: "symphony/TEST-1-planning",
+            repoPath: "/repo",
+            baseRef: "main",
+          },
+        }),
+        workspace: {
+          workspaceKey: "TEST-1-planning",
+          path: "/tmp/workspaces/TEST-1-planning",
+          sourceKind: "git_worktree",
+          branchName: "symphony/TEST-1-planning",
+          gitBranchName: "symphony/TEST-1-planning",
+          repoPath: "/repo",
+          baseRef: "main",
+        },
+        latestRun: runRecord({
+          runPhase: "issue_breakdown",
+          workspaceKey: "TEST-1-planning",
+          workspacePath: "/tmp/workspaces/TEST-1-planning",
+          gitBranchName: "symphony/TEST-1-planning",
+          repoPath: "/repo",
+          baseRef: "main",
+        }),
+        runs: [],
+        activity: { activity: [] },
+        transcript: [],
+        operatorLiveness: null,
+      },
+      "TEST-1",
+    );
+
+    expect(detail?.workspace).toBeNull();
   });
 
   it("projects durable-only issue details without a board card or invented mock data", () => {
@@ -439,6 +492,7 @@ describe("web issue detail projection", () => {
         workspace: null,
         session: null,
       },
+      workspace: null,
       activity: [],
       runs: [],
       transcript: [],
