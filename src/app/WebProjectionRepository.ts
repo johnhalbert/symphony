@@ -318,7 +318,15 @@ function projectionRevisionSelectorsForScopeKeys(
   scopeKind: string,
   scopeKeys: readonly string[],
 ): ProjectionRevisionSelector[] {
-  return scopeKeys.map((scopeKey) => ({ projectionName, scopeKind, scopeKey }));
+  return scopeKeys.map((scopeKey) => {
+    const projectContextId = webProjectionScopeKeyProjectContextId(scopeKey);
+    return {
+      projectionName,
+      ...(projectContextId ? { projectContextId } : {}),
+      scopeKind,
+      scopeKey,
+    };
+  });
 }
 
 function transcriptDefaultProjectionRevisionSelector(
@@ -376,6 +384,11 @@ function webProjectionScopeKeyCandidates(baseScopeKey: string, options: WebProje
 function webProjectionScopedScopeKey(baseScopeKey: string, projectContextId: string | null | undefined): string {
   const normalizedProjectContextId = normalizeOptionalProjectContextId(projectContextId);
   return normalizedProjectContextId ? `pc=${normalizedProjectContextId}|${baseScopeKey}` : baseScopeKey;
+}
+
+function webProjectionScopeKeyProjectContextId(scopeKey: string): string | undefined {
+  const match = /^pc=([^|]+)\|/.exec(scopeKey);
+  return match?.[1];
 }
 
 function shouldFallbackToLegacyDefaultScopeKey(projectContextId: string | null | undefined, defaultProjectContextId: string | null | undefined): boolean {

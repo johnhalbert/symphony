@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createWebProjectionReadRepositories } from "../src/app/WebProjectionRepository.js";
 import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID } from "../src/core/config/ProjectContexts.js";
 import {
   PostgresProjectionTransactionStore,
@@ -197,6 +198,148 @@ describe("ProjectionTransactionService", () => {
     ).resolves.toMatchObject({
       projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
       revision: 1,
+    });
+  });
+
+  it("reads scoped history and transcript web projections through store-backed project-context partitions", async () => {
+    const store = new InMemoryProjectionTransactionStore();
+    const service = new ProjectionTransactionService(store, { clock: () => new Date(fixedTime) });
+    const repositories = createWebProjectionReadRepositories({
+      reader: service,
+      defaultProjectContextId: "symphony",
+      isRecordCurrent: () => true,
+    });
+
+    await service.writeProjection({
+      projectionName: "history_projection",
+      projectContextId: "docs",
+      scopeKind: "global_collection",
+      scopeKey: "pc=docs|global:session:7:timeline:9",
+      payload: { sessions: [{ id: "docs-session" }], transcriptBySession: {}, timeline: [], defaultSessionId: "docs-session" },
+    });
+    await service.writeProjection({
+      projectionName: "history_projection",
+      projectContextId: "api",
+      scopeKind: "global_collection",
+      scopeKey: "pc=api|global:session:7:timeline:9",
+      payload: { sessions: [{ id: "api-session" }], transcriptBySession: {}, timeline: [], defaultSessionId: "api-session" },
+    });
+    await service.writeProjection({
+      projectionName: "transcript_projection",
+      projectContextId: "docs",
+      scopeKind: "run_page",
+      scopeKey: "pc=docs|shared-run:offset:10:limit:25",
+      payload: [{ text: "docs page" }],
+      fields: { runId: "shared-run", offsetStart: 10, offsetLimit: 25, nextOffset: 35, messageCount: 1 },
+    });
+    await service.writeProjection({
+      projectionName: "transcript_projection",
+      projectContextId: "api",
+      scopeKind: "run_page",
+      scopeKey: "pc=api|shared-run:offset:10:limit:25",
+      payload: [{ text: "api page" }],
+      fields: { runId: "shared-run", offsetStart: 10, offsetLimit: 25, nextOffset: 35, messageCount: 1 },
+    });
+    await service.writeProjection({
+      projectionName: "transcript_projection",
+      projectContextId: "docs",
+      scopeKind: "run_page",
+      scopeKey: "pc=docs|shared-run:offset:500:limit:500",
+      payload: [{ text: "docs tail" }],
+      fields: { runId: "shared-run", offsetStart: 500, offsetLimit: 500, nextOffset: null, messageCount: 1 },
+    });
+    await service.writeProjection({
+      projectionName: "transcript_projection",
+      projectContextId: "api",
+      scopeKind: "run_page",
+      scopeKey: "pc=api|shared-run:offset:500:limit:500",
+      payload: [{ text: "api tail" }],
+      fields: { runId: "shared-run", offsetStart: 500, offsetLimit: 500, nextOffset: null, messageCount: 1 },
+    });
+
+    await expect(
+      repositories.history.readGlobalCollection({ sessionLimit: 7, timelineLimit: 9, projectContextId: "docs" }),
+    ).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "history_projection",
+        scopeKind: "global_collection",
+        scopeKey: "pc=docs|global:session:7:timeline:9",
+      },
+      record: {
+        revision: { projectContextId: "docs" },
+        payload: { defaultSessionId: "docs-session" },
+      },
+    });
+    await expect(
+      repositories.history.readGlobalCollection({ sessionLimit: 7, timelineLimit: 9, projectContextId: "api" }),
+    ).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "history_projection",
+        scopeKind: "global_collection",
+        scopeKey: "pc=api|global:session:7:timeline:9",
+      },
+      record: {
+        revision: { projectContextId: "api" },
+        payload: { defaultSessionId: "api-session" },
+      },
+    });
+    await expect(
+      repositories.transcript.readRunPage({ runId: "shared-run", offset: 10, limit: 25, projectContextId: "docs" }),
+    ).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "transcript_projection",
+        scopeKind: "run_page",
+        scopeKey: "pc=docs|shared-run:offset:10:limit:25",
+      },
+      record: {
+        revision: { projectContextId: "docs" },
+        payload: [{ text: "docs page" }],
+      },
+    });
+    await expect(
+      repositories.transcript.readRunPage({ runId: "shared-run", offset: 10, limit: 25, projectContextId: "api" }),
+    ).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "transcript_projection",
+        scopeKind: "run_page",
+        scopeKey: "pc=api|shared-run:offset:10:limit:25",
+      },
+      record: {
+        revision: { projectContextId: "api" },
+        payload: [{ text: "api page" }],
+      },
+    });
+    await expect(
+      repositories.transcript.readRunDefaultPage({ runId: "shared-run", limit: 500, projectContextId: "docs" }),
+    ).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "transcript_projection",
+        scopeKind: "run_page",
+        scopeKey: "pc=docs|shared-run:offset:500:limit:500",
+      },
+      record: {
+        revision: { projectContextId: "docs" },
+        payload: [{ text: "docs tail" }],
+      },
+    });
+    await expect(
+      repositories.transcript.readRunDefaultPage({ runId: "shared-run", limit: 500, projectContextId: "api" }),
+    ).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "transcript_projection",
+        scopeKind: "run_page",
+        scopeKey: "pc=api|shared-run:offset:500:limit:500",
+      },
+      record: {
+        revision: { projectContextId: "api" },
+        payload: [{ text: "api tail" }],
+      },
     });
   });
 
@@ -667,6 +810,44 @@ describe("ProjectionTransactionService", () => {
     expect(runner.sqls[0]).toContain("ORDER BY (payload.next_offset IS NULL) DESC, payload.message_count DESC, payload.offset_start DESC");
   });
 
+  it("reads the current Postgres transcript default page by scoped project context when overlapping run ids share a tail limit", async () => {
+    const runner = new RecordingProjectionSqlRunner({
+      currentPayloadRow: {
+        projection_revision_id: 44,
+        projection_name: "transcript_projection",
+        project_context_id: "docs",
+        scope_kind: "run_page",
+        scope_key: "pc=docs|run-1:offset:700:limit:500",
+        revision: 5,
+        source_revisions: [{ source: "transcript:run-1", revision: "events-docs-1200", observedAt: null }],
+        source_cursors: { eventCount: 500, nextOffset: null },
+        content_sha256: "e".repeat(64),
+        generated_at: "2026-01-02T03:04:05.000Z",
+        expires_at: null,
+        superseded_at: null,
+        created_at: "2026-01-02T03:04:05.000Z",
+        payload: [{ text: "docs tail event 701" }, { text: "docs tail event 1200" }],
+        payload_sha256: "f".repeat(64),
+        raw_payload_refs: [],
+        payload_generated_at: "2026-01-02T03:04:07.000Z",
+        payload_expires_at: null,
+      },
+    });
+    const service = new ProjectionTransactionService(new PostgresProjectionTransactionStore(runner), { clock: () => new Date(fixedTime) });
+
+    const payload = await service.readCurrentTranscriptDefaultPayload<readonly { text: string }[]>({
+      runId: "run-1",
+      limit: 500,
+      projectContextId: "docs",
+    });
+
+    expect(payload?.revision.projectContextId).toBe("docs");
+    expect(payload?.revision.scopeKey).toBe("pc=docs|run-1:offset:700:limit:500");
+    expect(payload?.payload).toEqual([{ text: "docs tail event 701" }, { text: "docs tail event 1200" }]);
+    expect(runner.values[0]).toEqual(["run-1", 500, "docs"]);
+    expect(runner.sqls[0]).toContain("$3::text IS NOT NULL AND revision.scope_key LIKE ('pc=' || $3 || '|%')");
+  });
+
   it("rolls back the Postgres transaction and suppresses publication on payload insert failure", async () => {
     const runner = new RecordingProjectionSqlRunner({ failPayloadInsert: true });
     const service = new ProjectionTransactionService(new PostgresProjectionTransactionStore(runner), { clock: () => new Date(fixedTime) });
@@ -712,6 +893,18 @@ class InMemoryProjectionTransactionStore implements ProjectionTransactionStore {
 
   async readLatestRevision(selector: ProjectionRevisionSelector): Promise<ProjectionRevisionRecord | null> {
     return readLatestRevisionFrom(this.revisionRecords, normalizeSelectorForTest(selector));
+  }
+
+  async readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    return readCurrentPayloadFrom(this.revisionRecords, this.payloadRecords, normalizeSelectorForTest(selector));
+  }
+
+  async readCurrentTranscriptDefaultPayload<TPayload = unknown>(selector: {
+    runId: string;
+    limit: number;
+    projectContextId?: string | null;
+  }): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    return readCurrentTranscriptDefaultPayloadFrom(this.revisionRecords, this.payloadRecords, selector);
   }
 
   async withTransaction<T>(operation: (transaction: ProjectionTransactionRevisionPort) => Promise<T>): Promise<T> {
@@ -913,6 +1106,77 @@ function readLatestRevisionFrom(
 ): ProjectionRevisionRecord | null {
   const latest = records.filter((record) => matchesSelector(record, selector)).sort(compareRevisionDescending)[0];
   return latest ? cloneRevisionRecord(latest) : null;
+}
+
+function readCurrentPayloadFrom<TPayload>(
+  revisions: readonly ProjectionRevisionRecord[],
+  payloads: readonly ProjectionPayloadInsertInput[],
+  selector: NormalizedProjectionRevisionSelector,
+): ProjectionPayloadRecord<TPayload> | null {
+  const revision = readCurrentRevisionFrom(revisions, selector);
+  if (!revision) return null;
+  const payload = payloads.find(
+    (candidate) =>
+      candidate.projectionRevisionId === revision.projectionRevisionId &&
+      candidate.projectContextId === selector.projectContextId,
+  );
+  return payload ? projectionPayloadRecordFromWrite<TPayload>(revision, payload) : null;
+}
+
+function readCurrentTranscriptDefaultPayloadFrom<TPayload>(
+  revisions: readonly ProjectionRevisionRecord[],
+  payloads: readonly ProjectionPayloadInsertInput[],
+  selector: { runId: string; limit: number; projectContextId?: string | null },
+): ProjectionPayloadRecord<TPayload> | null {
+  const currentByRevisionId = new Map(
+    revisions
+      .filter((revision) => revision.projectionName === "transcript_projection" && revision.scopeKind === "run_page" && revision.supersededAt === null)
+      .map((revision) => [revision.projectionRevisionId, revision] as const),
+  );
+  const candidates = payloads
+    .flatMap((payload) => {
+      const revision = currentByRevisionId.get(payload.projectionRevisionId);
+      if (!revision) return [];
+      if (payload.projectionName !== "transcript_projection") return [];
+      if (payload.fields.runId !== selector.runId || payload.fields.offsetLimit !== selector.limit) return [];
+      if (!matchesTranscriptDefaultScope(revision.scopeKey, selector.projectContextId ?? null)) return [];
+      return [{ revision, payload }] as const;
+    })
+    .sort(compareTranscriptDefaultWrites);
+  const selected = candidates[0];
+  return selected ? projectionPayloadRecordFromWrite<TPayload>(selected.revision, selected.payload) : null;
+}
+
+function compareTranscriptDefaultWrites(
+  left: { revision: ProjectionRevisionRecord; payload: ProjectionPayloadInsertInput },
+  right: { revision: ProjectionRevisionRecord; payload: ProjectionPayloadInsertInput },
+): number {
+  return (
+    Number(right.payload.fields.nextOffset === null) - Number(left.payload.fields.nextOffset === null) ||
+    right.payload.fields.messageCount - left.payload.fields.messageCount ||
+    right.payload.fields.offsetStart - left.payload.fields.offsetStart ||
+    right.revision.revision - left.revision.revision ||
+    right.payload.generatedAt.localeCompare(left.payload.generatedAt)
+  );
+}
+
+function matchesTranscriptDefaultScope(scopeKey: string, projectContextId: string | null): boolean {
+  if (projectContextId === null) return !scopeKey.startsWith("pc=");
+  return scopeKey.startsWith(`pc=${projectContextId}|`);
+}
+
+function projectionPayloadRecordFromWrite<TPayload>(
+  revision: ProjectionRevisionRecord,
+  payload: ProjectionPayloadInsertInput,
+): ProjectionPayloadRecord<TPayload> {
+  return {
+    revision: cloneRevisionRecord(revision),
+    payload: cloneJson(payload.payload) as TPayload,
+    payloadSha256: payload.payloadSha256,
+    rawPayloadRefs: cloneJson(payload.rawPayloadRefs),
+    generatedAt: payload.generatedAt,
+    expiresAt: payload.expiresAt,
+  };
 }
 
 function compareRevisionDescending(left: ProjectionRevisionRecord, right: ProjectionRevisionRecord): number {

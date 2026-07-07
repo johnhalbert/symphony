@@ -204,6 +204,7 @@ describe("web projection read repositories", () => {
       projectionPayloadRecordFixture(
         {
           projectionName: "history_projection",
+          projectContextId: "docs",
           scopeKind: "global_collection",
           scopeKey: "pc=docs|global:session:7:timeline:9",
         },
@@ -212,6 +213,7 @@ describe("web projection read repositories", () => {
       projectionPayloadRecordFixture(
         {
           projectionName: "transcript_projection",
+          projectContextId: "docs",
           scopeKind: "run_page",
           scopeKey: "pc=docs|shared-run:offset:10:limit:25",
         },
@@ -220,6 +222,7 @@ describe("web projection read repositories", () => {
       projectionPayloadRecordFixture(
         {
           projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
           scopeKind: "run_page",
           scopeKey: "pc=default|legacy-scoped-run:offset:0:limit:500",
         },
@@ -228,6 +231,7 @@ describe("web projection read repositories", () => {
       projectionPayloadRecordFixture(
         {
           projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
           scopeKind: "run_page",
           scopeKey: "pc=default|legacy-scoped-run:offset:500:limit:500",
         },
@@ -333,15 +337,62 @@ describe("web projection read repositories", () => {
       },
     });
 
-    expect(reader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
-      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "pc=docs|global:session:7:timeline:9" },
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=docs|shared-run:offset:10:limit:25" },
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=symphony|legacy-scoped-run:offset:0:limit:500" },
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=default|legacy-scoped-run:offset:0:limit:500" },
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=symphony|legacy-run:offset:0:limit:500" },
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=default|legacy-run:offset:0:limit:500" },
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "legacy-run:offset:0:limit:500" },
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=docs|legacy-scoped-run:offset:0:limit:500" },
+    expect(
+      reader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({
+        projectionName,
+        projectContextId: projectContextId ?? null,
+        scopeKind,
+        scopeKey,
+      })),
+    ).toEqual([
+      {
+        projectionName: "history_projection",
+        projectContextId: "docs",
+        scopeKind: "global_collection",
+        scopeKey: "pc=docs|global:session:7:timeline:9",
+      },
+      {
+        projectionName: "transcript_projection",
+        projectContextId: "docs",
+        scopeKind: "run_page",
+        scopeKey: "pc=docs|shared-run:offset:10:limit:25",
+      },
+      {
+        projectionName: "transcript_projection",
+        projectContextId: "symphony",
+        scopeKind: "run_page",
+        scopeKey: "pc=symphony|legacy-scoped-run:offset:0:limit:500",
+      },
+      {
+        projectionName: "transcript_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "run_page",
+        scopeKey: "pc=default|legacy-scoped-run:offset:0:limit:500",
+      },
+      {
+        projectionName: "transcript_projection",
+        projectContextId: "symphony",
+        scopeKind: "run_page",
+        scopeKey: "pc=symphony|legacy-run:offset:0:limit:500",
+      },
+      {
+        projectionName: "transcript_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "run_page",
+        scopeKey: "pc=default|legacy-run:offset:0:limit:500",
+      },
+      {
+        projectionName: "transcript_projection",
+        projectContextId: null,
+        scopeKind: "run_page",
+        scopeKey: "legacy-run:offset:0:limit:500",
+      },
+      {
+        projectionName: "transcript_projection",
+        projectContextId: "docs",
+        scopeKind: "run_page",
+        scopeKey: "pc=docs|legacy-scoped-run:offset:0:limit:500",
+      },
     ]);
     expect(reader.defaultPageSelectors.map(({ runId, limit, projectContextId }) => ({ runId, limit, projectContextId: projectContextId ?? null }))).toEqual([
       { runId: "legacy-scoped-run", limit: 500, projectContextId: "symphony" },
@@ -375,6 +426,7 @@ describe("web projection read repositories", () => {
       projectionPayloadRecordFixture(
         {
           projectionName: "history_projection",
+          projectContextId: "symphony",
           scopeKind: "global_collection",
           scopeKey: "pc=symphony|global:session:5:timeline:7",
         },
@@ -383,6 +435,7 @@ describe("web projection read repositories", () => {
       projectionPayloadRecordFixture(
         {
           projectionName: "history_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
           scopeKind: "global_collection",
           scopeKey: "pc=default|global:session:5:timeline:7",
         },
@@ -391,6 +444,7 @@ describe("web projection read repositories", () => {
       projectionPayloadRecordFixture(
         {
           projectionName: "transcript_projection",
+          projectContextId: "symphony",
           scopeKind: "run_page",
           scopeKey: "pc=symphony|shadowed-run:offset:0:limit:500",
         },
@@ -400,6 +454,7 @@ describe("web projection read repositories", () => {
       projectionPayloadRecordFixture(
         {
           projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
           scopeKind: "run_page",
           scopeKey: "pc=default|shadowed-run:offset:0:limit:500",
         },
@@ -408,6 +463,7 @@ describe("web projection read repositories", () => {
       projectionPayloadRecordFixture(
         {
           projectionName: "transcript_projection",
+          projectContextId: "symphony",
           scopeKind: "run_page",
           scopeKey: "pc=symphony|fallback-run:offset:500:limit:500",
         },
@@ -464,11 +520,38 @@ describe("web projection read repositories", () => {
       record: { payload: [{ text: "legacy unscoped tail transcript" }] },
     });
 
-    expect(reader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
-      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "pc=symphony|global:session:5:timeline:7" },
-      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "pc=default|global:session:5:timeline:7" },
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=symphony|shadowed-run:offset:0:limit:500" },
-      { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=default|shadowed-run:offset:0:limit:500" },
+    expect(
+      reader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({
+        projectionName,
+        projectContextId: projectContextId ?? null,
+        scopeKind,
+        scopeKey,
+      })),
+    ).toEqual([
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "pc=symphony|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "global_collection",
+        scopeKey: "pc=default|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "transcript_projection",
+        projectContextId: "symphony",
+        scopeKind: "run_page",
+        scopeKey: "pc=symphony|shadowed-run:offset:0:limit:500",
+      },
+      {
+        projectionName: "transcript_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "run_page",
+        scopeKey: "pc=default|shadowed-run:offset:0:limit:500",
+      },
     ]);
     expect(reader.defaultPageSelectors.map(({ runId, limit, projectContextId }) => ({ runId, limit, projectContextId: projectContextId ?? null }))).toEqual([
       { runId: "fallback-run", limit: 500, projectContextId: "symphony" },
@@ -479,7 +562,18 @@ describe("web projection read repositories", () => {
 });
 
 function projectionSelectorKey(selector: ProjectionRevisionSelector): string {
-  return [selector.projectionName, selector.scopeKind ?? "global", selector.scopeKey ?? "global"].join(":");
+  return [
+    selector.projectionName,
+    normalizeSelectorProjectContextIdForTest(selector.projectContextId),
+    selector.scopeKind ?? "global",
+    selector.scopeKey ?? "global",
+  ].join(":");
+}
+
+function normalizeSelectorProjectContextIdForTest(projectContextId: string | null | undefined): string {
+  if (projectContextId === undefined || projectContextId === null) return LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+  const trimmed = projectContextId.trim();
+  return trimmed.length > 0 ? trimmed : LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
 }
 
 function projectionPayloadRecordFixture<TPayload>(

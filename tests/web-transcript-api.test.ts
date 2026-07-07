@@ -353,7 +353,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=default|active-run:offset:0:limit:1" },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "pc=default|active-run:offset:0:limit:1",
+        },
       ]);
     } finally {
       await server.stop();
@@ -434,7 +439,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=default|envelope-run:offset:0:limit:1" },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "pc=default|envelope-run:offset:0:limit:1",
+        },
       ]);
     } finally {
       await server.stop();
@@ -567,7 +577,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "pc=default|source-backfill-run:offset:0:limit:1" },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "pc=default|source-backfill-run:offset:0:limit:1",
+        },
       ]);
     } finally {
       await server.stop();
@@ -1597,6 +1612,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(projectionReader.selectors).toEqual([
         {
           projectionName: "transcript_projection",
+          projectContextId: "docs",
           scopeKind: "run_page",
           scopeKey: "pc=docs|docs-run:offset:0:limit:500",
         },
@@ -1684,11 +1700,13 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(projectionReader.selectors).toEqual([
         {
           projectionName: "transcript_projection",
+          projectContextId: "docs",
           scopeKind: "run_page",
           scopeKey: "pc=docs|legacy-context-run:offset:0:limit:500",
         },
         {
           projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
           scopeKind: "run_page",
           scopeKey: "pc=default|legacy-context-run:offset:0:limit:500",
         },
@@ -1716,6 +1734,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         expectedSelectors: [
           {
             projectionName: "transcript_projection",
+            projectContextId: "docs",
             scopeKind: "run_page",
             scopeKey: "pc=docs|current-default-scoped-run:offset:0:limit:500",
           },
@@ -1737,11 +1756,13 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         expectedSelectors: [
           {
             projectionName: "transcript_projection",
+            projectContextId: "docs",
             scopeKind: "run_page",
             scopeKey: "pc=docs|legacy-default-scoped-run:offset:0:limit:500",
           },
           {
             projectionName: "transcript_projection",
+            projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
             scopeKind: "run_page",
             scopeKey: "pc=default|legacy-default-scoped-run:offset:0:limit:500",
           },
