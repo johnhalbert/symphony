@@ -1412,12 +1412,21 @@ describe("/api/v1/web route contracts", () => {
       linearProjectSlug: "DOCS",
       routingSource: "candidate_poll",
     } as const;
+    const expectedWorkspaceProjectContext = {
+      ...docsProjectContext,
+      routingSource: "explicit",
+    } as const;
     const durableIssue = {
       ...issueModelFixture(),
       id: "docs:ENG-179",
       title: "Serve contextual durable workspace attribution",
       project: "Documentation Site",
-      projectContext: docsProjectContext,
+      projectContext: {
+        id: docsProjectContext.projectContextId,
+        label: docsProjectContext.projectContextLabel,
+        linearProject: docsProjectContext.linearProjectSlug,
+        codebase: null,
+      },
     };
     const issueBoard = {
       issues: [durableIssue],
@@ -1471,7 +1480,7 @@ describe("/api/v1/web route contracts", () => {
         gitBranchName: "symphony/docs/ENG-179",
         repoPath: "/repo-docs",
         baseRef: "origin/main",
-        projectContext: docsProjectContext,
+        projectContext: expectedWorkspaceProjectContext,
       });
     } finally {
       await server.stop();

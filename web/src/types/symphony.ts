@@ -40,6 +40,7 @@ export interface IssueModel {
   assignee: string;
   agent?: string | null;
   project: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
   cycle: string;
   desc?: string[];
   activity?: Array<{ t: string; verb: string; val: string; who: string }>;
@@ -49,11 +50,14 @@ export interface IssueModel {
   session?: string | null;
 }
 
-export interface RunningAgentProjectContextModel {
+export interface ProjectContextDisplayModel {
   id: string;
   label: string;
   linearProject: string | null;
   codebase: string | null;
+}
+
+export interface RunningAgentProjectContextModel extends ProjectContextDisplayModel {
   projectContextId: string;
   projectContextLabel: string;
   linearProjectSlug: string | null;
@@ -81,6 +85,7 @@ export interface ProviderGateModel {
   sourceIssue: string | null;
   sourceRunId: string | null;
   affected: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
 }
 
 export interface ActivityModel {
@@ -89,6 +94,7 @@ export interface ActivityModel {
   verb: string;
   id: string;
   extra: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
 }
 
 export interface RunSessionModelParam {
@@ -181,6 +187,7 @@ export interface SessionModel {
   id: string;
   issue: string;
   title: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
   state: "running" | "finished" | "error" | "cancelled" | "queued" | "not_live";
   model: string;
   startedAt: string;
@@ -453,8 +460,27 @@ export interface IssueBoardModel {
   selectedIssueId: string;
 }
 
+export interface WorkspaceProjectContextModel {
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
+  routingSource: string;
+}
+
+export interface WorkspaceModel {
+  workspaceKey: string | null;
+  path: string | null;
+  sourceKind: string | null;
+  branchName: string | null;
+  gitBranchName: string | null;
+  repoPath: string | null;
+  baseRef: string | null;
+  projectContext?: WorkspaceProjectContextModel | undefined;
+}
+
 export interface IssueDetailModel {
   issue: IssueModel;
+  workspace: WorkspaceModel | null;
   activity: ActivityModel[];
   runs: SessionModel[];
   transcript: TranscriptMessage[];

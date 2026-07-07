@@ -868,7 +868,7 @@ describe("API data source", () => {
   });
 
   it("fetches issue detail from the encoded issue-detail endpoint", async () => {
-    const detail = { issue: { id: "ENG/109", title: "Detail" }, activity: [], runs: [], transcript: [] };
+    const detail = { issue: { id: "ENG/109", title: "Detail" }, workspace: null, activity: [], runs: [], transcript: [] };
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(detail));
 
     await expect(createApiDataSource("https://symphony.example.test///").getIssueDetail("ENG/109")).resolves.toEqual(detail);
@@ -996,8 +996,8 @@ describe("API data source", () => {
   });
 
   it("passes AbortSignal through selected detail and transcript reads without sharing stale responses", async () => {
-    const firstDetail = { issue: { id: "ENG-124", title: "first detail" }, activity: [], runs: [], transcript: [] };
-    const secondDetail = { issue: { id: "ENG-124", title: "second detail" }, activity: [], runs: [], transcript: [] };
+    const firstDetail = { issue: { id: "ENG-124", title: "first detail" }, workspace: null, activity: [], runs: [], transcript: [] };
+    const secondDetail = { issue: { id: "ENG-124", title: "second detail" }, workspace: null, activity: [], runs: [], transcript: [] };
     const firstTranscript: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-05-30T00:00:00.000Z", text: "first transcript" }];
     const secondTranscript: TranscriptMessage[] = [{ kind: "assistant", ts: "2026-05-30T00:00:01.000Z", text: "second transcript" }];
     const firstTranscriptWindow = createTranscriptWindowResponse(firstTranscript);

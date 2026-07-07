@@ -422,6 +422,50 @@ describe("web issue detail projection", () => {
     expect(JSON.stringify(detail).toLowerCase()).not.toContain("mock");
   });
 
+  it("keeps planning workspaces out of top-level issue detail workspace projection outside issue-breakdown runs", () => {
+    const detail = projectWebIssueDetail(
+      {
+        issue: "TEST-1",
+        boardCard: null,
+        issueDetails: issueDetails({
+          workspace: {
+            workspaceKey: null,
+            path: null,
+            sourceKind: null,
+            branchName: null,
+            gitBranchName: null,
+            repoPath: null,
+            baseRef: null,
+          },
+        }),
+        workspace: {
+          workspaceKey: "TEST-1-planning",
+          path: "/tmp/workspaces/TEST-1-planning",
+          sourceKind: "git_worktree",
+          branchName: "symphony/TEST-1-planning",
+          gitBranchName: "symphony/TEST-1-planning",
+          repoPath: "/repo",
+          baseRef: "main",
+        },
+        latestRun: runRecord({
+          runPhase: "issue_breakdown",
+          workspaceKey: "TEST-1-planning",
+          workspacePath: "/tmp/workspaces/TEST-1-planning",
+          gitBranchName: "symphony/TEST-1-planning",
+          repoPath: "/repo",
+          baseRef: "main",
+        }),
+        runs: [],
+        activity: { activity: [] },
+        transcript: [],
+        operatorLiveness: null,
+      },
+      "TEST-1",
+    );
+
+    expect(detail?.workspace).toBeNull();
+  });
+
   it("projects durable-only issue details without a board card or invented mock data", () => {
     const detail = projectWebIssueDetail(durableDetail(), "REQ-2");
     const requestFallback = projectWebIssueDetail(
