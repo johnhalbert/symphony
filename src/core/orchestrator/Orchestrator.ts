@@ -6318,6 +6318,7 @@ export class Orchestrator {
       details: {
         verdictId: verdict.id,
         runId: context.handoffReconciliation.runId ?? verdict.runId,
+        operationKeys,
       },
     };
   }
