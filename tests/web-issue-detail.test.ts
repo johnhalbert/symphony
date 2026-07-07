@@ -406,8 +406,17 @@ describe("web issue detail projection", () => {
           result: "read_file result",
         },
       ],
+      workspace: {
+        workspaceKey: "TEST-1",
+        path: "/tmp/workspaces/TEST-1",
+        sourceKind: "git_worktree",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
     });
-    expect(Object.keys(detail ?? {})).toEqual(["issue", "activity", "runs", "transcript"]);
+    expect(Object.keys(detail ?? {})).toEqual(["issue", "workspace", "activity", "runs", "transcript"]);
     expect(detail?.transcript[2]).not.toHaveProperty("payload");
     expect(detail?.transcript[2]).not.toHaveProperty("runId");
     expect(JSON.stringify(detail).toLowerCase()).not.toContain("mock");
@@ -439,6 +448,7 @@ describe("web issue detail projection", () => {
         workspace: null,
         session: null,
       },
+      workspace: null,
       activity: [],
       runs: [],
       transcript: [],

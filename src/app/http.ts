@@ -20,6 +20,7 @@ import {
   projectRunningAgents,
   projectSessionModel,
   projectTranscriptMessages,
+  projectWorkspaceModel,
   projectWebDashboard,
   projectWebIssueBoard,
   projectWebIssueDetail,
@@ -2490,6 +2491,10 @@ export class StatusServer {
         : [];
     return {
       issue: cloneJson(issue),
+      workspace: projectWorkspaceModel(
+        resolvedIssue.status === "resolved" ? resolvedIssue.workspace : null,
+        { issue, latestRun },
+      ),
       activity: projectActivityModels(activity),
       runs: detailRuns.map(projectSessionModel),
       transcript: projectTranscriptMessages(transcript, { run: latestRun, includeRunPrelude: transcript.length > 0 }),

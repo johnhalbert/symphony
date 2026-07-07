@@ -186,6 +186,17 @@ export interface SessionModel {
   toolCount: number;
 }
 
+export interface WorkspaceModel {
+  workspaceKey: string | null;
+  path: string | null;
+  sourceKind: string | null;
+  branchName: string | null;
+  gitBranchName: string | null;
+  repoPath: string | null;
+  baseRef: string | null;
+  projectContext?: ProjectContextResolution | undefined;
+}
+
 export interface ChatMessage {
   id?: string;
   conversationId?: string;
@@ -261,6 +272,7 @@ export interface DashboardModel {
 
 export interface IssueDetailModel {
   issue: IssueModel;
+  workspace: WorkspaceModel | null;
   activity: ActivityModel[];
   runs: SessionModel[];
   transcript: TranscriptMessage[];
@@ -627,6 +639,7 @@ export function emptyDashboardSourceModel(): DashboardSourceModel {
 export function emptyIssueDetailModel(issueId = ""): IssueDetailModel {
   return {
     issue: emptyIssueModel(issueId),
+    workspace: null,
     activity: [],
     runs: [],
     transcript: [],
@@ -788,6 +801,10 @@ export function projectWebIssueDetail(
       requestKey,
       lane: input.boardCard?.lane ?? null,
       operatorLiveness: input.operatorLiveness ?? input.boardCard?.operatorLiveness ?? null,
+      latestRun: input.latestRun ?? null,
+    }),
+    workspace: projectWorkspaceModel(input.workspace ?? input.issueDetails.workspace, {
+      issue: input.issueDetails.issue,
       latestRun: input.latestRun ?? null,
     }),
     activity: projectActivityModels(input.activity ?? null),
@@ -1566,6 +1583,54 @@ function cloneActivityModel(input: ActivityModel): ActivityModel {
     ...input,
     ...(input.projectContext === undefined ? {} : { projectContext: cloneProjectContextDisplayModel(input.projectContext) }),
   };
+}
+
+export function projectWorkspaceModel(
+  workspace: IssueWorkspaceSummary | WorkspaceRecord | null | undefined,
+  options: { issue?: IssueStatusView | IssueModel | null; latestRun?: RunRecord | null } = {},
+): WorkspaceModel | null {
+  const source = (workspace ?? null) as Partial<WorkspaceModel & { projectContext?: Partial<ProjectContextResolution> | null }> | null;
+  const workspaceKey = firstNonEmpty(source?.workspaceKey, options.latestRun?.workspaceKey) ?? null;
+  const path = firstNonEmpty(source?.path, options.latestRun?.workspacePath) ?? null;
+  const sourceKind = firstNonEmpty(source?.sourceKind) ?? null;
+  const branchName = firstNonEmpty(source?.branchName) ?? null;
+  const gitBranchName = firstNonEmpty(source?.gitBranchName, options.latestRun?.gitBranchName) ?? null;
+  const repoPath = firstNonEmpty(source?.repoPath, options.latestRun?.repoPath) ?? null;
+  const baseRef = firstNonEmpty(source?.baseRef, options.latestRun?.baseRef) ?? null;
+
+  if ([workspaceKey, path, sourceKind, branchName, gitBranchName, repoPath, baseRef].every((value) => value === null)) return null;
+
+  const projectContext = projectWorkspaceProjectContext(source?.projectContext, options.issue ?? null, options.latestRun ?? null);
+
+  return {
+    workspaceKey,
+    path,
+    sourceKind,
+    branchName,
+    gitBranchName,
+    repoPath,
+    baseRef,
+    ...(projectContext === undefined ? {} : { projectContext }),
+  };
+}
+
+function projectWorkspaceProjectContext(
+  workspaceProjectContext: Partial<ProjectContextResolution> | null | undefined,
+  issue: IssueStatusView | IssueModel | null | undefined,
+  latestRun: RunRecord | null | undefined,
+): ProjectContextResolution | undefined {
+  const candidates = [
+    workspaceProjectContext ? normalizeProjectContextResolution(workspaceProjectContext) : undefined,
+    issue ? (projectContextResolutionFromIssue(issue) ?? undefined) : undefined,
+    latestRun?.projectContext ? normalizeProjectContextResolution(latestRun.projectContext) : undefined,
+  ];
+  let legacyFallback: ProjectContextResolution | undefined;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (candidate.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return candidate;
+    legacyFallback ??= candidate;
+  }
+  return legacyFallback;
 }
 
 function addReferenceLabel(labels: Map<string, ReferenceLabelModel>, value: string | null | undefined): void {

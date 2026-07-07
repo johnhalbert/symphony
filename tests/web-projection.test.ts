@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { IssueDetailsEnvelope } from "../src/core/types.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import type { IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
 import {
@@ -803,26 +808,103 @@ describe("web projection foundation", () => {
     ]);
   });
 
-  it("keeps legacy default tracker attribution out of the web project label", () => {
-    const legacyDefaultIssue = projectIssueModel(
-      issueDetails({
+  it("prefers explicit issue project context over legacy run defaults when projecting issue-detail workspaces", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const detail = projectIssueDetailModel({
+      issue: "docs:TEST-1",
+      boardCard: null,
+      issueDetails: issueDetails({
         issue: {
           ...issueDetails().issue,
-          linearProjectIdentity: { kind: "linear", slug: "ENG" },
-          linearProjectSlug: "ENG",
-          routingSource: "legacy_default",
+          projectContextId: docsProjectContext.projectContextId,
+          projectContextLabel: docsProjectContext.projectContextLabel,
+          linearProjectSlug: docsProjectContext.linearProjectSlug,
+          routingSource: docsProjectContext.routingSource,
+        },
+        workspace: {
+          workspaceKey: null,
+          path: null,
+          sourceKind: null,
+          branchName: null,
+          gitBranchName: null,
+          repoPath: null,
+          baseRef: null,
         },
       }),
-    );
+      latestRun: run({
+        workspaceKey: "TEST-1",
+        workspacePath: "/tmp/workspaces/TEST-1",
+        gitBranchName: "symphony/docs/TEST-1",
+        repoPath: "/repo/docs",
+        baseRef: "origin/main",
+        projectContext: {
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+          linearProjectSlug: null,
+          routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+        },
+      }),
+      runs: [],
+      operatorLiveness: null,
+    });
 
-    expect(legacyDefaultIssue).toMatchObject({
+    expect(detail.workspace).toMatchObject({
+      workspaceKey: "TEST-1",
+      path: "/tmp/workspaces/TEST-1",
+      gitBranchName: "symphony/docs/TEST-1",
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+      projectContext: docsProjectContext,
+    });
+  });
+
+  it("projects legacy default tracker attribution onto board and detail issues without changing blank project labels or unqualified ids", () => {
+    const legacyDefaultProjectContext = {
+      projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      linearProjectSlug: "ENG",
+      routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+    } as const;
+    const legacyDefaultDetails = issueDetails({
+      issue: {
+        ...issueDetails().issue,
+        linearProjectIdentity: { kind: "linear", slug: "ENG" },
+        linearProjectSlug: "ENG",
+        routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+      },
+    });
+    const board = projectWebIssueBoard({
+      issues: [
+        card({
+          issueDetails: legacyDefaultDetails,
+          live: null,
+          operatorLiveness: null,
+        }),
+      ],
+    });
+    const detail = projectIssueDetailModel({
+      issue: "TEST-1",
+      boardCard: null,
+      issueDetails: legacyDefaultDetails,
+      latestRun: run(),
+      runs: [],
+      operatorLiveness: null,
+    });
+
+    expect(board.issues[0]).toMatchObject({
       id: "TEST-1",
       project: "",
-      projectContext: displayProjectContext({
-        projectContextId: "default",
-        projectContextLabel: "Default",
-        linearProjectSlug: "ENG",
-      }),
+      projectContext: displayProjectContext(legacyDefaultProjectContext),
+    });
+    expect(detail.issue).toMatchObject({
+      id: "TEST-1",
+      project: "",
+      projectContext: displayProjectContext(legacyDefaultProjectContext),
     });
   });
 
