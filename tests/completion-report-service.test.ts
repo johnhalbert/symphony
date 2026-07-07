@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -41,11 +42,11 @@ describe("CompletionReportService", () => {
     const lifecycle = await lifecycleStore.get("issue-1");
     expect(lifecycle).toMatchObject({
       phase: "review",
-      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      lastCompletionReportId: "completion-report:issue-1:run-1:idem-1",
       incompleteTurnCount: 0,
       completionReports: [
         {
-          id: "completion-report:issue-1:idem-1",
+          id: "completion-report:issue-1:run-1:idem-1",
           idempotencyKey: "idem-1",
           runId: "run-1",
           issueId: "issue-1",
@@ -54,6 +55,16 @@ describe("CompletionReportService", () => {
           changedFiles: ["src/core/CompletionReportService.ts"],
           branchName: "symphony/TEST-1",
           pullRequest: null,
+          acceptanceContext: {
+            version: 1,
+            runId: "run-1",
+            branchName: "symphony/TEST-1",
+            baseRef: null,
+            baseHeadSha: null,
+            worktreeHeadSha: null,
+            pullRequestHeadSha: null,
+            worktreeDirty: null,
+          },
           risks: ["Reviewer handler remains out of scope."],
         },
       ],
@@ -325,7 +336,7 @@ describe("CompletionReportService", () => {
       status: "repair_dispatched",
       headSha: "head-sha-1",
       repairRunId: "run-2",
-      repairReportId: "completion-report:issue-1:repair-2",
+      repairReportId: "completion-report:issue-1:run-2:repair-2",
     });
   });
 
@@ -437,16 +448,133 @@ describe("CompletionReportService", () => {
   });
 
   it("replays duplicate reports without new lifecycle or writeback side effects", async () => {
+    const workspacePath = await createGitWorkspace(root);
     const { service, lifecycleStore, outbox } = fixture();
+    const replayContext = contextWithWorkspace({
+      workspacePath,
+      issue: issue({ state: "In Progress", branchName: "main" }),
+      workspace: workspaceForGitFixture(workspacePath),
+    });
 
-    const first = await service.submitCompletionReport(report(), context());
-    const second = await service.submitCompletionReport(report({ summary: "Changed summary on replay." }), context());
+    const first = await service.submitCompletionReport(report({ branchName: "main" }), replayContext);
+    const second = await service.submitCompletionReport(
+      report({ branchName: "main", summary: "Changed summary on replay." }),
+      replayContext,
+    );
 
     expect(first.replayed).toBe(false);
     expect(second.replayed).toBe(true);
     expect(second.report.summary).toBe("Implemented the service contract.");
     expect((await lifecycleStore.get("issue-1"))?.completionReports).toHaveLength(1);
     expect(await outbox.list()).toHaveLength(2);
+  });
+
+  it("treats the same idempotency key from a later run with a changed PR head as a fresh completion", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+    const pullRequest = {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "head-sha-1",
+      branch: "symphony/TEST-1",
+    };
+
+    const first = await service.submitCompletionReport(report({ pullRequest }), context());
+    const second = await service.submitCompletionReport(
+      report({
+        runId: "run-2",
+        pullRequest: {
+          ...pullRequest,
+          headSha: "head-sha-2",
+        },
+      }),
+      context({ activeRunId: "run-2" }),
+    );
+
+    expect(first.replayed).toBe(false);
+    expect(second.replayed).toBe(false);
+    expect(second.report.id).toBe("completion-report:issue-1:run-2:idem-1");
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      lastCompletionReportId: "completion-report:issue-1:run-2:idem-1",
+      completionReports: [
+        {
+          id: "completion-report:issue-1:run-1:idem-1",
+          runId: "run-1",
+          pullRequest: { headSha: "head-sha-1" },
+        },
+        {
+          id: "completion-report:issue-1:run-2:idem-1",
+          runId: "run-2",
+          pullRequest: { headSha: "head-sha-2" },
+        },
+      ],
+    });
+    expect(await outbox.list()).toHaveLength(4);
+  });
+
+  it("does not replay a same-key later run when worktree authority is unavailable", async () => {
+    const { service, lifecycleStore, outbox } = fixture();
+
+    await service.submitCompletionReport(report(), context({ workspacePath: null, workspace: null }));
+    const second = await service.submitCompletionReport(
+      report({ runId: "run-2" }),
+      context({ activeRunId: "run-2", workspacePath: null, workspace: null }),
+    );
+
+    expect(second.replayed).toBe(false);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      lastCompletionReportId: "completion-report:issue-1:run-2:idem-1",
+      completionReports: [
+        { runId: "run-1", acceptanceContext: { worktreeDirty: null, worktreeHeadSha: null } },
+        { runId: "run-2", acceptanceContext: { worktreeDirty: null, worktreeHeadSha: null } },
+      ],
+    });
+    expect(await outbox.list()).toHaveLength(4);
+  });
+
+  it("captures dirty worktree state on fresh same-key later runs", async () => {
+    const workspacePath = await createGitWorkspace(root);
+    const { service, lifecycleStore } = fixture();
+    const workspaceContext = () =>
+      contextWithWorkspace({
+        workspacePath,
+        issue: issue({ state: "In Progress", branchName: "main" }),
+        workspace: {
+          path: workspacePath,
+          workspaceKey: "TEST-1",
+          createdNow: false,
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          gitBranchName: "main",
+          repoPath: workspacePath,
+          baseRef: "main",
+        },
+      });
+
+    const first = await service.submitCompletionReport(report({ branchName: "main" }), workspaceContext());
+    await writeFile(path.join(workspacePath, "tracked.txt"), "changed\n", "utf8");
+    const second = await service.submitCompletionReport(
+      report({ runId: "run-2", branchName: "main" }),
+      { ...workspaceContext(), activeRunId: "run-2" },
+    );
+
+    expect(first.report.acceptanceContext).toMatchObject({
+      branchName: "main",
+      baseRef: "main",
+      worktreeDirty: false,
+      worktreeHeadSha: expect.any(String),
+      baseHeadSha: expect.any(String),
+    });
+    expect(second.replayed).toBe(false);
+    expect(second.report.acceptanceContext).toMatchObject({
+      branchName: "main",
+      baseRef: "main",
+      worktreeDirty: true,
+      worktreeHeadSha: first.report.acceptanceContext?.worktreeHeadSha,
+      baseHeadSha: first.report.acceptanceContext?.baseHeadSha,
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      lastCompletionReportId: "completion-report:issue-1:run-2:idem-1",
+    });
   });
 
   it("publishes a new service-owned PR before accepting a completion report", async () => {
@@ -541,20 +669,30 @@ describe("CompletionReportService", () => {
   });
 
   it("reuses a service-discovered PR and prevents duplicate publication on replay", async () => {
+    const workspacePath = await createGitWorkspace(root);
+    const headSha = await gitOutput(["rev-parse", "HEAD"], workspacePath);
     const publisher = new FakePublisher({
       action: "reused",
       url: "https://github.com/acme/symphony/pull/42",
       number: 42,
-      headBranch: "symphony/TEST-1",
-      headSha: "abc123",
+      headBranch: "main",
+      headSha,
       lastPushedAt: "2026-01-01T00:00:01Z",
       evidenceCursor: "idem-1",
     });
     const { service, runStore, outbox } = fixture({ publisher });
     await startRun(runStore);
+    const replayContext = contextWithWorkspace({
+      workspacePath,
+      issue: issue({ state: "In Progress", branchName: "main" }),
+      workspace: workspaceForGitFixture(workspacePath),
+    });
 
-    const first = await service.submitCompletionReport(report(), contextWithWorkspace());
-    const second = await service.submitCompletionReport(report({ summary: "Changed on replay." }), contextWithWorkspace());
+    const first = await service.submitCompletionReport(report({ branchName: "main" }), replayContext);
+    const second = await service.submitCompletionReport(
+      report({ branchName: "main", summary: "Changed on replay." }),
+      replayContext,
+    );
     const transcript = await runStore.readTranscript("run-1");
 
     expect(first.replayed).toBe(false);
@@ -903,7 +1041,7 @@ describe("CompletionReportService", () => {
     expect(result.writebackOperations).toHaveLength(0);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
       phase: "review",
-      lastCompletionReportId: "completion-report:issue-1:idem-1",
+      lastCompletionReportId: "completion-report:issue-1:run-1:idem-1",
     });
     expect(await outbox.list()).toHaveLength(0);
   });
@@ -1059,6 +1197,60 @@ async function startRun(runStore: FileRunTranscriptStore): Promise<void> {
     gitBranchName: "symphony/TEST-1",
     repoPath: "/repo",
     baseRef: "main",
+  });
+}
+
+async function createGitWorkspace(root: string): Promise<string> {
+  const workspacePath = await mkdtemp(path.join(root, "git-workspace-"));
+  await git(["init", "-b", "main"], workspacePath);
+  await writeFile(path.join(workspacePath, "tracked.txt"), "initial\n", "utf8");
+  await git(["add", "tracked.txt"], workspacePath);
+  await git(["-c", "user.name=Symphony Test", "-c", "user.email=symphony@example.test", "commit", "-m", "initial"], workspacePath);
+  return workspacePath;
+}
+
+function workspaceForGitFixture(workspacePath: string): NonNullable<CompletionReportActiveContext["workspace"]> {
+  return {
+    path: workspacePath,
+    workspaceKey: "TEST-1",
+    createdNow: false,
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    gitBranchName: "main",
+    repoPath: workspacePath,
+    baseRef: "main",
+  };
+}
+
+async function git(args: string[], cwd: string): Promise<void> {
+  await gitOutput(args, cwd);
+}
+
+function gitOutput(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    let stdout = "";
+    const child = spawn("git", args, {
+      cwd,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout.trim());
+      } else {
+        reject(new Error(stderr.trim() || `git ${args.join(" ")} failed with exit code ${code}`));
+      }
+    });
   });
 }
 

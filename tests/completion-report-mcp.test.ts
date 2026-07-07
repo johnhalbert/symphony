@@ -95,7 +95,7 @@ describe("completion report MCP handoff", () => {
     expect(result).toMatchObject({
       accepted: true,
       replayed: false,
-      reportId: "completion-report:issue-1:idem-1",
+      reportId: "completion-report:issue-1:run-1:idem-1",
       pullRequest: {
         url: "https://github.com/acme/symphony/pull/42",
         number: 42,
@@ -326,7 +326,7 @@ describe("completion report MCP handoff", () => {
         structuredContent: {
           accepted: true,
           replayed: false,
-          reportId: "completion-report:issue-1:stdio-idem-1",
+            reportId: "completion-report:issue-1:run-stdio-1:stdio-idem-1",
         },
       },
     });
@@ -334,7 +334,7 @@ describe("completion report MCP handoff", () => {
     await server;
     await expect(new FileIssueLifecycleStore(stateDir).get("TEST-1")).resolves.toMatchObject({
       phase: "review",
-      lastCompletionReportId: "completion-report:issue-1:stdio-idem-1",
+      lastCompletionReportId: "completion-report:issue-1:run-stdio-1:stdio-idem-1",
       completionReports: [
         {
           runId: "run-stdio-1",

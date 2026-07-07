@@ -112,6 +112,21 @@ export interface CompletionReportPullRequestRef {
   draft?: boolean | null;
 }
 
+export interface CompletionReportAcceptanceContext {
+  version: 1;
+  capturedAt: string;
+  runId: string;
+  branchName: string | null;
+  baseRef: string | null;
+  baseHeadSha: string | null;
+  worktreeHeadSha: string | null;
+  treeSha: string | null;
+  pullRequestHeadSha: string | null;
+  worktreeDirty: boolean | null;
+  worktreeStatus: "clean" | "dirty" | "unknown";
+  unmergedFiles: string[] | null;
+}
+
 export type PullRequestReviewEvidenceSource = "review" | "review_comment" | "issue_comment";
 
 export interface PullRequestReviewEvidenceItem {
@@ -158,6 +173,7 @@ export interface IssueCompletionReportRecord {
   changedFiles: string[];
   branchName: string | null;
   pullRequest: CompletionReportPullRequestRef | null;
+  acceptanceContext?: CompletionReportAcceptanceContext | null;
   risks: string[];
   acceptedAt: string;
   writebackOperationKeys: string[];
@@ -1868,6 +1884,7 @@ function normalizeCompletionReport(value: unknown, filePath: string, index: numb
     changedFiles: requiredStringArray(value.changedFiles, filePath, `completionReports[${index}].changedFiles`),
     branchName: nullableString(value.branchName, filePath, `completionReports[${index}].branchName`),
     pullRequest: normalizePullRequest(value.pullRequest, filePath, index),
+    acceptanceContext: normalizeCompletionReportAcceptanceContext(value.acceptanceContext, filePath, index),
     risks: requiredStringArray(value.risks, filePath, `completionReports[${index}].risks`),
     acceptedAt: requiredString(value.acceptedAt, filePath, `completionReports[${index}].acceptedAt`),
     writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, `completionReports[${index}].writebackOperationKeys`),
@@ -3188,6 +3205,47 @@ function normalizePullRequest(value: unknown, filePath: string, reportIndex: num
     headSha: optionalNullableString(value.headSha, filePath, `completionReports[${reportIndex}].pullRequest.headSha`),
     branch: optionalNullableString(value.branch, filePath, `completionReports[${reportIndex}].pullRequest.branch`),
   };
+}
+
+function normalizeCompletionReportAcceptanceContext(
+  value: unknown,
+  filePath: string,
+  reportIndex: number,
+): CompletionReportAcceptanceContext | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `completionReports[${reportIndex}].acceptanceContext is invalid`);
+  const version = value.version;
+  if (version !== 1) {
+    throw corruptLifecycle(filePath, `completionReports[${reportIndex}].acceptanceContext.version is invalid`);
+  }
+  const field = (name: string) => `completionReports[${reportIndex}].acceptanceContext.${name}`;
+  return {
+    version,
+    capturedAt: requiredString(value.capturedAt, filePath, field("capturedAt")),
+    runId: requiredString(value.runId, filePath, field("runId")),
+    branchName: optionalNullableString(value.branchName, filePath, field("branchName")),
+    baseRef: optionalNullableString(value.baseRef, filePath, field("baseRef")),
+    baseHeadSha: optionalNullableString(value.baseHeadSha, filePath, field("baseHeadSha")),
+    worktreeHeadSha: optionalNullableString(value.worktreeHeadSha, filePath, field("worktreeHeadSha")),
+    treeSha: optionalNullableString(value.treeSha, filePath, field("treeSha")),
+    pullRequestHeadSha: optionalNullableString(value.pullRequestHeadSha, filePath, field("pullRequestHeadSha")),
+    worktreeDirty: optionalNullableBoolean(value.worktreeDirty, filePath, field("worktreeDirty")),
+    worktreeStatus: normalizeCompletionReportWorktreeStatus(value.worktreeStatus, filePath, field("worktreeStatus")),
+    unmergedFiles:
+      value.unmergedFiles === undefined || value.unmergedFiles === null
+        ? null
+        : requiredStringArray(value.unmergedFiles, filePath, field("unmergedFiles")),
+  };
+}
+
+function normalizeCompletionReportWorktreeStatus(
+  value: unknown,
+  filePath: string,
+  field: string,
+): "clean" | "dirty" | "unknown" {
+  if (value === undefined || value === null) return "unknown";
+  if (value === "clean" || value === "dirty" || value === "unknown") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
 }
 
 function nonNegativeInteger(value: unknown, filePath: string, field: string): number {

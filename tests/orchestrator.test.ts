@@ -5369,7 +5369,7 @@ describe("Orchestrator", () => {
     });
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
       phase: "review",
-      lastCompletionReportId: "completion-report:issue-1:manual-run-1",
+      lastCompletionReportId: "completion-report:issue-1:manual-run-1:manual-run-1",
     });
   });
 
@@ -9549,7 +9549,7 @@ describe("Orchestrator", () => {
       phase: "passed",
       reviewRound: 1,
       incompleteTurnCount: 0,
-      lastCompletionReportId: "completion-report:issue-1:smoke-report-2",
+      lastCompletionReportId: "completion-report:issue-1:smoke-worker-run-2:smoke-report-2",
       lastReviewVerdictId: "review-verdict:issue-1:smoke-verdict-pass",
     });
     expect(

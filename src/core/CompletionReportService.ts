@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { z } from "zod";
 import {
   BaseRefVerifier,
@@ -9,6 +10,7 @@ import {
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError, errorMessage } from "./errors.js";
 import type {
+  CompletionReportAcceptanceContext,
   CompletionReportChecklistItem,
   CompletionReportPullRequestRef,
   IssueCompletionReportRejectionRecord,
@@ -158,6 +160,17 @@ export interface CompletionReportResult {
   writebackOperations: WritebackOperation[];
 }
 
+interface CompletionReportLocalGitSnapshot {
+  branchName: string | null;
+  baseRef: string | null;
+  baseHeadSha: string | null;
+  worktreeHeadSha: string | null;
+  treeSha: string | null;
+  worktreeDirty: boolean | null;
+  worktreeStatus: "clean" | "dirty" | "unknown";
+  unmergedFiles: string[] | null;
+}
+
 interface CompletionReportReadinessRejection {
   reasonCode: "unsatisfied_acceptance_checklist" | "pull_request_publication_failed";
   reason: string;
@@ -210,9 +223,22 @@ export class CompletionReportService {
     this.validateCaller(report, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
-    const existing = existingLifecycle?.completionReports.find((item) => item.idempotencyKey === report.idempotencyKey);
+    let existing = findCompletionReportForRun(existingLifecycle, report.runId, report.idempotencyKey);
+    const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
+    const localSnapshot = await captureCompletionReportLocalGitSnapshot(report, context, existingLifecycle, this.options.config);
     if (existing && isFinalizedCompletionReport(existing)) {
-      return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
+      const currentAcceptanceContext = buildCompletionReportAcceptanceContext({
+        report,
+        context,
+        pullRequest: inputPullRequest,
+        publication: null,
+        baseRefObservation: null,
+        localSnapshot,
+      });
+      if (completionReplayMatchesAuthoritativeState(existing, currentAcceptanceContext)) {
+        return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
+      }
+      existing = undefined;
     }
     const readinessRejection = completionReportReadinessRejection(report);
     if (readinessRejection) {
@@ -234,7 +260,6 @@ export class CompletionReportService {
       existing !== undefined && pendingPublicationHandoff?.pendingReport.id === existing.id;
 
     const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
-    const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
     let lifecycle = existingLifecycle;
     if (!resumingPendingPublication) {
       this.validateIssueIsAcceptingReports(context, lifecyclePhase);
@@ -316,6 +341,14 @@ export class CompletionReportService {
         report,
         issue: context.issue,
         pullRequest: inputPullRequest,
+        acceptanceContext: buildCompletionReportAcceptanceContext({
+          report,
+          context,
+          pullRequest: inputPullRequest,
+          publication: null,
+          baseRefObservation: null,
+          localSnapshot,
+        }),
         acceptedAt: existing?.acceptedAt ?? null,
         writebackOperationKeys: [],
       });
@@ -349,8 +382,11 @@ export class CompletionReportService {
     }
 
     let publication: CompletionReportPullRequestPublication | null = null;
+    let baseRefObservation: IssueBaseRefObservation | null = null;
     try {
-      publication = await this.publishPullRequestIfNeeded(report, context, lifecycle);
+      const publicationResult = await this.publishPullRequestIfNeeded(report, context, lifecycle);
+      publication = publicationResult.publication;
+      baseRefObservation = publicationResult.baseRefObservation;
     } catch (error) {
       const publicationError = error instanceof PullRequestPublicationFailure ? error.publicationError : null;
       if (publicationError === null) throw error;
@@ -368,7 +404,7 @@ export class CompletionReportService {
         rejection: completionReportPublicationRejection(publicationError),
       });
     }
-    return this.finalizeCompletionReport({ report, context, inputPullRequest, publication, lifecycle, existing });
+    return this.finalizeCompletionReport({ report, context, inputPullRequest, publication, baseRefObservation, localSnapshot, lifecycle, existing });
   }
 
   async resumeApprovedPublication(input: PublicationApprovalResumeInput): Promise<CompletionReportResult | null> {
@@ -409,13 +445,16 @@ export class CompletionReportService {
       phase: "blocked",
     };
     const publicationInput = this.buildPublicationInput(report, context, lifecycle);
-    await this.verifyBaseRefBeforePublication(input.issue, publicationInput, "recover_publication_approval");
+    const baseRefObservation = await this.verifyBaseRefBeforePublication(input.issue, publicationInput, "recover_publication_approval");
+    const localSnapshot = await captureCompletionReportLocalGitSnapshot(report, context, lifecycle, this.options.config);
     const publication = await this.options.pullRequestPublisher.publishPullRequest(publicationInput);
     const result = await this.finalizeCompletionReport({
       report,
       context,
       inputPullRequest: normalizeInputPullRequest(report.pullRequest, report.branchName),
       publication,
+      baseRefObservation,
+      localSnapshot,
       lifecycle,
       existing,
     });
@@ -550,6 +589,8 @@ export class CompletionReportService {
     context: CompletionReportActiveContext;
     inputPullRequest: CompletionReportPullRequestRef | null;
     publication: CompletionReportPullRequestPublication | null;
+    baseRefObservation: IssueBaseRefObservation | null;
+    localSnapshot: CompletionReportLocalGitSnapshot;
     lifecycle: ExistingIssueLifecycle;
     existing: IssueCompletionReportRecord | undefined;
   }): Promise<CompletionReportResult> {
@@ -599,6 +640,14 @@ export class CompletionReportService {
       report: input.report,
       issue: input.context.issue,
       pullRequest,
+      acceptanceContext: buildCompletionReportAcceptanceContext({
+        report: input.report,
+        context: input.context,
+        pullRequest,
+        publication: input.publication,
+        baseRefObservation: input.baseRefObservation,
+        localSnapshot: input.localSnapshot,
+      }),
       writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
       acceptedAt: input.existing?.acceptedAt ?? null,
     });
@@ -713,16 +762,19 @@ export class CompletionReportService {
     report: CompletionReportInput,
     context: CompletionReportActiveContext,
     existingLifecycle: ExistingIssueLifecycle,
-  ): Promise<CompletionReportPullRequestPublication | null> {
-    if (!this.options.config.github.publishPullRequests) return null;
-    if (this.shouldPersistBeforePublicationApproval()) return null;
+  ): Promise<{ publication: CompletionReportPullRequestPublication | null; baseRefObservation: IssueBaseRefObservation | null }> {
+    if (!this.options.config.github.publishPullRequests) return { publication: null, baseRefObservation: null };
+    if (this.shouldPersistBeforePublicationApproval()) return { publication: null, baseRefObservation: null };
     if (!this.options.pullRequestPublisher) {
       throw new SymphonyError("invalid_request", "PR publication is enabled but no GitHub publisher is configured");
     }
     const publicationInput = this.buildPublicationInput(report, context, existingLifecycle);
-    await this.verifyBaseRefBeforePublication(context.issue, publicationInput, "reconcile_completion_report_handoff");
+    const baseRefObservation = await this.verifyBaseRefBeforePublication(context.issue, publicationInput, "reconcile_completion_report_handoff");
     try {
-      return await this.options.pullRequestPublisher.publishPullRequest(publicationInput);
+      return {
+        publication: await this.options.pullRequestPublisher.publishPullRequest(publicationInput),
+        baseRefObservation,
+      };
     } catch (error) {
       throw new PullRequestPublicationFailure(error);
     }
@@ -1130,8 +1182,8 @@ function completionReportPublicationRejection(error: unknown): CompletionReportR
   };
 }
 
-function reportIdFor(issueId: string, idempotencyKey: string): string {
-  return `completion-report:${issueId}:${idempotencyKey}`;
+function reportIdFor(issueId: string, idempotencyKey: string, runId?: string | null): string {
+  return runId ? `completion-report:${issueId}:${runId}:${idempotencyKey}` : `completion-report:${issueId}:${idempotencyKey}`;
 }
 
 function reportRejectionIdFor(issueId: string, idempotencyKey: string): string {
@@ -1197,15 +1249,26 @@ function isTerminalApprovalStatus(
   return status === "rejected" || status === "stale" || status === "expired" || status === "cancelled";
 }
 
+function findCompletionReportForRun(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+  runId: string,
+  idempotencyKey: string,
+): IssueCompletionReportRecord | undefined {
+  return lifecycle?.completionReports.find(
+    (item) => item.runId === runId && item.idempotencyKey === idempotencyKey,
+  );
+}
+
 function buildCompletionReportRecord(input: {
   report: CompletionReportInput;
   issue: Issue;
   pullRequest: CompletionReportPullRequestRef | null;
+  acceptanceContext: CompletionReportAcceptanceContext | null;
   acceptedAt: string | null;
   writebackOperationKeys: string[];
 }): IssueCompletionReportRecord {
   return {
-    id: reportIdFor(input.issue.id, input.report.idempotencyKey),
+    id: reportIdFor(input.issue.id, input.report.idempotencyKey, input.report.runId),
     idempotencyKey: input.report.idempotencyKey,
     runId: input.report.runId,
     issueId: input.issue.id,
@@ -1216,10 +1279,89 @@ function buildCompletionReportRecord(input: {
     changedFiles: input.report.changedFiles,
     branchName: input.report.branchName,
     pullRequest: input.pullRequest,
+    acceptanceContext: input.acceptanceContext,
     risks: input.report.risks,
     acceptedAt: input.acceptedAt ?? new Date().toISOString(),
     writebackOperationKeys: input.writebackOperationKeys,
   };
+}
+
+function buildCompletionReportAcceptanceContext(input: {
+  report: CompletionReportInput;
+  context: CompletionReportActiveContext;
+  pullRequest: CompletionReportPullRequestRef | null;
+  publication: CompletionReportPullRequestPublication | null;
+  baseRefObservation: IssueBaseRefObservation | null;
+  localSnapshot: CompletionReportLocalGitSnapshot;
+}): CompletionReportAcceptanceContext {
+  const branchName =
+    input.localSnapshot.branchName ??
+    input.publication?.headBranch ??
+    input.pullRequest?.branch ??
+    input.context.workspace?.gitBranchName ??
+    input.report.branchName ??
+    input.context.issue.branchName ??
+    null;
+  const baseRef =
+    input.baseRefObservation?.baseRef ??
+    input.localSnapshot.baseRef ??
+    input.context.workspace?.baseRef ??
+    null;
+  const baseHeadSha =
+    input.baseRefObservation?.localBaseHeadShaAfterFetch ??
+    input.baseRefObservation?.githubBaseHeadSha ??
+    input.localSnapshot.baseHeadSha ??
+    null;
+  const worktreeHeadSha =
+    input.baseRefObservation?.worktreeHeadSha ??
+    input.localSnapshot.worktreeHeadSha ??
+    null;
+  const pullRequestHeadSha = input.publication?.headSha ?? input.pullRequest?.headSha ?? null;
+  return {
+    version: 1,
+    capturedAt: new Date().toISOString(),
+    runId: input.report.runId,
+    branchName,
+    baseRef,
+    baseHeadSha,
+    worktreeHeadSha,
+    treeSha: input.localSnapshot.treeSha,
+    pullRequestHeadSha,
+    worktreeDirty: input.localSnapshot.worktreeDirty,
+    worktreeStatus: input.localSnapshot.worktreeStatus,
+    unmergedFiles: input.localSnapshot.unmergedFiles,
+  };
+}
+
+function completionReplayMatchesAuthoritativeState(
+  existing: IssueCompletionReportRecord,
+  current: CompletionReportAcceptanceContext,
+): boolean {
+  const previous = existing.acceptanceContext ?? null;
+  if (!previous) return false;
+  if (previous.worktreeStatus === "unknown" || current.worktreeStatus === "unknown") return false;
+  if (previous.worktreeStatus !== current.worktreeStatus) return false;
+  if (previous.worktreeDirty !== current.worktreeDirty) return false;
+  if (!sameRequiredStateValue(previous.branchName, current.branchName)) return false;
+  if (!sameRequiredStateValue(previous.baseRef, current.baseRef)) return false;
+  if (!sameRequiredStateValue(previous.baseHeadSha, current.baseHeadSha)) return false;
+  if (!sameRequiredStateValue(previous.worktreeHeadSha, current.worktreeHeadSha)) return false;
+  if (!sameRequiredStateValue(previous.treeSha, current.treeSha)) return false;
+  if (!sameNullableStringArray(previous.unmergedFiles, current.unmergedFiles)) return false;
+
+  const previousPrHead = previous.pullRequestHeadSha ?? existing.pullRequest?.headSha ?? null;
+  const currentPrHead = current.pullRequestHeadSha ?? current.worktreeHeadSha;
+  if (previousPrHead !== null && currentPrHead !== null && previousPrHead !== currentPrHead) return false;
+  return true;
+}
+
+function sameRequiredStateValue(left: string | null, right: string | null): boolean {
+  return left !== null && right !== null && left === right;
+}
+
+function sameNullableStringArray(left: readonly string[] | null, right: readonly string[] | null): boolean {
+  if (left === null || right === null) return false;
+  return sameJson([...left].sort(), [...right].sort());
 }
 
 function buildCompletionReportRejectionRecord(input: {
@@ -1254,7 +1396,10 @@ function upsertCompletionReport(
   reports: IssueCompletionReportRecord[],
   report: IssueCompletionReportRecord,
 ): IssueCompletionReportRecord[] {
-  return [...reports.filter((item) => item.idempotencyKey !== report.idempotencyKey), report];
+  return [
+    ...reports.filter((item) => item.runId !== report.runId || item.idempotencyKey !== report.idempotencyKey),
+    report,
+  ];
 }
 
 function upsertCompletionReportRejection(
@@ -1301,6 +1446,117 @@ function rejectionSummaryPointersFor(
     prHeadSha: existingLifecycle?.summaryPointers.prHeadSha ?? null,
     prBranch: existingLifecycle?.summaryPointers.prBranch ?? null,
   };
+}
+
+async function captureCompletionReportLocalGitSnapshot(
+  report: CompletionReportInput,
+  context: CompletionReportActiveContext,
+  existingLifecycle: ExistingIssueLifecycle,
+  config: ServiceConfig,
+): Promise<CompletionReportLocalGitSnapshot> {
+  const workspacePath = context.workspacePath ?? context.workspace?.path ?? existingLifecycle?.summaryPointers.workspacePath ?? null;
+  const fallbackBranchName =
+    context.workspace?.gitBranchName ??
+    report.branchName ??
+    existingLifecycle?.summaryPointers.gitBranchName ??
+    existingLifecycle?.summaryPointers.branchName ??
+    context.issue.branchName ??
+    null;
+  const baseRef =
+    context.workspace?.baseRef ??
+    existingLifecycle?.summaryPointers.baseRef ??
+    config.workspace.source.baseRef ??
+    null;
+  const empty = {
+    branchName: fallbackBranchName,
+    baseRef,
+    baseHeadSha: null,
+    worktreeHeadSha: null,
+    treeSha: null,
+    worktreeDirty: null,
+    worktreeStatus: "unknown" as const,
+    unmergedFiles: null,
+  };
+  if (!workspacePath) return empty;
+
+  const [observedBranchName, worktreeHeadSha, treeSha, statusOutput, unmergedOutput, baseHeadSha] = await Promise.all([
+    runGit(workspacePath, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    runGit(workspacePath, ["rev-parse", "HEAD"]),
+    runGit(workspacePath, ["rev-parse", "HEAD^{tree}"]),
+    runGit(workspacePath, ["status", "--porcelain", "--untracked-files=all"]),
+    runGit(workspacePath, ["diff", "--name-only", "--diff-filter=U"]),
+    resolveLocalBaseHeadSha(workspacePath, baseRef),
+  ]);
+  const worktreeDirty = statusOutput === null ? null : statusOutput.length > 0;
+  const unmergedFiles =
+    unmergedOutput === null
+      ? null
+      : unmergedOutput
+          .split(/\r?\n/)
+          .map((item) => item.trim())
+          .filter(Boolean);
+  return {
+    branchName: observedBranchName ?? fallbackBranchName,
+    baseRef,
+    baseHeadSha,
+    worktreeHeadSha,
+    treeSha,
+    worktreeDirty,
+    worktreeStatus: worktreeDirty === null ? "unknown" : worktreeDirty ? "dirty" : "clean",
+    unmergedFiles,
+  };
+}
+
+async function resolveLocalBaseHeadSha(workspacePath: string, baseRef: string | null): Promise<string | null> {
+  if (!baseRef) return null;
+  for (const candidate of baseRefCandidates(baseRef)) {
+    const headSha = await runGit(workspacePath, ["rev-parse", "--verify", `${candidate}^{commit}`]);
+    if (headSha) return headSha;
+  }
+  return null;
+}
+
+function baseRefCandidates(baseRef: string): string[] {
+  const trimmed = baseRef.trim();
+  if (trimmed.length === 0) return [];
+  const branch =
+    trimmed.startsWith("refs/heads/")
+      ? trimmed.slice("refs/heads/".length)
+      : trimmed.startsWith("refs/remotes/origin/")
+        ? trimmed.slice("refs/remotes/origin/".length)
+        : trimmed.startsWith("origin/")
+          ? trimmed.slice("origin/".length)
+          : trimmed;
+  return [...new Set([trimmed, `origin/${branch}`, `refs/remotes/origin/${branch}`])];
+}
+
+function runGit(workspacePath: string, args: string[]): Promise<string | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let stdout = "";
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const finish = (value: string | null) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      resolve(value);
+    };
+    const child = spawn("git", args, {
+      cwd: workspacePath,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    timeout = setTimeout(() => {
+      child.kill();
+      finish(null);
+    }, 10_000);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.on("error", () => finish(null));
+    child.on("close", (code) => finish(code === 0 ? stdout.trim() : null));
+  });
 }
 
 function normalizeChecklist(items: CompletionReportInput["acceptanceChecklist"]): CompletionReportChecklistItem[] {
@@ -1394,7 +1650,7 @@ function completionReportWritebackDetails(
   pullRequest: CompletionReportPullRequestRef | null,
 ) {
   return {
-    reportId: reportIdFor(issue.id, report.idempotencyKey),
+    reportId: reportIdFor(issue.id, report.idempotencyKey, report.runId),
     idempotencyKey: report.idempotencyKey,
     summary: report.summary,
     validationEvidence: report.validationEvidence,
