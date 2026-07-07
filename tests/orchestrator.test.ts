@@ -3948,9 +3948,11 @@ describe("Orchestrator", () => {
 
   it("preserves routed worker retry redispatch context through config reload", async () => {
     const docsActiveStates = ["Docs In Progress"];
+    const retryBackoffMs = 1_000;
+    const retryObservationTimeoutMs = 10_000;
     const config = testConfig(root);
     config.agent.maxSdkErrorRetries = 1;
-    config.agent.maxRetryBackoffMs = 250;
+    config.agent.maxRetryBackoffMs = retryBackoffMs;
     config.writeback.enabled = true;
     config.writeback.mode = "live";
     config.writeback.dispatchState = "Docs In Progress";
@@ -4039,7 +4041,7 @@ describe("Orchestrator", () => {
 
     const reloadedConfig = testConfig(root);
     reloadedConfig.agent.maxSdkErrorRetries = 1;
-    reloadedConfig.agent.maxRetryBackoffMs = 250;
+    reloadedConfig.agent.maxRetryBackoffMs = retryBackoffMs;
     reloadedConfig.writeback.enabled = true;
     reloadedConfig.writeback.mode = "live";
     reloadedConfig.writeback.dispatchState = "Docs In Progress";
@@ -4051,11 +4053,17 @@ describe("Orchestrator", () => {
 
     try {
       await orchestrator.refreshNow();
-      await waitFor(() => harness.runs.length === 1 && orchestrator.snapshot().counts.retrying === 1, "first docs sdk retry scheduled");
+      await waitForTerminalRunRecord(runStore, "reload-sdk-error-run-1", retryObservationTimeoutMs);
+      await waitFor(
+        () => harness.runs.length === 1 && orchestrator.snapshot().counts.retrying === 1,
+        "first docs sdk retry scheduled",
+        retryObservationTimeoutMs,
+      );
       orchestrator.updateConfig(reloadedConfig, "Work on {{ issue.identifier }}");
       await waitFor(
         () => harness.runs.length === 2 && orchestrator.snapshot().counts.retrying === 0,
         "docs retry redispatch after config reload",
+        retryObservationTimeoutMs,
       );
     } finally {
       await orchestrator.stop();

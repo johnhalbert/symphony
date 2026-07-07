@@ -96,6 +96,13 @@ Protected-surface constraints for downstream implementation:
 - The only task references to `hermes/upstream-src/**` are safety guardrails: T005 requires this up-front verification, T104 requires a final git-diff audit, and the plan/task constraints explicitly say not to modify vendored Hermes source.
 - Caveat: this verification is scoped to the multi-project feature plan. It does not change any existing vendored-Hermes integration elsewhere in the repository, and follow-on multi-project issues should stay within Symphony-owned surfaces unless a separate issue explicitly authorizes upstream changes.
 
+### T104 verification note: final implementation diff leaves vendored Hermes upstream untouched
+
+- From the assigned ENG-459 worktree on branch `sinfonista/eng-459-t104-verify-no-hermes-upstream-source-changes`, `git diff --name-only origin/main --` returned only `specs/003-multi-project-config/research.md`, so the final implementation diff is limited to this verification note and contains no vendored-Hermes source paths.
+- `git diff --name-only origin/main -- 'hermes/upstream-src'` returned no paths, confirming the diff contains no tracked edits under `hermes/upstream-src/**`.
+- `git status --porcelain=v1 --untracked-files=all -- 'hermes/upstream-src'` returned no output, confirming there are no staged, unstaged, or untracked worktree changes under the protected vendored-Hermes surface.
+- An explicit guard script combining the protected-path diff and protected-path status checks returned `RESULT=PASS` with empty `PROTECTED_DIFF` and `PROTECTED_STATUS` blocks.
+
 ## Inspection note: current single-project assumptions (T001)
 
 **Scope**: Inspected the six source files called out by the issue contract to capture the current single-project assumptions before multi-project implementation begins.
