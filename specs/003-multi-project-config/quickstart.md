@@ -76,6 +76,13 @@
    npm test -- tests/postgres-schema.test.ts
    ```
 
+   To exercise the Docker-backed live migration/application checks in this test file, rerun:
+
+   ```powershell
+   $env:SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER = '1'
+   npm test -- tests/postgres-schema.test.ts
+   ```
+
 3. Confirm context columns and indexes exist for state and projection records that need collision-safe lookup.
 
 ## Full Validation
@@ -85,6 +92,27 @@ After the implementation tasks complete, run:
 ```powershell
 npm test -- tests/workflow.test.ts tests/doctor.test.ts tests/orchestrator.test.ts tests/git-worktree.test.ts tests/status-api.test.ts tests/web-projection.test.ts tests/web-history-projection.test.ts tests/web-transcript-projection.test.ts tests/web-route-contract.test.ts tests/web-projection-context.test.ts tests/completion-report-mcp.test.ts tests/review-verdict-mcp.test.ts tests/review-feedback-mcp.test.ts tests/writeback-outbox.test.ts tests/postgres-schema.test.ts tests/mcp-subprocess-environment.test.ts tests/cursor-harness.test.ts tests/hermes-harness.test.ts tests/hermes-acp-harness.test.ts
 ```
+
+To include the Docker-backed live Postgres migration/application checks in the same sweep, run:
+
+```powershell
+$env:SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER = '1'
+npm test -- tests/workflow.test.ts tests/doctor.test.ts tests/orchestrator.test.ts tests/git-worktree.test.ts tests/status-api.test.ts tests/web-projection.test.ts tests/web-history-projection.test.ts tests/web-transcript-projection.test.ts tests/web-route-contract.test.ts tests/web-projection-context.test.ts tests/completion-report-mcp.test.ts tests/review-verdict-mcp.test.ts tests/review-feedback-mcp.test.ts tests/writeback-outbox.test.ts tests/postgres-schema.test.ts tests/mcp-subprocess-environment.test.ts tests/cursor-harness.test.ts tests/hermes-harness.test.ts tests/hermes-acp-harness.test.ts
+```
+
+## Validation record (ENG-457 / T102)
+
+Validated on 2026-07-07 in the assigned `ENG-457` worktree.
+
+- Prerequisite check: the current `WORKFLOW.md` still loads as a legacy/single-project workflow with no `project_contexts` block, and all runtime credentials remain referenced through environment variables.
+- Scenario 1 / 2 command: `npm test -- tests/workflow.test.ts tests/doctor.test.ts` passed (`111 passed`).
+- Scenario 3 command: `npm test -- tests/orchestrator.test.ts tests/git-worktree.test.ts tests/writeback-outbox.test.ts` passed (`210 passed`).
+- Scenario 4 command: `npm test -- tests/orchestrator.test.ts tests/status-api.test.ts` passed (`196 passed`).
+- Scenario 5 command: `npm test -- tests/web-projection.test.ts tests/web-history-projection.test.ts tests/web-transcript-projection.test.ts tests/web-route-contract.test.ts tests/web-projection-context.test.ts` passed (`129 passed`).
+- Scenario 6 command: `npm test -- tests/postgres-schema.test.ts` passed with the baseline contract coverage (`16 passed, 2 skipped`). The Docker-backed live migration checks in that file are gated by `SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER`; rerunning `$env:SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER = '1'; npm test -- tests/postgres-schema.test.ts` in PowerShell passed the full live matrix (`18 passed`).
+- Full validation command: the documented `npm test -- ...` command above passed (`716 passed, 2 skipped`). The PowerShell Docker-enabled full-sweep variant (`$env:SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER = '1'` followed by the same `npm test -- ...` command) passed with the live Postgres checks included (`718 passed`).
+
+Operator note: the Docker-enabled snippets above use PowerShell-compatible `$env:...` assignment so the commands can be pasted directly into the quickstart shell context.
 
 ## Legacy backfill disposition note (ENG-443 / T088)
 
