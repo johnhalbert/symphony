@@ -104,12 +104,11 @@ export class WebProjectionReadRepository {
     limits: WebHistoryProjectionLimits,
     options: WebProjectionReadOptions = {},
   ): Promise<WebProjectionReadResult<ReturnType<typeof projectWebHistory>>> {
-    const scopeKeys = webProjectionScopeKeyCandidates(webHistoryProjectionBaseScopeKey(limits), {
-      projectContextId: limits.projectContextId,
-      defaultProjectContextId: limits.defaultProjectContextId ?? this.defaultProjectContextId,
-    });
     return this.readSelectors(
-      projectionRevisionSelectorsForScopeKeys("history_projection", "global_collection", scopeKeys),
+      historyProjectionRevisionSelectors({
+        ...limits,
+        defaultProjectContextId: limits.defaultProjectContextId ?? this.defaultProjectContextId,
+      }),
       options,
     );
   }
@@ -327,6 +326,52 @@ function projectionRevisionSelectorsForScopeKeys(
       scopeKey,
     };
   });
+}
+
+function historyProjectionRevisionSelectors(limits: WebHistoryProjectionLimits): ProjectionRevisionSelector[] {
+  const baseScopeKey = webHistoryProjectionBaseScopeKey(limits);
+  const projectContextId = normalizeOptionalProjectContextId(limits.projectContextId);
+  const defaultProjectContextId = resolveDefaultProjectContextId(limits.defaultProjectContextId);
+  if (!projectContextId) {
+    return defaultProjectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+      ? projectionRevisionSelectorsForScopeKeys("history_projection", "global_collection", [baseScopeKey])
+      : compatibilityDefaultHistoryProjectionRevisionSelectors(baseScopeKey, defaultProjectContextId);
+  }
+  if (!compatibilityDefaultProjectContextIds(defaultProjectContextId).has(projectContextId)) {
+    return [
+      {
+        projectionName: "history_projection",
+        projectContextId,
+        scopeKind: "global_collection",
+        scopeKey: webProjectionScopedScopeKey(baseScopeKey, projectContextId),
+      },
+    ];
+  }
+  return compatibilityDefaultHistoryProjectionRevisionSelectors(baseScopeKey, defaultProjectContextId);
+}
+
+function compatibilityDefaultHistoryProjectionRevisionSelectors(
+  baseScopeKey: string,
+  defaultProjectContextId: string | null | undefined,
+): ProjectionRevisionSelector[] {
+  return compatibilityDefaultProjectContextScopeIds(defaultProjectContextId).flatMap((projectContextId) => [
+    {
+      projectionName: "history_projection" as const,
+      projectContextId,
+      scopeKind: "global_collection",
+      scopeKey: webProjectionScopedScopeKey(baseScopeKey, projectContextId),
+    },
+    historyProjectionUnscopedRevisionSelector(baseScopeKey, projectContextId),
+  ]);
+}
+
+function historyProjectionUnscopedRevisionSelector(baseScopeKey: string, projectContextId: string): ProjectionRevisionSelector {
+  return {
+    projectionName: "history_projection",
+    ...(projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID ? {} : { projectContextId }),
+    scopeKind: "global_collection",
+    scopeKey: baseScopeKey,
+  };
 }
 
 function transcriptDefaultProjectionRevisionSelector(

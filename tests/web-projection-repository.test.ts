@@ -417,6 +417,106 @@ describe("web projection read repositories", () => {
     ).toBe("pc=symphony|legacy-run:tail:limit:500");
   });
 
+  it("reads renamed-default history rows stored under unscoped scope keys through implicit and explicit default-context reads", async () => {
+    const reader = new RecordingWebProjectionPayloadReader([
+      projectionPayloadRecordFixture(
+        {
+          projectionName: "history_projection",
+          projectContextId: "symphony",
+          scopeKind: "global_collection",
+          scopeKey: "global:session:5:timeline:7",
+        },
+        {
+          sessions: [{ id: "current-default-session" }],
+          transcriptBySession: {},
+          timeline: [],
+          defaultSessionId: "current-default-session",
+        },
+      ),
+      projectionPayloadRecordFixture(
+        {
+          projectionName: "history_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "global_collection",
+          scopeKey: "global:session:5:timeline:7",
+        },
+        {
+          sessions: [{ id: "legacy-session" }],
+          transcriptBySession: {},
+          timeline: [],
+          defaultSessionId: "legacy-session",
+        },
+      ),
+    ]);
+    const repositories = createWebProjectionReadRepositories({
+      reader,
+      defaultProjectContextId: "symphony",
+      isRecordCurrent: () => true,
+    });
+
+    await expect(repositories.history.readGlobalCollection({ sessionLimit: 5, timelineLimit: 7 })).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "history_projection",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+      record: {
+        revision: { projectContextId: "symphony" },
+        payload: { defaultSessionId: "current-default-session" },
+      },
+    });
+
+    await expect(
+      repositories.history.readGlobalCollection({ sessionLimit: 5, timelineLimit: 7, projectContextId: "symphony" }),
+    ).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "history_projection",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+      record: {
+        revision: { projectContextId: "symphony" },
+        payload: { defaultSessionId: "current-default-session" },
+      },
+    });
+
+    expect(
+      reader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({
+        projectionName,
+        projectContextId: projectContextId ?? null,
+        scopeKind,
+        scopeKey,
+      })),
+    ).toEqual([
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "pc=symphony|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "pc=symphony|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+    ]);
+  });
+
   it("continues renamed-default compatibility probing past expired and stale candidates to readable legacy rows", async () => {
     const staleScopeKeys = new Set([
       "pc=symphony|global:session:5:timeline:7",
@@ -533,6 +633,12 @@ describe("web projection read repositories", () => {
         projectContextId: "symphony",
         scopeKind: "global_collection",
         scopeKey: "pc=symphony|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
       },
       {
         projectionName: "history_projection",

@@ -212,6 +212,13 @@ describe("ProjectionTransactionService", () => {
 
     await service.writeProjection({
       projectionName: "history_projection",
+      projectContextId: "symphony",
+      scopeKind: "global_collection",
+      scopeKey: "global:session:7:timeline:9",
+      payload: { sessions: [{ id: "symphony-session" }], transcriptBySession: {}, timeline: [], defaultSessionId: "symphony-session" },
+    });
+    await service.writeProjection({
+      projectionName: "history_projection",
       projectContextId: "docs",
       scopeKind: "global_collection",
       scopeKey: "pc=docs|global:session:7:timeline:9",
@@ -257,6 +264,32 @@ describe("ProjectionTransactionService", () => {
       fields: { runId: "shared-run", offsetStart: 500, offsetLimit: 500, nextOffset: null, messageCount: 1 },
     });
 
+    await expect(repositories.history.readGlobalCollection({ sessionLimit: 7, timelineLimit: 9 })).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "history_projection",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:7:timeline:9",
+      },
+      record: {
+        revision: { projectContextId: "symphony" },
+        payload: { defaultSessionId: "symphony-session" },
+      },
+    });
+    await expect(
+      repositories.history.readGlobalCollection({ sessionLimit: 7, timelineLimit: 9, projectContextId: "symphony" }),
+    ).resolves.toMatchObject({
+      status: "hit",
+      selector: {
+        projectionName: "history_projection",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:7:timeline:9",
+      },
+      record: {
+        revision: { projectContextId: "symphony" },
+        payload: { defaultSessionId: "symphony-session" },
+      },
+    });
     await expect(
       repositories.history.readGlobalCollection({ sessionLimit: 7, timelineLimit: 9, projectContextId: "docs" }),
     ).resolves.toMatchObject({
