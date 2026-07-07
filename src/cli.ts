@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { Command } from "commander";
 import { StatusServer } from "./app/http.js";
 import { parseDatabaseConfig, type DatabaseConfig, type ServiceConfig } from "./core/config/Config.js";
-import { SymphonyError } from "./core/errors.js";
+import { SymphonyError, errorMessage } from "./core/errors.js";
 import { createAgentHarness } from "./core/harness/HarnessFactory.js";
 import { StructuredLogger } from "./core/logging/StructuredLogger.js";
 import {
@@ -82,6 +82,7 @@ import {
   type PostgresMigrationValidationResult,
 } from "./core/database/PostgresMigrations.js";
 import { createGitHubPullRequestClientForCapability } from "./integrations/github/GitHubCredentialResolver.js";
+import { ensureLinearOAuthStartupAuth } from "./integrations/linear/LinearOAuthStartup.js";
 
 const program = new Command();
 
@@ -698,6 +699,18 @@ program
   .action(async (workflow: string, options: { port?: string; host?: string; webAssetsRoot?: string }) => {
     const logger = new StructuredLogger();
     const workflowPath = path.resolve(process.cwd(), workflow);
+    try {
+      const auth = await ensureLinearOAuthStartupAuth({ workflowPath, parentEnv: process.env });
+      if (auth.status === "refreshed") {
+        logger.info("linear oauth startup token refreshed", {
+          env_var: auth.tokenEnvVar,
+          env_path: auth.envPath,
+        });
+      }
+    } catch (error) {
+      logger.error("linear oauth startup auth failed", { error: errorMessage(error) });
+      throw error;
+    }
     const loader = new WorkflowLoader(workflowPath);
     const loaded = await loader.load();
     const config = {
