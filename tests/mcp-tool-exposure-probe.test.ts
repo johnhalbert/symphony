@@ -621,9 +621,11 @@ describe("MCP tool exposure probe helpers", () => {
     vi.stubEnv("CURSOR_API_KEY", "cursor_secret_from_env");
     expect(
       redactSensitiveText(
-        "Authorization: Bearer cursor_secret_from_env GITHUB_TOKEN=ghp_1234567890abcdef token: \"github_pat_1234567890abcdef\"",
+        "Authorization: Bearer cursor_secret_from_env runtime sk-1234567890abcdef legacy sk_live_1234567890abcdef linear lin_1234567890abcdef refresh ghr_1234567890abcdef install ghs_1234567890abcdef GITHUB_TOKEN=ghp_1234567890abcdef token: \"github_pat_1234567890abcdef\"",
       ),
-    ).toBe('Authorization: Bearer [REDACTED] GITHUB_TOKEN=[REDACTED] token: "[REDACTED]"');
+    ).toBe(
+      'Authorization: Bearer [REDACTED] runtime [REDACTED] legacy [REDACTED] linear [REDACTED] refresh [REDACTED] install [REDACTED] GITHUB_TOKEN=[REDACTED] token: "[REDACTED]"',
+    );
     expect(redactSensitiveText("failed with value custom-secret", ["custom-secret"])).toBe("failed with value [REDACTED]");
     vi.unstubAllEnvs();
   });

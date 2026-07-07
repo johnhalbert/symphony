@@ -91,6 +91,24 @@ describe("projectWebHistory", () => {
     expect(JSON.stringify(model.sessions[0])).not.toContain("repo-secret");
   });
 
+  it("redacts prompt-derived fallback titles before projecting history sessions", () => {
+    const model = projectWebHistory([
+      run({
+        issueIdentifier: "",
+        prompt: "Investigate ghr_ABCDEFGH5 ghs_ABCDEFGH2 github_pat_ABCDEFGH3 lin_ABCDEFGH4 sk_live_ABCDEFGH6 during replay",
+      }),
+    ]);
+
+    expect(model.sessions[0]).toMatchObject({
+      title: "Investigate [redacted] [redacted] [redacted] [redacted] [redacted] during replay",
+    });
+    expect(JSON.stringify(model.sessions[0])).not.toContain("ghr_ABCDEFGH5");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("ghs_ABCDEFGH2");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("github_pat_ABCDEFGH3");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("lin_ABCDEFGH4");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("sk_live_ABCDEFGH6");
+  });
+
   it("filters sessions and timeline to matching project context records", () => {
     const docsProjectContext: TestProjectContext = {
       projectContextId: "docs",
@@ -400,7 +418,7 @@ describe("projectWebHistory", () => {
       gitBranchName: "symphony/TEST-1",
       status: "failed",
       completedAt: "2026-01-01T00:10:00.000Z",
-      error: "failed with password=SECRET_ERROR",
+      error: "failed with password=SECRET_ERROR sk_live_ABCDEFGH6 ghr_ABCDEFGH5 github_pat_ABCDEFGH3 lin_ABCDEFGH4",
       tokens: { inputTokens: 11, outputTokens: 13, totalTokens: 24 },
       transcriptEventCount: 9,
       prUrl: "https://github.com/acme/repo/pull/7",
@@ -555,7 +573,12 @@ describe("projectWebHistory", () => {
       },
     });
     expect(session.runSession).not.toHaveProperty("prompt");
+    expect(session.runSession.error).toBe("failed with password=[redacted] [redacted] [redacted] [redacted] [redacted]");
     expect(JSON.stringify(session.runSession)).not.toContain("SECRET_");
+    expect(JSON.stringify(session.runSession)).not.toContain("ghr_ABCDEFGH5");
+    expect(JSON.stringify(session.runSession)).not.toContain("github_pat_ABCDEFGH3");
+    expect(JSON.stringify(session.runSession)).not.toContain("lin_ABCDEFGH4");
+    expect(JSON.stringify(session.runSession)).not.toContain("sk_live_ABCDEFGH6");
   });
 
   it("maps persisted run statuses into web session states", () => {
