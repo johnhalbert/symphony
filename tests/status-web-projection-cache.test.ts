@@ -15,6 +15,7 @@ import {
   type WebProjectionRevisionListener,
   type WebProjectionRevisionProvider,
 } from "../src/app/WebProjectionContext.js";
+import type { WebProjectionReadRepositories } from "../src/app/WebProjectionRepository.js";
 import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID } from "../src/core/config/ProjectContexts.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore, type StartRunInput, type WorkspaceRecord } from "../src/core/persistence/RunTranscriptStore.js";
@@ -208,6 +209,125 @@ describe("StatusServer web projection context cache", () => {
 
     await expect(acquire(false)).resolves.toBe(revisionChanged);
     expect(builds).toBe(2);
+  });
+
+  it("uses the live default project context for post-reload durable history reads", async () => {
+    const generatedAt = "2026-01-01T00:00:00.000Z";
+    const selectors: Array<{
+      projectionName: string;
+      projectContextId?: string | null;
+      scopeKind?: string | null;
+      scopeKey?: string | null;
+    }> = [];
+    let currentDefaultProjectContextId = "docs";
+    let currentSourceRevisions: Array<{ source: string; revision: string | number; observedAt: string | null }> = [];
+    const server = createStatusServer({
+      generatedAt: () => generatedAt,
+      clock: () => new Date(generatedAt),
+      projectionReader: {
+        async readCurrentPayload(selector) {
+          selectors.push({ ...selector });
+          if (
+            selector.projectionName === "history_projection" &&
+            selector.scopeKind === "global_collection" &&
+            selector.scopeKey === "global:session:5:timeline:7" &&
+            selector.projectContextId === currentDefaultProjectContextId
+          ) {
+            return historyProjectionPayloadRecord(
+              currentDefaultProjectContextId,
+              generatedAt,
+              currentSourceRevisions,
+            ) as never;
+          }
+          return null;
+        },
+      },
+    });
+    const webProjectionRepositories = (server as unknown as {
+      webProjectionRepositories: WebProjectionReadRepositories;
+    }).webProjectionRepositories;
+    currentSourceRevisions = [
+      ...(await (server as unknown as {
+        resolveWebProjectionSourceRevisions(): Promise<
+          readonly { source: string; revision: string | number; observedAt: string | null }[]
+        >;
+      }).resolveWebProjectionSourceRevisions()),
+    ];
+
+    server.setDefaultProjectContextId("docs");
+    await expect(
+      webProjectionRepositories.history.readGlobalCollection({ sessionLimit: 5, timelineLimit: 7 }),
+    ).resolves.toMatchObject({
+      status: "stale",
+      record: { revision: { projectContextId: "docs" }, payload: { defaultSessionId: "docs-session" } },
+    });
+
+    currentDefaultProjectContextId = "symphony";
+    server.setDefaultProjectContextId("symphony");
+    await expect(
+      webProjectionRepositories.history.readGlobalCollection({ sessionLimit: 5, timelineLimit: 7 }),
+    ).resolves.toMatchObject({
+      status: "stale",
+      record: { revision: { projectContextId: "symphony" }, payload: { defaultSessionId: "symphony-session" } },
+    });
+
+    expect(
+      selectors.map((selector) => ({
+        projectionName: selector.projectionName,
+        projectContextId: selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: selector.scopeKind ?? "global",
+        scopeKey: selector.scopeKey ?? "global",
+      })),
+    ).toEqual([
+      {
+        projectionName: "history_projection",
+        projectContextId: "docs",
+        scopeKind: "global_collection",
+        scopeKey: "pc=docs|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "docs",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "global_collection",
+        scopeKey: "pc=default|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "pc=symphony|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "global_collection",
+        scopeKey: "pc=default|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+    ]);
   });
 
   it("rebuilds before TTL expiry when the default project context changes", async () => {
@@ -758,6 +878,42 @@ function durableProjectionRevisionReader(revision: () => number, generatedAt: st
         createdAt: generatedAt,
       };
     },
+  };
+}
+
+function historyProjectionPayloadRecord(
+  projectContextId: string,
+  generatedAt: string,
+  sourceRevisions: readonly { source: string; revision: string | number; observedAt: string | null }[],
+) {
+  return {
+    revision: {
+      projectionRevisionId: `history:${projectContextId}`,
+      projectionName: "history_projection" as const,
+      projectContextId,
+      scopeKind: "global_collection",
+      scopeKey: "global:session:5:timeline:7",
+      revision: 1,
+      buildMode: "bootstrap" as const,
+      sourceRevisions,
+      sourceCursors: {},
+      sourceFreshness: [],
+      contentSha256: "0".repeat(64),
+      generatedAt,
+      expiresAt: null,
+      supersededAt: null,
+      createdAt: generatedAt,
+    },
+    payload: {
+      sessions: [{ id: `${projectContextId}-session` }],
+      transcriptBySession: {},
+      timeline: [],
+      defaultSessionId: `${projectContextId}-session`,
+    },
+    payloadSha256: "0".repeat(64),
+    rawPayloadRefs: [],
+    generatedAt,
+    expiresAt: null,
   };
 }
 

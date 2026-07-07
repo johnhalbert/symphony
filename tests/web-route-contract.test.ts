@@ -1370,11 +1370,38 @@ describe("/api/v1/web route contracts", () => {
 
     expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(runStore.transcriptReadCount).toBe(1);
-    expect(projectionReader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({ projectionName, projectContextId, scopeKind, scopeKey }))).toEqual([
-      { projectionName: "issue_board_projection", projectContextId: "symphony", scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "issue_board_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "issue_board_projection", projectContextId: "symphony", scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "issue_board_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "board", scopeKey: "default-board" },
+    expect(
+      projectionReader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({
+        projectionName,
+        projectContextId: projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind,
+        scopeKey,
+      })),
+    ).toEqual([
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
     ]);
   });
 
@@ -1563,11 +1590,38 @@ describe("/api/v1/web route contracts", () => {
 
     expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(runStore.transcriptReadCount).toBe(0);
-    expect(projectionReader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({ projectionName, projectContextId, scopeKind, scopeKey }))).toEqual([
-      { projectionName: "issue_board_projection", projectContextId: "symphony", scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "issue_board_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "issue_board_projection", projectContextId: "symphony", scopeKind: "board", scopeKey: "default-board" },
-      { projectionName: "issue_board_projection", projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID, scopeKind: "board", scopeKey: "default-board" },
+    expect(
+      projectionReader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({
+        projectionName,
+        projectContextId: projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind,
+        scopeKey,
+      })),
+    ).toEqual([
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
     ]);
   });
 
@@ -3407,17 +3461,18 @@ class RecordingProjectionReader implements StatusServerProjectionReader {
   async readCurrentTranscriptDefaultPayload<TPayload = unknown>(selector: {
     runId: string;
     limit: number;
-    projectContextId?: string | null;
+    scopeKey?: string | null | undefined;
   }): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    const requestedProjectContextId = transcriptProjectionScopeKeyProjectContextId(selector.scopeKey ?? null);
     const record = [...this.records.values()]
       .filter((candidate) => {
         const page = transcriptProjectionPageFromScopeKey(candidate.revision.scopeKey);
         return (
           candidate.revision.projectionName === "transcript_projection" &&
-          candidate.revision.projectContextId === (selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID) &&
           candidate.revision.scopeKind === "run_page" &&
           page?.runId === selector.runId &&
-          page.limit === selector.limit
+          page.limit === selector.limit &&
+          (page.projectContextId ?? null) === requestedProjectContextId
         );
       })
       .sort(compareTranscriptDefaultProjectionRecords)[0];
@@ -3425,9 +3480,8 @@ class RecordingProjectionReader implements StatusServerProjectionReader {
     else {
       this.selectors.push({
         projectionName: "transcript_projection",
-        projectContextId: selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
         scopeKind: "run_page",
-        scopeKey: `${selector.runId}:tail:limit:${selector.limit}`,
+        scopeKey: selector.scopeKey ?? `${selector.runId}:tail:limit:${selector.limit}`,
       });
     }
     return record ? (cloneJson(record) as ProjectionPayloadRecord<TPayload>) : null;
@@ -3534,10 +3588,21 @@ function projectionRevisionSelector(revision: ProjectionRevisionRecord): Project
   };
 }
 
-function transcriptProjectionPageFromScopeKey(scopeKey: string): { runId: string; offset: number; limit: number } | null {
-  const match = /^(.*):offset:(\d+):limit:(\d+)$/.exec(scopeKey);
+function transcriptProjectionPageFromScopeKey(
+  scopeKey: string,
+): { projectContextId: string | null; runId: string; offset: number; limit: number } | null {
+  const scopedMatch = /^pc=([^|]+)\|(.*)$/.exec(scopeKey);
+  const projectContextId = scopedMatch?.[1] ?? null;
+  const unscopedScopeKey = scopedMatch?.[2] ?? scopeKey;
+  const match = /^(.*):offset:(\d+):limit:(\d+)$/.exec(unscopedScopeKey);
   if (!match) return null;
-  return { runId: match[1] ?? "", offset: Number(match[2]), limit: Number(match[3]) };
+  return { projectContextId, runId: match[1] ?? "", offset: Number(match[2]), limit: Number(match[3]) };
+}
+
+function transcriptProjectionScopeKeyProjectContextId(scopeKey: string | null | undefined): string | null {
+  if (typeof scopeKey !== "string") return null;
+  const match = /^pc=([^|]+)\|/.exec(scopeKey);
+  return match?.[1] ?? null;
 }
 
 function compareTranscriptDefaultProjectionRecords(left: ProjectionPayloadRecord, right: ProjectionPayloadRecord): number {
