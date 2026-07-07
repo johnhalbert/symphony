@@ -86,6 +86,20 @@ After the implementation tasks complete, run:
 npm test -- tests/workflow.test.ts tests/doctor.test.ts tests/orchestrator.test.ts tests/git-worktree.test.ts tests/status-api.test.ts tests/web-projection.test.ts tests/web-history-projection.test.ts tests/web-transcript-projection.test.ts tests/web-route-contract.test.ts tests/web-projection-context.test.ts tests/completion-report-mcp.test.ts tests/review-verdict-mcp.test.ts tests/review-feedback-mcp.test.ts tests/writeback-outbox.test.ts tests/postgres-schema.test.ts tests/mcp-subprocess-environment.test.ts tests/cursor-harness.test.ts tests/hermes-harness.test.ts tests/hermes-acp-harness.test.ts
 ```
 
+## Validation record (ENG-457 / T102)
+
+Validated on 2026-07-07 in the assigned `ENG-457` worktree.
+
+- Prerequisite check: the current `WORKFLOW.md` still loads as a legacy/single-project workflow with no `project_contexts` block, and all runtime credentials remain referenced through environment variables.
+- Scenario 1 / 2 command: `npm test -- tests/workflow.test.ts tests/doctor.test.ts` passed (`111 passed`).
+- Scenario 3 command: `npm test -- tests/orchestrator.test.ts tests/git-worktree.test.ts tests/writeback-outbox.test.ts` passed (`210 passed`).
+- Scenario 4 command: `npm test -- tests/orchestrator.test.ts tests/status-api.test.ts` passed (`196 passed`).
+- Scenario 5 command: `npm test -- tests/web-projection.test.ts tests/web-history-projection.test.ts tests/web-transcript-projection.test.ts tests/web-route-contract.test.ts tests/web-projection-context.test.ts` passed (`129 passed`).
+- Scenario 6 command: `npm test -- tests/postgres-schema.test.ts` passed with the baseline contract coverage (`16 passed, 2 skipped`). The Docker-backed live migration checks in that file are gated by `SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1`; rerunning `SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1 npm test -- tests/postgres-schema.test.ts` passed the full live matrix (`18 passed`).
+- Full validation command: the documented `npm test -- ...` command above passed (`716 passed, 2 skipped`).
+
+Operator note: set `SYMPHONY_POSTGRES_SCHEMA_VALIDATE_DOCKER=1` when reproducing Scenario 6 or the full validation command if you need the Docker-backed live Postgres migration/application checks instead of the baseline schema-contract-only pass.
+
 ## Legacy backfill disposition note (ENG-443 / T088)
 
 Checked-in planning for this legacy/default project-context work lives under `specs/003-multi-project-config/`, even though the ENG-838 issue description points at a non-present `specs/008-eng-443-legacy-backfill-resolution/tasks.md` source path.
