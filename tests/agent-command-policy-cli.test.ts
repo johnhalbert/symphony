@@ -289,7 +289,10 @@ describe("agent-command-policy-hook CLI", () => {
 });
 
 function hermesPayload(commandOrToolInput: string | Record<string, unknown>, options: { toolName?: string } = {}) {
-  const toolInput = typeof commandOrToolInput === "string" ? { command: commandOrToolInput } : commandOrToolInput;
+  const toolInput =
+    typeof commandOrToolInput === "string"
+      ? { command: commandOrToolInput, workdir: os.tmpdir() }
+      : { workdir: os.tmpdir(), ...commandOrToolInput };
   return {
     hook_event_name: "pre_tool_call",
     tool_name: options.toolName ?? "terminal",

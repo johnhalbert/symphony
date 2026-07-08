@@ -876,8 +876,8 @@ describe("Orchestrator", () => {
     try {
       await orchestrator.refreshNow();
       await waitFor(
-        () => harness.runs.length >= 2,
-        "max-turn exhaustion continuation runs",
+        () => harness.runs.length >= 1 && orchestrator.snapshot().counts.running === 0,
+        "worker dispatch completion",
       );
     } finally {
       await orchestrator.stop();
@@ -3430,9 +3430,15 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => harness.runs.length >= 1 && orchestrator.snapshot().counts.running === 0,
+        "handoff state dispatch completion",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.runs).toHaveLength(1);
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
@@ -3560,9 +3566,16 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => harness.runs.length >= 2,
+        "max-turn exhaustion continuation runs",
+        10_000,
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.runs).toHaveLength(2);
     expect(currentState).toBe("In Progress");
