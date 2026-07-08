@@ -769,6 +769,115 @@ describe("MergePolicyService", () => {
     });
   });
 
+  it("uses the current lifecycle PR head for base-ref repair when the latest completion report is historical", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "In Review", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await lifecycleStore.updateIssue(currentIssue, {
+      summaryPointers: { prHeadSha: "head-sha-2" },
+    });
+    const conflictGit = new FakeConflictGit({
+      status: "clean",
+      originalHeadSha: "head-sha-2",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      rebasedHeadSha: "rebased-head-sha",
+      conflictedFiles: [],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient(),
+      conflictGit,
+    });
+
+    const result = await service.repairBaseRefDrift(
+      currentIssue,
+      baseRefObservation({ worktreeHeadSha: "head-sha-2" }),
+    );
+
+    expect(result).toEqual({ status: "base_ref_repaired", headSha: "rebased-head-sha" });
+    expect(conflictGit.prepareInput).toMatchObject({
+      expectedHeadSha: "head-sha-2",
+    });
+    expect(conflictGit.publishInput).toMatchObject({
+      previousRemoteHeadSha: "head-sha-2",
+    });
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "issue-1",
+        fromStates: ["In Review", "In Progress"],
+        toState: "In Progress",
+        reason: "Symphony rebased stale worktree base; worker reverification required",
+      },
+    ]);
+  });
+
+  it("rejects PR-backed base-ref repair when no lifecycle PR head candidate matches the worktree head", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "In Review", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    await lifecycleStore.updateIssue(currentIssue, {
+      summaryPointers: { prHeadSha: "head-sha-2" },
+    });
+    const conflictGit = new FakeConflictGit({
+      status: "clean",
+      originalHeadSha: "head-sha-3",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      rebasedHeadSha: "rebased-head-sha",
+      conflictedFiles: [],
+    });
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        new MemoryWriter(currentIssue),
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient(),
+      conflictGit,
+    });
+
+    await expect(
+      service.repairBaseRefDrift(
+        currentIssue,
+        baseRefObservation({ worktreeHeadSha: "head-sha-3" }),
+      ),
+    ).rejects.toThrow("lifecycle PR head SHA does not match gated merge metadata");
+    expect(conflictGit.prepareInput).toBeNull();
+    expect(conflictGit.publishInput).toBeNull();
+  });
+
   it("refreshes local-only stale worktree base without fetching or publishing an issue branch", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",

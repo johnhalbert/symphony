@@ -2857,32 +2857,48 @@ function pullRequestForBaseRefRepair(
   headSha: string,
 ): CompletionReportPullRequestRef | null {
   const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
-  const url = reportPullRequest?.url ?? lifecycle.summaryPointers.prUrl;
-  const number = reportPullRequest?.number ?? lifecycle.summaryPointers.prNumber;
-  const remoteHeadSha =
-    reportPullRequest?.headSha ?? lifecycle.summaryPointers.prHeadSha;
-  const branch =
-    reportPullRequest?.branch ?? lifecycle.summaryPointers.prBranch ?? null;
-  const hasRemoteMetadata =
-    reportPullRequest !== null ||
-    url !== null ||
-    number !== null ||
-    remoteHeadSha !== null ||
-    branch !== null;
-  if (!hasRemoteMetadata) return null;
-  if (remoteHeadSha === null) {
+  const hasSummaryRemoteMetadata =
+    lifecycle.summaryPointers.prUrl !== null ||
+    lifecycle.summaryPointers.prNumber !== null ||
+    lifecycle.summaryPointers.prHeadSha !== null ||
+    lifecycle.summaryPointers.prBranch !== null;
+  const summaryPullRequest: CompletionReportPullRequestRef | null = hasSummaryRemoteMetadata
+    ? {
+        url: lifecycle.summaryPointers.prUrl ?? reportPullRequest?.url ?? null,
+        number: lifecycle.summaryPointers.prNumber ?? reportPullRequest?.number ?? null,
+        headSha: lifecycle.summaryPointers.prHeadSha,
+        branch:
+          lifecycle.summaryPointers.prBranch ??
+          reportPullRequest?.branch ??
+          branchName,
+      }
+    : null;
+  const candidates = [summaryPullRequest, reportPullRequest].filter(
+    (pullRequest): pullRequest is CompletionReportPullRequestRef =>
+      pullRequest !== null,
+  );
+  if (candidates.length === 0) return null;
+
+  const matched = candidates.find((pullRequest) => pullRequest.headSha === headSha) ?? null;
+  if (matched !== null) {
+    return {
+      ...matched,
+      headSha,
+      branch: matched.branch ?? branchName,
+    };
+  }
+  if (candidates.every((pullRequest) => pullRequest.headSha === null)) {
     throw new SymphonyError(
       "invalid_request",
       "PR-backed base-ref repair requires lifecycle PR head metadata",
     );
   }
-  requireMatches("lifecycle PR head SHA", remoteHeadSha, headSha);
-  return {
-    url,
-    number,
+  requireMatchesAny(
+    "lifecycle PR head SHA",
     headSha,
-    branch: branch ?? branchName,
-  };
+    candidates.map((pullRequest) => pullRequest.headSha),
+  );
+  throw new SymphonyError("invalid_request", "lifecycle PR head SHA does not match gated merge metadata");
 }
 
 function pullRequestRefForPreservedStashRestore(
