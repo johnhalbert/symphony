@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   renderCompletionMcpHandoffPrompt,
   renderIssueBreakdownMcpHandoffPrompt,
+  renderMergeConflictResolutionMcpHandoffPrompt,
   renderReviewMcpHandoffPrompt,
 } from "../src/core/harness/HandoffMcp.js";
 import { issue } from "./helpers.js";
@@ -75,5 +76,20 @@ describe("MCP handoff prompt rendering", () => {
     expect(prompt).toContain("reviewUrl/commentUrls/urls");
     expect(prompt).toContain("Never call submit_pull_request_review_feedback with {}");
     expect(prompt).toContain('{"kind":"review","event":"APPROVE","body":"...","idempotencyKey":"..."}');
+  });
+
+  it("requires merge-conflict workers to continue when the MCP result prepares a follow-up conflict", () => {
+    const prompt = renderMergeConflictResolutionMcpHandoffPrompt({
+      issue: issue({ id: "issue-1", identifier: "ENG-1", branchName: "symphony/ENG-1" }),
+      role: "worker",
+      workspacePath: "/workspace/ENG-1",
+      repoPath: "/repo/symphony",
+      baseRef: "origin/main",
+    });
+
+    expect(prompt).toContain("submit_merge_conflict_resolution");
+    expect(prompt).toContain("Inspect the MCP tool result before ending the run");
+    expect(prompt).toContain("continuation.required=true");
+    expect(prompt).toContain("continue repairing the newly prepared conflict");
   });
 });

@@ -77,6 +77,7 @@ export async function submitMergeConflictResolutionFromMcp(input: unknown, optio
       resolutionStatus: result.report.resolutionStatus,
       mergeConflict: result.mergeConflict,
       writebackOperationKeys: result.writebackOperations.map((operation) => operation.idempotencyKey),
+      ...(result.continuation === undefined ? {} : { continuation: result.continuation }),
     };
   } finally {
     await writebackOutbox?.close();

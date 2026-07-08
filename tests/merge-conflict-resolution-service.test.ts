@@ -2,7 +2,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SymphonyError } from "../src/core/errors.js";
 import { MergeConflictResolutionService } from "../src/core/MergeConflictResolutionService.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
@@ -377,19 +376,20 @@ describe("MergeConflictResolutionService", () => {
       finalizer: {
         async finalize(input) {
           finalizerCalls.push(input);
-          throw new SymphonyError("conflict", "refs/remotes/origin/main resolved to base-sha-2, not prepared base base-sha-1", {
-            kind: "prepared_base_ref_drift",
+          return {
+            status: "prepared_base_ref_drift" as const,
+            newHeadSha: "head-sha-2",
             refName: "refs/remotes/origin/main",
             actualSha: "base-sha-2",
             expectedSha: "base-sha-1",
             baseBranch: "main",
-          });
+          };
         },
         async reprepareAfterBaseDrift(input) {
           reprepareCalls.push(input);
           return {
             status: "conflicted" as const,
-            originalHeadSha: "head-sha-1",
+            originalHeadSha: "head-sha-2",
             observedPrBaseHeadSha: "base-sha-2",
             liveBaseHeadSha: "base-sha-2",
             preparedBaseHeadSha: "base-sha-2",
@@ -407,12 +407,20 @@ describe("MergeConflictResolutionService", () => {
     );
 
     expect(result.report.resolutionStatus).toBe("still_conflicted");
+    expect(result.continuation).toMatchObject({
+      required: true,
+      reason: "prepared_base_ref_drift",
+      conflictedFiles: ["src/index.ts"],
+      baseHeadSha: "base-sha-2",
+      preparedBaseHeadSha: "base-sha-2",
+      previousRepairHeadSha: "head-sha-2",
+    });
     expect(finalizerCalls).toHaveLength(1);
     expect(reprepareCalls).toEqual([
       expect.objectContaining({
         workspacePath: "/tmp/service-prepared-workspace",
         branchName: "symphony/TEST-1",
-        expectedHeadSha: "head-sha-1",
+        expectedHeadSha: "head-sha-2",
         baseBranch: "main",
         observedPrBaseHeadSha: "base-sha-2",
         liveBaseHeadSha: "base-sha-2",
@@ -424,7 +432,7 @@ describe("MergeConflictResolutionService", () => {
       mergeConflict: {
         status: "open",
         resolutionStatus: "pending",
-        currentHeadSha: "head-sha-1",
+        currentHeadSha: "head-sha-2",
         baseHeadSha: "base-sha-2",
         fixTurnCount: 0,
         lastConflictFixRunId: null,
@@ -432,6 +440,7 @@ describe("MergeConflictResolutionService", () => {
         blockedReason: null,
         servicePreparation: {
           status: "conflicted",
+          originalHeadSha: "head-sha-2",
           liveBaseHeadSha: "base-sha-2",
           preparedBaseHeadSha: "base-sha-2",
           squashCommitSha: "squash-sha-2",
@@ -440,12 +449,84 @@ describe("MergeConflictResolutionService", () => {
       mergeConflictResolutionReports: [
         expect.objectContaining({
           resolutionStatus: "still_conflicted",
-          newHeadSha: "head-sha-1",
+          newHeadSha: "head-sha-2",
           baseHeadSha: "base-sha-2",
         }),
       ],
     });
     await expect(outbox.list()).resolves.toEqual([]);
+  });
+
+  it("publishes a clean prepared-base drift reprepare and routes back to implementation", async () => {
+    const publishCalls: unknown[] = [];
+    const { service, lifecycleStore, outbox } = await fixture({
+      servicePreparation: servicePreparationRecord(),
+      finalizer: {
+        async finalize() {
+          return {
+            status: "prepared_base_ref_drift" as const,
+            newHeadSha: "head-sha-2",
+            refName: "refs/remotes/origin/main",
+            actualSha: "base-sha-2",
+            expectedSha: "base-sha-1",
+            baseBranch: "main",
+          };
+        },
+        async reprepareAfterBaseDrift(input) {
+          return {
+            status: "clean" as const,
+            originalHeadSha: input.expectedHeadSha,
+            observedPrBaseHeadSha: "base-sha-2",
+            liveBaseHeadSha: "base-sha-2",
+            preparedBaseHeadSha: "base-sha-2",
+            mergeBaseSha: "base-sha-0",
+            squashCommitSha: "squash-sha-2",
+            rebasedHeadSha: "head-sha-3",
+            conflictedFiles: [],
+          };
+        },
+        async publishPreparedHead(input) {
+          publishCalls.push(input);
+        },
+      },
+    });
+
+    const result = await service.submit_merge_conflict_resolution(
+      resolutionReport({ resolutionStatus: "resolved", omitNewHeadSha: true }),
+      context({ workspacePath: "/tmp/service-prepared-workspace" }),
+    );
+
+    expect(result.report.resolutionStatus).toBe("resolved");
+    expect(result.report.newHeadSha).toBe("head-sha-3");
+    expect(result.continuation).toBeUndefined();
+    expect(publishCalls).toEqual([
+      expect.objectContaining({
+        workspacePath: "/tmp/service-prepared-workspace",
+        branchName: "symphony/TEST-1",
+        previousRemoteHeadSha: "head-sha-2",
+      }),
+    ]);
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      mergeConflict: {
+        status: "resolved",
+        resolutionStatus: "resolved",
+        currentHeadSha: "head-sha-3",
+        resolvedHeadSha: "head-sha-3",
+        baseHeadSha: "base-sha-2",
+        servicePreparation: {
+          status: "finalized",
+          originalHeadSha: "head-sha-2",
+          liveBaseHeadSha: "base-sha-2",
+          finalizedHeadSha: "head-sha-3",
+        },
+      },
+    });
+    expect((await outbox.list()).map((operation) => operation.kind)).toEqual([
+      "comment",
+      "transition",
+    ]);
   });
 
   it("accepts service-prepared still-conflicted reports without requiring worker git metadata", async () => {

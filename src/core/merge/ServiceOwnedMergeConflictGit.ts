@@ -75,9 +75,19 @@ export interface ServiceOwnedMergeConflictFinalizationInput {
   authHeader: string;
 }
 
-export interface ServiceOwnedMergeConflictFinalizationResult {
-  newHeadSha: string;
-}
+export type ServiceOwnedMergeConflictFinalizationResult =
+  | {
+      status?: "finalized";
+      newHeadSha: string;
+    }
+  | {
+      status: "prepared_base_ref_drift";
+      newHeadSha: string;
+      refName: string;
+      actualSha: string;
+      expectedSha: string;
+      baseBranch: string;
+    };
 
 export interface ServiceOwnedPreserveWorktreeInput {
   workspacePath: string;
@@ -126,6 +136,7 @@ export interface PreparedBaseRefDriftDetails {
   actualSha: string;
   expectedSha: string;
   baseBranch: string;
+  finalizedHeadSha?: string;
 }
 
 export class ServiceOwnedMergeConflictGit {
@@ -339,14 +350,6 @@ export class ServiceOwnedMergeConflictGit {
     await git.assertCurrentBranch(input.branchName);
     await git.fetchBranch(input.branchName, input.authHeader);
     await git.assertRefSha(`refs/remotes/origin/${input.branchName}`, input.previousRemoteHeadSha, "expected PR head");
-    await fetchAndVerifyLocalRemoteBaseRef({
-      workspacePath: input.workspacePath,
-      baseRef: input.baseBranch,
-      expectedBaseHeadSha: input.preparedBaseHeadSha,
-      authHeader: input.authHeader,
-      createMismatchError: ({ refName, actualSha, expectedSha, baseBranch }) =>
-        preparedBaseRefDriftError(refName, actualSha, expectedSha, baseBranch),
-    });
     const workerTouchedFiles = await git.workerTouchedFiles();
     const actualOutside = workerTouchedFiles.filter((file) => !allowed.has(file));
     if (actualOutside.length > 0) {
@@ -368,6 +371,26 @@ export class ServiceOwnedMergeConflictGit {
     await git.assertNoRebaseInProgress();
     const newHeadSha = await git.headSha();
     await git.pushForceWithLease(input.branchName, input.previousRemoteHeadSha, input.authHeader);
+    try {
+      await fetchAndVerifyLocalRemoteBaseRef({
+        workspacePath: input.workspacePath,
+        baseRef: input.baseBranch,
+        expectedBaseHeadSha: input.preparedBaseHeadSha,
+        authHeader: input.authHeader,
+        createMismatchError: ({ refName, actualSha, expectedSha, baseBranch }) =>
+          preparedBaseRefDriftError(refName, actualSha, expectedSha, baseBranch, newHeadSha),
+      });
+    } catch (error) {
+      if (!isPreparedBaseRefDriftError(error)) throw error;
+      return {
+        status: "prepared_base_ref_drift",
+        newHeadSha,
+        refName: error.details.refName,
+        actualSha: error.details.actualSha,
+        expectedSha: error.details.expectedSha,
+        baseBranch: error.details.baseBranch,
+      };
+    }
     return { newHeadSha };
   }
 
@@ -717,6 +740,7 @@ function preparedBaseRefDriftError(
   actualSha: string,
   expectedSha: string,
   baseBranch: string,
+  finalizedHeadSha?: string,
 ): SymphonyError {
   return new SymphonyError("conflict", `${refName} resolved to ${actualSha}, not prepared base ${expectedSha}`, {
     kind: "prepared_base_ref_drift",
@@ -724,6 +748,7 @@ function preparedBaseRefDriftError(
     actualSha,
     expectedSha,
     baseBranch,
+    ...(finalizedHeadSha === undefined ? {} : { finalizedHeadSha }),
   } satisfies PreparedBaseRefDriftDetails);
 }
 

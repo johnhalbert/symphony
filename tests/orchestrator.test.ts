@@ -45,6 +45,7 @@ import {
   IssueTriageService,
   issueTriageTriggerFingerprint,
 } from "../src/core/IssueTriageService.js";
+import { MergeConflictResolutionService } from "../src/core/MergeConflictResolutionService.js";
 import type { MergePolicyGitHubClient } from "../src/core/merge/MergePolicyService.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import {
@@ -11021,6 +11022,113 @@ describe("Orchestrator", () => {
     expect(harness.runs[0]?.runPhase).toBe("merge_conflict_resolution");
   });
 
+  it("reconciles merge-conflict handoff without base-ref blocking detached service-prepared worktrees", async () => {
+    const config = testConfig(root);
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.conflictsState = "Merge Conflicts";
+    config.workspace.source.baseRef = "origin/main";
+    const branchName = "symphony/TEST-1";
+    const repo = await createBaseRefGuardRepo(root, branchName);
+    const candidate = issue({
+      state: "Merge Conflicts",
+      branchName,
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("Merge Conflicts") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const stateDir = config.workspace.stateDir;
+    const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+    const runStore = new FileRunTranscriptStore(stateDir);
+    const outboxStore = new FileWritebackOutboxStore(stateDir);
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "merge_conflict_resolution",
+      mergeConflict: openMergeConflict(candidate),
+      summaryPointers: {
+        workspaceKey: candidate.identifier,
+        workspacePath: repo.workspace,
+        branchName,
+        gitBranchName: branchName,
+        repoPath: repo.workspace,
+        baseRef: "origin/main",
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "conflict-head",
+        prBranch: branchName,
+      },
+    });
+    const harness = new MergeConflictResolutionSubmittingHarness(
+      lifecycleStore,
+      outboxStore,
+      {
+        workspacePath: repo.workspace,
+        afterSubmit: async () => {
+          await gitForTest(["checkout", "--detach", "HEAD"], repo.workspace);
+        },
+      },
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitForAsync(
+      async () =>
+        (await runStore.latestRunForIssue(candidate.id))?.status ===
+        "succeeded",
+      "merge conflict handoff accepted",
+    );
+    await orchestrator.stop();
+
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      mergeConflict: {
+        status: "resolved",
+        resolutionStatus: "resolved",
+        currentHeadSha: "resolved-head",
+      },
+    });
+    const issueState = await readIssueState(stateDir, candidate.id);
+    const history = issueState?.history ?? [];
+    expect(
+      history.some(
+        (snapshot) =>
+          snapshot.transitionKind ===
+          "reconcile_merge_conflict_resolution_handoff",
+      ),
+    ).toBe(true);
+    const mergeConflictHandoffBaseRefGuards = history.filter(
+      (snapshot) =>
+        (snapshot.transitionKind === "base_ref_observe" ||
+          snapshot.transitionKind === "base_ref_repair" ||
+          snapshot.transitionKind === "base_ref_block") &&
+        (snapshot.transitionRequestContext as { payload?: { targetTransitionKind?: unknown } } | null | undefined)
+          ?.payload?.targetTransitionKind ===
+          "reconcile_merge_conflict_resolution_handoff",
+    );
+    expect(mergeConflictHandoffBaseRefGuards).toHaveLength(0);
+  });
+
   it("reopens a blocked merge-conflict repair budget when the operator returns to the conflict state", async () => {
     const config = testConfig(root);
     config.mergePolicy.mode = "gated";
@@ -15918,6 +16026,72 @@ class LifecycleSnapshotHarness implements AgentHarness {
       runId: "snapshot-run-1",
     };
     this.snapshots.push(await this.lifecycleStore.get(ctx.issue.id));
+    yield { type: "completed" };
+  }
+}
+
+class MergeConflictResolutionSubmittingHarness implements AgentHarness {
+  readonly id = "merge-conflict-submit";
+  readonly capabilities = {
+    continuation: true,
+    mcpHandoff: true,
+    ephemeralSystemPrompt: true,
+  };
+  readonly runs: AgentRunContext[] = [];
+
+  constructor(
+    private readonly lifecycleStore: FileIssueLifecycleStore,
+    private readonly outboxStore: FileWritebackOutboxStore,
+    private readonly options: {
+      workspacePath: string;
+      afterSubmit?: () => Promise<void>;
+    },
+  ) {}
+
+  async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
+    this.runs.push(ctx);
+    const runId = "merge-conflict-run-1";
+    yield {
+      type: "session_started",
+      sessionId: "merge-conflict-session-1",
+      runId,
+    };
+    await new MergeConflictResolutionService({
+      config: ctx.config,
+      lifecycleStore: this.lifecycleStore,
+      writebackOutbox: this.outboxStore,
+    }).submit_merge_conflict_resolution(
+      {
+        runId,
+        issueId: ctx.issue.id,
+        resolutionStatus: "resolved",
+        summary: "Resolved merge conflicts.",
+        validationEvidence: ["test"],
+        changedFiles: ["file.txt"],
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "resolved-head",
+          branch: ctx.issue.branchName,
+        },
+        previousHeadSha: "conflict-head",
+        newHeadSha: "resolved-head",
+        baseBranch: "main",
+        baseHeadSha: "base-head",
+        risks: [],
+        idempotencyKey: "merge-conflict-resolved-1",
+      },
+      {
+        issue: ctx.issue,
+        activeRunId: runId,
+        role: "worker",
+        sessionId: "merge-conflict-session-1",
+        workspacePath: this.options.workspacePath,
+        workspace: { ...ctx.workspace, path: this.options.workspacePath },
+        phase: "merge_conflict_resolution",
+      },
+    );
+    await this.options.afterSubmit?.();
     yield { type: "completed" };
   }
 }

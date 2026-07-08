@@ -92,7 +92,7 @@ describe("ServiceOwnedMergeConflictGit", () => {
     ).rejects.toThrow(/outside the service-prepared conflict set/);
   });
 
-  it("reports prepared base drift through shared local base verification", async () => {
+  it("reports prepared base drift after finalizing and publishing the prepared repair", async () => {
     const { workspace, remote, featureHeadSha, liveBaseHeadSha, initialSha, branchName } = await conflictedRepo(root);
     const serviceGit = new ServiceOwnedMergeConflictGit();
     await serviceGit.prepare({
@@ -112,25 +112,28 @@ describe("ServiceOwnedMergeConflictGit", () => {
     await commit(updater, "base drift");
     await git(["push", "origin", "main"], updater);
 
-    await expect(
-      serviceGit.finalize({
-        workspacePath: workspace,
-        branchName,
-        previousRemoteHeadSha: featureHeadSha,
-        preparedBaseHeadSha: liveBaseHeadSha,
-        baseBranch: "main",
-        conflictedFiles: ["file.txt"],
-        changedFiles: ["file.txt"],
-        authHeader: "AUTHORIZATION: bearer test-token",
-      }),
-    ).rejects.toMatchObject({
-      code: "conflict",
-      details: {
-        kind: "prepared_base_ref_drift",
-        expectedSha: liveBaseHeadSha,
-        baseBranch: "main",
-      },
+    await writeFile(path.join(workspace, "file.txt"), "main\nfeature\n", "utf8");
+    const finalized = await serviceGit.finalize({
+      workspacePath: workspace,
+      branchName,
+      previousRemoteHeadSha: featureHeadSha,
+      preparedBaseHeadSha: liveBaseHeadSha,
+      baseBranch: "main",
+      conflictedFiles: ["file.txt"],
+      changedFiles: ["file.txt"],
+      authHeader: "AUTHORIZATION: bearer test-token",
     });
+
+    expect(finalized).toMatchObject({
+      status: "prepared_base_ref_drift",
+      newHeadSha: expect.stringMatching(/^[0-9a-f]{40}$/),
+      expectedSha: liveBaseHeadSha,
+      baseBranch: "main",
+    });
+    expect((await git(["status", "--porcelain=v1", "-uall"], workspace)).trim()).toBe("");
+    expect(await git(["rev-parse", "refs/heads/symphony/TEST-1"], path.join(root, "remote.git"))).toBe(
+      `${finalized.newHeadSha}\n`,
+    );
   });
 
   it("preserves dirty worktree changes in a custom stash ref, reapplies them, and drops the ref", async () => {

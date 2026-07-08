@@ -15295,7 +15295,7 @@ export class Orchestrator {
       `- Reason: ${conflict?.reason ?? "n/a"}`,
       `- GitHub mergeable_state: ${conflict?.mergeableState ?? "unknown"}`,
       "- Git operations are service-owned for this phase. Do not fetch, pull, merge, rebase, commit, push, or continue/abort/skip a rebase.",
-      "- Required handoff: call submit_merge_conflict_resolution before ending the run.",
+      "- Required handoff: call submit_merge_conflict_resolution, inspect the tool result, and continue if it returns continuation.required=true.",
       '- Report resolutionStatus="resolved", resolutionStatus="still_conflicted", or resolutionStatus="blocked"; include previousHeadSha, baseBranch, and baseHeadSha. Omit newHeadSha for service-prepared conflicts.',
       "",
       "Workspace:",
@@ -15874,7 +15874,6 @@ const BASE_REF_GUARDED_TRANSITION_KINDS = new Set<IssueTransitionKind>([
   "dispatch_worker",
   "dispatch_reviewer",
   "reconcile_completion_report_handoff",
-  "reconcile_merge_conflict_resolution_handoff",
   "recover_publication_approval",
   "merge_policy_refresh_conflict_base",
   "merge_policy_prepare_conflict",
@@ -17381,7 +17380,7 @@ function successConditionsForRun(
     return [
       "- Resolve only merge conflicts on the lifecycle-bound PR.",
       "- Validate the conflict resolution evidence.",
-      "- Call submit_merge_conflict_resolution before ending the run.",
+      "- Call submit_merge_conflict_resolution, inspect the tool result, and continue if it returns continuation.required=true.",
     ].join("\n");
   }
   const triage = latestIssueTriageReport(lifecycle);
@@ -17445,7 +17444,7 @@ function requiredHandoffForRun(entry: RunningEntry): string {
     case "issue_breakdown":
       return "Call submit_issue_breakdown_plan before ending the run.";
     case "merge_conflict_resolution":
-      return "Call submit_merge_conflict_resolution before ending the run.";
+      return "Call submit_merge_conflict_resolution, inspect the tool result, and continue if it returns continuation.required=true.";
     case "implementation":
       return "Call submit_completion_report before ending the run.";
   }

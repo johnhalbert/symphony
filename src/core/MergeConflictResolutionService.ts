@@ -109,6 +109,17 @@ export interface MergeConflictResolutionResult {
   report: IssueMergeConflictResolutionReportRecord;
   mergeConflict: IssueMergeConflictMetadata;
   writebackOperations: WritebackOperation[];
+  continuation?: MergeConflictResolutionContinuation;
+}
+
+export interface MergeConflictResolutionContinuation {
+  required: true;
+  reason: "prepared_base_ref_drift";
+  message: string;
+  conflictedFiles: string[];
+  baseHeadSha: string;
+  preparedBaseHeadSha: string;
+  previousRepairHeadSha: string;
 }
 
 export class MergeConflictResolutionService {
@@ -200,6 +211,7 @@ export class MergeConflictResolutionService {
       : resolved
         ? await this.enqueueResolvedWritebacks(context, storedReport, nextConflict)
         : [];
+    const continuation = mergeConflictContinuation(finalReport);
     const activeStash = preservedStashFromReport(finalReport);
     const preservedWorktreeStashes =
       activeStash === null
@@ -242,6 +254,7 @@ export class MergeConflictResolutionService {
       report: storedReport,
       mergeConflict: updated.mergeConflict ?? nextConflict,
       writebackOperations,
+      ...(continuation === undefined ? {} : { continuation }),
     };
   }
 
@@ -397,6 +410,20 @@ export class MergeConflictResolutionService {
         baseBranch,
         authHeader,
         liveBaseHeadSha: error.details.actualSha,
+        repairedHeadSha: error.details.finalizedHeadSha ?? mergeConflict.currentHeadSha,
+        finalizer,
+      });
+    }
+    if (finalized.status === "prepared_base_ref_drift") {
+      return this.reprepareAfterPreparedBaseDrift({
+        report,
+        mergeConflict,
+        workspacePath,
+        branchName,
+        baseBranch,
+        authHeader,
+        liveBaseHeadSha: finalized.actualSha,
+        repairedHeadSha: finalized.newHeadSha,
         finalizer,
       });
     }
@@ -457,6 +484,7 @@ export class MergeConflictResolutionService {
     baseBranch: string;
     authHeader: string;
     liveBaseHeadSha: string;
+    repairedHeadSha: string;
     finalizer: MergeConflictResolutionFinalizer;
   }): Promise<NormalizedMergeConflictResolutionInput> {
     const reprepare = input.finalizer.reprepareAfterBaseDrift?.bind(input.finalizer);
@@ -466,7 +494,7 @@ export class MergeConflictResolutionService {
     const preparation = await reprepare({
       workspacePath: input.workspacePath,
       branchName: input.branchName,
-      expectedHeadSha: input.mergeConflict.currentHeadSha,
+      expectedHeadSha: input.repairedHeadSha,
       baseBranch: input.baseBranch,
       observedPrBaseHeadSha: input.liveBaseHeadSha,
       liveBaseHeadSha: input.liveBaseHeadSha,
@@ -480,7 +508,7 @@ export class MergeConflictResolutionService {
       await publish({
         workspacePath: input.workspacePath,
         branchName: input.branchName,
-        previousRemoteHeadSha: input.mergeConflict.currentHeadSha,
+        previousRemoteHeadSha: input.repairedHeadSha,
         authHeader: input.authHeader,
       });
       return {
@@ -496,8 +524,8 @@ export class MergeConflictResolutionService {
     return {
       ...input.report,
       resolutionStatus: "still_conflicted",
-      pullRequest: { ...input.report.pullRequest, headSha: input.mergeConflict.currentHeadSha },
-      newHeadSha: input.mergeConflict.currentHeadSha,
+      pullRequest: { ...input.report.pullRequest, headSha: input.repairedHeadSha },
+      newHeadSha: input.repairedHeadSha,
       baseHeadSha: preparation.liveBaseHeadSha,
       blockedReason: null,
       serviceRemediation: { kind: "prepared_base_ref_drift", preparation },
@@ -535,6 +563,28 @@ type NormalizedMergeConflictResolutionInput = MergeConflictResolutionInput & {
     preservedStash: IssuePreservedWorktreeStash;
   };
 };
+
+function mergeConflictContinuation(
+  report: NormalizedMergeConflictResolutionInput,
+): MergeConflictResolutionContinuation | undefined {
+  const remediation = report.serviceRemediation;
+  if (
+    remediation?.kind !== "prepared_base_ref_drift" ||
+    remediation.preparation.status !== "conflicted"
+  ) {
+    return undefined;
+  }
+  return {
+    required: true,
+    reason: "prepared_base_ref_drift",
+    message:
+      "Conflict repair succeeded against the prepared base, but the base branch advanced and introduced a new conflict. Symphony has prepared the worktree for the next repair pass.",
+    conflictedFiles: remediation.preparation.conflictedFiles,
+    baseHeadSha: remediation.preparation.liveBaseHeadSha,
+    preparedBaseHeadSha: remediation.preparation.preparedBaseHeadSha,
+    previousRepairHeadSha: report.newHeadSha,
+  };
+}
 
 function buildMergeConflictResolutionReport(input: {
   report: NormalizedMergeConflictResolutionInput;
