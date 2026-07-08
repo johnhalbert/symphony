@@ -7094,7 +7094,10 @@ function inferResolvedIssueRunsFromStrongIssueId(input: {
   return input.runs.filter((record) => {
     if (resolvedRunIds.has(record.runId)) return false;
     if (record.issueId !== strongIssueId) return false;
-    return projectContextGroupId(projectContextIdForAliasMatching(record), input.defaultProjectContextId) !== input.resolvedGroupId;
+    const recordProjectContext = projectContextResolutionFromIssue(record);
+    if (!recordProjectContext) return true;
+    if (recordProjectContext.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return true;
+    return projectContextGroupId(recordProjectContext.projectContextId, input.defaultProjectContextId) === input.resolvedGroupId;
   });
 }
 

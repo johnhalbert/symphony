@@ -2137,6 +2137,30 @@ describe("/api/v1/web route contracts", () => {
         eventType: "progress",
         message: "symphony transcript",
       });
+      await runStore.startRun({
+        runId: "run-cross-context-stale",
+        sessionId: "session-cross-context-stale",
+        agentId: "agent-cross-context-stale",
+        role: "worker",
+        issueId: "issue-docs-1",
+        issueIdentifier: "STALE-TEST-1",
+        attempt: null,
+        turnNumber: 1,
+        prompt: "stale cross-context work",
+        workspaceKey: symphonyWorkspaceKey,
+        workspacePath: symphonyPath,
+        gitBranchName: "symphony/stale-TEST-1",
+        repoPath: "/repo/symphony",
+        baseRef: "origin/main",
+        projectContext: symphonyProjectContext,
+      });
+      await runStore.appendEvent({
+        runId: "run-cross-context-stale",
+        at: "2026-01-01T00:00:03.000Z",
+        source: "harness",
+        eventType: "progress",
+        message: "stale cross-context transcript",
+      });
 
       const docsEvidenceCursor = "idem-context-qualified-web-route-contract-docs";
       const docsPending = (
@@ -2469,6 +2493,7 @@ describe("/api/v1/web route contracts", () => {
         });
         expect(webIssueBody.runs).toEqual(expect.arrayContaining([expect.objectContaining({ id: "session-docs-1", issue: "TEST-1", title: "TEST-1" })]));
         expect(webIssueBody.runs.some((run) => run.id === "session-symphony-1")).toBe(false);
+        expect(webIssueBody.runs.some((run) => run.id === "session-cross-context-stale")).toBe(false);
         expect(webIssueBody.transcript).toEqual([]);
 
         expect(qualifiedIssueRuns.response.status).toBe(200);
@@ -2481,6 +2506,7 @@ describe("/api/v1/web route contracts", () => {
           runId: "run-docs-1",
         });
         expect(issueRunsBody.runs).toHaveLength(1);
+        expect(issueRunsBody.runs.some((run) => run.runId === "run-cross-context-stale")).toBe(false);
         expect(issueRunsBody.runs).toEqual(
           expect.arrayContaining([
             expect.objectContaining({
