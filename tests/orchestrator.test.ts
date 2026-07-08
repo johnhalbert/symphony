@@ -2045,13 +2045,20 @@ describe("Orchestrator", () => {
       ),
     });
 
-    await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1);
-    await waitFor(() => orchestrator.snapshot().counts.running === 0);
-    await settleOrchestratorExit();
-    await orchestrator.refreshNow();
-    await settleOrchestratorExit();
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 1, "issue breakdown planning dispatch", 10_000);
+      await waitFor(
+        () => orchestrator.snapshot().counts.running === 0,
+        "issue breakdown planning completion",
+        10_000,
+      );
+      await settleOrchestratorExit();
+      await orchestrator.refreshNow();
+      await settleOrchestratorExit();
+    } finally {
+      await orchestrator.stop();
+    }
 
     const lifecycle = await lifecycleStore.get(candidate.id);
     expect(writer.issueCreates).toEqual([]);
