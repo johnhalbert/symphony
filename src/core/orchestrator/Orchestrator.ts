@@ -7883,6 +7883,16 @@ export class Orchestrator {
         },
       },
       {
+        id: "orchestrator.base_ref.refresh_observed_blocker",
+        priority: issueTransitionRulesetPriority("base_ref_observe"),
+        evaluate: (snapshot) => {
+          const request = this.rulesetObservedBaseRefTransitionRequest(snapshot);
+          return request?.transitionKind === "base_ref_observe"
+            ? request
+            : null;
+        },
+      },
+      {
         id: "orchestrator.base_ref.repair_observed",
         priority: issueTransitionRulesetPriority("base_ref_repair"),
         evaluate: (snapshot) => {
@@ -8784,6 +8794,10 @@ export class Orchestrator {
     if (!reasonContainsBaseRefBlocker(snapshot.blockedReason, blockedReason))
       return null;
 
+    const refreshRequest =
+      this.baseRefObservationRefreshTransitionRequest(snapshot, observation);
+    if (refreshRequest !== null) return refreshRequest;
+
     if (baseRefObservationCanRepairByRebase(observation)) {
       return {
         transitionKind: "base_ref_repair",
@@ -8803,6 +8817,35 @@ export class Orchestrator {
       runId: snapshot.latestRunId ?? snapshot.issueId,
       baseRefObservationFingerprint: observation.inputFingerprint,
       baseRefObservationClassification: observation.classification,
+    };
+  }
+
+  private baseRefObservationRefreshTransitionRequest(
+    snapshot: IssueCurrentStateSnapshot,
+    observation: IssueBaseRefObservation,
+  ): IssueTransitionRequest | null {
+    if (!isStateIn(snapshot.trackerState, this.config.tracker.activeStates))
+      return null;
+    if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
+      return null;
+    if (baseRefObservationCanRepairByRebase(observation)) return null;
+    if (observation.operation !== "dispatch_worker") return null;
+
+    const targetRequest = dispatchTransitionRequest({
+      role: "worker",
+      runPhase: "implementation",
+      reason: "worker_dispatch",
+      promptScenario: promptScenarioForDispatch(
+        "worker",
+        "implementation",
+        false,
+      ),
+    });
+    return {
+      transitionKind: "base_ref_observe",
+      reason: "base_ref_reobserve_after_operator_resume",
+      baseRefTargetTransitionKind: targetRequest.transitionKind,
+      baseRefTargetRequest: targetRequest,
     };
   }
 

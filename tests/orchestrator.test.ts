@@ -6523,6 +6523,75 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
+  it("re-observes non-repairable base-ref blockers after operator resumes an issue to an active state", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    config.tracker.activeStates = ["Todo", "In Progress"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const rulesets = orchestrator.registeredTransitionRulesets();
+    const refreshRuleset = rulesets.find(
+      (ruleset) =>
+        ruleset.id === "orchestrator.base_ref.refresh_observed_blocker",
+    );
+    const blockRuleset = rulesets.find(
+      (ruleset) => ruleset.id === "orchestrator.base_ref.block_observed",
+    );
+    const observation = baseRefObservationForTest({
+      classification: "base_ref_unavailable",
+      operation: "dispatch_worker",
+      localBaseIsAncestorOfHead: null,
+      githubBaseHeadSha: null,
+      localBaseHeadShaAfterFetch: null,
+      worktreeHeadSha: null,
+      reason: "Unable to resolve GitHub live base ref",
+      error: "fetch failed",
+    });
+    const blockedReason = baseRefBlockedReason(observation);
+    const base = mergePolicyRulesetSnapshot({
+      trackerState: "In Progress",
+      phase: "blocked",
+      blockedReason,
+      lastBaseRefObservation: observation,
+      lastBaseRefObservationFingerprint: observation.inputFingerprint,
+      lastBaseRefObservationClassification: observation.classification,
+      latestWorkspacePath: observation.workspacePath,
+      latestGitBranchName: observation.branchName,
+      latestBaseRef: observation.baseRef,
+      candidateSource: "tick_candidates",
+    });
+
+    expect(refreshRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "base_ref_observe",
+      reason: "base_ref_reobserve_after_operator_resume",
+      baseRefTargetTransitionKind: "dispatch_worker",
+      baseRefTargetRequest: expect.objectContaining({
+        transitionKind: "dispatch_worker",
+        role: "worker",
+        runPhase: "implementation",
+      }),
+    });
+    expect(blockRuleset?.evaluate(base, [])).toBeNull();
+    expect(
+      new IssueOrchestrationEngine(rulesets).decide(base, []),
+    ).toMatchObject({
+      transitionKind: "base_ref_observe",
+      baseRefTargetTransitionKind: "dispatch_worker",
+    });
+    await orchestrator.stop();
+  });
+
   it("worker dispatch ruleset ignores candidate source lineage", async () => {
     const config = mergePolicyOrchestratorConfig(root);
     const logger = new StructuredLogger(() => undefined);
