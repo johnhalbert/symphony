@@ -8639,7 +8639,11 @@ export class Orchestrator {
   ): boolean {
     if (snapshot.triggerType !== "orchestrator.tick") return false;
     if (!this.rulesetBlockedByLifecycle(snapshot)) return false;
-    if (isReviewerBlockedTriageReason(snapshot.blockedReason)) return false;
+    if (
+      isReviewerBlockedTriageReason(snapshot.blockedReason) &&
+      !isStateIn(snapshot.trackerState, this.config.tracker.activeStates)
+    )
+      return false;
     if (isPendingPublicationApprovalReason(snapshot.blockedReason))
       return false;
     if (this.config.reviewLoop.blockedStates.length === 0) return false;
