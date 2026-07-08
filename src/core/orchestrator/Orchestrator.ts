@@ -4368,7 +4368,9 @@ export class Orchestrator {
             id: "validate_merge_policy_service_configuration",
             execute: async (context) => {
               const service = this.mergePolicyServiceForContext(context);
-              service.requireGatedServiceConfiguration();
+              service.requireGatedServiceConfiguration(
+                projectContextResolutionFromIssue(context.issue) ?? undefined,
+              );
               return { details: { mode: this.config.mergePolicy.mode } };
             },
           },
@@ -5067,6 +5069,8 @@ export class Orchestrator {
     context.mergePolicy.service ??= new MergePolicyService({
       config: this.config,
       tracker: this.options.tracker,
+      trackerResolver: (projectContext) =>
+        this.trackerClientForProjectContext(projectContext),
       lifecycleStore: this.requireLifecycleStoreForMergePolicy(),
       ...(this.options.runStore === undefined
         ? {}

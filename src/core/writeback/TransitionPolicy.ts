@@ -126,6 +126,7 @@ export interface MergeConflictsWritebackContext {
 
 export interface BaseRefRepairWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   operationId: string;
   fromState: string;
   branchName: string;
@@ -153,6 +154,7 @@ export interface MergeGateHeadSupersessionWritebackContext {
 
 export interface MergeGateHeadSupersessionRecoveryWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   gateId: string;
   pullRequest: {
     url: string | null;
@@ -1172,6 +1174,7 @@ export function planMergeGateHeadSupersessionRecoveryWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         dedupeKey: eventKey,
         body: [
@@ -1260,6 +1263,7 @@ export function planBaseRefRepairWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         dedupeKey: eventKey,
         body: [
@@ -1289,6 +1293,7 @@ export function planBaseRefRepairWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: uniqueStates([context.fromState, config.writeback.dispatchState]),
         toState: config.writeback.dispatchState,
