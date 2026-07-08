@@ -295,7 +295,7 @@ function hermesPayload(commandOrToolInput: string | Record<string, unknown>, opt
     tool_name: options.toolName ?? "terminal",
     tool_input: toolInput,
     session_id: "test-session",
-    cwd: path.resolve(process.cwd()),
+    cwd: os.tmpdir(),
     extra: { task_id: "task-1", tool_call_id: "tool-call-1" },
   };
 }

@@ -12202,9 +12202,12 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length >= 1, "fail verdict worker prompt");
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain(
@@ -12305,9 +12308,12 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length >= 1, "blocked verdict worker prompt");
+    } finally {
+      await orchestrator.stop();
+    }
 
     const prompt = harness.runs[0]?.prompt ?? "";
     const systemPrompt = harness.runs[0]?.ctx.ephemeralSystemPrompt ?? "";
@@ -12438,9 +12444,12 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length >= 1, "merge gate repair worker prompt");
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.runs[0]?.prompt).toContain("## Symphony Merge Gate Repair");
     expect(harness.runs[0]?.prompt).toContain(
@@ -13361,9 +13370,15 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => harness.prompts.length >= 1,
+        "non-resumable harness prompt",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.prompts).toHaveLength(1);
     expect(harness.prompts[0]).toContain("Work on TEST-1");
