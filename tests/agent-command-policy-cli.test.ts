@@ -330,6 +330,7 @@ function policyHookCliBaseEnvironment(): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
     const normalizedKey = key.toUpperCase();
+    if (/^(?:GIT|GH|GITHUB)_/u.test(normalizedKey)) continue;
     if (UNSAFE_POLICY_HOOK_CLI_ENVIRONMENT_KEYS.has(normalizedKey)) continue;
     if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/u.test(normalizedKey)) continue;
     environment[key] = value;

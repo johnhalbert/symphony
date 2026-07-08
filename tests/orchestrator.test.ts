@@ -873,9 +873,15 @@ describe("Orchestrator", () => {
       ]),
     );
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => harness.runs.length >= 2,
+        "max-turn exhaustion continuation runs",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Review-cycle hardening:");
