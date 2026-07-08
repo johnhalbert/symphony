@@ -4412,6 +4412,115 @@ describe("Orchestrator", () => {
     expect(writebacks.map((item) => item.kind)).toEqual(["comment"]);
   });
 
+  it("resets stale reviewer-blocked lifecycles in active states before worker dispatch", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.tracker.activeStates = ["Todo", "In Progress"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({
+      state: "Todo",
+      branchName: "symphony/TEST-1",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [candidate];
+      },
+      async fetchIssuesByStates(states) {
+        return states.some(
+          (state) => state.toLowerCase() === candidate.state.toLowerCase(),
+        )
+          ? [candidate]
+          : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const blockedVerdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(candidate),
+      id: "review-verdict:issue-1:review-verdict-blocked-1",
+      idempotencyKey: "review-verdict-blocked-1",
+      verdict: "blocked",
+      acceptanceResults: [],
+      findings: [
+        "Symphony pass writeback is blocked because the PR branch is not rebased onto the latest origin/main.",
+      ],
+      evidence: ["review pass writeback rejected stale base ref"],
+    };
+    await lifecycleStore.ensureIssue(candidate, {
+      phase: "review",
+      blockedReason:
+        "review blocked: Symphony pass writeback is blocked because the PR branch is not rebased onto the latest origin/main.",
+      lastReviewVerdictId: blockedVerdict.id,
+      reviewVerdicts: [blockedVerdict],
+    });
+    const harness = new LifecycleSnapshotHarness(lifecycleStore);
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+
+    expect(harness.runs).toEqual([]);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "implementation",
+      reviewRound: 0,
+      incompleteTurnCount: 0,
+      blockedReason: null,
+      lastIssueTriageReportId: null,
+      lastReviewVerdictId: blockedVerdict.id,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(
+      () => harness.runs.length === 1,
+      "stale reviewer-blocked worker dispatch",
+    );
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.role).toBe("worker");
+    expect(harness.runs[0]?.runPhase).toBe("implementation");
+    expect(harness.snapshots[0]).toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      lastReviewVerdictId: blockedVerdict.id,
+    });
+    const issueState = await readIssueState(
+      config.workspace.stateDir,
+      candidate.id,
+    );
+    const transitionKinds = issueState?.history.map(
+      (snapshot) => snapshot.transitionKind,
+    );
+    expect(transitionKinds).toEqual(
+      expect.arrayContaining([
+        "reset_lifecycle_after_operator_resume",
+        "dispatch_worker",
+      ]),
+    );
+    expect(
+      transitionKinds?.indexOf("reset_lifecycle_after_operator_resume"),
+    ).toBeLessThan(transitionKinds?.indexOf("dispatch_worker") ?? -1);
+  });
+
   it("keeps blocked issues stopped after triage even when blockers are worker-owned", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
@@ -10658,7 +10767,7 @@ describe("Orchestrator", () => {
     expect(harness.runs).toEqual([]);
   });
 
-  it("does not block resolved merge-conflict lifecycle metadata in the conflict state", async () => {
+  it("does not treat resolved merge-conflict lifecycle metadata in the conflict state as merge-ready", async () => {
     const config = testConfig(root);
     config.mergePolicy.mode = "gated";
     config.mergePolicy.conflictsState = "Merge Conflicts";
@@ -10683,7 +10792,7 @@ describe("Orchestrator", () => {
     );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await lifecycleStore.ensureIssue(candidate, {
-      phase: "passed",
+      phase: "implementation",
       blockedReason: null,
       mergeConflict: {
         ...openMergeConflict(candidate),
@@ -10714,7 +10823,7 @@ describe("Orchestrator", () => {
 
     expect(harness.runs).toEqual([]);
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-      phase: "passed",
+      phase: "implementation",
       blockedReason: null,
       mergeConflict: {
         status: "resolved",

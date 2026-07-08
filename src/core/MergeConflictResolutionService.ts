@@ -27,7 +27,10 @@ import type {
   IssuePreservedWorktreeStash,
 } from "./persistence/IssueLifecycleStore.js";
 import type { Issue, Workspace } from "./types.js";
-import { planBlockedEscalationWritebacks } from "./writeback/TransitionPolicy.js";
+import {
+  planBlockedEscalationWritebacks,
+  planMergeConflictResolvedWritebacks,
+} from "./writeback/TransitionPolicy.js";
 import type {
   WritebackOperation,
   WritebackOutboxStore,
@@ -203,12 +206,12 @@ export class MergeConflictResolutionService {
               blockedReason,
             };
 
-    const writebackOperations = blocked ? await this.enqueueBlockedWritebacks(context, nextConflict) : [];
-    const implementationPhase =
-      !blocked &&
-      finalReport.resolutionStatus === "resolved" &&
-      (finalReport.serviceRemediation?.kind === "preserved_stash_applied_clean" ||
-        finalReport.serviceRemediation?.kind === "stash_apply_finalized");
+    const resolved = !blocked && nextConflict.resolutionStatus === "resolved";
+    const writebackOperations = blocked
+      ? await this.enqueueBlockedWritebacks(context, nextConflict)
+      : resolved
+        ? await this.enqueueResolvedWritebacks(context, storedReport, nextConflict)
+        : [];
     const activeStash = preservedStashFromReport(finalReport);
     const preservedWorktreeStashes =
       activeStash === null
@@ -218,11 +221,9 @@ export class MergeConflictResolutionService {
       projectContext,
       phase: blocked
         ? "blocked"
-        : implementationPhase
+        : resolved
           ? "implementation"
-          : nextConflict.resolutionStatus === "resolved"
-            ? "passed"
-            : "merge_conflict_resolution",
+          : "merge_conflict_resolution",
       blockedReason: blocked ? nextConflict.blockedReason : null,
       mergeConflict: {
         ...nextConflict,
@@ -243,7 +244,7 @@ export class MergeConflictResolutionService {
         prHeadSha: finalReport.pullRequest.headSha,
         prBranch: finalReport.pullRequest.branch,
         lastEvidenceCursor: finalReport.idempotencyKey,
-        ...(implementationPhase ? { ciStatus: null } : {}),
+        ...(resolved ? { ciStatus: null } : {}),
       },
     });
 
@@ -305,6 +306,26 @@ export class MergeConflictResolutionService {
           `Latest reported head SHA: ${mergeConflict.currentHeadSha}`,
           "Inspect the branch, resolve conflicts manually or reset approval, then move the issue when Symphony should continue.",
         ].join("\n"),
+      },
+      this.options.config,
+    );
+    const enqueued: WritebackOperation[] = [];
+    for (const operation of operations) enqueued.push(await this.options.writebackOutbox.enqueueOnce(operation));
+    return enqueued;
+  }
+
+  private async enqueueResolvedWritebacks(
+    context: MergeConflictResolutionActiveContext,
+    report: IssueMergeConflictResolutionReportRecord,
+    mergeConflict: IssueMergeConflictMetadata,
+  ): Promise<WritebackOperation[]> {
+    const conflictsState = this.options.config.mergePolicy.conflictsState ?? mergeConflict.conflictsState;
+    const operations = planMergeConflictResolvedWritebacks(
+      {
+        issue: context.issue,
+        report,
+        fromState: context.issue.state,
+        conflictsState,
       },
       this.options.config,
     );

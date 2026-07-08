@@ -344,6 +344,8 @@ export class HermesHarness implements AgentHarness {
       profileDir: profile.profileDir,
       servers: symphonyRoleMcpServers(ctx, { cliPath, mcpCwd: ctx.workspace.path }),
       agentMaxTurns: SYMPHONY_HERMES_AGENT_MAX_TURNS,
+      model: ctx.config.hermes.model,
+      provider: ctx.config.hermes.provider,
       ...(commandPolicyHooks === undefined ? {} : { hooks: commandPolicyHooks, hooksAutoAccept: true }),
       removeCommandPolicyHooks: commandPolicyHookOptions === undefined ? !ctx.config.hermes.commandPolicy.enabled : true,
     });

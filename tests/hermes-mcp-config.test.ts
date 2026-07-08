@@ -82,6 +82,38 @@ describe("Hermes MCP config", () => {
     });
   });
 
+  it("writes the Symphony runtime model and provider into generated profile config", async () => {
+    const profileDir = path.join(root, "profile");
+    await mkdir(profileDir, { recursive: true });
+    await writeFile(
+      path.join(profileDir, "config.yaml"),
+      YAML.stringify({
+        model: {
+          default: "old-model",
+          provider: "old-provider",
+          base_url: "https://example.invalid/v1",
+        },
+      }),
+      "utf8",
+    );
+
+    await writeHermesMcpConfig({
+      profileDir,
+      servers: {},
+      model: "gpt-5-test",
+      provider: "openai-codex",
+    });
+
+    const parsed = YAML.parse(await readFile(path.join(profileDir, "config.yaml"), "utf8")) as Record<string, unknown>;
+    expect(parsed).toMatchObject({
+      model: {
+        default: "gpt-5-test",
+        provider: "openai-codex",
+        base_url: "https://example.invalid/v1",
+      },
+    });
+  });
+
   it("can stamp the Symphony agent turn budget into an existing profile config", async () => {
     const profileDir = path.join(root, "profile");
     await mkdir(profileDir, { recursive: true });

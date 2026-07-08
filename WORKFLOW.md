@@ -45,7 +45,7 @@ merge_policy:
   mode: gated
   source_states:
     - Ready to Merge
-  conflicts_state: Approved with Conflicts
+  conflicts_state: Conflict Repair
   max_conflict_fix_turns: 3
   done_state: Done
   merge_method: merge
@@ -253,7 +253,7 @@ Use Linear only as read context unless the prompt explicitly asks for a non-life
 
 ## State Contract
 
-`Todo` and `In Progress` are the worker implementation queue. `Approved with Conflicts` is reserved for scoped merge-conflict repair after Symphony prepares the lifecycle-bound PR worktree with service-owned git operations. `In Review` is the reviewer-agent queue and stops worker dispatch/retry behavior after Symphony accepts the worker completion report. The PR-driven `Human Review` handoff is disabled for the initial Hermes dogfood loop. Symphony publishes or reuses the lifecycle-bound pull request and transitions accepted completion reports directly to `In Review`; the separate PR handoff check gate is not active. `Blocked` is the human-required escalation state for exhausted review loops, repeated incomplete worker turns, or other conditions that require operator intervention.
+`Todo` and `In Progress` are the worker implementation queue. `Conflict Repair` is reserved for scoped merge-conflict repair after Symphony prepares the lifecycle-bound PR worktree with service-owned git operations. A successful conflict repair returns to `In Progress` for worker reverification, fresh completion, and fresh review before merge can continue. `In Review` is the reviewer-agent queue and stops worker dispatch/retry behavior after Symphony accepts the worker completion report. The PR-driven `Human Review` handoff is disabled for the initial Hermes dogfood loop. Symphony publishes or reuses the lifecycle-bound pull request and transitions accepted completion reports directly to `In Review`; the separate PR handoff check gate is not active. `Blocked` is the human-required escalation state for exhausted review loops, repeated incomplete worker turns, or other conditions that require operator intervention.
 
 A passing review is recorded with structured reviewer verdict evidence, such as a Linear comment or PR review, and Symphony transitions the issue from `In Review` to `Ready to Merge`. Review failures continue through the review loop, and escalation failures transition to `Blocked`.
 

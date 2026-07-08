@@ -303,6 +303,16 @@ describe("HermesHarness", () => {
     expect(clients[0]?.env.model).toBe("gpt-5-test");
     expect(clients[0]?.env.provider).toBe("openai-codex");
     expect(clients[0]?.env.extraEnv?.HERMES_API_KEY).toBeUndefined();
+    const profileConfig = YAML.parse(await readFile(path.join(clients[0]!.env.hermesHome, "config.yaml"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(profileConfig).toMatchObject({
+      model: {
+        default: "gpt-5-test",
+        provider: "openai-codex",
+      },
+    });
     const managedAuth = JSON.parse(await readFile(path.join(config.hermes.auth.managedRoot, "auth.json"), "utf8")) as Record<
       string,
       any

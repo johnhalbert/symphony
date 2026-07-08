@@ -47,6 +47,8 @@ export interface WriteHermesMcpConfigOptions {
   timeoutSeconds?: number;
   connectTimeoutSeconds?: number;
   agentMaxTurns?: number;
+  model?: string | null;
+  provider?: string | null;
   hooks?: HermesShellHooksConfig;
   hooksAutoAccept?: boolean;
   removeCommandPolicyHooks?: boolean;
@@ -95,6 +97,7 @@ export async function writeHermesMcpConfig(options: WriteHermesMcpConfigOptions)
   const next = {
     ...existing,
     ...(options.agentMaxTurns === undefined ? {} : { agent: { ...recordValue(existing.agent), max_turns: options.agentMaxTurns } }),
+    ...symphonyHermesRuntimeModelConfig(existing, options),
     ...symphonyHermesNonInteractiveToolGuardConfig(existing),
     ...(hooks === undefined ? {} : { hooks }),
     ...(options.hooksAutoAccept === undefined ? {} : { hooks_auto_accept: options.hooksAutoAccept }),
@@ -432,6 +435,26 @@ function symphonyHermesNonInteractiveToolGuardConfig(existing: Record<string, un
       tirith_enabled: SYMPHONY_HERMES_TIRITH_ENABLED,
     },
   };
+}
+
+function symphonyHermesRuntimeModelConfig(
+  existing: Record<string, unknown>,
+  options: Pick<WriteHermesMcpConfigOptions, "model" | "provider">,
+): Record<string, unknown> {
+  const model = nonEmptyString(options.model);
+  const provider = nonEmptyString(options.provider);
+  if (!model && !provider) return {};
+
+  const existingModel = existing.model;
+  const modelConfig = {
+    ...recordValue(existingModel),
+  };
+  const existingModelDefault = typeof existingModel === "string" ? nonEmptyString(existingModel) : nonEmptyString(String(modelConfig.default ?? ""));
+  const nextDefault = model ?? existingModelDefault;
+  if (nextDefault) modelConfig.default = nextDefault;
+  if (provider) modelConfig.provider = provider;
+
+  return { model: modelConfig };
 }
 
 function dedupeHermesShellHooks(entries: HermesShellHookConfig[]): HermesShellHookConfig[] {

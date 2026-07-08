@@ -1733,17 +1733,17 @@ Work on {{ issue.identifier }}.
         merge_policy: {
           mode: "gated",
           source_states: ["Ready to Merge"],
-          conflicts_state: "Approved with Conflicts",
+          conflicts_state: "Conflict Repair",
         },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
     );
 
-    expect(config.mergePolicy.conflictsState).toBe("Approved with Conflicts");
-    expect(config.tracker.activeStates).not.toContain("Approved with Conflicts");
-    expect(config.issueBoard.columns.progress).not.toContain("Approved with Conflicts");
-    expect(config.issueBoard.columns.review).not.toContain("Approved with Conflicts");
+    expect(config.mergePolicy.conflictsState).toBe("Conflict Repair");
+    expect(config.tracker.activeStates).not.toContain("Conflict Repair");
+    expect(config.issueBoard.columns.progress).not.toContain("Conflict Repair");
+    expect(config.issueBoard.columns.review).not.toContain("Conflict Repair");
   });
 
   it("accepts legacy merge conflict states that overlap normal lifecycle buckets because new routing ignores them", () => {
@@ -2340,7 +2340,7 @@ Work on {{ issue.identifier }}.
     ).toThrow("hermes_acp.profile_prefix must be a valid host Hermes profile name");
   });
 
-  it("parses the canonical workflow with current Hermes dogfood defaults", async () => {
+  it("parses the canonical workflow with current Hermes defaults", async () => {
     const workflowPath = path.resolve("WORKFLOW.md");
     const parsed = parseWorkflowFile(await readFile(workflowPath, "utf8"), workflowPath);
     const config = parseServiceConfig(parsed.config, workflowPath, {
@@ -2357,6 +2357,10 @@ Work on {{ issue.identifier }}.
     });
 
     const rawGithub = parsed.config.github as { pr_handoff?: { enabled?: unknown } } | undefined;
+    const rawAgent = parsed.config.agent as {
+      max_concurrent_agents?: unknown;
+      protected_paths?: unknown;
+    } | undefined;
     const rawHermes = parsed.config.hermes as {
       model?: unknown;
       worker_session_lifecycle?: unknown;
@@ -2365,7 +2369,7 @@ Work on {{ issue.identifier }}.
     } | undefined;
 
     expect(config.agent.harness).toBe("hermes");
-    expect(config.agent.maxConcurrentAgents).toBe(5);
+    expect(config.agent.maxConcurrentAgents).toBe(rawAgent?.max_concurrent_agents);
     expect(config.agent.maxTurns).toBe(1);
     expect(config.mergePolicy.mode).toBe("gated");
     expect(config.continuationContext.searchEnabled).toBe(false);
@@ -2409,7 +2413,7 @@ Work on {{ issue.identifier }}.
       maxAttemptsPerTrigger: 1,
     });
     expect(config.agent.workerExcludeLabels).toEqual(["review_only"]);
-    expect(config.agent.protectedPaths).toContain("hermes/src/**");
+    expect(config.agent.protectedPaths).toEqual(rawAgent?.protected_paths);
     const expectedReasoningEffortByTemplate = new Map([
       ["worker", "xhigh"],
       ["reviewer", "xhigh"],

@@ -284,6 +284,7 @@ export interface MergePolicyConflictPreparationExecution {
 
 export interface MergePolicyConflictWritebackPlan {
   operations: Parameters<WritebackProcessor["enqueueAndProcess"]>[0][];
+  expectedState: string | null;
 }
 
 export class MergePolicyService {
@@ -479,7 +480,7 @@ export class MergePolicyService {
       await validateConflictApprovalCarryForward(github, resolvedConflict, approvedPullRequest, approvedHeadSha, headSha);
     }
 
-    const approvalVerdict = latestMergeApprovalPassVerdict(lifecycle, resolvedConflict !== null);
+    const approvalVerdict = latestMergeApprovalPassVerdict(lifecycle);
     const existingGateFailure = findMergeGateFailure(lifecycle, gateId);
     const checkDecision = await this.evaluateChecks(github, headSha, pullRequest, gateId, lifecycle);
     const decision = mergeGateDecisionWithMergeability(
@@ -557,7 +558,7 @@ export class MergePolicyService {
       });
     }
 
-    const verdict = latestMergeApprovalPassVerdict(lifecycle, resolvedConflict !== null);
+    const verdict = latestMergeApprovalPassVerdict(lifecycle);
     const currentMergeGate = lifecycle.mergeGate ?? null;
     if (
       decision.kind === "passed" &&
@@ -1730,8 +1731,28 @@ export class MergePolicyService {
       execution.stashApplyResult?.status === "conflicted"
         ? execution.stashApplyResult
         : null;
-    if (plan.mode === "base_refresh") return { operations: [] };
-    if (execution.preparation.status !== "conflicted" && stashApplyConflict === null) return { operations: [] };
+    if (execution.preparation.status === "clean" && stashApplyConflict === null) {
+      const operations = planBaseRefRepairWritebacks(
+        {
+          issue,
+          operationId: `service-conflict:${issue.id}:${plan.expectedHeadSha}:${plan.baseObservation.liveBaseHeadSha}`,
+          fromState: plan.sourceState,
+          branchName: plan.branchName,
+          baseBranch: plan.baseBranch,
+          previousHeadSha: plan.previousRemoteHeadSha,
+          rebasedHeadSha: execution.pullRequestHeadSha,
+          baseHeadSha: plan.baseObservation.liveBaseHeadSha,
+          mode: "pr_backed",
+        },
+        this.options.config,
+      );
+      return {
+        operations,
+        expectedState:
+          operations.length > 0 ? this.options.config.writeback.dispatchState : null,
+      };
+    }
+    if (plan.mode === "base_refresh") return { operations: [], expectedState: null };
     return {
       operations: planMergeConflictsWritebacks(
         {
@@ -1755,6 +1776,7 @@ export class MergePolicyService {
         },
         resolveServiceConfigForProjectContext(this.options.config, plan.projectContext),
       ),
+      expectedState: plan.conflictsState,
     };
   }
 
@@ -1766,7 +1788,7 @@ export class MergePolicyService {
     const results = await this.requireMergeGateWritebacksSucceeded(
       issue,
       writebackPlan.operations,
-      writebackPlan.operations.length > 0 ? plan.conflictsState : null,
+      writebackPlan.expectedState,
       plan.projectContext,
     );
     return {
@@ -1825,11 +1847,9 @@ export class MergePolicyService {
     const phase =
       stashApplyConflict !== null
         ? "merge_conflict_resolution"
-        : execution.preparation.status === "clean" && execution.finalPreservedStash !== null
+        : execution.preparation.status === "clean"
           ? "implementation"
-          : execution.preparation.status === "clean"
-            ? "passed"
-            : "merge_conflict_resolution";
+          : "merge_conflict_resolution";
     const updated = await this.options.lifecycleStore.updateIssue(issue, {
       phase,
       blockedReason: null,
@@ -2197,7 +2217,7 @@ export class MergePolicyService {
       await validateConflictApprovalCarryForward(github, resolvedConflict, approvedPullRequest, approvedHeadSha, headSha);
     }
 
-    const approvalVerdict = latestMergeApprovalPassVerdict(activeLifecycle, resolvedConflict !== null);
+    const approvalVerdict = latestMergeApprovalPassVerdict(activeLifecycle);
     const existingGateFailure = findMergeGateFailure(activeLifecycle, gateId);
     const checkDecision = await this.evaluateChecks(github, headSha, pullRequest, gateId, activeLifecycle);
     const decision = mergeGateDecisionWithMergeability(
@@ -2285,7 +2305,7 @@ export class MergePolicyService {
       return { status: "checks_pending", gate: decision.gate };
     }
 
-    const verdict = latestMergeApprovalPassVerdict(activeLifecycle, resolvedConflict !== null);
+    const verdict = latestMergeApprovalPassVerdict(activeLifecycle);
     if (decision.kind === "failure") {
       return this.handleMergeGateFailure(latestIssue, activeLifecycle, report, decision.gate, sourceState, projectContext, existingGateFailure);
     }
@@ -2780,14 +2800,6 @@ export class MergePolicyService {
     const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
     const sourceState = resolvedConfig.mergePolicy.sourceStates.find((state) => statesEqual(state, issue.state)) ?? null;
     if (sourceState !== null) return sourceState;
-    const conflictsState = resolvedConfig.mergePolicy.conflictsState;
-    if (
-      conflictsState !== null &&
-      statesEqual(issue.state, conflictsState) &&
-      lifecycle?.mergeConflict?.resolutionStatus === "resolved"
-    ) {
-      return conflictsState;
-    }
     return null;
   }
 
@@ -3354,16 +3366,8 @@ function validateLivePullRequestMetadata(
 
 function latestMergeApprovalPassVerdict(
   lifecycle: IssueLifecycleRecord,
-  allowConflictResolutionCarryForward: boolean,
 ): IssueReviewVerdictRecord | null {
-  const current = latestCurrentApprovalPassVerdict(lifecycle);
-  if (current !== null || !allowConflictResolutionCarryForward) return current;
-  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
-    if (verdict.issueId !== lifecycle.issueId || verdict.issueIdentifier !== lifecycle.issueIdentifier) continue;
-    if (verdict.verdict !== "pass" || verdict.reviewer === MERGE_GATE_REVIEWER) continue;
-    return verdict;
-  }
-  return null;
+  return latestCurrentApprovalPassVerdict(lifecycle);
 }
 
 function isOpenPullRequest(livePullRequest: PullRequestDetails): boolean {
