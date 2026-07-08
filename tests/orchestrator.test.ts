@@ -11607,9 +11607,21 @@ describe("Orchestrator", () => {
       pullRequestClient,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => pullRequestClient.branches.length >= 2,
+        "pull request discovery by branch",
+      );
+      await waitForAsync(
+        async () =>
+          (await runStore.latestRunForIssue(candidate.identifier))?.prNumber ===
+          12,
+        "pull request metadata persistence",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     const run = await runStore.latestRunForIssue(candidate.identifier);
     const transcript = await runStore.readTranscript(run?.runId ?? "");
@@ -11706,9 +11718,15 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => authorizations.length >= 2,
+        "worker GitHub discovery credentials",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(authorizations).toEqual([
       "Bearer discovery-secret",
@@ -11824,9 +11842,19 @@ describe("Orchestrator", () => {
       pullRequestReviewClient,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          pullRequestReviewClient.calls.length >= 1 &&
+          (harness.runs[0]?.prompt ?? "").includes(
+            "PR review feedback to address",
+          ),
+        "review evidence prompt ingestion",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(pullRequestReviewClient.calls).toEqual([42]);
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
@@ -11963,9 +11991,16 @@ describe("Orchestrator", () => {
       pullRequestReviewClient,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          pullRequestReviewClient.calls.length >= 1 && harness.runs.length >= 1,
+        "linkback-only review evidence prompt ingestion",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     const prompt = harness.runs[0]?.prompt ?? "";
     expect(pullRequestReviewClient.calls).toEqual([42]);
@@ -12089,9 +12124,19 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          calls.length >= 4 &&
+          (harness.runs[0]?.prompt ?? "").includes(
+            "Please address the reviewer-owned evidence path.",
+          ),
+        "review evidence credential resolution",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(calls.map((call) => call.authorization)).toEqual([
       "Bearer review-read-secret",
