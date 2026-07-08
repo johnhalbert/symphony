@@ -2124,6 +2124,7 @@ function lifecycleRecordFromHistorySnapshot(
     blockedReason: stringFromUnknown(snapshot.lifecycleBlockedReason),
     summaryPointers,
     summaryReferences: [],
+    events: [],
     issueBreakdownPlans,
     completionReports:
       latestCompletionReport === null ? [] : [latestCompletionReport],

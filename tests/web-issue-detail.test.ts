@@ -8,11 +8,16 @@ import {
   type BoardIssueDetailProjectionInput,
   type IssueBoardCardProjectionInput,
 } from "../src/app/webProjection.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
-import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore, type RunRecord, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { Issue, IssueDetailsEnvelope, TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
@@ -401,11 +406,64 @@ describe("web issue detail projection", () => {
           result: "read_file result",
         },
       ],
+      workspace: {
+        workspaceKey: "TEST-1",
+        path: "/tmp/workspaces/TEST-1",
+        sourceKind: "git_worktree",
+        branchName: "symphony/TEST-1",
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo",
+        baseRef: "main",
+      },
     });
-    expect(Object.keys(detail ?? {})).toEqual(["issue", "activity", "runs", "transcript"]);
+    expect(Object.keys(detail ?? {})).toEqual(["issue", "workspace", "activity", "runs", "transcript"]);
     expect(detail?.transcript[2]).not.toHaveProperty("payload");
     expect(detail?.transcript[2]).not.toHaveProperty("runId");
     expect(JSON.stringify(detail).toLowerCase()).not.toContain("mock");
+  });
+
+  it("keeps planning workspaces and lifecycle-derived workspace fallbacks out of top-level issue detail workspace projection outside issue-breakdown runs", () => {
+    const detail = projectWebIssueDetail(
+      {
+        issue: "TEST-1",
+        boardCard: null,
+        issueDetails: issueDetails({
+          workspace: {
+            workspaceKey: "TEST-1-planning",
+            path: "/tmp/workspaces/TEST-1-planning",
+            sourceKind: null,
+            branchName: "symphony/TEST-1-planning",
+            gitBranchName: "symphony/TEST-1-planning",
+            repoPath: "/repo",
+            baseRef: "main",
+          },
+        }),
+        workspace: {
+          workspaceKey: "TEST-1-planning",
+          path: "/tmp/workspaces/TEST-1-planning",
+          sourceKind: "git_worktree",
+          branchName: "symphony/TEST-1-planning",
+          gitBranchName: "symphony/TEST-1-planning",
+          repoPath: "/repo",
+          baseRef: "main",
+        },
+        latestRun: runRecord({
+          runPhase: "issue_breakdown",
+          workspaceKey: "TEST-1-planning",
+          workspacePath: "/tmp/workspaces/TEST-1-planning",
+          gitBranchName: "symphony/TEST-1-planning",
+          repoPath: "/repo",
+          baseRef: "main",
+        }),
+        runs: [],
+        activity: { activity: [] },
+        transcript: [],
+        operatorLiveness: null,
+      },
+      "TEST-1",
+    );
+
+    expect(detail?.workspace).toBeNull();
   });
 
   it("projects durable-only issue details without a board card or invented mock data", () => {
@@ -434,6 +492,7 @@ describe("web issue detail projection", () => {
         workspace: null,
         session: null,
       },
+      workspace: null,
       activity: [],
       runs: [],
       transcript: [],
@@ -584,7 +643,7 @@ describe("GET /api/v1/web/issues/:issueId", () => {
         model: "gpt-5-test",
         workspace: "TEST-1",
         session: "session-1",
-        note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
+        note: "Initialized implementation run from persisted run metadata. System prompt redacted. Project context: Default.",
       });
       expect(explicitMessages[1]).toMatchObject({
         kind: "user",
@@ -622,7 +681,7 @@ describe("GET /api/v1/web/issues/:issueId", () => {
       expect(serializedTranscript).not.toContain("sk-ABCDEFGH1");
       expect(JSON.stringify(body).toLowerCase()).not.toContain("mock");
       expect(JSON.stringify(explicitBody).toLowerCase()).not.toContain("mock");
-      expect(tracker.fetchCount).toBe(1);
+      expect(tracker.fetchCount).toBe(2);
     } finally {
       await server.stop();
     }
@@ -715,15 +774,22 @@ describe("GET /api/v1/web/issues/:issueId", () => {
     }
   });
 
-  it("returns a durable-only web issue detail through the HTTP route when tracker data is unavailable", async () => {
+  it("returns a durable-only context-qualified web issue detail through the HTTP route when tracker data is unavailable and legacy lifecycle defaults are present", async () => {
     const config = testConfig(path.join(root, "workspaces"));
     const logger = new StructuredLogger(() => undefined);
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "explicit",
+    } as const;
     await runStore.upsertWorkspace({
-      workspaceKey: "TEST-DURABLE",
+      workspaceKey: "docs:TEST-DURABLE",
       issueId: "issue-durable",
       issueIdentifier: "TEST-DURABLE",
+      projectContext: docsProjectContext,
       path: path.join(config.workspace.root, "TEST-DURABLE"),
       sourceKind: "git_worktree",
       gitBranchName: "symphony/TEST-DURABLE",
@@ -737,15 +803,27 @@ describe("GET /api/v1/web/issues/:issueId", () => {
       role: "worker",
       issueId: "issue-durable",
       issueIdentifier: "TEST-DURABLE",
+      projectContext: docsProjectContext,
       attempt: null,
       turnNumber: 1,
       prompt: "work",
-      workspaceKey: "TEST-DURABLE",
+      workspaceKey: "docs:TEST-DURABLE",
       workspacePath: path.join(config.workspace.root, "TEST-DURABLE"),
       gitBranchName: "symphony/TEST-DURABLE",
       repoPath: "/repo",
       baseRef: "main",
     });
+    await lifecycleStore.ensureIssue(
+      { id: "issue-durable", identifier: "TEST-DURABLE" },
+      {
+        projectContext: {
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+          linearProjectSlug: null,
+          routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+        },
+      },
+    );
     const server = new StatusServer({
       orchestrator: fakeOrchestrator(),
       workspaceManager: new WorkspaceManager({ workspace: config.workspace, hooks: config.hooks, logger }),
@@ -760,20 +838,20 @@ describe("GET /api/v1/web/issues/:issueId", () => {
     });
     const address = await server.start();
     try {
-      const response = await fetch(`http://${address.host}:${address.port}/api/v1/web/issues/TEST-DURABLE`);
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/web/issues/docs:TEST-DURABLE`);
       const body = (await response.json()) as { issue: Record<string, unknown> };
 
       expect(response.status).toBe(200);
       expect(body).toMatchObject({
         issue: {
-          id: "TEST-DURABLE",
+          id: "docs:TEST-DURABLE",
           title: "TEST-DURABLE",
           status: "progress",
           priority: 0,
           labels: [],
           assignee: "unassigned",
           agent: "agent-durable",
-          project: "",
+          project: "Documentation Site",
           cycle: "",
           activity: [],
           pr: null,

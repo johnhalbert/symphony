@@ -7,6 +7,11 @@ import {
 import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
+import {
+  projectContextResolutionFromIssue,
+  sameProjectContextIdentity,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import type { Issue } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { SqliteWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -16,6 +21,7 @@ export const REVIEW_VERDICT_TOOL_NAME = "submit_review_verdict";
 
 export interface ReviewVerdictMcpContextFile {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string | null;
   role: "reviewer";
   token?: string | null;
@@ -37,25 +43,26 @@ export async function submitReviewVerdictFromMcp(input: unknown, options: {
   workflowPath: string;
   contextFile: string;
 }): Promise<unknown> {
-  const loadedContext = await readReviewVerdictContext(options.contextFile);
-  if (!loadedContext.activeRunId) {
-    throw new SymphonyError("invalid_request", "Review verdict context is not ready for the active run");
-  }
-
   const loader = new WorkflowLoader(options.workflowPath);
   let writebackOutbox: SqliteWritebackOutboxStore | null = null;
   try {
     const loaded = await loader.load();
     const config = loaded.serviceConfig;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const loadedContext = await readReviewVerdictContext(options.contextFile, lifecycleStore);
+    if (!loadedContext.activeRunId) {
+      throw new SymphonyError("invalid_request", "Review verdict context is not ready for the active run");
+    }
     writebackOutbox = new SqliteWritebackOutboxStore(config.workspace.stateDir);
     const service = new ReviewVerdictService({
       config,
-      lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
+      lifecycleStore,
       writebackOutbox,
       runStore: new FileRunTranscriptStore(config.workspace.stateDir),
     });
     const context: ReviewVerdictActiveContext = {
       issue: loadedContext.issue,
+      projectContext: loadedContext.projectContext,
       activeRunId: loadedContext.activeRunId,
       role: loadedContext.role,
       token: loadedContext.token ?? null,
@@ -99,12 +106,33 @@ export async function runReviewVerdictMcpServer(options: {
   });
 }
 
-async function readReviewVerdictContext(filePath: string): Promise<ReviewVerdictMcpContextFile> {
+async function readReviewVerdictContext(
+  filePath: string,
+  lifecycleStore?: Pick<FileIssueLifecycleStore, "get">,
+): Promise<ReviewVerdictMcpContextFile> {
   const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as ReviewVerdictMcpContextFile;
   if (!parsed.issue || parsed.role !== "reviewer") {
     throw new SymphonyError("invalid_request", "Review verdict MCP context is invalid");
   }
-  return parsed;
+  const authoritativeProjectContext = await readServiceOwnedReviewVerdictProjectContext(parsed.issue, lifecycleStore);
+  if (parsed.projectContext && authoritativeProjectContext && !sameProjectContextIdentity(parsed.projectContext, authoritativeProjectContext)) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Review verdict MCP context does not match the service-owned issue project context",
+    );
+  }
+  return authoritativeProjectContext ? { ...parsed, projectContext: authoritativeProjectContext } : parsed;
+}
+
+async function readServiceOwnedReviewVerdictProjectContext(
+  issue: Issue,
+  lifecycleStore?: Pick<FileIssueLifecycleStore, "get">,
+): Promise<ProjectContextResolution | null> {
+  const lifecycle =
+    (await lifecycleStore?.get(issue.id)) ??
+    (issue.identifier !== issue.id ? await lifecycleStore?.get(issue.identifier) : null) ??
+    null;
+  return lifecycle?.projectContext ?? projectContextResolutionFromIssue(issue);
 }
 
 function reviewVerdictInputSchema(): Record<string, unknown> {

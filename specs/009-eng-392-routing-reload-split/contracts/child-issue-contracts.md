@@ -1,182 +1,538 @@
-# Contract: ENG-392 Child Issue Contracts
+# ENG-392 child issue contract family templates
 
-This file defines the planned child issue contract families for ENG-392. These are planning templates only; the Linear issue description remains the canonical contract once a child issue is created or delegated.
+These templates finalize the child-issue decomposition units for the blocked ENG-392 repair. Each family below freezes:
 
-## Required Child Families
+- one stable primary requirement ID,
+- a suggested child-issue title for title-based dependency wiring,
+- the exact authorized surfaces that the child issue may list in `Touched Surfaces`,
+- a copyable issue body that already matches the shared fenced-JSON issue-contract shape, and
+- promotion-readiness guidance that keeps protected workflow surfaces manual-only.
 
-### REQ-392-DECISION - Decomposition Decision
+Use these as planning references, not as already-created Linear issues. Keep the primary requirement IDs and suggested titles stable if you copy a template into a child issue.
 
-**Purpose**: Record whether ENG-392 will be split/retargeted, explicitly widened through child contracts, or closed/replaced with current-base evidence.
+## Dependency order at a glance
 
-**Authorized Surfaces**:
+The current apply path resolves sibling dependencies by normalized child title, so the suggested titles below are part of the contract guidance.
 
-- Linear comments or issue update through Symphony-owned writeback.
-- Spec Kit or planning evidence.
-- Issue breakdown plan records.
+| Order | Suggested child title | Primary requirement ID | Depends on title(s) | Why this comes here |
+| --- | --- | --- | --- | --- |
+| 1 | `ENG-392 child — decision and scope lock` | `REQ-392-DECISION` | none | Freezes whether the repair stays split into child issues and keeps later scope expansions explicit instead of recreating the original tests-only/runtime mismatch. |
+| 2 | `ENG-392 child — runtime routing repair` | `REQ-392-RUNTIME-ROUTING` | `ENG-392 child — decision and scope lock` | Establishes project-context-qualified routing and workspace identity before reload, approval, or proof work tries to preserve or validate it. |
+| 3 | `ENG-392 child — reload preservation repair` | `REQ-392-RELOAD-PRESERVATION` | `ENG-392 child — runtime routing repair` | Builds on stable routing identity so an in-progress worker or reviewer context can survive config reload without bucket drift or duplicate dispatch. |
+| 4 | `ENG-392 child — approval writeback repair` | `REQ-392-APPROVAL-WRITEBACK` | `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair` | Repairs pending-publication approval and writeback recovery only after routed runtime identity and reload preservation are stable. |
+| 5 | `ENG-392 child — orchestrator proof` | `REQ-392-TEST-PROOF` | `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, `ENG-392 child — approval writeback repair` | Adds the final focused orchestrator proof after the underlying runtime and approval invariants are explicit and deterministic. |
+| 6 | `ENG-392 child — publication hygiene closure` | `REQ-392-PUBLICATION-HYGIENE` | `ENG-392 child — decision and scope lock`, `ENG-392 child — orchestrator proof`, `ENG-392 child — approval writeback repair` | Closes the loop by keeping the final diff, evidence packet, and repository hygiene aligned with the declared child scopes. |
 
-**Requirement Template**:
+### Runtime prerequisite chain for proof work — T038
 
-```json
-{
-  "schemaVersion": 1,
-  "contractVersion": "2026-06-14.1",
-  "requirements": [
-    {
-      "id": "REQ-392-DECISION",
-      "requirement": "Record an operator-facing ENG-392 decomposition decision before any renewed worker dispatch.",
-      "proofHint": "Show the selected path and cite the contract/publication mismatch evidence from Linear comments."
-    }
-  ]
-}
-```
+For the runtime-focused children, keep the default prerequisite order explicit:
 
-### REQ-392-TEST-PROOF - Narrow Routing And Reload Test Proof
+1. `ENG-392 child — runtime routing repair`
+2. `ENG-392 child — reload preservation repair`
+3. `ENG-392 child — approval writeback repair`
+4. `ENG-392 child — orchestrator proof`
 
-**Purpose**: Preserve the original ENG-392 obligation as an independently reviewable test-proof child.
+Use the full chain whenever a later child still depends on unpublished or out-of-contract behavior from an earlier sibling. The chain may be shortened only when the base behavior from the removed blocker is already satisfied by accepted proof on the remaining authorized surfaces and the later child body records both (a) which blocker was removed and (b) why the remaining work no longer exercises that sibling's unpublished behavior. In practice, `ENG-392 child — orchestrator proof` stays blocked on runtime, reload, and approval/writeback by default; drop one of those blockers only after the accepted child evidence shows the corresponding base behavior is already satisfied and no longer part of the proof child's unpublished dependency set.
 
-**Authorized Surfaces**:
+## Current operator boundary decision — T019
 
-- `tests/orchestrator.test.ts`
-- Planning or issue evidence that records dependency status.
+The current operator decision remains **split/retarget**, not widened.
 
-**Requirement Template**:
+- **Widened-boundary status**: No widened child-contract path has been selected. No additional surface families or repo paths are authorized beyond the six child families below and their per-family `Touched Surfaces` lists.
+- **Authoritative child contract list while not widened**:
+  1. `ENG-392 child — decision and scope lock` (`REQ-392-DECISION`)
+  2. `ENG-392 child — runtime routing repair` (`REQ-392-RUNTIME-ROUTING`)
+  3. `ENG-392 child — reload preservation repair` (`REQ-392-RELOAD-PRESERVATION`)
+  4. `ENG-392 child — approval writeback repair` (`REQ-392-APPROVAL-WRITEBACK`)
+  5. `ENG-392 child — orchestrator proof` (`REQ-392-TEST-PROOF`)
+  6. `ENG-392 child — publication hygiene closure` (`REQ-392-PUBLICATION-HYGIENE`)
+- **If widening is later selected**: Record the widened child contract title(s), newly authorized surface families or repo paths, and the validation proof that makes the broader boundary intentional before renewed worker or reviewer dispatch resumes.
 
-```json
-{
-  "schemaVersion": 1,
-  "contractVersion": "2026-06-14.1",
-  "requirements": [
-    {
-      "id": "REQ-392-TEST-PROOF",
-      "requirement": "Add or preserve orchestrator tests proving two Linear project contexts route to distinct workspaces/state buckets and in-progress contexts survive config reload.",
-      "proofHint": "Show focused routing/reload tests and full orchestrator validation after declared runtime dependencies are satisfied."
-    },
-    {
-      "id": "REQ-392-TEST-SURFACE",
-      "requirement": "Keep the publication candidate limited to the test-proof contract surface unless a separate child contract authorizes more.",
-      "proofHint": "Attach a contract-to-surface comparison for the candidate."
-    }
-  ]
-}
-```
+## Cross-artifact consistency review — T011
 
-### REQ-392-RUNTIME-ROUTING - Runtime Context Routing Prerequisites
+This review compared the expected planning surfaces `specs/009-eng-392-routing-reload-split/spec.md`, `specs/009-eng-392-routing-reload-split/plan.md`, `specs/009-eng-392-routing-reload-split/tasks.md`, `specs/009-eng-392-routing-reload-split/data-model.md`, `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`, `specs/009-eng-392-routing-reload-split/quickstart.md`, `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md`, and `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md`.
 
-**Purpose**: Own runtime behavior needed for project-context dispatch, retry, reconciliation, handoff, continuation, and readback.
+- `spec.md`, `plan.md`, and `tasks.md` are not tracked in the current `009-eng-392-routing-reload-split` snapshot. Treat that absence as an explicit planning gap rather than implicit agreement with the generic Spec Kit layout.
+- When a worker workspace lacks `spec.md`, `plan.md`, or `tasks.md`, use the following authoritative fallback source order:
+  1. `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` — stable child titles, requirement IDs, dependency order, and authorized surfaces.
+  2. `specs/009-eng-392-routing-reload-split/data-model.md` — runtime prerequisite families, decomposition state rules, and blocked transitions.
+  3. `specs/009-eng-392-routing-reload-split/quickstart.md` — blocked-state proof inventory, current coverage gaps, and focused validation command baselines.
+  4. `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` — required evidence categories, redaction rules, and intentionally-unverified boundary handling.
+  5. `specs/009-eng-392-routing-reload-split/contracts/publication-surface-gate.md` — publication-surface comparison rules, explicit exclusions, and vendored-source no-touch checks.
+- Until the missing Spec Kit files exist or the task source is retargeted, use the fallback order above as the durable baseline for decomposition scope, dependency order, runtime prerequisite mapping, evidence shape, and publication boundaries.
+- Family A dependency validation is evaluated over direct or transitive dependency edges unless a later family is intentionally independent and says so explicitly.
 
-**Authorized Surfaces**:
+### Runtime prerequisite crosswalk
 
-- `src/core/orchestrator/Orchestrator.ts`
-- `src/core/config/Config.ts`
-- `src/core/workspace/WorkspaceManager.ts`
-- Tests that directly validate those runtime paths.
+The table below supplies the minimum prerequisite map referenced by `data-model.md` for a confirmed decomposition decision.
 
-**Requirement Template**:
+| Data-model surface family | Child contract owner(s) | Consistency note |
+| --- | --- | --- |
+| `routing-reload-core` | `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, `REQ-392-TEST-PROOF` | Family B establishes routed identity, Family C preserves it across reload, and Family E proves it end to end. |
+| `workspace-lifecycle` | `REQ-392-RUNTIME-ROUTING`, `REQ-392-RELOAD-PRESERVATION`, `REQ-392-APPROVAL-WRITEBACK` | Family B separates routed workspace and lifecycle buckets, Family C preserves them, and Family D reuses them during approval and writeback recovery. |
+| `operator-http-entrypoints` | `REQ-392-RUNTIME-ROUTING`, `REQ-392-APPROVAL-WRITEBACK` | Routed status or workspace entrypoints land in Family B and routed approval or status recovery lands in Family D. |
+| `publication-handoff` | `REQ-392-APPROVAL-WRITEBACK`, `REQ-392-PUBLICATION-HYGIENE` | Family D repairs completion-report, approval, and writeback recovery; Family F closes the publication-facing evidence surface. |
+| `writeback-guardrails` | `REQ-392-APPROVAL-WRITEBACK`, `REQ-392-PUBLICATION-HYGIENE` | Family D restores durable audit and writeback invariants while Family F confirms no unauthorized closure surface remains. |
 
-```json
-{
-  "schemaVersion": 1,
-  "contractVersion": "2026-06-14.1",
-  "requirements": [
-    {
-      "id": "REQ-392-RUNTIME-ROUTING",
-      "requirement": "Carry the resolved project context through dispatch, retry, running-run reconciliation, handoff, continuation, and readback behavior required by the routing/reload proof.",
-      "proofHint": "Show failing-before or base-behavior evidence, then focused passing validation for context-specific runtime routing."
-    }
-  ]
-}
-```
+## Family A — `REQ-392-DECISION`
 
-### REQ-392-RELOAD-PRESERVATION - Worker And Reviewer Redispatch Preservation
+- Suggested child title: `ENG-392 child — decision and scope lock`
+- Dependency order: **1 of 6**
+- Draft label guidance for Linear creation: keep the parent `dogfood` label, do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload, and let the operator add readiness labels only after review.
+- Draft dependency guidance for Linear creation: no earlier sibling blocks this first child, and every later ENG-392 child should depend on this exact suggested title when it needs the scope lock.
+- Authorized surfaces to list in `Touched Surfaces`:
+  - `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`
+  - `specs/009-eng-392-routing-reload-split/quickstart.md`
+  - `specs/009-eng-392-routing-reload-split/research.md`
 
-**Purpose**: Own preservation of the original issue/request project context after config reload until worker or reviewer redispatch completes.
+````markdown
+## Problem / Goal
 
-**Authorized Surfaces**:
+Record the ENG-392 decomposition decision before any child implementation work starts so later child issues either stay split into contract-scoped siblings or explicitly document any authorized scope expansion instead of reintroducing the original tests-only/runtime mismatch.
 
-- `src/core/orchestrator/Orchestrator.ts`
-- `src/core/persistence/RunTranscriptStore.ts`
-- `src/core/persistence/IssueLifecycleStore.ts`
-- `tests/orchestrator.test.ts`
+## Labels / Dependencies
 
-**Requirement Template**:
+- Proposed labels: keep the parent `dogfood` label.
+- Do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload; operator review owns readiness-label changes even though the issue is eligible to recommend readiness below.
+- Sibling dependency guidance: this first child has no earlier sibling blocker, and later ENG-392 children should depend on `ENG-392 child — decision and scope lock` by exact title when they require the decomposition decision.
+
+## Issue Contract
 
 ```json
-{
-  "schemaVersion": 1,
-  "contractVersion": "2026-06-14.1",
-  "requirements": [
-    {
-      "id": "REQ-392-RELOAD-PRESERVATION",
-      "requirement": "Preserve worker and reviewer redispatch routing through the original project context after config reload until the flow completes.",
-      "proofHint": "Show worker retry and reviewer redispatch validation that uses original active/review states and original state buckets after reload."
-    }
-  ]
-}
+{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-DECISION","requirement":"The child issue must record the ENG-392 decomposition decision, the sibling dependency order it unblocks, and the exact surfaces that remain excluded until a later child contract authorizes them.","proofHint":"Cite the dependency table plus the named included and excluded surfaces in specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md and quickstart.md."}]}
 ```
 
-### REQ-392-APPROVAL-WRITEBACK - Approval Recovery And Writeback Buckets
+## Touched Surfaces
 
-**Purpose**: Own approved, rejected, stale, and expired publication approval recovery after config reload.
+- [X] Docs only
+- specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md
+- specs/009-eng-392-routing-reload-split/quickstart.md
+- specs/009-eng-392-routing-reload-split/research.md
 
-**Authorized Surfaces**:
+## Acceptance Criteria
 
-- `src/core/CompletionReportService.ts`
-- `src/core/approval/OperatorApprovalService.ts`
-- `src/core/writeback/WritebackOutbox.ts`
-- `src/core/orchestrator/Orchestrator.ts`
-- Focused tests for approval recovery and writeback routing.
+- The issue names the chosen decomposition path and the child titles or superseding replacement that depend on it.
+- The issue includes operator-facing label and dependency guidance that keeps the drafted payload free of auto-ready labels and keeps later sibling blockers title-stable.
+- The issue limits operator outcomes to split/retarget, widened child-contract authorization, or close/replace with durable proof.
+- The issue states the evidence required before renewed worker or reviewer dispatch can resume.
+- The issue keeps excluded runtime, test, publication, and debug-capture surfaces explicit until a later child contract names them directly or replacement evidence retires them.
 
-**Requirement Template**:
+### Operator decision checklist
+
+1. Restate the blocking evidence that forced decomposition, including the current candidate or diff reference plus the coupled protected surfaces.
+2. Choose exactly one allowed outcome and cite proof:
+   - **Split or retarget**: identify the scoped child title(s), requirement ID(s), and diff or surface-map proof showing the renewed candidate stays within those authorized surfaces.
+   - **Widen child contract(s)**: name the widened child contract(s), newly authorized surface families or paths, and validation proof showing the broader scope is intentional and fully owned.
+   - **Close or replace**: record why the blocked candidate will not resume, plus the superseding issue, branch, PR, or explicit closure record that replaces it.
+3. Record what remains excluded after the choice, including runtime, publication, and debug-capture surfaces not yet authorized.
+4. Confirm renewed worker or reviewer dispatch stays blocked until the cited proof is present and the dependency order or superseding replacement is stable.
+
+## Contract Checklist
+
+- Happy path: the decision freezes exactly one allowed outcome and lists the child titles, requirement IDs, or replacement reference it unblocks.
+- Negative/error path: ambiguous or contradictory scope language is removed instead of leaving multiple incompatible repair paths open or allowing renewed dispatch without proof.
+- Adjacent sibling surface: the decision keeps the tests-only proof slice and the protected runtime/publication slices distinct, even when a widened contract or replacement path is chosen.
+- Empty/missing/stale/fallback state: the issue says what remains excluded and that the blocked non-dispatch state persists when no later child contract or replacement proof exists yet.
+- Replay/restart/idempotency: repeated plan review points back to the same stable child titles, requirement IDs, or superseding replacement record.
+- Credential/security boundary: no secret values, local absolute paths, or credential-bearing URLs appear in the planning notes.
+- Side-effect verification: review the recorded proof bundle before renewed dispatch instead of inferring scope from a nearby PR diff.
+
+## Validation Requirements
+
+- Review this child issue body and confirm the `Labels / Dependencies` section preserves the no-auto-ready-label rule, the exact dependency title, and the no-earlier-sibling baseline for the first child.
+- Review `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` and confirm the operator decision checklist lists all three allowed outcomes and the proof each one requires before redispatch.
+- Review `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md` and confirm every later family depends on this title directly or transitively, or stays intentionally independent.
+- Review `specs/009-eng-392-routing-reload-split/quickstart.md` and confirm excluded surfaces remain explicitly excluded until a later child contract authorizes them.
+
+## Out Of Scope
+
+- Implementing runtime, approval, or test repairs.
+- Creating or applying Linear child issues directly.
+
+## Promotion Readiness
+
+- Ready for `dogfood-ready`: yes
+- Remaining blocker: none
+````
+
+## Family B — `REQ-392-RUNTIME-ROUTING`
+
+- Suggested child title: `ENG-392 child — runtime routing repair`
+- Dependency order: **2 of 6**
+- Draft label guidance for Linear creation: keep the parent `dogfood` label, do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload, and let operator review own readiness-label changes because this child authorizes protected runtime surfaces.
+- Draft dependency guidance for Linear creation: declare dependency on `ENG-392 child — decision and scope lock` by exact title, and keep later sibling routing, reload, approval, and proof work blocked on this title chain when they depend on routed workspace identity.
+- Declare dependency on: `ENG-392 child — decision and scope lock`
+- Authorized surfaces to list in `Touched Surfaces`:
+  - `src/core/orchestrator/Orchestrator.ts`
+  - `src/core/config/ProjectContexts.ts`
+  - `src/core/config/ProjectContextServiceConfig.ts`
+  - `src/core/workspace/WorkspaceManager.ts`
+  - `src/app/http.ts`
+  - `cursor/src/CursorWorkspaceOpener.ts`
+  - `tests/orchestrator.test.ts`
+  - `tests/status-api.test.ts`
+  - `tests/cursor-workspace-opener.test.ts`
+
+````markdown
+## Problem / Goal
+
+Repair the routed runtime path so two different Linear project contexts resolve to distinct issue, workspace, and lifecycle buckets instead of sharing a default bucket or reusing the wrong routed workspace.
+
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label and leave `dogfood-ready` plus any configured worker-dispatch labels for operator review after the protected routing surfaces and validation evidence are reviewed.
+- Sibling dependency guidance: declare dependency on `ENG-392 child — decision and scope lock` by exact title so routed runtime repair cannot run before the decomposition path is frozen; later sibling work that relies on routed workspace identity should continue to depend on `ENG-392 child — runtime routing repair` by exact title.
+
+## Issue Contract
 
 ```json
-{
-  "schemaVersion": 1,
-  "contractVersion": "2026-06-14.1",
-  "requirements": [
-    {
-      "id": "REQ-392-APPROVAL-WRITEBACK",
-      "requirement": "Preserve the request project context and writeback state bucket for approved, rejected, stale, and expired publication approval outcomes after config reload.",
-      "proofHint": "Show per-context outbox/writeback evidence and focused approval recovery validation."
-    }
-  ]
-}
+{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-RUNTIME-ROUTING","requirement":"Routed worker, reviewer, and open-workspace flows must keep project-context-qualified issue lookup, workspace identity, and lifecycle state distinct so two Linear project contexts never share a workspace or state bucket by accident.","proofHint":"Cite focused orchestrator, status, or workspace-opening evidence that shows distinct projectContext-qualified workspace keys and fail-closed handling for wrong-context or ambiguous routes, and record that parent task REQ-T035 prepared this Linear-ready child body."}]}
 ```
 
-### REQ-392-PUBLICATION-HYGIENE - Publication Surface And Debug Artifact Hygiene
+## Touched Surfaces
 
-**Purpose**: Ensure final publication candidates contain only authorized surfaces and no orphaned debug artifacts.
+- [X] Runtime harness/transcript mapping
+- [X] Lifecycle/persistence/replay
+- [X] API/projection
+- src/core/orchestrator/Orchestrator.ts
+- src/core/config/ProjectContexts.ts
+- src/core/config/ProjectContextServiceConfig.ts
+- src/core/workspace/WorkspaceManager.ts
+- src/app/http.ts
+- cursor/src/CursorWorkspaceOpener.ts
+- tests/orchestrator.test.ts
+- tests/status-api.test.ts
+- tests/cursor-workspace-opener.test.ts
 
-**Authorized Surfaces**:
+## Acceptance Criteria
 
-- Contract-to-surface evidence.
-- Redacted fixture files only when referenced by tests.
-- Removal of transient debug captures.
+- The drafted payload includes operator-facing label and dependency guidance that keeps auto-ready or worker-dispatch labels out of the initial Linear payload and cites `ENG-392 child — decision and scope lock` as the exact earlier-sibling dependency.
+- Distinct project contexts produce distinct routed workspace and lifecycle identities.
+- Wrong-context, ambiguous, or missing routes fail closed instead of reusing another context's workspace or state bucket.
 
-**Requirement Template**:
+## Contract Checklist
+
+- Happy path: two valid project contexts route to separate workspace/state buckets.
+- Negative/error path: wrong-context or ambiguous routing is rejected instead of silently falling back to another context.
+- Adjacent sibling surface: routed open-workspace and status/readback views stay aligned with orchestrator dispatch identity.
+- Empty/missing/stale/fallback state: legacy/default-context fallback stays explicit and does not overwrite non-default routed state.
+- Replay/restart/idempotency: re-reading routed issue/workspace identity after restart yields the same project-context-qualified bucket.
+- Credential/security boundary: public route evidence cites only safe identifiers and sanitized project-context metadata.
+- Side-effect verification: validate emitted workspace keys, project-context identifiers, and routed state buckets rather than inferring behavior from helper names.
+
+## Validation Requirements
+
+- Review this child issue body and confirm the `Labels / Dependencies` section keeps only the parent `dogfood` label in the drafted payload, omits `dogfood-ready` plus configured worker-dispatch labels, and cites `ENG-392 child — decision and scope lock` as the exact earlier-sibling dependency.
+- Review the fenced JSON `Issue Contract` and confirm it remains valid JSON, preserves the child requirement id `REQ-392-RUNTIME-ROUTING`, and records parent-task traceability to `REQ-T035` in the `proofHint`.
+- `npm test -- tests/orchestrator.test.ts tests/status-api.test.ts tests/cursor-workspace-opener.test.ts`
+- Manual or API inspection that the routed issue and workspace identity differ across at least two project contexts without sharing one bucket.
+
+## Out Of Scope
+
+- Pending-publication approval recovery.
+- Final publication-hygiene cleanup.
+
+## Promotion Readiness
+
+- Ready for `dogfood-ready`: no
+- Remaining blocker: Manual operator review required because this child authorizes protected routing and workspace surfaces in `src/core/orchestrator/Orchestrator.ts`, `src/core/workspace/WorkspaceManager.ts`, `src/app/http.ts`, and `cursor/src/CursorWorkspaceOpener.ts`.
+````
+
+## Family C — `REQ-392-RELOAD-PRESERVATION`
+
+- Suggested child title: `ENG-392 child — reload preservation repair`
+- Dependency order: **3 of 6**
+- Declare dependency on: `ENG-392 child — runtime routing repair`
+- Draft label guidance for Linear creation: keep the parent `dogfood` label and do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload because the protected reload-preservation surfaces keep this child manual-only pending operator review.
+- Draft dependency guidance for Linear creation: declare the sibling dependency on `ENG-392 child — runtime routing repair` by exact title, and keep this child blocked until that routed workspace/lifecycle baseline is stable instead of widening into adjacent routing or approval/writeback work.
+- Authorized surfaces to list in `Touched Surfaces`:
+  - `src/core/orchestrator/Orchestrator.ts`
+  - `src/core/workspace/WorkspaceManager.ts`
+  - `src/core/persistence/RunTranscriptStore.ts`
+  - `src/core/types.ts`
+  - `tests/orchestrator.test.ts`
+  - `tests/status-api.test.ts`
+
+````markdown
+## Problem / Goal
+
+Preserve the in-progress routed worker or reviewer context across config reload so the same project-context-qualified workspace, prompt identity, and lifecycle state survive restart without duplicate dispatch or bucket drift.
+
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label.
+- Do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload; protected orchestrator and persistence surfaces keep this child manual-only until operator review.
+- Sibling dependency guidance: declare a dependency on `ENG-392 child — runtime routing repair` by exact title, and keep this child blocked until that routed workspace/lifecycle baseline is stable instead of widening into adjacent routing or approval/writeback work.
+
+## Issue Contract
 
 ```json
-{
-  "schemaVersion": 1,
-  "contractVersion": "2026-06-14.1",
-  "requirements": [
-    {
-      "id": "REQ-392-PUBLICATION-HYGIENE",
-      "requirement": "Ensure every publication candidate maps changed surfaces to the active contract and contains no orphaned debug/runtime captures.",
-      "proofHint": "Attach git diff name/status, git diff stat, and fixture/redaction notes."
-    }
-  ]
-}
+{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-RELOAD-PRESERVATION","requirement":"Config reload and restart handling must preserve an already-running routed worker or reviewer context with the same project-context-qualified workspace identity, lifecycle bucket, and non-redispatch invariants.","proofHint":"Cite orchestrator evidence for pre-reload and post-reload workspace identity, lifecycle state, and the absence of duplicate redispatch or incomplete-turn burn while the preserved run remains active."}]}
 ```
 
-## Dependency Order
+## Touched Surfaces
 
-```text
-REQ-392-DECISION
-  -> REQ-392-RUNTIME-ROUTING
-  -> REQ-392-RELOAD-PRESERVATION
-  -> REQ-392-APPROVAL-WRITEBACK
-  -> REQ-392-TEST-PROOF
-  -> REQ-392-PUBLICATION-HYGIENE
+- [X] Runtime harness/transcript mapping
+- [X] Lifecycle/persistence/replay
+- [X] Config/workflow prompt
+- src/core/orchestrator/Orchestrator.ts
+- src/core/workspace/WorkspaceManager.ts
+- src/core/persistence/RunTranscriptStore.ts
+- src/core/types.ts
+- tests/orchestrator.test.ts
+- tests/status-api.test.ts
+
+## Acceptance Criteria
+
+- Reload or restart preserves the in-progress routed run with the same workspace and lifecycle identity.
+- Preservation does not redispatch a second run, burn incomplete-turn counters, or discard the routed prompt/context while the original run is still intentional.
+- The issue includes operator-facing label and dependency guidance that keeps the drafted payload free of auto-ready labels and ties the work to `ENG-392 child — runtime routing repair` by exact title.
+
+## Contract Checklist
+
+- Happy path: an active routed run survives reload with the same workspace and lifecycle identity.
+- Negative/error path: stale, missing, or terminal runs do not get falsely treated as preservable in-progress contexts.
+- Adjacent sibling surface: worker and reviewer reload preservation stay downstream from `ENG-392 child — runtime routing repair` and do not implicitly authorize approval/writeback recovery or broader routing expansion.
+- Empty/missing/stale/fallback state: missing persistence falls back safely without reusing another issue's active context.
+- Replay/restart/idempotency: repeated reloads preserve the same active routed context instead of spawning duplicates.
+- Credential/security boundary: proof cites run IDs, workspace keys, and lifecycle fields, not secret prompt bodies or credential values.
+- Side-effect verification: check run state, transcript/lifecycle evidence, and redispatch counters directly instead of assuming preservation from restart code paths.
+
+## Validation Requirements
+
+- Review this child issue body and confirm the `Labels / Dependencies` section preserves the no-auto-ready-label rule, the exact sibling dependency title, and the manual-only protected-surface blocker.
+- `npm test -- tests/orchestrator.test.ts tests/status-api.test.ts`
+- Manual or API inspection that reload leaves the active routed run in one preserved bucket and does not create a duplicate run.
+
+## Out Of Scope
+
+- Creating the final cross-context proof scenario after the runtime invariants are fixed.
+- Approval-terminal writeback repair.
+
+## Promotion Readiness
+
+- Ready for `dogfood-ready`: no
+- Remaining blocker: Manual operator review required because this child depends on `ENG-392 child — runtime routing repair` and changes protected orchestrator and persistence surfaces that preserve active routed run state across reload.
+````
+
+## Family D — `REQ-392-APPROVAL-WRITEBACK`
+
+- Suggested child title: `ENG-392 child — approval writeback repair`
+- Dependency order: **4 of 6**
+- Draft label guidance for Linear creation: keep the parent `dogfood` label, do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload, and let the operator add readiness labels only after review because this child authorizes protected approval, writeback, and publication-recovery surfaces.
+- Declare dependency on: `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`
+- Draft dependency guidance for Linear creation: declare both sibling blockers by exact title because routed approval and writeback recovery depend on the project-context-qualified workspace and lifecycle identity that those prerequisite children stabilize before terminal, replay, or after-worker-exit recovery can be validated.
+- Authorized surfaces to list in `Touched Surfaces`:
+  - `src/core/orchestrator/Orchestrator.ts`
+  - `src/core/CompletionReportService.ts`
+  - `src/core/approval/OperatorApprovalService.ts`
+  - `src/core/writeback/WritebackOutbox.ts`
+  - `src/app/http.ts`
+  - `tests/orchestrator.test.ts`
+  - `tests/completion-report-service.test.ts`
+  - `tests/operator-approval-service.test.ts`
+  - `tests/approval-status-api.test.ts`
+  - `tests/status-api.test.ts`
+
+````markdown
+## Problem / Goal
+
+Repair the pending-publication approval and writeback path so routed runtime identity, approval wait state, writeback audit records, and after-worker-exit recovery stay aligned without duplicate publication or redispatch.
+
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label and leave readiness-label changes to operator review because this child authorizes protected approval/writeback recovery surfaces.
+- Do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload; operator review owns readiness-label changes after the prerequisite runtime-routing and reload-preservation siblings plus the focused approval/writeback proof are in place.
+- Sibling dependency guidance: declare dependencies on `ENG-392 child — runtime routing repair` and `ENG-392 child — reload preservation repair` by exact title because routed approval/writeback recovery depends on the project-context-qualified workspace and lifecycle identity those sibling children stabilize before pending, terminal, replay, or after-worker-exit recovery can be validated.
+
+## Issue Contract
+
+```json
+{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-APPROVAL-WRITEBACK","requirement":"Pending-publication approval, terminal approval replay, and writeback recovery must preserve routed project-context identity, durable audit state, and no-redispatch invariants across live waits, worker exit, and orchestrator resume paths.","proofHint":"Cite approval, completion-report, orchestrator, or status evidence for pending, approved, rejected, cancelled, replayed, and after-worker-exit recovery cases, including lifecycle state and durable writeback outcomes."}]}
 ```
 
-The order may be shortened when a prerequisite is proven already satisfied on current base. The test-proof child must not be accepted while it depends on unpublished or out-of-contract runtime behavior.
+## Touched Surfaces
+
+- [X] Lifecycle/persistence/replay
+- [X] Writeback/tracker
+- [X] Publication/GitHub/merge gate
+- [X] API/projection
+- src/core/orchestrator/Orchestrator.ts
+- src/core/CompletionReportService.ts
+- src/core/approval/OperatorApprovalService.ts
+- src/core/writeback/WritebackOutbox.ts
+- src/app/http.ts
+- tests/orchestrator.test.ts
+- tests/completion-report-service.test.ts
+- tests/operator-approval-service.test.ts
+- tests/approval-status-api.test.ts
+- tests/status-api.test.ts
+
+## Acceptance Criteria
+
+- Pending, approved, rejected, cancelled, and replayed approval paths keep the correct routed lifecycle state and durable writeback records.
+- Intentional pending-approval or blocked states do not redispatch worker/reviewer runs or lose publication-handoff audit data after reload or worker exit.
+- The issue body records the exact prerequisite sibling titles, draft label guidance, and focused validation sweep needed before approval/writeback recovery can be treated as ready for operator review.
+
+## Contract Checklist
+
+- Happy path: routed pending approval resumes or finalizes with the expected writeback and lifecycle state.
+- Negative/error path: rejected, cancelled, stale, expired, or already-terminal approvals stay distinguishable and do not trigger duplicate publication.
+- Adjacent sibling surface: HTTP approval routes, completion-report handoff, and writeback outbox agree on the same approval identity and terminal result.
+- Dependency/prerequisite boundary: approval/writeback recovery stays downstream from `ENG-392 child — runtime routing repair` and `ENG-392 child — reload preservation repair` instead of implicitly re-authorizing their routing or reload fixes.
+- Empty/missing/stale/fallback state: missing run links or unsettled audit operations remain blocked instead of being treated as complete.
+- Replay/restart/idempotency: replaying an approval or reprocessing the same writeback does not create duplicate terminalization or redispatch.
+- Credential/security boundary: validation cites public-safe run, approval, writeback, and PR metadata without leaking tokens or private repository credentials.
+- Side-effect verification: inspect lifecycle fields, transcript events, and durable writeback results rather than assuming success from enqueue intent.
+
+## Validation Requirements
+
+- Review this child issue body and confirm the `Labels / Dependencies` section keeps the drafted payload free of auto-ready labels and names `ENG-392 child — runtime routing repair` plus `ENG-392 child — reload preservation repair` exactly.
+- Review `specs/009-eng-392-routing-reload-split/data-model.md`, `specs/009-eng-392-routing-reload-split/quickstart.md`, and `specs/009-eng-392-routing-reload-split/contracts/validation-evidence.md` and confirm the child stays downstream from the routing/reload prerequisites, cites the focused approval/writeback validation sweep, and keeps public-safe durable evidence expectations explicit.
+- `npm test -- tests/orchestrator.test.ts tests/completion-report-service.test.ts tests/operator-approval-service.test.ts tests/approval-status-api.test.ts tests/status-api.test.ts`
+- Manual or API inspection that pending, approved, rejected, cancelled, replayed, and after-worker-exit recovery cases keep one routed lifecycle record and one durable approval/writeback trail.
+
+## Out Of Scope
+
+- Re-authorizing or re-implementing runtime-routing or reload-preservation prerequisite behavior outside their own child contracts.
+- General repository publishing policy changes unrelated to ENG-392.
+- Docs-only cleanup that can happen after the runtime and approval repair lands.
+
+## Promotion Readiness
+
+- Ready for `dogfood-ready`: no
+- Remaining blocker: Manual operator review required because this child authorizes protected completion-report, approval, writeback, and publication-recovery surfaces.
+````
+
+## Family E — `REQ-392-TEST-PROOF`
+
+- Suggested child title: `ENG-392 child — orchestrator proof`
+- Dependency order: **5 of 6**
+- Declare dependency on: `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, `ENG-392 child — approval writeback repair`
+- Authorized surfaces to list in `Touched Surfaces`:
+  - `tests/orchestrator.test.ts`
+
+````markdown
+## Problem / Goal
+
+Add the focused orchestrator proof for ENG-392 only after the runtime prerequisite siblings land so the published evidence shows both cross-project routing isolation and in-progress reload preservation in the single contract-scoped test surface.
+
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label and leave readiness-label changes to operator review after the prerequisite runtime children are accepted.
+- Sibling dependency guidance: follow the default runtime proof order `ENG-392 child — runtime routing repair` → `ENG-392 child — reload preservation repair` → `ENG-392 child — approval writeback repair` → `ENG-392 child — orchestrator proof`, and declare the first three siblings as exact-title blockers while the proof still relies on their unpublished or out-of-contract behavior.
+- Shortened-chain rule: remove one of those exact-title blockers only when accepted proof already shows the removed sibling's base behavior is satisfied and the child body records why the remaining proof no longer exercises that unpublished dependency.
+
+## Issue Contract
+
+```json
+{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-TEST-PROOF","requirement":"Focused orchestrator coverage must prove that at least two Linear project contexts route to distinct workspaces or lifecycle buckets and that an already-running routed context survives config reload without duplicate redispatch or identity drift.","proofHint":"Cite the focused orchestrator scenarios and the specific workspace, project-context, run-state, or redispatch assertions they add."}]}
+```
+
+## Touched Surfaces
+
+- [X] Runtime harness/transcript mapping
+- tests/orchestrator.test.ts
+
+## Acceptance Criteria
+
+- One focused proof path demonstrates distinct routed workspace/state buckets across at least two project contexts.
+- One focused proof path demonstrates reload preservation for an already-running routed context without duplicate redispatch or state drift.
+- If accepted base behavior already satisfies one prerequisite, the child body may record a shorter blocker chain for the proof; otherwise, if any declared sibling dependency is still unresolved or the proof still relies on unpublished or out-of-contract runtime behavior from those siblings, the child stays blocked and does not widen publication beyond `tests/orchestrator.test.ts`.
+
+## Contract Checklist
+
+- Happy path: the new orchestrator proof passes with the intended routed runtime behavior present.
+- Negative/error path: wrong-context, unresolved-dependency, or duplicate-dispatch regressions fail the proof or keep the child blocked instead of remaining implicit.
+- Adjacent sibling surface: the test stays contract-scoped to `tests/orchestrator.test.ts` while relying on runtime siblings for implementation.
+- Empty/missing/stale/fallback state: the proof distinguishes preserved active state from missing or terminal state.
+- Replay/restart/idempotency: rerunning the same proof still shows one preserved routed context and stable bucket identity.
+- Credential/security boundary: assertions use safe identifiers and route metadata, not raw prompt bodies or credential values.
+- Side-effect verification: the test checks emitted workspace/lifecycle/run assertions directly instead of inferring preservation from unrelated helpers.
+
+## Validation Requirements
+
+- `npm test -- tests/orchestrator.test.ts`
+- Review the new dependency notes and assertions and confirm they cite routed workspace identity, non-redispatch behavior, the default runtime prerequisite order, and any shortened-chain justification linking runtime routing, reload preservation, and approval/writeback explicitly.
+
+## Out Of Scope
+
+- Runtime implementation changes outside the test file.
+- Publication or quickstart cleanup.
+
+## Promotion Readiness
+
+- Ready for `dogfood-ready`: no
+- Remaining blocker: Wait for `ENG-392 child — runtime routing repair`, `ENG-392 child — reload preservation repair`, and `ENG-392 child — approval writeback repair` to land unless accepted proof already records a shorter prerequisite chain; until then keep publication blocked and the child limited to `tests/orchestrator.test.ts`.
+````
+
+## Family F — `REQ-392-PUBLICATION-HYGIENE`
+
+- Suggested child title: `ENG-392 child — publication hygiene closure`
+- Dependency order: **6 of 6**
+- Draft label guidance for Linear creation: keep the parent `dogfood` label, do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload, and let operator review own readiness-label changes because this child closes publication/evidence hygiene instead of re-authorizing protected runtime scope.
+- Declare dependency on: `ENG-392 child — decision and scope lock`, `ENG-392 child — orchestrator proof`, `ENG-392 child — approval writeback repair`
+- Draft dependency guidance for Linear creation: declare the decision, orchestrator proof, and approval/writeback siblings by exact title because publication closure relies on their accepted surface map, focused proof bundle, and publication-handoff evidence before it can claim the remaining diff and evidence packet are clean.
+- Authorized surfaces to list in `Touched Surfaces`:
+  - `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`
+  - `specs/009-eng-392-routing-reload-split/quickstart.md`
+  - `tmp-debug-*/**`
+
+````markdown
+## Problem / Goal
+
+Close the ENG-392 decomposition loop by preparing a Linear-ready publication-hygiene child that keeps the final publication and evidence surface aligned with the declared child scopes, removes stray non-fixture debug captures, and tells reviewers exactly which proof paths and redaction rules govern the final closure packet.
+
+## Labels / Dependencies
+
+- Proposed labels: keep the parent `dogfood` label and leave readiness-label changes to operator review because this child documents publication hygiene closure rather than re-authorizing new runtime scope.
+- Do not include `dogfood-ready` or any configured worker-dispatch labels in the drafted payload; operator review owns readiness-label changes after `ENG-392 child — decision and scope lock`, `ENG-392 child — orchestrator proof`, and `ENG-392 child — approval writeback repair` are accepted.
+- Sibling dependency guidance: declare dependencies on `ENG-392 child — decision and scope lock`, `ENG-392 child — orchestrator proof`, and `ENG-392 child — approval writeback repair` by exact title because publication closure depends on their accepted surface map, proof bundle, and publication-handoff/writeback evidence before it can claim the diff and evidence packet are contract-scoped.
+- Blocking rule: if any prerequisite child remains unresolved, if stray `tmp-debug-*` captures still exist, or if the remaining diff surface no longer matches the authorized surface map, keep the child blocked and record the missing proof instead of claiming publication closure.
+
+## Issue Contract
+
+```json
+{"schemaVersion":1,"contractVersion":"2026-06-14.1","requirements":[{"id":"REQ-392-PUBLICATION-HYGIENE","requirement":"The final ENG-392 follow-up must publish a contract-scoped surface map, remove stray non-fixture debug artifacts, and keep the evidence packet redacted to public-safe repo-relative proof paths instead of secrets, prompt bodies, or local absolute paths.","proofHint":"Cite the authorized surface list, any removed or absent `tmp-debug-*` captures, and the publication or quickstart notes that point reviewers to public-safe proof paths and redaction expectations."}]}
+```
+
+## Touched Surfaces
+
+- [X] Docs only
+- specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md
+- specs/009-eng-392-routing-reload-split/quickstart.md
+- tmp-debug-*/**
+
+## Acceptance Criteria
+
+- The issue body is Linear-ready: it includes operator-facing label and dependency guidance plus a contract-scoped surface map limited to the authorized publication, quickstart, and debug-cleanup paths.
+- The issue body tells reviewers how to handle stray `tmp-debug-*` captures and which proof paths justify the final diff and evidence packet.
+- The issue body states redaction expectations: keep publication notes public-safe, repo-relative, and free of secrets, credential values, raw prompt bodies, or local absolute paths.
+
+## Contract Checklist
+
+- Happy path: the final diff and evidence packet cite only the authorized publication, quickstart, and debug-cleanup surfaces plus the same stable proof paths.
+- Negative/error path: stray debug captures, unauthorized runtime or test paths, or missing prerequisite proof block closure instead of being waved through as incidental.
+- Adjacent sibling surface: the publication notes stay aligned with the decision, orchestrator proof, and approval/writeback siblings that authorized the remaining surface map.
+- Empty/missing/stale/fallback state: if a prerequisite child, proof path, or cleanup result is missing or stale, the issue records the blocker instead of claiming closure.
+- Replay/restart/idempotency: rerunning the hygiene review yields the same authorized file list, the same proof paths, and zero stray non-fixture debug captures.
+- Credential/security boundary: publication notes use repo-relative paths and public-safe descriptions; no secret values, raw prompt bodies, credential-bearing URLs, or local absolute paths appear.
+- Side-effect verification: review the recorded file list, quickstart references, and debug-artifact status directly rather than assuming the published diff is clean.
+
+## Validation Requirements
+
+- Review this child issue body and confirm the `Labels / Dependencies` section keeps the parent `dogfood` label, excludes `dogfood-ready` and worker-dispatch labels, and names the exact prerequisite sibling titles.
+- Validate the fenced JSON in this child issue body parses and the `REQ-392-PUBLICATION-HYGIENE` requirement text explicitly covers surface mapping, debug-artifact hygiene, and redaction expectations.
+- Review the `Touched Surfaces`, `Acceptance Criteria`, and `Contract Checklist` sections and confirm they limit closure to `specs/009-eng-392-routing-reload-split/contracts/child-issue-contracts.md`, `specs/009-eng-392-routing-reload-split/quickstart.md`, and `tmp-debug-*/**`.
+- Review this family body and confirm the publication-proof notes point reviewers to public-safe repo-relative evidence rather than secrets or local absolute paths.
+
+## Out Of Scope
+
+- Reopening the runtime or approval repair once those child issues are already accepted.
+- Editing vendored Hermes source.
+
+## Promotion Readiness
+
+- Ready for `dogfood-ready`: yes
+- Remaining blocker: none
+````

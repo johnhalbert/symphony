@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID } from "../src/core/config/ProjectContexts.js";
 import {
   OrchestratorChatProjectionReducer,
   projectOrchestratorChatProjectionPayload,
@@ -110,7 +111,10 @@ describe("OrchestratorChatProjectionReducer", () => {
       new ProjectionTransactionService(projectionStore, { clock: () => new Date(fixedTime) }),
     );
 
-    await conversations.createConversation({ metadata: { issueKey: "ENG-204", runId: "run-204" }, at: "2026-01-02T03:00:00.000Z" });
+    await conversations.createConversation({
+      metadata: { issueKey: "ENG-204", runId: "run-204", projectContextId: "docs" },
+      at: "2026-01-02T03:00:00.000Z",
+    });
     await conversations.appendMessage({
       id: "user-1",
       role: "user",
@@ -183,6 +187,7 @@ describe("OrchestratorChatProjectionReducer", () => {
 
     const defaultConversationWrites = projectionStore.payloadWrites().filter((write) => write.scopeKey === DEFAULT_ORCHESTRATOR_CONVERSATION_ID);
     expect(defaultConversationWrites.map((write) => write.revision)).toEqual([1, 2, 3, 4]);
+    expect(defaultConversationWrites.at(-1)?.projectContextId).toBe("docs");
     expect(defaultConversationWrites.at(-1)?.fields).toMatchObject({
       conversationKey: DEFAULT_ORCHESTRATOR_CONVERSATION_ID,
       issueKey: "ENG-204",
@@ -339,6 +344,7 @@ class CapturingProjectionTransaction implements ProjectionTransactionRevisionPor
     const record: ProjectionRevisionRecord = {
       projectionRevisionId: this.nextProjectionRevisionId,
       projectionName: input.projectionName,
+      projectContextId: input.projectContextId,
       scopeKind: input.scopeKind,
       scopeKey: input.scopeKey,
       revision: input.revision,
@@ -365,6 +371,7 @@ class CapturingProjectionTransaction implements ProjectionTransactionRevisionPor
 function normalizeSelectorForTest(selector: ProjectionRevisionSelector): NormalizedProjectionRevisionSelector {
   return {
     projectionName: selector.projectionName,
+    projectContextId: normalizeStringForTest(selector.projectContextId, LEGACY_DEFAULT_PROJECT_CONTEXT_ID),
     scopeKind: normalizeStringForTest(selector.scopeKind, "global"),
     scopeKey: normalizeStringForTest(selector.scopeKey, defaultsByProjectionName[selector.projectionName]),
   };
@@ -399,7 +406,12 @@ function compareRevisionDescending(left: ProjectionRevisionRecord, right: Projec
 }
 
 function matchesSelector(record: ProjectionRevisionRecord, selector: NormalizedProjectionRevisionSelector): boolean {
-  return record.projectionName === selector.projectionName && record.scopeKind === selector.scopeKind && record.scopeKey === selector.scopeKey;
+  return (
+    record.projectionName === selector.projectionName &&
+    record.projectContextId === selector.projectContextId &&
+    record.scopeKind === selector.scopeKind &&
+    record.scopeKey === selector.scopeKey
+  );
 }
 
 function cloneRevisionRecord(record: ProjectionRevisionRecord): ProjectionRevisionRecord {

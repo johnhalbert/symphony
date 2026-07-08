@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -9,6 +9,11 @@ import {
   replayRunSessionState,
   type ReplayedRunSessionState,
 } from "../src/app/RunReplayProjection.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import { FileRunTranscriptStore, type RunRecord, type RunStatus, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
 import type { TokenCounts } from "../src/core/types.js";
 
@@ -255,6 +260,41 @@ describe("run event replay reconstruction", () => {
         result: "tests passed",
       }),
     ]);
+  });
+
+  it("replays persisted historical runs with synthesized legacy/default project context without rewriting run metadata", async () => {
+    const result = await persistAndReplay("legacy default attribution", [
+      sessionStarted("2026-01-06T00:00:00.000Z", "session-legacy-default", "agent-legacy-default"),
+      event({
+        at: "2026-01-06T00:00:01.000Z",
+        source: "runtime",
+        eventType: "message_complete",
+        payload: { textPreview: "legacy default replay answer", status: "completed" },
+      }),
+      completed("2026-01-06T00:00:02.000Z", "done"),
+    ]);
+
+    const runMetaPath = path.join(root, "runs", result.persistedRun.runId, "meta.json");
+    const rawRun = JSON.parse(await readFile(runMetaPath, "utf8")) as Record<string, unknown>;
+    delete rawRun.projectContext;
+    await writeFile(runMetaPath, `${JSON.stringify(rawRun, null, 2)}
+`, "utf8");
+    const beforeRead = await readFile(runMetaPath, "utf8");
+
+    const reloaded = new FileRunTranscriptStore(root);
+    const persistedRun = await mustGetRun(reloaded, result.persistedRun.runId);
+    const page = await reloaded.readTranscript(result.persistedRun.runId, { offset: 0, limit: 1_000 });
+    const replayed = replayRunSessionState(persistedRun, page.events);
+
+    expect(persistedRun.projectContext).toEqual({
+      projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      linearProjectSlug: null,
+      routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+    });
+    expect(replayed.status).toBe("succeeded");
+    expect(assistantTexts(replayed)).toEqual(["legacy default replay answer"]);
+    await expect(readFile(runMetaPath, "utf8")).resolves.toBe(beforeRead);
   });
 
   async function persistAndReplay(label: string, inputs: FixtureEventInput[]): Promise<ReplayFixtureResult> {

@@ -108,6 +108,7 @@ export function toIssueDetailModel(raw: RawData, issueId: string): IssueDetailMo
   const sessionIds = new Set(runs.map((session) => session.id));
   return {
     issue,
+    workspace: null,
     activity: raw.activity.filter((item) => item.id === issueId),
     runs,
     transcript: sessionIds.size === 0 ? [] : raw.transcript,

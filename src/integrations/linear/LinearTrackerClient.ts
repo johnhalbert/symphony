@@ -17,7 +17,7 @@ import type {
   TrackerWriteResult,
   TrackerWriter,
 } from "../../core/tracker/TrackerWriter.js";
-import type { Issue, IssueBlockerRef } from "../../core/types.js";
+import type { Issue, IssueBlockerRef, IssueProjectContextMetadata } from "../../core/types.js";
 
 type FetchLike = typeof fetch;
 
@@ -74,6 +74,10 @@ interface LinearIssueNode {
   } | null;
   children?: {
     nodes?: Array<{ id?: unknown }>;
+  } | null;
+  project?: {
+    id?: unknown;
+    slugId?: unknown;
   } | null;
   inverseRelations?: {
     nodes?: LinearRelationNode[];
@@ -138,6 +142,12 @@ interface LinearIssueRelationContext {
   } | null;
 }
 
+interface LinearTrackerIssueContextMetadata {
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
+}
+
 export interface AssigneeFilter {
   matchValues: Set<string>;
 }
@@ -166,6 +176,7 @@ const ISSUE_FIELDS = `
   delegate { id }
   labels { nodes { name } }
   children(first: 1) { nodes { id } }
+  project { id slugId }
   inverseRelations { nodes { type issue { id identifier state { name } } } }
 `;
 
@@ -346,6 +357,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
   constructor(
     private readonly config: TrackerConfig,
     private readonly fetchImpl: FetchLike = fetch,
+    private readonly projectContextMetadata: LinearTrackerIssueContextMetadata | null = null,
   ) {}
 
   async fetchCandidateIssues(): Promise<Issue[]> {
@@ -357,6 +369,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
         activeStates: this.config.activeStates,
       },
       assigneeFilter,
+      "candidate_poll",
     );
   }
 
@@ -370,6 +383,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
         states: stateNames,
       },
       assigneeFilter,
+      "state_refresh",
     );
   }
 
@@ -400,6 +414,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
         },
       },
       assigneeFilter,
+      "candidate_poll",
     );
   }
 
@@ -414,6 +429,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       TICK_ISSUE_CANDIDATES_QUERY,
       { filter },
       assigneeFilter,
+      "candidate_poll",
     );
   }
 
@@ -434,6 +450,7 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
         after: input.after ?? null,
         ...(input.first === undefined ? {} : { first: input.first }),
       },
+      "candidate_poll",
     );
   }
 
@@ -444,6 +461,8 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
       ISSUE_STATES_QUERY,
       { ids: uniqueStrings(issueIds) },
       assigneeFilter,
+      "state_refresh",
+      { requireActualProjectSlugMatch: true },
     );
   }
 
@@ -652,6 +671,8 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     query: string,
     variables: Record<string, unknown>,
     assigneeFilter: AssigneeFilter | null = null,
+    routingSource: IssueProjectContextMetadata["routingSource"] = "state_refresh",
+    metadataOptions: { requireActualProjectSlugMatch?: boolean } = {},
   ): Promise<Issue[]> {
     const issues: Issue[] = [];
     let after: string | null = null;
@@ -662,6 +683,8 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
         variables,
         assigneeFilter,
         { after },
+        routingSource,
+        metadataOptions,
       );
       issues.push(...page.issues);
       after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
@@ -675,6 +698,8 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     variables: Record<string, unknown>,
     assigneeFilter: AssigneeFilter | null,
     page: { first?: number; after?: string | null } = {},
+    routingSource: IssueProjectContextMetadata["routingSource"] = "state_refresh",
+    metadataOptions: { requireActualProjectSlugMatch?: boolean } = {},
   ): Promise<TrackerIssueCandidatePage> {
     const response = await this.graphql<{
       issues: { nodes: LinearIssueNode[]; pageInfo: LinearPageInfoNode };
@@ -689,9 +714,27 @@ export class LinearTrackerClient implements TrackerClient, TrackerWriter {
     );
     return {
       issues: response.issues.nodes
-        .map((node) => normalizeIssue(node, assigneeFilter))
+        .map((node) => normalizeIssue(node, assigneeFilter, this.issueProjectContextMetadata(node, routingSource, metadataOptions)))
         .filter((issue): issue is Issue => issue !== null),
       pageInfo,
+    };
+  }
+
+  private issueProjectContextMetadata(
+    node: Pick<LinearIssueNode, "project">,
+    routingSource: IssueProjectContextMetadata["routingSource"],
+    options: { requireActualProjectSlugMatch?: boolean } = {},
+  ): IssueProjectContextMetadata | null {
+    if (!this.projectContextMetadata) return null;
+    const actualLinearProjectSlug = asNullableString(node.project?.slugId);
+    if (options.requireActualProjectSlugMatch && !sameProjectSlug(actualLinearProjectSlug, this.projectContextMetadata.linearProjectSlug)) {
+      return null;
+    }
+    return {
+      projectContextId: this.projectContextMetadata.projectContextId,
+      projectContextLabel: this.projectContextMetadata.projectContextLabel,
+      linearProjectSlug: actualLinearProjectSlug ?? this.projectContextMetadata.linearProjectSlug,
+      routingSource,
     };
   }
 
@@ -916,7 +959,11 @@ function linearPageSize(value: number): number {
   return Number.isInteger(value) && value >= 1 && value <= 250 ? value : 250;
 }
 
-export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFilter | null = null): Issue | null {
+export function normalizeIssue(
+  node: LinearIssueNode,
+  assigneeFilter: AssigneeFilter | null = null,
+  projectContextMetadata: IssueProjectContextMetadata | null = null,
+): Issue | null {
   const id = asString(node.id);
   const identifier = asString(node.identifier);
   const title = asString(node.title);
@@ -924,6 +971,15 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
   if (!id || !identifier || !title || !state) return null;
   const assigneeId = asNullableString(node.assignee?.id);
   const delegateId = asNullableString(node.delegate?.id);
+  const linearProjectSlug = asNullableString(node.project?.slugId);
+  const linearProjectId = asNullableString(node.project?.id);
+  const resolvedProjectContext =
+    projectContextMetadata === null
+      ? null
+      : {
+          ...projectContextMetadata,
+          linearProjectSlug: linearProjectSlug ?? projectContextMetadata.linearProjectSlug,
+        };
 
   return {
     id,
@@ -942,7 +998,25 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
     hasChildren: (node.children?.nodes ?? []).length > 0,
     createdAt: asNullableString(node.createdAt),
     updatedAt: asNullableString(node.updatedAt),
-  };
+    ...(linearProjectSlug
+      ? {
+          linearProjectIdentity: {
+            kind: "linear",
+            slug: linearProjectSlug,
+            ...(linearProjectId === null ? {} : { id: linearProjectId }),
+          },
+        }
+      : {}),
+    ...(resolvedProjectContext === null
+      ? {}
+      : {
+          projectContext: resolvedProjectContext,
+          projectContextId: resolvedProjectContext.projectContextId,
+          projectContextLabel: resolvedProjectContext.projectContextLabel,
+          linearProjectSlug: resolvedProjectContext.linearProjectSlug,
+          routingSource: resolvedProjectContext.routingSource,
+        }),
+  } as Issue;
 }
 
 function normalizeLabels(nodes: Array<{ name?: unknown }> | undefined): string[] {
@@ -979,6 +1053,10 @@ function asNullableString(value: unknown): string | null {
 
 function sameName(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function sameProjectSlug(left: string | null, right: string | null): boolean {
+  return left !== null && right !== null && left.toLowerCase() === right.toLowerCase();
 }
 
 function formatTeam(teamKey: string, teamName: string | null): string {

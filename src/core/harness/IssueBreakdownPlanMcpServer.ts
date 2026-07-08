@@ -7,6 +7,8 @@ import {
 import { SymphonyError } from "../errors.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../persistence/RunTranscriptStore.js";
+import { resolveServiceConfigForProjectContext } from "../config/ProjectContextServiceConfig.js";
+import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
@@ -15,6 +17,7 @@ export const ISSUE_BREAKDOWN_PLAN_TOOL_NAME = "submit_issue_breakdown_plan";
 
 export interface IssueBreakdownPlanMcpContextFile {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string | null;
   role: "planner" | "worker";
   phase: "issue_breakdown";
@@ -42,7 +45,7 @@ export async function submitIssueBreakdownPlanFromMcp(
   const loader = new WorkflowLoader(options.workflowPath);
   try {
     const loaded = await loader.load();
-    const config = loaded.serviceConfig;
+    const config = resolveServiceConfigForProjectContext(loaded.serviceConfig, loadedContext.projectContext);
     const service = new IssueBreakdownPlanService({
       config,
       lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
@@ -50,6 +53,7 @@ export async function submitIssueBreakdownPlanFromMcp(
     });
     const context: IssueBreakdownPlanActiveContext = {
       issue: loadedContext.issue,
+      projectContext: loadedContext.projectContext,
       activeRunId: loadedContext.activeRunId,
       role: loadedContext.role,
       phase: loadedContext.phase,

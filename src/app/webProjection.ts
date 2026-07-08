@@ -9,6 +9,13 @@ import { sanitizedPreviewValue, sanitizePublicJson } from "../core/transcript/Tr
 import type { RunRecord, TranscriptEvent, TranscriptPage, WorkspaceRecord } from "../core/persistence/RunTranscriptStore.js";
 import type { HistoryModel as WebHistoryModel } from "./WebHistoryProjection.js";
 import { projectWebTranscript, type TranscriptMessage as WebTranscriptMessage } from "./WebTranscriptProjection.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  normalizeProjectContextResolution,
+  publicRepositorySummary,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../core/config/ProjectContexts.js";
 import type {
   AgentRunKind,
   AgentRunPhase,
@@ -44,6 +51,20 @@ export interface ReferenceData {
   users: Record<string, ReferenceUserModel>;
 }
 
+export interface ProjectContextDisplayModel {
+  id: string;
+  label: string;
+  linearProject: string | null;
+  codebase: string | null;
+}
+
+export interface RunningAgentProjectContextModel extends ProjectContextDisplayModel {
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
+  routingSource: string | null;
+}
+
 export interface IssueModel {
   id: string;
   title: string;
@@ -53,6 +74,7 @@ export interface IssueModel {
   assignee: string;
   agent: string | null;
   project: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
   cycle: string;
   activity: IssueActivityModel[];
   pr: string | null;
@@ -61,6 +83,12 @@ export interface IssueModel {
   session: string | null;
   desc?: string[];
 }
+
+const RAW_DASHBOARD_ISSUE_ID_ALIASES = Symbol("rawDashboardIssueIdAliases");
+
+type IssueModelWithRawDashboardIssueIdAliases = IssueModel & {
+  [RAW_DASHBOARD_ISSUE_ID_ALIASES]?: readonly string[];
+};
 
 export interface IssueActivityModel {
   t: string;
@@ -119,6 +147,7 @@ export interface RunningAgentModel {
   step: string;
   duration: string;
   tokens: string;
+  projectContext?: RunningAgentProjectContextModel | undefined;
 }
 
 export interface ProviderGateModel {
@@ -131,6 +160,7 @@ export interface ProviderGateModel {
   sourceIssue: string | null;
   sourceRunId: string | null;
   affected: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
 }
 
 export interface ActivityModel {
@@ -139,12 +169,14 @@ export interface ActivityModel {
   verb: string;
   id: string;
   extra: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
 }
 
 export interface SessionModel {
   id: string;
   issue: string;
   title: string;
+  projectContext?: ProjectContextDisplayModel | undefined;
   state: string;
   model: string | null;
   startedAt: string | null;
@@ -152,6 +184,17 @@ export interface SessionModel {
   msgCount: number;
   lastEvent: string | null;
   toolCount: number;
+}
+
+export interface WorkspaceModel {
+  workspaceKey: string | null;
+  path: string | null;
+  sourceKind: string | null;
+  branchName: string | null;
+  gitBranchName: string | null;
+  repoPath: string | null;
+  baseRef: string | null;
+  projectContext?: ProjectContextResolution | undefined;
 }
 
 export interface ChatMessage {
@@ -229,6 +272,7 @@ export interface DashboardModel {
 
 export interface IssueDetailModel {
   issue: IssueModel;
+  workspace: WorkspaceModel | null;
   activity: ActivityModel[];
   runs: SessionModel[];
   transcript: TranscriptMessage[];
@@ -421,6 +465,7 @@ export interface ActivityItemProjectionInput {
   at: string;
   kind: string;
   source: string;
+  projectContext?: Partial<ProjectContextResolution> | null;
   issue: { id: string | null; identifier: string | null } | null;
   run: {
     runId?: string | null;
@@ -641,6 +686,7 @@ export function emptyDashboardSourceModel(): DashboardSourceModel {
 export function emptyIssueDetailModel(issueId = ""): IssueDetailModel {
   return {
     issue: emptyIssueModel(issueId),
+    workspace: null,
     activity: [],
     runs: [],
     transcript: [],
@@ -731,13 +777,13 @@ export function projectIssueModel(
     details = source;
   }
   const issue = details.issue;
-  const id =
-    firstNonEmpty(issue.identifier, card?.issueIdentifier, issue.id, card?.issueId, card?.key, options.requestKey) ?? "";
+  const id = contextualIssueIdentifier(issue, card) ?? firstNonEmpty(issue.id, card?.issueId, card?.key, options.requestKey) ?? "";
+  const projectContext = projectContextDisplayForIssue(issue);
   const operatorLiveness = options.operatorLiveness ?? card?.operatorLiveness ?? null;
   const pullRequest = details.pullRequest;
   const model: IssueModel = {
     id,
-    title: firstNonEmpty(issue.title) ?? id,
+    title: firstNonEmpty(issue.title, issue.identifier, card?.issueIdentifier, issue.id, card?.issueId, card?.key, options.requestKey) ?? id,
     status: deriveIssueStatus({
       lane: options.lane ?? card?.lane ?? null,
       state: issue.state,
@@ -749,7 +795,8 @@ export function projectIssueModel(
     labels: Array.isArray(issue.labels) ? [...issue.labels] : [],
     assignee: firstNonEmpty(issue.assigneeId) ?? "unassigned",
     agent: agentIdFromInputs(card, operatorLiveness),
-    project: "",
+    project: projectLabelForIssue(issue),
+    ...(projectContext === null ? {} : { projectContext }),
     cycle: "",
     activity: projectIssueActivity(details, card, operatorLiveness),
     pr: formatPullRequest(pullRequest, card?.metadata ?? null),
@@ -768,6 +815,7 @@ export function projectIssueModel(
         details.latestRun.runId,
       ) ?? null,
   };
+  attachRawDashboardIssueIdAliases(model, [issue.id, card?.issueId]);
   const description = projectIssueDescription(details, card?.reviewLoop ?? null);
   if (description.length > 0) model.desc = description;
   return model;
@@ -795,11 +843,16 @@ export function projectWebIssueDetail(
   if (!input) return null;
   const transcriptEvents = Array.isArray(input.transcript) ? input.transcript : (input.transcript?.events ?? []);
   const includeRunPrelude = transcriptEvents.length > 0;
+  const workspace = projectIssueDetailWorkspaceSource(input);
   return {
     issue: projectIssueModel(input.boardCard ?? input.issueDetails, {
       requestKey,
       lane: input.boardCard?.lane ?? null,
       operatorLiveness: input.operatorLiveness ?? input.boardCard?.operatorLiveness ?? null,
+      latestRun: input.latestRun ?? null,
+    }),
+    workspace: projectWorkspaceModel(workspace, {
+      issue: input.issueDetails.issue,
       latestRun: input.latestRun ?? null,
     }),
     activity: projectActivityModels(input.activity ?? null),
@@ -842,6 +895,32 @@ export function projectWebIssueBoard(
 export function projectIssueDetailModel(input: BoardIssueDetailProjectionInput | null | undefined): IssueDetailModel {
   if (!input) return emptyIssueDetailModel();
   return projectWebIssueDetail(input, input.issue) ?? emptyIssueDetailModel(input.issue);
+}
+
+function projectIssueDetailWorkspaceSource(
+  input: Pick<BoardIssueDetailProjectionInput, "issueDetails" | "live" | "workspace">,
+): IssueWorkspaceSummary | WorkspaceRecord | null {
+  return selectIssueDetailWorkspaceSource([input.workspace ?? null, input.issueDetails.workspace], input.live?.runPhase ?? null);
+}
+
+export function selectIssueDetailWorkspaceSource<T extends Pick<IssueWorkspaceSummary | WorkspaceRecord, "workspaceKey" | "path">>(
+  candidates: readonly (T | null | undefined)[],
+  liveRunPhase: AgentRunPhase | string | null | undefined,
+): T | null {
+  const allowPlanningWorkspace = liveRunPhase === "issue_breakdown";
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (!allowPlanningWorkspace && isPlanningIssueWorkspace(candidate)) continue;
+    return candidate;
+  }
+  return null;
+}
+
+function isPlanningIssueWorkspace(workspace: Pick<IssueWorkspaceSummary | WorkspaceRecord, "workspaceKey" | "path">): boolean {
+  if (typeof workspace.workspaceKey === "string" && workspace.workspaceKey.trim().endsWith("-planning")) return true;
+  if (typeof workspace.path !== "string") return false;
+  const workspaceName = workspace.path.trim().split(/[\\/]/).pop() ?? "";
+  return workspaceName.endsWith("-planning");
 }
 
 export function projectWebDashboard(input: DashboardProjectionInput = {}): DashboardModel {
@@ -931,13 +1010,17 @@ export function projectWebSidebar(
 export function projectActivityModels(input: ActivityFeedResponseProjectionInput | ActivityModel[] | null | undefined): ActivityModel[] {
   if (!input) return [];
   if (Array.isArray(input)) return input.map(cloneActivityModel);
-  return (input.activity ?? []).map((item) => ({
-    t: item.at,
-    who: activityActor(item) ?? "",
-    verb: activityVerb(item),
-    id: activityDisplayId(item),
-    extra: activityExtra(item),
-  }));
+  return (input.activity ?? []).map((item) => {
+    const projectContext = projectContextDisplayFromResolution(item.projectContext);
+    return {
+      t: item.at,
+      who: activityActor(item) ?? "",
+      verb: activityVerb(item),
+      id: activityDisplayId(item),
+      extra: activityExtra(item),
+      ...(projectContext === null ? {} : { projectContext }),
+    };
+  });
 }
 
 export function projectTranscriptMessages(
@@ -949,10 +1032,12 @@ export function projectTranscriptMessages(
 }
 
 export function projectSessionModel(run: RunRecord): SessionModel {
+  const projectContext = projectContextDisplayForRun(run);
   return {
     id: run.sessionId ?? run.runId,
     issue: run.issueIdentifier,
     title: run.issueIdentifier,
+    ...(projectContext === null ? {} : { projectContext }),
     state: run.status,
     model: firstNonEmpty(run.runtimeModel, legacyCursorRuntimeFallbackModel(run)),
     startedAt: run.startedAt ?? null,
@@ -981,9 +1066,15 @@ function shouldUseCursorRuntimeFallback(run: RunRecord): boolean {
 
 export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefined, generatedAt: string | null | undefined = snapshot?.generatedAt ?? null): RunningAgentModel[] {
   return (snapshot?.running ?? []).map((row) => {
-    const id = firstNonEmpty(row.runId, row.issueIdentifier, row.issueId) ?? "";
+    const id = runningAgentProjectionId({
+      runId: row.runId,
+      issueId: row.issueId,
+      issueIdentifier: row.issueIdentifier,
+      projectContext: row.projectContext,
+    });
     const issue = firstNonEmpty(row.issueIdentifier, row.issueId) ?? "";
     const totalTokens = row.tokens?.totalTokens ?? 0;
+    const projectContext = runningAgentProjectContextFromResolution(row.projectContext);
     return {
       id,
       issue,
@@ -992,6 +1083,7 @@ export function projectRunningAgents(snapshot: RuntimeSnapshot | null | undefine
       step: firstNonEmpty(row.lastMessage, row.lastEvent) ?? "",
       duration: formatRunDuration(row.startedAt, generatedAt),
       tokens: Number.isFinite(totalTokens) && totalTokens > 0 ? String(totalTokens) : "",
+      ...(projectContext === null ? {} : { projectContext }),
     };
   });
 }
@@ -1001,9 +1093,18 @@ function projectDurableRunningAgents(runs: readonly RunRecord[], generatedAt: st
     .filter((run) => run.status === "running")
     .sort((left, right) => compareDashboardRunRecency(right, left))
     .map((run) => {
-      const id = firstNonEmpty(run.runId, run.issueIdentifier, run.issueId, run.workspaceKey) ?? "";
+      const id = runningAgentProjectionId({
+        runId: run.runId,
+        issueId: run.issueId,
+        issueIdentifier: run.issueIdentifier,
+        workspaceKey: run.workspaceKey,
+        projectContext: run.projectContext,
+      });
       const issue = firstNonEmpty(run.issueIdentifier, run.issueId, run.workspaceKey) ?? "";
       const totalTokens = run.tokens?.totalTokens ?? 0;
+      const projectContext = runningAgentProjectContextFromResolution(run.projectContext, {
+        codebase: publicRepositorySummary(run.repoPath, { allowLocalPath: false }),
+      });
       return {
         id,
         issue,
@@ -1012,6 +1113,7 @@ function projectDurableRunningAgents(runs: readonly RunRecord[], generatedAt: st
         step: firstNonEmpty(run.runPhase, run.runKind, run.role) ?? "",
         duration: formatRunDuration(run.startedAt, generatedAt ?? run.updatedAt),
         tokens: Number.isFinite(totalTokens) && totalTokens > 0 ? String(totalTokens) : "",
+        ...(projectContext === null ? {} : { projectContext }),
       };
     });
 }
@@ -1024,6 +1126,7 @@ export function projectProviderGates(snapshot: RuntimeSnapshot | null | undefine
     ]
       .filter((value) => typeof value === "string" && value.trim().length > 0)
       .join(", ");
+    const projectContext = projectContextDisplayFromResolution(gate.source?.projectContext);
     return {
       id: firstNonEmpty(gate.id) ?? "",
       provider: firstNonEmpty(gate.scope?.providerId, gate.scope?.harnessId) ?? "",
@@ -1034,6 +1137,7 @@ export function projectProviderGates(snapshot: RuntimeSnapshot | null | undefine
       sourceIssue: firstNonEmpty(gate.source?.issueIdentifier, gate.source?.issueId) ?? null,
       sourceRunId: firstNonEmpty(gate.source?.runId) ?? null,
       affected,
+      ...(projectContext === null ? {} : { projectContext }),
     };
   });
 }
@@ -1227,7 +1331,7 @@ function dashboardTotalsFromDurableState(
   const latestRunByAlias = buildLatestRunByAlias(runs);
 
   for (const issue of board.issues) {
-    addDashboardIssueStatus(totals, representedAliases, issue.status, [issue.id], `board:${issue.id}`);
+    addDashboardIssueStatus(totals, representedAliases, issue.status, [issue.id, ...rawDashboardIssueIdAliases(issue)], `board:${issue.id}`);
   }
 
   for (const lifecycle of lifecycleRecords) {
@@ -1419,7 +1523,7 @@ function uniqueIssueCards(input: IssueBoardResponseProjectionInput | null | unde
   const seen = new Set<string>();
   const cards: IssueBoardCardProjectionInput[] = [];
   for (const card of candidateIssueCards(input)) {
-    const key = firstNonEmpty(card.issueIdentifier, card.issueId, card.key);
+    const key = issueCardIdentityKey(card);
     if (!key || seen.has(key)) continue;
     seen.add(key);
     cards.push(card);
@@ -1510,12 +1614,31 @@ function cloneWebIssueBoardModel(input: WebIssueBoardModel): WebIssueBoardModel 
 }
 
 function cloneIssueModel(input: IssueModel): IssueModel {
-  return {
+  const cloned: IssueModel = {
     ...input,
     labels: [...input.labels],
+    ...(input.projectContext === undefined ? {} : { projectContext: cloneProjectContextDisplayModel(input.projectContext) }),
     activity: input.activity.map((item) => ({ ...item })),
     ...(input.desc === undefined ? {} : { desc: [...input.desc] }),
   };
+  const rawAliases = rawDashboardIssueIdAliases(input);
+  return rawAliases.length > 0 ? attachRawDashboardIssueIdAliases(cloned, rawAliases) : cloned;
+}
+
+function attachRawDashboardIssueIdAliases(model: IssueModel, aliases: readonly (string | null | undefined)[]): IssueModel {
+  const normalized = dashboardAliases(...aliases);
+  if (normalized.length === 0) return model;
+  Object.defineProperty(model, RAW_DASHBOARD_ISSUE_ID_ALIASES, {
+    value: normalized,
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+  return model;
+}
+
+function rawDashboardIssueIdAliases(model: IssueModel): readonly string[] {
+  return (model as IssueModelWithRawDashboardIssueIdAliases)[RAW_DASHBOARD_ISSUE_ID_ALIASES] ?? [];
 }
 
 function cloneReferenceData(input: ReferenceData): ReferenceData {
@@ -1525,8 +1648,84 @@ function cloneReferenceData(input: ReferenceData): ReferenceData {
   };
 }
 
-function cloneActivityModel(input: ActivityModel): ActivityModel {
+function cloneProjectContextDisplayModel(input: ProjectContextDisplayModel): ProjectContextDisplayModel {
   return { ...input };
+}
+
+function cloneActivityModel(input: ActivityModel): ActivityModel {
+  return {
+    ...input,
+    ...(input.projectContext === undefined ? {} : { projectContext: cloneProjectContextDisplayModel(input.projectContext) }),
+  };
+}
+
+export function projectWorkspaceModel(
+  workspace: IssueWorkspaceSummary | WorkspaceRecord | null | undefined,
+  options: { issue?: IssueStatusView | IssueModel | null; latestRun?: RunRecord | null; allowRunFieldFallback?: boolean } = {},
+): WorkspaceModel | null {
+  const source = (workspace ?? null) as Partial<WorkspaceModel & { projectContext?: Partial<ProjectContextResolution> | null }> | null;
+  const latestRun = options.allowRunFieldFallback === false || options.latestRun?.runPhase === "issue_breakdown" ? null : options.latestRun;
+  const workspaceKey = firstNonEmpty(source?.workspaceKey, latestRun?.workspaceKey) ?? null;
+  const path = firstNonEmpty(source?.path, latestRun?.workspacePath) ?? null;
+  const sourceKind = firstNonEmpty(source?.sourceKind) ?? null;
+  const branchName = firstNonEmpty(source?.branchName) ?? null;
+  const gitBranchName = firstNonEmpty(source?.gitBranchName, latestRun?.gitBranchName) ?? null;
+  const repoPath = firstNonEmpty(source?.repoPath, latestRun?.repoPath) ?? null;
+  const baseRef = firstNonEmpty(source?.baseRef, latestRun?.baseRef) ?? null;
+
+  if ([workspaceKey, path, sourceKind, branchName, gitBranchName, repoPath, baseRef].every((value) => value === null)) return null;
+
+  const projectContext = projectWorkspaceProjectContext(source?.projectContext, options.issue ?? null, options.latestRun ?? null);
+
+  return {
+    workspaceKey,
+    path,
+    sourceKind,
+    branchName,
+    gitBranchName,
+    repoPath,
+    baseRef,
+    ...(projectContext === undefined ? {} : { projectContext }),
+  };
+}
+
+function projectWorkspaceProjectContext(
+  workspaceProjectContext: Partial<ProjectContextResolution> | null | undefined,
+  issue: IssueStatusView | IssueModel | null | undefined,
+  latestRun: RunRecord | null | undefined,
+): ProjectContextResolution | undefined {
+  const candidates = [
+    workspaceProjectContext ? normalizeProjectContextResolution(workspaceProjectContext) : undefined,
+    projectWorkspaceIssueProjectContext(issue),
+    latestRun?.projectContext ? normalizeProjectContextResolution(latestRun.projectContext) : undefined,
+  ];
+  let legacyFallback: ProjectContextResolution | undefined;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (candidate.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return candidate;
+    legacyFallback ??= candidate;
+  }
+  return legacyFallback;
+}
+
+function projectWorkspaceIssueProjectContext(
+  issue: IssueStatusView | IssueModel | null | undefined,
+): ProjectContextResolution | undefined {
+  if (!issue) return undefined;
+  if (isProjectedIssueModel(issue)) {
+    if (!issue.projectContext) return undefined;
+    return {
+      projectContextId: issue.projectContext.id,
+      projectContextLabel: issue.projectContext.label,
+      linearProjectSlug: issue.projectContext.linearProject,
+      routingSource: issue.projectContext.id === LEGACY_DEFAULT_PROJECT_CONTEXT_ID ? "legacy_default" : "explicit",
+    };
+  }
+  return projectContextResolutionFromIssue(issue) ?? undefined;
+}
+
+function isProjectedIssueModel(issue: IssueStatusView | IssueModel): issue is IssueModel {
+  return "project" in issue && "cycle" in issue && !("state" in issue);
 }
 
 function addReferenceLabel(labels: Map<string, ReferenceLabelModel>, value: string | null | undefined): void {
@@ -1746,11 +1945,105 @@ function formatPullRequest(pullRequest: IssuePullRequestSummary, metadata?: Issu
   return metadata?.prUrl ?? null;
 }
 
+function projectContextDisplayFromResolution(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  options: { codebase?: string | null } = {},
+): ProjectContextDisplayModel | null {
+  if (projectContext === null || projectContext === undefined) return null;
+  const normalized = normalizeProjectContextResolution(projectContext);
+  return projectContextDisplayFromNormalizedResolution(normalized, options);
+}
+
+function projectContextDisplayFromNormalizedResolution(
+  normalized: ProjectContextResolution,
+  options: { codebase?: string | null } = {},
+): ProjectContextDisplayModel {
+  const codebase = typeof options.codebase === "string" && options.codebase.trim().length > 0 ? options.codebase : null;
+  return {
+    id: normalized.projectContextId,
+    label: normalized.projectContextLabel,
+    linearProject: normalized.linearProjectSlug,
+    codebase,
+  };
+}
+
+function runningAgentProjectContextFromResolution(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  options: { codebase?: string | null } = {},
+): RunningAgentProjectContextModel | null {
+  if (projectContext === null || projectContext === undefined) return null;
+  const normalized = normalizeProjectContextResolution(projectContext);
+  return {
+    ...projectContextDisplayFromNormalizedResolution(normalized, options),
+    projectContextId: normalized.projectContextId,
+    projectContextLabel: normalized.projectContextLabel,
+    linearProjectSlug: normalized.linearProjectSlug,
+    routingSource: normalized.routingSource ?? null,
+  };
+}
+
+function projectContextDisplayForIssue(issue: IssueStatusView): ProjectContextDisplayModel | null {
+  return projectContextDisplayFromResolution(projectContextForIssueProjection(issue));
+}
+
+function projectContextDisplayForRun(run: RunRecord): ProjectContextDisplayModel | null {
+  return projectContextDisplayFromResolution(run.projectContext, {
+    codebase: publicRepositorySummary(run.repoPath, { allowLocalPath: false }),
+  });
+}
+
+function projectContextForIssueProjection(issue: IssueStatusView): ReturnType<typeof projectContextResolutionFromIssue> {
+  return projectContextResolutionFromIssue(issue);
+}
+
+function projectLabelForIssue(issue: IssueStatusView): string {
+  const projectContext = projectContextForIssueProjection(issue);
+  if (!projectContext || projectContext.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return "";
+  return projectContext.projectContextLabel;
+}
+
+function contextualIssueIdentifier(issue: IssueStatusView, card: IssueBoardCardProjectionInput | null = null): string | null {
+  const identifier = firstNonEmpty(issue.identifier, card?.issueIdentifier);
+  if (!identifier) return null;
+  const projectContextId = projectContextForIssueProjection(issue)?.projectContextId;
+  if (!projectContextId || projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return identifier;
+  return `${projectContextId}:${identifier}`;
+}
+
+function issueCardIdentityKey(card: IssueBoardCardProjectionInput): string | null {
+  const issue = card.issueDetails.issue;
+  const issueId = firstNonEmpty(card.issueId, issue.id);
+  if (issueId) return `issue:${issueId}`;
+  const identifier = contextualIssueIdentifier(issue, card);
+  if (identifier) return `identifier:${identifier}`;
+  const key = firstNonEmpty(card.key);
+  return key ? `key:${key}` : null;
+}
+
 function firstNonEmpty(...values: Array<string | null | undefined>): string | null {
   for (const value of values) {
     if (typeof value === "string" && value.trim().length > 0) return value;
   }
   return null;
+}
+
+function runningAgentProjectionId(input: {
+  runId?: string | null;
+  issueId?: string | null;
+  issueIdentifier?: string | null;
+  workspaceKey?: string | null;
+  projectContext?: ProjectContextResolution | null | undefined;
+}): string {
+  const runId = firstNonEmpty(input.runId);
+  if (runId) return runId;
+  const issueId = firstNonEmpty(input.issueId);
+  if (issueId) return issueId;
+  const issueIdentifier = firstNonEmpty(input.issueIdentifier);
+  if (issueIdentifier) {
+    const projectContextId = firstNonEmpty(input.projectContext?.projectContextId);
+    return projectContextId ? `${projectContextId}:${issueIdentifier}` : issueIdentifier;
+  }
+  return firstNonEmpty(input.workspaceKey) ?? "";
 }
 
 function activityActor(item: ActivityItemProjectionInput): string | null {

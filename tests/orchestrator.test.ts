@@ -92,6 +92,7 @@ import {
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
   ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
   WritebackProcessor,
+  writebackIdentityKey,
 } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
@@ -11168,7 +11169,7 @@ describe("Orchestrator", () => {
           idempotencyKey: "review-verdict-blocked-1",
           verdict: "blocked",
           writebackOperationKeys: [
-            "comment:issue-1:review-run-1:review-verdict-blocked",
+            writebackIdentityKey("comment:issue-1:review-run-1:review-verdict-blocked"),
           ],
         },
       ],
@@ -13255,6 +13256,7 @@ describe("Orchestrator", () => {
       timer: retryTimer,
       error: "retry later",
       runPhase: "implementation",
+      projectContext: undefined,
     });
     const activeIssue = issue({ id: "issue-active", identifier: "TEST-9" });
     const abortController = new AbortController();
@@ -14212,7 +14214,7 @@ async function expectStartupReplayActivitySkipReasons(
   const expectedKinds = ["issue_create", "issue_relation", "comment"];
   for (const [index, key] of fixture.replayOperationKeys.entries()) {
     const item = activity.find(
-      (candidate) => candidate.id === `writeback:${key}`,
+      (candidate) => candidate.id === `writeback:default:${key}`,
     );
     expect(item).toMatchObject({
       kind: "writeback_operation",
@@ -15251,6 +15253,7 @@ class RecordingShutdownProgress {
 function shutdownTestRunningEntry(activeIssue: Issue, abortController: AbortController): RunningEntry {
   return {
     issue: activeIssue,
+    projectContext: null,
     role: "worker",
     runPhase: "implementation",
     workspacePath: null,
@@ -15599,12 +15602,12 @@ class LifecycleSnapshotHarness implements AgentHarness {
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
     this.runs.push(ctx);
+    this.snapshots.push((await this.lifecycleStore.get(ctx.issue.id)) ?? (await this.lifecycleStore.get(ctx.issue.identifier)));
     yield {
       type: "session_started",
       sessionId: "snapshot-session-1",
       runId: "snapshot-run-1",
     };
-    this.snapshots.push(await this.lifecycleStore.get(ctx.issue.id));
     yield { type: "completed" };
   }
 }

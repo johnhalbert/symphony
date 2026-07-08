@@ -63,6 +63,7 @@ export function IssuesView({
       {detailOpen ? (
         <DetailColumn
           issue={issueDetail.data?.issue ?? null}
+          workspace={issueDetail.data?.workspace ?? null}
           issueId={selectedDetailId}
           loading={Boolean(selectedDetailId) && issueDetail.loading}
           error={issueDetail.error}

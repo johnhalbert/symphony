@@ -103,6 +103,7 @@ describe("StatusServer realtime SSE API", () => {
       observedAt: "2026-01-01T00:00:01.000Z",
       detail: {
         source: "run_activity",
+        projectContextId: "docs",
         runId: "run-activity-1",
         sessionId: "session-activity-1",
         afterSequence: 2,
@@ -111,27 +112,49 @@ describe("StatusServer realtime SSE API", () => {
         resourcesChanged: ["history", "session-transcript"],
       },
     });
-    expect(requireEvent(runActivityEvents.find((event) => event.type === "run.updated"))).toMatchObject({
+    const runActivityProjectionEvent = requireEvent(runActivityEvents.find((event) => event.type === "projection.updated"));
+    const runActivitySourceEvent = requireEvent(runActivityEvents.find((event) => event.type === "source.status"));
+    const runActivityRunEvent = requireEvent(runActivityEvents.find((event) => event.type === "run.updated"));
+    const runActivityTranscriptEvent = requireEvent(runActivityEvents.find((event) => event.type === "transcript.delta"));
+    expect(runActivityProjectionEvent).toMatchObject({
+      type: "projection.updated",
+      payload: {
+        projectContext: { projectContextId: "docs" },
+        resourcesChanged: ["history", "session-transcript"],
+      },
+    });
+    expect(runActivitySourceEvent).toMatchObject({
+      type: "source.status",
+      scope: "source",
+      key: "run_activity",
+      source: { source: "run_activity", revision: 8 },
+      payload: { projectContext: { projectContextId: "docs" } },
+    });
+    expect(runActivityRunEvent).toMatchObject({
       type: "run.updated",
       scope: "run",
       key: "run-activity-1",
-      payload: { source: "run_activity", sourceRevision: 8, runId: "run-activity-1", status: "running" },
+      payload: {
+        source: "run_activity",
+        sourceRevision: 8,
+        projectContext: { projectContextId: "docs" },
+        runId: "run-activity-1",
+        status: "running",
+      },
     });
-    expect(requireEvent(runActivityEvents.find((event) => event.type === "transcript.delta"))).toMatchObject({
+    expect(runActivityTranscriptEvent).toMatchObject({
       type: "transcript.delta",
       scope: "session",
       key: "session-activity-1",
       payload: {
         source: "run_activity",
         sourceRevision: 8,
+        projectContext: { projectContextId: "docs" },
         runId: "run-activity-1",
         sessionId: "session-activity-1",
         afterSequence: 2,
         eventCount: 3,
       },
-    });
-    expect(requireEvent(runActivityEvents.find((event) => event.type === "projection.updated"))).toMatchObject({
-      payload: { resourcesChanged: ["history", "session-transcript"] },
     });
 
     for (const chatSource of [
@@ -399,20 +422,24 @@ describe("StatusServer realtime SSE API", () => {
       expect(projection.data).toMatchObject({
         type: "projection.updated",
         source: { source: "run_activity", revision: 1 },
-        payload: { resourcesChanged: ["history", "session-transcript", "dashboard", "sidebar"] },
+        payload: {
+          projectContext: { projectContextId: "default" },
+          resourcesChanged: ["history", "session-transcript", "dashboard", "sidebar"],
+        },
       });
       expect(source.data).toMatchObject({
         type: "source.status",
         scope: "source",
         key: "run_activity",
         source: { source: "run_activity", revision: 1 },
+        payload: { projectContext: { projectContextId: "default" } },
       });
       expect(run.data).toMatchObject({
         type: "run.updated",
         scope: "run",
         key: "run-realtime-activity",
         source: { source: "run_activity", revision: 1 },
-        payload: { runId: "run-realtime-activity", status: null },
+        payload: { projectContext: { projectContextId: "default" }, runId: "run-realtime-activity", status: null },
       });
       expect(transcript.data).toMatchObject({
         type: "transcript.delta",
@@ -420,6 +447,7 @@ describe("StatusServer realtime SSE API", () => {
         key: "session-realtime-activity",
         source: { source: "run_activity", revision: 1 },
         payload: {
+          projectContext: { projectContextId: "default" },
           runId: "run-realtime-activity",
           sessionId: "session-realtime-activity",
           afterSequence: 0,
@@ -433,6 +461,7 @@ describe("StatusServer realtime SSE API", () => {
   });
 
   it("suppresses realtime events for duplicate run activity appends", async () => {
+
     const runActivitySourceStore = new InMemoryRunActivityAppendStore();
     const server = createRealtimeServer({ runActivitySourceStore });
     const address = await server.start();
@@ -1063,6 +1092,109 @@ describe("StatusServer realtime SSE API", () => {
       await expect(client.nextEventOfType("transcript.delta", 150)).rejects.toThrow(/Timed out waiting for SSE event/);
       await expect(runStore.readTranscript("run-transcript-source-1", { offset: 0, limit: 10 })).resolves.toMatchObject({
         events: [expect.objectContaining({ eventType: "message_delta", message: "Hermes message delta" })],
+      });
+    } finally {
+      await client.close();
+      await server.stop();
+    }
+  });
+
+  it("adds service-owned project context attribution to store-driven realtime transcript status and system patches", async () => {
+    const runStore = new FileRunTranscriptStore(root);
+    const expectedPublicProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const expectedTranscriptProjectContext = {
+      id: "docs",
+      label: "Documentation Site",
+      linearProject: "DOCS",
+      codebase: null,
+    } as const;
+
+    await runStore.startRun({
+      runId: "run-transcript-context-patch-1",
+      sessionId: "session-transcript-context-patch-1",
+      agentId: "agent-1",
+      role: "worker",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "work",
+      workspaceKey: "TEST-1",
+      workspacePath: "/tmp/workspace",
+      projectContext: expectedPublicProjectContext,
+    });
+    const server = createRealtimeServer({ runStore });
+    const address = await server.start();
+    const baseUrl = `http://${address.host}:${address.port}`;
+    const client = await openSseClient(`${baseUrl}/api/v1/realtime`);
+
+    try {
+      await waitFor(() => server.activeRealtimeSubscriberCount() === 1, "SSE subscriber to register");
+
+      await runStore.appendEvent({
+        runId: "run-transcript-context-patch-1",
+        at: "2026-01-01T00:00:01.000Z",
+        source: "cursor",
+        eventType: "status",
+        message: "Cursor status running",
+        payload: { kind: "status", status: "running", messagePreview: "workspace ready" },
+      });
+      const statusDelta = await client.nextEventOfType("transcript.delta");
+      expect(statusDelta.data).toMatchObject({
+        type: "transcript.delta",
+        payload: {
+          detail: {
+            sourceCursors: {
+              projectContext: expectedPublicProjectContext,
+            },
+          },
+          messages: [
+            {
+              sequence: 1,
+              message: {
+                kind: "status",
+                state: "running",
+                text: "workspace ready · Project context: Documentation Site [docs]",
+                projectContext: expectedTranscriptProjectContext,
+              },
+            },
+          ],
+        },
+      });
+
+      await runStore.appendEvent({
+        runId: "run-transcript-context-patch-1",
+        at: "2026-01-01T00:00:02.000Z",
+        source: "cursor",
+        eventType: "system",
+        message: "Cursor system event: startup",
+        payload: { kind: "system", subtype: "startup", messagePreview: "system public preview", truncated: false },
+      });
+      const systemDelta = await client.nextEventOfType("transcript.delta");
+      expect(systemDelta.data).toMatchObject({
+        type: "transcript.delta",
+        payload: {
+          detail: {
+            sourceCursors: {
+              projectContext: expectedPublicProjectContext,
+            },
+          },
+          messages: [
+            {
+              sequence: 2,
+              message: {
+                kind: "system",
+                note: "system public preview. Project context: Documentation Site [docs].",
+                projectContext: expectedTranscriptProjectContext,
+              },
+            },
+          ],
+        },
       });
     } finally {
       await client.close();
@@ -1768,6 +1900,7 @@ interface FakeProjectionWriter extends NonNullable<StatusServerOptions["projecti
 function projectionPublication(overrides: Partial<ProjectionRevisionPublication> = {}): ProjectionRevisionPublication {
   return {
     projectionName: "history_projection",
+    projectContextId: "default",
     scopeKind: "global",
     scopeKey: "global",
     projectionRevisionId: "projection-revision-default",
@@ -1812,6 +1945,7 @@ function fakeProjectionWriterPublishingWrites(): FakeProjectionWriter {
       const generatedAt = normalizeProjectionWriteTimestamp(input.generatedAt, revision);
       const publication = projectionPublication({
         projectionName: input.projectionName,
+        projectContextId: input.projectContextId ?? "default",
         scopeKind: input.scopeKind ?? "global",
         scopeKey: input.scopeKey ?? "global",
         projectionRevisionId: `projection-revision-write-${revision}`,
@@ -1834,6 +1968,7 @@ function fakeProjectionWriterPublishingWrites(): FakeProjectionWriter {
         revision: {
           projectionRevisionId: publication.projectionRevisionId,
           projectionName: publication.projectionName,
+          projectContextId: publication.projectContextId,
           scopeKind: publication.scopeKind,
           scopeKey: publication.scopeKey,
           revision: publication.revision,

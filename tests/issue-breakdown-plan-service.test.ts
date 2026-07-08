@@ -17,7 +17,15 @@ import {
   issue,
   nestedFencedIssueContractSpoof,
   testConfig,
+  trackerIssue,
 } from "./helpers.js";
+
+const docsProjectContext = {
+  projectContextId: "docs-site",
+  projectContextLabel: "Documentation Site",
+  linearProjectSlug: "DOCS",
+  routingSource: "candidate_poll",
+} as const;
 
 describe("IssueBreakdownPlanService", () => {
   let root: string;
@@ -81,6 +89,95 @@ describe("IssueBreakdownPlanService", () => {
       planId: first.plan.id,
       summary: expect.stringContaining("Build planning schema"),
       issueContentFingerprint: first.plan.issueContentFingerprint,
+    });
+  });
+
+  it("persists exact issue-id status pointers for context-scoped issue breakdown plans", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = trackerIssue({
+      id: "issue-docs-1",
+      identifier: "ENG-123",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    const result = await service.submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-docs-1",
+        issueId: candidate.id,
+        summary: "Split the docs-context work into child issues.",
+        proposedIssues: [
+          {
+            title: "Create implementation task",
+            description: agentEligibleIssueContract(),
+            acceptanceCriteria: ["Behavior is implemented and tested."],
+            dependencies: [],
+            labels: ["planning"],
+          },
+        ],
+        idempotencyKey: "plan-docs-1",
+      },
+      {
+        issue: candidate,
+        activeRunId: "run-plan-docs-1",
+        role: "worker",
+        phase: "issue_breakdown",
+      },
+    );
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    const expectedStatusApiPointers = [
+      "/api/v1/issues/issue-docs-1",
+      "/api/v1/issues/issue-docs-1/runs",
+      "/api/v1/runs/run-plan-docs-1",
+    ];
+
+    expect(result.plan.statusApiPointers).toEqual(expectedStatusApiPointers);
+    expect(lifecycle?.issueBreakdownPlans[0]?.statusApiPointers).toEqual(expectedStatusApiPointers);
+    expect(lifecycle?.summaryReferences[0]?.statusApiPointers).toEqual(expectedStatusApiPointers);
+    expect(lifecycle?.summaryReferences[0]?.statusApiPointers).not.toContain("/api/v1/issues/ENG-123");
+  });
+
+  it("propagates project context onto persisted issue breakdown plans and lifecycle state", async () => {
+    const config = testConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ updatedAt: "2026-01-02T00:00:00Z" });
+    const service = new IssueBreakdownPlanService({ config, lifecycleStore });
+
+    const result = await service.submit_issue_breakdown_plan(
+      {
+        runId: "run-plan-context",
+        issueId: candidate.id,
+        summary: "Split the work into child issues.",
+        proposedIssues: [
+          {
+            title: "Build planning schema",
+            description: agentEligibleIssueContract(),
+            acceptanceCriteria: ["Plans persist proposed issues."],
+            dependencies: [],
+            labels: ["planning"],
+          },
+        ],
+        idempotencyKey: "plan-context",
+      },
+      {
+        issue: candidate,
+        projectContext: docsProjectContext,
+        activeRunId: "run-plan-context",
+        role: "worker",
+        phase: "issue_breakdown",
+      },
+    );
+
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    expect(result.plan).toMatchObject({ projectContext: docsProjectContext });
+    expect(lifecycle).toMatchObject({
+      projectContext: docsProjectContext,
+      issueBreakdownPlans: [expect.objectContaining({ projectContext: docsProjectContext })],
     });
   });
 

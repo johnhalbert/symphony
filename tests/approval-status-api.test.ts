@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -29,7 +29,7 @@ import { FileRunTranscriptStore, type RunRecord } from "../src/core/persistence/
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
 import type { TrackerCommentInput, TrackerTransitionInput, TrackerWriteResult, TrackerWriter } from "../src/core/tracker/TrackerWriter.js";
 import type { Issue } from "../src/core/types.js";
-import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
+import { FileWritebackOutboxStore, WritebackProcessor, writebackIdentityKey } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import { issue, testConfig } from "./helpers.js";
@@ -46,6 +46,18 @@ describe("approval status API", () => {
   let lifecycleStore: FileIssueLifecycleStore;
   let store: FileOperatorApprovalStore;
   let service: OperatorApprovalService;
+  const docsProjectContext = {
+    projectContextId: "docs",
+    projectContextLabel: "Documentation Site",
+    linearProjectSlug: "DOCS",
+    routingSource: "candidate_poll",
+  } as const;
+  const symphonyProjectContext = {
+    projectContextId: "symphony",
+    projectContextLabel: "Symphony",
+    linearProjectSlug: "ENG",
+    routingSource: "candidate_poll",
+  } as const;
 
   beforeEach(async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "symphony-approval-api-"));
@@ -64,6 +76,7 @@ describe("approval status API", () => {
       role: "worker",
       issueId: "issue-1",
       issueIdentifier: "TEST-1",
+      projectContext: docsProjectContext,
       attempt: null,
       turnNumber: 1,
       prompt: "work",
@@ -75,6 +88,14 @@ describe("approval status API", () => {
   afterEach(async () => {
     await rmWithRetry(root);
   });
+
+  async function stripPersistedProjectContext(requestId: string): Promise<void> {
+    const approvalPath = path.join(config.workspace.stateDir, "approval-requests", `${requestId}.json`);
+    const record = JSON.parse(await readFile(approvalPath, "utf8")) as Record<string, unknown>;
+    delete record.projectContext;
+    await writeFile(approvalPath, `${JSON.stringify(record, null, 2)}
+`, "utf8");
+  }
 
   it("requires the mutation token and approves pending requests", async () => {
     const pending = await createPending("idem-1");
@@ -107,6 +128,202 @@ describe("approval status API", () => {
       expect(approvedBody.request.status).toBe("approved");
       expect(issueBody.capabilities.pendingApproval.active).toBe(false);
       expect(resumed).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("includes project context on pending approval issue details and capability summaries", async () => {
+    const pending = await createPending("idem-project-context-capability");
+    const server = statusServer({});
+    const address = await server.start();
+
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/TEST-1`);
+      const body = (await response.json()) as {
+        capabilities: {
+          pendingApproval: {
+            active: boolean;
+            requestId: string | null;
+            projectContext: typeof docsProjectContext | null;
+          };
+        };
+        pendingApproval: {
+          requestId: string;
+          projectContext: typeof docsProjectContext;
+        } | null;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.capabilities.pendingApproval).toMatchObject({
+        active: true,
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+      expect(body.pendingApproval).toMatchObject({
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("repairs legacy pending approvals in issue and run status views", async () => {
+    const pending = await createPending("idem-project-context-legacy-status");
+    await stripPersistedProjectContext(pending.requestId);
+    const server = statusServer({});
+    const address = await server.start();
+
+    try {
+      const baseUrl = `http://${address.host}:${address.port}`;
+      const issueResponse = await fetch(`${baseUrl}/api/v1/issues/TEST-1`);
+      const runResponse = await fetch(`${baseUrl}/api/v1/runs/run-1`);
+      const issueBody = (await issueResponse.json()) as {
+        capabilities: {
+          pendingApproval: {
+            active: boolean;
+            requestId: string | null;
+            projectContext: typeof docsProjectContext | null;
+          };
+        };
+        pendingApproval: {
+          requestId: string;
+          projectContext: typeof docsProjectContext;
+        } | null;
+      };
+      const runBody = (await runResponse.json()) as {
+        pendingApproval: {
+          requestId: string;
+          projectContext: typeof docsProjectContext;
+        } | null;
+      };
+
+      expect(issueResponse.status).toBe(200);
+      expect(issueBody.capabilities.pendingApproval).toMatchObject({
+        active: true,
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+      expect(issueBody.pendingApproval).toMatchObject({
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+      expect(runResponse.status).toBe(200);
+      expect(runBody.pendingApproval).toMatchObject({
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("returns pending approval for context-qualified issue lookups when project-context siblings collide", async () => {
+    const pending = await createPending("idem-project-context-collision-status");
+    await runStore.startRun({
+      runId: "run-2",
+      sessionId: "session-2",
+      agentId: "agent-2",
+      role: "worker",
+      issueId: "issue-2",
+      issueIdentifier: "TEST-1",
+      projectContext: symphonyProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "other work",
+      workspaceKey: "TEST-1",
+      workspacePath: path.join(root, "workspace-2"),
+    });
+    const server = statusServer({});
+    const address = await server.start();
+
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/issues/docs:TEST-1`);
+      const body = (await response.json()) as {
+        pendingApproval: {
+          requestId: string;
+          projectContext: typeof docsProjectContext;
+        } | null;
+      };
+
+      expect(pending.projectContext).toMatchObject(docsProjectContext);
+      expect(response.status).toBe(200);
+      expect(body.pendingApproval).toMatchObject({
+        requestId: pending.requestId,
+        projectContext: docsProjectContext,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("resolves approval alias POSTs through the matched approval request id when project-context siblings collide", async () => {
+    const docsPending = await createPending("idem-project-context-collision-post-docs");
+    await runStore.startRun({
+      runId: "run-2",
+      sessionId: "session-2",
+      agentId: "agent-2",
+      role: "worker",
+      issueId: "issue-2",
+      issueIdentifier: "TEST-1",
+      projectContext: symphonyProjectContext,
+      attempt: null,
+      turnNumber: 1,
+      prompt: "other work",
+      workspaceKey: "TEST-1",
+      workspacePath: path.join(root, "workspace-2"),
+    });
+    const symphonyEvidenceCursor = "idem-project-context-collision-post-symphony";
+    const { record: symphonyPending } = await store.requestOrGetPending(
+      {
+        issueId: "issue-2",
+        issueIdentifier: "TEST-1",
+        runId: "run-2",
+        evidenceCursor: symphonyEvidenceCursor,
+        action: action(symphonyEvidenceCursor),
+      },
+      null,
+    );
+    await runStore.updateRun("run-2", {
+      metadata: {
+        pendingApprovalRequestId: symphonyPending.requestId,
+        pendingApprovalRequestedAt: symphonyPending.requestedAt,
+      },
+    });
+    const resumed: OperatorApprovalRecord[] = [];
+    const server = statusServer({ resumed });
+    const address = await server.start();
+
+    try {
+      const response = await fetch(`http://${address.host}:${address.port}/api/v1/approval-requests/${encodeURIComponent("docs:TEST-1")}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-symphony-token": "secret" },
+        body: JSON.stringify({ decision: "approve" }),
+      });
+      const body = (await response.json()) as {
+        request: {
+          requestId: string;
+          status: string;
+          projectContext: typeof docsProjectContext;
+        };
+        replayed: boolean;
+      };
+      const storedDocsPending = await store.get(docsPending.requestId);
+      const storedSymphonyPending = await store.get(symphonyPending.requestId);
+
+      expect(response.status).toBe(200);
+      expect(body.request).toMatchObject({
+        requestId: docsPending.requestId,
+        status: "approved",
+        projectContext: docsProjectContext,
+      });
+      expect(body.request.requestId).not.toBe(symphonyPending.requestId);
+      expect(body.replayed).toBe(false);
+      expect(storedDocsPending?.status).toBe("approved");
+      expect(storedSymphonyPending?.status).toBe("pending");
+      expect(resumed).toHaveLength(1);
+      expect(resumed[0]?.requestId).toBe(docsPending.requestId);
     } finally {
       await server.stop();
     }
@@ -577,6 +794,7 @@ describe("approval status API", () => {
       lifecycleStore,
       writebackOutbox: outboxStore,
       operatorApproval: service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -713,6 +931,7 @@ describe("approval status API", () => {
       lifecycleStore,
       writebackOutbox: outboxStore,
       operatorApproval: service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -992,6 +1211,7 @@ describe("approval status API", () => {
       lifecycleStore,
       writebackOutbox: outboxStore,
       operatorApproval: service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: "secret",
@@ -1157,8 +1377,8 @@ describe("approval status API", () => {
               branch: "symphony/TEST-1",
             },
             writebackOperationKeys: [
-              "comment:issue-1:run-1:completion-report:idem-1",
-              "transition:issue-1:run-1:completion-report:idem-1:In Review",
+              writebackIdentityKey("comment:issue-1:run-1:completion-report:idem-1"),
+              writebackIdentityKey("transition:issue-1:run-1:completion-report:idem-1:In Review"),
             ],
           }),
         ],
@@ -1551,6 +1771,7 @@ describe("approval status API", () => {
     await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
       phase: "blocked",
       blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+      projectContext: docsProjectContext,
       lastCompletionReportId: `completion-report:issue-1:${evidenceCursor}`,
       completionReports: [
         {
@@ -1594,6 +1815,7 @@ describe("approval status API", () => {
         await lifecycleStore.ensureIssue(issue({ state: "Blocked", branchName: "symphony/TEST-1" }), {
           phase: "blocked",
           blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          projectContext: docsProjectContext,
           lastCompletionReportId: `completion-report:issue-1:${pending.evidenceCursor}`,
           completionReports: [
             {
@@ -1744,6 +1966,7 @@ describe("approval status API", () => {
       runStore,
       lifecycleStore,
       operatorApproval: options.operatorApproval ?? service,
+      defaultProjectContextId: docsProjectContext.projectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: options.openWorkspaceToken === undefined ? "secret" : options.openWorkspaceToken,

@@ -1,5 +1,13 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import type { ProjectionPayloadWriteInput, ProjectionWriteResult } from "../src/core/persistence/ProjectionTransactionService.js";
 import {
   InMemoryRunActivityAppendStore,
@@ -7,7 +15,7 @@ import {
 } from "../src/core/persistence/RunActivityAppendStore.js";
 import type { OrchestratorConversationStore } from "../src/core/persistence/OrchestratorConversationStore.js";
 import type { IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
-import type { RunRecord, RunTranscriptStore, TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
+import { FileRunTranscriptStore, type RunRecord, type RunTranscriptStore, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
 import { mapRunActivityEventToTranscriptEvent } from "../src/core/transcript/RunActivityEventMapper.js";
 import type { Issue, TrackerStateLists } from "../src/core/types.js";
 
@@ -219,7 +227,17 @@ describe("web history/transcript durable projection writes", () => {
 
   it("persists transcript page projections with run/session/page fields and sanitized payload", async () => {
     const projectionWriter = recordingProjectionWriter();
-    const run = runFixture({ runId: "run-1", sessionId: "session-1", transcriptEventCount: 3 });
+    const run = runFixture({
+      runId: "run-1",
+      sessionId: "session-1",
+      transcriptEventCount: 3,
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "docs",
+        routingSource: "issue_record",
+      },
+    });
     const server = createStatusServer({
       runStore: runStoreFixture({
         runs: [run],
@@ -251,11 +269,17 @@ describe("web history/transcript durable projection writes", () => {
         projectionName: "transcript_projection",
         buildMode: "incremental",
         scopeKind: "run_page",
-        scopeKey: "run-1:offset:1:limit:1",
+        scopeKey: "pc=docs|run-1:offset:1:limit:1",
         sourceCursors: {
           runId: "run-1",
           sessionId: "session-1",
           issueKey: "TEST-1",
+          projectContext: {
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+            linearProjectSlug: "docs",
+            routingSource: "issue_record",
+          },
           offset: 1,
           limit: 1,
           nextOffset: 2,
@@ -472,6 +496,193 @@ describe("web history/transcript durable projection writes", () => {
     expect(serializedWrites).toContain("token=[redacted]");
   });
 
+  it("passes project context ids into durable transcript rebuild reads when transcript pages come from the run-activity source store", async () => {
+    const projectionWriter = recordingProjectionWriter();
+    const run = runFixture({
+      runId: "shared-run",
+      sessionId: "shared-session-red",
+      issueId: "issue-red",
+      issueIdentifier: "TEST-RED",
+      transcriptEventCount: 2,
+      projectContext: {
+        projectContextId: "red",
+        projectContextLabel: "Red",
+        linearProjectSlug: "red",
+        routingSource: "issue_record",
+      },
+    });
+    const durableActivityStore = new InMemoryRunActivityAppendStore();
+    const appended = await durableActivityStore.appendEvents([
+      runActivityInputFixture({
+        id: "activity-shared-1",
+        runId: run.runId,
+        sessionId: run.sessionId,
+        sequence: 1,
+        text: "shared durable message 1",
+      }),
+      runActivityInputFixture({
+        id: "activity-shared-2",
+        runId: run.runId,
+        sessionId: run.sessionId,
+        sequence: 2,
+        text: "shared durable message 2",
+      }),
+    ]);
+    expect(appended.rejected).toEqual([]);
+    const durableReadCalls: Array<{ runId: string; offset: number | undefined; limit: number | undefined; projectContextId: string | null }> = [];
+    const runActivitySourceStore = {
+      async readRunEvents(runId: string, options: { offset?: number; limit?: number; projectContextId?: string | null } = {}) {
+        durableReadCalls.push({
+          runId,
+          offset: options.offset,
+          limit: options.limit,
+          projectContextId: options.projectContextId ?? null,
+        });
+        return durableActivityStore.readRunEvents(runId, {
+          ...(options.offset === undefined ? {} : { offset: options.offset }),
+          ...(options.limit === undefined ? {} : { limit: options.limit }),
+        });
+      },
+    };
+    let rawTranscriptReads = 0;
+    const server = createStatusServer({
+      runStore: runStoreFixture({
+        runs: [run],
+        beforeReadTranscript: () => {
+          rawTranscriptReads += 1;
+          throw new Error("context-scoped durable rebuild should not hydrate raw transcript pages");
+        },
+      }),
+      runActivitySourceStore,
+      projectionWriter,
+    });
+
+    const result = await server.rebuildDurableWebProjections({
+      projections: ["transcript_projection"],
+      transcriptPageLimit: 1,
+    });
+
+    expect(result).toMatchObject({ attempted: 3, written: 3, unchanged: 0, skipped: 0, failed: 0 });
+    expect(rawTranscriptReads).toBe(0);
+    expect(durableReadCalls).toEqual([
+      { runId: "shared-run", offset: 0, limit: 1, projectContextId: "red" },
+      { runId: "shared-run", offset: 0, limit: 500, projectContextId: "red" },
+      { runId: "shared-run", offset: 0, limit: 1, projectContextId: "red" },
+      { runId: "shared-run", offset: 1, limit: 1, projectContextId: "red" },
+    ]);
+  });
+
+
+
+  it("passes the legacy/default project context id into durable transcript rebuild reads for persisted runs missing projectContext metadata", async () => {
+    const projectionWriter = recordingProjectionWriter();
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-web-transcript-legacy-"));
+    const runStore = new FileRunTranscriptStore(root);
+    const run = await runStore.startRun({
+      runId: "legacy-default-run",
+      sessionId: "legacy-default-session",
+      agentId: "agent-legacy-default",
+      role: "worker",
+      issueId: "issue-legacy-default",
+      issueIdentifier: "LEGACY-1",
+      attempt: 1,
+      turnNumber: 1,
+      prompt: "Repair legacy/default projection attribution coverage",
+      workspaceKey: "LEGACY-1",
+      workspacePath: "/tmp/workspaces/LEGACY-1",
+      gitBranchName: "symphony/LEGACY-1",
+      repoPath: "/tmp/repo",
+      baseRef: "origin/main",
+    });
+
+    const runMetaPath = path.join(root, "runs", run.runId, "meta.json");
+    const legacyRun = JSON.parse(await readFile(runMetaPath, "utf8")) as Record<string, unknown>;
+    delete legacyRun.projectContext;
+    await writeFile(runMetaPath, `${JSON.stringify(legacyRun, null, 2)}\n`, "utf8");
+
+    await expect(runStore.listRuns()).resolves.toMatchObject([
+      {
+        runId: "legacy-default-run",
+        projectContext: {
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+          linearProjectSlug: null,
+          routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+        },
+      },
+    ]);
+
+    const durableActivityStore = new InMemoryRunActivityAppendStore();
+    const appended = await durableActivityStore.appendEvents([
+      runActivityInputFixture({
+        id: "activity-legacy-default-1",
+        runId: run.runId,
+        sessionId: run.sessionId,
+        sequence: 1,
+        text: "legacy default durable message 1",
+      }),
+      runActivityInputFixture({
+        id: "activity-legacy-default-2",
+        runId: run.runId,
+        sessionId: run.sessionId,
+        sequence: 2,
+        text: "legacy default durable message 2",
+      }),
+    ]);
+    expect(appended.rejected).toEqual([]);
+    const durableReadCalls: Array<{ runId: string; offset: number | undefined; limit: number | undefined; projectContextId: string | null }> = [];
+    const runActivitySourceStore = {
+      async readRunEvents(runId: string, options: { offset?: number; limit?: number; projectContextId?: string | null } = {}) {
+        durableReadCalls.push({
+          runId,
+          offset: options.offset,
+          limit: options.limit,
+          projectContextId: options.projectContextId ?? null,
+        });
+        return durableActivityStore.readRunEvents(runId, {
+          ...(options.offset === undefined ? {} : { offset: options.offset }),
+          ...(options.limit === undefined ? {} : { limit: options.limit }),
+          ...(options.projectContextId === undefined ? {} : { projectContextId: options.projectContextId }),
+        });
+      },
+    };
+    let rawTranscriptReads = 0;
+    const instrumentedRunStore = new Proxy(runStore as RunTranscriptStore, {
+      get(target, prop, receiver) {
+        if (prop === "readTranscript" || prop === "readTranscriptTail") {
+          return async () => {
+            rawTranscriptReads += 1;
+            throw new Error("legacy/default scoped durable rebuild should not hydrate raw transcript pages");
+          };
+        }
+        const value = Reflect.get(target as object, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as RunTranscriptStore;
+    const server = createStatusServer({
+      runStore: instrumentedRunStore,
+      runActivitySourceStore,
+      projectionWriter,
+    });
+
+    try {
+      const result = await server.rebuildDurableWebProjections({
+        projections: ["transcript_projection"],
+        transcriptPageLimit: 2,
+      });
+
+      expect(result).toMatchObject({ attempted: 2, written: 2, unchanged: 0, skipped: 0, failed: 0 });
+      expect(rawTranscriptReads).toBe(0);
+      expect(durableReadCalls).toEqual([
+        { runId: "legacy-default-run", offset: 0, limit: 1, projectContextId: "default" },
+        { runId: "legacy-default-run", offset: 0, limit: 500, projectContextId: "default" },
+        { runId: "legacy-default-run", offset: 0, limit: 2, projectContextId: "default" },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("serves large history views from bounded run slices without transcript hydration", async () => {
     const projectionWriter = recordingProjectionWriter();
     const runs = Array.from({ length: 250 }, (_, index) =>
@@ -529,7 +740,7 @@ describe("web history/transcript durable projection writes", () => {
     }
   });
 
-  it("rebuilds dashboard and sidebar rows with durable running runs and lifecycle-only issues omitted by the tracker board", async () => {
+  it("rebuilds dashboard and sidebar rows with runtime-authoritative running agents and lifecycle-only issues omitted by the tracker board", async () => {
     const projectionWriter = statefulProjectionWriter();
     const runningRun = runFixture({
       runId: "run-active-only",
@@ -571,6 +782,7 @@ describe("web history/transcript durable projection writes", () => {
       expect(routeSidebar).toBeDefined();
 
       const routeDashboardPayload = routeDashboard.payload as {
+        agentUsageLabel: string;
         runningAgents: Array<{ id: string; issue: string; state: string; tokens: string }>;
         totals: Record<string, number>;
       };
@@ -578,8 +790,9 @@ describe("web history/transcript durable projection writes", () => {
         runningAgents: Array<{ id: string; issue: string; state: string; tokens: string }>;
         totals: Record<string, number>;
       };
-      expect(routeDashboardPayload.runningAgents).toMatchObject([
-        { id: "run-active-only", issue: "TEST-RUN-ONLY", state: "running", tokens: "25" },
+      expect(routeDashboardPayload.agentUsageLabel).toBe("1 agent");
+      expect(routeDashboardPayload.runningAgents).toEqual([
+        expect.objectContaining({ issue: "TEST-RUN-ONLY" }),
       ]);
       expect(routeDashboardPayload.totals).toMatchObject({ progress: 1, review: 1, open: 2, all: 2 });
       expect(routeDashboard.sourceCursors).toMatchObject({ issueCount: 2, openIssueCount: 2, runningAgentCount: 1 });

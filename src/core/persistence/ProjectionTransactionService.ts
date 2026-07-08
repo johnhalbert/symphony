@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID, normalizeProjectContextId } from "../config/ProjectContexts.js";
 import {
   mergeProjectionSourceFreshness,
   normalizeProjectionSourceFreshnessList,
@@ -33,6 +34,7 @@ export type ProjectionWriteMode = Exclude<ProjectionBuildMode, "bootstrap">;
 
 export interface ProjectionRevisionSelector {
   projectionName: DurableProjectionName;
+  projectContextId?: string | null;
   scopeKind?: string | null;
   scopeKey?: string | null;
 }
@@ -40,6 +42,7 @@ export interface ProjectionRevisionSelector {
 export interface ProjectionRevisionRecord {
   projectionRevisionId: string | number;
   projectionName: DurableProjectionName;
+  projectContextId: string;
   scopeKind: string;
   scopeKey: string;
   revision: number;
@@ -87,6 +90,7 @@ export interface ProjectionPayloadWriteInput extends ProjectionRevisionSelector 
 
 export interface ProjectionRevisionInsertInput {
   projectionName: DurableProjectionName;
+  projectContextId: string;
   scopeKind: string;
   scopeKey: string;
   revision: number;
@@ -101,6 +105,7 @@ export interface ProjectionRevisionInsertInput {
 
 export interface ProjectionPayloadInsertInput {
   projectionName: DurableProjectionName;
+  projectContextId: string;
   projectionRevisionId: string | number;
   scopeKey: string;
   revision: number;
@@ -138,6 +143,8 @@ export interface ProjectionPayloadRecord<TPayload = unknown> {
 export interface ProjectionTranscriptDefaultPayloadSelector {
   runId: string;
   limit: number;
+  scopeKey?: string | null | undefined;
+  projectContextId?: string | null | undefined;
 }
 
 export interface ProjectionTransactionPayloadStore extends ProjectionTransactionStore {
@@ -152,6 +159,7 @@ export interface ProjectionTranscriptDefaultPayloadStore extends ProjectionTrans
 
 export interface ProjectionRevisionPublication {
   projectionName: DurableProjectionName;
+  projectContextId: string;
   scopeKind: string;
   scopeKey: string;
   projectionRevisionId: string | number;
@@ -218,6 +226,7 @@ export interface PostgresProjectionTransactionStoreOptions {
 
 export interface NormalizedProjectionRevisionSelector {
   projectionName: DurableProjectionName;
+  projectContextId: string;
   scopeKind: string;
   scopeKey: string;
 }
@@ -225,6 +234,7 @@ export interface NormalizedProjectionRevisionSelector {
 interface NormalizedProjectionTranscriptDefaultPayloadSelector {
   runId: string;
   limit: number;
+  projectContextId: string | null;
 }
 
 export interface NormalizedProjectionPayloadFields {
@@ -386,6 +396,7 @@ export class ProjectionTransactionService {
       await transaction.supersedeCurrentRevision(selector, input.generatedAt);
       const revision = await transaction.insertProjectionRevision({
         projectionName: input.projectionName,
+        projectContextId: input.projectContextId,
         scopeKind: input.scopeKind,
         scopeKey: input.scopeKey,
         revision: nextRevision,
@@ -399,6 +410,7 @@ export class ProjectionTransactionService {
       });
       await transaction.insertProjectionPayload({
         projectionName: input.projectionName,
+        projectContextId: input.projectContextId,
         projectionRevisionId: revision.projectionRevisionId,
         scopeKey: input.scopeKey,
         revision: nextRevision,
@@ -519,10 +531,10 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
     const rows = await this.runner.query<ProjectionRevisionRow>(
       `SELECT ${projectionRevisionSelectColumns()}
        FROM ${this.table("projection_revision")}
-       WHERE projection_name = $1 AND scope_kind = $2 AND scope_key = $3 AND superseded_at IS NULL
+       WHERE project_context_id = $1 AND projection_name = $2 AND scope_kind = $3 AND scope_key = $4 AND superseded_at IS NULL
        ORDER BY revision DESC
        LIMIT 1${options.lock ? " FOR UPDATE" : ""}`,
-      [selector.projectionName, selector.scopeKind, selector.scopeKey],
+      [selector.projectContextId, selector.projectionName, selector.scopeKind, selector.scopeKey],
     );
     return mapProjectionRevisionRow(rows.rows[0]);
   }
@@ -534,10 +546,10 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
     const rows = await this.runner.query<ProjectionRevisionRow>(
       `SELECT ${projectionRevisionSelectColumns()}
        FROM ${this.table("projection_revision")}
-       WHERE projection_name = $1 AND scope_kind = $2 AND scope_key = $3
+       WHERE project_context_id = $1 AND projection_name = $2 AND scope_kind = $3 AND scope_key = $4
        ORDER BY revision DESC, generated_at DESC
        LIMIT 1${options.lock ? " FOR UPDATE" : ""}`,
-      [selector.projectionName, selector.scopeKind, selector.scopeKey],
+      [selector.projectContextId, selector.projectionName, selector.scopeKind, selector.scopeKey],
     );
     return mapProjectionRevisionRow(rows.rows[0]);
   }
@@ -553,13 +565,15 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
        FROM ${this.table("projection_revision")} revision
        JOIN ${this.table(selector.projectionName)} payload
          ON payload.projection_revision_id = revision.projection_revision_id
-       WHERE revision.projection_name = $1
-         AND revision.scope_kind = $2
-         AND revision.scope_key = $3
+       WHERE revision.project_context_id = $1
+         AND payload.project_context_id = $1
+         AND revision.projection_name = $2
+         AND revision.scope_kind = $3
+         AND revision.scope_key = $4
          AND revision.superseded_at IS NULL
        ORDER BY revision.revision DESC
        LIMIT 1`,
-      [selector.projectionName, selector.scopeKind, selector.scopeKey],
+      [selector.projectContextId, selector.projectionName, selector.scopeKind, selector.scopeKey],
     );
     return mapProjectionPayloadRow<TPayload>(rows.rows[0]);
   }
@@ -582,13 +596,17 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
          AND revision.superseded_at IS NULL
          AND payload.run_id = $1
          AND payload.offset_limit = $2
+         AND (
+           ($3::text IS NULL AND revision.scope_key NOT LIKE 'pc=%|%')
+           OR ($3::text IS NOT NULL AND revision.scope_key LIKE ('pc=' || $3 || '|%'))
+         )
        ORDER BY (payload.next_offset IS NULL) DESC,
                 payload.message_count DESC,
                 payload.offset_start DESC,
                 revision.revision DESC,
                 payload.generated_at DESC
        LIMIT 1`,
-      [selector.runId, selector.limit],
+      [selector.runId, selector.limit, selector.projectContextId],
     );
     return mapProjectionPayloadRow<TPayload>(rows.rows[0]);
   }
@@ -596,15 +614,16 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
   async supersedeCurrentRevision(selector: NormalizedProjectionRevisionSelector, supersededAt: string): Promise<void> {
     await this.runner.query(
       `UPDATE ${this.table("projection_revision")}
-       SET superseded_at = $4::timestamptz
-       WHERE projection_name = $1 AND scope_kind = $2 AND scope_key = $3 AND superseded_at IS NULL`,
-      [selector.projectionName, selector.scopeKind, selector.scopeKey, supersededAt],
+       SET superseded_at = $5::timestamptz
+       WHERE project_context_id = $1 AND projection_name = $2 AND scope_kind = $3 AND scope_key = $4 AND superseded_at IS NULL`,
+      [selector.projectContextId, selector.projectionName, selector.scopeKind, selector.scopeKey, supersededAt],
     );
   }
 
   async insertProjectionRevision(input: ProjectionRevisionInsertInput): Promise<ProjectionRevisionRecord> {
     const rows = await this.runner.query<ProjectionRevisionRow>(
       `INSERT INTO ${this.table("projection_revision")} (
+         project_context_id,
          projection_name,
          scope_kind,
          scope_key,
@@ -616,9 +635,10 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
          content_sha256,
          generated_at,
          expires_at
-       ) VALUES ($1, $2, $3, $4::bigint, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10::timestamptz, $11::timestamptz)
+       ) VALUES ($1, $2, $3, $4, $5::bigint, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11::timestamptz, $12::timestamptz)
        RETURNING ${projectionRevisionSelectColumns()}`,
       [
+        input.projectContextId,
         input.projectionName,
         input.scopeKind,
         input.scopeKey,
@@ -651,6 +671,7 @@ class PostgresProjectionTransaction implements ProjectionTransactionRevisionPort
 interface ProjectionRevisionRow {
   projection_revision_id: string | number;
   projection_name: string;
+  project_context_id: string;
   scope_kind: string;
   scope_key: string;
   revision: string | number;
@@ -679,27 +700,46 @@ interface ProjectionPayloadRow extends ProjectionRevisionRow {
 }
 
 function projectionSelectorFromNormalized(input: NormalizedProjectionRevisionSelector): NormalizedProjectionRevisionSelector {
-  return { projectionName: input.projectionName, scopeKind: input.scopeKind, scopeKey: input.scopeKey };
+  return {
+    projectionName: input.projectionName,
+    projectContextId: input.projectContextId,
+    scopeKind: input.scopeKind,
+    scopeKey: input.scopeKey,
+  };
 }
 
 function normalizeProjectionRevisionSelector(selector: ProjectionRevisionSelector): NormalizedProjectionRevisionSelector {
   assertDurableProjectionName(selector.projectionName);
+  const projectContextId = normalizeProjectionContextSelectorValue(selector.projectContextId);
   const scopeKind = normalizeNonEmptyString(selector.scopeKind, DEFAULT_SCOPE_KIND, "projection scope kind");
   const scopeKey = normalizeNonEmptyString(
     selector.scopeKey,
     DEFAULT_PROJECTION_SCOPE_KEYS[selector.projectionName],
     "projection scope key",
   );
-  return { projectionName: selector.projectionName, scopeKind, scopeKey };
+  return { projectionName: selector.projectionName, projectContextId, scopeKind, scopeKey };
 }
 
 function normalizeProjectionTranscriptDefaultPayloadSelector(
   selector: ProjectionTranscriptDefaultPayloadSelector,
 ): NormalizedProjectionTranscriptDefaultPayloadSelector {
+  const runId = normalizeNonEmptyString(selector.runId, null, "transcript projection runId");
+  const limit = normalizeInteger(selector.limit, { minimum: 1, name: "transcript projection limit" });
+  const scopeKey = normalizeNonEmptyString(selector.scopeKey, `${runId}:tail:limit:${limit}`, "transcript projection scopeKey");
+  const projectContextId =
+    typeof selector.projectContextId === "string" && selector.projectContextId.trim().length > 0
+      ? selector.projectContextId.trim()
+      : transcriptProjectionScopeKeyProjectContextId(scopeKey);
   return {
-    runId: normalizeNonEmptyString(selector.runId, null, "transcript projection runId"),
-    limit: normalizeInteger(selector.limit, { minimum: 1, name: "transcript projection limit" }),
+    runId,
+    limit,
+    projectContextId,
   };
+}
+
+function transcriptProjectionScopeKeyProjectContextId(scopeKey: string): string | null {
+  const match = /^pc=([^|]+)\|/.exec(scopeKey);
+  return match?.[1] ?? null;
 }
 
 function normalizeProjectionPayloadWrite(input: ProjectionPayloadWriteInput, clock: () => Date): NormalizedProjectionPayloadWrite {
@@ -764,16 +804,22 @@ function isProjectionPublicationForSelector(
   event: ProjectionRevisionPublication,
   selector: NormalizedProjectionRevisionSelector,
 ): boolean {
-  return event.projectionName === selector.projectionName && event.scopeKind === selector.scopeKind && event.scopeKey === selector.scopeKey;
+  return (
+    event.projectionName === selector.projectionName &&
+    event.projectContextId === selector.projectContextId &&
+    event.scopeKind === selector.scopeKind &&
+    event.scopeKey === selector.scopeKey
+  );
 }
 
 function projectionProviderSource(selector: NormalizedProjectionRevisionSelector): string {
-  return `${selector.projectionName}:${selector.scopeKind}:${selector.scopeKey}`;
+  return `${selector.projectionName}:${selector.projectContextId}:${selector.scopeKind}:${selector.scopeKey}`;
 }
 
 function revisionPublicationFromRecord(record: ProjectionRevisionRecord): ProjectionRevisionPublication {
   return {
     projectionName: record.projectionName,
+    projectContextId: record.projectContextId,
     scopeKind: record.scopeKind,
     scopeKey: record.scopeKey,
     projectionRevisionId: record.projectionRevisionId,
@@ -792,6 +838,7 @@ function projectionRevisionSelectColumns(tableAlias?: string): string {
   const columns = [
     "projection_revision_id",
     "projection_name",
+    "project_context_id",
     "scope_kind",
     "scope_key",
     "revision",
@@ -822,6 +869,7 @@ function projectionPayloadInsertStatement(schema: string, input: ProjectionPaylo
     expressions.push(`$${values.length}${cast ? `::${cast}` : ""}`);
   };
 
+  push("project_context_id", input.projectContextId);
   push("projection_revision_id", input.projectionRevisionId, "bigint");
   push("scope_key", input.scopeKey);
   push("revision", input.revision, "bigint");
@@ -872,6 +920,7 @@ function mapProjectionRevisionRow(row: ProjectionRevisionRow | undefined): Proje
   return {
     projectionRevisionId: row.projection_revision_id,
     projectionName: row.projection_name,
+    projectContextId: normalizeProjectionContextSelectorValue(row.project_context_id),
     scopeKind: row.scope_kind,
     scopeKey: row.scope_key,
     revision,
@@ -991,6 +1040,13 @@ function projectionBuildModeFromDb(value: string | null | undefined, revision: n
 function normalizeNullableString(value: string | null | undefined, name: string): string | null {
   if (value === undefined || value === null) return null;
   return normalizeNonEmptyString(value, null, name);
+}
+
+function normalizeProjectionContextSelectorValue(value: string | null | undefined): string {
+  if (value === undefined || value === null) return LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+  return normalizeProjectContextId(trimmed);
 }
 
 function normalizeNonEmptyString(value: unknown, fallback: string | null, name: string): string {

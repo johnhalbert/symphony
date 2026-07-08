@@ -1,4 +1,5 @@
 import type { ServiceConfig } from "../config/Config.js";
+import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 import type { RunActivityEvent } from "../runActivity/RunActivityEvent.js";
@@ -45,6 +46,7 @@ export interface AgentHarnessCapabilities {
 
 export interface AgentRunContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   role: AgentRunRole;
   runPhase?: AgentRunPhase;
   attempt: number | null;

@@ -759,6 +759,31 @@ repos/<repository-sha>
 locks/<repo-branch-sha>.lock
 ```
 
+### Project Context Attribution
+
+Source: `src/core/config/ProjectContexts.ts`, `src/core/persistence/RunTranscriptStore.ts`, `src/core/persistence/IssueLifecycleStore.ts`, `src/core/writeback/WritebackOutbox.ts`, `src/core/approval/OperatorApprovalService.ts`.
+
+```ts
+interface ProjectContextResolution {
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
+  routingSource: string;
+}
+```
+
+Common `routingSource` values:
+
+- `candidate_poll`: current tracker polling/config matched the issue to an enabled project context.
+- `replay` / `state_refresh`: durable state already carried explicit routing metadata, so reload/replay preserved that attribution even if current config drift later disables or removes the context.
+- `legacy_default`: compatibility fallback for historical single-project records or workflows that still omit `project_contexts` and rely on the synthesized default context.
+
+Compatibility contract:
+
+- File-backed `WorkspaceRecord`, `RunRecord`, `IssueLifecycleRecord`, writeback operations, operator approval requests, handoff memo packets, and related status/API projections normalize a missing `projectContext` field to `{ projectContextId: "default", projectContextLabel: "Default", linearProjectSlug: null, routingSource: "legacy_default" }` on read.
+- That normalization is a read-time compatibility repair. Legacy files are not rewritten just because the default context was synthesized.
+- Durable transcript/history rebuilds and Postgres read paths scope lookups by `projectContextId`; historical runs without explicit attribution must still read through the synthesized `default` context rather than treating bare run/session ids as globally unique.
+
 ### Workspace Records
 
 Source: `FileRunTranscriptStore` and `WorkspaceManager`.
@@ -768,6 +793,7 @@ interface WorkspaceRecord {
   workspaceKey: WorkspaceKey;
   issueId: IssueId | null;
   issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
   path: FilePath;
   sourceKind: string;
   repoPath?: FilePath;
@@ -781,6 +807,8 @@ interface WorkspaceMetadata extends WorkspaceRecord {}
 ```
 
 Workspace records are keyed by sanitized issue identifier. Planning workspaces use `<identifier>-planning`.
+
+`WorkspaceRecord.projectContext` preserves which workflow/codebase context owns the durable workspace. Legacy workspace files that predate explicit attribution read back as the synthesized legacy/default context.
 
 Workspace marker files:
 
@@ -823,6 +851,7 @@ interface RunRecord {
   runKind?: AgentRunKind;
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
   attempt: number | null;
   turnNumber: number;
   prompt: string;
@@ -907,6 +936,7 @@ Relationships:
 
 - `RunRecord.runId` owns `runs/<runId>/events.jsonl`.
 - `RunRecord.issueId` relates to `IssueLifecycleRecord.issueId`, writebacks, approvals, and provider gate sources.
+- `RunRecord.projectContext` scopes durable transcript/run-activity reads and status projections; legacy run metadata missing that field is normalized to the legacy/default context on read.
 - `RunRecord.workspaceKey` relates to `WorkspaceRecord.workspaceKey`.
 - Harnesses provide `sessionId`, `agentId`, token counts, SDK/run status, provider-limit signals, and transcript events.
 
@@ -925,6 +955,7 @@ type IssueLifecyclePhase =
   | "unknown";
 
 interface IssueLifecycleSummaryPointers {
+  projectContext?: ProjectContextResolution;
   workspaceKey: WorkspaceKey | null;
   workspacePath: FilePath | null;
   branchName: string | null;
@@ -972,6 +1003,7 @@ interface IssueBreakdownPlanRecord {
   runId: RunId;
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
   summary: string;
   proposedIssues: ProposedIssueRecord[];
   transcriptPointers: string[];
@@ -1009,6 +1041,7 @@ interface IssueCompletionReportRecord {
   runId: RunId;
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
   summary: string;
   validationEvidence: string[];
   acceptanceChecklist: Array<{ text: string; satisfied: boolean; evidence: string | null }>;
@@ -1026,6 +1059,7 @@ interface IssueReviewVerdictRecord {
   runId: RunId;
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
   verdict: "pass" | "fail";
   acceptanceResults: Array<{ text: string; satisfied: boolean; evidence: string | null }>;
   findings: string[];
@@ -1042,6 +1076,7 @@ interface IssueReviewFeedbackRecord {
   runId: RunId;
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
   kind: "review" | "review_comment" | "issue_comment";
   event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT" | null;
   body: string;
@@ -1164,6 +1199,7 @@ interface IssueMergeConflictResolutionReportRecord {
   runId: RunId;
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
   resolutionStatus: "resolved" | "still_conflicted" | "blocked";
   summary: string;
   validationEvidence: string[];
@@ -1182,6 +1218,7 @@ interface IssueLaneMemo {
   version: 1;
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
   updatedAt: IsoDateTime;
   reviewRound: number;
   incompleteTurnCount: number;
@@ -1200,9 +1237,22 @@ interface IssueHandoffState {
   lastReviewerOutput: IssueReviewerOutputContract | null;
 }
 
+interface WorkerHandoffPacket {
+  version: 1;
+  issueId: IssueId;
+  issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
+  generatedAt: IsoDateTime;
+  memo: IssueLaneMemo;
+  lastWorkerOutput: IssueWorkerOutputContract | null;
+  lastReviewerOutput: IssueReviewerOutputContract | null;
+  pointers: IssueLifecycleSummaryPointers;
+}
+
 interface IssueLifecycleRecord {
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
   phase: IssueLifecyclePhase;
   reviewRound: number;
   incompleteTurnCount: number;
@@ -1234,9 +1284,9 @@ interface IssueLifecycleRecord {
 Lifecycle relationships:
 
 - `lastCompletionReportId`, `lastReviewVerdictId`, `lastIssueBreakdownPlanId`, and merge conflict ids point into arrays inside the same lifecycle record.
-- `summaryPointers` is the denormalized "latest known" bridge to workspaces, runs, git, PR, and CI.
+- `summaryPointers` is the denormalized "latest known" bridge to project context, workspaces, runs, git, PR, and CI.
 - `summaryReferences` points to transcript and status API locations that can rebuild context.
-- `handoff.memo` is the compact cross-turn memory used between worker and reviewer lanes.
+- `handoff.memo` and `WorkerHandoffPacket` preserve the currently attributed project context across worker/reviewer lane transitions.
 - `reviewEvidence.lastWorkerEvidenceCursor` prevents workers from reusing stale PR review evidence.
 - Merge automation uses completion report + review approval + PR details + required checks to update `mergeGate`, `mergeConflict`, or `merge`.
 
@@ -1262,6 +1312,7 @@ type WritebackOperation =
 interface WritebackCommon {
   idempotencyKey: string;
   issueId: IssueId;
+  projectContext?: ProjectContextResolution;
   runId?: RunId;
   status: WritebackStatus;
   attempt: number;
@@ -1320,6 +1371,7 @@ interface WritebackIssueRelationOperation extends WritebackCommon {
 Writeback relationships:
 
 - `issueId` links to Linear and lifecycle.
+- `projectContext` scopes idempotency and replay to the attributed workflow/codebase context even when issue identifiers or run ids overlap elsewhere.
 - `runId` links to the run that generated the operation when applicable.
 - Lifecycle records store operation keys in reports, plans, merge gates, merge conflict metadata, and final merge metadata.
 - Issue-breakdown application freshness checks use the current `IssueBreakdownPlanRecord` and operation bindings.
@@ -1349,6 +1401,7 @@ interface OperatorApprovalRecord {
   status: OperatorApprovalStatus;
   issueId: IssueId;
   issueIdentifier: IssueIdentifier;
+  projectContext?: ProjectContextResolution;
   runId: RunId;
   evidenceCursor: string;
   dedupeKey: string;
@@ -1365,6 +1418,7 @@ interface OperatorApprovalRecord {
 Approval relationships:
 
 - Completion-report publication can create an approval request.
+- `projectContext` preserves which workflow/codebase context requested publication and follows the same legacy/default readback contract as other durable records.
 - `RunRecord.pendingApprovalRequestId` mirrors pending state.
 - Approval creation and resolution also append transcript events to the run.
 - Rejection can mark the run failed or cancelled depending on `github.operatorApproval.rejectPolicy`.

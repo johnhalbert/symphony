@@ -14,10 +14,16 @@ import {
   writeActiveHandoffMcpContexts,
   writeInitialHandoffMcpContexts,
 } from "../../src/core/harness/HandoffMcp.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../../src/core/config/ProjectContexts.js";
 import { errorMessage, SymphonyError } from "../../src/core/errors.js";
 import type { RunTranscriptStore } from "../../src/core/persistence/RunTranscriptStore.js";
 import type { AgentRunPhase, TokenCounts } from "../../src/core/types.js";
 import { redactTextPreserveFormatting, redactTranscriptText, sanitizedPreviewValue } from "../../src/core/transcript/TranscriptProjection.js";
+import { sanitizeWorkspaceKey } from "../../src/core/workspace/WorkspaceManager.js";
 import { resolveRuntimeCredential } from "../../src/app/RuntimeDependencies.js";
 import { ScopedGatewayClient, type GatewayEvent, type HermesGatewayClient, type HermesGatewayEnvironment } from "./GatewayFacade.js";
 import {
@@ -55,6 +61,8 @@ interface HermesLease {
   key: string;
   reusable: boolean;
   profile: HermesProfile;
+  workspaceKey: string;
+  projectContext: ProjectContextResolution | null;
   client: HermesGatewayClient;
   startupTimeoutMs: number;
   requestTimeoutMs: number;
@@ -70,6 +78,12 @@ interface HermesLease {
 type TerminalStatus = "succeeded" | "failed" | "cancelled" | null;
 
 const HERMES_SESSION_STATE_FILENAME = ".symphony-hermes-session.json";
+
+interface HermesSessionStateMetadata {
+  profileKey: string;
+  workspaceKey: string;
+  projectContext: ProjectContextResolution | null;
+}
 
 export class HermesHarness implements AgentHarness {
   readonly id = "hermes";
@@ -301,7 +315,9 @@ export class HermesHarness implements AgentHarness {
     const reusable = shouldReuseLease(ctx);
     const resume = ctx.hermesResume ?? null;
     const freshLeaseId = reusable ? null : randomUUID();
-    const key = resume ? resumedLeaseKey(resume) : reusable ? reusableLeaseKey(ctx) : `fresh:${freshLeaseId}`;
+    const workspaceKey = contextQualifiedWorkspaceKey(ctx);
+    const projectContext = resolvedProjectContext(ctx);
+    const key = resume ? resumedLeaseKey(resume) : reusable ? reusableLeaseKey(ctx, workspaceKey) : `fresh:${freshLeaseId}`;
     const existing = resume || reusable ? this.leases.get(key) : undefined;
     if (existing && !existing.disposed) {
       await this.disposeLease(existing, "superseded_reusable_run");
@@ -313,11 +329,11 @@ export class HermesHarness implements AgentHarness {
     const profile =
       resume === null
         ? await manager.materialize({
-            workspaceKey: ctx.workspace.workspaceKey,
+            workspaceKey,
             role: ctx.role,
             phase,
             template: templateForRun(ctx),
-            profileKey: hermesRunProfileKey(ctx, phase, reusable, freshLeaseId),
+            profileKey: hermesRunProfileKey(ctx, phase, reusable, freshLeaseId, workspaceKey),
             mode: reusable ? "reuse" : "fresh",
           })
         : await this.materializeResumedProfile(ctx, manager, resume);
@@ -361,7 +377,10 @@ export class HermesHarness implements AgentHarness {
         : null;
     if ((resume || reusable) && hermesSessionKey) this.reusableSessionKeys.set(key, hermesSessionKey);
 
-    const credential = requiredAuthProviders.length > 0 ? null : resolveRuntimeCredential(ctx.config, ctx.role, this.id);
+    const credential =
+      requiredAuthProviders.length > 0
+        ? null
+        : resolveRuntimeCredential(ctx.config, ctx.role, this.id, { projectContext: configuredProjectContext(ctx) ?? undefined });
     const extraEnv: Record<string, string> = {};
     if (credential?.value) extraEnv[ctx.config.hermes.runtimeCredentialEnv] = credential.value;
     const client = this.gatewayFactory({
@@ -381,6 +400,8 @@ export class HermesHarness implements AgentHarness {
       key,
       reusable: resume !== null || reusable,
       profile,
+      workspaceKey,
+      projectContext,
       client,
       startupTimeoutMs: ctx.config.hermes.startupTimeoutMs,
       requestTimeoutMs: ctx.config.hermes.requestTimeoutMs,
@@ -570,7 +591,7 @@ export class HermesHarness implements AgentHarness {
     lease.hermesSessionKey = hermesSessionKey;
     if (!lease.reusable) return;
     this.reusableSessionKeys.set(lease.key, hermesSessionKey);
-    await writeHermesSessionKey(lease.profile.profileDir, hermesSessionKey);
+    await writeHermesSessionKey(lease.profile.profileDir, hermesSessionKey, reusableSessionStateMetadata(lease));
   }
 
   private async forgetHermesSessionKey(lease: HermesLease): Promise<void> {
@@ -591,7 +612,7 @@ export class HermesHarness implements AgentHarness {
   private async persistReusableHermesSessionKeyAfterRun(ctx: AgentRunContext, lease: HermesLease): Promise<void> {
     if (!lease.hermesSessionKey) return;
     try {
-      await writeHermesSessionKey(lease.profile.profileDir, lease.hermesSessionKey);
+      await writeHermesSessionKey(lease.profile.profileDir, lease.hermesSessionKey, reusableSessionStateMetadata(lease));
     } catch (error) {
       ctx.logger.warn("hermes reusable session state write failed", {
         profile_dir: lease.profile.profileDir,
@@ -669,9 +690,9 @@ function shouldReuseLease(ctx: AgentRunContext): boolean {
   );
 }
 
-function reusableLeaseKey(ctx: AgentRunContext): string {
+function reusableLeaseKey(ctx: AgentRunContext, workspaceKey: string): string {
   if (ctx.operatorChat) return `${ctx.workspace.path}:operator:${ctx.operatorChat.conversationId}`;
-  return `${ctx.workspace.path}:worker:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
+  return `${workspaceKey}:${ctx.workspace.path}:worker:${ctx.issue.id || ctx.issue.identifier}:${currentRunPhase(ctx)}`;
 }
 
 function resumedLeaseKey(resume: NonNullable<AgentRunContext["hermesResume"]>): string {
@@ -703,6 +724,8 @@ function hermesProfileMetadataPayload(
     handoffRepairSourceRunId: ctx.handoffRepair?.sourceRunId ?? null,
     handoffRepairKind: ctx.handoffRepair?.kind ?? null,
     handoffRepairAttempt: ctx.handoffRepair?.attempt ?? null,
+    workspaceKey: lease.workspaceKey,
+    projectContext: lease.projectContext,
   };
 }
 
@@ -744,10 +767,16 @@ function shouldInstallAgentCommandPolicyHook(ctx: AgentRunContext, phase: AgentR
   return ctx.role === "worker" && phase !== "issue_breakdown";
 }
 
-function hermesRunProfileKey(ctx: AgentRunContext, phase: AgentRunPhase, reusable: boolean, freshLeaseId: string | null): string {
+function hermesRunProfileKey(
+  ctx: AgentRunContext,
+  phase: AgentRunPhase,
+  reusable: boolean,
+  freshLeaseId: string | null,
+  workspaceKey: string,
+): string {
   if (ctx.operatorChat) {
     return hermesAcpProfileName({
-      workspaceKey: ctx.workspace.workspaceKey,
+      workspaceKey,
       role: "planner",
       issueIdentifier: ctx.operatorChat.conversationId,
       phase: "operator_chat",
@@ -756,7 +785,7 @@ function hermesRunProfileKey(ctx: AgentRunContext, phase: AgentRunPhase, reusabl
     });
   }
   return hermesAcpProfileName({
-    workspaceKey: ctx.workspace.workspaceKey,
+    workspaceKey,
     role: ctx.role,
     issueIdentifier: ctx.issue.identifier,
     phase,
@@ -1453,6 +1482,35 @@ function assertPathInsideRoot(targetPath: string, rootPath: string): void {
   throw new SymphonyError("config_validation_error", `Hermes resume profile path escapes state root: ${target}`);
 }
 
+function resolvedProjectContext(ctx: Pick<AgentRunContext, "issue" | "projectContext">): ProjectContextResolution | null {
+  return ctx.projectContext ?? projectContextResolutionFromIssue(ctx.issue);
+}
+
+function configuredProjectContext(
+  ctx: Pick<AgentRunContext, "config" | "issue" | "projectContext">,
+): ProjectContextResolution | null {
+  const projectContext = resolvedProjectContext(ctx);
+  return projectContext && ctx.config.projectContexts.byId.has(projectContext.projectContextId) ? projectContext : null;
+}
+
+function contextQualifiedWorkspaceKey(ctx: Pick<AgentRunContext, "issue" | "projectContext" | "workspace">): string {
+  return scopeWorkspaceKey(ctx.workspace.workspaceKey, resolvedProjectContext(ctx));
+}
+
+function scopeWorkspaceKey(workspaceKey: string, projectContext: ProjectContextResolution | null): string {
+  if (!projectContext || projectContext.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return workspaceKey;
+  const scopedPrefix = `${sanitizeWorkspaceKey(projectContext.projectContextId)}__`;
+  return workspaceKey.startsWith(scopedPrefix) ? workspaceKey : `${scopedPrefix}${workspaceKey}`;
+}
+
+function reusableSessionStateMetadata(lease: HermesLease): HermesSessionStateMetadata {
+  return {
+    profileKey: lease.profile.profileKey,
+    workspaceKey: lease.workspaceKey,
+    projectContext: lease.projectContext,
+  };
+}
+
 async function readHermesSessionKey(
   profileDir: string,
   warn: (message: string, payload?: Record<string, unknown>) => void,
@@ -1470,11 +1528,15 @@ async function readHermesSessionKey(
   }
 }
 
-async function writeHermesSessionKey(profileDir: string, hermesSessionKey: string): Promise<void> {
+async function writeHermesSessionKey(
+  profileDir: string,
+  hermesSessionKey: string,
+  metadata?: HermesSessionStateMetadata,
+): Promise<void> {
   await fs.mkdir(profileDir, { recursive: true });
   await fs.writeFile(
     path.join(profileDir, HERMES_SESSION_STATE_FILENAME),
-    `${JSON.stringify({ hermesSessionKey, updatedAt: new Date().toISOString() }, null, 2)}\n`,
+    `${JSON.stringify({ hermesSessionKey, updatedAt: new Date().toISOString(), ...metadata }, null, 2)}\n`,
     "utf8",
   );
 }

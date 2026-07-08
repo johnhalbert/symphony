@@ -15,11 +15,11 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 - `GET /api/v1/board/issues/:id` returns a board-scoped issue detail payload with the issue envelope, workspace capabilities, runs, PR/CI, blockers, and liveness data.
 - `GET /api/v1/issue-board?refresh=1` remains the legacy board response with `lanes` for existing clients.
 - `GET /api/v1/activity?offset=0&limit=50` returns a globally sorted feed of persisted run, transcript, and writeback activity.
-- `GET /api/v1/issues/:id` returns live issue status when present plus durable workspace, latest run metadata, and an `issueDetails` envelope. Prefer `issueDetails` for extension issue cards; top-level `metadata`, `workspace`, `latestRun`, and `lifecycle` remain available for backward compatibility and detailed inspection.
-- `GET /api/v1/issues/:id/runs` returns all persisted runs for an issue id or identifier plus the same `issueDetails` envelope.
-- `GET /api/v1/runs/:runId` returns run metadata.
+- `GET /api/v1/issues/:id` returns live issue status when present plus durable workspace, latest run metadata, and an `issueDetails` envelope. Prefer `issueDetails` for extension issue cards; top-level `metadata`, `workspace`, `latestRun`, and `lifecycle` remain available for backward compatibility and detailed inspection. Those top-level durable records expose normalized `projectContext` metadata when known.
+- `GET /api/v1/issues/:id/runs` returns all persisted runs for an issue id or identifier plus the same `issueDetails` envelope. Each run row retains its normalized `projectContext`.
+- `GET /api/v1/runs/:runId` returns run metadata, including normalized `projectContext` attribution for durable reads.
 - `GET /api/v1/runs/:runId/transcript?offset=0&limit=100` returns paginated transcript events.
-- `GET /api/v1/workspaces` returns known durable workspace records.
+- `GET /api/v1/workspaces` returns known durable workspace records, including normalized `projectContext` attribution.
 - `GET /api/v1/workspaces/:key` returns a workspace record by key, issue id, or issue identifier.
 - `POST /api/v1/issues/:id/open-workspace` opens the associated workspace in Cursor.
 - `POST /api/v1/issues/:id/pause` prevents new dispatch for that issue and clears pending retries.
@@ -46,6 +46,8 @@ Symphony remains the orchestration service. A future Cursor extension should be 
 - `workspace`: workspace and git hints (`workspaceKey`, `path`, `sourceKind`, `branchName`, `gitBranchName`, `repoPath`, `baseRef`) resolved with the same precedence as legacy status metadata.
 - `pullRequest`: GitHub PR hints (`url`, `number`, `headSha`, `branch`, `ciStatus`, `lastPushedAt`) when known.
 - `latestRun`: run summary (`runId`, `status`, `terminalReason`, `error`, `completedAt`). Live envelopes prefer the active run (`activeRunId` or live `runId`) so issue cards describe the running agent. Durable envelopes use the issue-wide latest persisted run. `terminalReason` is normalized from persisted run status; `timed_out` is reserved until a durable timeout signal exists.
+
+`issueDetails` itself does not currently surface `projectContext`. When clients need durable attribution, read the top-level `workspace`, `latestRun`, `lifecycle`, or run-list records on the same response family. Older persisted records that predate explicit attribution are normalized on read to the legacy/default context (`projectContextId: "default"`, `projectContextLabel: "Default"`, `routingSource: "legacy_default"`) so compatibility endpoints stay context-safe.
 
 `GET /api/v1/state` also exposes raw `running[].issueDetails` directly from the orchestrator snapshot. That raw field is the bare tracker-shaped `issue` view, not the envelope. Use `operatorView.running[].issueDetails` when the extension needs the enriched envelope.
 
@@ -75,7 +77,7 @@ Columns contain the same card shape as the flat `issues` list. Card `capabilitie
 
 ## Board Issue Detail
 
-`GET /api/v1/board/issues/:id` accepts either a Linear issue id or identifier. It first resolves the issue against the current board projection so tracker-backed board cards include title, description, labels, state, and blockers. It then attaches durable Symphony data: `workspace`, `latestRun`, enriched `runs`, `lifecycle`, `reviewLoop`, `metadata`, `pullRequest`, `blockers`, `operatorLiveness`, and `capabilities`.
+`GET /api/v1/board/issues/:id` accepts either a Linear issue id or identifier. It first resolves the issue against the current board projection so tracker-backed board cards include title, description, labels, state, and blockers. It then attaches durable Symphony data: `workspace`, `latestRun`, enriched `runs`, `lifecycle`, `reviewLoop`, `metadata`, `pullRequest`, `blockers`, `operatorLiveness`, and `capabilities`. Those attached durable records retain normalized `projectContext` metadata, including legacy/default fallback when older file-backed rows omitted explicit attribution.
 
 If tracker lookup fails but live or durable Symphony data exists, the endpoint returns that partial detail. It returns `503` only when tracker-backed data is required and no local fallback exists, and `404` when the issue is absent from board, live, workspace, run, and lifecycle sources.
 

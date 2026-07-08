@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
+import { normalizeProjectContextResolution, projectContextResolutionFromIssue, type ProjectContextResolution } from "./config/ProjectContexts.js";
 import {
   AGENT_ELIGIBLE_ISSUE_REQUIRED_SECTIONS,
   analyzeIssueContractDescription,
@@ -43,6 +44,7 @@ type IssueBreakdownProposedIssue = IssueBreakdownPlanInput["proposedIssues"][num
 
 export interface IssueBreakdownPlanActiveContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string;
   role: "planner" | "worker";
   phase: "issue_breakdown";
@@ -105,6 +107,7 @@ export class IssueBreakdownPlanService {
     validateProposedIssues(parsed.proposedIssues, this.options.config);
 
     const acceptedAt = new Date().toISOString();
+    const projectContext = resolveIssueBreakdownProjectContext(context, existingLifecycle);
     const plan: IssueBreakdownPlanRecord = {
       id: issueBreakdownPlanIdFor(context.issue.id, parsed.idempotencyKey),
       idempotencyKey: parsed.idempotencyKey,
@@ -112,12 +115,13 @@ export class IssueBreakdownPlanService {
       runId: parsed.runId,
       issueId: context.issue.id,
       issueIdentifier: context.issue.identifier,
+      projectContext,
       summary: parsed.summary,
       proposedIssues: parsed.proposedIssues,
       transcriptPointers: [`/api/v1/runs/${encodeURIComponent(parsed.runId)}/transcript`],
       statusApiPointers: [
-        `/api/v1/issues/${encodeURIComponent(context.issue.identifier)}`,
-        `/api/v1/issues/${encodeURIComponent(context.issue.identifier)}/runs`,
+        `/api/v1/issues/${encodeURIComponent(context.issue.id)}`,
+        `/api/v1/issues/${encodeURIComponent(context.issue.id)}/runs`,
         `/api/v1/runs/${encodeURIComponent(parsed.runId)}`,
       ],
       issueUpdatedAt: context.issue.updatedAt,
@@ -149,6 +153,7 @@ export class IssueBreakdownPlanService {
     };
 
     const lifecycle = await this.options.lifecycleStore.ensureIssue(context.issue, {
+      projectContext,
       lastIssueBreakdownPlanId: plan.id,
       planningFailureCount: 0,
       planningDispatchRetryCount: 0,
@@ -175,6 +180,15 @@ export function parseIssueBreakdownPlan(input: unknown): IssueBreakdownPlanInput
     throw new SymphonyError("invalid_request", "Issue breakdown plan is invalid", parsed.error.flatten());
   }
   return parsed.data;
+}
+
+export function resolveIssueBreakdownProjectContext(
+  context: IssueBreakdownPlanActiveContext,
+  lifecycle: IssueLifecycleRecord | null | undefined,
+): ProjectContextResolution {
+  return normalizeProjectContextResolution(
+    context.projectContext ?? lifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
 }
 
 export function issueBreakdownConfigFingerprint(config: ServiceConfig): string {

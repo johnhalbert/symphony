@@ -1,6 +1,37 @@
 export const WEB_CONTRACT_ISSUE_ID = "ENG-195";
 export const WEB_CONTRACT_SESSION_ID = "run-195";
 
+const webContractDisplayProjectContext = {
+  id: "symphony",
+  label: "Symphony",
+  linearProject: "ENG",
+  codebase: null,
+} as const;
+
+const webContractRunningAgentProjectContext = {
+  ...webContractDisplayProjectContext,
+  projectContextId: "symphony",
+  projectContextLabel: "Symphony",
+  linearProjectSlug: "ENG",
+  routingSource: "candidate_poll",
+} as const;
+
+const webContractIssueDetailWorkspace = {
+  workspaceKey: WEB_CONTRACT_ISSUE_ID,
+  path: "/tmp/symphony-workspaces/ENG-195",
+  sourceKind: "git_worktree",
+  branchName: "sinfonista/eng-195-eng-176e-add-contract-fixtures-and-adapter-conformance-tests",
+  gitBranchName: "sinfonista/eng-195-eng-176e-add-contract-fixtures-and-adapter-conformance-tests",
+  repoPath: "/tmp/symphony",
+  baseRef: "main",
+  projectContext: {
+    projectContextId: "symphony",
+    projectContextLabel: "Symphony",
+    linearProjectSlug: "ENG",
+    routingSource: "candidate_poll",
+  },
+} as const;
+
 const issueActivity = [
   {
     t: "2026-05-31T12:02:00.000Z",
@@ -51,7 +82,8 @@ export const webContractIssues = {
     labels: ["dogfood-ready", "api", "web"],
     assignee: "delegate-a",
     agent: "worker-195",
-    project: "",
+    project: "Symphony",
+    projectContext: webContractDisplayProjectContext,
     cycle: "",
     activity: issueActivity,
     pr: "#195",
@@ -222,6 +254,7 @@ export const webRouteContractFixtures = {
         sourceIssue: WEB_CONTRACT_ISSUE_ID,
         sourceRunId: WEB_CONTRACT_SESSION_ID,
         affected: "worker, implementation",
+        projectContext: webContractDisplayProjectContext,
       },
     ],
     runningAgents: [
@@ -233,6 +266,7 @@ export const webRouteContractFixtures = {
         step: "writing conformance tests",
         duration: "2m",
         tokens: "1550",
+        projectContext: webContractRunningAgentProjectContext,
       },
     ],
     activity: [
@@ -242,6 +276,7 @@ export const webRouteContractFixtures = {
         verb: "dispatched",
         id: WEB_CONTRACT_ISSUE_ID,
         extra: "worker implementation",
+        projectContext: webContractDisplayProjectContext,
       },
       {
         t: "2026-05-31T12:01:00.000Z",
@@ -279,6 +314,7 @@ export const webRouteContractFixtures = {
         id: WEB_CONTRACT_SESSION_ID,
         issue: WEB_CONTRACT_ISSUE_ID,
         title: "ENG-195: Add contract fixtures and adapter conformance tests",
+        projectContext: webContractDisplayProjectContext,
         state: "running",
         model: "gpt-5.5",
         startedAt: "2026-05-31T12:00:00.000Z",
@@ -431,6 +467,7 @@ export const webRouteContractFixturesWithIssueDetail = {
   ...webRouteContractFixtures,
   issueDetail: {
     issue: webContractIssues.progress,
+    workspace: webContractIssueDetailWorkspace,
     activity: webRouteContractFixtures.dashboard.activity,
     runs: webRouteContractFixtures.history.sessions,
     transcript: webRouteContractFixtures.transcript.messages,
@@ -493,7 +530,7 @@ export const webRouteContractGetFixtureCases = [
     name: "issue detail",
     path: webRouteContractPaths.issueDetail,
     fixture: webRouteContractFixturesWithIssueDetail.issueDetail,
-    topLevelKeys: ["activity", "issue", "runs", "transcript"],
+    topLevelKeys: ["activity", "issue", "runs", "transcript", "workspace"],
   },
   {
     name: "history",

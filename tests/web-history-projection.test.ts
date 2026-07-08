@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { projectWebHistory } from "../src/app/WebHistoryProjection.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import type { RunRecord } from "../src/core/persistence/RunTranscriptStore.js";
 
 type TestRunRecord = RunRecord & { runtimeModel?: string | null; issueTitle?: string | null };
+type TestProjectContext = NonNullable<RunRecord["projectContext"]>;
 
 describe("projectWebHistory", () => {
   it("sorts sessions by updatedAt descending then runId and uses runId as the session id", () => {
@@ -47,6 +53,338 @@ describe("projectWebHistory", () => {
     });
   });
 
+  it("projects public project context attribution for explicit and historical runs", () => {
+    const docsProjectContext: TestProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    };
+    const persistedDocsProjectContext = {
+      ...docsProjectContext,
+      repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+      path: "packages/site",
+    } as TestProjectContext & { repository: string; path: string };
+
+    const model = projectWebHistory([
+      run({ runId: "run-legacy", sessionId: "session-legacy", updatedAt: "2026-01-01T00:00:01.000Z" }),
+      run({
+        runId: "run-docs",
+        sessionId: "session-docs",
+        updatedAt: "2026-01-01T00:00:02.000Z",
+        projectContext: persistedDocsProjectContext,
+      }),
+    ]);
+
+    expect(model.sessions).toMatchObject([
+      {
+        id: "run-docs",
+        projectContext: docsProjectContext,
+        runSession: { projectContext: docsProjectContext },
+      },
+      {
+        id: "run-legacy",
+        projectContext: legacyDefaultProjectContext(),
+        runSession: { projectContext: legacyDefaultProjectContext() },
+      },
+    ]);
+    expect(JSON.stringify(model.sessions[0])).not.toContain("repo-secret");
+  });
+
+  it("redacts prompt-derived fallback titles before projecting history sessions", () => {
+    const model = projectWebHistory([
+      run({
+        issueIdentifier: "",
+        prompt: "Investigate ghr_ABCDEFGH5 ghs_ABCDEFGH2 github_pat_ABCDEFGH3 lin_ABCDEFGH4 sk_live_ABCDEFGH6 during replay",
+      }),
+    ]);
+
+    expect(model.sessions[0]).toMatchObject({
+      title: "Investigate [redacted] [redacted] [redacted] [redacted] [redacted] during replay",
+    });
+    expect(JSON.stringify(model.sessions[0])).not.toContain("ghr_ABCDEFGH5");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("ghs_ABCDEFGH2");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("github_pat_ABCDEFGH3");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("lin_ABCDEFGH4");
+    expect(JSON.stringify(model.sessions[0])).not.toContain("sk_live_ABCDEFGH6");
+  });
+
+  it("filters sessions and timeline to matching project context records", () => {
+    const docsProjectContext: TestProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    };
+    const apiProjectContext: TestProjectContext = {
+      projectContextId: "api",
+      projectContextLabel: "API Service",
+      linearProjectSlug: "API",
+      routingSource: "explicit",
+    };
+
+    const model = projectWebHistory(
+      [
+        run({
+          runId: "run-api-active",
+          issueIdentifier: "ENG-123",
+          status: "running",
+          updatedAt: "2026-01-01T00:00:04.000Z",
+          projectContext: apiProjectContext,
+        }),
+        run({
+          runId: "run-docs-history",
+          issueIdentifier: "ENG-123",
+          status: "succeeded",
+          updatedAt: "2026-01-01T00:00:03.000Z",
+          completedAt: "2026-01-01T00:00:03.000Z",
+          projectContext: docsProjectContext,
+        }),
+        run({
+          runId: "run-docs-active",
+          issueIdentifier: "ENG-123",
+          status: "running",
+          updatedAt: "2026-01-01T00:00:02.000Z",
+          projectContext: docsProjectContext,
+        }),
+        run({
+          runId: "run-legacy-history",
+          issueIdentifier: "ENG-123",
+          status: "succeeded",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+          completedAt: "2026-01-01T00:00:01.000Z",
+        }),
+      ],
+      [
+        activity({
+          id: "api-active",
+          at: "2026-01-01T00:00:04.000Z",
+          runId: "run-api-active",
+          issueIdentifier: "ENG-123",
+          projectContext: apiProjectContext,
+        }),
+        activity({
+          id: "docs-completed",
+          at: "2026-01-01T00:00:03.000Z",
+          kind: "run_completed",
+          runId: "run-docs-history",
+          issueIdentifier: "ENG-123",
+          projectContext: docsProjectContext,
+          status: "succeeded",
+        }),
+        activity({
+          id: "docs-active",
+          at: "2026-01-01T00:00:02.000Z",
+          runId: "run-docs-active",
+          issueIdentifier: "ENG-123",
+          projectContext: docsProjectContext,
+        }),
+        activity({
+          id: "legacy-completed",
+          at: "2026-01-01T00:00:01.000Z",
+          kind: "run_completed",
+          runId: "run-legacy-history",
+          issueIdentifier: "ENG-123",
+          status: "succeeded",
+        }),
+      ],
+      { projectContext: docsProjectContext },
+    );
+
+    expect(
+      model.sessions.map((session) => ({ id: session.id, projectContextId: session.projectContext.projectContextId })),
+    ).toEqual([
+      { id: "run-docs-history", projectContextId: "docs" },
+      { id: "run-docs-active", projectContextId: "docs" },
+    ]);
+    expect(model.timeline).toEqual([
+      { t: "2026-01-01T00:00:03.000Z", sess: "run-docs-history", kind: "status", text: "ENG-123 run finished", state: "finished" },
+      { t: "2026-01-01T00:00:02.000Z", sess: "run-docs-active", kind: "status", text: "ENG-123 run started", state: "running" },
+    ]);
+    expect(model.defaultSessionId).toBe("run-docs-history");
+  });
+
+  it("filters timeline entries using the broader activity run slice when sessions are windowed", () => {
+    const docsProjectContext: TestProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    };
+    const apiProjectContext: TestProjectContext = {
+      projectContextId: "api",
+      projectContextLabel: "API Service",
+      linearProjectSlug: "API",
+      routingSource: "explicit",
+    };
+    const docsSessionRun = run({
+      runId: "run-docs-session",
+      issueIdentifier: "ENG-123",
+      status: "running",
+      updatedAt: "2026-01-01T00:00:02.000Z",
+      projectContext: docsProjectContext,
+    });
+    const docsTimelineRun = run({
+      runId: "run-docs-timeline-only",
+      issueIdentifier: "ENG-123",
+      status: "succeeded",
+      updatedAt: "2026-01-01T00:00:03.000Z",
+      completedAt: "2026-01-01T00:00:03.000Z",
+      projectContext: docsProjectContext,
+    });
+    const apiTimelineRun = run({
+      runId: "run-api-timeline-only",
+      issueIdentifier: "ENG-999",
+      status: "running",
+      updatedAt: "2026-01-01T00:00:01.000Z",
+      projectContext: apiProjectContext,
+    });
+
+    const model = projectWebHistory(
+      [docsSessionRun],
+      [
+        activity({
+          id: "docs-timeline-only",
+          at: "2026-01-01T00:00:03.000Z",
+          kind: "run_completed",
+          runId: docsTimelineRun.runId,
+          issueIdentifier: docsTimelineRun.issueIdentifier,
+          status: docsTimelineRun.status,
+        }),
+        activity({
+          id: "docs-session",
+          at: "2026-01-01T00:00:02.000Z",
+          runId: docsSessionRun.runId,
+          issueIdentifier: docsSessionRun.issueIdentifier,
+          status: docsSessionRun.status,
+        }),
+        activity({
+          id: "api-timeline-only",
+          at: "2026-01-01T00:00:01.000Z",
+          runId: apiTimelineRun.runId,
+          issueIdentifier: apiTimelineRun.issueIdentifier,
+          status: apiTimelineRun.status,
+        }),
+      ],
+      {
+        projectContext: docsProjectContext,
+        activityRuns: [docsSessionRun, docsTimelineRun, apiTimelineRun],
+      },
+    );
+
+    expect(model.sessions.map((session) => session.id)).toEqual(["run-docs-session"]);
+    expect(model.timeline).toEqual([
+      { t: "2026-01-01T00:00:03.000Z", sess: "run-docs-timeline-only", kind: "status", text: "ENG-123 run finished", state: "finished" },
+      { t: "2026-01-01T00:00:02.000Z", sess: "run-docs-session", kind: "status", text: "ENG-123 run started", state: "running" },
+    ]);
+    expect(model.defaultSessionId).toBe("run-docs-session");
+  });
+
+  it("falls back to the linked run context when activity rows carry legacy partial project metadata", () => {
+    const docsProjectContext: TestProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    };
+    const apiProjectContext: TestProjectContext = {
+      projectContextId: "api",
+      projectContextLabel: "API Service",
+      linearProjectSlug: "API",
+      routingSource: "explicit",
+    };
+
+    const docsRun = run({
+      runId: "run-docs-history",
+      issueIdentifier: "ENG-123",
+      status: "succeeded",
+      updatedAt: "2026-01-01T00:00:02.000Z",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      projectContext: docsProjectContext,
+    });
+    const apiRun = run({
+      runId: "run-api-active",
+      issueIdentifier: "ENG-123",
+      status: "running",
+      updatedAt: "2026-01-01T00:00:01.000Z",
+      projectContext: apiProjectContext,
+    });
+
+    const model = projectWebHistory(
+      [docsRun, apiRun],
+      [
+        activity({
+          id: "docs-legacy-partial",
+          at: "2026-01-01T00:00:02.000Z",
+          kind: "run_completed",
+          runId: docsRun.runId,
+          issueIdentifier: docsRun.issueIdentifier,
+          status: docsRun.status,
+          projectContext: { projectContextLabel: "Documentation Site" },
+        }),
+        activity({
+          id: "api-active",
+          at: "2026-01-01T00:00:01.000Z",
+          runId: apiRun.runId,
+          issueIdentifier: apiRun.issueIdentifier,
+          status: apiRun.status,
+          projectContext: apiProjectContext,
+        }),
+      ],
+      { projectContext: docsProjectContext },
+    );
+
+    expect(
+      model.sessions.map((session) => ({ id: session.id, projectContextId: session.projectContext.projectContextId })),
+    ).toEqual([{ id: "run-docs-history", projectContextId: "docs" }]);
+    expect(model.timeline).toEqual([
+      { t: "2026-01-01T00:00:02.000Z", sess: "run-docs-history", kind: "status", text: "ENG-123 run finished", state: "finished" },
+    ]);
+    expect(model.defaultSessionId).toBe("run-docs-history");
+  });
+
+  it("keeps runless writeback timeline entries for the matching project context", () => {
+    const docsProjectContext: TestProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    };
+    const apiProjectContext: TestProjectContext = {
+      projectContextId: "api",
+      projectContextLabel: "API Service",
+      linearProjectSlug: "API",
+      routingSource: "explicit",
+    };
+
+    const model = projectWebHistory(
+      [],
+      [
+        writebackActivity({
+          id: "docs-writeback",
+          at: "2026-01-01T00:00:03.000Z",
+          issueIdentifier: "ENG-123",
+          projectContext: docsProjectContext,
+          bodyLength: 14,
+        }),
+        writebackActivity({
+          id: "api-writeback",
+          at: "2026-01-01T00:00:02.000Z",
+          issueIdentifier: "ENG-999",
+          projectContext: apiProjectContext,
+          bodyLength: 9,
+        }),
+      ],
+      { projectContext: docsProjectContext },
+    );
+
+    expect(model.sessions).toEqual([]);
+    expect(model.timeline).toEqual([
+      { t: "2026-01-01T00:00:03.000Z", sess: "", kind: "status", text: "ENG-123 comment pending (14 chars)", state: "pending" },
+    ]);
+    expect(model.defaultSessionId).toBe("");
+  });
+
   it("projects durable run-session metadata and redacts public diagnostics", () => {
     const sourceRun = run({
       runId: "run-secure",
@@ -80,7 +418,7 @@ describe("projectWebHistory", () => {
       gitBranchName: "symphony/TEST-1",
       status: "failed",
       completedAt: "2026-01-01T00:10:00.000Z",
-      error: "failed with password=SECRET_ERROR",
+      error: "failed with password=SECRET_ERROR sk_live_ABCDEFGH6 ghr_ABCDEFGH5 github_pat_ABCDEFGH3 lin_ABCDEFGH4",
       tokens: { inputTokens: 11, outputTokens: 13, totalTokens: 24 },
       transcriptEventCount: 9,
       prUrl: "https://github.com/acme/repo/pull/7",
@@ -235,7 +573,12 @@ describe("projectWebHistory", () => {
       },
     });
     expect(session.runSession).not.toHaveProperty("prompt");
+    expect(session.runSession.error).toBe("failed with password=[redacted] [redacted] [redacted] [redacted] [redacted]");
     expect(JSON.stringify(session.runSession)).not.toContain("SECRET_");
+    expect(JSON.stringify(session.runSession)).not.toContain("ghr_ABCDEFGH5");
+    expect(JSON.stringify(session.runSession)).not.toContain("github_pat_ABCDEFGH3");
+    expect(JSON.stringify(session.runSession)).not.toContain("lin_ABCDEFGH4");
+    expect(JSON.stringify(session.runSession)).not.toContain("sk_live_ABCDEFGH6");
   });
 
   it("maps persisted run statuses into web session states", () => {
@@ -428,14 +771,59 @@ function run(overrides: Partial<TestRunRecord> = {}): TestRunRecord {
   };
 }
 
-function activity(input: { id: string; at: string; runId: string; issueIdentifier: string }) {
+function activity(input: {
+  id: string;
+  at: string;
+  runId: string;
+  issueIdentifier: string;
+  kind?: "run_started" | "run_completed";
+  status?: TestRunRecord["status"];
+  projectContext?: Partial<TestProjectContext>;
+}) {
+  const kind = input.kind ?? "run_started";
   return {
     id: input.id,
     at: input.at,
-    kind: "run_started",
+    kind,
+    ...(input.projectContext === undefined ? {} : { projectContext: input.projectContext }),
     issue: { id: input.issueIdentifier.toLowerCase(), identifier: input.issueIdentifier },
-    run: { runId: input.runId, status: "running" as const },
+    run: { runId: input.runId, status: input.status ?? (kind === "run_completed" ? "succeeded" : "running") },
     transcript: null,
     writeback: null,
+  };
+}
+
+function writebackActivity(input: {
+  id: string;
+  at: string;
+  issueIdentifier: string;
+  projectContext?: TestProjectContext;
+  status?: string;
+  bodyLength: number;
+}) {
+  return {
+    id: input.id,
+    at: input.at,
+    kind: "writeback_operation",
+    ...(input.projectContext === undefined ? {} : { projectContext: input.projectContext }),
+    issue: { id: input.issueIdentifier.toLowerCase(), identifier: input.issueIdentifier },
+    run: null,
+    transcript: null,
+    writeback: {
+      operationKind: "comment",
+      status: input.status ?? "pending",
+      skipReason: null,
+      transition: null,
+      comment: { bodyLength: input.bodyLength },
+    },
+  };
+}
+
+function legacyDefaultProjectContext(): TestProjectContext {
+  return {
+    projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+    linearProjectSlug: null,
+    routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
   };
 }

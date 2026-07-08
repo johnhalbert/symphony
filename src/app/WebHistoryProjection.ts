@@ -1,4 +1,9 @@
 import type { RunRecord, RunStatus } from "../core/persistence/RunTranscriptStore.js";
+import {
+  normalizeProjectContextResolution,
+  sameProjectContextIdentity,
+  type ProjectContextResolution,
+} from "../core/config/ProjectContexts.js";
 import type { ProviderLimitSignal } from "../core/provider/ProviderLimits.js";
 import { sanitizedPreviewValue } from "../core/transcript/TranscriptProjection.js";
 import { runKindForPhase } from "../core/types.js";
@@ -16,6 +21,8 @@ export interface WebHistoryRuntimeSnapshot {
 
 export interface WebHistoryProjectionOptions {
   runtime?: WebHistoryRuntimeSnapshot | null;
+  projectContext?: Partial<ProjectContextResolution> | null;
+  activityRuns?: readonly RunRecord[];
 }
 
 export interface WebRunSessionRuntimeModel {
@@ -65,6 +72,7 @@ export interface WebRunSessionModel {
   runId: string;
   sessionId: string | null;
   agentId: string | null;
+  projectContext: ProjectContextResolution;
   role: RunRecord["role"];
   runPhase: NonNullable<RunRecord["runPhase"]> | null;
   runKind: NonNullable<RunRecord["runKind"]> | null;
@@ -135,6 +143,7 @@ export interface SessionModel {
   id: string;
   issue: string;
   title: string;
+  projectContext: ProjectContextResolution;
   state: WebRunState;
   model: string;
   startedAt: string;
@@ -190,10 +199,25 @@ export interface HistoryModel {
   defaultSessionId: string;
 }
 
+export function isWebHistorySessionListCurrent(value: unknown): value is HistoryModel["sessions"] {
+  if (!Array.isArray(value)) return false;
+  return value.every((session) => {
+    if (!isObjectRecord(session)) return false;
+    const runSession = session["runSession"];
+    return hasHistoryProjectContext(session["projectContext"]) && isObjectRecord(runSession) && hasHistoryProjectContext(runSession["projectContext"]);
+  });
+}
+
+export function isWebHistoryProjectionPayloadCurrent(value: unknown): value is HistoryModel {
+  if (!isObjectRecord(value)) return false;
+  return isWebHistorySessionListCurrent(value["sessions"]);
+}
+
 export interface WebHistoryActivityItem {
   id: string;
   at: string;
   kind: string;
+  projectContext?: Partial<ProjectContextResolution> | null;
   issue: {
     id: string;
     identifier: string;
@@ -226,14 +250,16 @@ export function projectWebHistory(
   activity: readonly WebHistoryActivityItem[] = [],
   options: WebHistoryProjectionOptions = {},
 ): HistoryModel {
-  const sortedActivity = [...activity].sort(compareHistoryActivityItems);
+  const filteredRuns = filterHistoryRunsByProjectContext(runs, options.projectContext);
+  const activityRuns = options.activityRuns ?? runs;
+  const sortedActivity = [...filterHistoryActivityByProjectContext(activity, activityRuns, options.projectContext)].sort(compareHistoryActivityItems);
   const latestActivityByRun = new Map<string, WebHistoryActivityItem>();
   for (const item of sortedActivity) {
     const runId = item.run?.runId;
     if (runId && !latestActivityByRun.has(runId)) latestActivityByRun.set(runId, item);
   }
 
-  const sessions = [...runs]
+  const sessions = [...filteredRuns]
     .sort(compareHistoryRuns)
     .map((run) => projectSession(run, latestActivityByRun.get(run.runId), options));
 
@@ -283,10 +309,12 @@ function projectSession(
   options: WebHistoryProjectionOptions,
 ): SessionModel {
   const state = mapRunToSessionState(run, options.runtime);
+  const projectContext = projectContextForHistory(run.projectContext);
   return {
     id: run.runId,
     issue: run.issueIdentifier,
     title: sessionTitle(run),
+    projectContext,
     state,
     model: sessionModel(run),
     startedAt: run.startedAt,
@@ -304,6 +332,7 @@ export function projectRunSession(run: RunRecord): WebRunSessionModel {
     runId: run.runId,
     sessionId: cleanString(run.sessionId),
     agentId: cleanString(run.agentId),
+    projectContext: projectContextForHistory(run.projectContext),
     role: run.role,
     runPhase,
     runKind: run.runKind ?? (runPhase ? runKindForPhase(runPhase) : null),
@@ -394,6 +423,40 @@ function projectTimelineEvent(item: WebHistoryActivityItem): TimelineEvent {
     text: timelineText(item),
     ...(state ? { state } : {}),
   };
+}
+
+function filterHistoryRunsByProjectContext(
+  runs: readonly RunRecord[],
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+): readonly RunRecord[] {
+  if (projectContext === null || projectContext === undefined) return runs;
+  return runs.filter((run) => sameProjectContextIdentity(run.projectContext, projectContext));
+}
+
+function filterHistoryActivityByProjectContext(
+  activity: readonly WebHistoryActivityItem[],
+  runs: readonly RunRecord[],
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+): readonly WebHistoryActivityItem[] {
+  if (projectContext === null || projectContext === undefined) return activity;
+  const runsById = new Map(runs.map((run) => [run.runId, run]));
+  return activity.filter((item) => {
+    const runProjectContext = item.run?.runId ? runsById.get(item.run.runId)?.projectContext : undefined;
+    const itemProjectContext = historyActivityProjectContextForFilter(item.projectContext, runProjectContext);
+    return sameProjectContextIdentity(itemProjectContext, projectContext);
+  });
+}
+
+function historyActivityProjectContextForFilter(
+  itemProjectContext: Partial<ProjectContextResolution> | null | undefined,
+  runProjectContext: Partial<ProjectContextResolution> | null | undefined,
+): Partial<ProjectContextResolution> | null | undefined {
+  if (cleanString(itemProjectContext?.projectContextId)) return itemProjectContext;
+  return runProjectContext ?? itemProjectContext;
+}
+
+function projectContextForHistory(projectContext: Partial<ProjectContextResolution> | null | undefined): ProjectContextResolution {
+  return normalizeProjectContextResolution(projectContext);
 }
 
 function sessionTitle(run: RunRecord): string {
@@ -512,6 +575,20 @@ function compareString(left: string, right: string): number {
   return 0;
 }
 
+function hasHistoryProjectContext(value: unknown): boolean {
+  return (
+    isObjectRecord(value) &&
+    typeof value["projectContextId"] === "string" &&
+    value["projectContextId"].trim().length > 0 &&
+    typeof value["projectContextLabel"] === "string" &&
+    value["projectContextLabel"].trim().length > 0
+  );
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function cleanString(value: string | null | undefined): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -606,7 +683,6 @@ function isSensitiveParamId(id: string): boolean {
 }
 
 function promptPreview(prompt: string): string {
-  const oneLine = prompt.replace(/\s+/g, " ").trim();
-  if (oneLine.length === 0) return "Untitled run";
-  return oneLine.length <= 120 ? oneLine : oneLine.slice(0, 117) + "...";
+  const preview = sanitizedPreviewValue(prompt, 120).preview?.trim() ?? "";
+  return preview.length > 0 ? preview : "Untitled run";
 }

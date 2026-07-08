@@ -15,6 +15,8 @@ import {
   type WebProjectionRevisionListener,
   type WebProjectionRevisionProvider,
 } from "../src/app/WebProjectionContext.js";
+import type { WebProjectionReadRepositories } from "../src/app/WebProjectionRepository.js";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID } from "../src/core/config/ProjectContexts.js";
 import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore, type StartRunInput, type WorkspaceRecord } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore, type NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
@@ -120,6 +122,280 @@ describe("StatusServer web projection context cache", () => {
     });
 
     await expect(acquire(false)).resolves.toBe(revisionChanged);
+    expect(builds).toBe(2);
+  });
+
+  it("fingerprints legacy-compatible durable collection revisions using configured-default fallback", async () => {
+    const generatedAt = "2026-01-01T00:00:00.000Z";
+    let legacyDashboardRevision = 1;
+    let builds = 0;
+    const selectors: Array<{
+      projectionName: string;
+      projectContextId?: string | null;
+      scopeKind?: string | null;
+      scopeKey?: string | null;
+    }> = [];
+    const server = createStatusServer({
+      generatedAt: () => generatedAt,
+      clock: () => new Date(generatedAt),
+      projectionReader: {
+        async readCurrentPayload() {
+          return null;
+        },
+        async readCurrentRevision(selector) {
+          selectors.push({ ...selector });
+          if (
+            selector.projectionName === "dashboard_projection" &&
+            (selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID) === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+          ) {
+            return {
+              projectionRevisionId: `${selector.projectionName}:${selector.scopeKind ?? "global"}:${selector.scopeKey ?? "global"}:${legacyDashboardRevision}`,
+              projectionName: selector.projectionName,
+              projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+              scopeKind: selector.scopeKind ?? "global",
+              scopeKey: selector.scopeKey ?? "global",
+              revision: legacyDashboardRevision,
+              buildMode: legacyDashboardRevision === 1 ? "bootstrap" : "incremental",
+              sourceRevisions: [],
+              sourceCursors: {},
+              sourceFreshness: [],
+              contentSha256: "0".repeat(64),
+              generatedAt,
+              expiresAt: null,
+              supersededAt: null,
+              createdAt: generatedAt,
+            };
+          }
+          return null;
+        },
+      },
+      builder: (input) => {
+        builds += 1;
+        return contextFixture(input, builds);
+      },
+    });
+    server.setDefaultProjectContextId("symphony");
+    const acquire = acquireFrom(server);
+
+    const first = await acquire(false);
+    expect(first.metadata.fingerprint.durableProjectionRevisions).toContainEqual({
+      source: "projection:dashboard_projection:global:global",
+      revision: 1,
+      observedAt: generatedAt,
+    });
+    expect(
+      selectors
+        .filter((selector) => selector.projectionName === "dashboard_projection")
+        .map((selector) => selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID)
+        .slice(0, 2),
+    ).toEqual(["symphony", LEGACY_DEFAULT_PROJECT_CONTEXT_ID]);
+
+    selectors.length = 0;
+    legacyDashboardRevision = 2;
+    const revisionChanged = await acquire(false);
+    expect(revisionChanged).not.toBe(first);
+    expect(projectedBuild(revisionChanged)).toBe(2);
+    expect(revisionChanged.metadata.fingerprint.durableProjectionRevisions).toContainEqual({
+      source: "projection:dashboard_projection:global:global",
+      revision: 2,
+      observedAt: generatedAt,
+    });
+    expect(
+      selectors
+        .filter((selector) => selector.projectionName === "dashboard_projection")
+        .map((selector) => selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID)
+        .slice(0, 2),
+    ).toEqual(["symphony", LEGACY_DEFAULT_PROJECT_CONTEXT_ID]);
+
+    await expect(acquire(false)).resolves.toBe(revisionChanged);
+    expect(builds).toBe(2);
+  });
+
+  it("uses the live default project context for post-reload durable history reads", async () => {
+    const generatedAt = "2026-01-01T00:00:00.000Z";
+    const selectors: Array<{
+      projectionName: string;
+      projectContextId?: string | null;
+      scopeKind?: string | null;
+      scopeKey?: string | null;
+    }> = [];
+    let currentDefaultProjectContextId = "docs";
+    let currentSourceRevisions: Array<{ source: string; revision: string | number; observedAt: string | null }> = [];
+    const server = createStatusServer({
+      generatedAt: () => generatedAt,
+      clock: () => new Date(generatedAt),
+      projectionReader: {
+        async readCurrentPayload(selector) {
+          selectors.push({ ...selector });
+          if (
+            selector.projectionName === "history_projection" &&
+            selector.scopeKind === "global_collection" &&
+            selector.scopeKey === "global:session:5:timeline:7" &&
+            selector.projectContextId === currentDefaultProjectContextId
+          ) {
+            return historyProjectionPayloadRecord(
+              currentDefaultProjectContextId,
+              generatedAt,
+              currentSourceRevisions,
+            ) as never;
+          }
+          return null;
+        },
+      },
+    });
+    const webProjectionRepositories = (server as unknown as {
+      webProjectionRepositories: WebProjectionReadRepositories;
+    }).webProjectionRepositories;
+    currentSourceRevisions = [
+      ...(await (server as unknown as {
+        resolveWebProjectionSourceRevisions(): Promise<
+          readonly { source: string; revision: string | number; observedAt: string | null }[]
+        >;
+      }).resolveWebProjectionSourceRevisions()),
+    ];
+
+    server.setDefaultProjectContextId("docs");
+    await expect(
+      webProjectionRepositories.history.readGlobalCollection({ sessionLimit: 5, timelineLimit: 7 }),
+    ).resolves.toMatchObject({
+      status: "stale",
+      record: { revision: { projectContextId: "docs" }, payload: { defaultSessionId: "docs-session" } },
+    });
+
+    currentDefaultProjectContextId = "symphony";
+    server.setDefaultProjectContextId("symphony");
+    await expect(
+      webProjectionRepositories.history.readGlobalCollection({ sessionLimit: 5, timelineLimit: 7 }),
+    ).resolves.toMatchObject({
+      status: "stale",
+      record: { revision: { projectContextId: "symphony" }, payload: { defaultSessionId: "symphony-session" } },
+    });
+
+    expect(
+      selectors.map((selector) => ({
+        projectionName: selector.projectionName,
+        projectContextId: selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: selector.scopeKind ?? "global",
+        scopeKey: selector.scopeKey ?? "global",
+      })),
+    ).toEqual([
+      {
+        projectionName: "history_projection",
+        projectContextId: "docs",
+        scopeKind: "global_collection",
+        scopeKey: "pc=docs|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "docs",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "global_collection",
+        scopeKey: "pc=default|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "pc=symphony|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: "symphony",
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "global_collection",
+        scopeKey: "pc=default|global:session:5:timeline:7",
+      },
+      {
+        projectionName: "history_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "global_collection",
+        scopeKey: "global:session:5:timeline:7",
+      },
+    ]);
+  });
+
+  it("rebuilds before TTL expiry when the default project context changes", async () => {
+    let builds = 0;
+    const server = createStatusServer({
+      generatedAt: () => "2026-01-01T00:00:00.000Z",
+      clock: () => new Date("2026-01-01T00:00:00.000Z"),
+      builder: (input) => {
+        builds += 1;
+        return contextFixture(input, builds);
+      },
+    });
+    server.setDefaultProjectContextId("symphony");
+    const acquire = acquireFrom(server);
+
+    const first = await acquire(false);
+    expect(first.metadata.fingerprint.defaultProjectContextId).toBe("symphony");
+
+    server.setDefaultProjectContextId("docs");
+    const changed = await acquire(false);
+    expect(changed).not.toBe(first);
+    expect(projectedBuild(changed)).toBe(2);
+    expect(changed.metadata.fingerprint.defaultProjectContextId).toBe("docs");
+
+    await expect(acquire(false)).resolves.toBe(changed);
+    expect(builds).toBe(2);
+  });
+
+  it("does not reuse an in-flight build after the default project context changes", async () => {
+    const pendingBuilds: Array<{
+      build: number;
+      input: StatusServerWebProjectionContextBuildInput;
+      deferred: Deferred<StatusServerWebProjectionContext>;
+    }> = [];
+    let builds = 0;
+    const server = createStatusServer({
+      generatedAt: () => "2026-01-01T00:00:00.000Z",
+      clock: () => new Date("2026-01-01T00:00:00.000Z"),
+      builder: (input) => {
+        builds += 1;
+        const deferredBuild = deferred<StatusServerWebProjectionContext>();
+        pendingBuilds.push({ build: builds, input, deferred: deferredBuild });
+        return deferredBuild.promise;
+      },
+    });
+    server.setDefaultProjectContextId("symphony");
+    const acquire = acquireFrom(server);
+
+    const first = acquire(false);
+    await settleMicrotasks();
+    expect(builds).toBe(1);
+
+    server.setDefaultProjectContextId("docs");
+    const second = acquire(false);
+    await settleMicrotasks();
+    expect(builds).toBe(2);
+
+    const firstPending = pendingBuilds[0];
+    const secondPending = pendingBuilds[1];
+    if (!firstPending || !secondPending) throw new Error("expected pending builds for both default contexts");
+    firstPending.deferred.resolve(contextFixture(firstPending.input, firstPending.build));
+    secondPending.deferred.resolve(contextFixture(secondPending.input, secondPending.build));
+
+    const [firstContext, secondContext] = await Promise.all([first, second]);
+    expect(firstContext).not.toBe(secondContext);
+    expect(firstContext.metadata.fingerprint.defaultProjectContextId).toBe("symphony");
+    expect(secondContext.metadata.fingerprint.defaultProjectContextId).toBe("docs");
+    await expect(acquire(false)).resolves.toBe(secondContext);
     expect(builds).toBe(2);
   });
 
@@ -588,6 +864,7 @@ function durableProjectionRevisionReader(revision: () => number, generatedAt: st
       return {
         projectionRevisionId: `${selector.projectionName}:${selector.scopeKind ?? "global"}:${selector.scopeKey ?? "global"}:${currentRevision}`,
         projectionName: selector.projectionName,
+        projectContextId: selector.projectContextId ?? "default",
         scopeKind: selector.scopeKind ?? "global",
         scopeKey: selector.scopeKey ?? "global",
         revision: currentRevision,
@@ -602,6 +879,42 @@ function durableProjectionRevisionReader(revision: () => number, generatedAt: st
         createdAt: generatedAt,
       };
     },
+  };
+}
+
+function historyProjectionPayloadRecord(
+  projectContextId: string,
+  generatedAt: string,
+  sourceRevisions: readonly { source: string; revision: string | number; observedAt: string | null }[],
+) {
+  return {
+    revision: {
+      projectionRevisionId: `history:${projectContextId}`,
+      projectionName: "history_projection" as const,
+      projectContextId,
+      scopeKind: "global_collection",
+      scopeKey: "global:session:5:timeline:7",
+      revision: 1,
+      buildMode: "bootstrap" as const,
+      sourceRevisions,
+      sourceCursors: {},
+      sourceFreshness: [],
+      contentSha256: "0".repeat(64),
+      generatedAt,
+      expiresAt: null,
+      supersededAt: null,
+      createdAt: generatedAt,
+    },
+    payload: {
+      sessions: [{ id: `${projectContextId}-session` }],
+      transcriptBySession: {},
+      timeline: [],
+      defaultSessionId: `${projectContextId}-session`,
+    },
+    payloadSha256: "0".repeat(64),
+    rawPayloadRefs: [],
+    generatedAt,
+    expiresAt: null,
   };
 }
 

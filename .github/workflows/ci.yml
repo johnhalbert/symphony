@@ -22,7 +22,7 @@ concurrency:
 jobs:
   check:
     name: Typecheck and test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 15
     env:
       SYMPHONY_REAL_SMOKE: "0"
@@ -39,8 +39,17 @@ jobs:
       - run: npm run typecheck --prefix web
       - run: npm test --prefix web
       - run: npm run build --prefix web
+      - uses: browser-actions/setup-chrome@v2
+        id: setup-chrome
+        with:
+          chrome-version: stable
+          install-dependencies: true
       - run: npm run smoke:browser --prefix web
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
       - run: npm run smoke:browser-production --prefix web
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
       - run: npm run extension:ci
       - run: npm run extension:typecheck
       - run: npm run extension:test
@@ -50,7 +59,7 @@ jobs:
     name: Real integration smoke
     needs: check
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.real_smoke == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

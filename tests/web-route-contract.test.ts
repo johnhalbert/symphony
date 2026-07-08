@@ -10,7 +10,20 @@ import {
   type StatusServerWebProjectionContextBuilder,
 } from "../src/app/http.js";
 import type { WebProjectionRevisionProvider } from "../src/app/WebProjectionContext.js";
+import { PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON } from "../src/core/CompletionReportService.js";
+import { FileOperatorApprovalStore, OperatorApprovalService } from "../src/core/approval/OperatorApprovalService.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
+import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
+import { FileIssueLifecycleStore, type IssueLifecycleStore } from "../src/core/persistence/IssueLifecycleStore.js";
+import {
+  FileOrchestratorConversationStore,
+  type OrchestratorConversationStore,
+} from "../src/core/persistence/OrchestratorConversationStore.js";
 import type {
   DurableProjectionName,
   ProjectionPayloadRecord,
@@ -20,18 +33,20 @@ import type {
   ProjectionSourceRevision,
   ProjectionWriteResult,
 } from "../src/core/persistence/ProjectionTransactionService.js";
-import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
-import type { RunRecord, RunTranscriptStore, TranscriptEvent, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
-import type { TrackerStateLists } from "../src/core/types.js";
+import { projectOrchestratorChatProjectionPayload } from "../src/core/persistence/OrchestratorChatProjectionReducer.js";
+import {
+  FileRunTranscriptStore,
+  type RunRecord,
+  type RunTranscriptStore,
+  type TranscriptEvent,
+  type TranscriptPage,
+  type WorkspaceRecord,
+} from "../src/core/persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../src/core/tracker/TrackerClient.js";
+import type { TrackerStateLists } from "../src/core/types.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import { webRouteContractGetFixtureCases, webRouteContractPaths } from "../web/tests/fixtures/webRouteContractFixtures.js";
-import {
-  FileOrchestratorConversationStore,
-  type OrchestratorConversationStore,
-} from "../src/core/persistence/OrchestratorConversationStore.js";
-import { projectOrchestratorChatProjectionPayload } from "../src/core/persistence/OrchestratorChatProjectionReducer.js";
-import { testConfig } from "./helpers.js";
+import { issue, testConfig, trackerIssue } from "./helpers.js";
 
 describe("/api/v1/web route contracts", () => {
   let root: string;
@@ -260,7 +275,19 @@ describe("/api/v1/web route contracts", () => {
       totals: { ...emptyTotals(), progress: 1, open: 1, all: 1, completeness: 0 },
     };
     const history = {
-      sessions: [{ id: "durable-session", title: "Durable session", subtitle: "read model", updatedAt: "2026-05-31T00:00:00.000Z", msgCount: 1, lastEvent: "done", toolCount: 0 }],
+      sessions: [
+        historySessionFixture({
+          id: "durable-session",
+          issue: "ENG-179",
+          title: "Durable session",
+          subtitle: "read model",
+          startedAt: "2026-05-31T00:00:00.000Z",
+          updatedAt: "2026-05-31T00:00:00.000Z",
+          msgCount: 1,
+          lastEvent: "done",
+          toolCount: 0,
+        }),
+      ],
       transcriptBySession: {},
       timeline: [],
       defaultSessionId: "durable-session",
@@ -319,6 +346,7 @@ describe("/api/v1/web route contracts", () => {
         detail: "Durable tracker source is current",
       },
     ];
+    const expectedDashboard = dashboard;
     const projectionReader = new RecordingProjectionReader([
       projectionPayloadRecordFixture(
         { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
@@ -354,7 +382,7 @@ describe("/api/v1/web route contracts", () => {
     const baseUrl = baseUrlFor(address);
     try {
       const durableDashboard = await getJson(`${baseUrl}/api/v1/web/dashboard`);
-      expect(durableDashboard.body).toEqual(dashboard);
+      expect(durableDashboard.body).toEqual(expectedDashboard);
       expect(durableDashboard.response.headers.get("x-symphony-projection-status")).toBe("hit");
       expect(durableDashboard.response.headers.get("x-symphony-projection-cache")).toBe("hit");
       expect(durableDashboard.response.headers.get("x-symphony-projection-name")).toBe("dashboard_projection");
@@ -395,7 +423,7 @@ describe("/api/v1/web route contracts", () => {
       await server.stop();
     }
 
-    expect(calls.snapshot).toBe(0);
+    expect(calls.snapshot).toBe(1);
     expect(projectionWriter.writes).toEqual([]);
     expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
       { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
@@ -406,6 +434,164 @@ describe("/api/v1/web route contracts", () => {
       { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "operator-room" },
       { projectionName: "orchestrator_chat_projection", scopeKind: "conversation", scopeKey: "legacy-room" },
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+    ]);
+  });
+
+  it("treats stale durable history payloads missing project context attribution as rebuild candidates", async () => {
+    const runStore = new RecordingRunStore([
+      runRecordFixture({
+        runId: "run-history-current",
+        sessionId: "session-history-current",
+        issueId: "issue-history-current",
+        issueIdentifier: "ENG-424",
+        updatedAt: "2026-05-31T00:02:00.000Z",
+        completedAt: "2026-05-31T00:02:00.000Z",
+        status: "succeeded",
+      }),
+    ]);
+    const staleSession = historySessionFixture({
+      id: "run-history-current",
+      issue: "ENG-424",
+      title: "ENG-424: Durable history",
+      updatedAt: "2026-05-31T00:02:00.000Z",
+      msgCount: 0,
+      lastEvent: "legacy durable history",
+      toolCount: 0,
+    }) as Record<string, unknown>;
+    const staleRunSession = staleSession["runSession"] as Record<string, unknown>;
+    delete staleSession["projectContext"];
+    delete staleRunSession["projectContext"];
+    const staleHistory = {
+      sessions: [staleSession],
+      transcriptBySession: {},
+      timeline: [],
+      defaultSessionId: "run-history-current",
+    };
+    const sourceRevisions = [{ source: "runs", revision: "7", observedAt: null }];
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
+        staleHistory,
+        { sourceRevisions, revision: 6 },
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server } = createStatusServer(root, {
+      projectionReader,
+      projectionWriter,
+      runStore: runStore.asRunTranscriptStore(),
+      webProjectionRevisionProviders: [
+        {
+          source: "runs",
+          getRevision: () => ({ source: "runs", revision: "7", observedAt: null }),
+        },
+      ],
+    });
+    const address = await server.start();
+    try {
+      const history = await getJson(`${baseUrlFor(address)}/api/v1/web/history`);
+      expect(history.response.headers.get("x-symphony-projection-status")).toBe("stale");
+      expect(history.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(history.body).not.toEqual(staleHistory);
+      expect(history.body).toMatchObject({
+        defaultSessionId: "run-history-current",
+        sessions: [
+          {
+            id: "run-history-current",
+            projectContext: legacyDefaultProjectContext(),
+            runSession: { projectContext: legacyDefaultProjectContext() },
+          },
+        ],
+      });
+      expect((history.body as { timeline: unknown[] }).timeline).toHaveLength(2);
+    } finally {
+      await server.stop();
+    }
+
+    expect(projectionWriter.writeFor("history_projection").payload).toEqual(
+      expect.objectContaining({
+        defaultSessionId: "run-history-current",
+      }),
+    );
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "history_projection", scopeKind: "global_collection", scopeKey: "global:session:100:timeline:250" },
+    ]);
+  });
+
+  it("invalidates stale durable sidebar payloads missing project context attribution", async () => {
+    const runStore = new RecordingRunStore([
+      runRecordFixture({
+        runId: "run-sidebar-current",
+        sessionId: "session-sidebar-current",
+        issueId: "issue-sidebar-current",
+        issueIdentifier: "ENG-424",
+        updatedAt: "2026-05-31T00:03:00.000Z",
+        completedAt: "2026-05-31T00:03:00.000Z",
+        status: "succeeded",
+      }),
+    ]);
+    const staleSession = historySessionFixture({
+      id: "run-sidebar-current",
+      issue: "ENG-424",
+      title: "ENG-424: Durable sidebar",
+      updatedAt: "2026-05-31T00:03:00.000Z",
+      msgCount: 0,
+      lastEvent: "legacy durable sidebar",
+      toolCount: 0,
+    }) as Record<string, unknown>;
+    const staleRunSession = staleSession["runSession"] as Record<string, unknown>;
+    delete staleSession["projectContext"];
+    delete staleRunSession["projectContext"];
+    const staleSidebar = {
+      providerGates: [],
+      runningAgents: [],
+      reviewIssues: [],
+      activity: [],
+      sessions: [staleSession],
+      chat: [],
+      totals: emptyTotals(),
+    };
+    const sourceRevisions = [{ source: "runs", revision: "9", observedAt: null }];
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+        staleSidebar,
+        { sourceRevisions, revision: 7 },
+      ),
+    ]);
+    const projectionWriter = new RecordingProjectionWriter();
+    const { server } = createStatusServer(root, {
+      projectionReader,
+      projectionWriter,
+      runStore: runStore.asRunTranscriptStore(),
+      webProjectionRevisionProviders: [
+        {
+          source: "runs",
+          getRevision: () => ({ source: "runs", revision: "9", observedAt: null }),
+        },
+      ],
+    });
+    const address = await server.start();
+    try {
+      const sidebar = await getJson(`${baseUrlFor(address)}/api/v1/web/sidebar`);
+      expect(sidebar.response.headers.get("x-symphony-projection-status")).toBe("stale");
+      expect(sidebar.response.headers.get("x-symphony-projection-cache")).toBe("miss");
+      expect(sidebar.body).not.toEqual(staleSidebar);
+      expect(sidebar.body).toMatchObject({
+        providerGates: [],
+        runningAgents: [],
+        reviewIssues: [],
+        activity: [],
+        sessions: [],
+        chat: [],
+      });
+    } finally {
+      await server.stop();
+    }
+
+    expect(projectionWriter.writes).toEqual([]);
+    expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
+      { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
     ]);
   });
 
@@ -430,15 +616,20 @@ describe("/api/v1/web route contracts", () => {
         })),
       };
     });
-    const historySessions = Array.from({ length: 100 }, (_, index) => ({
-      id: `session-large-${index + 1}`,
-      title: `Large durable session ${index + 1}`,
-      subtitle: `ENG-${1000 + index} · worker-${index % 5}`,
-      updatedAt: new Date(Date.UTC(2026, 4, 31, 2, index % 60, 0)).toISOString(),
-      msgCount: 500 + index,
-      lastEvent: `large event ${index + 1}`,
-      toolCount: index % 7,
-    }));
+    const historySessions = Array.from({ length: 100 }, (_, index) =>
+      historySessionFixture({
+        id: `session-large-${index + 1}`,
+        issue: `ENG-${1000 + index}`,
+        title: `Large durable session ${index + 1}`,
+        subtitle: `ENG-${1000 + index} · worker-${index % 5}`,
+        startedAt: new Date(Date.UTC(2026, 4, 31, 1, index % 60, 0)).toISOString(),
+        updatedAt: new Date(Date.UTC(2026, 4, 31, 2, index % 60, 0)).toISOString(),
+        msgCount: 500 + index,
+        lastEvent: `large event ${index + 1}`,
+        toolCount: index % 7,
+        agentId: `worker-${index % 5}`,
+      }),
+    );
     const historyTimeline = Array.from({ length: 250 }, (_, index) => ({
       id: `timeline-large-${index + 1}`,
       sessionId: historySessions[index % historySessions.length]?.id,
@@ -556,6 +747,8 @@ describe("/api/v1/web route contracts", () => {
         },
       ),
     ]);
+    const expectedDashboard = dashboard;
+    const expectedSidebar = sidebar;
     const projectionWriter = new RecordingProjectionWriter();
     let contextBuilds = 0;
     const { server, calls } = createStatusServer(root, {
@@ -583,7 +776,7 @@ describe("/api/v1/web route contracts", () => {
 
     try {
       const durableDashboard = await getJson(`${baseUrl}/api/v1/web/dashboard`);
-      expect(durableDashboard.body).toEqual(dashboard);
+      expect(durableDashboard.body).toEqual(expectedDashboard);
       expect((durableDashboard.body as { activity: unknown[] }).activity).toHaveLength(250);
       expectProjectionHeaders(durableDashboard.response, {
         name: "dashboard_projection",
@@ -614,7 +807,7 @@ describe("/api/v1/web route contracts", () => {
       });
 
       const durableSidebar = await getJson(`${baseUrl}/api/v1/web/sidebar`);
-      expect(durableSidebar.body).toEqual(sidebar);
+      expect(durableSidebar.body).toEqual(expectedSidebar);
       expect((durableSidebar.body as { reviewIssues: unknown[] }).reviewIssues).toHaveLength(80);
       expectProjectionHeaders(durableSidebar.response, {
         name: "sidebar_projection",
@@ -1068,13 +1261,514 @@ describe("/api/v1/web route contracts", () => {
       await server.stop();
     }
 
-    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
     expect(runStore.transcriptReadCount).toBe(1);
     expect(projectionWriter.writes).toEqual([]);
     expect(projectionReader.selectors.map(({ projectionName, scopeKind, scopeKey }) => ({ projectionName, scopeKind, scopeKey }))).toEqual([
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
       { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
       { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:0:limit:500" },
+    ]);
+  });
+
+  it("serves contextual issue-detail payloads from durable board projections without losing raw run associations", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const durableIssue = {
+      ...issueModelFixture(),
+      id: "docs:ENG-179",
+      title: "Serve contextual durable web projections",
+      project: "Documentation Site",
+    };
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [durableIssue], review: [] },
+      cycleLabel: "Docs cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "docs:ENG-179",
+    };
+    const transcriptEvents: TranscriptEvent[] = [
+      {
+        runId: "run-docs-1",
+        sequence: 1,
+        at: "2026-05-31T00:00:31.000Z",
+        source: "runtime",
+        eventType: "assistant_complete",
+        message: "served from contextual durable issue detail transcript",
+      },
+    ];
+    const run = runRecordFixture({
+      runId: "run-docs-1",
+      sessionId: "session-docs-1",
+      issueId: "issue-docs-179",
+      issueIdentifier: "ENG-179",
+      workspaceKey: "ENG-179",
+      projectContext: docsProjectContext,
+      cursorModel: "gpt-5-durable-docs",
+      transcriptEventCount: transcriptEvents.length,
+    });
+    const durableTranscript = [
+      { kind: "assistant" as const, ts: "2026-05-31T00:00:00.000Z", text: "served from contextual durable transcript" },
+    ];
+    const runStore = new RecordingRunStore([run], { "run-docs-1": transcriptEvents });
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+            { source: "lifecycleStore", revision: "lifecycle-current", observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+      projectionPayloadRecordFixture(
+        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-docs-1:offset:0:limit:500" },
+        durableTranscript,
+      ),
+    ]);
+    const { server, calls } = createStatusServer(root, {
+      projectionReader,
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179`);
+      expect(detail.body).toMatchObject({ issue: durableIssue, transcript: [] });
+      expect((detail.body as { activity: unknown[] }).activity).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ verb: "run_started", id: "ENG-179", extra: "succeeded", who: "agent-1" }),
+          expect.objectContaining({ verb: "run_completed", id: "ENG-179", extra: "succeeded", who: "agent-1" }),
+        ]),
+      );
+      expect((detail.body as { runs: unknown[] }).runs).toEqual([
+        expect.objectContaining({ id: "session-docs-1", issue: "ENG-179", state: "succeeded", model: "gpt-5-durable-docs", msgCount: 1 }),
+      ]);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+
+      const detailWithTranscript = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179?includeTranscript=1`);
+      expect((detailWithTranscript.body as { runs: unknown[] }).runs).toEqual((detail.body as { runs: unknown[] }).runs);
+      expect((detailWithTranscript.body as { transcript: unknown[] }).transcript).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "system", model: "gpt-5-durable-docs", workspace: "ENG-179", session: "session-docs-1" }),
+          expect.objectContaining({ kind: "assistant", text: "served from contextual durable issue detail transcript" }),
+        ]),
+      );
+      expect(detailWithTranscript.response.headers.get("x-symphony-projection-status")).toBe("hit");
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(1);
+    expect(
+      projectionReader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({
+        projectionName,
+        projectContextId: projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind,
+        scopeKey,
+      })),
+    ).toEqual([
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+    ]);
+  });
+
+  it("serves durable issue-detail workspace projectContext from issue metadata when latest runs omit it", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const expectedWorkspaceProjectContext = {
+      ...docsProjectContext,
+      routingSource: "explicit",
+    } as const;
+    const durableIssue = {
+      ...issueModelFixture(),
+      id: "docs:ENG-179",
+      title: "Serve contextual durable workspace attribution",
+      project: "Documentation Site",
+      projectContext: {
+        id: docsProjectContext.projectContextId,
+        label: docsProjectContext.projectContextLabel,
+        linearProject: docsProjectContext.linearProjectSlug,
+        codebase: null,
+      },
+    };
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [durableIssue], review: [] },
+      cycleLabel: "Docs cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "docs:ENG-179",
+    };
+    const run = runRecordFixture({
+      runId: "run-docs-workspace-1",
+      sessionId: "session-docs-workspace-1",
+      issueId: "docs:ENG-179",
+      issueIdentifier: "ENG-179",
+      workspaceKey: "ENG-179",
+      workspacePath: path.join("workspaces", "docs", "ENG-179"),
+      gitBranchName: "symphony/docs/ENG-179",
+      repoPath: "/repo-docs",
+      baseRef: "origin/main",
+    });
+    const runStore = new RecordingRunStore([run]);
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+            { source: "lifecycleStore", revision: "lifecycle-current", observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+    ]);
+    const { server } = createStatusServer(root, {
+      projectionReader,
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179`);
+
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect((detail.body as { workspace: Record<string, unknown> | null }).workspace).toMatchObject({
+        workspaceKey: "ENG-179",
+        path: path.join("workspaces", "docs", "ENG-179"),
+        gitBranchName: "symphony/docs/ENG-179",
+        repoPath: "/repo-docs",
+        baseRef: "origin/main",
+        projectContext: expectedWorkspaceProjectContext,
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("suppresses planning workspaces from cached durable issue-detail hits outside issue-breakdown runs", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const durableIssue = {
+      ...issueModelFixture(),
+      id: "TEST-1",
+      title: "Cached review issue",
+      status: "review" as const,
+      workspace: null,
+    };
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [], review: [durableIssue] },
+      cycleLabel: "Review cycle",
+      cycleDateRange: "July 2026",
+      selectedIssueId: "TEST-1",
+    };
+    await runStore.upsertWorkspace({
+      workspaceKey: "TEST-1-planning",
+      issueId: "issue-1",
+      issueIdentifier: "TEST-1",
+      path: path.join(config.workspace.root, "TEST-1-planning"),
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/TEST-1-planning",
+      repoPath: "/repo",
+      baseRef: "main",
+      createdAt: "2026-07-07T00:00:00.000Z",
+      updatedAt: "2026-07-07T00:00:00.000Z",
+    });
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: String(runStore.projectionRevision()), observedAt: null },
+            { source: "lifecycleStore", revision: "lifecycle-current", observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+    ]);
+    const { server, calls } = createStatusServer(root, {
+      projectionReader,
+      runStore,
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/TEST-1`);
+
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect((detail.body as { issue: { workspace: string | null }; workspace: unknown }).issue.workspace).toBeNull();
+      expect((detail.body as { workspace: unknown }).workspace).toBeNull();
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 1, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+  });
+
+  it("infers contextual durable-detail runs from lifecycle-backed issue ids when legacy run records lack project context", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    await runStore.startRun({
+      runId: "run-docs-legacy-1",
+      sessionId: "session-docs-legacy-1",
+      agentId: "agent-docs-legacy-1",
+      role: "worker",
+      issueId: "issue-docs-179",
+      issueIdentifier: "ENG-179",
+      attempt: null,
+      turnNumber: 1,
+      prompt: "docs work",
+      workspaceKey: "ENG-179",
+      workspacePath: path.join(config.workspace.root, "docs", "ENG-179"),
+      gitBranchName: "symphony/docs/ENG-179",
+      repoPath: "/repo-docs",
+      baseRef: "origin/main",
+      cursorModel: "gpt-5-legacy-docs",
+    });
+    await runStore.appendEvent({
+      runId: "run-docs-legacy-1",
+      at: "2026-05-31T00:00:31.000Z",
+      source: "runtime",
+      eventType: "assistant_complete",
+      message: "legacy contextual durable transcript",
+    });
+    await runStore.updateRun("run-docs-legacy-1", {
+      status: "succeeded",
+      completedAt: "2026-05-31T00:01:00.000Z",
+    });
+    await lifecycleStore.ensureIssue(
+      trackerIssue({ id: "issue-docs-179", identifier: "ENG-179", title: "Tracker-backed docs issue", projectContext: docsProjectContext }),
+      { phase: "implementation", projectContext: docsProjectContext },
+    );
+
+    const durableIssue = {
+      ...issueModelFixture(),
+      id: "docs:ENG-179",
+      title: "Serve contextual durable web projections",
+      project: "Documentation Site",
+    };
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [durableIssue], review: [] },
+      cycleLabel: "Docs cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "docs:ENG-179",
+    };
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: String(runStore.projectionRevision()), observedAt: null },
+            { source: "lifecycleStore", revision: String(lifecycleStore.projectionRevision()), observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+    ]);
+    const { server, calls } = createStatusServer(root, {
+      projectionReader,
+      runStore,
+      lifecycleStore,
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179`);
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect((detail.body as { runs: unknown[] }).runs).toEqual([
+        expect.objectContaining({ id: "session-docs-legacy-1", issue: "ENG-179", state: "succeeded", model: "gpt-5-legacy-docs", msgCount: 1 }),
+      ]);
+      expect((detail.body as { activity: unknown[] }).activity).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ verb: "run_started", id: "ENG-179", extra: "succeeded", who: "agent-docs-legacy-1" }),
+          expect.objectContaining({ verb: "run_completed", id: "ENG-179", extra: "succeeded", who: "agent-docs-legacy-1" }),
+        ]),
+      );
+
+      const detailWithTranscript = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179?includeTranscript=1`);
+      expect(detailWithTranscript.response.status).toBe(200);
+      expect(detailWithTranscript.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect((detailWithTranscript.body as { transcript: unknown[] }).transcript).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "system", model: "gpt-5-legacy-docs", workspace: "ENG-179", session: "session-docs-legacy-1" }),
+          expect.objectContaining({ kind: "assistant", text: "legacy contextual durable transcript" }),
+        ]),
+      );
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+  });
+
+  it("keeps unresolved contextual durable detail aliases isolated from raw runs in other project contexts", async () => {
+    const durableIssue = {
+      ...issueModelFixture(),
+      id: "docs:ENG-179",
+      title: "Serve contextual durable web projections",
+      project: "Documentation Site",
+    };
+    const issueBoard = {
+      issues: [durableIssue],
+      backlog: [],
+      lanes: { todo: [], progress: [durableIssue], review: [] },
+      cycleLabel: "Docs cycle",
+      cycleDateRange: "May 2026",
+      selectedIssueId: "docs:ENG-179",
+    };
+    const otherContextRun = runRecordFixture({
+      runId: "run-default-1",
+      sessionId: "session-default-1",
+      issueId: "issue-default-179",
+      issueIdentifier: "ENG-179",
+      workspaceKey: "ENG-179",
+      cursorModel: "gpt-5-default",
+      transcriptEventCount: 1,
+    });
+    const runStore = new RecordingRunStore(
+      [otherContextRun],
+      {
+        "run-default-1": [
+          {
+            runId: "run-default-1",
+            sequence: 1,
+            at: "2026-05-31T00:00:30.000Z",
+            source: "runtime",
+            eventType: "assistant_complete",
+            message: "must not leak across project contexts",
+          },
+        ],
+      },
+    );
+    const projectionReader = new RecordingProjectionReader([
+      projectionPayloadRecordFixture(
+        { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+        issueBoard,
+        {
+          sourceRevisions: [
+            { source: "runStore", revision: runStore.projectionRevision(), observedAt: null },
+            { source: "lifecycleStore", revision: "lifecycle-current", observedAt: null },
+            { source: "writebackOutbox", revision: "writeback-current", observedAt: null },
+            { source: "orchestrator_conversations", revision: "chat-current", observedAt: null },
+          ],
+        },
+      ),
+    ]);
+    const { server, calls } = createStatusServer(root, {
+      projectionReader,
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179`);
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(detail.body).toMatchObject({ issue: durableIssue, activity: [], runs: [], transcript: [] });
+
+      const detailWithTranscript = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179?includeTranscript=1`);
+      expect(detailWithTranscript.response.status).toBe(200);
+      expect(detailWithTranscript.response.headers.get("x-symphony-projection-status")).toBe("hit");
+      expect(detailWithTranscript.body).toMatchObject({ issue: durableIssue, activity: [], runs: [], transcript: [] });
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 2, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(0);
+    expect(
+      projectionReader.selectors.map(({ projectionName, projectContextId, scopeKind, scopeKey }) => ({
+        projectionName,
+        projectContextId: projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind,
+        scopeKey,
+      })),
+    ).toEqual([
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: "symphony",
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
+      {
+        projectionName: "issue_board_projection",
+        projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        scopeKind: "board",
+        scopeKey: "default-board",
+      },
     ]);
   });
 
@@ -1142,6 +1836,843 @@ describe("/api/v1/web route contracts", () => {
       { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:700:limit:500" },
       { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "run-1:offset:2:limit:3" },
     ]);
+  });
+
+  it("resolves legacy web transcript aliases through the compatibility default context", async () => {
+    const runStore = new RecordingRunStore(
+      [
+        runRecordFixture({
+          runId: "run-default-alias-1",
+          sessionId: "session-default-alias-1",
+          issueId: "issue-default-alias-1",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+        }),
+      ],
+      {
+        "run-default-alias-1": [
+          {
+            runId: "run-default-alias-1",
+            sequence: 1,
+            at: "2026-05-31T00:00:30.000Z",
+            source: "runtime",
+            eventType: "assistant_complete",
+            message: "served from compatibility default alias",
+          },
+        ],
+      },
+    );
+    const { server, calls } = createStatusServer(root, {
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const transcript = await getJson(`${baseUrl}/api/v1/web/sessions/ENG-179/transcript`);
+      const payload = transcript.body as { messages: Array<{ text?: string }>; window: { kind: string; limit: number } };
+
+      expect(transcript.response.status).toBe(200);
+      expect(payload.window).toMatchObject({ kind: "tail", limit: 500 });
+      expect(payload.messages).toEqual(
+        expect.arrayContaining([expect.objectContaining({ text: "served from compatibility default alias" })]),
+      );
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(1);
+  });
+
+  it("fails closed for ambiguous legacy web transcript aliases while qualified aliases still resolve", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const runStore = new RecordingRunStore(
+      [
+        runRecordFixture({
+          runId: "run-default-ambiguous-1",
+          sessionId: "session-default-ambiguous-1",
+          issueId: "issue-default-ambiguous-1",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+        }),
+        runRecordFixture({
+          runId: "run-docs-ambiguous-1",
+          sessionId: "session-docs-ambiguous-1",
+          issueId: "issue-docs-ambiguous-1",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+          projectContext: docsProjectContext,
+        }),
+      ],
+      {
+        "run-default-ambiguous-1": [
+          {
+            runId: "run-default-ambiguous-1",
+            sequence: 1,
+            at: "2026-05-31T00:00:30.000Z",
+            source: "runtime",
+            eventType: "assistant_complete",
+            message: "default transcript alias",
+          },
+        ],
+        "run-docs-ambiguous-1": [
+          {
+            runId: "run-docs-ambiguous-1",
+            sequence: 1,
+            at: "2026-05-31T00:00:31.000Z",
+            source: "runtime",
+            eventType: "assistant_complete",
+            message: "docs transcript alias",
+          },
+        ],
+      },
+    );
+    const { server, calls } = createStatusServer(root, {
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const ambiguous = await getJson(`${baseUrl}/api/v1/web/sessions/ENG-179/transcript`);
+      const ambiguousBody = ambiguous.body as { error: { message: string } };
+      expect(ambiguous.response.status).toBe(404);
+      expect(ambiguousBody.error.message).toContain("ambiguous across project contexts");
+      expect(ambiguousBody.error.message).toContain("context-qualified alias");
+
+      const qualified = await getJson(`${baseUrl}/api/v1/web/sessions/docs%3AENG-179/transcript`);
+      const qualifiedBody = qualified.body as { messages: Array<{ text?: string }>; window: { kind: string; limit: number } };
+      expect(qualified.response.status).toBe(200);
+      expect(qualifiedBody.window).toMatchObject({ kind: "tail", limit: 500 });
+      expect(qualifiedBody.messages).toEqual(expect.arrayContaining([expect.objectContaining({ text: "docs transcript alias" })]));
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(1);
+  });
+
+  it("fails closed for wrong-context legacy web transcript aliases with actionable guidance", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const runStore = new RecordingRunStore(
+      [
+        runRecordFixture({
+          runId: "run-docs-wrong-context-1",
+          sessionId: "session-docs-wrong-context-1",
+          issueId: "issue-docs-wrong-context-1",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+          projectContext: docsProjectContext,
+        }),
+      ],
+      {
+        "run-docs-wrong-context-1": [
+          {
+            runId: "run-docs-wrong-context-1",
+            sequence: 1,
+            at: "2026-05-31T00:00:31.000Z",
+            source: "runtime",
+            eventType: "assistant_complete",
+            message: "docs transcript alias",
+          },
+        ],
+      },
+    );
+    const { server, calls } = createStatusServer(root, {
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const wrongContext = await getJson(`${baseUrl}/api/v1/web/sessions/ENG-179/transcript`);
+      const wrongContextBody = wrongContext.body as { error: { message: string } };
+      expect(wrongContext.response.status).toBe(404);
+      expect(wrongContextBody.error.message).toContain("not available through the default project context");
+      expect(wrongContextBody.error.message).toContain("context-qualified alias");
+
+      const qualified = await getJson(`${baseUrl}/api/v1/web/sessions/docs%3AENG-179/transcript`);
+      const qualifiedBody = qualified.body as { messages: Array<{ text?: string }>; window: { kind: string; limit: number } };
+      expect(qualified.response.status).toBe(200);
+      expect(qualifiedBody.window).toMatchObject({ kind: "tail", limit: 500 });
+      expect(qualifiedBody.messages).toEqual(expect.arrayContaining([expect.objectContaining({ text: "docs transcript alias" })]));
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls).toEqual({ snapshot: 0, getIssueDetails: 0, refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    expect(runStore.transcriptReadCount).toBe(1);
+    });
+
+    it("resolves context-qualified issue, run, workspace, transcript, and approval routes safely across project-context siblings", async () => {
+      const config = testConfig(path.join(root, "workspaces"));
+      config.github.publishPullRequests = true;
+      config.github.operatorApproval!.requiredForPublication = true;
+      config.github.operatorApproval!.rejectPolicy = "cancel";
+
+      const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+      const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+      const approvalStore = new FileOperatorApprovalStore(config.workspace.stateDir);
+      const operatorApproval = new OperatorApprovalService({ config, store: approvalStore, runStore });
+      const docsProjectContext = {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      } as const;
+      const symphonyProjectContext = {
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        linearProjectSlug: "ENG",
+        routingSource: "candidate_poll",
+      } as const;
+      const docsTrackerIssue = trackerIssue({
+        id: "issue-docs-1",
+        identifier: "TEST-1",
+        title: "Docs detail title",
+        description: "Documentation context detail.",
+        state: "Blocked",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        branchName: "symphony/docs/TEST-1",
+      });
+      const symphonyTrackerIssue = trackerIssue({
+        id: "issue-symphony-1",
+        identifier: "TEST-1",
+        title: "Symphony detail title",
+        description: "Symphony context detail.",
+        state: "Blocked",
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        linearProjectSlug: "ENG",
+        branchName: "symphony/TEST-1",
+      });
+      const docsWorkspaceKey = "docs__TEST-1";
+      const symphonyWorkspaceKey = "symphony__TEST-1";
+      const docsPath = path.join(config.workspace.root, docsWorkspaceKey);
+      const symphonyPath = path.join(config.workspace.root, symphonyWorkspaceKey);
+      await mkdir(docsPath, { recursive: true });
+      await mkdir(symphonyPath, { recursive: true });
+
+      await runStore.upsertWorkspace({
+        workspaceKey: docsWorkspaceKey,
+        issueId: "issue-docs-1",
+        issueIdentifier: "TEST-1",
+        projectContext: docsProjectContext,
+        path: docsPath,
+        sourceKind: "git_worktree",
+        gitBranchName: "symphony/docs/TEST-1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      await runStore.upsertWorkspace({
+        workspaceKey: symphonyWorkspaceKey,
+        issueId: "issue-symphony-1",
+        issueIdentifier: "TEST-1",
+        projectContext: symphonyProjectContext,
+        path: symphonyPath,
+        sourceKind: "git_worktree",
+        gitBranchName: "symphony/TEST-1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      await runStore.startRun({
+        runId: "run-docs-1",
+        sessionId: "session-docs-1",
+        agentId: "agent-docs-1",
+        role: "worker",
+        issueId: "issue-docs-1",
+        issueIdentifier: "TEST-1",
+        attempt: null,
+        turnNumber: 1,
+        prompt: "docs work",
+        workspaceKey: docsWorkspaceKey,
+        workspacePath: docsPath,
+        gitBranchName: "symphony/docs/TEST-1",
+        repoPath: "/repo/docs",
+        baseRef: "origin/main",
+        projectContext: docsProjectContext,
+      });
+      await runStore.appendEvent({
+        runId: "run-docs-1",
+        at: "2026-01-01T00:00:01.000Z",
+        source: "harness",
+        eventType: "progress",
+        message: "docs transcript",
+      });
+      await runStore.startRun({
+        runId: "run-symphony-1",
+        sessionId: "session-symphony-1",
+        agentId: "agent-symphony-1",
+        role: "worker",
+        issueId: "issue-symphony-1",
+        issueIdentifier: "TEST-1",
+        attempt: null,
+        turnNumber: 1,
+        prompt: "symphony work",
+        workspaceKey: symphonyWorkspaceKey,
+        workspacePath: symphonyPath,
+        gitBranchName: "symphony/TEST-1",
+        repoPath: "/repo/symphony",
+        baseRef: "origin/main",
+        projectContext: symphonyProjectContext,
+      });
+      await runStore.appendEvent({
+        runId: "run-symphony-1",
+        at: "2026-01-01T00:00:02.000Z",
+        source: "harness",
+        eventType: "progress",
+        message: "symphony transcript",
+      });
+
+      const docsEvidenceCursor = "idem-context-qualified-web-route-contract-docs";
+      const docsPending = (
+        await approvalStore.requestOrGetPending(
+          {
+            issueId: "issue-docs-1",
+            issueIdentifier: "TEST-1",
+            runId: "run-docs-1",
+            evidenceCursor: docsEvidenceCursor,
+            action: {
+              kind: "push_and_pr",
+              branchName: "symphony/docs/TEST-1",
+              baseBranch: "origin/main",
+              workspacePath: docsPath,
+              title: "TEST-1: Docs work",
+              evidenceCursor: docsEvidenceCursor,
+              summaryPreview: "Implemented the documentation-context service contract.",
+              changedFiles: ["tests/web-route-contract.test.ts"],
+              plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+            },
+          },
+          null,
+        )
+      ).record;
+      await runStore.updateRun("run-docs-1", {
+        metadata: {
+          pendingApprovalRequestId: docsPending.requestId,
+          pendingApprovalRequestedAt: docsPending.requestedAt,
+        },
+      });
+      const symphonyEvidenceCursor = "idem-context-qualified-web-route-contract-symphony";
+      const symphonyPending = (
+        await approvalStore.requestOrGetPending(
+          {
+            issueId: "issue-symphony-1",
+            issueIdentifier: "TEST-1",
+            runId: "run-symphony-1",
+            evidenceCursor: symphonyEvidenceCursor,
+            action: {
+              kind: "push_and_pr",
+              branchName: "symphony/TEST-1",
+              baseBranch: "origin/main",
+              workspacePath: symphonyPath,
+              title: "TEST-1: Symphony work",
+              evidenceCursor: symphonyEvidenceCursor,
+              summaryPreview: "Implemented the symphony sibling service contract.",
+              changedFiles: ["tests/web-route-contract.test.ts"],
+              plannedOperations: ["commit_if_needed", "git_push", "pull_request_create_or_reuse"],
+            },
+          },
+          null,
+        )
+      ).record;
+      await runStore.updateRun("run-symphony-1", {
+        metadata: {
+          pendingApprovalRequestId: symphonyPending.requestId,
+          pendingApprovalRequestedAt: symphonyPending.requestedAt,
+        },
+      });
+      await lifecycleStore.ensureIssue(
+        issue({
+          id: "issue-docs-1",
+          identifier: "TEST-1",
+          title: docsTrackerIssue.title,
+          description: docsTrackerIssue.description,
+          state: "Blocked",
+          branchName: "symphony/docs/TEST-1",
+        }),
+        {
+          phase: "blocked",
+          blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          projectContext: docsProjectContext,
+          lastCompletionReportId: `completion-report:issue-docs-1:${docsEvidenceCursor}`,
+          completionReports: [
+            {
+              id: `completion-report:issue-docs-1:${docsEvidenceCursor}`,
+              idempotencyKey: docsEvidenceCursor,
+              runId: "run-docs-1",
+              issueId: "issue-docs-1",
+              issueIdentifier: "TEST-1",
+              summary: "Implemented the documentation-context service contract.",
+              validationEvidence: ["vitest web-route-contract"],
+              acceptanceChecklist: [{ text: "approval linked", satisfied: true, evidence: "web route contract fixture" }],
+              changedFiles: ["tests/web-route-contract.test.ts"],
+              branchName: "symphony/docs/TEST-1",
+              pullRequest: null,
+              risks: [],
+              acceptedAt: "2026-01-01T00:00:00.000Z",
+              writebackOperationKeys: [],
+            },
+          ],
+          summaryPointers: {
+            workspaceKey: docsWorkspaceKey,
+            workspacePath: docsPath,
+            branchName: "symphony/docs/TEST-1",
+            gitBranchName: "symphony/docs/TEST-1",
+            repoPath: "/repo/docs",
+            baseRef: "origin/main",
+          },
+        },
+      );
+      await lifecycleStore.ensureIssue(
+        issue({
+          id: "issue-symphony-1",
+          identifier: "TEST-1",
+          title: symphonyTrackerIssue.title,
+          description: symphonyTrackerIssue.description,
+          state: "Blocked",
+          branchName: "symphony/TEST-1",
+        }),
+        {
+          phase: "blocked",
+          blockedReason: PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
+          projectContext: symphonyProjectContext,
+          lastCompletionReportId: `completion-report:issue-symphony-1:${symphonyEvidenceCursor}`,
+          completionReports: [
+            {
+              id: `completion-report:issue-symphony-1:${symphonyEvidenceCursor}`,
+              idempotencyKey: symphonyEvidenceCursor,
+              runId: "run-symphony-1",
+              issueId: "issue-symphony-1",
+              issueIdentifier: "TEST-1",
+              summary: "Implemented the symphony sibling service contract.",
+              validationEvidence: ["vitest web-route-contract"],
+              acceptanceChecklist: [{ text: "approval linked", satisfied: true, evidence: "web route contract fixture" }],
+              changedFiles: ["tests/web-route-contract.test.ts"],
+              branchName: "symphony/TEST-1",
+              pullRequest: null,
+              risks: [],
+              acceptedAt: "2026-01-01T00:00:00.000Z",
+              writebackOperationKeys: [],
+            },
+          ],
+          summaryPointers: {
+            workspaceKey: symphonyWorkspaceKey,
+            workspacePath: symphonyPath,
+            branchName: "symphony/TEST-1",
+            gitBranchName: "symphony/TEST-1",
+            repoPath: "/repo/symphony",
+            baseRef: "origin/main",
+          },
+        },
+      );
+
+      const { orchestrator, calls } = instrumentedOrchestrator();
+      const server = new StatusServer({
+        orchestrator,
+        workspaceManager: new WorkspaceManager({
+          workspace: config.workspace,
+          hooks: config.hooks,
+          logger: new StructuredLogger(() => undefined),
+        }),
+        workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+        runStore,
+        lifecycleStore,
+        operatorApproval,
+        tracker: trackerClient(async () => [symphonyTrackerIssue, docsTrackerIssue]),
+        defaultProjectContextId: "symphony",
+        host: "127.0.0.1",
+        port: 0,
+        openWorkspaceToken: "secret",
+        trackerStateLists: testTrackerStateLists(),
+        staleThresholdMs: 300_000,
+      });
+      const address = await server.start();
+      const baseUrl = baseUrlFor(address);
+      try {
+        const ambiguousIssue = await getJson(`${baseUrl}/api/v1/issues/TEST-1`);
+        const ambiguousWorkspace = await getJson(`${baseUrl}/api/v1/workspaces/TEST-1`);
+        const ambiguousTranscript = await getJson(`${baseUrl}/api/v1/web/sessions/TEST-1/transcript`);
+        const ambiguousWebIssue = await getJson(`${baseUrl}/api/v1/web/issues/TEST-1`);
+        const ambiguousIssueRuns = await getJson(`${baseUrl}/api/v1/issues/TEST-1/runs`);
+        const ambiguousRun = await getJson(`${baseUrl}/api/v1/runs/TEST-1`);
+        const ambiguousApproval = await getJson(`${baseUrl}/api/v1/approval-requests/TEST-1`);
+        const qualifiedIssue = await getJson(`${baseUrl}/api/v1/issues/${encodeURIComponent("docs:TEST-1")}`);
+        const qualifiedWebIssue = await getJson(`${baseUrl}/api/v1/web/issues/${encodeURIComponent("docs:TEST-1")}`);
+        const qualifiedIssueRuns = await getJson(`${baseUrl}/api/v1/issues/${encodeURIComponent("docs:TEST-1")}/runs`);
+        const qualifiedWorkspace = await getJson(`${baseUrl}/api/v1/workspaces/${encodeURIComponent("docs:TEST-1")}`);
+        const qualifiedTranscript = await getJson(`${baseUrl}/api/v1/web/sessions/${encodeURIComponent("docs:TEST-1")}/transcript`);
+        const qualifiedRun = await getJson(`${baseUrl}/api/v1/runs/${encodeURIComponent("docs:run-docs-1")}`);
+        const approvalRoute = await getJson(`${baseUrl}/api/v1/approval-requests/${encodeURIComponent("docs:TEST-1")}`);
+
+        const ambiguousIssueBody = ambiguousIssue.body as { error: { message: string } };
+        const ambiguousWorkspaceBody = ambiguousWorkspace.body as { error: { message: string } };
+        const ambiguousTranscriptBody = ambiguousTranscript.body as { error: { message: string } };
+        const ambiguousWebIssueBody = ambiguousWebIssue.body as { error: { message: string } };
+        const ambiguousIssueRunsBody = ambiguousIssueRuns.body as { error: { message: string } };
+        const ambiguousRunBody = ambiguousRun.body as { error: { message: string } };
+        const ambiguousApprovalBody = ambiguousApproval.body as { error: { message: string } };
+        const issueBody = qualifiedIssue.body as {
+          issue: string;
+          workspace: {
+            workspaceKey: string;
+            issueId: string;
+            issueIdentifier: string;
+            projectContext?: { projectContextId: string };
+          } | null;
+          latestRun: { runId: string; projectContext?: { projectContextId: string } } | null;
+          lifecycle: { projectContext?: { projectContextId: string } } | null;
+          capabilities: {
+            continuationSummary: { path: string; requiresToken: boolean };
+            pendingApproval: {
+              active: boolean;
+              requestId: string | null;
+              projectContext?: { projectContextId: string };
+              resolve: { method: string; path: string; header: string } | null;
+              requiresToken: boolean;
+            };
+          };
+          pendingApproval: {
+            requestId: string;
+            projectContext?: { projectContextId: string };
+            capabilities: { resolve: { path: string } };
+          } | null;
+        };
+        const webIssueBody = qualifiedWebIssue.body as {
+          issue: { id: string; title: string; workspace: string; session: string; desc: string[] };
+          runs: Array<{ id: string; issue: string; title: string }>;
+          transcript: unknown[];
+        };
+        const issueRunsBody = qualifiedIssueRuns.body as {
+          issue: string;
+          issueDetails: {
+            workspace: {
+              workspaceKey: string;
+              path: string | null;
+            } | null;
+            latestRun: { runId: string | null } | null;
+          };
+          runs: Array<{
+            runId: string;
+            issueId: string;
+            issueIdentifier: string;
+            projectContext?: { projectContextId: string };
+          }>;
+        };
+        const workspaceBody = qualifiedWorkspace.body as {
+          workspaceKey: string;
+          issueId: string;
+          issueIdentifier: string;
+          projectContext?: { projectContextId: string };
+        };
+        const transcriptBody = qualifiedTranscript.body as {
+          messages: Array<{ kind: string; text?: string; issue?: string; session?: string }>;
+          window: { kind: string; limit: number };
+          activeTail: { refetchHref: string | null };
+        };
+        const runBody = qualifiedRun.body as {
+          runId: string;
+          issueId: string;
+          issueIdentifier: string;
+          projectContext?: { projectContextId: string };
+          pendingApproval: { requestId: string; projectContext?: { projectContextId: string } } | null;
+        };
+        const approvalBody = approvalRoute.body as {
+          requestId: string;
+          issueId: string;
+          issueIdentifier: string;
+          projectContext?: { projectContextId: string };
+          capabilities: { resolve: { method: string; path: string; header: string } };
+        };
+
+        expect(ambiguousIssue.response.status).toBe(409);
+        expect(ambiguousIssueBody.error.message).toContain("Ambiguous issue identifier: TEST-1");
+        expect(ambiguousIssueBody.error.message).toContain("Use exact issue id");
+        expect(ambiguousIssueBody.error.message).toContain("[docs]");
+        expect(ambiguousIssueBody.error.message).toContain("[symphony]");
+        expect(ambiguousWorkspace.response.status).toBe(409);
+        expect(ambiguousWorkspaceBody.error.message).toContain("Ambiguous issue identifier: TEST-1");
+        expect(ambiguousWorkspaceBody.error.message).toContain("Use exact issue id");
+        expect(ambiguousWorkspaceBody.error.message).toContain("[docs]");
+        expect(ambiguousWorkspaceBody.error.message).toContain("[symphony]");
+        expect(ambiguousTranscript.response.status).toBe(404);
+        expect(ambiguousTranscriptBody.error.message).toContain("context-qualified alias");
+        expect(ambiguousWebIssue.response.status).toBe(409);
+        expect(ambiguousWebIssueBody.error.message).toContain("Ambiguous issue identifier: TEST-1");
+        expect(ambiguousWebIssueBody.error.message).toContain("Use exact issue id");
+        expect(ambiguousWebIssueBody.error.message).toContain("[docs]");
+        expect(ambiguousWebIssueBody.error.message).toContain("[symphony]");
+        expect(ambiguousIssueRuns.response.status).toBe(409);
+        expect(ambiguousIssueRunsBody.error.message).toContain("Ambiguous issue identifier: TEST-1");
+        expect(ambiguousIssueRunsBody.error.message).toContain("Use exact issue id");
+        expect(ambiguousIssueRunsBody.error.message).toContain("[docs]");
+        expect(ambiguousIssueRunsBody.error.message).toContain("[symphony]");
+        expect(ambiguousRun.response.status).toBe(404);
+        expect(ambiguousRunBody.error.message).toContain("ambiguous across project contexts");
+        expect(ambiguousRunBody.error.message).toContain("context-qualified alias");
+        expect(ambiguousApproval.response.status).toBe(404);
+        expect(ambiguousApprovalBody.error.message).toContain("ambiguous across project contexts");
+        expect(ambiguousApprovalBody.error.message).toContain("context-qualified alias");
+
+        expect(qualifiedIssue.response.status).toBe(200);
+        expect(issueBody.issue).toBe("issue-docs-1");
+        expect(issueBody.workspace).toMatchObject({
+          workspaceKey: docsWorkspaceKey,
+          issueId: "issue-docs-1",
+          issueIdentifier: "TEST-1",
+          projectContext: { projectContextId: "docs" },
+        });
+        expect(issueBody.latestRun).toMatchObject({ runId: "run-docs-1", projectContext: { projectContextId: "docs" } });
+        expect(issueBody.lifecycle?.projectContext).toMatchObject({ projectContextId: "docs" });
+        expect(issueBody.capabilities.continuationSummary).toMatchObject({
+          path: "/api/v1/issues/docs%3ATEST-1/continuation-summary",
+          requiresToken: true,
+        });
+        expect(issueBody.capabilities.pendingApproval).toMatchObject({
+          active: true,
+          requestId: docsPending.requestId,
+          projectContext: { projectContextId: "docs" },
+          resolve: {
+            method: "POST",
+            path: `/api/v1/approval-requests/${docsPending.requestId}`,
+            header: "X-Symphony-Token",
+          },
+          requiresToken: true,
+        });
+        expect(issueBody.capabilities.pendingApproval.requestId).not.toBe(symphonyPending.requestId);
+        expect(issueBody.pendingApproval).toMatchObject({
+          requestId: docsPending.requestId,
+          projectContext: { projectContextId: "docs" },
+          capabilities: { resolve: { path: `/api/v1/approval-requests/${docsPending.requestId}` } },
+        });
+        expect(issueBody.pendingApproval?.requestId).not.toBe(symphonyPending.requestId);
+
+        expect(qualifiedWebIssue.response.status).toBe(200);
+        expect(webIssueBody.issue).toMatchObject({
+          id: "docs:TEST-1",
+          workspace: docsPath,
+          session: "session-docs-1",
+        });
+        expect(webIssueBody.runs).toEqual(expect.arrayContaining([expect.objectContaining({ id: "session-docs-1", issue: "TEST-1", title: "TEST-1" })]));
+        expect(webIssueBody.runs.some((run) => run.id === "session-symphony-1")).toBe(false);
+        expect(webIssueBody.transcript).toEqual([]);
+
+        expect(qualifiedIssueRuns.response.status).toBe(200);
+        expect(issueRunsBody.issue).toBe("issue-docs-1");
+        expect(issueRunsBody.issueDetails.workspace).toMatchObject({
+          workspaceKey: docsWorkspaceKey,
+          path: docsPath,
+        });
+        expect(issueRunsBody.issueDetails.latestRun).toMatchObject({
+          runId: "run-docs-1",
+        });
+        expect(issueRunsBody.runs).toHaveLength(1);
+        expect(issueRunsBody.runs).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              runId: "run-docs-1",
+              issueId: "issue-docs-1",
+              issueIdentifier: "TEST-1",
+              projectContext: expect.objectContaining({ projectContextId: "docs" }),
+            }),
+          ]),
+        );
+
+
+        expect(qualifiedWorkspace.response.status).toBe(200);
+        expect(workspaceBody).toMatchObject({
+          workspaceKey: docsWorkspaceKey,
+          issueId: "issue-docs-1",
+          issueIdentifier: "TEST-1",
+          projectContext: { projectContextId: "docs" },
+        });
+
+        expect(qualifiedTranscript.response.status).toBe(200);
+        expect(transcriptBody.window).toMatchObject({ kind: "tail", limit: 500 });
+        expect(transcriptBody.messages).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ kind: "user", issue: "TEST-1", text: "docs work" }),
+            expect.objectContaining({ kind: "assistant", text: "docs transcript" }),
+          ]),
+        );
+        expect(transcriptBody.activeTail.refetchHref).toBe("/api/v1/web/sessions/session-docs-1/transcript?refresh=1");
+
+        expect(qualifiedRun.response.status).toBe(200);
+        expect(runBody).toMatchObject({
+          runId: "run-docs-1",
+          issueId: "issue-docs-1",
+          issueIdentifier: "TEST-1",
+          projectContext: { projectContextId: "docs" },
+          pendingApproval: {
+            requestId: docsPending.requestId,
+            projectContext: { projectContextId: "docs" },
+          },
+        });
+        expect(runBody.pendingApproval?.requestId).not.toBe(symphonyPending.requestId);
+
+        expect(approvalRoute.response.status).toBe(200);
+        expect(approvalBody).toMatchObject({
+          requestId: docsPending.requestId,
+          issueId: "issue-docs-1",
+          issueIdentifier: "TEST-1",
+          projectContext: { projectContextId: "docs" },
+          capabilities: {
+            resolve: {
+              method: "POST",
+              path: `/api/v1/approval-requests/${docsPending.requestId}`,
+              header: "X-Symphony-Token",
+            },
+          },
+        });
+      } finally {
+        await server.stop();
+      }
+
+      expect(calls).toMatchObject({ refreshNow: 0, pauseIssue: 0, resumeIssue: 0, cancelIssue: 0 });
+    });
+
+  it("resolves context-qualified web issue detail lookups during refresh bypasses", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const runStore = new RecordingRunStore([
+      runRecordFixture({
+        runId: "run-docs-refresh-1",
+        sessionId: "session-docs-refresh-1",
+        issueId: "issue-docs-refresh-1",
+        issueIdentifier: "ENG-179",
+        workspaceKey: "ENG-179",
+        projectContext: docsProjectContext,
+        cursorModel: "gpt-5-refresh-docs",
+      }),
+    ]);
+    const { server, calls } = createStatusServer(root, {
+      runStore: runStore.asRunTranscriptStore(),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179?refresh=1`);
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(detail.body).toMatchObject({
+        issue: {
+          id: "docs:ENG-179",
+          title: "ENG-179",
+          project: "Documentation Site",
+        },
+        runs: [expect.objectContaining({ id: "session-docs-refresh-1", issue: "ENG-179", model: "gpt-5-refresh-docs" })],
+      });
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls.snapshot).toBeGreaterThanOrEqual(1);
+  });
+
+  it("resolves tracker-backed context-qualified web issue details during refresh bypasses", async () => {
+    const docsIssue = trackerIssue({
+      id: "issue-docs-179",
+      identifier: "ENG-179",
+      title: "Tracker-backed docs issue",
+      description: "Tracker-backed docs issue detail.",
+      priority: 2,
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+    const { server, calls } = createStatusServer(root, {
+      tracker: trackerClient(async () => [docsIssue]),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const board = await getJson(`${baseUrl}/api/v1/web/issues?refresh=1`);
+      expect(board.response.status).toBe(200);
+      expect(board.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(board.body).toMatchObject({
+        selectedIssueId: "docs:ENG-179",
+        issues: [expect.objectContaining({ id: "docs:ENG-179", title: "Tracker-backed docs issue", project: "Documentation Site" })],
+      });
+
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179?refresh=1`);
+      expect(detail.response.status).toBe(200);
+      expect(detail.response.headers.get("x-symphony-projection-status")).toBe("refresh_bypass");
+      expect(detail.body).toMatchObject({
+        issue: {
+          id: "docs:ENG-179",
+          title: "Tracker-backed docs issue",
+          project: "Documentation Site",
+        },
+        runs: [],
+        transcript: [],
+      });
+    } finally {
+      await server.stop();
+    }
+
+    expect(calls.snapshot).toBeGreaterThanOrEqual(2);
+  });
+
+  it("refreshes cached tracker-backed contextual alias lookups before serving stale web issue details", async () => {
+    const docsIssue = trackerIssue({
+      id: "issue-docs-179",
+      identifier: "ENG-179",
+      title: "Tracker-backed docs issue",
+      description: "Tracker-backed docs issue detail.",
+      priority: 2,
+      state: "In Progress",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+    let fetchCount = 0;
+    const { server, calls } = createStatusServer(root, {
+      tracker: trackerClient(async () => {
+        fetchCount += 1;
+        return fetchCount === 1 ? [docsIssue] : [];
+      }),
+      defaultProjectContextId: "symphony",
+    });
+    const address = await server.start();
+    const baseUrl = baseUrlFor(address);
+    try {
+      const board = await getJson(`${baseUrl}/api/v1/web/issues`);
+      expect(board.response.status).toBe(200);
+      expect(board.body).toMatchObject({
+        selectedIssueId: "docs:ENG-179",
+        issues: [expect.objectContaining({ id: "docs:ENG-179", title: "Tracker-backed docs issue", project: "Documentation Site" })],
+      });
+
+      const detail = await getJson(`${baseUrl}/api/v1/web/issues/docs:ENG-179`);
+      expect(detail.response.status).toBe(200);
+      expect(detail.body).toBeNull();
+    } finally {
+      await server.stop();
+    }
+
+    expect(fetchCount).toBe(2);
+    expect(calls.snapshot).toBeGreaterThanOrEqual(2);
   });
 
   it("returns explicit stale responses without rebuilding canonical web projection sources", async () => {
@@ -2040,7 +3571,9 @@ interface CreateStatusServerOptions {
   projectionWriter?: StatusServerProjectionWriter;
   projectionReader?: StatusServerProjectionReader;
   webProjectionRevisionProviders?: readonly WebProjectionRevisionProvider[];
+  defaultProjectContextId?: string | null;
   runStore?: RunTranscriptStore;
+  lifecycleStore?: IssueLifecycleStore;
   tracker?: TrackerClient;
   webProjectionContextClock?: () => Date;
   webProjectionContextBuilder?: StatusServerWebProjectionContextBuilder;
@@ -2098,7 +3631,9 @@ class RecordingProjectionReader implements StatusServerProjectionReader {
   async readCurrentTranscriptDefaultPayload<TPayload = unknown>(selector: {
     runId: string;
     limit: number;
+    scopeKey?: string | null | undefined;
   }): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    const requestedProjectContextId = transcriptProjectionScopeKeyProjectContextId(selector.scopeKey ?? null);
     const record = [...this.records.values()]
       .filter((candidate) => {
         const page = transcriptProjectionPageFromScopeKey(candidate.revision.scopeKey);
@@ -2106,7 +3641,8 @@ class RecordingProjectionReader implements StatusServerProjectionReader {
           candidate.revision.projectionName === "transcript_projection" &&
           candidate.revision.scopeKind === "run_page" &&
           page?.runId === selector.runId &&
-          page.limit === selector.limit
+          page.limit === selector.limit &&
+          (page.projectContextId ?? null) === requestedProjectContextId
         );
       })
       .sort(compareTranscriptDefaultProjectionRecords)[0];
@@ -2115,7 +3651,7 @@ class RecordingProjectionReader implements StatusServerProjectionReader {
       this.selectors.push({
         projectionName: "transcript_projection",
         scopeKind: "run_page",
-        scopeKey: `${selector.runId}:tail:limit:${selector.limit}`,
+        scopeKey: selector.scopeKey ?? `${selector.runId}:tail:limit:${selector.limit}`,
       });
     }
     return record ? (cloneJson(record) as ProjectionPayloadRecord<TPayload>) : null;
@@ -2163,6 +3699,10 @@ class RecordingRunStore {
     return [...this.runsById.values()].map((run) => cloneJson(run));
   }
 
+  async listWorkspaces(): Promise<WorkspaceRecord[]> {
+    return [];
+  }
+
   async readTranscript(runId: string, page: { offset: number; limit: number }): Promise<TranscriptPage> {
     this.transcriptReadCount += 1;
     const events = this.transcriptEventsByRunId.get(runId) ?? [];
@@ -2201,17 +3741,38 @@ class FailingTranscriptRunStore extends RecordingRunStore {
 }
 
 function projectionSelectorKey(selector: ProjectionRevisionSelector): string {
-  return [selector.projectionName, selector.scopeKind ?? "global", selector.scopeKey ?? "global"].join(":");
+  return [
+    selector.projectionName,
+    selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    selector.scopeKind ?? "global",
+    selector.scopeKey ?? "global",
+  ].join(":");
 }
 
 function projectionRevisionSelector(revision: ProjectionRevisionRecord): ProjectionRevisionSelector {
-  return { projectionName: revision.projectionName, scopeKind: revision.scopeKind, scopeKey: revision.scopeKey };
+  return {
+    projectionName: revision.projectionName,
+    projectContextId: revision.projectContextId,
+    scopeKind: revision.scopeKind,
+    scopeKey: revision.scopeKey,
+  };
 }
 
-function transcriptProjectionPageFromScopeKey(scopeKey: string): { runId: string; offset: number; limit: number } | null {
-  const match = /^(.*):offset:(\d+):limit:(\d+)$/.exec(scopeKey);
+function transcriptProjectionPageFromScopeKey(
+  scopeKey: string,
+): { projectContextId: string | null; runId: string; offset: number; limit: number } | null {
+  const scopedMatch = /^pc=([^|]+)\|(.*)$/.exec(scopeKey);
+  const projectContextId = scopedMatch?.[1] ?? null;
+  const unscopedScopeKey = scopedMatch?.[2] ?? scopeKey;
+  const match = /^(.*):offset:(\d+):limit:(\d+)$/.exec(unscopedScopeKey);
   if (!match) return null;
-  return { runId: match[1] ?? "", offset: Number(match[2]), limit: Number(match[3]) };
+  return { projectContextId, runId: match[1] ?? "", offset: Number(match[2]), limit: Number(match[3]) };
+}
+
+function transcriptProjectionScopeKeyProjectContextId(scopeKey: string | null | undefined): string | null {
+  if (typeof scopeKey !== "string") return null;
+  const match = /^pc=([^|]+)\|/.exec(scopeKey);
+  return match?.[1] ?? null;
 }
 
 function compareTranscriptDefaultProjectionRecords(left: ProjectionPayloadRecord, right: ProjectionPayloadRecord): number {
@@ -2238,7 +3799,7 @@ function transcriptProjectionRecordMessageCount(record: ProjectionPayloadRecord)
 }
 
 function projectionPayloadRecordFixture<TPayload>(
-  selector: { projectionName: DurableProjectionName; scopeKind: string; scopeKey: string },
+  selector: { projectionName: DurableProjectionName; projectContextId?: string; scopeKind: string; scopeKey: string },
   payload: TPayload,
   options: {
     sourceRevisions?: ProjectionSourceRevision[];
@@ -2254,6 +3815,7 @@ function projectionPayloadRecordFixture<TPayload>(
     revision: {
       projectionRevisionId: revision,
       projectionName: selector.projectionName,
+      projectContextId: selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
       scopeKind: selector.scopeKind,
       scopeKey: selector.scopeKey,
       revision,
@@ -2320,6 +3882,148 @@ function runRecordFixture(overrides: Partial<RunRecord> = {}): RunRecord {
   };
 }
 
+function historySessionFixture(input: {
+  id: string;
+  issue: string;
+  title: string;
+  updatedAt: string;
+  msgCount: number;
+  lastEvent: string;
+  toolCount: number;
+  subtitle?: string;
+  startedAt?: string;
+  agentId?: string;
+  state?: "running" | "finished" | "error" | "cancelled" | "queued" | "not_live";
+  status?: RunRecord["status"];
+  model?: string;
+  projectContext?: {
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string | null;
+    routingSource: string;
+  };
+}) {
+  const {
+    id,
+    issue,
+    title,
+    updatedAt,
+    msgCount,
+    lastEvent,
+    toolCount,
+    subtitle,
+    startedAt = updatedAt,
+    agentId = "agent-1",
+    state = "finished",
+    status = "succeeded",
+    model = "claude-sonnet-4",
+    projectContext = legacyDefaultProjectContext(),
+  } = input;
+  return {
+    id,
+    issue,
+    title,
+    ...(subtitle ? { subtitle } : {}),
+    projectContext,
+    state,
+    model,
+    startedAt,
+    updatedAt,
+    msgCount,
+    lastEvent,
+    toolCount,
+    runSession: {
+      runId: id,
+      sessionId: id,
+      agentId,
+      projectContext,
+      role: "worker" as const,
+      runPhase: "implementation" as const,
+      runKind: "implementation" as const,
+      attempt: 1,
+      turnNumber: 1,
+      harnessId: "cursor",
+      status,
+      startedAt,
+      updatedAt,
+      completedAt: status === "running" ? null : updatedAt,
+      error: null,
+      transcriptEventCount: msgCount,
+      tokens: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      runtime: {
+        model,
+        modelParams: [],
+        settingSources: [],
+        mode: null,
+        allowLargeContext: null,
+        agentLifecycle: null,
+      },
+      cursor: {
+        model,
+        modelParams: [],
+        settingSources: [],
+        mode: null,
+        allowLargeContext: null,
+        workerAgentLifecycle: null,
+      },
+      workspace: {
+        key: issue,
+        path: path.join("workspaces", issue),
+        repoPath: "/repo",
+        baseRef: "main",
+        branch: `symphony/${issue}`,
+      },
+      pullRequest: {
+        url: null,
+        number: null,
+        headSha: null,
+        branch: null,
+        ciStatus: null,
+        lastPushedAt: null,
+        lastEvidenceCursor: null,
+      },
+      approval: {
+        pendingRequestId: null,
+        requestedAt: null,
+      },
+      cancellation: {
+        requestedAt: null,
+        source: null,
+        reason: null,
+        outcome: null,
+        harnessStopRequestedAt: null,
+        harnessStopFailedAt: null,
+        harnessStopFailedReason: null,
+        cancelFailed: false,
+        cancelFailedAt: null,
+        cancelFailedReason: null,
+        cancelFailedSource: null,
+      },
+      failure: {
+        kind: null,
+        diagnosticCode: null,
+        diagnosticMessage: null,
+        diagnosticAt: null,
+      },
+      providerLimit: null,
+      links: {
+        issue: `/api/v1/web/issues/${encodeURIComponent(issue)}`,
+        run: `/api/v1/runs/${encodeURIComponent(id)}`,
+        transcript: `/api/v1/web/sessions/${encodeURIComponent(id)}/transcript`,
+      },
+    },
+  };
+}
+
+function legacyDefaultProjectContext() {
+  return {
+    projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+    linearProjectSlug: null,
+    routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+  };
+}
+
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
@@ -2328,6 +4032,7 @@ function projectionRevisionRecordFixture(input: ProjectionPayloadWriteInput, rev
   return {
     projectionRevisionId: revision,
     projectionName: input.projectionName,
+    projectContextId: input.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
     scopeKind: input.scopeKind ?? "global",
     scopeKey: input.scopeKey ?? "global",
     revision,
@@ -2359,6 +4064,7 @@ function createStatusServer(
         logger: new StructuredLogger(() => undefined),
       }),
       workspaceOpener: new CursorWorkspaceOpener({ workspaceRoot: config.workspace.root, openerCommand: null }),
+      defaultProjectContextId: options.defaultProjectContextId,
       host: "127.0.0.1",
       port: 0,
       openWorkspaceToken: null,
@@ -2367,6 +4073,7 @@ function createStatusServer(
       webAssetsRoot: options.webAssetsRoot,
       ...(options.enableStatusServer === undefined ? {} : { enableStatusServer: options.enableStatusServer }),
       ...(options.runStore ? { runStore: options.runStore } : {}),
+      ...(options.lifecycleStore ? { lifecycleStore: options.lifecycleStore } : {}),
       ...(options.tracker ? { tracker: options.tracker } : {}),
       ...(options.webProjectionContextClock ? { webProjectionContextClock: options.webProjectionContextClock } : {}),
       ...(options.webProjectionContextBuilder ? { webProjectionContextBuilder: options.webProjectionContextBuilder } : {}),

@@ -4,10 +4,20 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
+import {
+  normalizeProjectContextResolution,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
 import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 import { isRunActivityCommandPolicyDecisionPayload } from "../runActivity/RunActivityEvent.js";
 import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
+import {
+  ProjectionRevisionNotifier,
+  type ProjectionChangeSource,
+  type ProjectionChangeListener,
+  type ProjectionChangeUnsubscribe,
+} from "./ProjectionRevision.js";
 
 export type RunStatus = "running" | "succeeded" | "failed" | "cancelled";
 export type PersistedRunRole = AgentRunRole | "planner";
@@ -90,6 +100,7 @@ export interface WorkspaceRecord {
   workspaceKey: string;
   issueId: string | null;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   path: string;
   sourceKind: string;
   repoPath?: string;
@@ -97,6 +108,10 @@ export interface WorkspaceRecord {
   gitBranchName?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ProjectContextScopedLookup {
+  projectContext?: ProjectContextResolution | undefined;
 }
 
 export interface RunMetadata {
@@ -161,6 +176,7 @@ export interface RunRecord {
   runKind?: AgentRunKind;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   attempt: number | null;
   turnNumber: number;
   prompt: string;
@@ -406,6 +422,7 @@ export interface StartRunInput {
   runKind?: AgentRunKind;
   issueId: string;
   issueIdentifier: string;
+  projectContext?: ProjectContextResolution | undefined;
   attempt: number | null;
   turnNumber: number;
   prompt: string;
@@ -436,6 +453,7 @@ export interface StartRunInput {
 export interface UpdateRunInput {
   sessionId?: string | null;
   agentId?: string | null;
+  projectContext?: ProjectContextResolution | undefined;
   status?: RunStatus;
   completedAt?: string | null;
   error?: string | null;
@@ -460,6 +478,8 @@ export class FileRunTranscriptStore {
   private readonly transcriptEventCounts = new Map<string, number>();
   private readonly transcriptSource = new TranscriptEventSource();
   private readonly fileTranscriptSink: FileTranscriptSink;
+  private projectionRevisionValue = 0;
+  private readonly projectionNotifier = new ProjectionRevisionNotifier();
 
   constructor(private readonly stateDir: string) {
     this.fileTranscriptSink = new FileTranscriptSink((event) => this.writeTranscriptEvent(event));
@@ -470,6 +490,14 @@ export class FileRunTranscriptStore {
     return this.transcriptSource.subscribe(listener);
   }
 
+  projectionRevision(): number {
+    return this.projectionRevisionValue;
+  }
+
+  onProjectionChanged(listener: ProjectionChangeListener): ProjectionChangeUnsubscribe {
+    return this.projectionNotifier.subscribe(listener);
+  }
+
   transcriptSinkFailures(): readonly TranscriptSinkFailure[] {
     return this.fileTranscriptSink.failuresSnapshot();
   }
@@ -477,21 +505,28 @@ export class FileRunTranscriptStore {
   async upsertWorkspace(record: WorkspaceRecord): Promise<void> {
     await fs.mkdir(this.workspacesDir(), { recursive: true });
     const existing = await this.getWorkspace(record.workspaceKey);
-    await writeJson(this.workspacePath(record.workspaceKey), {
+    const normalized = normalizeWorkspaceRecord({
       ...record,
-      createdAt: existing?.createdAt ?? record.createdAt,
-      updatedAt: record.updatedAt,
+      projectContext: record.projectContext ?? existing?.projectContext,
     });
+    await writeJson(this.workspacePath(record.workspaceKey), {
+      ...normalized,
+      createdAt: existing?.createdAt ?? normalized.createdAt,
+      updatedAt: normalized.updatedAt,
+    });
+    this.markProjectionChanged();
   }
 
   async getWorkspace(workspaceKey: string): Promise<WorkspaceRecord | null> {
-    return readJsonIfExists<WorkspaceRecord>(this.workspacePath(workspaceKey));
+    const record = await readJsonIfExists<WorkspaceRecord>(this.workspacePath(workspaceKey));
+    return record === null ? null : normalizeWorkspaceRecord(record);
   }
 
   async deleteWorkspace(workspaceKey: string): Promise<void> {
     const existing = await this.getWorkspace(workspaceKey);
     if (!existing) return;
     await fs.rm(this.workspacePath(workspaceKey), { force: true });
+    this.markProjectionChanged();
   }
 
   async listWorkspaces(): Promise<WorkspaceRecord[]> {
@@ -500,26 +535,32 @@ export class FileRunTranscriptStore {
     const records = await Promise.all(
       entries.filter((entry) => entry.endsWith(".json")).map((entry) => readJsonIfExists<WorkspaceRecord>(path.join(this.workspacesDir(), entry))),
     );
-    return records.filter((record): record is WorkspaceRecord => record !== null);
+    return records.filter((record): record is WorkspaceRecord => record !== null).map(normalizeWorkspaceRecord);
   }
 
-  async findWorkspace(issueIdOrIdentifierOrKey: string): Promise<WorkspaceRecord | null> {
+  async findWorkspace(
+    issueIdOrIdentifierOrKey: string,
+    options: ProjectContextScopedLookup = {},
+  ): Promise<WorkspaceRecord | null> {
     const direct = await this.getWorkspace(issueIdOrIdentifierOrKey);
-    if (direct) return direct;
+    if (direct && matchesProjectContext(direct.projectContext, options.projectContext)) return direct;
     const records = await this.listWorkspaces();
-    return (
-      records.find(
+    const matches = records
+      .filter(
         (record) =>
-          record.issueId === issueIdOrIdentifierOrKey ||
-          record.issueIdentifier === issueIdOrIdentifierOrKey ||
-          record.workspaceKey === issueIdOrIdentifierOrKey,
-      ) ?? null
-    );
+          (record.issueId === issueIdOrIdentifierOrKey ||
+            record.issueIdentifier === issueIdOrIdentifierOrKey ||
+            record.workspaceKey === issueIdOrIdentifierOrKey) &&
+          matchesProjectContext(record.projectContext, options.projectContext),
+      )
+      .sort(compareWorkspaceRecencyDesc);
+    return selectPreferredWorkspaceRecord(issueIdOrIdentifierOrKey, matches);
   }
 
   async startRun(input: StartRunInput): Promise<RunRecord> {
     const now = new Date().toISOString();
     const existing = await this.getRun(input.runId);
+    const projectContext = normalizeProjectContextResolution(input.projectContext ?? existing?.projectContext);
     const record: RunRecord = {
       ...existing,
       runId: input.runId,
@@ -530,6 +571,7 @@ export class FileRunTranscriptStore {
       runKind: input.runKind ?? existing?.runKind ?? runKindForPhase(input.runPhase ?? existing?.runPhase ?? defaultRunPhase(input.role)),
       issueId: input.issueId,
       issueIdentifier: input.issueIdentifier,
+      projectContext,
       attempt: input.attempt,
       turnNumber: input.turnNumber,
       prompt: promptPreview(input.prompt),
@@ -583,6 +625,9 @@ export class FileRunTranscriptStore {
         ...existing,
         ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
         ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+        ...(input.projectContext === undefined
+          ? {}
+          : { projectContext: normalizeProjectContextResolution(input.projectContext) }),
         ...(input.status === undefined ? {} : { status: input.status }),
         ...(input.completedAt === undefined ? {} : { completedAt: input.completedAt }),
         ...(input.error === undefined ? {} : { error: input.error }),
@@ -631,14 +676,37 @@ export class FileRunTranscriptStore {
         payload: sanitizeJson(input.payload),
       };
       const record = await this.getRun(input.runId);
+      const reduced = reduceRunActivityEvent(record, event, count + 1, { terminalEvents: true });
+      if (reduced) {
+        await this.writeRun(reduced);
+      }
+      const projectionRecord = reduced ?? record;
       this.transcriptSource.emit({
         type: "transcript.appended",
         runId: event.runId,
-        sessionId: record?.sessionId ?? event.runId,
+        sessionId: projectionRecord?.sessionId ?? event.runId,
         afterSequence: count,
         event,
         emittedAt: new Date().toISOString(),
       });
+      if (shouldPublishRunStoreTranscriptPatch(event)) {
+        this.notifyProjectionChanged({
+          runId: event.runId,
+          sessionId: projectionRecord?.sessionId ?? event.runId,
+          afterSequence: count,
+          eventCount: 1,
+          events: [event],
+          sourceCursors: {
+            runId: event.runId,
+            sessionId: projectionRecord?.sessionId ?? event.runId,
+            afterSequence: count,
+            eventCount: 1,
+            ...(projectionRecord?.projectContext === undefined ? {} : { projectContext: projectionRecord.projectContext }),
+          },
+        }, "runs");
+      } else {
+        this.markProjectionChanged();
+      }
       await this.fileTranscriptSink.waitForIdle(input.runId);
       return event;
     });
@@ -672,18 +740,22 @@ export class FileRunTranscriptStore {
     return record === null ? null : normalizeRunRecord(record);
   }
 
-  async listRunsForIssue(issueIdOrIdentifier: string): Promise<RunRecord[]> {
+  async listRunsForIssue(issueIdOrIdentifier: string, options: ProjectContextScopedLookup = {}): Promise<RunRecord[]> {
     const records = await this.listRuns();
     return records
-      .filter((record) => record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier)
+      .filter(
+        (record) =>
+          (record.issueId === issueIdOrIdentifier || record.issueIdentifier === issueIdOrIdentifier) &&
+          matchesProjectContext(record.projectContext, options.projectContext),
+      )
       .sort(compareRunChronology);
   }
 
   async latestRunForIssue(
     issueIdOrIdentifier: string,
-    options: { role?: PersistedRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind } = {},
+    options: ProjectContextScopedLookup & { role?: PersistedRunRole; runPhase?: AgentRunPhase; runKind?: AgentRunKind } = {},
   ): Promise<RunRecord | null> {
-    const records = await this.listRunsForIssue(issueIdOrIdentifier);
+    const records = await this.listRunsForIssue(issueIdOrIdentifier, options);
     const filtered = records.filter(
       (record) =>
         (options.role === undefined || record.role === options.role) &&
@@ -747,6 +819,7 @@ export class FileRunTranscriptStore {
       }
       await fs.rm(this.runDir(runId), { recursive: true, force: true });
       this.transcriptEventCounts.delete(runId);
+      this.markProjectionChanged();
       return { runId, deleted: true, bytesRemoved: usage.bytes };
     });
   }
@@ -754,6 +827,18 @@ export class FileRunTranscriptStore {
   private async writeRun(record: RunRecord): Promise<void> {
     await fs.mkdir(this.runDir(record.runId), { recursive: true });
     await writeJson(this.metaPath(record.runId), record);
+    this.markProjectionChanged();
+  }
+
+  private markProjectionChanged(): void {
+    // Run transcript writes are exposed to realtime subscribers through the
+    // notifier below; durable transcript projection freshness is keyed by
+    // explicit page selectors and must not be invalidated by every live append.
+  }
+
+  private notifyProjectionChanged(detail: Readonly<Record<string, unknown>> | null = null, source: ProjectionChangeSource = "runs"): void {
+    this.markProjectionChanged();
+    this.projectionNotifier.notify(source, detail);
   }
 
   private async withRunUpdateLock<T>(runId: string, operation: () => Promise<T>): Promise<T> {
@@ -839,6 +924,39 @@ export function compareRunChronology(left: RunRecord, right: RunRecord): number 
   );
 }
 
+function compareWorkspaceRecencyDesc(left: WorkspaceRecord, right: WorkspaceRecord): number {
+  return (
+    compareNumber(Date.parse(right.updatedAt), Date.parse(left.updatedAt)) ||
+    compareString(right.updatedAt, left.updatedAt) ||
+    compareNumber(Date.parse(right.createdAt), Date.parse(left.createdAt)) ||
+    compareString(right.createdAt, left.createdAt) ||
+    compareString(left.workspaceKey, right.workspaceKey)
+  );
+}
+
+function selectPreferredWorkspaceRecord(
+  query: string,
+  records: readonly WorkspaceRecord[],
+): WorkspaceRecord | null {
+  return (
+    records.find((record) => record.issueId === query) ??
+    records.find((record) => record.workspaceKey === query) ??
+    records.find((record) => record.issueIdentifier === query) ??
+    null
+  );
+}
+
+function matchesProjectContext(
+  recordProjectContext: ProjectContextResolution | undefined,
+  expectedProjectContext: ProjectContextResolution | undefined,
+): boolean {
+  if (!expectedProjectContext) return true;
+  return (
+    normalizeProjectContextResolution(recordProjectContext).projectContextId ===
+    normalizeProjectContextResolution(expectedProjectContext).projectContextId
+  );
+}
+
 function safeFileName(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_") || "record";
 }
@@ -872,6 +990,13 @@ function promptTextHash(prompt: string): string {
   return createHash("sha256").update(prompt).digest("hex");
 }
 
+function normalizeWorkspaceRecord(record: WorkspaceRecord): WorkspaceRecord {
+  return {
+    ...record,
+    projectContext: normalizeProjectContextResolution(record.projectContext),
+  };
+}
+
 function normalizeRunRecord(record: RunRecord): RunRecord {
   const runPhase = record.runPhase ?? defaultRunPhase(record.role);
   const harnessId =
@@ -885,6 +1010,7 @@ function normalizeRunRecord(record: RunRecord): RunRecord {
   const shouldBackfillCursorRuntime = harnessId === "cursor";
   return {
     ...record,
+    projectContext: normalizeProjectContextResolution(record.projectContext),
     runPhase,
     runKind: record.runKind ?? runKindForPhase(runPhase),
     ...(harnessId === undefined ? {} : { harnessId }),
@@ -930,6 +1056,10 @@ function defaultRunPhase(role: PersistedRunRole): AgentRunPhase {
       : role === "post_mortem"
         ? "post_mortem"
         : "implementation";
+}
+
+function shouldPublishRunStoreTranscriptPatch(event: TranscriptEvent): boolean {
+  return event.eventType === "status" || event.eventType === "system";
 }
 
 function metadataPatch(metadata: RunMetadata | undefined): Partial<RunRecord> {
@@ -1446,10 +1576,18 @@ function reduceCompletedEvent(
   payload: UnknownRecord | null,
   options: RunActivityReductionOptions,
 ): RunRecord {
-  if (record.runPhase === "issue_breakdown") {
+  if (requiresIssueBreakdownPlan(record)) {
     return reducePlanningRunFailedEvent(record, event, payload, options, PLANNING_NO_PLAN_ERROR, true);
   }
   return reduceTerminalEvent(record, event, "succeeded", null, options);
+}
+
+function requiresIssueBreakdownPlan(record: RunRecord): boolean {
+  return record.runPhase === "issue_breakdown" && !isOperatorConversationRun(record);
+}
+
+function isOperatorConversationRun(record: RunRecord): boolean {
+  return record.issueIdentifier === "OPERATOR" && record.issueId.startsWith("operator:");
 }
 
 function reducePlanningRunFailedEvent(
