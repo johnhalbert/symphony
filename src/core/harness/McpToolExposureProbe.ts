@@ -1259,7 +1259,7 @@ function probeAgentRunContext(config: ServiceConfig, role: AgentRunRole, cwd: st
     priority: null,
     state:
       runPhase === "merge_conflict_resolution"
-        ? config.mergePolicy.conflictsState ?? "Approved with Conflicts"
+        ? config.mergePolicy.conflictsState ?? "Conflict Repair"
         : role === "worker"
           ? "In Progress"
           : role === "post_mortem"

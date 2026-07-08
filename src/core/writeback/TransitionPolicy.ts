@@ -2,6 +2,7 @@ import type { ServiceConfig } from "../config/Config.js";
 import type {
   IssueCompletionReportRecord,
   IssueMergeGateMergeabilityState,
+  IssueMergeConflictResolutionReportRecord,
   IssuePostMortemReportRecord,
   IssueReviewVerdictRecord,
   IssueTriageReportRecord,
@@ -114,6 +115,13 @@ export interface MergeConflictsWritebackContext {
   };
   mergeableState: string | null;
   reason: string;
+}
+
+export interface MergeConflictResolvedWritebackContext {
+  issue: Issue;
+  report: IssueMergeConflictResolutionReportRecord;
+  fromState: string;
+  conflictsState: string;
 }
 
 export interface BaseRefRepairWritebackContext {
@@ -862,7 +870,7 @@ function formatIssueTriageNextActionMatrix(context: IssueTriageReportWritebackCo
       `Move to ${conflictsState}`,
       "Symphony resets conflict-fix attempts and starts the prepared merge-conflict repair path.",
       "Use when the current blocker is an actual pull request merge conflict.",
-      "Success lets Symphony finish the service-owned git flow and continue the merge gate; unresolved conflicts can block again after the fresh conflict-fix budget.",
+      "Success returns the issue to the worker queue for reverification and a fresh review; unresolved conflicts can block again after the fresh conflict-fix budget.",
     ]);
   }
   return [
@@ -1162,7 +1170,7 @@ export function planMergeConflictsWritebacks(
         body: [
           "## Symphony Gated Merge Blocked",
           "",
-          "Status: approved pull request has merge conflicts",
+          "Status: pull request has merge conflicts",
           context.reason,
           "",
           `Pull request: ${formatPullRequest(context.pullRequest)}`,
@@ -1183,6 +1191,57 @@ export function planMergeConflictsWritebacks(
         fromStates: [context.fromState],
         toState: context.conflictsState,
         reason: `Symphony gated merge blocked: ${context.reason}`,
+      },
+    },
+  ];
+}
+
+export function planMergeConflictResolvedWritebacks(
+  context: MergeConflictResolvedWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled) return [];
+  const resolvedHeadSha = context.report.newHeadSha ?? context.report.pullRequest.headSha ?? "unknown";
+  const eventKey = `merge-conflict-resolved:${safeKeySegment(context.report.idempotencyKey)}:${safeKeySegment(resolvedHeadSha)}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.report.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Conflict Repair Resolved",
+          "",
+          "Status: conflict repair resolved, worker reverification required",
+          `Next state: ${config.writeback.dispatchState} (worker queue)`,
+          "",
+          `Run: ${context.report.runId}`,
+          `Pull request: ${formatPullRequest(context.report.pullRequest)}`,
+          `Base branch: ${context.report.baseBranch ?? "n/a"}`,
+          `Base head SHA: ${context.report.baseHeadSha ?? "n/a"}`,
+          `Previous conflicted head SHA: ${context.report.previousHeadSha ?? "n/a"}`,
+          `Resolved head SHA: ${resolvedHeadSha}`,
+          "",
+          "Required action:",
+          "Symphony finalized the prepared conflict repair. The implementation worker must revalidate the repaired changes and submit a fresh completion report before review and merge can continue.",
+        ].join("\n"),
+      },
+    },
+    {
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      runId: context.report.runId,
+      payload: {
+        fromStates: uniqueStates([
+          context.fromState,
+          context.conflictsState,
+          config.writeback.dispatchState,
+        ]),
+        toState: config.writeback.dispatchState,
+        reason: "Symphony conflict repair resolved; worker reverification required",
       },
     },
   ];

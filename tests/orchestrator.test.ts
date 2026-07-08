@@ -10740,7 +10740,7 @@ describe("Orchestrator", () => {
     expect(harness.runs).toEqual([]);
   });
 
-  it("does not block resolved merge-conflict lifecycle metadata in the conflict state", async () => {
+  it("does not treat resolved merge-conflict lifecycle metadata in the conflict state as merge-ready", async () => {
     const config = testConfig(root);
     config.mergePolicy.mode = "gated";
     config.mergePolicy.conflictsState = "Merge Conflicts";
@@ -10765,7 +10765,7 @@ describe("Orchestrator", () => {
     );
     const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
     await lifecycleStore.ensureIssue(candidate, {
-      phase: "passed",
+      phase: "implementation",
       blockedReason: null,
       mergeConflict: {
         ...openMergeConflict(candidate),
@@ -10796,7 +10796,7 @@ describe("Orchestrator", () => {
 
     expect(harness.runs).toEqual([]);
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-      phase: "passed",
+      phase: "implementation",
       blockedReason: null,
       mergeConflict: {
         status: "resolved",

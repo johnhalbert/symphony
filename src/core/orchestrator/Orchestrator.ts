@@ -4885,11 +4885,6 @@ export class Orchestrator {
             execute: (context) =>
               this.processMergeConflictResolutionWritebacksAction(context),
           },
-          {
-            id: "request_merge_policy_after_resolved_conflict",
-            execute: (context) =>
-              this.requestMergePolicyAfterResolvedConflictAction(context),
-          },
         ],
       },
       {
@@ -5947,31 +5942,6 @@ export class Orchestrator {
       details: {
         reportId: report.id,
         runId: context.handoffReconciliation.runId ?? report.runId,
-      },
-    };
-  }
-
-  private async requestMergePolicyAfterResolvedConflictAction(
-    context: OrchestratorTransitionContext,
-  ) {
-    const report = context.handoffReconciliation.mergeConflictResolutionReport;
-    if (!report)
-      return {
-        status: "skipped" as const,
-        stop: true,
-        message: "Merge conflict handoff was not loaded",
-      };
-    if (report.resolutionStatus !== "resolved") {
-      return {
-        status: "skipped" as const,
-        message: "Merge conflict resolution did not report resolved status",
-      };
-    }
-    await this.processMergePolicyTransitionCandidate(context.issue);
-    return {
-      details: {
-        reportId: report.id,
-        resolutionStatus: report.resolutionStatus,
       },
     };
   }

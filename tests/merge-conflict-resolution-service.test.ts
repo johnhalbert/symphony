@@ -8,6 +8,8 @@ import { FileIssueLifecycleStore } from "../src/core/persistence/IssueLifecycleS
 import { FileWritebackOutboxStore } from "../src/core/writeback/WritebackOutbox.js";
 import { issue, testConfig } from "./helpers.js";
 
+const CONFLICT_STATE = "Conflict Repair";
+
 describe("MergeConflictResolutionService", () => {
   let root: string;
 
@@ -19,8 +21,8 @@ describe("MergeConflictResolutionService", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("records resolved conflict reports without re-entering normal review", async () => {
-    const { service, lifecycleStore } = await fixture();
+  it("records resolved conflict reports and returns to worker reverification", async () => {
+    const { service, lifecycleStore, outbox } = await fixture();
 
     const result = await service.submit_merge_conflict_resolution(
       resolutionReport({ resolutionStatus: "resolved", headSha: "head-sha-2" }),
@@ -36,7 +38,7 @@ describe("MergeConflictResolutionService", () => {
       baseHeadSha: "base-sha-1",
     });
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "passed",
+      phase: "implementation",
       blockedReason: null,
       summaryPointers: {
         prHeadSha: "head-sha-2",
@@ -59,6 +61,26 @@ describe("MergeConflictResolutionService", () => {
         },
       ],
     });
+    expect(result.writebackOperations.map((operation) => operation.kind)).toEqual([
+      "comment",
+      "transition",
+    ]);
+    const operations = await outbox.list();
+    expect(operations).toMatchObject([
+      {
+        kind: "comment",
+        payload: expect.objectContaining({
+          body: expect.stringContaining("worker reverification required"),
+        }),
+      },
+      {
+        kind: "transition",
+        payload: expect.objectContaining({
+          fromStates: [CONFLICT_STATE, "In Progress"],
+          toState: "In Progress",
+        }),
+      },
+    ]);
   });
 
   it("counts still-conflicted reports once and blocks at the configured conflict-fix limit", async () => {
@@ -195,7 +217,7 @@ describe("MergeConflictResolutionService", () => {
       }),
     ]);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "passed",
+      phase: "implementation",
       summaryPointers: {
         prHeadSha: "head-sha-2",
       },
@@ -462,7 +484,7 @@ describe("MergeConflictResolutionService", () => {
 
     expect(result.replayed).toBe(false);
     await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
-      phase: "passed",
+      phase: "implementation",
       mergeConflict: {
         status: "resolved",
         resolutionStatus: "resolved",
@@ -484,11 +506,11 @@ describe("MergeConflictResolutionService", () => {
     config.writeback.dispatchState = "In Progress";
     config.reviewLoop.blockedStates = ["Blocked"];
     config.mergePolicy.mode = "gated";
-    config.mergePolicy.conflictsState = "Approved with Conflicts";
+    config.mergePolicy.conflictsState = CONFLICT_STATE;
     config.mergePolicy.maxConflictFixTurns = 3;
-    config.tracker.activeStates = ["Todo", "In Progress", "Approved with Conflicts"];
+    config.tracker.activeStates = ["Todo", "In Progress"];
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
-    const conflictIssue = issue({ state: "Approved with Conflicts" });
+    const conflictIssue = issue({ state: CONFLICT_STATE });
     await lifecycleStore.ensureIssue(conflictIssue, {
       phase: "merge_conflict_resolution",
       mergeConflict: mergeConflictRecord({
@@ -513,7 +535,7 @@ describe("MergeConflictResolutionService", () => {
 
 function context(overrides: Partial<Parameters<MergeConflictResolutionService["submit_merge_conflict_resolution"]>[1]> = {}) {
   return {
-    issue: issue({ state: "Approved with Conflicts" }),
+    issue: issue({ state: CONFLICT_STATE }),
     activeRunId: "conflict-run-1",
     role: "worker" as const,
     workspacePath: "/tmp/workspace",
@@ -580,7 +602,7 @@ function mergeConflictRecord(input: {
     baseBranch: "main",
     baseHeadSha: "base-sha-1",
     sourceState: "Ready to Merge",
-    conflictsState: "Approved with Conflicts",
+    conflictsState: CONFLICT_STATE,
     reason: "Pull request has merge conflicts with the base branch",
     mergeableState: "dirty",
     servicePreparation: input.servicePreparation ?? null,
