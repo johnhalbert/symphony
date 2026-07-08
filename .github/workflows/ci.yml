@@ -23,7 +23,7 @@ jobs:
   check:
     name: Typecheck and test
     runs-on: ubuntu-slim
-    timeout-minutes: 15
+    timeout-minutes: 45
     env:
       SYMPHONY_REAL_SMOKE: "0"
     steps:
