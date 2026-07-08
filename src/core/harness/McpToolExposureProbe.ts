@@ -408,6 +408,8 @@ export async function runHermesGatewayMcpToolExposureProbe(
       const hermesServers = await writeHermesMcpConfig({
         profileDir: profile.profileDir,
         servers,
+        model: config.hermes.model,
+        provider: config.hermes.provider,
         hooks: buildHermesAgentCommandPolicyHookConfig(commandPolicyHookOptions),
         hooksAutoAccept: true,
       });
