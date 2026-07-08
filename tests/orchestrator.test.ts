@@ -7,6 +7,11 @@ import { StatusServer } from "../src/app/http.js";
 import { projectWebTranscript } from "../src/app/WebTranscriptProjection.js";
 import { CursorWorkspaceOpener } from "../cursor/src/CursorWorkspaceOpener.js";
 import {
+  baseRefBlockedReason,
+  baseRefObservationInputFingerprint,
+  type IssueBaseRefObservation,
+} from "../src/core/BaseRefVerification.js";
+import {
   CompletionReportService,
   PUBLICATION_APPROVAL_AWAITING_OPERATOR_REASON,
   PUBLICATION_APPROVAL_SETUP_INCOMPLETE_REASON,
@@ -6355,6 +6360,162 @@ describe("Orchestrator", () => {
             kind: "other_requested_transition",
           } as never,
         },
+        [],
+      ),
+    ).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it("routes observed review-state base-ref drift to repair before triage", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    config.issueTriage.enabled = true;
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const rulesets = orchestrator.registeredTransitionRulesets();
+    const repairRuleset = rulesets.find(
+      (ruleset) => ruleset.id === "orchestrator.base_ref.repair_observed",
+    );
+    const triageRuleset = rulesets.find(
+      (ruleset) => ruleset.id === "orchestrator.dispatch.triage.issue_triage",
+    );
+    const observation = baseRefObservationForTest({
+      operation: "review_feedback",
+    });
+    const blockedReason = baseRefBlockedReason(observation);
+    const base = mergePolicyRulesetSnapshot({
+      trackerState: "In Review",
+      phase: "review",
+      blockedReason: `review blocked: ${blockedReason}`,
+      currentMergePolicyObservationInputFingerprint: null,
+      lastBaseRefObservation: observation,
+      lastBaseRefObservationFingerprint: observation.inputFingerprint,
+      lastBaseRefObservationClassification: observation.classification,
+      latestWorkspacePath: observation.workspacePath,
+      latestGitBranchName: observation.branchName,
+      latestBaseRef: observation.baseRef,
+      mergeQueueStatus: "inactive",
+      candidateSource: "reviewer_candidates",
+    });
+
+    expect(repairRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "base_ref_repair",
+      reason: blockedReason,
+      baseRefObservationFingerprint: observation.inputFingerprint,
+      baseRefObservationClassification: "branch_not_based_on_live_base",
+    });
+    expect(triageRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "dispatch_triage",
+      role: "triage",
+      runPhase: "issue_triage",
+    });
+    expect(
+      new IssueOrchestrationEngine(rulesets).decide(base, []),
+    ).toMatchObject({
+      transitionKind: "base_ref_repair",
+      baseRefObservationFingerprint: observation.inputFingerprint,
+    });
+    expect(
+      new IssueOrchestrationEngine(rulesets).decide(
+        { ...base, availableSlots: 0 },
+        [],
+      ),
+    ).toMatchObject({
+      transitionKind: "base_ref_repair",
+      baseRefObservationFingerprint: observation.inputFingerprint,
+    });
+    expect(
+      triageRuleset?.evaluate({ ...base, availableSlots: 0 }, []),
+    ).toBeNull();
+    expect(
+      new IssueOrchestrationEngine(rulesets).decide(
+        {
+          ...base,
+          trackerState: "In Progress",
+          phase: "blocked",
+          candidateSource: "tick_candidates",
+        },
+        [],
+      ),
+    ).toMatchObject({
+      transitionKind: "base_ref_repair",
+      baseRefObservationFingerprint: observation.inputFingerprint,
+    });
+    await orchestrator.stop();
+  });
+
+  it("blocks observed non-repairable base-ref failures without re-blocking blocked issues", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    config.issueTriage.enabled = true;
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const rulesets = orchestrator.registeredTransitionRulesets();
+    const blockRuleset = rulesets.find(
+      (ruleset) => ruleset.id === "orchestrator.base_ref.block_observed",
+    );
+    const observation = baseRefObservationForTest({
+      classification: "base_ref_unavailable",
+      operation: "review_feedback",
+      localBaseIsAncestorOfHead: null,
+      reason:
+        "Base ref verification requires a workspace path, branch, and base ref",
+    });
+    const blockedReason = baseRefBlockedReason(observation);
+    const base = mergePolicyRulesetSnapshot({
+      trackerState: "In Review",
+      phase: "review",
+      blockedReason: `review blocked: ${blockedReason}`,
+      currentMergePolicyObservationInputFingerprint: null,
+      lastBaseRefObservation: observation,
+      lastBaseRefObservationFingerprint: observation.inputFingerprint,
+      lastBaseRefObservationClassification: observation.classification,
+      latestWorkspacePath: observation.workspacePath,
+      latestGitBranchName: observation.branchName,
+      latestBaseRef: observation.baseRef,
+      mergeQueueStatus: "inactive",
+      candidateSource: "reviewer_candidates",
+    });
+
+    expect(blockRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "base_ref_block",
+      reason: blockedReason,
+      blockedReason,
+      baseRefObservationFingerprint: observation.inputFingerprint,
+      baseRefObservationClassification: "base_ref_unavailable",
+    });
+    expect(
+      new IssueOrchestrationEngine(rulesets).decide(base, []),
+    ).toMatchObject({
+      transitionKind: "base_ref_block",
+      baseRefObservationFingerprint: observation.inputFingerprint,
+    });
+    expect(
+      blockRuleset?.evaluate({ ...base, trackerState: "Blocked" }, []),
+    ).toBeNull();
+    expect(
+      blockRuleset?.evaluate(
+        { ...base, blockedReason: "review blocked: unrelated reviewer blocker" },
         [],
       ),
     ).toBeNull();
@@ -15041,6 +15202,49 @@ function mergePolicyChainContext(
       iteration,
       maxIterations: 6,
     },
+  };
+}
+
+function baseRefObservationForTest(
+  overrides: Partial<IssueBaseRefObservation> = {},
+): IssueBaseRefObservation {
+  const workspacePath = overrides.workspacePath ?? "/workspace/TEST-1";
+  const branchName = overrides.branchName ?? "symphony/TEST-1";
+  const baseRef = overrides.baseRef ?? "origin/main";
+  const operation = overrides.operation ?? "merge_policy_merge_pull_request";
+  return {
+    version: 1,
+    inputFingerprint:
+      overrides.inputFingerprint ??
+      baseRefObservationInputFingerprint({
+        workspacePath,
+        branchName,
+        baseRef,
+        operation,
+      }),
+    classification:
+      overrides.classification ?? "branch_not_based_on_live_base",
+    operation,
+    checkedAt: overrides.checkedAt ?? "2026-01-01T00:00:00.000Z",
+    workspacePath,
+    branchName,
+    baseRef,
+    normalizedBaseBranch: overrides.normalizedBaseBranch ?? "main",
+    localBaseRef: overrides.localBaseRef ?? "refs/remotes/origin/main",
+    githubBaseHeadSha: overrides.githubBaseHeadSha ?? "base-sha-1",
+    localBaseHeadShaBeforeFetch:
+      overrides.localBaseHeadShaBeforeFetch ?? "old-base-sha",
+    localBaseHeadShaAfterFetch:
+      overrides.localBaseHeadShaAfterFetch ?? "base-sha-1",
+    worktreeHeadSha: overrides.worktreeHeadSha ?? "head-sha-1",
+    localBaseIsAncestorOfHead:
+      "localBaseIsAncestorOfHead" in overrides
+        ? (overrides.localBaseIsAncestorOfHead ?? null)
+        : false,
+    reason:
+      overrides.reason ??
+      "Worktree HEAD is not based on the live origin base",
+    error: overrides.error ?? null,
   };
 }
 

@@ -2428,7 +2428,8 @@ export class Orchestrator {
         return "issue_triage_not_configured";
       if (
         !ignoreState &&
-        !isStateIn(issue.state, this.config.reviewLoop.blockedStates)
+        !isStateIn(issue.state, this.config.reviewLoop.blockedStates) &&
+        !isStateIn(issue.state, this.config.reviewLoop.reviewStates)
       )
         return "issue_not_in_blocked_state";
       if (!this.hasStateSlot(issue.state)) return "state_slot_unavailable";
@@ -3331,7 +3332,7 @@ export class Orchestrator {
     for (const state of uniqueStateNames(this.config.reviewLoop.reviewStates)) {
       lanes.push({
         id: `review_dispatch:${state}`,
-        requiresAgentSlot: true,
+        requiresAgentSlot: false,
         branch: {
           id: `review_dispatch:${state}`,
           stateNames: [state],
@@ -7882,6 +7883,24 @@ export class Orchestrator {
         },
       },
       {
+        id: "orchestrator.base_ref.repair_observed",
+        priority: issueTransitionRulesetPriority("base_ref_repair"),
+        evaluate: (snapshot) => {
+          const request = this.rulesetObservedBaseRefTransitionRequest(snapshot);
+          return request?.transitionKind === "base_ref_repair"
+            ? request
+            : null;
+        },
+      },
+      {
+        id: "orchestrator.base_ref.block_observed",
+        priority: issueTransitionRulesetPriority("base_ref_block"),
+        evaluate: (snapshot) => {
+          const request = this.rulesetObservedBaseRefTransitionRequest(snapshot);
+          return request?.transitionKind === "base_ref_block" ? request : null;
+        },
+      },
+      {
         id: "orchestrator.preserved_stash.restore",
         priority: issueTransitionRulesetPriority("preserved_stash_restore"),
         evaluate: (snapshot) =>
@@ -8480,13 +8499,7 @@ export class Orchestrator {
     )
       return false;
     if (!this.rulesetCommonDispatchGate(snapshot)) return false;
-    const reviewBlockedTriage =
-      isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates) &&
-      isReviewerBlockedTriageReason(snapshot.blockedReason);
-    if (
-      !isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates) &&
-      !reviewBlockedTriage
-    )
+    if (!this.rulesetAllowsIssueTriageInCurrentState(snapshot))
       return false;
     if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
       return false;
@@ -8616,6 +8629,15 @@ export class Orchestrator {
       return false;
     if (isPendingPublicationApprovalReason(snapshot.blockedReason))
       return false;
+    const observation = snapshot.lastBaseRefObservation ?? null;
+    if (
+      observation !== null &&
+      reasonContainsBaseRefBlocker(
+        snapshot.blockedReason,
+        baseRefBlockedReason(observation),
+      )
+    )
+      return false;
     if (this.config.reviewLoop.blockedStates.length === 0) return false;
     if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
       return false;
@@ -8731,6 +8753,57 @@ export class Orchestrator {
     snapshot: IssueCurrentStateSnapshot,
   ): boolean {
     return snapshot.phase === "blocked" || snapshot.blockedReason !== null;
+  }
+
+  private rulesetAllowsIssueTriageInCurrentState(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
+      return true;
+    return (
+      isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates) &&
+      isReviewerBlockedTriageReason(snapshot.blockedReason)
+    );
+  }
+
+  private rulesetObservedBaseRefTransitionRequest(
+    snapshot: IssueCurrentStateSnapshot,
+  ): IssueTransitionRequest | null {
+    if (snapshot.triggerType !== "orchestrator.tick") return null;
+    if (!snapshot.lifecyclePersistenceAvailable) return null;
+    if (snapshot.running || snapshot.paused || snapshot.claimed) return null;
+    if (this.rulesetRetryBackoffActive(snapshot)) return null;
+    if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
+      return null;
+
+    const observation = snapshot.lastBaseRefObservation ?? null;
+    if (observation === null || observation.classification === "ok")
+      return null;
+
+    const blockedReason = baseRefBlockedReason(observation);
+    if (!reasonContainsBaseRefBlocker(snapshot.blockedReason, blockedReason))
+      return null;
+
+    if (baseRefObservationCanRepairByRebase(observation)) {
+      return {
+        transitionKind: "base_ref_repair",
+        reason: blockedReason,
+        baseRefObservationFingerprint: observation.inputFingerprint,
+        baseRefObservationClassification: observation.classification,
+      };
+    }
+
+    if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
+      return null;
+
+    return {
+      transitionKind: "base_ref_block",
+      reason: blockedReason,
+      blockedReason,
+      runId: snapshot.latestRunId ?? snapshot.issueId,
+      baseRefObservationFingerprint: observation.inputFingerprint,
+      baseRefObservationClassification: observation.classification,
+    };
   }
 
   private rulesetPlannerAllowedFromBlocked(
@@ -9073,7 +9146,7 @@ export class Orchestrator {
     if (
       role === "triage" &&
       !ignoreState &&
-      !isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates)
+      !this.rulesetAllowsIssueTriageInCurrentState(snapshot)
     ) {
       return terminate("non-blocked state");
     }
@@ -9106,7 +9179,14 @@ export class Orchestrator {
       !snapshot.lifecyclePersistenceAvailable
     )
       return false;
-    if (snapshot.phase !== "blocked") return false;
+    if (
+      snapshot.phase !== "blocked" &&
+      !(
+        snapshot.phase === "review" &&
+        isReviewerBlockedTriageReason(snapshot.blockedReason)
+      )
+    )
+      return false;
     if (snapshot.lastIssueTriageReportId === null) return false;
     if (snapshot.lastIssueTriageReportWritebackOperationKeys === null)
       return false;
@@ -15976,6 +16056,15 @@ function baseRefObservationCanRepairByRebase(
   observation: IssueBaseRefObservation,
 ): boolean {
   return observation.classification === "branch_not_based_on_live_base";
+}
+
+function reasonContainsBaseRefBlocker(
+  reason: string | null | undefined,
+  blockedReason: string,
+): boolean {
+  return (reason ?? "")
+    .toLowerCase()
+    .includes(blockedReason.toLowerCase());
 }
 
 function tickTransitionShouldContinue(kind: IssueTransitionKind): boolean {
