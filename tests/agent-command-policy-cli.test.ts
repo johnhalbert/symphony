@@ -343,34 +343,42 @@ async function runPolicyHookCli(options: {
   input: string;
 }): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   const cliPath = path.resolve(process.cwd(), "src", "cli.ts");
-  const child = spawn(process.execPath, ["--import", "tsx", cliPath, "agent-command-policy-hook", ...(options.args ?? [])], {
-    cwd: process.cwd(),
-    env: {
-      ...policyHookCliBaseEnvironment(),
-      FORCE_COLOR: "0",
-      SYMPHONY_AGENT_ROLE: "",
-      SYMPHONY_RUN_PHASE: "",
-      SYMPHONY_ISSUE_ID: "",
-      SYMPHONY_RUN_ID: "",
-      ...(options.env ?? {}),
-    },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  const neutralHome = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-cli-home-"));
+  try {
+    const child = spawn(process.execPath, ["--import", "tsx", cliPath, "agent-command-policy-hook", ...(options.args ?? [])], {
+      cwd: process.cwd(),
+      env: {
+        ...policyHookCliBaseEnvironment(),
+        FORCE_COLOR: "0",
+        HOME: neutralHome,
+        USERPROFILE: neutralHome,
+        XDG_CONFIG_HOME: neutralHome,
+        SYMPHONY_AGENT_ROLE: "",
+        SYMPHONY_RUN_PHASE: "",
+        SYMPHONY_ISSUE_ID: "",
+        SYMPHONY_RUN_ID: "",
+        ...(options.env ?? {}),
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
 
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk: Buffer) => {
-    stdout += chunk.toString("utf8");
-  });
-  child.stderr.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString("utf8");
-  });
-  child.stdin.end(options.input);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.stdin.end(options.input);
 
-  const exitCode = await new Promise<number | null>((resolve, reject) => {
-    child.on("error", reject);
-    child.on("close", resolve);
-  });
+    const exitCode = await new Promise<number | null>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", resolve);
+    });
 
-  return { exitCode, stdout, stderr };
+    return { exitCode, stdout, stderr };
+  } finally {
+    await rm(neutralHome, { recursive: true, force: true });
+  }
 }
