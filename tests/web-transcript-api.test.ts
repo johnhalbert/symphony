@@ -2,8 +2,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { LEGACY_DEFAULT_PROJECT_CONTEXT_ID } from "../src/core/config/ProjectContexts.js";
 import { StatusServer, type StatusServerProjectionWriter } from "../src/app/http.js";
-import type { WebProjectionPayloadReader } from "../src/app/WebProjectionRepository.js";
+import type { WebProjectionPayloadReader, WebTranscriptProjectionDefaultPageSelector } from "../src/app/WebProjectionRepository.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import type { Orchestrator } from "../src/core/orchestrator/Orchestrator.js";
 import { FileRunTranscriptStore, type TranscriptEvent } from "../src/core/persistence/RunTranscriptStore.js";
@@ -65,6 +66,32 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       const fallbackBody = transcriptMessages(await fallbackResponse.json());
       expectRunPrelude(fallbackBody, { session: "direct-session", issue: "TEST-1" });
       expect(fallbackBody.at(-1)).toMatchObject({ kind: "assistant", text: "direct run transcript" });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("serves literal colon-bearing session IDs before treating the request as a contextual alias", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const sessionId = "sym_eng-447_worker_issue:00dcda50:hermes-run-1";
+    await startRun(runStore, config, { runId: "colon-session-run", sessionId, issueIdentifier: "TEST-1" });
+    await runStore.appendEvent({
+      runId: "colon-session-run",
+      at: "2026-01-01T00:00:01.000Z",
+      source: "harness",
+      eventType: "progress",
+      message: "colon session transcript",
+    });
+
+    const server = createServer(config, runStore);
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/${encodeURIComponent(sessionId)}/transcript`);
+      expect(response.status).toBe(200);
+      const body = transcriptMessages(await response.json());
+      expectRunPrelude(body, { session: sessionId, issue: "TEST-1" });
+      expect(body.at(-1)).toMatchObject({ kind: "assistant", text: "colon session transcript" });
     } finally {
       await server.stop();
     }
@@ -304,7 +331,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(projectionWriter.writes.at(-1)).toMatchObject({
         projectionName: "transcript_projection",
         scopeKind: "run_page",
-        scopeKey: "active-run:offset:0:limit:500",
+        scopeKey: "pc=default|active-run:offset:0:limit:500",
         fields: { runId: "active-run", sessionId: "active-session", offsetStart: 0, offsetLimit: 500 },
       });
 
@@ -326,7 +353,12 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
         },
       });
       expect(projectionReader.selectors).toEqual([
-        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "active-run:offset:0:limit:1" },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "pc=default|active-run:offset:0:limit:1",
+        },
       ]);
     } finally {
       await server.stop();
@@ -371,7 +403,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/envelope-run/transcript?offset=0&limit=1`);
       expect(response.status).toBe(200);
       const body = await response.json();
-      expect(transcriptMessages(body)).toEqual(durableMessages);
+      expect(transcriptMessages(body)).toEqual([{ kind: "assistant", text: "durable page event" }]);
       expect(body).toMatchObject({
         window: {
           kind: "page",
@@ -389,9 +421,168 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
           strategy: "refetch",
           reason: "tail-gap",
         },
+        source: {
+          runId: "envelope-run",
+          sessionId: "envelope-session",
+          issueId: "test-1",
+          issueIdentifier: "TEST-1",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+          workspace: {
+            key: "TEST-1",
+            path: path.join(config.workspace.root, "TEST-1"),
+          },
+        },
       });
       expect(projectionReader.selectors).toEqual([
-        { projectionName: "transcript_projection", scopeKind: "run_page", scopeKey: "envelope-run:offset:0:limit:1" },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "pc=default|envelope-run:offset:0:limit:1",
+        },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("backfills source metadata and project-context attribution for durable transcript window envelopes missing source", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, { runId: "source-backfill-run", sessionId: "source-backfill-session", issueIdentifier: "TEST-1" });
+    const durableMessages = [
+      { kind: "status", state: "running", ts: "2026-01-01T00:00:00.000Z", text: "workspace ready" },
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.100Z",
+        model: "",
+        cwd: "",
+        workspace: "",
+        session: "source-backfill-run",
+        tools: [],
+        note: "system public preview",
+      },
+      { kind: "assistant", text: "durable page event" },
+    ];
+    const projectionReader = new StaticProjectionReader(
+      {
+        schemaVersion: 1,
+        messages: durableMessages,
+        page: {
+          offset: 0,
+          limit: 1,
+          size: 1,
+          total: 1,
+          nextOffset: null,
+          previousOffset: null,
+          hasNext: false,
+          hasPrevious: false,
+          firstSequence: null,
+          lastSequence: null,
+          lastEventAt: null,
+        },
+        window: {
+          kind: "page",
+          tailLimit: 1,
+          messageCount: 1,
+          requested: { offset: 0, limit: 1 },
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          runStatus: "running",
+          tailLimit: 1,
+          afterSequence: null,
+          lastEventAt: null,
+          refetchHref: null,
+          gapFallback: { strategy: "refetch", reason: "tail-gap", href: null },
+        },
+        recovery: { strategy: "refetch", reason: "tail-gap", href: null },
+        compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+      },
+      [{ source: "runStore", revision: runStore.projectionRevision(), observedAt: null }],
+    );
+    const server = createServer(config, runStore, { projectionReader });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/source-backfill-run/transcript?offset=0&limit=1`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(transcriptMessages(body)).toEqual([
+        {
+          kind: "status",
+          state: "running",
+          ts: "2026-01-01T00:00:00.000Z",
+          text: "workspace ready · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
+        {
+          kind: "system",
+          ts: "2026-01-01T00:00:00.100Z",
+          model: "",
+          cwd: "",
+          workspace: "",
+          session: "source-backfill-run",
+          tools: [],
+          note: "system public preview. Project context: Default.",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
+        { kind: "assistant", text: "durable page event" },
+      ]);
+      expect(body).toMatchObject({
+        source: {
+          runId: "source-backfill-run",
+          sessionId: "source-backfill-session",
+          issueId: "test-1",
+          issueIdentifier: "TEST-1",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+          workspace: {
+            key: "TEST-1",
+            path: path.join(config.workspace.root, "TEST-1"),
+          },
+          cursors: {
+            offset: 0,
+            limit: 1,
+            nextOffset: null,
+            previousOffset: null,
+            total: 1,
+            windowKind: "page",
+            hasNext: false,
+            hasPrevious: false,
+            eventCount: 1,
+            firstSequence: null,
+            lastSequence: null,
+            lastEventAt: null,
+          },
+        },
+      });
+      expect(projectionReader.selectors).toEqual([
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "pc=default|source-backfill-run:offset:0:limit:1",
+        },
       ]);
     } finally {
       await server.stop();
@@ -488,7 +679,7 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(projectionWriter.writes[0]).toMatchObject({
         projectionName: "transcript_projection",
         scopeKind: "run_page",
-        scopeKey: "query-run:offset:2:limit:1000",
+        scopeKey: "pc=default|query-run:offset:2:limit:1000",
         fields: {
           issueKey: "TEST-1",
           runId: "query-run",
@@ -661,7 +852,13 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
           kind: "status",
           state: "approved",
           ts: "2026-01-01T00:00:05.000Z",
-          text: "Operator approval approved: branch -> main",
+          text: "Operator approval approved: branch -> main · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
         },
       ]);
       const serialized = JSON.stringify(body);
@@ -779,7 +976,18 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expectRunPrelude(body, { session: "hermes-acp-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
-        { kind: "status", state: "cancelled", ts: "2026-01-01T00:00:04.000Z", text: "Run cancelled" },
+        {
+          kind: "status",
+          state: "cancelled",
+          ts: "2026-01-01T00:00:04.000Z",
+          text: "Run cancelled · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
       ]);
       expect(JSON.stringify(body)).not.toContain("SECRET_TOOL_PROGRESS");
     } finally {
@@ -838,7 +1046,18 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expectRunPrelude(body, { session: "mapped-acp-delta-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello world token=[redacted]" },
-        { kind: "status", state: "failed", ts: "2026-01-01T00:00:07.000Z", text: "Run failed before message.complete" },
+        {
+          kind: "status",
+          state: "failed",
+          ts: "2026-01-01T00:00:07.000Z",
+          text: "Run failed before message.complete · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
       ]);
       const serialized = JSON.stringify(body);
       expect(serialized).not.toContain("api-delta-value");
@@ -916,7 +1135,18 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expectRunPrelude(body, { session: "hermes-dual-session", issue: "TEST-1" });
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "Hello" },
-        { kind: "status", state: "failed", ts: "2026-01-01T00:00:03.000Z", text: "Run failed before message.complete" },
+        {
+          kind: "status",
+          state: "failed",
+          ts: "2026-01-01T00:00:03.000Z",
+          text: "Run failed before message.complete · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
       ]);
     } finally {
       await server.stop();
@@ -1031,7 +1261,18 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
       expect(body.slice(2)).toEqual([
         { kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "hello from stream" },
         { kind: "assistant", ts: "2026-01-01T00:00:02.000Z", text: "legacy progress text" },
-        { kind: "status", state: "warming", ts: "2026-01-01T00:00:03.000Z", text: "Workspace warming" },
+        {
+          kind: "status",
+          state: "warming",
+          ts: "2026-01-01T00:00:03.000Z",
+          text: "Workspace warming · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
       ]);
     } finally {
       await server.stop();
@@ -1082,8 +1323,25 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
           from: "orchestrator",
           issue: "TEST-1",
           text: "Implement the requested web transcript route",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
         },
-        { kind: "status", state: "warming", ts: "2026-01-01T00:00:01.000Z", text: "status public preview" },
+        {
+          kind: "status",
+          state: "warming",
+          ts: "2026-01-01T00:00:01.000Z",
+          text: "status public preview · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
         {
           kind: "system",
           ts: "2026-01-01T00:00:02.000Z",
@@ -1092,13 +1350,25 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
           workspace: "",
           session: "cursor-nonassistant-run",
           tools: [],
-          note: "system public preview",
+          note: "system public preview. Project context: Default.",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
         },
         {
           kind: "status",
           state: "novel_cursor_event",
           ts: "2026-01-01T00:00:03.000Z",
-          text: "novel_cursor_event",
+          text: "novel_cursor_event · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
         },
       ]);
       expect(body.map((message) => message.kind)).not.toContain("assistant");
@@ -1107,11 +1377,631 @@ describe("GET /api/v1/web/sessions/:sessionId/transcript", () => {
     }
   });
 
+  it("preserves cached tail metadata while backfilling source and project-context attribution for durable-only transcript envelopes", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const durableMessages = [
+      { kind: "status", state: "running", ts: "2026-01-01T00:00:03.000Z", text: "status public preview" },
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:03.100Z",
+        model: "",
+        cwd: "",
+        workspace: "",
+        session: "durable-tail-run",
+        tools: [],
+        note: "system public preview",
+      },
+      { kind: "assistant", text: "durable tail event" },
+    ];
+    const projectionReader = new StaticProjectionReader(
+      {
+        schemaVersion: 1,
+        messages: durableMessages,
+        page: {
+          offset: 700,
+          limit: 500,
+          size: 1,
+          total: 1_200,
+          nextOffset: null,
+          previousOffset: 200,
+          hasNext: false,
+          hasPrevious: true,
+          firstSequence: 1_200,
+          lastSequence: 1_200,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+        },
+        window: {
+          kind: "tail",
+          tailLimit: 500,
+          messageCount: 1,
+          requested: { offset: null, limit: 500 },
+        },
+        activeTail: {
+          enabled: true,
+          canAppend: true,
+          runStatus: "running",
+          tailLimit: 500,
+          afterSequence: 1_234,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+          refetchHref: "/cached-refetch",
+          gapFallback: { strategy: "refetch", reason: "tail-gap", href: "/cached-gap" },
+        },
+        recovery: { strategy: "refetch", reason: "tail-gap", href: "/cached-recovery" },
+        compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+      },
+      [],
+      {
+        runId: "durable-tail-run",
+        sessionId: "durable-tail-session",
+        issueKey: "TEST-1",
+        offset: 700,
+        limit: 500,
+        nextOffset: null,
+        previousOffset: 200,
+        total: 1_200,
+        windowKind: "tail",
+        hasNext: false,
+        hasPrevious: true,
+        eventCount: 1,
+        firstSequence: 1_200,
+        lastSequence: 1_200,
+        lastEventAt: "2026-01-01T00:00:03.000Z",
+        projectContext: {
+          projectContextId: "default",
+          projectContextLabel: "Default",
+          linearProjectSlug: null,
+          routingSource: "legacy_default",
+        },
+      },
+    );
+    const server = createServer(config, undefined, { projectionReader });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/durable-tail-run/transcript?offset=700&limit=500`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(transcriptMessages(body)).toEqual([
+        {
+          kind: "status",
+          state: "running",
+          ts: "2026-01-01T00:00:03.000Z",
+          text: "status public preview · Project context: Default",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
+        {
+          kind: "system",
+          ts: "2026-01-01T00:00:03.100Z",
+          model: "",
+          cwd: "",
+          workspace: "",
+          session: "durable-tail-run",
+          tools: [],
+          note: "system public preview. Project context: Default.",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+        },
+        { kind: "assistant", text: "durable tail event" },
+      ]);
+      expect(body).toMatchObject({
+        activeTail: {
+          enabled: true,
+          canAppend: true,
+          runStatus: "running",
+          tailLimit: 500,
+          afterSequence: 1_234,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+          refetchHref: "/cached-refetch",
+          gapFallback: { strategy: "refetch", reason: "tail-gap", href: "/cached-gap" },
+        },
+        recovery: { strategy: "refetch", reason: "tail-gap", href: "/cached-recovery" },
+        source: {
+          runId: "durable-tail-run",
+          sessionId: "durable-tail-session",
+          issueId: null,
+          issueIdentifier: "TEST-1",
+          projectContext: {
+            id: "default",
+            label: "Default",
+            linearProject: null,
+            codebase: null,
+          },
+          workspace: null,
+          cursors: {
+            offset: 700,
+            limit: 500,
+            previousOffset: 200,
+            total: 1200,
+            windowKind: "tail",
+            hasNext: false,
+            hasPrevious: true,
+            eventCount: 1,
+            firstSequence: 1200,
+            lastSequence: 1200,
+            lastEventAt: "2026-01-01T00:00:03.000Z",
+          },
+        },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("selects durable transcript pages with the run project context when live run metadata is available", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await startRun(runStore, config, {
+      runId: "docs-run",
+      sessionId: "docs-session",
+      issueIdentifier: "TEST-1",
+      projectContextId: "docs",
+    });
+    const durableMessages = [{ kind: "assistant", text: "docs scoped durable event" }];
+    const projectionReader = new StaticProjectionReader(
+      {
+        schemaVersion: 1,
+        messages: durableMessages,
+        page: {
+          offset: 0,
+          limit: 500,
+          size: 1,
+          total: 1,
+          nextOffset: null,
+          previousOffset: null,
+          hasNext: false,
+          hasPrevious: false,
+          firstSequence: 1,
+          lastSequence: 1,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+        },
+        window: {
+          kind: "page",
+          tailLimit: 500,
+          messageCount: 1,
+          requested: { offset: 0, limit: 500 },
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          runStatus: "running",
+          tailLimit: 500,
+          afterSequence: 1,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+          refetchHref: null,
+          gapFallback: { strategy: "refetch", reason: "tail-gap", href: null },
+        },
+        recovery: { strategy: "refetch", reason: "tail-gap", href: null },
+        compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+      },
+      [{ source: "runStore", revision: runStore.projectionRevision(), observedAt: null }],
+      {
+        runId: "docs-run",
+        sessionId: "docs-session",
+        issueKey: "TEST-1",
+        offset: 0,
+        limit: 500,
+        nextOffset: null,
+        previousOffset: null,
+        total: 1,
+        windowKind: "page",
+        hasNext: false,
+        hasPrevious: false,
+        eventCount: 1,
+        firstSequence: 1,
+        lastSequence: 1,
+        lastEventAt: "2026-01-01T00:00:03.000Z",
+        projectContext: {
+          projectContextId: "docs",
+          projectContextLabel: "Docs",
+          linearProjectSlug: null,
+          routingSource: "explicit",
+        },
+      },
+    );
+    const server = createServer(config, runStore, { projectionReader });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/docs-run/transcript?offset=0&limit=500`);
+      expect(response.status).toBe(200);
+      expect(transcriptMessages(await response.json())).toEqual(durableMessages);
+      expect(projectionReader.selectors).toEqual([
+        {
+          projectionName: "transcript_projection",
+          projectContextId: "docs",
+          scopeKind: "run_page",
+          scopeKey: "pc=docs|docs-run:offset:0:limit:500",
+        },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("falls back from configured default project contexts to unscoped legacy durable transcript rows when run metadata is unavailable", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const durableMessages = [{ kind: "assistant", text: "legacy default durable event" }];
+    const projectionReader = new MapProjectionReader([
+      projectionPayloadRecord(
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "legacy-context-run:offset:0:limit:500",
+        },
+        {
+          schemaVersion: 1,
+          messages: durableMessages,
+          page: {
+            offset: 0,
+            limit: 500,
+            size: 1,
+            total: 1,
+            nextOffset: null,
+            previousOffset: null,
+            hasNext: false,
+            hasPrevious: false,
+            firstSequence: 1,
+            lastSequence: 1,
+            lastEventAt: "2026-01-01T00:00:03.000Z",
+          },
+          window: {
+            kind: "page",
+            tailLimit: 500,
+            messageCount: 1,
+            requested: { offset: 0, limit: 500 },
+          },
+          activeTail: {
+            enabled: false,
+            canAppend: false,
+            runStatus: null,
+            tailLimit: 500,
+            afterSequence: 1,
+            lastEventAt: "2026-01-01T00:00:03.000Z",
+            refetchHref: null,
+            gapFallback: { strategy: "refetch", reason: "tail-gap", href: null },
+          },
+          recovery: { strategy: "refetch", reason: "tail-gap", href: null },
+          compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+        },
+        [],
+        {
+          runId: "legacy-context-run",
+          sessionId: "legacy-context-session",
+          issueKey: "TEST-1",
+          offset: 0,
+          limit: 500,
+          nextOffset: null,
+          previousOffset: null,
+          total: 1,
+          windowKind: "page",
+          hasNext: false,
+          hasPrevious: false,
+          eventCount: 1,
+          firstSequence: 1,
+          lastSequence: 1,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+        },
+      ),
+    ]);
+    const server = createServer(config, undefined, {
+      projectionReader,
+      defaultProjectContextId: "docs",
+    });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/legacy-context-run/transcript?offset=0&limit=500`);
+      expect(response.status).toBe(200);
+      expect(transcriptMessages(await response.json())).toEqual(durableMessages);
+      expect(projectionReader.selectors).toEqual([
+        {
+          projectionName: "transcript_projection",
+          projectContextId: "docs",
+          scopeKind: "run_page",
+          scopeKey: "pc=docs|legacy-context-run:offset:0:limit:500",
+        },
+        {
+          projectionName: "transcript_projection",
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          scopeKind: "run_page",
+          scopeKey: "pc=default|legacy-context-run:offset:0:limit:500",
+        },
+        {
+          projectionName: "transcript_projection",
+          scopeKind: "run_page",
+          scopeKey: "legacy-context-run:offset:0:limit:500",
+        },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("reads scoped default-context durable transcript pages and tails when run metadata is unavailable", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const scenarios = [
+      {
+        runId: "current-default-scoped-run",
+        storedProjectContextId: "docs",
+        pageScopeKey: "pc=docs|current-default-scoped-run:offset:0:limit:500",
+        tailScopeKey: "pc=docs|current-default-scoped-run:tail:limit:500",
+        pageMessages: [{ kind: "assistant", text: "current default scoped page event" }],
+        tailMessages: [{ kind: "assistant", text: "current default scoped tail event" }],
+        expectedSelectors: [
+          {
+            projectionName: "transcript_projection",
+            projectContextId: "docs",
+            scopeKind: "run_page",
+            scopeKey: "pc=docs|current-default-scoped-run:offset:0:limit:500",
+          },
+          {
+            projectionName: "transcript_projection",
+            projectContextId: "docs",
+            scopeKind: "run_page",
+            scopeKey: "pc=docs|current-default-scoped-run:tail:limit:500",
+          },
+        ],
+      },
+      {
+        runId: "legacy-default-scoped-run",
+        storedProjectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+        pageScopeKey: "pc=default|legacy-default-scoped-run:offset:0:limit:500",
+        tailScopeKey: "pc=default|legacy-default-scoped-run:tail:limit:500",
+        pageMessages: [{ kind: "assistant", text: "legacy default scoped page event" }],
+        tailMessages: [{ kind: "assistant", text: "legacy default scoped tail event" }],
+        expectedSelectors: [
+          {
+            projectionName: "transcript_projection",
+            projectContextId: "docs",
+            scopeKind: "run_page",
+            scopeKey: "pc=docs|legacy-default-scoped-run:offset:0:limit:500",
+          },
+          {
+            projectionName: "transcript_projection",
+            projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+            scopeKind: "run_page",
+            scopeKey: "pc=default|legacy-default-scoped-run:offset:0:limit:500",
+          },
+          {
+            projectionName: "transcript_projection",
+            projectContextId: "docs",
+            scopeKind: "run_page",
+            scopeKey: "pc=docs|legacy-default-scoped-run:tail:limit:500",
+          },
+          {
+            projectionName: "transcript_projection",
+            projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+            scopeKind: "run_page",
+            scopeKey: "pc=default|legacy-default-scoped-run:tail:limit:500",
+          },
+        ],
+      },
+    ] as const;
+
+    for (const scenario of scenarios) {
+      const projectionReader = new MapProjectionReader([
+        projectionPayloadRecord(
+          {
+            projectionName: "transcript_projection",
+            projectContextId: scenario.storedProjectContextId,
+            scopeKind: "run_page",
+            scopeKey: scenario.pageScopeKey,
+          },
+          {
+            schemaVersion: 1,
+            messages: scenario.pageMessages,
+            page: {
+              offset: 0,
+              limit: 500,
+              size: 1,
+              total: 1,
+              nextOffset: null,
+              previousOffset: null,
+              hasNext: false,
+              hasPrevious: false,
+              firstSequence: 1,
+              lastSequence: 1,
+              lastEventAt: "2026-01-01T00:00:03.000Z",
+            },
+            window: {
+              kind: "page",
+              tailLimit: 500,
+              messageCount: 1,
+              requested: { offset: 0, limit: 500 },
+            },
+            activeTail: {
+              enabled: false,
+              canAppend: false,
+              runStatus: null,
+              tailLimit: 500,
+              afterSequence: 1,
+              lastEventAt: "2026-01-01T00:00:03.000Z",
+              refetchHref: null,
+              gapFallback: { strategy: "refetch", reason: "tail-gap", href: null },
+            },
+            recovery: { strategy: "refetch", reason: "tail-gap", href: null },
+            compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+          },
+          [],
+        ),
+        projectionPayloadRecord(
+          {
+            projectionName: "transcript_projection",
+            projectContextId: scenario.storedProjectContextId,
+            scopeKind: "run_page",
+            scopeKey: scenario.tailScopeKey,
+          },
+          {
+            schemaVersion: 1,
+            messages: scenario.tailMessages,
+            page: {
+              offset: 700,
+              limit: 500,
+              size: 1,
+              total: 701,
+              nextOffset: null,
+              previousOffset: 200,
+              hasNext: false,
+              hasPrevious: true,
+              firstSequence: 701,
+              lastSequence: 701,
+              lastEventAt: "2026-01-01T00:00:04.000Z",
+            },
+            window: {
+              kind: "tail",
+              tailLimit: 500,
+              messageCount: 1,
+              requested: { offset: null, limit: 500 },
+            },
+            activeTail: {
+              enabled: true,
+              canAppend: true,
+              runStatus: "running",
+              tailLimit: 500,
+              afterSequence: 701,
+              lastEventAt: "2026-01-01T00:00:04.000Z",
+              refetchHref: null,
+              gapFallback: { strategy: "refetch", reason: "tail-gap", href: null },
+            },
+            recovery: { strategy: "refetch", reason: "tail-gap", href: null },
+            compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+          },
+          [],
+        ),
+      ]);
+      const server = createServer(config, undefined, {
+        projectionReader,
+        defaultProjectContextId: "docs",
+      });
+      const address = await server.start();
+      try {
+        const pageResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/${scenario.runId}/transcript?offset=0&limit=500`);
+        expect(pageResponse.status).toBe(200);
+        expect(transcriptMessages(await pageResponse.json())).toEqual(scenario.pageMessages);
+
+        const tailResponse = await fetch(`${baseUrl(address)}/api/v1/web/sessions/${scenario.runId}/transcript`);
+        expect(tailResponse.status).toBe(200);
+        expect(transcriptMessages(await tailResponse.json())).toEqual(scenario.tailMessages);
+
+        expect(projectionReader.selectors).toEqual(scenario.expectedSelectors);
+      } finally {
+        await server.stop();
+      }
+    }
+  });
+
+  it("backfills issue attribution from durable cursors when run records are unavailable", async () => {
+    const config = testConfig(path.join(root, "workspaces"));
+    const durableMessages = [{ kind: "assistant", text: "durable page event" }];
+    const projectionReader = new StaticProjectionReader(
+      {
+        schemaVersion: 1,
+        messages: durableMessages,
+        page: {
+          offset: 2,
+          limit: 3,
+          size: 1,
+          total: 3,
+          nextOffset: null,
+          previousOffset: 0,
+          hasNext: false,
+          hasPrevious: true,
+          firstSequence: 3,
+          lastSequence: 3,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+        },
+        window: {
+          kind: "page",
+          tailLimit: 3,
+          messageCount: 1,
+          requested: { offset: 2, limit: 3 },
+        },
+        activeTail: {
+          enabled: false,
+          canAppend: false,
+          runStatus: null,
+          tailLimit: 3,
+          afterSequence: 3,
+          lastEventAt: "2026-01-01T00:00:03.000Z",
+          refetchHref: null,
+          gapFallback: { strategy: "refetch", reason: "tail-gap", href: null },
+        },
+        recovery: { strategy: "refetch", reason: "tail-gap", href: null },
+        compatibility: { responseShape: "transcript_window", messagesField: "messages" },
+      },
+      [],
+      {
+        runId: "cursor-fallback-run",
+        sessionId: "cursor-fallback-session",
+        issueKey: "ENG-425",
+        offset: 2,
+        limit: 3,
+        nextOffset: null,
+        previousOffset: 0,
+        total: 3,
+        windowKind: "page",
+        hasNext: false,
+        hasPrevious: true,
+        eventCount: 1,
+        firstSequence: 3,
+        lastSequence: 3,
+        lastEventAt: "2026-01-01T00:00:03.000Z",
+      },
+    );
+    const server = createServer(config, undefined, { projectionReader });
+    const address = await server.start();
+    try {
+      const response = await fetch(`${baseUrl(address)}/api/v1/web/sessions/cursor-fallback-run/transcript?offset=2&limit=3`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(transcriptMessages(body)).toEqual(durableMessages);
+      expect(body).toMatchObject({
+        source: {
+          runId: "cursor-fallback-run",
+          sessionId: "cursor-fallback-session",
+          issueId: null,
+          issueIdentifier: "ENG-425",
+          projectContext: null,
+          workspace: null,
+          cursors: {
+            offset: 2,
+            limit: 3,
+            previousOffset: 0,
+            total: 3,
+            windowKind: "page",
+            hasNext: false,
+            hasPrevious: true,
+            eventCount: 1,
+            firstSequence: 3,
+            lastSequence: 3,
+            lastEventAt: "2026-01-01T00:00:03.000Z",
+          },
+        },
+      });
+      expect(projectionReader.selectors).toEqual([
+        {
+          projectionName: "transcript_projection",
+          scopeKind: "run_page",
+          scopeKey: "cursor-fallback-run:offset:2:limit:3",
+        },
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
 });
 
 interface CreateServerOptions {
   projectionReader?: WebProjectionPayloadReader;
   projectionWriter?: StatusServerProjectionWriter;
+  defaultProjectContextId?: string;
 }
 
 function createServer(
@@ -1136,6 +2026,7 @@ function createServer(
     staleThresholdMs: 300_000,
     ...(options.projectionReader ? { projectionReader: options.projectionReader } : {}),
     ...(options.projectionWriter ? { projectionWriter: options.projectionWriter } : {}),
+    ...(options.defaultProjectContextId ? { defaultProjectContextId: options.defaultProjectContextId } : {}),
   });
 }
 
@@ -1145,11 +2036,55 @@ class StaticProjectionReader implements WebProjectionPayloadReader {
   constructor(
     private readonly payload: unknown,
     private readonly sourceRevisions: ProjectionPayloadRecord["revision"]["sourceRevisions"] = [],
+    private readonly sourceCursors: ProjectionPayloadRecord["revision"]["sourceCursors"] = {},
   ) {}
 
   async readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null> {
     this.selectors.push({ ...selector });
-    return projectionPayloadRecord(selector, this.payload as TPayload, this.sourceRevisions);
+    return projectionPayloadRecord(selector, this.payload as TPayload, this.sourceRevisions, this.sourceCursors);
+  }
+}
+
+class MapProjectionReader implements WebProjectionPayloadReader {
+  readonly selectors: ProjectionRevisionSelector[] = [];
+  private readonly records = new Map<string, ProjectionPayloadRecord>();
+
+  constructor(records: readonly ProjectionPayloadRecord[]) {
+    for (const record of records) {
+      this.records.set(projectionSelectorKey(record.revision), cloneJson(record));
+    }
+  }
+
+  async readCurrentPayload<TPayload = unknown>(selector: ProjectionRevisionSelector): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    this.selectors.push({ ...selector });
+    const exactRecord = this.records.get(projectionSelectorKey(selector));
+    if (exactRecord) return cloneJson(exactRecord) as ProjectionPayloadRecord<TPayload>;
+    if (selector.projectContextId === undefined || selector.projectContextId === null) {
+      for (const record of this.records.values()) {
+        if (
+          record.revision.projectionName === selector.projectionName
+          && record.revision.scopeKind === (selector.scopeKind ?? "global")
+          && record.revision.scopeKey === (selector.scopeKey ?? "global")
+        ) {
+          return cloneJson(record) as ProjectionPayloadRecord<TPayload>;
+        }
+      }
+    }
+    return null;
+  }
+
+  async readCurrentTranscriptDefaultPayload<TPayload = unknown>(
+    selector: WebTranscriptProjectionDefaultPageSelector,
+  ): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    const revisionSelector: ProjectionRevisionSelector = {
+      projectionName: "transcript_projection",
+      projectContextId: selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      scopeKind: "run_page",
+      scopeKey: selector.scopeKey ?? `${selector.runId}:tail:limit:${selector.limit}`,
+    };
+    this.selectors.push({ ...revisionSelector });
+    const record = this.records.get(projectionSelectorKey(revisionSelector));
+    return record ? (cloneJson(record) as ProjectionPayloadRecord<TPayload>) : null;
   }
 }
 
@@ -1157,18 +2092,20 @@ function projectionPayloadRecord<TPayload>(
   selector: ProjectionRevisionSelector,
   payload: TPayload,
   sourceRevisions: ProjectionPayloadRecord["revision"]["sourceRevisions"],
+  sourceCursors: ProjectionPayloadRecord["revision"]["sourceCursors"] = {},
 ): ProjectionPayloadRecord<TPayload> {
   const generatedAt = "2026-01-01T00:00:00.000Z";
   return {
     revision: {
       projectionRevisionId: "test-projection-revision",
       projectionName: selector.projectionName,
+      projectContextId: selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
       scopeKind: selector.scopeKind ?? "global",
       scopeKey: selector.scopeKey ?? "global",
       revision: 1,
       buildMode: "bootstrap",
       sourceRevisions,
-      sourceCursors: {},
+      sourceCursors,
       sourceFreshness: [],
       contentSha256: null,
       generatedAt,
@@ -1196,6 +2133,7 @@ class RecordingProjectionWriter implements StatusServerProjectionWriter {
       revision: {
         projectionRevisionId: this.writes.length,
         projectionName: input.projectionName,
+        projectContextId: input.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
         scopeKind: input.scopeKind ?? "global",
         scopeKey: input.scopeKey ?? "global",
         revision: this.writes.length,
@@ -1222,7 +2160,7 @@ class RecordingProjectionWriter implements StatusServerProjectionWriter {
 async function startRun(
   runStore: FileRunTranscriptStore,
   config: ReturnType<typeof testConfig>,
-  input: { runId: string; sessionId: string; issueIdentifier: string },
+  input: { runId: string; sessionId: string; issueIdentifier: string; projectContextId?: string },
 ): Promise<void> {
   await runStore.startRun({
     runId: input.runId,
@@ -1241,7 +2179,30 @@ async function startRun(
     gitBranchName: `symphony/${input.issueIdentifier}`,
     repoPath: "/repo",
     baseRef: "main",
+    ...(input.projectContextId
+      ? {
+          projectContext: {
+            projectContextId: input.projectContextId,
+            projectContextLabel: input.projectContextId.charAt(0).toUpperCase() + input.projectContextId.slice(1),
+            linearProjectSlug: null,
+            routingSource: "explicit",
+          },
+        }
+      : {}),
   });
+}
+
+function projectionSelectorKey(selector: ProjectionRevisionSelector): string {
+  return [
+    selector.projectionName,
+    selector.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+    selector.scopeKind ?? "global",
+    selector.scopeKey ?? "global",
+  ].join(":");
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function transcriptEvent(overrides: Partial<TranscriptEvent>): TranscriptEvent {
@@ -1268,6 +2229,7 @@ function transcriptMessages(body: unknown): Array<Record<string, unknown>> {
     window: expect.any(Object),
     activeTail: expect.any(Object),
     recovery: expect.any(Object),
+    source: expect.any(Object),
     compatibility: { responseShape: "transcript_window", messagesField: "messages" },
   });
   return (body as { messages: Array<Record<string, unknown>> }).messages;
@@ -1314,7 +2276,13 @@ function expectRunPrelude(body: Array<Record<string, unknown>>, expected: { sess
       workspace: expected.issue,
       session: expected.session,
       tools: [],
-      note: "Initialized implementation run from persisted run metadata. System prompt redacted.",
+      note: "Initialized implementation run from persisted run metadata. System prompt redacted. Project context: Default.",
+      projectContext: {
+        id: "default",
+        label: "Default",
+        linearProject: null,
+        codebase: null,
+      },
     },
     {
       kind: "user",
@@ -1322,6 +2290,12 @@ function expectRunPrelude(body: Array<Record<string, unknown>>, expected: { sess
       from: "orchestrator",
       issue: expected.issue,
       text: "Implement the requested web transcript route",
+      projectContext: {
+        id: "default",
+        label: "Default",
+        linearProject: null,
+        codebase: null,
+      },
     },
   ]);
 }

@@ -5,14 +5,23 @@ import { constants as fsConstants, promises as fs, type Stats } from "node:fs";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer } from "ws";
 import type { Orchestrator } from "../core/orchestrator/Orchestrator.js";
-import type { WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
+import type { WorkspaceIssueInput, WorkspaceManager } from "../core/workspace/WorkspaceManager.js";
 import type { WorkspaceOpener } from "./WorkspaceOpener.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  normalizeProjectContextId,
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../core/config/ProjectContexts.js";
 import { SymphonyError, errorMessage } from "../core/errors.js";
 import {
   projectActivityModels,
   projectProviderGates,
   projectSessionModel,
+  selectIssueDetailWorkspaceSource,
   projectTranscriptMessages,
+  projectWorkspaceModel,
   projectWebDashboard,
   projectWebIssueBoard,
   projectWebIssueDetail,
@@ -36,6 +45,8 @@ import {
   type Issue,
   type IssueBoardColumnId,
   type IssueBoardColumnMapping,
+  type IssueRouteEvidence,
+  type IssueRouteEvidenceSource,
 } from "../core/types.js";
 import type {
   IssueCompletionReportRecord,
@@ -83,6 +94,7 @@ import {
   issueBreakdownPlanIdForOperation,
   type WritebackOutboxStore,
   type WritebackOperation,
+  writebackIdentityKey,
 } from "../core/writeback/WritebackOutbox.js";
 import type { TrackerClient } from "../core/tracker/TrackerClient.js";
 import {
@@ -112,11 +124,19 @@ import {
   type OrchestratorChatCommandResultStatus,
 } from "../core/orchestrator/OrchestratorChatCommand.js";
 
-import { projectWebHistory } from "./WebHistoryProjection.js";
 import {
+  applyWebHistoryRuntimeLiveness,
+  isWebHistoryProjectionPayloadCurrent,
+  isWebHistorySessionListCurrent,
+  projectWebHistory,
+} from "./WebHistoryProjection.js";
+import {
+  applyWebTranscriptProjectContextAttribution,
   emptyWebTranscriptProjectionPayload,
   isWebTranscriptProjectionPayload,
+  projectRunProjectContext,
   projectWebTranscript,
+  projectWebTranscriptProjectContext,
   projectWebTranscriptWindow,
   type TranscriptMessage as WebTranscriptMessage,
   type WebTranscriptProjectionPayload,
@@ -128,6 +148,7 @@ import {
   defaultWebProjectionIssueBoardColumns,
   isWebProjectionContextExpired,
   isWebProjectionRefreshRequested,
+  webProjectionIssueKeyAliases,
   webProjectionFingerprintCacheKey,
   webProjectionIssueBoardFetchStates,
   type BuiltWebProjectionSourceIndex,
@@ -143,6 +164,8 @@ import {
 import { RealtimeProjectionEventBus, type RealtimeResourceKind } from "./RealtimeProjectionEvents.js";
 import {
   createWebProjectionReadRepositories,
+  legacyCompatibleDefaultProjectionRevisionSelectors,
+  webHistoryProjectionRevisionSelectors,
   webHistoryProjectionScopeKey,
   webOrchestratorChatProjectionScopeKey,
   webTranscriptProjectionScopeKey,
@@ -294,6 +317,7 @@ export interface StatusServerOptions {
   orchestrator: Orchestrator;
   workspaceManager: WorkspaceManager;
   workspaceOpener: WorkspaceOpener;
+  defaultProjectContextId?: string | null | undefined;
   runStore?: RunTranscriptStore;
   runActivitySourceStore?: RunActivityEventSourceStore;
   orchestratorConversationStore?: OrchestratorConversationStore;
@@ -355,8 +379,13 @@ export class StatusServer {
     this.webProjectionRevisionProviders = this.projectionStatusEnabled ? createStatusServerWebProjectionRevisionProviders(options) : [];
     this.webProjectionRepositories = createWebProjectionReadRepositories({
       ...(options.projectionReader ? { reader: options.projectionReader } : {}),
+      defaultProjectContextId: () => this.options.defaultProjectContextId,
       isRecordCurrent: (record) => this.isDurableProjectionRecordCurrent(record),
     });
+  }
+
+  setDefaultProjectContextId(defaultProjectContextId: string | null | undefined): void {
+    this.options.defaultProjectContextId = defaultProjectContextId;
   }
 
   async start(): Promise<{ host: string; port: number }> {
@@ -851,6 +880,7 @@ export class StatusServer {
             lifecycleStore: this.options.lifecycleStore,
             writebackOutbox: this.options.writebackOutbox,
             query: parseActivityQuery(url),
+            defaultProjectContextId: this.options.defaultProjectContextId,
           }),
         );
         return;
@@ -888,13 +918,25 @@ export class StatusServer {
             );
             return;
           }
+          const defaultProjectContextId = this.options.defaultProjectContextId;
           const durableTranscript = requestedTranscriptPage
             ? await this.webProjectionRepositories.transcript.readRunPage(
-                { runId: sessionIdOrRunId, offset: requestedTranscriptPage.offset, limit: requestedTranscriptPage.limit },
+                {
+                  runId: sessionIdOrRunId,
+                  offset: requestedTranscriptPage.offset,
+                  limit: requestedTranscriptPage.limit,
+                  projectContextId: defaultProjectContextId,
+                  defaultProjectContextId,
+                },
                 { forceRefresh },
               )
             : await this.webProjectionRepositories.transcript.readRunDefaultPage(
-                { runId: sessionIdOrRunId, limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT },
+                {
+                  runId: sessionIdOrRunId,
+                  limit: WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT,
+                  projectContextId: defaultProjectContextId,
+                  defaultProjectContextId,
+                },
                 { forceRefresh },
               );
           if (durableTranscript.status === "hit" && durableTranscript.record) {
@@ -924,8 +966,11 @@ export class StatusServer {
           );
           return;
         }
-        const run = await resolveWebTranscriptRun(this.options.runStore, sessionIdOrRunId);
-        if (!run) {
+        const resolvedRun = await resolveWebTranscriptRun(this.options.runStore, sessionIdOrRunId, this.options.defaultProjectContextId);
+        if (resolvedRun.status === "ambiguous" || resolvedRun.status === "wrong_context") {
+          throw statusAliasResolutionError("Transcript", sessionIdOrRunId, resolvedRun.status);
+        }
+        if (!resolvedRun.run) {
           sendJson(
             response,
             200,
@@ -937,10 +982,11 @@ export class StatusServer {
           );
           return;
         }
+        const run = resolvedRun.run;
         let durableTranscript: DurableProjectionReadResult<WebTranscriptProjectionPayload> | undefined;
         if (!requestedFullTranscript && !shouldBypassDurableWebTranscriptForActiveTail(run, requestedTranscriptPage)) {
           durableTranscript = await this.webProjectionRepositories.transcript.readRunPage(
-            transcriptProjectionPageSelectorForRequest(run, requestedTranscriptPage),
+            transcriptProjectionPageSelectorForRequest(run, requestedTranscriptPage, this.options.defaultProjectContextId),
             { forceRefresh },
           );
           if (durableTranscript.status === "hit" && durableTranscript.record) {
@@ -1075,7 +1121,7 @@ export class StatusServer {
       }
       if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
         sendJson(response, 200, {
-          workspaces: (await this.options.runStore?.listWorkspaces()) ?? [],
+          workspaces: ((await this.options.runStore?.listWorkspaces()) ?? []).map(publicWorkspaceRecord),
         });
         return;
       }
@@ -1098,9 +1144,20 @@ export class StatusServer {
 
       const approvalMatch = /^\/api\/v1\/approval-requests\/([^/]+)$/.exec(url.pathname);
       if (approvalMatch) {
-        const requestId = decodeURIComponent(approvalMatch[1] ?? "");
+        const requestId = decodeURIComponent(approvalMatch[1] ?? "").trim();
         if (request.method === "GET") {
-          const approval = await this.options.operatorApproval?.get(requestId);
+          const resolvedApproval = await resolveApprovalRouteFromAlias({
+            operatorApproval: this.options.operatorApproval,
+            requestKey: requestId,
+            snapshot: this.options.orchestrator.snapshot(),
+            runStore: this.options.runStore,
+            lifecycleStore: this.options.lifecycleStore,
+            defaultProjectContextId: this.options.defaultProjectContextId,
+          });
+          if (resolvedApproval.status === "ambiguous" || resolvedApproval.status === "wrong_context") {
+            throw statusAliasResolutionError("Approval", requestId, resolvedApproval.status);
+          }
+          const approval = resolvedApproval.approval;
           if (!approval) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
           sendJson(response, 200, approvalResponse(approval, this.options.operatorApproval?.isRequired() ?? false));
           return;
@@ -1108,12 +1165,23 @@ export class StatusServer {
         if (request.method === "POST") {
           this.requireApprovalMutationToken(request);
           const decision = parseApprovalDecision(await readJsonBody(request));
-          let existingApproval: OperatorApprovalRecord | null = null;
+          let resolvedApproval: ApprovalRouteResolution = { status: "none", approval: null };
           try {
-            existingApproval = (await this.options.operatorApproval?.get(requestId)) ?? null;
+            resolvedApproval = await resolveApprovalRouteFromAlias({
+              operatorApproval: this.options.operatorApproval,
+              requestKey: requestId,
+              snapshot: this.options.orchestrator.snapshot(),
+              runStore: this.options.runStore,
+              lifecycleStore: this.options.lifecycleStore,
+              defaultProjectContextId: this.options.defaultProjectContextId,
+            });
           } catch {
-            existingApproval = null;
+            resolvedApproval = { status: "none", approval: null };
           }
+          if (resolvedApproval.status === "ambiguous" || resolvedApproval.status === "wrong_context") {
+            throw statusAliasResolutionError("Approval", requestId, resolvedApproval.status);
+          }
+          const existingApproval = resolvedApproval.approval;
           if (existingApproval?.status === "pending") {
             const currentApproval = await currentPendingPublicationApproval({
               approval: existingApproval,
@@ -1125,11 +1193,12 @@ export class StatusServer {
               throw new SymphonyError("conflict", "Approval request is not current pending publication approval");
             }
           }
+          const resolvedRequestId = existingApproval?.requestId ?? requestId;
           let result;
           try {
-            result = await this.options.operatorApproval?.resolve(requestId, decision);
+            result = await this.options.operatorApproval?.resolve(resolvedRequestId, decision);
           } catch (error) {
-            await this.recordPublicationApprovalTerminalConflict(requestId, error);
+            await this.recordPublicationApprovalTerminalConflict(resolvedRequestId, error);
             throw error;
           }
           if (!result) throw new SymphonyError("not_found", `Approval request not found: ${requestId}`);
@@ -1167,8 +1236,11 @@ export class StatusServer {
       if (request.method === "POST" && pauseMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(pauseMatch[1] ?? "");
-        await this.options.orchestrator.pauseIssue(issueId);
-        sendJson(response, 202, { paused: true, issue: issueId });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
+        if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+        const lookupIssueId = lookup.issueId ?? issueId;
+        await this.options.orchestrator.pauseIssue(lookupIssueId);
+        sendJson(response, 202, { paused: true, issue: lookupIssueId });
         return;
       }
 
@@ -1176,8 +1248,11 @@ export class StatusServer {
       if (request.method === "POST" && resumeMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(resumeMatch[1] ?? "");
-        await this.options.orchestrator.resumeIssue(issueId);
-        sendJson(response, 202, { paused: false, issue: issueId });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
+        if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+        const lookupIssueId = lookup.issueId ?? issueId;
+        await this.options.orchestrator.resumeIssue(lookupIssueId);
+        sendJson(response, 202, { paused: false, issue: lookupIssueId });
         return;
       }
 
@@ -1185,8 +1260,11 @@ export class StatusServer {
       if (request.method === "POST" && cancelMatch) {
         this.requireMutationToken(request);
         const issueId = decodeURIComponent(cancelMatch[1] ?? "");
-        await this.options.orchestrator.cancelIssue(issueId);
-        sendJson(response, 202, { cancelled: true, issue: issueId });
+        const lookup = await this.resolveRouteIssueLookup(issueId);
+        if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+        const lookupIssueId = lookup.issueId ?? issueId;
+        await this.options.orchestrator.cancelIssue(lookupIssueId);
+        sendJson(response, 202, { cancelled: true, issue: lookupIssueId });
         return;
       }
 
@@ -1206,18 +1284,72 @@ export class StatusServer {
 
       const issueRunsMatch = /^\/api\/v1\/issues\/([^/]+)\/runs$/.exec(url.pathname);
       if (request.method === "GET" && issueRunsMatch) {
-        const issueId = decodeURIComponent(issueRunsMatch[1] ?? "");
+        const issueId = decodeURIComponent(issueRunsMatch[1] ?? "").trim();
         const snapshot = this.options.orchestrator.snapshot();
-        const live = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
-        const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const parsedIssueAlias = parseContextualAlias(issueId);
+        const preferRouteLookup =
+          parsedIssueAlias.projectContextId === null && (!this.options.defaultProjectContextId || Boolean(this.options.tracker));
+        const routeLookup =
+          parsedIssueAlias.projectContextId === null ? await this.resolveRouteIssueLookup(issueId, snapshot) : null;
+        const resolvedIssue = await resolveIssueAliasData({
+          requestKey: issueId,
+          snapshot,
+          runStore: this.options.runStore,
+          lifecycleStore: this.options.lifecycleStore,
+          defaultProjectContextId: this.options.defaultProjectContextId,
+        });
+        let issueResponseKey = issueId;
+        let lookupIssueId: string | null = null;
+        let live: RunningRow | null = null;
+        let workspace: WorkspaceRecord | null = null;
+        let latestRun: RunRecord | null = null;
+        let runs: RunRecord[] = [];
+        let rawLifecycle: IssueLifecycleRecord | null = null;
+        if (routeLookup?.resolutionKind === "exact_issue_id" && routeLookup.issueId) {
+          lookupIssueId = routeLookup.issueId;
+          issueResponseKey = lookupIssueId;
+          live = this.options.orchestrator.getIssueDetails(lookupIssueId);
+          rawLifecycle = (await this.options.lifecycleStore?.get(lookupIssueId)) ?? null;
+          workspace = (await this.options.runStore?.findWorkspace(lookupIssueId)) ?? null;
+          latestRun = (await this.options.runStore?.latestRunForIssue(lookupIssueId)) ?? null;
+          runs = (await this.options.runStore?.listRunsForIssue(lookupIssueId)) ?? [];
+        } else if (preferRouteLookup && routeLookup?.ambiguousCandidates.length) {
+          throw ambiguousIssueLookupError(issueId, routeLookup.ambiguousCandidates);
+        } else if (preferRouteLookup && routeLookup?.issueId) {
+          lookupIssueId = routeLookup.issueId;
+          issueResponseKey = routeLookup.resolutionKind === "issue_identifier" ? issueId : lookupIssueId;
+          live = this.options.orchestrator.getIssueDetails(lookupIssueId);
+          rawLifecycle = (await this.options.lifecycleStore?.get(lookupIssueId)) ?? null;
+          workspace = (await this.options.runStore?.findWorkspace(lookupIssueId)) ?? null;
+          latestRun = (await this.options.runStore?.latestRunForIssue(lookupIssueId)) ?? null;
+          runs = (await this.options.runStore?.listRunsForIssue(lookupIssueId)) ?? [];
+        } else {
+          if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+            throw statusAliasResolutionError("Issue", issueId, resolvedIssue.status);
+          }
+          if (resolvedIssue.status === "resolved") {
+            issueResponseKey = parsedIssueAlias.projectContextId !== null ? issueId : resolvedIssue.requestKey;
+            lookupIssueId =
+              resolvedIssue.lifecycle?.issueId ??
+              resolvedIssue.latestRun?.issueId ??
+              resolvedIssue.workspace?.issueId ??
+              resolvedIssue.live?.issueId ??
+              null;
+            live = resolvedIssue.live;
+            workspace = resolvedIssue.workspace;
+            latestRun = resolvedIssue.latestRun;
+            runs = [...resolvedIssue.runs];
+            rawLifecycle = resolvedIssue.lifecycle;
+          } else {
+            throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
+          }
+        }
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
-        const runs = (await this.options.runStore?.listRunsForIssue(issueId)) ?? [];
         const lifecycle = sanitizeStatusLifecycle({
           live,
           workspace,
           latestRun,
-          lifecycle: await this.options.lifecycleStore?.get(issueId),
+          lifecycle: rawLifecycle,
         });
         const enrichedRuns = await Promise.all(
           runs.map(async (run) => ({
@@ -1227,9 +1359,9 @@ export class StatusServer {
           })),
         );
         sendJson(response, 200, {
-          issue: issueId,
+          issue: lookupIssueId ?? issueResponseKey,
           issueDetails: buildIssueDetailsEnvelope({
-            requestKey: issueId,
+            requestKey: issueResponseKey,
             generatedAt: snapshot.generatedAt,
             trackerStateLists: this.options.trackerStateLists,
             staleThresholdMs: this.options.staleThresholdMs,
@@ -1256,8 +1388,54 @@ export class StatusServer {
       const continuationSummaryMatch = /^\/api\/v1\/issues\/([^/]+)\/continuation-summary$/.exec(url.pathname);
       if (request.method === "POST" && continuationSummaryMatch) {
         this.requireMutationToken(request);
-        const issueId = decodeURIComponent(continuationSummaryMatch[1] ?? "");
-        const result = await this.options.orchestrator.createContinuationSummary(issueId);
+        const issueId = decodeURIComponent(continuationSummaryMatch[1] ?? "").trim();
+        const parsedIssueAlias = parseContextualAlias(issueId);
+        const preferRouteLookup =
+          parsedIssueAlias.projectContextId === null && (!this.options.defaultProjectContextId || Boolean(this.options.tracker));
+        if (parsedIssueAlias.projectContextId === null) {
+          const lookup = await this.resolveRouteIssueLookup(issueId);
+          if (lookup.resolutionKind === "exact_issue_id" && lookup.issueId) {
+            const result = await this.options.orchestrator.createContinuationSummary(lookup.issueId);
+            sendJson(response, 201, {
+              issue: lookup.issueId,
+              summaryReference: result.summaryReference,
+              lifecycle: result.lifecycle,
+            });
+            return;
+          }
+          if (preferRouteLookup && lookup.ambiguousCandidates.length > 0) {
+            throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+          }
+          if (preferRouteLookup && lookup.issueId) {
+            const result = await this.options.orchestrator.createContinuationSummary(lookup.issueId);
+            sendJson(response, 201, {
+              issue: lookup.issueId,
+              summaryReference: result.summaryReference,
+              lifecycle: result.lifecycle,
+            });
+            return;
+          }
+        }
+        const resolvedIssue = await resolveIssueAliasData({
+          requestKey: issueId,
+          snapshot: this.options.orchestrator.snapshot(),
+          runStore: this.options.runStore,
+          lifecycleStore: this.options.lifecycleStore,
+          defaultProjectContextId: this.options.defaultProjectContextId,
+        });
+        if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+          throw statusAliasResolutionError("Issue", issueId, resolvedIssue.status);
+        }
+        let continuationSummaryIssueId = issueId;
+        if (resolvedIssue.status === "resolved") {
+          continuationSummaryIssueId =
+            resolvedIssue.lifecycle?.issueId ??
+            resolvedIssue.latestRun?.issueId ??
+            resolvedIssue.workspace?.issueId ??
+            resolvedIssue.live?.issueId ??
+            continuationSummaryIssueId;
+        }
+        const result = await this.options.orchestrator.createContinuationSummary(continuationSummaryIssueId);
         sendJson(response, 201, {
           issue: issueId,
           summaryReference: result.summaryReference,
@@ -1269,53 +1447,183 @@ export class StatusServer {
       const issueBreakdownMatch = /^\/api\/v1\/issues\/([^/]+)\/planning-run$/.exec(url.pathname);
       if (request.method === "POST" && issueBreakdownMatch) {
         this.requireMutationToken(request);
-        const issueId = decodeURIComponent(issueBreakdownMatch[1] ?? "");
-        const result = await this.options.orchestrator.requestIssueBreakdown(issueId);
-        sendJson(response, result.queued ? 202 : 200, {
-          queued: result.queued,
-          issue: result.issue.identifier,
-          issueId: result.issue.id,
-          runPhase: "issue_breakdown",
-          runKind: "planning",
-          reason: result.reason,
+        const issueId = decodeURIComponent(issueBreakdownMatch[1] ?? "").trim();
+        const resolvedTarget = await resolveIssueActionTarget({
+          requestKey: issueId,
+          snapshot: this.options.orchestrator.snapshot(),
+          runStore: this.options.runStore,
+          lifecycleStore: this.options.lifecycleStore,
+          defaultProjectContextId: this.options.defaultProjectContextId,
         });
+        if (resolvedTarget.status !== "resolved") {
+          throw statusAliasResolutionError(
+            "Issue",
+            issueId,
+            resolvedTarget.status,
+            buildIssueRouteEvidence({
+              kind: "issue_breakdown",
+              requestKey: issueId,
+              status: resolvedTarget.status,
+              reason:
+                resolvedTarget.status === "ambiguous"
+                  ? "alias_ambiguous_across_project_contexts"
+                  : "alias_not_available_through_default_project_context",
+            }),
+          );
+        }
+        const { target } = resolvedTarget;
+        const aliasRouteEvidence = buildIssueRouteEvidence({
+          kind: "issue_breakdown",
+          requestKey: issueId,
+          status: "resolved",
+          resolvedProjectContextId: target.projectContext?.projectContextId ?? null,
+          lookupKey: target.lookupKey,
+          sources: issueRouteEvidenceAliasSources(target),
+        });
+        try {
+          const result = await this.options.orchestrator.requestIssueBreakdown(target.lookupKey, {
+            ...(target.projectContext ? { projectContext: target.projectContext } : {}),
+          });
+          sendJson(response, result.queued ? 202 : 200, {
+            queued: result.queued,
+            issue: result.issue.identifier,
+            issueId: result.issue.id,
+            runPhase: "issue_breakdown",
+            runKind: "planning",
+            reason: result.reason,
+            routeEvidence: result.routeEvidence ? mergeIssueRouteEvidence(aliasRouteEvidence, result.routeEvidence) : aliasRouteEvidence,
+          });
+        } catch (error) {
+          throw mergeRouteEvidenceIntoError(error, aliasRouteEvidence);
+        }
         return;
       }
 
       const issueBreakdownApplyMatch = /^\/api\/v1\/issues\/([^/]+)\/planning-run\/apply$/.exec(url.pathname);
       if (request.method === "POST" && issueBreakdownApplyMatch) {
         this.requireIssueBreakdownApplyToken(request);
-        const issueId = decodeURIComponent(issueBreakdownApplyMatch[1] ?? "");
-        const options = parseIssueBreakdownApplyRequest(await readJsonBody(request));
-        const result = await this.options.orchestrator.applyIssueBreakdownPlan(issueId, options);
-        sendJson(response, result.status === "pending" ? 202 : 200, {
-          issue: issueId,
-          mode: options.dryRun ? "preview" : "apply",
-          ...result,
+        const issueId = decodeURIComponent(issueBreakdownApplyMatch[1] ?? "").trim();
+        const resolvedTarget = await resolveIssueActionTarget({
+          requestKey: issueId,
+          snapshot: this.options.orchestrator.snapshot(),
+          runStore: this.options.runStore,
+          lifecycleStore: this.options.lifecycleStore,
+          defaultProjectContextId: this.options.defaultProjectContextId,
         });
+        if (resolvedTarget.status !== "resolved") {
+          throw statusAliasResolutionError(
+            "Issue",
+            issueId,
+            resolvedTarget.status,
+            buildIssueRouteEvidence({
+              kind: "issue_breakdown_apply",
+              requestKey: issueId,
+              status: resolvedTarget.status,
+              reason:
+                resolvedTarget.status === "ambiguous"
+                  ? "alias_ambiguous_across_project_contexts"
+                  : "alias_not_available_through_default_project_context",
+            }),
+          );
+        }
+        const { target } = resolvedTarget;
+        const aliasRouteEvidence = buildIssueRouteEvidence({
+          kind: "issue_breakdown_apply",
+          requestKey: issueId,
+          status: "resolved",
+          resolvedProjectContextId: target.projectContext?.projectContextId ?? null,
+          lookupKey: target.lookupKey,
+          sources: issueRouteEvidenceAliasSources(target),
+        });
+        try {
+          const options = parseIssueBreakdownApplyRequest(await readJsonBody(request));
+          const result = await this.options.orchestrator.applyIssueBreakdownPlan(target.lookupKey, {
+            ...options,
+            ...(target.projectContext ? { projectContext: target.projectContext } : {}),
+          });
+          sendJson(response, result.status === "pending" ? 202 : 200, {
+            issue: issueId,
+            mode: options.dryRun ? "preview" : "apply",
+            ...result,
+            routeEvidence: result.routeEvidence ? mergeIssueRouteEvidence(aliasRouteEvidence, result.routeEvidence) : aliasRouteEvidence,
+          });
+        } catch (error) {
+          throw mergeRouteEvidenceIntoError(error, aliasRouteEvidence);
+        }
         return;
       }
 
       const issueMatch = /^\/api\/v1\/issues\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && issueMatch) {
-        const issueId = decodeURIComponent(issueMatch[1] ?? "");
+        const issueId = decodeURIComponent(issueMatch[1] ?? "").trim();
         const snapshot = this.options.orchestrator.snapshot();
-        const live = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
-        const latestRun = await this.options.runStore?.latestRunForIssue(issueId);
+        const parsedIssueAlias = parseContextualAlias(issueId);
+        const preferRouteLookup =
+          parsedIssueAlias.projectContextId === null && (!this.options.defaultProjectContextId || Boolean(this.options.tracker));
+        const routeLookup =
+          parsedIssueAlias.projectContextId === null ? await this.resolveRouteIssueLookup(issueId, snapshot) : null;
+        const resolvedIssue = await resolveIssueAliasData({
+          requestKey: issueId,
+          snapshot,
+          runStore: this.options.runStore,
+          lifecycleStore: this.options.lifecycleStore,
+          defaultProjectContextId: this.options.defaultProjectContextId,
+        });
+        let issueRouteKey = issueId;
+        let lookupIssueId: string | null = null;
+        let live: RunningRow | null = null;
+        let workspace: WorkspaceRecord | null = null;
+        let latestRun: RunRecord | null = null;
+        let rawLifecycle: IssueLifecycleRecord | null = null;
+        if (routeLookup?.resolutionKind === "exact_issue_id" && routeLookup.issueId) {
+          lookupIssueId = routeLookup.issueId;
+          issueRouteKey = lookupIssueId;
+          live = this.options.orchestrator.getIssueDetails(lookupIssueId);
+          rawLifecycle = (await this.options.lifecycleStore?.get(lookupIssueId)) ?? null;
+          workspace = (await this.options.runStore?.findWorkspace(lookupIssueId)) ?? null;
+          latestRun = (await this.options.runStore?.latestRunForIssue(lookupIssueId)) ?? null;
+        } else if (preferRouteLookup && routeLookup?.ambiguousCandidates.length) {
+          throw ambiguousIssueLookupError(issueId, routeLookup.ambiguousCandidates);
+        } else if (preferRouteLookup && routeLookup?.issueId) {
+          lookupIssueId = routeLookup.issueId;
+          issueRouteKey = routeLookup.resolutionKind === "issue_identifier" ? issueId : lookupIssueId;
+          live = this.options.orchestrator.getIssueDetails(lookupIssueId);
+          rawLifecycle = (await this.options.lifecycleStore?.get(lookupIssueId)) ?? null;
+          workspace = (await this.options.runStore?.findWorkspace(lookupIssueId)) ?? null;
+          latestRun = (await this.options.runStore?.latestRunForIssue(lookupIssueId)) ?? null;
+        } else {
+          if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+            throw statusAliasResolutionError("Issue", issueId, resolvedIssue.status);
+          }
+          if (resolvedIssue.status === "resolved") {
+            issueRouteKey = parsedIssueAlias.projectContextId !== null ? issueId : resolvedIssue.requestKey;
+            lookupIssueId =
+              resolvedIssue.lifecycle?.issueId ??
+              resolvedIssue.latestRun?.issueId ??
+              resolvedIssue.workspace?.issueId ??
+              resolvedIssue.live?.issueId ??
+              null;
+            live = resolvedIssue.live;
+            workspace = resolvedIssue.workspace;
+            latestRun = resolvedIssue.latestRun;
+            rawLifecycle = resolvedIssue.lifecycle;
+          } else {
+            throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
+          }
+        }
         const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, this.options.runStore);
         const lifecycle = sanitizeStatusLifecycle({
           live,
           workspace,
           latestRun,
-          lifecycle: await this.options.lifecycleStore?.get(issueId),
+          lifecycle: rawLifecycle,
         });
-        if (!live && !workspace && !latestRun && !lifecycle) throw new SymphonyError("not_found", `Issue not found: ${issueId}`);
         const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
-        const keys = issueKeys(issueId, { live, latestRun, lifecycle });
+        const keys = issueKeys(issueRouteKey, { live, latestRun, lifecycle });
         const paused = isIssuePaused(snapshot, keys);
         const resolvedAgentId = live ? await resolveRunningAgentId(live, this.options.runStore) : null;
-        const pendingApprovalCandidate = await this.options.operatorApproval?.findPendingForIssue(keys);
+        const issueProjectContext = lifecycle?.projectContext ?? workspace?.projectContext ?? projectContextResolutionFromIssue(live) ?? latestRun?.projectContext;
+        const pendingApprovalCandidate = await this.options.operatorApproval?.findPendingForIssue(keys, issueProjectContext);
         const pendingApproval = pendingApprovalCandidate
           ? await currentPendingPublicationApproval({
               approval: pendingApprovalCandidate,
@@ -1333,16 +1641,17 @@ export class StatusServer {
         });
         const controls = operatorControls({ issueKnown: true, live, paused, mutationsConfigured: Boolean(this.options.openWorkspaceToken) });
         const affordances = operatorAffordances({
-          issueKey: issueId,
+          issueKey: issueRouteKey,
           lifecycle,
           continuationSummaryAvailable: Boolean(this.options.lifecycleStore && this.options.runStore),
           mutationsRequireToken: controls.mutationsRequireToken,
         });
         sendJson(response, 200, {
-          issue: issueId,
+          issue: lookupIssueId ?? issueRouteKey,
           issueDetails: buildIssueDetailsEnvelope({
-            requestKey: issueId,
+            requestKey: issueRouteKey,
             generatedAt: snapshot.generatedAt,
+
             trackerStateLists: this.options.trackerStateLists,
             staleThresholdMs: this.options.staleThresholdMs,
             live,
@@ -1392,29 +1701,47 @@ export class StatusServer {
 
       const transcriptMatch = /^\/api\/v1\/runs\/([^/]+)\/transcript$/.exec(url.pathname);
       if (request.method === "GET" && transcriptMatch) {
-        const runId = decodeURIComponent(transcriptMatch[1] ?? "");
-        const run = await this.options.runStore?.getRun(runId);
-        if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
-        const page = await this.options.runStore?.readTranscript(runId, parsePagination(url));
+        const runId = decodeURIComponent(transcriptMatch[1] ?? "").trim();
+        if (!this.options.runStore) throw new SymphonyError("not_found", `Run not found: ${runId}`);
+        const resolvedRun = await resolveTranscriptRunFromAlias({
+          runStore: this.options.runStore,
+          requestKey: runId,
+          defaultProjectContextId: this.options.defaultProjectContextId,
+        });
+        if (resolvedRun.status === "ambiguous" || resolvedRun.status === "wrong_context") {
+          throw statusAliasResolutionError("Transcript", runId, resolvedRun.status);
+        }
+        if (!resolvedRun.run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
+        const page = await this.options.runStore.readTranscript(resolvedRun.run.runId, parsePagination(url));
         sendJson(response, 200, page ? publicTranscriptPage(page) : page);
         return;
       }
 
       const runMatch = /^\/api\/v1\/runs\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && runMatch) {
-        const runId = decodeURIComponent(runMatch[1] ?? "");
-        const run = await this.options.runStore?.getRun(runId);
+        const runId = decodeURIComponent(runMatch[1] ?? "").trim();
+        if (!this.options.runStore) throw new SymphonyError("not_found", `Run not found: ${runId}`);
+        const resolvedRun = await resolveTranscriptRunFromAlias({
+          runStore: this.options.runStore,
+          requestKey: runId,
+          defaultProjectContextId: this.options.defaultProjectContextId,
+        });
+        if (resolvedRun.status === "ambiguous" || resolvedRun.status === "wrong_context") {
+          throw statusAliasResolutionError("Run", runId, resolvedRun.status);
+        }
+        const run = resolvedRun.run;
         if (!run) throw new SymphonyError("not_found", `Run not found: ${runId}`);
-        const issueRunsByIdentifier = (await this.options.runStore?.listRunsForIssue(run.issueIdentifier)) ?? [];
+        const issueLookupOptions = run.projectContext ? { projectContext: run.projectContext } : {};
+        const issueRunsByIdentifier = (await this.options.runStore?.listRunsForIssue(run.issueIdentifier, issueLookupOptions)) ?? [];
         const issueRuns =
           issueRunsByIdentifier.length > 0 || run.issueIdentifier === run.issueId
             ? issueRunsByIdentifier
-            : ((await this.options.runStore?.listRunsForIssue(run.issueId)) ?? []);
+            : ((await this.options.runStore?.listRunsForIssue(run.issueId, issueLookupOptions)) ?? []);
         const lifecycle =
           (await this.options.lifecycleStore?.get(run.issueId)) ?? (await this.options.lifecycleStore?.get(run.issueIdentifier)) ?? null;
         sendJson(response, 200, {
           ...publicRunRecord(run),
-          pendingApproval: (await this.options.operatorApproval?.findPendingForRun(runId)) ?? null,
+          pendingApproval: (await this.options.operatorApproval?.findPendingForRun(run.runId)) ?? null,
           telemetry: await runTelemetrySummary(run.runId, this.options.runStore),
           operatorLiveness: await runOperatorLiveness(run, this.options.orchestrator.snapshot(), lifecycle, issueRuns, this.options.runStore),
           operatorLivenessContract: OPERATOR_LIVENESS_CONTRACT,
@@ -1424,26 +1751,193 @@ export class StatusServer {
 
       const workspaceMatch = /^\/api\/v1\/workspaces\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && workspaceMatch) {
-        const workspaceKey = decodeURIComponent(workspaceMatch[1] ?? "");
-        const workspace = await this.options.runStore?.findWorkspace(workspaceKey);
-        if (!workspace) throw new SymphonyError("not_found", `Workspace not found: ${workspaceKey}`);
-        sendJson(response, 200, workspace);
+        const workspaceKey = decodeURIComponent(workspaceMatch[1] ?? "").trim();
+        const directWorkspace = await this.options.runStore?.getWorkspace(workspaceKey);
+        if (directWorkspace && (directWorkspace.workspaceKey !== directWorkspace.issueIdentifier || !this.options.defaultProjectContextId)) {
+          sendJson(response, 200, publicWorkspaceRecord(directWorkspace));
+          return;
+        }
+        const parsedWorkspaceAlias = parseContextualAlias(workspaceKey);
+        if (parsedWorkspaceAlias.projectContextId === null) {
+          const lookup = await this.resolveRouteIssueLookup(workspaceKey);
+          if (lookup.resolutionKind === "exact_issue_id" && lookup.issueId) {
+            const exactWorkspace = await this.options.runStore?.findWorkspace(lookup.issueId);
+            if (exactWorkspace) {
+              sendJson(response, 200, publicWorkspaceRecord(exactWorkspace));
+              return;
+            }
+          }
+          if (lookup.ambiguousCandidates.length > 0 && (!this.options.defaultProjectContextId || this.options.tracker)) {
+            throw ambiguousIssueLookupError(workspaceKey, lookup.ambiguousCandidates);
+          }
+        }
+        const snapshot = this.options.orchestrator.snapshot();
+        const resolvedIssue = await resolveIssueAliasData({
+          requestKey: workspaceKey,
+          snapshot,
+          runStore: this.options.runStore,
+          lifecycleStore: this.options.lifecycleStore,
+          defaultProjectContextId: this.options.defaultProjectContextId,
+        });
+        if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+          throw statusAliasResolutionError("Workspace", workspaceKey, resolvedIssue.status);
+        }
+        if (!resolvedIssue.workspace) throw new SymphonyError("not_found", `Workspace not found: ${workspaceKey}`);
+        sendJson(response, 200, publicWorkspaceRecord(resolvedIssue.workspace));
         return;
       }
 
       const openMatch = /^\/api\/v1\/issues\/([^/]+)\/open-workspace$/.exec(url.pathname);
       if (request.method === "POST" && openMatch) {
         this.requireMutationToken(request);
-        const issueId = decodeURIComponent(openMatch[1] ?? "");
-        const details = this.options.orchestrator.getIssueDetails(issueId);
-        const workspace = await this.options.runStore?.findWorkspace(issueId);
+        const issueId = decodeURIComponent(openMatch[1] ?? "").trim();
+        const parsedIssueAlias = parseContextualAlias(issueId);
+        const preferRouteLookup =
+          parsedIssueAlias.projectContextId === null && (!this.options.defaultProjectContextId || Boolean(this.options.tracker));
+        if (parsedIssueAlias.projectContextId === null) {
+          const lookup = await this.resolveRouteIssueLookup(issueId);
+          if (preferRouteLookup && lookup.ambiguousCandidates.length > 0) {
+            throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+          }
+          if (lookup.issueId && (lookup.resolutionKind === "exact_issue_id" || preferRouteLookup)) {
+            const lookupIssueId = lookup.issueId;
+            const details = this.options.orchestrator.getIssueDetails(lookupIssueId);
+            const lifecycle = await this.options.lifecycleStore?.get(lookupIssueId);
+            const workspace = await this.options.runStore?.findWorkspace(lookupIssueId);
+            const latestRun = await this.options.runStore?.latestRunForIssue(lookupIssueId);
+            const persistedWorkspaceLookupKey =
+              workspace?.workspaceKey ?? latestRun?.workspaceKey ?? lifecycle?.summaryPointers.workspaceKey ?? null;
+            const workspacePath =
+              details?.workspacePath ??
+              workspace?.path ??
+              latestRun?.workspacePath ??
+              lifecycle?.summaryPointers.workspacePath ??
+              (persistedWorkspaceLookupKey
+                ? workspacePathForLookupKey(persistedWorkspaceLookupKey, this.options.workspaceManager)
+                : lifecycle
+                  ? this.options.workspaceManager.getPathForIssue({
+                      id: lifecycle.issueId,
+                      identifier: lifecycle.issueIdentifier,
+                      branchName: lifecycle.summaryPointers.gitBranchName ?? lifecycle.summaryPointers.branchName ?? null,
+                      ...(lifecycle.projectContext === undefined ? {} : { projectContext: lifecycle.projectContext }),
+                    })
+                  : null);
+            if (!workspacePath) {
+              throw new SymphonyError("not_found", `Workspace not found for issue: ${issueId}`);
+            }
+            if (!(await pathExists(workspacePath))) {
+              throw new SymphonyError("not_found", `Workspace not found: ${workspacePath}`);
+            }
+            await this.options.workspaceOpener.open(workspacePath);
+            sendJson(response, 202, { opened: true, workspace_path: workspacePath });
+            return;
+          }
+        }
+        const resolvedTarget = await resolveIssueActionTarget({
+          requestKey: issueId,
+          snapshot: this.options.orchestrator.snapshot(),
+          runStore: this.options.runStore,
+          lifecycleStore: this.options.lifecycleStore,
+          defaultProjectContextId: this.options.defaultProjectContextId,
+        });
+        if (resolvedTarget.status !== "resolved") {
+          throw statusAliasResolutionError(
+            "Issue",
+            issueId,
+            resolvedTarget.status,
+            buildIssueRouteEvidence({
+              kind: "open_workspace",
+              requestKey: issueId,
+              status: resolvedTarget.status,
+              reason:
+                resolvedTarget.status === "ambiguous"
+                  ? "alias_ambiguous_across_project_contexts"
+                  : "alias_not_available_through_default_project_context",
+            }),
+          );
+        }
+        const { target } = resolvedTarget;
+        const aliasSources = issueRouteEvidenceAliasSources(target);
+        const workspaceLookupKey = resolvedWorkspaceActionLookupKey(target, this.options.defaultProjectContextId);
+        const scopedIssueLookupKeys = Array.from(
+          new Set(
+            [target.live?.issueId, target.latestRun?.issueId, target.lifecycle?.issueId, target.workspace?.issueId, workspaceLookupKey, issueId].filter(
+              (key): key is string => typeof key === "string" && key.length > 0,
+            ),
+          ),
+        );
+        const details =
+          target.live ??
+          scopedIssueLookupKeys
+            .map((key) => this.options.orchestrator.getIssueDetails(key))
+            .find((candidate) => candidate !== null) ??
+          null;
+        const scopedWorkspaceLookupKeys = Array.from(
+          new Set(
+            [
+              target.workspace?.workspaceKey,
+              target.latestRun?.workspaceKey,
+              target.lifecycle?.summaryPointers.workspaceKey,
+              target.workspace?.issueId,
+              target.live?.issueId,
+              target.latestRun?.issueId,
+              target.lifecycle?.issueId,
+              workspaceLookupKey,
+              issueId,
+            ].filter((key): key is string => typeof key === "string" && key.length > 0),
+          ),
+        );
+        let workspace = target.workspace;
+        if (!workspace && this.options.runStore) {
+          for (const key of scopedWorkspaceLookupKeys) {
+            workspace = await this.options.runStore.findWorkspace(key);
+            if (workspace) break;
+          }
+        }
         const workspacePath =
-          details?.workspacePath ?? workspace?.path ?? this.options.workspaceManager.getPathForIssue(issueId);
+          details?.workspacePath ??
+          workspace?.path ??
+          target.latestRun?.workspacePath ??
+          target.lifecycle?.summaryPointers.workspacePath ??
+          workspacePathForLookupKey(workspaceLookupKey, this.options.workspaceManager);
+        let workspaceSource: IssueRouteEvidenceSource = "workspace_filesystem_fallback";
+        if (details?.workspacePath) {
+          workspaceSource = "workspace_live";
+        } else if (workspace?.path) {
+          workspaceSource = "workspace_record";
+        } else if (target.latestRun?.workspacePath) {
+          workspaceSource = "workspace_run";
+        } else if (target.lifecycle?.summaryPointers.workspacePath) {
+          workspaceSource = "workspace_lifecycle";
+        }
+
         if (!(await pathExists(workspacePath))) {
-          throw new SymphonyError("not_found", `Workspace not found: ${workspacePath}`);
+          throw new SymphonyError("not_found", `Workspace not found: ${workspacePath}`, {
+            routeEvidence: buildIssueRouteEvidence({
+              kind: "open_workspace",
+              requestKey: issueId,
+              status: "missing",
+              reason: "workspace_path_not_found",
+              resolvedProjectContextId: target.projectContext?.projectContextId ?? null,
+              lookupKey: workspaceLookupKey,
+              sources: [...aliasSources, workspaceSource],
+            }),
+          });
         }
         await this.options.workspaceOpener.open(workspacePath);
-        sendJson(response, 202, { opened: true, workspace_path: workspacePath });
+        sendJson(response, 202, {
+          opened: true,
+          workspace_path: workspacePath,
+          routeEvidence: buildIssueRouteEvidence({
+            kind: "open_workspace",
+            requestKey: issueId,
+            status: "resolved",
+            reason: workspaceSource === "workspace_filesystem_fallback" ? "workspace_filesystem_fallback" : null,
+            resolvedProjectContextId: target.projectContext?.projectContextId ?? null,
+            lookupKey: workspaceLookupKey,
+            sources: [...aliasSources, workspaceSource],
+          }),
+        });
         return;
       }
 
@@ -1463,11 +1957,13 @@ export class StatusServer {
           : error instanceof SymphonyError && error.code === "invalid_request"
             ? 401
             : 500;
+      const routeEvidence = issueRouteEvidenceFromError(error);
       sendJson(response, status, {
         error: {
           code: error instanceof SymphonyError ? error.code : "internal_error",
           message: errorMessage(error),
         },
+        ...(routeEvidence ? { routeEvidence } : {}),
       });
     }
   }
@@ -1629,7 +2125,7 @@ export class StatusServer {
         snapshot,
       );
       const issues = projectWebIssueBoard(board);
-      const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot });
+      const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot, activityRuns: activitySources.runs });
       const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
       const sidebar = projectWebSidebar(dashboard, issues, history, chat);
       await this.recordProjectionRebuildEntry(
@@ -1661,7 +2157,7 @@ export class StatusServer {
         query: { issue: null, offset: 0, limit: limits.timelineLimit },
         includeTranscriptEvents: false,
       });
-      const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot });
+      const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot, activityRuns });
       await this.recordProjectionRebuildEntry(
         this.webHistoryProjectionWriteInput(history, {
           sourceIndex,
@@ -1763,7 +2259,7 @@ export class StatusServer {
             entries.push({
               projectionName: "transcript_projection",
               scopeKind: "run_page",
-              scopeKey: transcriptProjectionScopeKey(run, page),
+              scopeKey: transcriptProjectionScopeKey(run, page, this.options.defaultProjectContextId),
               status: "failed",
               revision: null,
               reason: "Transcript source returned a non-advancing nextOffset cursor",
@@ -1776,7 +2272,13 @@ export class StatusServer {
         entries.push({
           projectionName: "transcript_projection",
           scopeKind: "run_page",
-          scopeKey: `${run.runId}:offset:${offset}:limit:${pageLimit}`,
+          scopeKey: webTranscriptProjectionScopeKey({
+            runId: run.runId,
+            offset,
+            limit: pageLimit,
+            projectContextId: run.projectContext?.projectContextId ?? null,
+            defaultProjectContextId: this.options.defaultProjectContextId,
+          }),
           status: "failed",
           revision: null,
           reason: publicDiagnosticText(errorMessage(error)),
@@ -1791,7 +2293,7 @@ export class StatusServer {
     entries: StatusServerProjectionRebuildEntry[],
     recordedScopeKeys: Set<string>,
   ): Promise<void> {
-    const scopeKey = transcriptProjectionScopeKey(run, page);
+    const scopeKey = transcriptProjectionScopeKey(run, page, this.options.defaultProjectContextId);
     if (recordedScopeKeys.has(scopeKey)) return;
     recordedScopeKeys.add(scopeKey);
     const transcript = projectWebTranscript(page.events, { run });
@@ -1883,6 +2385,7 @@ export class StatusServer {
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "dashboard_projection",
+      projectContextId: this.options.defaultProjectContextId ?? null,
       scopeKind: "global",
       scopeKey: "global",
       payload: dashboard,
@@ -1908,6 +2411,7 @@ export class StatusServer {
     const fetchedStates = webProjectionIssueBoardFetchStates(input.issueBoardColumns);
     return {
       projectionName: "issue_board_projection",
+      projectContextId: this.options.defaultProjectContextId ?? null,
       scopeKind: "board",
       scopeKey: "default-board",
       payload: issues,
@@ -1937,6 +2441,7 @@ export class StatusServer {
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "sidebar_projection",
+      projectContextId: this.options.defaultProjectContextId ?? null,
       scopeKind: "global",
       scopeKey: "global",
       payload: sidebar,
@@ -1965,6 +2470,7 @@ export class StatusServer {
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "history_projection",
+      projectContextId: this.options.defaultProjectContextId ?? null,
       scopeKind: "global_collection",
       scopeKey: historyProjectionScopeKey(input.limits),
       payload: history,
@@ -1992,8 +2498,9 @@ export class StatusServer {
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "transcript_projection",
+      projectContextId: run.projectContext?.projectContextId ?? this.options.defaultProjectContextId ?? null,
       scopeKind: "run_page",
-      scopeKey: transcriptProjectionScopeKey(run, page),
+      scopeKey: transcriptProjectionScopeKey(run, page, this.options.defaultProjectContextId),
       payload: transcript,
       sourceRevisions: statusServerTranscriptProjectionSourceRevisions(this.options.runStore, run, page),
       sourceCursors: transcriptProjectionSourceCursors(run, page),
@@ -2014,6 +2521,7 @@ export class StatusServer {
   ): ProjectionPayloadWriteInput {
     return {
       projectionName: "orchestrator_chat_projection",
+      projectContextId: firstChatMetadataString(chat.chat, "projectContextId") ?? this.options.defaultProjectContextId ?? null,
       scopeKind: "conversation",
       scopeKey: orchestratorChatProjectionScopeKey(chat.conversation.id),
       payload: chat,
@@ -2062,8 +2570,8 @@ export class StatusServer {
     try {
       const detail = await this.fetchBoardIssueDetail(issueId, forceRefresh);
       const issueActivityKey =
-        detail.issueDetails.issue.identifier ??
         detail.issueDetails.issue.id ??
+        detail.issueDetails.issue.identifier ??
         detail.boardCard?.issueIdentifier ??
         detail.boardCard?.issueId ??
         issueId;
@@ -2077,6 +2585,7 @@ export class StatusServer {
         writebackOutbox: this.options.writebackOutbox,
         query: { issue: issueActivityKey, offset: 0, limit: 50 },
         includeTranscriptEvents: false,
+        defaultProjectContextId: this.options.defaultProjectContextId,
       });
       const transcript =
         options.includeTranscript === true && this.options.runStore && latestRunId
@@ -2100,27 +2609,53 @@ export class StatusServer {
     const issue = durableWebIssueFromIssueBoard(board, issueId);
     if (!issue) return null;
 
-    const issueActivityKey = issue.id || issueId;
-    const issueRuns = this.options.runStore
-      ? (await this.options.runStore.listRuns()).filter((run) => activityRunMatchesIssue(run, issueActivityKey))
-      : [];
+    const snapshot = this.options.orchestrator.snapshot();
+    const fallbackIssueActivityKey = issue.id || issueId;
+    const resolvedIssue = await resolveIssueAliasData({
+      requestKey: issueId,
+      snapshot,
+      runStore: this.options.runStore,
+      lifecycleStore: this.options.lifecycleStore,
+      defaultProjectContextId: this.options.defaultProjectContextId,
+    });
+    const issueActivityKey =
+      resolvedIssue.status === "resolved"
+        ? resolvedIssue.lifecycle?.issueId ??
+          resolvedIssue.latestRun?.issueId ??
+          resolvedIssue.workspace?.issueId ??
+          resolvedIssue.live?.issueId ??
+          fallbackIssueActivityKey
+        : fallbackIssueActivityKey;
+    const issueRuns =
+      resolvedIssue.status === "resolved"
+        ? resolvedIssue.runs
+        : this.options.runStore
+          ? (await this.options.runStore.listRuns()).filter((run) => activityRunMatchesIssue(run, issueActivityKey))
+          : [];
     const detailRuns = selectLatestChronologicalRuns(issueRuns, WEB_ISSUE_DETAIL_RUN_LIMIT);
-    const latestRun = detailRuns.at(-1) ?? null;
+    const latestRun = resolvedIssue.status === "resolved" ? resolvedIssue.latestRun ?? detailRuns.at(-1) ?? null : detailRuns.at(-1) ?? null;
     const activity = await buildActivityFeed({
       generatedAt: record.generatedAt || record.revision.generatedAt,
       runStore: this.options.runStore,
       runs: detailRuns,
       lifecycleStore: this.options.lifecycleStore,
+      ...(resolvedIssue.status === "resolved" && resolvedIssue.lifecycle ? { lifecycleRecords: [resolvedIssue.lifecycle] } : {}),
       writebackOutbox: this.options.writebackOutbox,
       query: { issue: issueActivityKey, offset: 0, limit: 50 },
       includeTranscriptEvents: false,
+      defaultProjectContextId: this.options.defaultProjectContextId,
     });
     const transcript =
       options.includeTranscript === true && this.options.runStore && latestRun
         ? await readBoundedWebTranscript(this.options.runStore, latestRun.runId, options.transcriptUrl)
         : [];
+    const workspace =
+      resolvedIssue.status === "resolved"
+        ? selectIssueDetailWorkspaceSource([resolvedIssue.workspace], resolvedIssue.live?.runPhase ?? null)
+        : null;
     return {
       issue: cloneJson(issue),
+      workspace: projectWorkspaceModel(workspace, { issue, latestRun }),
       activity: projectActivityModels(activity),
       runs: detailRuns.map(projectSessionModel),
       transcript: projectTranscriptMessages(transcript, { run: latestRun, includeRunPrelude: transcript.length > 0 }),
@@ -2495,7 +3030,7 @@ export class StatusServer {
       snapshot,
     );
     const issues = projectWebIssueBoard(board);
-    const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot });
+    const history = projectWebHistory(activitySources.runs, historyActivity.activity, { runtime: snapshot, activityRuns: activitySources.runs });
     const chat = projectWebOrchestratorChat(await this.fetchWebOrchestratorChatMessages());
     const sidebar = projectWebSidebar(dashboard, issues, history, chat);
     await this.persistWebSidebarProjection(sidebar, {
@@ -2533,7 +3068,7 @@ export class StatusServer {
       query: { issue: null, offset: 0, limit: limits.timelineLimit },
       includeTranscriptEvents: false,
     });
-    const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot });
+    const history = projectWebHistory(runs, activityFeed.activity, { runtime: snapshot, activityRuns });
     await this.persistWebHistoryProjection(history, {
       sourceIndex,
       limits,
@@ -2648,6 +3183,12 @@ export class StatusServer {
   private async isDurableProjectionRecordCurrent(record: ProjectionPayloadRecord): Promise<boolean> {
     const orchestratorChatRecordCurrent = await this.isDurableOrchestratorChatProjectionRecordCurrent(record);
     if (orchestratorChatRecordCurrent !== null) return orchestratorChatRecordCurrent;
+    if (record.revision.projectionName === "history_projection" && !isWebHistoryProjectionPayloadCurrent(record.payload)) {
+      return false;
+    }
+    if (record.revision.projectionName === "sidebar_projection" && !isWebSidebarProjectionPayloadCurrent(record.payload)) {
+      return false;
+    }
 
     const currentRevisions = projectionCurrentSourceRevisionsForRead(
       record.revision.projectionName,
@@ -2727,8 +3268,74 @@ export class StatusServer {
     });
   }
 
+  private resolveBoardIssueLookup(issueId: string, sourceIndex: BuiltWebProjectionSourceIndex): IssueLookupResult {
+    const lookupCandidates = dedupeIssueLookupCandidates([
+      ...(sourceIndex.trackerIssues.error ? [] : sourceIndex.trackerIssues.issues.map(issueLookupCandidateFromIssue)),
+      ...sourceIndex.runtime.snapshot.running.map(issueLookupCandidateFromRunningRow),
+      ...sourceIndex.lifecycles.records.map(issueLookupCandidateFromLifecycle),
+      ...sourceIndex.workspaces.workspaces.map(issueLookupCandidateFromWorkspace),
+      ...sourceIndex.runs.runs.map(issueLookupCandidateFromRun),
+    ].filter((candidate): candidate is IssueLookupCandidate => candidate !== null));
+    const direct = resolveIssueLookupFromCandidates(issueId, lookupCandidates);
+    if (direct.issueId !== null || direct.ambiguousCandidates.length > 0) return direct;
+
+    const parsedIssueAlias = parseContextualAlias(issueId);
+    if (parsedIssueAlias.projectContextId === null) return direct;
+
+    const resolution = resolveContextualAliasMatches({
+      requestKey: issueId,
+      candidates: buildIssueAliasCandidates({
+        snapshot: sourceIndex.runtime.snapshot,
+        trackerIssues: sourceIndex.trackerIssues.error ? [] : sourceIndex.trackerIssues.issues,
+        runs: sourceIndex.runs.runs,
+        workspaces: sourceIndex.workspaces.workspaces,
+        lifecycles: sourceIndex.lifecycles.records,
+      }),
+      aliasValues: issueAliasValuesForCandidate,
+      projectContextId: issueAliasCandidateProjectContextId,
+      defaultProjectContextId: this.options.defaultProjectContextId,
+    });
+    if (resolution.status !== "resolved" || resolution.matches.length === 0) return direct;
+
+    const contextualCandidates = dedupeIssueLookupCandidates(
+      resolution.matches
+        .map(issueLookupCandidateFromAliasCandidate)
+        .filter((candidate): candidate is IssueLookupCandidate => candidate !== null),
+    );
+    if (contextualCandidates.length === 1) {
+      return {
+        issueId: contextualCandidates[0]?.issueId ?? null,
+        ambiguousCandidates: [],
+        resolutionKind: "contextual_alias",
+        refreshTrackerCache: resolution.matches.some((candidate) => candidate.kind === "tracker"),
+      };
+    }
+
+    return {
+      issueId: null,
+      ambiguousCandidates: contextualCandidates.length > 1 ? contextualCandidates : [],
+      resolutionKind: "unresolved",
+    };
+  }
+
   private async fetchBoardIssueDetail(issueId: string, forceRefresh: boolean) {
-    const { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
+    let { sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(forceRefresh);
+    let lookup = this.resolveBoardIssueLookup(issueId, sourceIndex);
+    const refreshTrackerLookup =
+      Boolean(this.options.tracker) && sourceIndex.trackerIssues.cached && (lookup.resolutionKind === "issue_identifier" || lookup.refreshTrackerCache === true);
+    if (refreshTrackerLookup) {
+      ({ sourceIndex, issueBoardColumns } = await this.fetchWebProjectionSourceIndex(true));
+      lookup = this.resolveBoardIssueLookup(issueId, sourceIndex);
+    }
+    if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issueId, lookup.ambiguousCandidates);
+    if (
+      this.options.tracker &&
+      sourceIndex.trackerIssues.error &&
+      (lookup.resolutionKind === "issue_identifier" || lookup.refreshTrackerCache === true || refreshTrackerLookup)
+    ) {
+      throw trackerFailureFromSourceIndex(sourceIndex);
+    }
+    const lookupIssueId = lookup.issueId ?? issueId;
     let board: IssueBoardResponse | null = null;
     let trackerFailure: SymphonyError | null = null;
     if (sourceIndex.trackerIssues.error) {
@@ -2745,9 +3352,9 @@ export class StatusServer {
       });
     }
 
-    const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), [issueId])) ?? null;
+    const card = board?.issues.find((item) => hasBoardKey(new Set(boardCardKeys(item)), [lookupIssueId])) ?? null;
     const detail = await buildBoardIssueDetail({
-      requestKey: issueId,
+      requestKey: lookupIssueId,
       card,
       sourceIndex,
       mutationsConfigured: Boolean(this.options.openWorkspaceToken),
@@ -2846,6 +3453,7 @@ export class StatusServer {
     const sourceIndex = await buildWebProjectionSourceIndex({
       snapshot: input.snapshot,
       issueBoardColumns: input.issueBoardColumns,
+      defaultProjectContextId: this.options.defaultProjectContextId,
       ...(this.options.tracker
         ? { fetchTrackerProjection: ({ columns, forceRefresh }) => this.fetchIssueBoardTrackerProjection(columns, forceRefresh, input.clock) }
         : {}),
@@ -2863,8 +3471,57 @@ export class StatusServer {
     return this.options.issueBoardColumns ?? defaultWebProjectionIssueBoardColumns(this.options.trackerStateLists);
   }
 
+  private async resolveRouteIssueLookup(
+    issueKey: string,
+    snapshot: RuntimeSnapshot = this.options.orchestrator.snapshot(),
+  ): Promise<IssueLookupResult> {
+    const resolveLookup = async (trackerIssues: readonly Issue[]): Promise<IssueLookupResult> =>
+      resolveIssueLookupKey(issueKey, {
+        snapshot,
+        lifecycleStore: this.options.lifecycleStore,
+        runStore: this.options.runStore,
+        trackerIssues,
+      });
+
+    const initialTrackerLookup = await this.loadTrackerIssuesForRouteLookup();
+    let lookup = await resolveLookup(initialTrackerLookup.trackerIssues);
+    if (lookup.resolutionKind === "issue_identifier") {
+      if (initialTrackerLookup.trackerFailure) {
+        throw initialTrackerLookup.trackerFailure;
+      }
+      if (initialTrackerLookup.trackerCached) {
+        const refreshedTrackerLookup = await this.loadTrackerIssuesForRouteLookup(true);
+        lookup = await resolveLookup(refreshedTrackerLookup.trackerIssues);
+        if (refreshedTrackerLookup.trackerFailure) {
+          throw refreshedTrackerLookup.trackerFailure;
+        }
+      }
+    }
+    return lookup;
+  }
+
+  private async loadTrackerIssuesForRouteLookup(forceRefresh = false): Promise<{
+    trackerIssues: readonly Issue[];
+    trackerFailure: SymphonyError | null;
+    trackerCached: boolean;
+  }> {
+    if (!this.options.tracker) return { trackerIssues: [], trackerFailure: null, trackerCached: false };
+    try {
+      const projection = await this.fetchIssueBoardTrackerProjection(
+        this.resolveWebProjectionIssueBoardColumns(),
+        forceRefresh,
+      );
+      return { trackerIssues: projection.trackerIssues, trackerFailure: null, trackerCached: projection.cached };
+    } catch (error) {
+      if (error instanceof SymphonyError && (error.code === "tracker_error" || error.code === "tracker_unavailable")) {
+        return { trackerIssues: [], trackerFailure: error, trackerCached: false };
+      }
+      throw error;
+    }
+  }
+
   private async createWebProjectionContextFingerprint(
-    snapshot: ReturnType<Orchestrator["snapshot"]>,
+    snapshot: RuntimeSnapshot,
     issueBoardColumns: IssueBoardColumnMapping,
   ): Promise<WebProjectionCacheFingerprint> {
     const fetchedStates = webProjectionIssueBoardFetchStates(issueBoardColumns);
@@ -2874,6 +3531,7 @@ export class StatusServer {
     ]);
     return createWebProjectionFingerprint({
       runtimeGeneratedAt: statusServerRuntimeFingerprintKey(snapshot),
+      defaultProjectContextId: this.options.defaultProjectContextId,
       issueBoardStates: [issueBoardFetchedStateCacheKey(fetchedStates)],
       issueBoardColumns: issueBoardColumnCacheKeyValues(issueBoardColumns),
       durableSourceRevisions,
@@ -2891,9 +3549,14 @@ export class StatusServer {
     const reader = this.options.projectionReader;
     if (!reader?.readCurrentRevision) return [];
     return Promise.all(
-      statusServerWebProjectionContextDurableRevisionSelectors().map(async (selector) => {
+      statusServerWebProjectionContextDurableRevisionSelectorGroups(this.options.defaultProjectContextId).map(async (selectors) => {
+        const selector = selectors[0]!;
         try {
-          return durableProjectionRevisionFingerprint(selector, await reader.readCurrentRevision!(selector));
+          for (const candidate of selectors) {
+            const record = await reader.readCurrentRevision!(candidate);
+            if (record) return durableProjectionRevisionFingerprint(selector, record);
+          }
+          return durableProjectionRevisionFingerprint(selector, null);
         } catch {
           return durableProjectionRevisionFingerprint(selector, null, "error");
         }
@@ -3166,19 +3829,27 @@ function isStatusServerProjectionRevisionStore(store: unknown): store is StatusS
   );
 }
 
-function statusServerWebProjectionContextDurableRevisionSelectors(): readonly ProjectionRevisionSelector[] {
+function statusServerWebProjectionContextDurableRevisionSelectorGroups(
+  defaultProjectContextId: string | null | undefined,
+): readonly (readonly ProjectionRevisionSelector[])[] {
   return [
-    { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
-    { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
-    { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
-    {
-      projectionName: "history_projection",
-      scopeKind: "global_collection",
-      scopeKey: webHistoryProjectionScopeKey({
-        sessionLimit: WEB_HISTORY_DEFAULT_SESSION_LIMIT,
-        timelineLimit: WEB_HISTORY_DEFAULT_TIMELINE_LIMIT,
-      }),
-    },
+    legacyCompatibleDefaultProjectionRevisionSelectors(
+      { projectionName: "dashboard_projection", scopeKind: "global", scopeKey: "global" },
+      defaultProjectContextId,
+    ),
+    legacyCompatibleDefaultProjectionRevisionSelectors(
+      { projectionName: "issue_board_projection", scopeKind: "board", scopeKey: "default-board" },
+      defaultProjectContextId,
+    ),
+    legacyCompatibleDefaultProjectionRevisionSelectors(
+      { projectionName: "sidebar_projection", scopeKind: "global", scopeKey: "global" },
+      defaultProjectContextId,
+    ),
+    webHistoryProjectionRevisionSelectors({
+      sessionLimit: WEB_HISTORY_DEFAULT_SESSION_LIMIT,
+      timelineLimit: WEB_HISTORY_DEFAULT_TIMELINE_LIMIT,
+      defaultProjectContextId,
+    }),
   ];
 }
 
@@ -3203,7 +3874,10 @@ async function readRunActivityTranscriptPage(
   run: RunRecord,
   options: { offset: number; limit: number },
 ): Promise<TranscriptPage | null> {
-  const sourcePage = await sourceStore.readRunEvents(run.runId, options);
+  const sourcePage = await sourceStore.readRunEvents(run.runId, {
+    ...options,
+    projectContextId: run.projectContext?.projectContextId ?? null,
+  });
   if (sourcePage.total === 0) return null;
   return runActivityEventsPageToTranscriptPage(sourcePage, run);
 }
@@ -3213,11 +3887,19 @@ async function readRunActivityTranscriptTail(
   run: RunRecord,
   options: { limit: number },
 ): Promise<TranscriptPage | null> {
-  const sourceHead = await sourceStore.readRunEvents(run.runId, { offset: 0, limit: 1 });
+  const sourceHead = await sourceStore.readRunEvents(run.runId, {
+    offset: 0,
+    limit: 1,
+    projectContextId: run.projectContext?.projectContextId ?? null,
+  });
   if (sourceHead.total === 0) return null;
   const offset = Math.max(0, sourceHead.total - options.limit);
   return runActivityEventsPageToTranscriptPage(
-    await sourceStore.readRunEvents(run.runId, { offset, limit: options.limit }),
+    await sourceStore.readRunEvents(run.runId, {
+      offset,
+      limit: options.limit,
+      projectContextId: run.projectContext?.projectContextId ?? null,
+    }),
     run,
     "tail",
   );
@@ -3577,17 +4259,34 @@ function historyProjectionScopeKey(limits: { sessionLimit: number; timelineLimit
   return webHistoryProjectionScopeKey(limits);
 }
 
-function transcriptProjectionScopeKey(run: RunRecord, page: TranscriptPage): string {
-  return webTranscriptProjectionScopeKey({ runId: run.runId, offset: page.offset, limit: page.limit });
+function transcriptProjectionScopeKey(
+  run: RunRecord,
+  page: TranscriptPage,
+  defaultProjectContextId?: string | null,
+): string {
+  return webTranscriptProjectionScopeKey({
+    runId: run.runId,
+    offset: page.offset,
+    limit: page.limit,
+    projectContextId: run.projectContext?.projectContextId ?? null,
+    defaultProjectContextId,
+  });
 }
 
 function transcriptProjectionPageSelectorForRequest(
   run: RunRecord,
   requestedPage: { offset: number; limit: number } | null,
+  defaultProjectContextId?: string | null,
 ): WebTranscriptProjectionPageSelector {
   const offset = requestedPage?.offset ?? Math.max(0, (run.transcriptEventCount ?? 0) - WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT);
   const limit = requestedPage?.limit ?? WEB_TRANSCRIPT_DEFAULT_EVENT_LIMIT;
-  return { runId: run.runId, offset, limit };
+  return {
+    runId: run.runId,
+    offset,
+    limit,
+    projectContextId: run.projectContext?.projectContextId ?? null,
+    defaultProjectContextId,
+  };
 }
 
 function shouldBypassDurableWebTranscriptForActiveTail(
@@ -3608,6 +4307,7 @@ function transcriptProjectionSourceCursors(run: RunRecord, page: TranscriptPage)
     runId: run.runId,
     sessionId: run.sessionId,
     issueKey: run.issueIdentifier || run.issueId,
+    ...(run.projectContext ? { projectContext: { ...run.projectContext } } : {}),
     offset: page.offset,
     limit: page.limit,
     nextOffset: page.nextOffset,
@@ -3633,7 +4333,6 @@ function webTranscriptProjectionResponseBody(
     sourceCursors?: Record<string, unknown> | null;
   },
 ): WebTranscriptProjectionPayload {
-  if (isWebTranscriptProjectionPayload(body)) return body;
   const record = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
   const pageRecord = record?.page && typeof record.page === "object" && !Array.isArray(record.page) ? (record.page as Record<string, unknown>) : null;
   const windowRecord = record?.window && typeof record.window === "object" && !Array.isArray(record.window) ? (record.window as Record<string, unknown>) : null;
@@ -3643,6 +4342,13 @@ function webTranscriptProjectionResponseBody(
       ? (record.messages as WebTranscriptMessage[])
       : [];
   const cursor = input.sourceCursors ?? {};
+  const sourceProjectContext =
+    isRecordObject(record?.source) && Object.prototype.hasOwnProperty.call(record.source, "projectContext")
+      ? projectWebTranscriptProjectContext(record.source.projectContext)
+      : null;
+  const resolvedProjectContext =
+    projectRunProjectContext(input.run) ?? sourceProjectContext ?? projectWebTranscriptProjectContext(cursor.projectContext);
+  const projectedMessages = applyWebTranscriptProjectContextAttribution(messages, resolvedProjectContext);
   const offset = optionalNumber(pageRecord?.offset) ?? optionalNumber(cursor.offset) ?? input.requestedPage?.offset ?? 0;
   const limit = optionalNumber(pageRecord?.limit) ?? optionalNumber(cursor.limit) ?? input.limit;
   const nextOffset = optionalNumber(pageRecord?.nextOffset) ?? optionalNumber(cursor.nextOffset);
@@ -3663,7 +4369,7 @@ function webTranscriptProjectionResponseBody(
     nextOffset,
     events: [],
     total: optionalNumber(pageRecord?.total) ?? optionalNumber(cursor.total),
-    eventCount: optionalNumber(pageRecord?.size) ?? optionalNumber(cursor.eventCount) ?? messages.length,
+    eventCount: optionalNumber(pageRecord?.size) ?? optionalNumber(cursor.eventCount) ?? projectedMessages.length,
     previousOffset,
     hasNext: optionalBoolean(pageRecord?.hasNext) ?? optionalBoolean(cursor.hasNext) ?? nextOffset !== null,
     hasPrevious: optionalBoolean(pageRecord?.hasPrevious) ?? optionalBoolean(cursor.hasPrevious) ?? previousOffset !== null,
@@ -3672,12 +4378,87 @@ function webTranscriptProjectionResponseBody(
     lastSequence: optionalNumber(pageRecord?.lastSequence) ?? optionalNumber(cursor.lastSequence),
     lastEventAt: optionalString(pageRecord?.lastEventAt) ?? optionalString(cursor.lastEventAt),
   };
-  return projectWebTranscriptWindow(page, messages, {
+  let projection = projectWebTranscriptWindow(page, projectedMessages, {
     run: input.run,
     requestedPage: input.requestedPage,
     tailLimit: limit,
     kind,
+    sourceIdentity: transcriptSourceIdentityFallback(cursor),
   });
+  if (projection.source.projectContext === null && resolvedProjectContext !== null) {
+    projection = {
+      ...projection,
+      source: {
+        ...projection.source,
+        projectContext: resolvedProjectContext,
+      },
+    };
+  }
+  if (isWebTranscriptProjectionPayload(body)) {
+    return {
+      ...body,
+      messages: projectedMessages,
+      source: mergeWebTranscriptSourceRecord(body.source, projection.source),
+    };
+  }
+  if (isBackfillableWebTranscriptProjectionEnvelope(record)) {
+    return {
+      ...projection,
+      ...record,
+      messages: projectedMessages,
+      source: projection.source,
+    };
+  }
+  return projection;
+}
+
+function isBackfillableWebTranscriptProjectionEnvelope(
+  value: Record<string, unknown> | null,
+): value is Omit<WebTranscriptProjectionPayload, "source"> & { source?: unknown } {
+  if (!value) return false;
+  return (
+    value.schemaVersion === 1 &&
+    Array.isArray(value.messages) &&
+    isRecordObject(value.page) &&
+    isRecordObject(value.window) &&
+    isRecordObject(value.activeTail) &&
+    isRecordObject(value.recovery) &&
+    !isWebTranscriptSourceRecordLike(value.source) &&
+    isRecordObject(value.compatibility)
+  );
+}
+
+function isWebTranscriptSourceRecordLike(value: unknown): value is WebTranscriptProjectionPayload["source"] {
+  return isRecordObject(value) && typeof value.runId === "string" && value.runId.length > 0 && isRecordObject(value.cursors);
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function transcriptSourceIdentityFallback(
+  sourceCursors: Record<string, unknown> | null | undefined,
+): { sessionId?: string | null; issueIdentifier?: string | null } | null {
+  if (!sourceCursors) return null;
+  const sessionId = optionalString(sourceCursors.sessionId);
+  const issueIdentifier = optionalString(sourceCursors.issueKey);
+  if (!sessionId && !issueIdentifier) return null;
+  return { sessionId, issueIdentifier };
+}
+
+function mergeWebTranscriptSourceRecord(
+  source: WebTranscriptProjectionPayload["source"],
+  fallback: WebTranscriptProjectionPayload["source"],
+): WebTranscriptProjectionPayload["source"] {
+  return {
+    runId: optionalString(source.runId) ?? fallback.runId,
+    sessionId: optionalString(source.sessionId) ?? fallback.sessionId,
+    issueId: optionalString(source.issueId) ?? fallback.issueId,
+    issueIdentifier: optionalString(source.issueIdentifier) ?? fallback.issueIdentifier,
+    projectContext: isRecordObject(source.projectContext) ? source.projectContext : fallback.projectContext,
+    workspace: isRecordObject(source.workspace) ? source.workspace : fallback.workspace,
+    cursors: isRecordObject(source.cursors) ? source.cursors : fallback.cursors,
+  };
 }
 
 function optionalNumber(value: unknown): number | null {
@@ -4750,6 +5531,7 @@ function approvalCapability(
     requestId: record?.requestId ?? null,
     status: record?.status ?? null,
     action: record?.action ?? null,
+    projectContext: record?.projectContext ?? null,
     requestedAt: record?.requestedAt ?? null,
     resolve: record === null ? null : approvalResolve(record),
     requiresToken: approvalMutationsRequireToken(enabled, openWorkspaceToken),
@@ -4892,6 +5674,7 @@ interface IssueBoardTrackerCache {
 
 interface ActivityQuery {
   issue: string | null;
+  projectContextId?: string | null;
   offset: number;
   limit: number;
 }
@@ -4901,6 +5684,7 @@ interface ActivityItem {
   at: string;
   kind: "run_started" | "run_completed" | "transcript_event" | "writeback_operation";
   source: "run" | TranscriptEvent["source"] | "writeback";
+  projectContext?: ProjectContextResolution | null;
   issue: {
     id: string;
     identifier: string;
@@ -5090,7 +5874,7 @@ async function buildBoardIssueDetail(input: {
   continuationSummaryAvailable: boolean;
 }) {
   const snapshot = input.sourceIndex.runtime.snapshot;
-  const keys = input.card ? boardCardKeys(input.card) : [input.requestKey];
+  const keys = input.card?.issueId ? [input.card.issueId] : input.card ? boardCardKeys(input.card) : [input.requestKey];
   const live = liveIssueByKeys(input.sourceIndex, keys);
   const workspace = workspaceByKeys(input.sourceIndex, keys);
   const latestRun = latestRunByKeys(input.sourceIndex, keys);
@@ -5098,7 +5882,7 @@ async function buildBoardIssueDetail(input: {
   const lifecycle = sanitizeStatusLifecycle({ live, workspace, latestRun, lifecycle: rawLifecycle });
   if (!input.card && !live && !workspace && !latestRun && !lifecycle) return null;
 
-  const issueKey = input.card?.issueIdentifier ?? input.card?.issueId ?? input.requestKey;
+  const issueKey = input.card?.issueId ?? input.card?.issueIdentifier ?? input.requestKey;
   const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, input.runStore, input.sourceIndex.runs);
   const runs = runsByKeys(input.sourceIndex, keys);
   const enrichedRuns = await Promise.all(
@@ -5111,7 +5895,7 @@ async function buildBoardIssueDetail(input: {
   const issueDetails =
     input.card?.issueDetails ??
     buildIssueDetailsEnvelope({
-      requestKey: input.requestKey,
+      requestKey: issueKey,
       generatedAt: snapshot.generatedAt,
       trackerStateLists: input.trackerStateLists,
       staleThresholdMs: input.staleThresholdMs,
@@ -5142,7 +5926,7 @@ async function buildBoardIssueDetail(input: {
   const workspacePath = live?.workspacePath ?? workspace?.path ?? null;
   const metadata = statusMetadata({ live, workspace, latestRun, lifecycle });
   return {
-    issue: input.requestKey,
+    issue: issueKey,
     boardCard: input.card ? acceptedBoardCard(input.card) : null,
     issueDetails,
     live: live ? liveIssueResponse(live, operatorLiveness) : null,
@@ -5239,12 +6023,25 @@ async function buildActivityFeed(input: {
   writebackOperations?: readonly WritebackOperation[];
   query: ActivityQuery;
   includeTranscriptEvents?: boolean;
+  defaultProjectContextId?: string | null | undefined;
 }) {
   const allRuns = input.runs ?? (input.runStore ? await input.runStore.listRuns() : []);
   const includeTranscriptEvents = input.includeTranscriptEvents ?? true;
   const lifecycleRecords = input.lifecycleRecords ?? (await input.lifecycleStore?.list()) ?? [];
-  const issueFilter = input.query.issue;
-  const runs = issueFilter ? allRuns.filter((run) => activityRunMatchesIssue(run, issueFilter)) : allRuns;
+  const requestedProjectContextId = input.query.projectContextId ?? null;
+  const scopedRuns = requestedProjectContextId
+    ? allRuns.filter((run) => matchesActivityProjectContext(run.projectContext, requestedProjectContextId, input.defaultProjectContextId))
+    : allRuns;
+  const scopedLifecycleRecords = requestedProjectContextId
+    ? lifecycleRecords.filter((lifecycle) =>
+        matchesActivityProjectContext(lifecycle.projectContext, requestedProjectContextId, input.defaultProjectContextId),
+      )
+    : lifecycleRecords;
+  const requestedIssueFilter = input.query.issue;
+  const resolvedIssueFilter = requestedIssueFilter
+    ? resolveActivityIssueFilter(requestedIssueFilter, scopedRuns, scopedLifecycleRecords, input.defaultProjectContextId)
+    : null;
+  const runs = resolvedIssueFilter ? scopedRuns.filter((run) => activityRunMatchesIssue(run, resolvedIssueFilter)) : scopedRuns;
   const activity: ActivityItem[] = [];
   let transcriptEventsConsidered = 0;
   let transcriptEventsTotal = 0;
@@ -5275,11 +6072,34 @@ async function buildActivityFeed(input: {
   }
 
   const writebackOperations = input.writebackOperations ?? (await input.writebackOutbox?.list()) ?? [];
-  const filteredWritebackOperations = issueFilter
-    ? writebackOperations.filter((operation) => writebackOperationMatchesIssue(operation, issueFilter, allRuns, lifecycleRecords))
+  const projectScopedWritebackOperations = requestedProjectContextId
+    ? writebackOperations.filter((operation) =>
+        writebackOperationMatchesProjectContext(
+          operation,
+          requestedProjectContextId,
+          allRuns,
+          lifecycleRecords,
+          input.defaultProjectContextId,
+        ),
+      )
     : writebackOperations;
+  const filteredWritebackOperations = resolvedIssueFilter
+    ? projectScopedWritebackOperations.filter((operation) =>
+        writebackOperationMatchesIssue(
+          operation,
+          resolvedIssueFilter,
+          allRuns,
+          lifecycleRecords,
+          input.defaultProjectContextId,
+        ),
+      )
+    : projectScopedWritebackOperations;
   writebackOperationsConsidered = filteredWritebackOperations.length;
-  activity.push(...filteredWritebackOperations.map((operation) => activityItemForWritebackOperation(operation, allRuns, lifecycleRecords)));
+  activity.push(
+    ...filteredWritebackOperations.map((operation) =>
+      activityItemForWritebackOperation(operation, allRuns, lifecycleRecords, input.defaultProjectContextId),
+    ),
+  );
 
   activity.sort(compareActivityItems);
   const page = activity.slice(input.query.offset, input.query.offset + input.query.limit);
@@ -5308,6 +6128,7 @@ async function buildActivityFeed(input: {
     },
     filter: {
       issue: input.query.issue,
+      projectContextId: requestedProjectContextId,
     },
   };
 }
@@ -5328,6 +6149,7 @@ function activityItemForRun(run: RunRecord, kind: Extract<ActivityItem["kind"], 
     at,
     kind,
     source: "run",
+    projectContext: activityProjectContext(run.projectContext),
     issue: activityIssue(run),
     run: activityRun(run),
     transcript: null,
@@ -5342,6 +6164,7 @@ function activityItemForTranscriptEvent(run: RunRecord, event: TranscriptEvent):
     at: event.at,
     kind: "transcript_event",
     source: event.source,
+    projectContext: activityProjectContext(run.projectContext),
     issue: activityIssue(run),
     run: activityRun(run),
     transcript: {
@@ -5358,18 +6181,20 @@ function activityItemForWritebackOperation(
   operation: WritebackOperation,
   runs: readonly RunRecord[],
   lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
 ): ActivityItem {
   const run = operation.runId ? (runs.find((candidate) => candidate.runId === operation.runId) ?? null) : null;
-  const lifecycle =
-    lifecycles.find((candidate) => candidate.issueId === operation.issueId || candidate.issueIdentifier === operation.issueId) ?? null;
+  const lifecycle = writebackOperationLifecycle(operation, lifecycles, defaultProjectContextId);
+  const issueId = run?.issueId ?? lifecycle?.issueId ?? operation.issueId;
   const issueIdentifier = run?.issueIdentifier ?? lifecycle?.issueIdentifier ?? operation.issueId;
   return {
-    id: `writeback:${operation.idempotencyKey}`,
+    id: writebackActivityId(operation),
     at: operation.updatedAt,
     kind: "writeback_operation",
     source: "writeback",
+    projectContext: activityProjectContext(run?.projectContext ?? lifecycle?.projectContext ?? operation.projectContext),
     issue: {
-      id: operation.issueId,
+      id: issueId,
       identifier: issueIdentifier,
     },
     run: run ? activityRun(run) : null,
@@ -5404,6 +6229,20 @@ function activityItemForWritebackOperation(
       transcript: null,
     },
   };
+}
+
+function writebackActivityId(operation: WritebackOperation): string {
+  const projectContextId = normalizeProjectContextResolution(operation.projectContext).projectContextId;
+  return `writeback:${projectContextId}:${operation.idempotencyKey}`;
+}
+
+function activityProjectContext(projectContext: Partial<ProjectContextResolution> | null | undefined): ProjectContextResolution {
+  return normalizeProjectContextResolution(projectContext);
+}
+
+function isWebSidebarProjectionPayloadCurrent(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return isWebHistorySessionListCurrent((value as { sessions?: unknown }).sessions);
 }
 
 function writebackSkipReason(operation: WritebackOperation): WritebackSkipReason | null {
@@ -5590,13 +6429,13 @@ async function buildSymphonyOnlyBoardCards(input: {
   };
 
   for (const live of snapshot.running) {
-    await maybeAdd(live.issueIdentifier, live);
+    await maybeAdd(live.issueId, live);
   }
   for (const pausedKey of snapshot.paused) {
     await maybeAdd(pausedKey);
   }
   for (const lifecycle of input.sourceIndex.lifecycles.records) {
-    if (isLifecycleBlocked(lifecycle)) await maybeAdd(lifecycle.issueIdentifier);
+    if (isLifecycleBlocked(lifecycle)) await maybeAdd(lifecycle.issueId);
   }
   return cards;
 }
@@ -5780,6 +6619,774 @@ function compareRunRecencyDesc(left: RunRecord, right: RunRecord): number {
   return compareIsoDesc(left.updatedAt, right.updatedAt) || compareIsoDesc(left.startedAt, right.startedAt) || compareString(right.runId, left.runId);
 }
 
+type AliasResolutionStatus = "resolved" | "none" | "ambiguous" | "wrong_context";
+
+interface ParsedContextualAlias {
+  alias: string;
+  projectContextId: string | null;
+}
+
+interface AliasResolutionResult<T> {
+  status: AliasResolutionStatus;
+  matches: T[];
+  parsed: ParsedContextualAlias;
+}
+
+type IssueAliasCandidate =
+  | { kind: "tracker"; record: Issue }
+  | { kind: "live"; record: RunningRow }
+  | { kind: "workspace"; record: WorkspaceRecord }
+  | { kind: "run"; record: RunRecord }
+  | { kind: "lifecycle"; record: IssueLifecycleRecord };
+
+interface ResolvedIssueAliasData {
+  status: AliasResolutionStatus;
+  requestKey: string;
+  live: RunningRow | null;
+  workspace: WorkspaceRecord | null;
+  latestRun: RunRecord | null;
+  runs: RunRecord[];
+  lifecycle: IssueLifecycleRecord | null;
+}
+
+interface ResolvedIssueActionTarget {
+  lookupKey: string;
+  requestAlias: string;
+  projectContext: ProjectContextResolution | undefined;
+  live: RunningRow | null;
+  workspace: WorkspaceRecord | null;
+  latestRun: RunRecord | null;
+  lifecycle: IssueLifecycleRecord | null;
+}
+
+interface TranscriptRunResolution {
+  status: AliasResolutionStatus;
+  run: RunRecord | null;
+}
+
+interface ApprovalRouteResolution {
+  status: AliasResolutionStatus;
+  approval: OperatorApprovalRecord | null;
+}
+
+function parseContextualAlias(requestKey: string): ParsedContextualAlias {
+  const trimmed = requestKey.trim();
+  if (trimmed.length === 0) return { alias: "", projectContextId: null };
+  const separatorIndex = trimmed.indexOf(":");
+  if (separatorIndex <= 0 || separatorIndex >= trimmed.length - 1) {
+    return { alias: trimmed, projectContextId: null };
+  }
+
+  try {
+    return {
+      alias: trimmed.slice(separatorIndex + 1).trim(),
+      projectContextId: normalizeProjectContextId(trimmed.slice(0, separatorIndex)),
+    };
+  } catch {
+    return { alias: trimmed, projectContextId: null };
+  }
+}
+
+function projectContextResolutionFromParsedAlias(parsed: ParsedContextualAlias): ProjectContextResolution | undefined {
+  if (!parsed.projectContextId) return undefined;
+  return {
+    projectContextId: parsed.projectContextId,
+    projectContextLabel: parsed.projectContextId,
+    linearProjectSlug: null,
+    routingSource: "explicit",
+  };
+}
+
+function workspaceIssueInputFromLookupKey(lookupKey: string): WorkspaceIssueInput {
+  const parsed = parseContextualAlias(lookupKey);
+  const projectContext = projectContextResolutionFromParsedAlias(parsed);
+  return {
+    id: null,
+    identifier: parsed.alias || lookupKey.trim(),
+    branchName: null,
+    ...(projectContext === undefined ? {} : { projectContext }),
+  };
+}
+
+function workspacePathForLookupKey(lookupKey: string, workspaceManager: WorkspaceManager): string {
+  return workspaceManager.getPathForIssue(workspaceIssueInputFromLookupKey(lookupKey));
+}
+
+function resolvedIssueActionProjectContext(
+  input: Pick<ResolvedIssueAliasData, "live" | "workspace" | "latestRun" | "lifecycle">,
+): ProjectContextResolution | undefined {
+  return input.lifecycle?.projectContext ?? input.workspace?.projectContext ?? projectContextResolutionFromIssue(input.live) ?? input.latestRun?.projectContext;
+}
+
+function contextualWorkspaceLookupKey(
+  issueIdentifier: string,
+  projectContext: ProjectContextResolution | undefined,
+  defaultProjectContextId: string | null | undefined,
+): string {
+  const normalizedIssueIdentifier = issueIdentifier.trim();
+  if (normalizedIssueIdentifier.length === 0) return normalizedIssueIdentifier;
+  const projectContextId = normalizeOptionalProjectContextId(projectContext?.projectContextId);
+  if (!projectContextId) return normalizedIssueIdentifier;
+  if (compatibilityDefaultProjectContextIds(defaultProjectContextId).has(projectContextId)) {
+    return normalizedIssueIdentifier;
+  }
+  return `${projectContextId}:${normalizedIssueIdentifier}`;
+}
+
+function resolvedWorkspaceActionLookupKey(
+  target: ResolvedIssueActionTarget,
+  defaultProjectContextId: string | null | undefined,
+): string {
+  const persistedWorkspaceKey =
+    target.workspace?.workspaceKey ?? target.latestRun?.workspaceKey ?? target.lifecycle?.summaryPointers.workspaceKey;
+  if (typeof persistedWorkspaceKey === "string" && persistedWorkspaceKey.trim().length > 0) {
+    return persistedWorkspaceKey;
+  }
+
+  const canonicalIssueIdentifier =
+    target.workspace?.issueIdentifier ??
+    target.latestRun?.issueIdentifier ??
+    target.lifecycle?.issueIdentifier ??
+    target.live?.issueIdentifier ??
+    target.requestAlias ??
+    target.lookupKey;
+  return contextualWorkspaceLookupKey(canonicalIssueIdentifier, target.projectContext, defaultProjectContextId);
+}
+
+function normalizeOptionalProjectContextId(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  try {
+    return normalizeProjectContextId(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function resolvedDefaultProjectContextId(defaultProjectContextId: string | null | undefined): string {
+  return normalizeOptionalProjectContextId(defaultProjectContextId) ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+}
+
+function compatibilityDefaultProjectContextIds(defaultProjectContextId: string | null | undefined): ReadonlySet<string> {
+  const defaultContextId = resolvedDefaultProjectContextId(defaultProjectContextId);
+  return defaultContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID
+    ? new Set([LEGACY_DEFAULT_PROJECT_CONTEXT_ID])
+    : new Set([LEGACY_DEFAULT_PROJECT_CONTEXT_ID, defaultContextId]);
+}
+
+function projectContextIdForAliasMatching(record: unknown): string {
+  return projectContextResolutionFromIssue(record)?.projectContextId ?? LEGACY_DEFAULT_PROJECT_CONTEXT_ID;
+}
+
+function projectContextGroupId(projectContextId: string, defaultProjectContextId: string | null | undefined): string {
+  const defaultContextId = resolvedDefaultProjectContextId(defaultProjectContextId);
+  return compatibilityDefaultProjectContextIds(defaultContextId).has(projectContextId) ? defaultContextId : projectContextId;
+}
+
+function resolveContextualAliasMatches<T>(input: {
+  requestKey: string;
+  candidates: readonly T[];
+  aliasValues: (candidate: T) => readonly string[];
+  projectContextId: (candidate: T) => string;
+  defaultProjectContextId: string | null | undefined;
+}): AliasResolutionResult<T> {
+  const parsed = parseContextualAlias(input.requestKey);
+  if (parsed.alias.length === 0) {
+    return { status: "none", matches: [], parsed };
+  }
+
+  const defaultContextId = resolvedDefaultProjectContextId(input.defaultProjectContextId);
+  const compatibilityIds = compatibilityDefaultProjectContextIds(defaultContextId);
+  const rawMatches = input.candidates.filter((candidate) => input.aliasValues(candidate).some((alias) => alias === parsed.alias));
+  if (rawMatches.length === 0) {
+    return { status: "none", matches: [], parsed };
+  }
+
+  const groupedMatches = new Map<string, T[]>();
+  for (const candidate of rawMatches) {
+    const candidateContextId = input.projectContextId(candidate);
+    const groupId = compatibilityIds.has(candidateContextId) ? defaultContextId : candidateContextId;
+    const existing = groupedMatches.get(groupId) ?? [];
+    existing.push(candidate);
+    groupedMatches.set(groupId, existing);
+  }
+
+  if (parsed.projectContextId !== null) {
+    const requestedGroupId = compatibilityIds.has(parsed.projectContextId) ? defaultContextId : parsed.projectContextId;
+    const matches = groupedMatches.get(requestedGroupId) ?? [];
+    return { status: matches.length > 0 ? "resolved" : "none", matches, parsed };
+  }
+
+  if (groupedMatches.size === 1 && groupedMatches.has(defaultContextId)) {
+    return { status: "resolved", matches: groupedMatches.get(defaultContextId) ?? [], parsed };
+  }
+  if (groupedMatches.size === 1) {
+    return { status: "wrong_context", matches: [], parsed };
+  }
+  return { status: "ambiguous", matches: [], parsed };
+}
+
+function issueAliasValuesForTracker(issue: Issue): string[] {
+  return webProjectionIssueKeyAliases({ issueId: issue.id, issueIdentifier: issue.identifier });
+}
+
+function issueAliasValuesForLive(live: RunningRow): string[] {
+  return webProjectionIssueKeyAliases({ issueId: live.issueId, issueIdentifier: live.issueIdentifier });
+}
+
+function issueAliasValuesForWorkspace(workspace: WorkspaceRecord): string[] {
+  return webProjectionIssueKeyAliases({
+    issueId: workspace.issueId,
+    issueIdentifier: workspace.issueIdentifier,
+    workspaceKey: workspace.workspaceKey,
+  });
+}
+
+function issueAliasValuesForRun(run: RunRecord): string[] {
+  return webProjectionIssueKeyAliases({
+    issueId: run.issueId,
+    issueIdentifier: run.issueIdentifier,
+    workspaceKey: run.workspaceKey,
+  });
+}
+
+function issueAliasValuesForLifecycle(lifecycle: IssueLifecycleRecord): string[] {
+  return webProjectionIssueKeyAliases({ issueId: lifecycle.issueId, issueIdentifier: lifecycle.issueIdentifier });
+}
+
+function transcriptAliasValuesForRun(run: RunRecord): string[] {
+  return webProjectionIssueKeyAliases({
+    issueId: run.issueId,
+    issueIdentifier: run.issueIdentifier,
+    workspaceKey: run.workspaceKey,
+    runId: run.runId,
+    sessionId: run.sessionId,
+  });
+}
+
+function buildIssueAliasCandidates(input: {
+  snapshot: RuntimeSnapshot;
+  trackerIssues?: readonly Issue[];
+  runs: readonly RunRecord[];
+  workspaces: readonly WorkspaceRecord[];
+  lifecycles: readonly IssueLifecycleRecord[];
+}): IssueAliasCandidate[] {
+  return [
+    ...(input.trackerIssues ?? []).map((record) => ({ kind: "tracker" as const, record })),
+    ...input.snapshot.running.map((record) => ({ kind: "live" as const, record })),
+    ...input.workspaces.map((record) => ({ kind: "workspace" as const, record })),
+    ...input.runs.map((record) => ({ kind: "run" as const, record })),
+    ...input.lifecycles.map((record) => ({ kind: "lifecycle" as const, record })),
+  ];
+}
+
+function issueAliasValuesForCandidate(candidate: IssueAliasCandidate): string[] {
+  switch (candidate.kind) {
+    case "tracker":
+      return issueAliasValuesForTracker(candidate.record);
+    case "live":
+      return issueAliasValuesForLive(candidate.record);
+    case "workspace":
+      return issueAliasValuesForWorkspace(candidate.record);
+    case "run":
+      return issueAliasValuesForRun(candidate.record);
+    case "lifecycle":
+      return issueAliasValuesForLifecycle(candidate.record);
+  }
+}
+
+function issueAliasCandidateProjectContextId(candidate: IssueAliasCandidate): string {
+  return projectContextIdForAliasMatching(candidate.record);
+}
+
+function addIssueAliasLookupKeys(target: Set<string>, candidate: IssueAliasCandidate): void {
+  switch (candidate.kind) {
+    case "tracker":
+      target.add(candidate.record.id);
+      target.add(candidate.record.identifier);
+      return;
+    case "live":
+      target.add(candidate.record.issueId);
+      target.add(candidate.record.issueIdentifier);
+      return;
+    case "workspace":
+      if (candidate.record.issueId) target.add(candidate.record.issueId);
+      target.add(candidate.record.issueIdentifier);
+      target.add(candidate.record.workspaceKey);
+      return;
+    case "run":
+      target.add(candidate.record.issueId);
+      target.add(candidate.record.issueIdentifier);
+      target.add(candidate.record.workspaceKey);
+      return;
+    case "lifecycle":
+      target.add(candidate.record.issueId);
+      target.add(candidate.record.issueIdentifier);
+      return;
+  }
+}
+
+function aliasValuesIntersect(values: readonly string[], keys: ReadonlySet<string>): boolean {
+  return values.some((value) => keys.has(value));
+}
+
+interface WorkspaceContextSource {
+  issueId: string | null;
+  issueIdentifier: string;
+  workspaceKey?: string | null;
+  projectContext?: ProjectContextResolution | undefined;
+}
+
+function workspaceAliasMatchPriority(workspace: WorkspaceRecord, alias: string): number | null {
+  if (workspace.workspaceKey === alias) return 0;
+  if (workspace.issueIdentifier === alias) return 1;
+  if (workspace.issueId === alias) return 2;
+  return null;
+}
+
+function workspaceContextSourcePriority(workspace: WorkspaceRecord, source: WorkspaceContextSource): number | null {
+  if (source.workspaceKey && workspace.workspaceKey === source.workspaceKey) return 0;
+  if (workspace.issueId && source.issueId) return workspace.issueId === source.issueId ? 1 : null;
+  return workspace.issueIdentifier === source.issueIdentifier ? 2 : null;
+}
+
+function resolveWorkspaceProjectContext(
+  workspace: WorkspaceRecord,
+  sources: readonly WorkspaceContextSource[],
+): ProjectContextResolution | undefined {
+  const explicitProjectContext = projectContextResolutionFromIssue(workspace) ?? workspace.projectContext;
+  if (explicitProjectContext && explicitProjectContext.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID) {
+    return explicitProjectContext;
+  }
+
+  let bestMatch: { priority: number; legacyRank: number; projectContext: ProjectContextResolution } | null = null;
+  for (const source of sources) {
+    const priority = workspaceContextSourcePriority(workspace, source);
+    const projectContext = projectContextResolutionFromIssue(source) ?? source.projectContext;
+    if (priority === null || !projectContext) continue;
+    const legacyRank = projectContext.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID ? 1 : 0;
+    if (
+      !bestMatch ||
+      priority < bestMatch.priority ||
+      (priority === bestMatch.priority && legacyRank < bestMatch.legacyRank)
+    ) {
+      bestMatch = { priority, legacyRank, projectContext };
+    }
+  }
+
+  return bestMatch?.projectContext ?? explicitProjectContext ?? undefined;
+}
+
+async function resolveIssueAliasData(input: {
+  requestKey: string;
+  snapshot: RuntimeSnapshot;
+  runStore: RunTranscriptStore | undefined;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  defaultProjectContextId: string | null | undefined;
+}): Promise<ResolvedIssueAliasData> {
+  const runs = ((await input.runStore?.listRuns()) ?? []).sort(compareRunChronology);
+  const workspaces = (await input.runStore?.listWorkspaces()) ?? [];
+  const lifecycles = (await input.lifecycleStore?.list()) ?? [];
+  const candidates = buildIssueAliasCandidates({ snapshot: input.snapshot, runs, workspaces, lifecycles });
+  const resolution = resolveContextualAliasMatches({
+    requestKey: input.requestKey,
+    candidates,
+    aliasValues: issueAliasValuesForCandidate,
+    projectContextId: issueAliasCandidateProjectContextId,
+    defaultProjectContextId: input.defaultProjectContextId,
+  });
+  if (resolution.status !== "resolved" || resolution.matches.length === 0) {
+    return {
+      status: resolution.status,
+      requestKey: input.requestKey,
+      live: null,
+      workspace: null,
+      latestRun: null,
+      runs: [],
+      lifecycle: null,
+    };
+  }
+
+  const lookupKeys = new Set<string>();
+  for (const match of resolution.matches) addIssueAliasLookupKeys(lookupKeys, match);
+  const resolvedGroupId = projectContextGroupId(issueAliasCandidateProjectContextId(resolution.matches[0]!), input.defaultProjectContextId);
+  const live =
+    input.snapshot.running.find(
+      (record) =>
+        projectContextGroupId(projectContextIdForAliasMatching(record), input.defaultProjectContextId) === resolvedGroupId &&
+        aliasValuesIntersect(issueAliasValuesForLive(record), lookupKeys),
+    ) ?? null;
+  const resolvedRuns = runs.filter(
+    (record) =>
+      projectContextGroupId(projectContextIdForAliasMatching(record), input.defaultProjectContextId) === resolvedGroupId &&
+      aliasValuesIntersect(issueAliasValuesForRun(record), lookupKeys),
+  );
+  const lifecycle =
+    lifecycles.find(
+      (record) =>
+        projectContextGroupId(projectContextIdForAliasMatching(record), input.defaultProjectContextId) === resolvedGroupId &&
+        aliasValuesIntersect(issueAliasValuesForLifecycle(record), lookupKeys),
+    ) ?? null;
+  const workspaceContextSources: WorkspaceContextSource[] = [
+    ...(live ? [live] : []),
+    ...resolvedRuns,
+    ...(lifecycle ? [lifecycle] : []),
+  ];
+  const workspaceCandidates = workspaces
+    .map((record) => ({ record, projectContext: resolveWorkspaceProjectContext(record, workspaceContextSources) }))
+    .filter(
+      ({ record, projectContext }) =>
+        projectContextGroupId(projectContext?.projectContextId ?? projectContextIdForAliasMatching(record), input.defaultProjectContextId) ===
+          resolvedGroupId && aliasValuesIntersect(issueAliasValuesForWorkspace(record), lookupKeys),
+    );
+  const prioritizedWorkspaceCandidate = workspaceCandidates.reduce<
+    | { record: WorkspaceRecord; projectContext: ProjectContextResolution | undefined; priority: number }
+    | null
+  >((best, candidate) => {
+    const priority = workspaceAliasMatchPriority(candidate.record, resolution.parsed.alias);
+    if (priority === null) return best;
+    if (!best || priority < best.priority) {
+      return { ...candidate, priority };
+    }
+    return best;
+  }, null);
+  const workspaceCandidate = prioritizedWorkspaceCandidate ?? workspaceCandidates[0] ?? null;
+  const workspace = workspaceCandidate
+    ? {
+        ...workspaceCandidate.record,
+        ...(workspaceCandidate.projectContext ? { projectContext: workspaceCandidate.projectContext } : {}),
+      }
+    : null;
+  const inferredRuns = inferResolvedIssueRunsFromStrongIssueId({
+    runs,
+    resolvedRuns,
+    lifecycle,
+    workspace,
+    live,
+    resolvedGroupId,
+    defaultProjectContextId: input.defaultProjectContextId,
+  });
+  const contextualRuns = [...resolvedRuns, ...inferredRuns].sort(compareRunChronology);
+  return {
+    status: "resolved",
+    requestKey: lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? contextualRuns.at(-1)?.issueIdentifier ?? live?.issueIdentifier ?? input.requestKey,
+    live,
+    workspace,
+    latestRun: contextualRuns.at(-1) ?? null,
+    runs: contextualRuns,
+    lifecycle,
+  };
+}
+
+function inferResolvedIssueRunsFromStrongIssueId(input: {
+  runs: readonly RunRecord[];
+  resolvedRuns: readonly RunRecord[];
+  lifecycle: IssueLifecycleRecord | null;
+  workspace: WorkspaceRecord | null;
+  live: RunningRow | null;
+  resolvedGroupId: string;
+  defaultProjectContextId: string | null | undefined;
+}): RunRecord[] {
+  const strongIssueId = input.lifecycle?.issueId ?? input.workspace?.issueId ?? input.live?.issueId ?? null;
+  if (!strongIssueId) return [];
+  const resolvedRunIds = new Set(input.resolvedRuns.map((record) => record.runId));
+  return input.runs.filter((record) => {
+    if (resolvedRunIds.has(record.runId)) return false;
+    if (record.issueId !== strongIssueId) return false;
+    const recordProjectContext = projectContextResolutionFromIssue(record);
+    if (!recordProjectContext) return true;
+    if (recordProjectContext.projectContextId === LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return true;
+    return projectContextGroupId(recordProjectContext.projectContextId, input.defaultProjectContextId) === input.resolvedGroupId;
+  });
+}
+
+async function resolveIssueActionTarget(input: {
+  requestKey: string;
+  snapshot: RuntimeSnapshot;
+  runStore: RunTranscriptStore | undefined;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  defaultProjectContextId: string | null | undefined;
+}): Promise<{ status: Extract<AliasResolutionStatus, "ambiguous" | "wrong_context"> } | { status: "resolved"; target: ResolvedIssueActionTarget }> {
+  const parsed = parseContextualAlias(input.requestKey);
+  const fallbackLookupKey = parsed.alias || input.requestKey.trim();
+  const fallbackProjectContext = projectContextResolutionFromParsedAlias(parsed);
+  if (!input.runStore && !input.lifecycleStore) {
+    return {
+      status: "resolved",
+      target: {
+        lookupKey: fallbackLookupKey,
+        requestAlias: parsed.alias,
+        projectContext: fallbackProjectContext,
+        live: null,
+        workspace: null,
+        latestRun: null,
+        lifecycle: null,
+      },
+    };
+  }
+
+  const resolvedIssue = await resolveIssueAliasData(input);
+  if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+    return { status: resolvedIssue.status };
+  }
+  if (resolvedIssue.status !== "resolved") {
+    return {
+      status: "resolved",
+      target: {
+        lookupKey: fallbackLookupKey,
+        requestAlias: parsed.alias,
+        projectContext: fallbackProjectContext,
+        live: null,
+        workspace: null,
+        latestRun: null,
+        lifecycle: null,
+      },
+    };
+  }
+
+  return {
+    status: "resolved",
+    target: {
+      lookupKey:
+        resolvedIssue.lifecycle?.issueId ??
+        resolvedIssue.latestRun?.issueId ??
+        resolvedIssue.workspace?.issueId ??
+        resolvedIssue.live?.issueId ??
+        fallbackLookupKey,
+      requestAlias: parsed.alias,
+      projectContext: resolvedIssueActionProjectContext(resolvedIssue) ?? fallbackProjectContext,
+      live: resolvedIssue.live,
+      workspace: resolvedIssue.workspace,
+      latestRun: resolvedIssue.latestRun,
+      lifecycle: resolvedIssue.lifecycle,
+    },
+  };
+}
+
+function issueRouteEvidenceRequest(
+  requestKey: string,
+): Pick<IssueRouteEvidence, "requestKey" | "requestAlias" | "requestedProjectContextId" | "lookupKey"> {
+  const parsed = parseContextualAlias(requestKey);
+  const trimmedRequestKey = requestKey.trim();
+  const normalizedAlias = parsed.alias || trimmedRequestKey;
+  return {
+    requestKey: trimmedRequestKey,
+    requestAlias: normalizedAlias,
+    requestedProjectContextId: parsed.projectContextId ?? null,
+    lookupKey: normalizedAlias,
+  };
+}
+
+function issueRouteEvidenceAliasSources(
+  input: Pick<ResolvedIssueActionTarget, "live" | "workspace" | "latestRun" | "lifecycle">,
+): IssueRouteEvidenceSource[] {
+  const sources: IssueRouteEvidenceSource[] = [];
+  if (input.live) sources.push("alias_live");
+  if (input.workspace) sources.push("alias_workspace");
+  if (input.latestRun) sources.push("alias_run");
+  if (input.lifecycle) sources.push("alias_lifecycle");
+  return sources;
+}
+
+function buildIssueRouteEvidence(input: {
+  kind: IssueRouteEvidence["kind"];
+  requestKey: string;
+  status: IssueRouteEvidence["status"];
+  reason?: string | null;
+  lookupKey?: string | null;
+  requestedProjectContextId?: string | null;
+  resolvedProjectContextId?: string | null;
+  sources?: IssueRouteEvidenceSource[];
+}): IssueRouteEvidence {
+  const request = issueRouteEvidenceRequest(input.requestKey);
+  return {
+    kind: input.kind,
+    requestKey: request.requestKey,
+    requestAlias: request.requestAlias,
+    requestedProjectContextId: input.requestedProjectContextId ?? request.requestedProjectContextId,
+    resolvedProjectContextId: input.resolvedProjectContextId ?? null,
+    lookupKey: input.lookupKey ?? request.lookupKey,
+    sources: [...new Set(input.sources ?? [])],
+    status: input.status,
+    reason: input.reason ?? null,
+    redacted: true,
+  };
+}
+
+function mergeIssueRouteEvidence(base: IssueRouteEvidence, overlay: IssueRouteEvidence): IssueRouteEvidence {
+  return {
+    ...overlay,
+    requestKey: base.requestKey,
+    requestAlias: base.requestAlias,
+    requestedProjectContextId: base.requestedProjectContextId,
+    resolvedProjectContextId: overlay.resolvedProjectContextId ?? base.resolvedProjectContextId,
+    lookupKey: overlay.lookupKey ?? base.lookupKey,
+    sources: [...new Set([...base.sources, ...overlay.sources])],
+    reason: overlay.reason ?? base.reason,
+    redacted: true,
+  };
+}
+
+function issueRouteEvidenceFromError(error: unknown): IssueRouteEvidence | null {
+  if (!(error instanceof SymphonyError)) return null;
+  const details = error.details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return null;
+  const routeEvidence = (details as { routeEvidence?: unknown }).routeEvidence;
+  if (!routeEvidence || typeof routeEvidence !== "object" || Array.isArray(routeEvidence)) return null;
+  return (routeEvidence as IssueRouteEvidence).redacted === true ? (routeEvidence as IssueRouteEvidence) : null;
+}
+
+function mergeRouteEvidenceIntoError(error: unknown, routeEvidence: IssueRouteEvidence): unknown {
+  if (!(error instanceof SymphonyError)) return error;
+  const details =
+    error.details && typeof error.details === "object" && !Array.isArray(error.details)
+      ? { ...(error.details as Record<string, unknown>) }
+      : {};
+  const existing = issueRouteEvidenceFromError(error);
+  return new SymphonyError(error.code, error.message, {
+    ...details,
+    routeEvidence: existing ? mergeIssueRouteEvidence(routeEvidence, existing) : routeEvidence,
+  });
+}
+
+function statusAliasResolutionError(
+  entityLabel: string,
+  requestKey: string,
+  status: Extract<AliasResolutionStatus, "ambiguous" | "wrong_context">,
+  routeEvidence?: IssueRouteEvidence,
+): SymphonyError {
+  if (status === "ambiguous") {
+    return new SymphonyError(
+      "not_found",
+      `${entityLabel} alias is ambiguous across project contexts: ${requestKey}. Use a context-qualified alias.`,
+      routeEvidence ? { routeEvidence } : undefined,
+    );
+  }
+  return new SymphonyError(
+    "not_found",
+    `${entityLabel} alias is not available through the default project context: ${requestKey}. Use a context-qualified alias.`,
+    routeEvidence ? { routeEvidence } : undefined,
+  );
+}
+
+function approvalAliasLookupKeys(requestKey: string, resolvedIssue: ResolvedIssueAliasData): string[] {
+  return [
+    requestKey,
+    resolvedIssue.live?.issueId,
+    resolvedIssue.live?.issueIdentifier,
+    resolvedIssue.workspace?.issueId,
+    resolvedIssue.workspace?.issueIdentifier,
+    resolvedIssue.latestRun?.issueId,
+    resolvedIssue.latestRun?.issueIdentifier,
+    resolvedIssue.lifecycle?.issueId,
+    resolvedIssue.lifecycle?.issueIdentifier,
+  ].filter((value, index, values): value is string => value !== null && value !== undefined && values.indexOf(value) === index);
+}
+
+async function resolveCurrentPendingApprovalAlias(input: {
+  approval: OperatorApprovalRecord | null;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  runStore: RunTranscriptStore | undefined;
+}): Promise<OperatorApprovalRecord | null> {
+  if (!input.approval) return null;
+  if (!input.lifecycleStore || !input.runStore) return input.approval;
+  return currentPendingPublicationApproval({
+    approval: input.approval,
+    lifecycleStore: input.lifecycleStore,
+    runStore: input.runStore,
+  });
+}
+
+async function resolveApprovalRouteFromAlias(input: {
+  operatorApproval: StatusServerOptions["operatorApproval"];
+  requestKey: string;
+  snapshot: RuntimeSnapshot;
+  runStore: RunTranscriptStore | undefined;
+  lifecycleStore: IssueLifecycleStore | undefined;
+  defaultProjectContextId: string | null | undefined;
+}): Promise<ApprovalRouteResolution> {
+  const directApproval = await input.operatorApproval?.get(input.requestKey);
+  if (directApproval) return { status: "resolved", approval: directApproval };
+  if (!input.operatorApproval) return { status: "none", approval: null };
+
+  if (input.runStore) {
+    const resolvedRun = await resolveTranscriptRunFromAlias({
+      runStore: input.runStore,
+      requestKey: input.requestKey,
+      defaultProjectContextId: input.defaultProjectContextId,
+    });
+    if (resolvedRun.status === "ambiguous" || resolvedRun.status === "wrong_context") {
+      return { status: resolvedRun.status, approval: null };
+    }
+    if (resolvedRun.run) {
+      const approval = await resolveCurrentPendingApprovalAlias({
+        approval: await input.operatorApproval.findPendingForRun(resolvedRun.run.runId),
+        lifecycleStore: input.lifecycleStore,
+        runStore: input.runStore,
+      });
+      if (approval) return { status: "resolved", approval };
+    }
+  }
+
+  const resolvedIssue = await resolveIssueAliasData({
+    requestKey: input.requestKey,
+    snapshot: input.snapshot,
+    runStore: input.runStore,
+    lifecycleStore: input.lifecycleStore,
+    defaultProjectContextId: input.defaultProjectContextId,
+  });
+  if (resolvedIssue.status === "ambiguous" || resolvedIssue.status === "wrong_context") {
+    return { status: resolvedIssue.status, approval: null };
+  }
+  if (resolvedIssue.status !== "resolved") return { status: "none", approval: null };
+
+  const approval = await resolveCurrentPendingApprovalAlias({
+    approval: await input.operatorApproval.findPendingForIssue(
+      approvalAliasLookupKeys(input.requestKey, resolvedIssue),
+      resolvedIssueActionProjectContext(resolvedIssue) ?? projectContextResolutionFromParsedAlias(parseContextualAlias(input.requestKey)),
+    ),
+    lifecycleStore: input.lifecycleStore,
+    runStore: input.runStore,
+  });
+  return approval ? { status: "resolved", approval } : { status: "none", approval: null };
+}
+
+async function resolveTranscriptRunFromAlias(input: {
+  runStore: RunTranscriptStore;
+  requestKey: string;
+  defaultProjectContextId: string | null | undefined;
+}): Promise<TranscriptRunResolution> {
+  const directRun = await input.runStore.getRun(input.requestKey);
+  if (directRun) return { status: "resolved", run: directRun };
+
+  const runs = (await input.runStore.listRuns()).sort(compareRunChronology);
+  const directSessionMatches = runs.filter((record) => record.sessionId === input.requestKey);
+  if (directSessionMatches.length === 1) return { status: "resolved", run: directSessionMatches[0] ?? null };
+  if (directSessionMatches.length > 1) return { status: "ambiguous", run: null };
+
+  const resolution = resolveContextualAliasMatches({
+    requestKey: input.requestKey,
+    candidates: runs,
+    aliasValues: transcriptAliasValuesForRun,
+    projectContextId: (record) => projectContextIdForAliasMatching(record),
+    defaultProjectContextId: input.defaultProjectContextId,
+  });
+  if (resolution.status !== "resolved") {
+    return { status: resolution.status, run: null };
+  }
+
+  const runIdMatches = resolution.matches.filter((record) => record.runId === resolution.parsed.alias);
+  if (runIdMatches.length === 1) return { status: "resolved", run: runIdMatches[0] ?? null };
+  if (runIdMatches.length > 1) return { status: "ambiguous", run: null };
+
+  const sessionMatches = resolution.matches.filter((record) => record.sessionId === resolution.parsed.alias);
+  if (sessionMatches.length === 1) return { status: "resolved", run: sessionMatches[0] ?? null };
+  if (sessionMatches.length > 1) return { status: "ambiguous", run: null };
+
+  return { status: "resolved", run: resolution.matches.at(-1) ?? null };
+}
+
 function lifecycleByKeys(sourceIndex: BuiltWebProjectionSourceIndex, keys: string[]): IssueLifecycleRecord | null {
   for (const key of keys) {
     const lifecycle = sourceIndex.lifecycles.lifecycleByIssueKey.get(key);
@@ -5802,24 +7409,115 @@ function boardCardKeys(card: IssueBoardCard): string[] {
   return [card.key, card.issueId, card.issueIdentifier].filter((value): value is string => value !== null && value !== undefined);
 }
 
-function activityRunMatchesIssue(run: RunRecord, issue: string): boolean {
-  return run.issueId === issue || run.issueIdentifier === issue;
+function resolveActivityIssueFilter(
+  issue: string,
+  runs: readonly RunRecord[],
+  lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
+): string {
+  const lookupCandidates = dedupeIssueLookupCandidates(
+    [...runs.map(issueLookupCandidateFromRun), ...lifecycles.map(issueLookupCandidateFromLifecycle)].filter(
+      (candidate): candidate is IssueLookupCandidate => candidate !== null,
+    ),
+  );
+  const lookup = resolveIssueLookupFromCandidates(issue, lookupCandidates);
+  if (lookup.ambiguousCandidates.length > 0) throw ambiguousIssueLookupError(issue, lookup.ambiguousCandidates);
+  if (lookup.issueId) return lookup.issueId;
+
+  const parsed = parseContextualAlias(issue);
+  if (parsed.projectContextId === null) return issue;
+
+  const resolution = resolveContextualAliasMatches({
+    requestKey: issue,
+    candidates: [
+      ...runs.map((record) => ({ kind: "run" as const, record })),
+      ...lifecycles.map((record) => ({ kind: "lifecycle" as const, record })),
+    ],
+    aliasValues: issueAliasValuesForCandidate,
+    projectContextId: issueAliasCandidateProjectContextId,
+    defaultProjectContextId,
+  });
+  if (resolution.status !== "resolved" || resolution.matches.length === 0) return issue;
+
+  const contextualCandidates = dedupeIssueLookupCandidates(
+    resolution.matches
+      .map(issueLookupCandidateFromAliasCandidate)
+      .filter((candidate): candidate is IssueLookupCandidate => candidate !== null),
+  );
+  if (contextualCandidates.length > 1) throw ambiguousIssueLookupError(issue, contextualCandidates);
+  return contextualCandidates[0]?.issueId ?? issue;
+}
+
+function writebackOperationLifecycle(
+  operation: WritebackOperation,
+  lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
+): IssueLifecycleRecord | null {
+  const candidateLifecycles = lifecycles.filter(
+    (candidate) => candidate.issueId === operation.issueId || candidate.issueIdentifier === operation.issueId,
+  );
+  const explicitProjectContextId = normalizeOptionalProjectContextId(operation.projectContext?.projectContextId);
+  if (explicitProjectContextId !== null) {
+    const explicitProjectContextGroupId = projectContextGroupId(explicitProjectContextId, defaultProjectContextId);
+    return candidateLifecycles.find(
+      (candidate) => projectContextGroupId(projectContextIdForAliasMatching(candidate), defaultProjectContextId) === explicitProjectContextGroupId,
+    ) ?? null;
+  }
+  return candidateLifecycles[0] ?? null;
+}
+
+function activityRunMatchesIssue(run: RunRecord, issueKey: string): boolean {
+  return run.issueId === issueKey || run.issueIdentifier === issueKey;
+}
+
+function matchesActivityProjectContext(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+  projectContextId: string | null | undefined,
+  defaultProjectContextId: string | null | undefined,
+): boolean {
+  if (!projectContextId) return true;
+  const candidateProjectContextId = normalizeProjectContextResolution(projectContext).projectContextId;
+  return projectContextGroupId(candidateProjectContextId, defaultProjectContextId) === projectContextGroupId(projectContextId, defaultProjectContextId);
+}
+
+function writebackOperationProjectContext(
+  operation: WritebackOperation,
+  runs: readonly RunRecord[],
+  lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
+): Partial<ProjectContextResolution> | null | undefined {
+  const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
+  if (run?.projectContext) return run.projectContext;
+  const lifecycle = writebackOperationLifecycle(operation, lifecycles, defaultProjectContextId);
+  return lifecycle?.projectContext ?? operation.projectContext;
+}
+
+function writebackOperationMatchesProjectContext(
+  operation: WritebackOperation,
+  projectContextId: string | null | undefined,
+  runs: readonly RunRecord[],
+  lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
+): boolean {
+  return matchesActivityProjectContext(
+    writebackOperationProjectContext(operation, runs, lifecycles, defaultProjectContextId),
+    projectContextId,
+    defaultProjectContextId,
+  );
 }
 
 function writebackOperationMatchesIssue(
   operation: WritebackOperation,
-  issue: string,
+  issueId: string,
   runs: readonly RunRecord[],
   lifecycles: readonly IssueLifecycleRecord[],
+  defaultProjectContextId: string | null | undefined,
 ): boolean {
-  if (operation.issueId === issue) return true;
+  if (operation.issueId === issueId) return true;
   const run = operation.runId ? runs.find((candidate) => candidate.runId === operation.runId) : null;
-  if (run && activityRunMatchesIssue(run, issue)) return true;
-  return lifecycles.some(
-    (lifecycle) =>
-      (lifecycle.issueId === operation.issueId || lifecycle.issueIdentifier === operation.issueId) &&
-      (lifecycle.issueId === issue || lifecycle.issueIdentifier === issue),
-  );
+  if (run && activityRunMatchesIssue(run, issueId)) return true;
+  const lifecycle = writebackOperationLifecycle(operation, lifecycles, defaultProjectContextId);
+  return lifecycle ? lifecycle.issueId === issueId || lifecycle.issueIdentifier === issueId : false;
 }
 
 function uniqueStateNames(states: readonly string[]): string[] {
@@ -5967,7 +7665,7 @@ function renderRunningRow(
   const operator = runningOperatorLiveness(row, paused, row.lifecycle, agentId);
   const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
   const affordances = operatorAffordances({
-    issueKey: row.issueIdentifier,
+    issueKey: row.issueIdentifier || row.issueId,
     lifecycle: row.lifecycle,
     continuationSummaryAvailable,
     mutationsRequireToken: controls.mutationsRequireToken,
@@ -6425,14 +8123,18 @@ async function operatorSnapshotView(
       const keys = issueKeys(row.issueIdentifier, { live: row, latestRun: null, lifecycle: row.lifecycle });
       const paused = isIssuePaused(snapshot, keys);
       const agentId = await resolveRunningAgentId(row, runStore);
-      const workspace = (await runStore?.findWorkspace(row.issueId)) ?? (await runStore?.findWorkspace(row.issueIdentifier));
+      const lookupOptions = row.lifecycle?.projectContext ? { projectContext: row.lifecycle.projectContext } : {};
+      const workspace =
+        (await runStore?.findWorkspace(row.issueId, lookupOptions)) ??
+        (await runStore?.findWorkspace(row.issueIdentifier, lookupOptions));
       const latestRun =
-        (await runStore?.latestRunForIssue(row.issueId)) ?? (await runStore?.latestRunForIssue(row.issueIdentifier));
+        (await runStore?.latestRunForIssue(row.issueId, lookupOptions)) ??
+        (await runStore?.latestRunForIssue(row.issueIdentifier, lookupOptions));
       const summaryRun = await resolveIssueDetailsSummaryRun(row, latestRun, runStore);
       const controls = operatorControls({ issueKnown: true, live: row, paused, mutationsConfigured });
       const mergeConflict = mergeConflictOperatorSummary(row.lifecycle?.mergeConflict ?? null);
       const affordances = operatorAffordances({
-        issueKey: row.issueIdentifier,
+        issueKey: row.issueIdentifier || row.issueId,
         lifecycle: row.lifecycle,
         continuationSummaryAvailable: Boolean(lifecycleStore && runStore),
         mutationsRequireToken: controls.mutationsRequireToken,
@@ -6444,11 +8146,12 @@ async function operatorSnapshotView(
         runPhase: row.runPhase,
         runKind: row.runKind,
         state: row.state,
+        ...(row.projectContext === undefined ? {} : { projectContext: row.projectContext }),
         runId: row.liveness.activeRunId ?? row.runId,
         workspacePath: row.workspacePath,
         paused,
         issueDetails: buildIssueDetailsEnvelope({
-          requestKey: row.issueIdentifier,
+          requestKey: row.issueIdentifier || row.issueId,
           generatedAt: snapshot.generatedAt,
           trackerStateLists,
           staleThresholdMs,
@@ -6529,7 +8232,7 @@ function providerGateOperatorSummary(gate: RuntimeSnapshot["providerGates"][numb
     windowKind: gate.window?.windowKind ?? null,
     affectedRoles: gate.affectedRoles,
     affectedRunPhases: gate.affectedRunPhases,
-    source: gate.source,
+    source: gate.source === null ? null : gate.source === undefined ? undefined : publicProviderLimitSource(gate.source),
     controls: {
       clear: true,
       resume: true,
@@ -6592,8 +8295,9 @@ async function resolveRunningAgentId(
     const run = await runStore.getRun(runId);
     if (runMatchesLiveRow(row, run)) return run.agentId;
   }
+  const lookupOptions = row.lifecycle?.projectContext ? { projectContext: row.lifecycle.projectContext } : {};
   for (const issueKey of [row.issueId, row.issueIdentifier]) {
-    const run = await runStore.latestRunForIssue(issueKey);
+    const run = await runStore.latestRunForIssue(issueKey, lookupOptions);
     if (runMatchesLiveRow(row, run)) return run.agentId;
   }
   return null;
@@ -6616,8 +8320,9 @@ async function pausedOperatorViews(
   return Promise.all(
     pausedKeys.map(async (pausedKey) => {
       const lifecycle = (await lifecycleStore?.get(pausedKey)) ?? null;
-      const workspace = await runStore?.findWorkspace(pausedKey);
-      const latestRun = await runStore?.latestRunForIssue(pausedKey);
+      const lookupOptions = lifecycle?.projectContext ? { projectContext: lifecycle.projectContext } : {};
+      const workspace = await runStore?.findWorkspace(pausedKey, lookupOptions);
+      const latestRun = await runStore?.latestRunForIssue(pausedKey, lookupOptions);
       const live = running.find((row) => row.issueId === pausedKey || row.issueIdentifier === pausedKey) ?? null;
       const summaryRun = await resolveIssueDetailsSummaryRun(live, latestRun, runStore);
       const issueIdentifier = lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? pausedKey;
@@ -6629,7 +8334,7 @@ async function pausedOperatorViews(
         paused: true,
         controls,
         issueDetails: buildIssueDetailsEnvelope({
-          requestKey: pausedKey,
+          requestKey: lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? latestRun?.issueIdentifier ?? pausedKey,
           generatedAt,
           trackerStateLists,
           staleThresholdMs,
@@ -6641,7 +8346,7 @@ async function pausedOperatorViews(
         }),
         reviewLoop: reviewLoopStatus({ live, latestRun, lifecycle }),
         ...operatorAffordances({
-          issueKey: issueIdentifier,
+          issueKey: lifecycle?.issueIdentifier ?? workspace?.issueIdentifier ?? latestRun?.issueIdentifier ?? pausedKey,
           lifecycle,
           continuationSummaryAvailable: Boolean(lifecycleStore && runStore),
           mutationsRequireToken: controls.mutationsRequireToken,
@@ -6698,11 +8403,16 @@ async function runOperatorLiveness(
   return null;
 }
 
-async function resolveWebTranscriptRun(runStore: RunTranscriptStore, sessionIdOrRunId: string): Promise<RunRecord | null> {
-  const directRun = await runStore.getRun(sessionIdOrRunId);
-  if (directRun) return directRun;
-  const runs = (await runStore.listRuns()).sort(compareRunChronology);
-  return runs.find((run) => run.sessionId === sessionIdOrRunId) ?? null;
+async function resolveWebTranscriptRun(
+  runStore: RunTranscriptStore,
+  sessionIdOrRunId: string,
+  defaultProjectContextId: string | null | undefined,
+): Promise<TranscriptRunResolution> {
+  return resolveTranscriptRunFromAlias({
+    runStore,
+    requestKey: sessionIdOrRunId,
+    defaultProjectContextId,
+  });
 }
 
 async function readBoundedWebTranscript(runStore: RunTranscriptStore, runId: string, url?: URL): Promise<TranscriptEvent[]> {
@@ -6807,13 +8517,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function publicRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
-  return sanitizePublicJson(snapshot) as RuntimeSnapshot;
+  const publicSnapshot = sanitizePublicJson(snapshot) as RuntimeSnapshot;
+  return {
+    ...publicSnapshot,
+    providerGates: snapshot.providerGates.map(publicProviderGate),
+    running: snapshot.running.map(publicLiveRow),
+  };
 }
 
 function publicRunRecord(run: RunRecord): RunRecord {
+  const projectContext = publicProjectContext(run.projectContext);
   const record: RunRecord = {
     ...run,
     error: publicDiagnosticText(run.error),
+    ...(projectContext === undefined ? {} : { projectContext }),
+    ...(run.providerLimit === undefined
+      ? {}
+      : { providerLimit: run.providerLimit === null ? null : publicProviderLimitSignal(run.providerLimit) }),
     ...(run.commandPolicy === undefined
       ? {}
       : { commandPolicy: sanitizeCommandPolicyReplayStateForPublicOutput(run.commandPolicy) }),
@@ -6831,12 +8551,66 @@ function publicDiagnosticText(value: string | null | undefined): string | null {
   return sanitizedPreviewValue(value).preview;
 }
 
-function publicLiveRow(row: RunningRow): RunningRow {
+function publicProjectContext(
+  projectContext: Partial<ProjectContextResolution> | undefined,
+): ProjectContextResolution | undefined {
+  if (projectContext === undefined) return undefined;
+  const publicProjectContext = sanitizePublicJson(projectContext) as Partial<ProjectContextResolution>;
+  return normalizeProjectContextResolution(publicProjectContext);
+}
+
+function publicNullableProjectContext(
+  projectContext: Partial<ProjectContextResolution> | null | undefined,
+): ProjectContextResolution | null | undefined {
+  if (projectContext === null) return null;
+  return publicProjectContext(projectContext);
+}
+
+function publicProviderLimitSource(
+  source: NonNullable<RuntimeSnapshot["providerGates"][number]["source"]>,
+): RuntimeSnapshot["providerGates"][number]["source"] {
+  const publicSource = sanitizePublicJson(source) as NonNullable<RuntimeSnapshot["providerGates"][number]["source"]>;
+  const projectContext = publicNullableProjectContext(publicSource.projectContext);
   return {
-    ...row,
+    ...publicSource,
+    ...(projectContext === undefined ? {} : { projectContext }),
+  };
+}
+
+function publicProviderLimitSignal(signal: NonNullable<RunRecord["providerLimit"]>): NonNullable<RunRecord["providerLimit"]> {
+  return {
+    ...signal,
+    ...(signal.source === undefined ? {} : { source: signal.source === null ? null : publicProviderLimitSource(signal.source) }),
+  };
+}
+
+function publicProviderGate(gate: RuntimeSnapshot["providerGates"][number]): RuntimeSnapshot["providerGates"][number] {
+  const publicGate = sanitizePublicJson(gate) as RuntimeSnapshot["providerGates"][number];
+  return {
+    ...publicGate,
+    ...(gate.source === undefined ? {} : { source: gate.source === null ? null : publicProviderLimitSource(gate.source) }),
+  };
+}
+
+function publicWorkspaceRecord(workspace: WorkspaceRecord): WorkspaceRecord {
+  const projectContext = publicProjectContext(workspace.projectContext);
+  return {
+    ...workspace,
+    ...(projectContext === undefined ? {} : { projectContext }),
+  };
+}
+
+function publicLiveRow(row: RunningRow): RunningRow {
+  const publicRow = sanitizePublicJson(row) as RunningRow;
+  const projectContext = publicProjectContext(
+    row.projectContext ?? projectContextResolutionFromIssue(publicRow.issueDetails) ?? row.lifecycle?.projectContext,
+  );
+  return {
+    ...publicRow,
     lastEvent: publicDiagnosticText(row.lastEvent),
     lastMessage: publicDiagnosticText(row.lastMessage),
-    cancellation: publicLiveCancellation(row.cancellation),
+    ...(projectContext === undefined ? {} : { projectContext }),
+    cancellation: publicLiveCancellation(publicRow.cancellation),
   };
 }
 
@@ -7325,7 +9099,7 @@ function buildIssueDetailsEnvelope(input: {
       issue,
       tracker: buildIssueTrackerMetadata(issue, input.generatedAt, input.trackerStateLists, input.staleThresholdMs),
       blockers: buildIssueBlockerSummary(issue.blockedBy, input.trackerStateLists, lifecycle, issue.state),
-      workspace: buildIssueWorkspaceSummary(sanitizedInput, metadata),
+      workspace: buildIssueWorkspaceSummary(sanitizedInput),
       pullRequest: buildIssuePullRequestSummary(metadata),
       mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(metadata)),
       latestRun: buildIssueLatestRunSummary(input.summaryRun),
@@ -7338,7 +9112,7 @@ function buildIssueDetailsEnvelope(input: {
     issue: durableIssueStatusView(sanitizedInput),
     tracker: buildIssueTrackerMetadata(null, null, input.trackerStateLists, input.staleThresholdMs),
     blockers: buildIssueBlockerSummary(null, input.trackerStateLists, lifecycle, null),
-    workspace: buildIssueWorkspaceSummary(sanitizedInput, metadata),
+    workspace: buildIssueWorkspaceSummary(sanitizedInput),
     pullRequest: buildIssuePullRequestSummary(metadata),
     mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(metadata)),
     latestRun: buildIssueLatestRunSummary(input.summaryRun),
@@ -7364,12 +9138,28 @@ async function resolveIssueDetailsSummaryRun(
   return runMatchesLiveRow(live, issueWideLatestRun ?? null) ? (issueWideLatestRun ?? null) : null;
 }
 
+function preferredDurableIssueProjectContext(input: {
+  workspace: WorkspaceRecord | null | undefined;
+  latestRun: RunRecord | null | undefined;
+  lifecycle: IssueLifecycleRecord | null | undefined;
+}): ProjectContextResolution | null {
+  const candidates = [input.workspace?.projectContext ?? null, input.latestRun?.projectContext ?? null, input.lifecycle?.projectContext ?? null];
+  let legacyFallback: ProjectContextResolution | null = null;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (candidate.projectContextId !== LEGACY_DEFAULT_PROJECT_CONTEXT_ID) return candidate;
+    if (!legacyFallback) legacyFallback = candidate;
+  }
+  return legacyFallback;
+}
+
 function durableIssueStatusView(input: {
   requestKey: string;
   latestRun: RunRecord | null | undefined;
   lifecycle: IssueLifecycleRecord | null | undefined;
   workspace: WorkspaceRecord | null | undefined;
 }): IssueStatusView {
+  const projectContext = preferredDurableIssueProjectContext(input);
   return {
     id: input.lifecycle?.issueId ?? input.latestRun?.issueId ?? input.workspace?.issueId ?? null,
     identifier: input.lifecycle?.issueIdentifier ?? input.latestRun?.issueIdentifier ?? input.workspace?.issueIdentifier ?? null,
@@ -7386,6 +9176,15 @@ function durableIssueStatusView(input: {
     blockedBy: [],
     createdAt: null,
     updatedAt: null,
+    ...(projectContext
+      ? {
+          projectContext: { ...projectContext },
+          projectContextId: projectContext.projectContextId,
+          projectContextLabel: projectContext.projectContextLabel,
+          linearProjectSlug: projectContext.linearProjectSlug,
+          routingSource: projectContext.routingSource,
+        }
+      : {}),
   };
 }
 
@@ -7450,22 +9249,54 @@ function buildIssueWorkspaceSummary(
     latestRun: RunRecord | null | undefined;
     lifecycle: IssueLifecycleRecord | null | undefined;
   },
-  metadata: ReturnType<typeof statusMetadata>,
 ): IssueWorkspaceSummary {
+  const allowPlanningWorkspace = input.live?.runPhase === "issue_breakdown";
   const latestWorkspaceRun = input.latestRun?.runPhase === "issue_breakdown" ? null : input.latestRun;
   const workspaceRecord =
-    input.workspace?.workspaceKey.endsWith("-planning") === true && input.live?.runPhase !== "issue_breakdown"
+    !allowPlanningWorkspace && isPlanningWorkspaceSurface(input.workspace?.workspaceKey, input.workspace?.path)
       ? null
       : input.workspace;
+  const lifecycleWorkspacePointers =
+    !allowPlanningWorkspace &&
+    isPlanningWorkspaceSurface(input.lifecycle?.summaryPointers.workspaceKey, input.lifecycle?.summaryPointers.workspacePath)
+      ? null
+      : input.lifecycle?.summaryPointers;
   return {
-    workspaceKey: workspaceRecord?.workspaceKey ?? latestWorkspaceRun?.workspaceKey ?? input.lifecycle?.summaryPointers.workspaceKey ?? null,
-    path: workspaceRecord?.path ?? input.live?.workspacePath ?? latestWorkspaceRun?.workspacePath ?? input.lifecycle?.summaryPointers.workspacePath ?? null,
+    workspaceKey: workspaceRecord?.workspaceKey ?? latestWorkspaceRun?.workspaceKey ?? lifecycleWorkspacePointers?.workspaceKey ?? null,
+    path: workspaceRecord?.path ?? input.live?.workspacePath ?? latestWorkspaceRun?.workspacePath ?? lifecycleWorkspacePointers?.workspacePath ?? null,
     sourceKind: workspaceRecord?.sourceKind ?? null,
-    branchName: metadata.branchName,
-    gitBranchName: metadata.gitBranchName,
-    repoPath: metadata.repoPath,
-    baseRef: metadata.baseRef,
+    branchName:
+      input.live?.metadata?.branchName ??
+      lifecycleWorkspacePointers?.branchName ??
+      latestWorkspaceRun?.gitBranchName ??
+      workspaceRecord?.gitBranchName ??
+      null,
+    gitBranchName:
+      input.live?.metadata?.gitBranchName ??
+      lifecycleWorkspacePointers?.gitBranchName ??
+      latestWorkspaceRun?.gitBranchName ??
+      workspaceRecord?.gitBranchName ??
+      null,
+    repoPath:
+      input.live?.metadata?.repoPath ??
+      lifecycleWorkspacePointers?.repoPath ??
+      latestWorkspaceRun?.repoPath ??
+      workspaceRecord?.repoPath ??
+      null,
+    baseRef:
+      input.live?.metadata?.baseRef ??
+      lifecycleWorkspacePointers?.baseRef ??
+      latestWorkspaceRun?.baseRef ??
+      workspaceRecord?.baseRef ??
+      null,
   };
+}
+
+function isPlanningWorkspaceSurface(workspaceKey: string | null | undefined, workspacePath: string | null | undefined): boolean {
+  if (typeof workspaceKey === "string" && workspaceKey.trim().endsWith("-planning")) return true;
+  if (typeof workspacePath !== "string") return false;
+  const workspaceName = workspacePath.trim().split(/[\\/]/).pop() ?? "";
+  return workspaceName.endsWith("-planning");
 }
 
 function buildIssuePullRequestSummary(metadata: ReturnType<typeof statusMetadata>): IssuePullRequestSummary {
@@ -7580,6 +9411,162 @@ function defaultTrackerStateLists(): TrackerStateLists {
 
 function isStateNameIn(state: string, states: readonly string[]): boolean {
   return states.some((candidate) => candidate.toLowerCase() === state.toLowerCase());
+}
+
+interface IssueLookupCandidate {
+  issueId: string;
+  issueIdentifier: string;
+  projectContextId: string | null;
+}
+
+interface IssueLookupResult {
+  issueId: string | null;
+  ambiguousCandidates: IssueLookupCandidate[];
+  resolutionKind: "exact_issue_id" | "issue_identifier" | "contextual_alias" | "unresolved";
+  refreshTrackerCache?: boolean;
+}
+
+async function resolveIssueLookupKey(
+  issueKey: string,
+  input: {
+    snapshot: RuntimeSnapshot;
+    lifecycleStore: IssueLifecycleStore | undefined;
+    runStore: RunTranscriptStore | undefined;
+    trackerIssues?: readonly Issue[];
+  },
+): Promise<IssueLookupResult> {
+  const [lifecycleRecords, workspaces, runs] = await Promise.all([
+    input.lifecycleStore?.list() ?? Promise.resolve([]),
+    input.runStore?.listWorkspaces() ?? Promise.resolve([]),
+    input.runStore?.listRuns() ?? Promise.resolve([]),
+  ]);
+  return resolveIssueLookupFromCandidates(
+    issueKey,
+    dedupeIssueLookupCandidates(
+      [
+        ...(input.trackerIssues ?? []).map(issueLookupCandidateFromIssue),
+        ...input.snapshot.running.map(issueLookupCandidateFromRunningRow),
+        ...lifecycleRecords.map(issueLookupCandidateFromLifecycle),
+        ...workspaces.map(issueLookupCandidateFromWorkspace),
+        ...runs.map(issueLookupCandidateFromRun),
+      ].filter((candidate): candidate is IssueLookupCandidate => candidate !== null),
+    ),
+  );
+}
+
+function resolveIssueLookupFromCandidates(
+  issueKey: string,
+  candidates: readonly IssueLookupCandidate[],
+): IssueLookupResult {
+  const exactIssueIdMatch = candidates.find((candidate) => candidate.issueId === issueKey);
+  if (exactIssueIdMatch) {
+    return { issueId: exactIssueIdMatch.issueId, ambiguousCandidates: [], resolutionKind: "exact_issue_id" };
+  }
+  const identifierMatches = candidates.filter((candidate) => candidate.issueIdentifier === issueKey);
+  if (identifierMatches.length === 1) {
+    return { issueId: identifierMatches[0]?.issueId ?? null, ambiguousCandidates: [], resolutionKind: "issue_identifier" };
+  }
+  return {
+    issueId: null,
+    ambiguousCandidates: identifierMatches.length > 1 ? identifierMatches : [],
+    resolutionKind: "unresolved",
+  };
+}
+
+function ambiguousIssueLookupError(issueKey: string, candidates: readonly IssueLookupCandidate[]): SymphonyError {
+  const details = candidates.map((candidate) => {
+    const context = candidate.projectContextId ? ` [${candidate.projectContextId}]` : "";
+    return `${candidate.issueId}${context}`;
+  });
+  return new SymphonyError(
+    "conflict",
+    `Ambiguous issue identifier: ${issueKey}. Use exact issue id. Candidates: ${details.join(", ")}`,
+  );
+}
+
+function issueLookupCandidateFromRunningRow(row: RunningRow): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: row.issueId,
+    issueIdentifier: row.issueIdentifier,
+    projectContext: projectContextResolutionFromIssue(row) ?? undefined,
+  });
+}
+
+function issueLookupCandidateFromIssue(issue: Issue): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    projectContext: projectContextResolutionFromIssue(issue) ?? undefined,
+  });
+}
+
+function issueLookupCandidateFromLifecycle(record: IssueLifecycleRecord): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: record.issueId,
+    issueIdentifier: record.issueIdentifier,
+    projectContext: record.projectContext,
+  });
+}
+
+function issueLookupCandidateFromWorkspace(record: WorkspaceRecord): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: record.issueId ?? null,
+    issueIdentifier: record.issueIdentifier,
+    projectContext: record.projectContext,
+  });
+}
+
+function issueLookupCandidateFromRun(record: RunRecord): IssueLookupCandidate | null {
+  return issueLookupCandidate({
+    issueId: record.issueId,
+    issueIdentifier: record.issueIdentifier,
+    projectContext: record.projectContext,
+  });
+}
+
+function issueLookupCandidateFromAliasCandidate(candidate: IssueAliasCandidate): IssueLookupCandidate | null {
+  switch (candidate.kind) {
+    case "tracker":
+      return issueLookupCandidateFromIssue(candidate.record);
+    case "live":
+      return issueLookupCandidateFromRunningRow(candidate.record);
+    case "workspace":
+      return issueLookupCandidateFromWorkspace(candidate.record);
+    case "run":
+      return issueLookupCandidateFromRun(candidate.record);
+    case "lifecycle":
+      return issueLookupCandidateFromLifecycle(candidate.record);
+  }
+}
+
+function issueLookupCandidate(input: {
+  issueId: string | null;
+  issueIdentifier: string | null;
+  projectContext?: IssueLifecycleRecord["projectContext"] | WorkspaceRecord["projectContext"] | RunRecord["projectContext"];
+}): IssueLookupCandidate | null {
+  if (!input.issueId || !input.issueIdentifier) {
+    return null;
+  }
+  return {
+    issueId: input.issueId,
+    issueIdentifier: input.issueIdentifier,
+    projectContextId: input.projectContext?.projectContextId ?? null,
+  };
+}
+
+function dedupeIssueLookupCandidates(candidates: readonly IssueLookupCandidate[]): IssueLookupCandidate[] {
+  const byIssueId = new Map<string, IssueLookupCandidate>();
+  for (const candidate of candidates) {
+    const existing = byIssueId.get(candidate.issueId);
+    if (!existing) {
+      byIssueId.set(candidate.issueId, candidate);
+      continue;
+    }
+    if (existing.projectContextId === null && candidate.projectContextId !== null) {
+      byIssueId.set(candidate.issueId, candidate);
+    }
+  }
+  return [...byIssueId.values()].sort((left, right) => compareString(left.issueId, right.issueId));
 }
 
 function issueKeys(
@@ -7713,8 +9700,18 @@ function parseActivityQuery(url: URL): ActivityQuery {
   const offset = Number(url.searchParams.get("offset") ?? "0");
   const limit = Number(url.searchParams.get("limit") ?? "50");
   const issue = url.searchParams.get("issue");
+  const rawProjectContextId = url.searchParams.get("projectContextId")?.trim() ?? "";
+  let projectContextId: string | null = null;
+  if (rawProjectContextId.length > 0) {
+    try {
+      projectContextId = normalizeProjectContextId(rawProjectContextId);
+    } catch {
+      throw new SymphonyError("invalid_request", `Invalid project context filter: ${rawProjectContextId}`);
+    }
+  }
   return {
     issue: issue && issue.length > 0 ? issue : null,
+    projectContextId,
     offset: Number.isFinite(offset) ? Math.max(Math.floor(offset), 0) : 0,
     limit: Number.isFinite(limit) ? Math.min(Math.max(Math.floor(limit), 1), 100) : 50,
   };

@@ -92,6 +92,7 @@ import {
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
   ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
   WritebackProcessor,
+  writebackIdentityKey,
 } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
@@ -872,9 +873,15 @@ describe("Orchestrator", () => {
       ]),
     );
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => harness.runs.length >= 1 && orchestrator.snapshot().counts.running === 0,
+        "worker dispatch completion",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain("Review-cycle hardening:");
@@ -2038,13 +2045,20 @@ describe("Orchestrator", () => {
       ),
     });
 
-    await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1);
-    await waitFor(() => orchestrator.snapshot().counts.running === 0);
-    await settleOrchestratorExit();
-    await orchestrator.refreshNow();
-    await settleOrchestratorExit();
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length === 1, "issue breakdown planning dispatch", 10_000);
+      await waitFor(
+        () => orchestrator.snapshot().counts.running === 0,
+        "issue breakdown planning completion",
+        10_000,
+      );
+      await settleOrchestratorExit();
+      await orchestrator.refreshNow();
+      await settleOrchestratorExit();
+    } finally {
+      await orchestrator.stop();
+    }
 
     const lifecycle = await lifecycleStore.get(candidate.id);
     expect(writer.issueCreates).toEqual([]);
@@ -3423,9 +3437,15 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => harness.runs.length >= 1 && orchestrator.snapshot().counts.running === 0,
+        "handoff state dispatch completion",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.runs).toHaveLength(1);
     expect(orchestrator.snapshot().counts.retrying).toBe(0);
@@ -3553,9 +3573,16 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => harness.runs.length >= 2,
+        "max-turn exhaustion continuation runs",
+        10_000,
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.runs).toHaveLength(2);
     expect(currentState).toBe("In Progress");
@@ -11277,7 +11304,7 @@ describe("Orchestrator", () => {
           idempotencyKey: "review-verdict-blocked-1",
           verdict: "blocked",
           writebackOperationKeys: [
-            "comment:issue-1:review-run-1:review-verdict-blocked",
+            writebackIdentityKey("comment:issue-1:review-run-1:review-verdict-blocked"),
           ],
         },
       ],
@@ -11715,9 +11742,21 @@ describe("Orchestrator", () => {
       pullRequestClient,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => pullRequestClient.branches.length >= 2,
+        "pull request discovery by branch",
+      );
+      await waitForAsync(
+        async () =>
+          (await runStore.latestRunForIssue(candidate.identifier))?.prNumber ===
+          12,
+        "pull request metadata persistence",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     const run = await runStore.latestRunForIssue(candidate.identifier);
     const transcript = await runStore.readTranscript(run?.runId ?? "");
@@ -11814,9 +11853,15 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => authorizations.length >= 2,
+        "worker GitHub discovery credentials",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(authorizations).toEqual([
       "Bearer discovery-secret",
@@ -11932,9 +11977,19 @@ describe("Orchestrator", () => {
       pullRequestReviewClient,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          pullRequestReviewClient.calls.length >= 1 &&
+          (harness.runs[0]?.prompt ?? "").includes(
+            "PR review feedback to address",
+          ),
+        "review evidence prompt ingestion",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(pullRequestReviewClient.calls).toEqual([42]);
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
@@ -12071,9 +12126,16 @@ describe("Orchestrator", () => {
       pullRequestReviewClient,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          pullRequestReviewClient.calls.length >= 1 && harness.runs.length >= 1,
+        "linkback-only review evidence prompt ingestion",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     const prompt = harness.runs[0]?.prompt ?? "";
     expect(pullRequestReviewClient.calls).toEqual([42]);
@@ -12197,9 +12259,19 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () =>
+          calls.length >= 4 &&
+          (harness.runs[0]?.prompt ?? "").includes(
+            "Please address the reviewer-owned evidence path.",
+          ),
+        "review evidence credential resolution",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(calls.map((call) => call.authorization)).toEqual([
       "Bearer review-read-secret",
@@ -12265,9 +12337,12 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length >= 1, "fail verdict worker prompt");
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.runs[0]?.prompt).toContain("Work on TEST-1");
     expect(harness.runs[0]?.prompt).toContain(
@@ -12368,9 +12443,12 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length >= 1, "blocked verdict worker prompt");
+    } finally {
+      await orchestrator.stop();
+    }
 
     const prompt = harness.runs[0]?.prompt ?? "";
     const systemPrompt = harness.runs[0]?.ctx.ephemeralSystemPrompt ?? "";
@@ -12501,9 +12579,12 @@ describe("Orchestrator", () => {
       lifecycleStore,
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(() => harness.runs.length >= 1, "merge gate repair worker prompt");
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.runs[0]?.prompt).toContain("## Symphony Merge Gate Repair");
     expect(harness.runs[0]?.prompt).toContain(
@@ -13364,6 +13445,7 @@ describe("Orchestrator", () => {
       timer: retryTimer,
       error: "retry later",
       runPhase: "implementation",
+      projectContext: undefined,
     });
     const activeIssue = issue({ id: "issue-active", identifier: "TEST-9" });
     const abortController = new AbortController();
@@ -13423,9 +13505,15 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
     });
 
-    await orchestrator.refreshNow();
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await orchestrator.stop();
+    try {
+      await orchestrator.refreshNow();
+      await waitFor(
+        () => harness.prompts.length >= 1,
+        "non-resumable harness prompt",
+      );
+    } finally {
+      await orchestrator.stop();
+    }
 
     expect(harness.prompts).toHaveLength(1);
     expect(harness.prompts[0]).toContain("Work on TEST-1");
@@ -14321,7 +14409,7 @@ async function expectStartupReplayActivitySkipReasons(
   const expectedKinds = ["issue_create", "issue_relation", "comment"];
   for (const [index, key] of fixture.replayOperationKeys.entries()) {
     const item = activity.find(
-      (candidate) => candidate.id === `writeback:${key}`,
+      (candidate) => candidate.id === `writeback:default:${key}`,
     );
     expect(item).toMatchObject({
       kind: "writeback_operation",
@@ -15360,6 +15448,7 @@ class RecordingShutdownProgress {
 function shutdownTestRunningEntry(activeIssue: Issue, abortController: AbortController): RunningEntry {
   return {
     issue: activeIssue,
+    projectContext: null,
     role: "worker",
     runPhase: "implementation",
     workspacePath: null,
@@ -15708,12 +15797,12 @@ class LifecycleSnapshotHarness implements AgentHarness {
 
   async *run(ctx: AgentRunContext): AsyncIterable<AgentEvent> {
     this.runs.push(ctx);
+    this.snapshots.push((await this.lifecycleStore.get(ctx.issue.id)) ?? (await this.lifecycleStore.get(ctx.issue.identifier)));
     yield {
       type: "session_started",
       sessionId: "snapshot-session-1",
       runId: "snapshot-run-1",
     };
-    this.snapshots.push(await this.lifecycleStore.get(ctx.issue.id));
     yield { type: "completed" };
   }
 }

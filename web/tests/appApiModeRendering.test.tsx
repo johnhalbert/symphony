@@ -187,6 +187,22 @@ const apiSelectedIssueDetail: IssueDetailModel = {
     title: "API issue detail title from GET /api/v1/web/issues/API-SELECTED",
     desc: ["API detail description loaded from the issue-detail endpoint."],
     activity: [{ t: "1m ago", verb: "loaded", val: "API detail activity", who: "api-detail-service" }],
+    workspace: "stale-worktree/issue-field-should-not-render",
+  },
+  workspace: {
+    workspaceKey: "API-SELECTED",
+    path: "api-worktree/API-SELECTED",
+    sourceKind: "git_worktree",
+    branchName: "sinfonista/api-selected",
+    gitBranchName: "sinfonista/api-selected",
+    repoPath: "/tmp/api-repo",
+    baseRef: "main",
+    projectContext: {
+      projectContextId: "api",
+      projectContextLabel: "API Project",
+      linearProjectSlug: "API",
+      routingSource: "candidate_poll",
+    },
   },
   activity: [],
   runs: [],
@@ -1217,6 +1233,7 @@ describe("App API-mode rendering", () => {
     expect(markup).toContain("API detail description loaded from the issue-detail endpoint.");
     expect(markup).toContain("API detail activity");
     expect(markup).toContain("api-worktree/API-SELECTED");
+    expect(markup).not.toContain("stale-worktree/issue-field-should-not-render");
     expect(markup).toContain("run-api-selected");
     expect(markup).toContain("#909");
     expect(markup).toContain("green");

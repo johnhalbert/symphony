@@ -6,50 +6,194 @@ import type { AgentRunPhase, IssueBoardColumnId, IssueBoardColumnMapping } from 
 import {
   createCredentialProfileRegistry,
   rawCredentialProfilesSchema,
+  rawCredentialProfilesOverrideSchema,
   type CredentialProfileRegistry,
+  type RawCredentialProfilesConfig,
+  type RawCredentialProfilesOverrideConfig,
 } from "./CredentialProfiles.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  buildProjectContextRegistry,
+  defaultProjectContextLabel,
+  normalizeLegacyDefaultProjectContext,
+  normalizeProjectContextId,
+  projectContextSummaryForPublicRead,
+  type NormalizedProjectContext,
+  type ProjectContextConfig,
+  type ProjectContextRegistry,
+} from "./ProjectContexts.js";
 
 const stringArray = z.array(z.string());
 
+const rawTrackerSchema = z
+  .object({
+    kind: z.string().optional(),
+    endpoint: z.string().optional(),
+    api_key: z.string().optional(),
+    project_slug: z.string().optional(),
+    assignee: z.string().optional(),
+    page_size: z.number().int().min(1).max(250).optional(),
+    active_states: stringArray.optional(),
+    handoff_states: stringArray.optional(),
+    terminal_states: stringArray.optional(),
+  })
+  .passthrough();
+
+const rawReviewLoopSchema = z
+  .object({
+    review_states: stringArray.optional(),
+    blocked_states: stringArray.optional(),
+    review_pass_state: z.string().optional(),
+    reviewer_prompt: z.string().optional(),
+    reviewer_prompt_extensions: stringArray.optional(),
+    worker_prompt_extensions: stringArray.optional(),
+    max_review_rounds: z.number().int().positive().optional(),
+    failure_limits: z
+      .object({
+        reviewer_failures: z.number().int().positive().optional(),
+        merge_gate_failures: z.number().int().positive().optional(),
+      })
+      .passthrough()
+      .optional(),
+    max_incomplete_turns: z.number().int().positive().optional(),
+    continuation_history_threshold: z.number().int().nonnegative().optional(),
+    transcript_history_limit: z.number().int().nonnegative().optional(),
+    pr_review_evidence_limit: z.number().int().positive().optional(),
+  })
+  .passthrough();
+
+const rawIssueBreakdownApplyToLinearSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    mode: z.enum(["child_issues"]).optional(),
+    auto_apply: z.boolean().optional(),
+  })
+  .passthrough();
+
+const rawIssueBreakdownSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    cursor_mode: z.enum(["agent", "plan"]).optional(),
+    prompt: z.string().optional(),
+    planning_labels: stringArray.optional(),
+    apply_to_linear: rawIssueBreakdownApplyToLinearSchema.optional(),
+    workspace_mode: z.enum(["none", "readonly_checkout", "writable_checkout"]).optional(),
+    max_planning_failures: z.number().int().positive().optional(),
+    max_planning_dispatch_retries: z.number().int().positive().optional(),
+    planning_retry_base_ms: z.number().int().positive().optional(),
+    planning_retry_max_ms: z.number().int().positive().optional(),
+  })
+  .passthrough();
+
+const rawWorkspaceSourceSchema = z
+  .object({
+    kind: z.enum(["none", "copy", "git", "git_worktree"]).optional(),
+    path: z.string().optional(),
+    repository: z.string().optional(),
+    ref: z.string().optional(),
+    base_ref: z.string().optional(),
+    branch_template: z.string().optional(),
+    cache_path: z.string().optional(),
+    cleanup: z.enum(["refuse_dirty", "force"]).optional(),
+  })
+  .passthrough();
+
+const rawWorkspaceSchema = z
+  .object({
+    root: z.string().optional(),
+    state_dir: z.string().optional(),
+    source: rawWorkspaceSourceSchema.optional(),
+  })
+  .passthrough();
+
+const rawAgentSchema = z
+  .object({
+    harness: z.string().optional(),
+    max_concurrent_agents: z.number().int().positive().optional(),
+    max_turns: z.number().int().positive().optional(),
+    max_retry_backoff_ms: z.number().int().positive().optional(),
+    max_sdk_error_retries: z.number().int().nonnegative().optional(),
+    max_infra_failures: z.number().int().positive().optional(),
+    max_concurrent_agents_by_state: z.record(z.string(), z.number()).optional(),
+    require_labels: stringArray.optional(),
+    exclude_labels: stringArray.optional(),
+    worker_exclude_labels: stringArray.optional(),
+    reviewer_exclude_labels: stringArray.optional(),
+    planner_exclude_labels: stringArray.optional(),
+    protected_paths: stringArray.optional(),
+  })
+  .passthrough();
+
+const rawGitHubAppSchema = z
+  .object({
+    app_id: z.string().optional(),
+    client_id: z.string().optional(),
+    installation_id: z.string().optional(),
+    private_key: z.string().optional(),
+    private_key_path: z.string().optional(),
+    token_refresh_buffer_seconds: z.number().int().nonnegative().optional(),
+  })
+  .passthrough();
+
+const rawGitHubOperatorApprovalSchema = z
+  .object({
+    required_for_publication: z.boolean().optional(),
+    reject_policy: z.enum(["cancel", "fail"]).optional(),
+    poll_interval_ms: z.number().int().positive().optional(),
+    timeout_ms: z.number().int().nonnegative().nullable().optional(),
+  })
+  .passthrough();
+
+const rawGitHubNoCiSchema = z
+  .object({
+    allowed: z.boolean().optional(),
+    evidence: z.string().optional(),
+  })
+  .passthrough();
+
+const rawGitHubPrHandoffSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    target_state: z.string().optional(),
+    allow_drafts: z.boolean().optional(),
+    required_checks: stringArray.optional(),
+    no_ci: rawGitHubNoCiSchema.optional(),
+  })
+  .passthrough();
+
+const rawGitHubSchema = z
+  .object({
+    owner: z.string().optional(),
+    repo: z.string().optional(),
+    token: z.string().optional(),
+    app: rawGitHubAppSchema.optional(),
+    head_owner: z.string().optional(),
+    api_base_url: z.string().optional(),
+    publish_pull_requests: z.boolean().optional(),
+    operator_approval: rawGitHubOperatorApprovalSchema.optional(),
+    pr_handoff: rawGitHubPrHandoffSchema.optional(),
+  })
+  .passthrough();
+
+const rawProjectContextSchema = z
+  .object({
+    id: z.string(),
+    label: z.string().optional(),
+    enabled: z.boolean().optional(),
+    tracker: rawTrackerSchema.optional(),
+    workspace: rawWorkspaceSchema.optional(),
+    github: rawGitHubSchema.optional(),
+    review_loop: rawReviewLoopSchema.optional(),
+    issue_breakdown: rawIssueBreakdownSchema.optional(),
+    agent: rawAgentSchema.optional(),
+    credential_profiles: rawCredentialProfilesOverrideSchema.optional(),
+  })
+  .passthrough();
+
 const rawConfigSchema = z
   .object({
-    tracker: z
-      .object({
-        kind: z.string().optional(),
-        endpoint: z.string().optional(),
-        api_key: z.string().optional(),
-        project_slug: z.string().optional(),
-        assignee: z.string().optional(),
-        page_size: z.number().int().min(1).max(250).optional(),
-        active_states: stringArray.optional(),
-        handoff_states: stringArray.optional(),
-        terminal_states: stringArray.optional(),
-      })
-      .passthrough()
-      .optional(),
-    review_loop: z
-      .object({
-        review_states: stringArray.optional(),
-        blocked_states: stringArray.optional(),
-        review_pass_state: z.string().optional(),
-        reviewer_prompt: z.string().optional(),
-        reviewer_prompt_extensions: stringArray.optional(),
-        worker_prompt_extensions: stringArray.optional(),
-        max_review_rounds: z.number().int().positive().optional(),
-        failure_limits: z
-          .object({
-            reviewer_failures: z.number().int().positive().optional(),
-            merge_gate_failures: z.number().int().positive().optional(),
-          })
-          .passthrough()
-          .optional(),
-        max_incomplete_turns: z.number().int().positive().optional(),
-        continuation_history_threshold: z.number().int().nonnegative().optional(),
-        transcript_history_limit: z.number().int().nonnegative().optional(),
-        pr_review_evidence_limit: z.number().int().positive().optional(),
-      })
-      .passthrough()
-      .optional(),
+    tracker: rawTrackerSchema.optional(),
+    review_loop: rawReviewLoopSchema.optional(),
     merge_policy: z
       .object({
         enabled: z.boolean().optional(),
@@ -120,28 +264,7 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
-    issue_breakdown: z
-      .object({
-        enabled: z.boolean().optional(),
-        cursor_mode: z.enum(["agent", "plan"]).optional(),
-        prompt: z.string().optional(),
-        planning_labels: stringArray.optional(),
-        apply_to_linear: z
-          .object({
-            enabled: z.boolean().optional(),
-            mode: z.enum(["child_issues"]).optional(),
-            auto_apply: z.boolean().optional(),
-          })
-          .passthrough()
-          .optional(),
-        workspace_mode: z.enum(["none", "readonly_checkout", "writable_checkout"]).optional(),
-        max_planning_failures: z.number().int().positive().optional(),
-        max_planning_dispatch_retries: z.number().int().positive().optional(),
-        planning_retry_base_ms: z.number().int().positive().optional(),
-        planning_retry_max_ms: z.number().int().positive().optional(),
-      })
-      .passthrough()
-      .optional(),
+    issue_breakdown: rawIssueBreakdownSchema.optional(),
     issue_triage: z
       .object({
         enabled: z.boolean().optional(),
@@ -185,26 +308,7 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
-    workspace: z
-      .object({
-        root: z.string().optional(),
-        state_dir: z.string().optional(),
-        source: z
-          .object({
-            kind: z.enum(["none", "copy", "git", "git_worktree"]).optional(),
-            path: z.string().optional(),
-            repository: z.string().optional(),
-            ref: z.string().optional(),
-            base_ref: z.string().optional(),
-            branch_template: z.string().optional(),
-            cache_path: z.string().optional(),
-            cleanup: z.enum(["refuse_dirty", "force"]).optional(),
-          })
-          .passthrough()
-          .optional(),
-      })
-      .passthrough()
-      .optional(),
+    workspace: rawWorkspaceSchema.optional(),
     hooks: z
       .object({
         after_create: z.string().optional(),
@@ -215,24 +319,7 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
-    agent: z
-      .object({
-        harness: z.string().optional(),
-        max_concurrent_agents: z.number().int().positive().optional(),
-        max_turns: z.number().int().positive().optional(),
-        max_retry_backoff_ms: z.number().int().positive().optional(),
-        max_sdk_error_retries: z.number().int().nonnegative().optional(),
-        max_infra_failures: z.number().int().positive().optional(),
-        max_concurrent_agents_by_state: z.record(z.string(), z.number()).optional(),
-        require_labels: stringArray.optional(),
-        exclude_labels: stringArray.optional(),
-        worker_exclude_labels: stringArray.optional(),
-        reviewer_exclude_labels: stringArray.optional(),
-        planner_exclude_labels: stringArray.optional(),
-        protected_paths: stringArray.optional(),
-      })
-      .passthrough()
-      .optional(),
+    agent: rawAgentSchema.optional(),
     prompts: z
       .object({
         templates_dir: z.string().optional(),
@@ -335,58 +422,24 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
-    github: z
-      .object({
-        owner: z.string().optional(),
-        repo: z.string().optional(),
-        token: z.string().optional(),
-        app: z
-          .object({
-            app_id: z.string().optional(),
-            client_id: z.string().optional(),
-            installation_id: z.string().optional(),
-            private_key: z.string().optional(),
-            private_key_path: z.string().optional(),
-            token_refresh_buffer_seconds: z.number().int().nonnegative().optional(),
-          })
-          .passthrough()
-          .optional(),
-        head_owner: z.string().optional(),
-        api_base_url: z.string().optional(),
-        publish_pull_requests: z.boolean().optional(),
-        operator_approval: z
-          .object({
-            required_for_publication: z.boolean().optional(),
-            reject_policy: z.enum(["cancel", "fail"]).optional(),
-            poll_interval_ms: z.number().int().positive().optional(),
-            timeout_ms: z.number().int().nonnegative().nullable().optional(),
-          })
-          .passthrough()
-          .optional(),
-        pr_handoff: z
-          .object({
-            enabled: z.boolean().optional(),
-            target_state: z.string().optional(),
-            allow_drafts: z.boolean().optional(),
-            required_checks: stringArray.optional(),
-            no_ci: z
-              .object({
-                allowed: z.boolean().optional(),
-                evidence: z.string().optional(),
-              })
-              .passthrough()
-              .optional(),
-          })
-          .passthrough()
-          .optional(),
-      })
-      .passthrough()
-      .optional(),
+    github: rawGitHubSchema.optional(),
+    project_contexts: z.array(rawProjectContextSchema).min(1).optional(),
     credential_profiles: rawCredentialProfilesSchema.optional(),
   })
   .passthrough();
 
 export type RawWorkflowConfig = z.infer<typeof rawConfigSchema>;
+export type RawProjectContextConfig = z.infer<typeof rawProjectContextSchema>;
+
+export type WorkflowProjectContextConfig = ProjectContextConfig<
+  RawWorkflowConfig["tracker"],
+  RawWorkflowConfig["workspace"],
+  RawWorkflowConfig["github"],
+  RawWorkflowConfig["review_loop"],
+  RawWorkflowConfig["issue_breakdown"],
+  RawWorkflowConfig["agent"],
+  RawWorkflowConfig["credential_profiles"]
+>;
 
 export interface TrackerConfig {
   kind: "linear";
@@ -682,9 +735,29 @@ export interface TranscriptCleanupConfig {
   };
 }
 
+export type WorkflowProjectContext = NormalizedProjectContext<
+  TrackerConfig,
+  WorkspaceConfig,
+  GitHubConfig,
+  ReviewLoopConfig,
+  IssueBreakdownConfig,
+  AgentConfig,
+  RawCredentialProfilesConfig
+> & {
+  credentialProfileRegistry: CredentialProfileRegistry;
+};
+
+export type WorkflowProjectContextRegistry = ProjectContextRegistry<WorkflowProjectContext>;
+
+export interface TopLevelParseDependencyDefaults {
+  tracker: TrackerConfig;
+  workspace: WorkspaceConfig;
+}
+
 export interface ServiceConfig {
   workflowPath: string;
   workflowDir: string;
+  environment: NodeJS.ProcessEnv;
   tracker: TrackerConfig;
   polling: {
     intervalMs: number;
@@ -710,11 +783,26 @@ export interface ServiceConfig {
   issueTriage: IssueTriageConfig;
   postMortem: PostMortemConfig;
   handoffRepair: HandoffRepairConfig;
+  projectContexts: WorkflowProjectContextRegistry;
+  topLevelDefaults?: TopLevelParseDependencyDefaults;
   raw: RawWorkflowConfig;
+}
+
+export function resolveDefaultProjectContextCredentialProfiles(
+  raw: RawWorkflowConfig,
+  defaultContextId: string,
+): RawWorkflowConfig["credential_profiles"] | undefined {
+  for (const context of raw.project_contexts ?? []) {
+    if (normalizeProjectContextId(context.id) === defaultContextId) {
+      return mergeCredentialProfileDefaults(raw.credential_profiles, context.credential_profiles);
+    }
+  }
+  return raw.credential_profiles;
 }
 
 const DEFAULT_ACTIVE_STATES = ["Todo", "In Progress"];
 const DEFAULT_TERMINAL_STATES = ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"];
+
 const VALID_CURSOR_SETTING_SOURCES = new Set<CursorSettingSource>([
   "project",
   "user",
@@ -758,6 +846,178 @@ const DEFAULT_ISSUE_BREAKDOWN_PROMPT = [
   "Symphony persists these proposals locally; do not create or modify Linear issues.",
 ].join("\n");
 
+const AUTHORIZED_RUNTIME_SOURCE_PATH_PATTERN =
+  /(?:^|[^a-z0-9._\/-])((?:cursor\/)?src\/[a-z0-9._/*-]+(?:\/[a-z0-9._/*-]+)*)(?=$|[^a-z0-9._\/-])/gi;
+
+interface MarkdownFenceDelimiter {
+  marker: "`" | "~";
+  length: number;
+  trailing: string;
+}
+
+export interface IssueRuntimeSourceScope {
+  hasTouchedSurfacesSection: boolean;
+  authorizedPaths: string[];
+}
+
+export function parseIssueRuntimeSourceScope(description: string | null | undefined): IssueRuntimeSourceScope {
+  if (typeof description !== "string" || description.trim().length === 0) {
+    return { hasTouchedSurfacesSection: false, authorizedPaths: [] };
+  }
+
+  const touchedSurfaces = markdownSections(description).get("touched surfaces");
+  if (touchedSurfaces === undefined) {
+    return { hasTouchedSurfacesSection: false, authorizedPaths: [] };
+  }
+
+  const authorizedPaths = new Set<string>();
+  for (const match of normalizeRuntimeSourcePathScanText(touchedSurfaces).matchAll(AUTHORIZED_RUNTIME_SOURCE_PATH_PATTERN)) {
+    const candidate = normalizeRuntimeSourcePath(match[1] ?? "");
+    if (!isRuntimeSourcePath(candidate)) continue;
+    authorizedPaths.add(candidate);
+  }
+
+  return {
+    hasTouchedSurfacesSection: true,
+    authorizedPaths: [...authorizedPaths],
+  };
+}
+
+export function normalizeRuntimeSourcePath(value: string): string {
+  return normalizeRuntimeSourcePathScanText(value)
+    .trim()
+    .replace(/^[`"'(<[{]+/g, "")
+    .replace(/[`"')>\]}]+$/g, "")
+    .replace(/[.!?,;:]+$/g, "")
+    .replace(/^(?:\.\/)+/g, "")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/");
+}
+
+export function isRuntimeSourcePath(value: string | null | undefined): boolean {
+  if (typeof value !== "string") return false;
+  const normalized = normalizeRuntimeSourcePath(value);
+  const comparisonKey = normalized.toLowerCase();
+  if (comparisonKey.length === 0) return false;
+  if (comparisonKey.startsWith("hermes/upstream-src/")) return false;
+  return comparisonKey.startsWith("src/") || comparisonKey.startsWith("cursor/src/");
+}
+
+export function matchesRuntimeSourcePathPattern(pattern: string, value: string): boolean {
+  return runtimeSourcePathPatternMatches(normalizeRuntimeSourcePath(pattern).toLowerCase(), normalizeRuntimeSourcePath(value).toLowerCase());
+}
+
+function markdownSections(description: string): Map<string, string> {
+  const sections = new Map<string, string>();
+  let currentHeading: string | null = null;
+  let buffer: string[] = [];
+  let activeFence: MarkdownFenceDelimiter | null = null;
+
+  const flush = (): void => {
+    if (!currentHeading) return;
+    sections.set(currentHeading, buffer.join("\n").trim());
+  };
+
+  for (const line of description.split(/\r?\n/)) {
+    const fence = parseMarkdownFenceDelimiter(line);
+    if (activeFence) {
+      if (
+        fence &&
+        fence.marker === activeFence.marker &&
+        fence.length >= activeFence.length &&
+        fence.trailing.trim().length === 0
+      ) {
+        activeFence = null;
+      }
+      if (currentHeading) buffer.push(line);
+      continue;
+    }
+
+    if (fence) {
+      activeFence = fence;
+      if (currentHeading) buffer.push(line);
+      continue;
+    }
+
+    const match = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+    if (match) {
+      flush();
+      currentHeading = normalizeIssueContractHeading(match[1] ?? "");
+      buffer = [];
+      continue;
+    }
+    if (currentHeading) buffer.push(line);
+  }
+
+  flush();
+  return sections;
+}
+
+function parseMarkdownFenceDelimiter(line: string): MarkdownFenceDelimiter | null {
+  const match = line.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+  if (!match) return null;
+
+  const delimiter = match[1] ?? "";
+  const marker = delimiter[0];
+  if (marker !== "`" && marker !== "~") return null;
+
+  return {
+    marker,
+    length: delimiter.length,
+    trailing: match[2] ?? "",
+  };
+}
+
+function normalizeIssueContractHeading(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/&amp;/g, "and")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function normalizeRuntimeSourcePathScanText(value: string): string {
+  return value.replace(/\\/g, "/");
+}
+
+function runtimeSourcePathPatternMatches(pattern: string, value: string): boolean {
+  if (!runtimeSourcePathPatternHasGlob(pattern)) return pattern === value;
+  return runtimeSourceGlobPatternToRegExp(pattern).test(value);
+}
+
+function runtimeSourcePathPatternHasGlob(value: string): boolean {
+  return value.includes("*");
+}
+
+function runtimeSourceGlobPatternToRegExp(pattern: string): RegExp {
+  let source = "^";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index] ?? "";
+    if (char === "*") {
+      if (pattern[index + 1] === "*") {
+        if (pattern[index + 2] === "/") {
+          source += "(?:[^/]+/)*";
+          index += 2;
+        } else {
+          source += ".*";
+          index += 1;
+        }
+      } else {
+        source += "[^/]*";
+      }
+      continue;
+    }
+    source += escapeRegExp(char);
+  }
+  source += "$";
+  return new RegExp(source);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[\\^$+?.()|[\]{}]/g, "\\$&");
+}
+
 export function parseDatabaseConfig(rawInput: unknown, workflowPath: string, env = process.env): DatabaseConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
   if (!parsed.success) {
@@ -770,106 +1030,34 @@ export function parseDatabaseConfig(rawInput: unknown, workflowPath: string, env
 export function parseServiceConfig(rawInput: unknown, workflowPath: string, env = process.env): ServiceConfig {
   const parsed = rawConfigSchema.safeParse(rawInput ?? {});
   if (!parsed.success) {
-    throw new SymphonyError("config_validation_error", "Workflow config is invalid", parsed.error.flatten());
+    throw new SymphonyError("config_validation_error", "Workflow config is invalid", buildWorkflowConfigValidationDetails(rawInput, parsed.error));
   }
 
   const raw = parsed.data;
   const workflowDir = path.dirname(path.resolve(workflowPath));
-  const trackerKind = raw.tracker?.kind ?? "linear";
-  if (trackerKind !== "linear") {
-    throw new SymphonyError("unsupported_tracker_kind", `Unsupported tracker kind: ${trackerKind}`);
-  }
-
-  const trackerApiKey =
-    resolveConfigString(raw.tracker?.api_key, env) ?? resolveConfigString("$LINEAR_API_KEY", env) ?? "";
-  if (trackerApiKey.length === 0) {
-    throw new SymphonyError("missing_tracker_api_key", "Linear API key is required");
-  }
-
-  const projectSlug = resolveConfigString(raw.tracker?.project_slug, env) ?? "";
-  if (projectSlug.length === 0) {
-    throw new SymphonyError("missing_tracker_project_slug", "Linear project slug is required");
-  }
-  const trackerAssignee =
-    resolveConfigString(raw.tracker?.assignee, env) ?? resolveConfigString("$LINEAR_ASSIGNEE", env) ?? "";
-
-  const workspaceRoot = resolvePathValue(raw.workspace?.root ?? "symphony_workspaces", workflowDir, env);
-  const workspaceStateDir = resolvePathValue(raw.workspace?.state_dir ?? ".symphony", workspaceRoot, env);
-  const sourceKind = raw.workspace?.source?.kind ?? "none";
-  const sourcePath =
-    raw.workspace?.source?.path === undefined
-      ? undefined
-      : resolvePathValue(raw.workspace.source.path, workflowDir, env);
-  const sourceCachePath =
-    raw.workspace?.source?.cache_path === undefined
-      ? undefined
-      : resolvePathValue(raw.workspace.source.cache_path, workflowDir, env);
-  const sourceRepository =
-    raw.workspace?.source?.repository === undefined
-      ? undefined
-      : resolveRepositoryValue(raw.workspace.source.repository, workflowDir, env);
-
-  if (sourceKind === "git_worktree") {
-    if (!raw.workspace?.source?.repository) {
-      throw new SymphonyError("config_validation_error", "workspace.source.repository is required for git_worktree");
-    }
-    if (!raw.workspace?.source?.base_ref) {
-      throw new SymphonyError("config_validation_error", "workspace.source.base_ref is required for git_worktree");
-    }
-  }
-  const issueBreakdownWorkspaceMode = raw.issue_breakdown?.workspace_mode ?? "none";
-  if (issueBreakdownWorkspaceMode === "readonly_checkout" || issueBreakdownWorkspaceMode === "writable_checkout") {
-    if (sourceKind !== "git_worktree") {
-      throw new SymphonyError(
-        "config_validation_error",
-        `issue_breakdown.workspace_mode ${issueBreakdownWorkspaceMode} requires workspace.source.kind git_worktree`,
-      );
-    }
-  }
-  if (issueBreakdownWorkspaceMode === "readonly_checkout") {
-    if (process.platform === "win32") {
-      throw new SymphonyError(
-        "config_validation_error",
-        "issue_breakdown.workspace_mode readonly_checkout is not supported on Windows; use workspace_mode none",
-      );
-    }
-  }
-
-  const workspaceSource: WorkspaceSourceConfig = {
-    kind: sourceKind,
-    ...(sourcePath === undefined ? {} : { path: sourcePath }),
-    ...(sourceRepository === undefined ? {} : { repository: sourceRepository }),
-    ...(raw.workspace?.source?.ref === undefined ? {} : { ref: raw.workspace.source.ref }),
-    ...(raw.workspace?.source?.base_ref === undefined ? {} : { baseRef: raw.workspace.source.base_ref }),
-    ...(raw.workspace?.source?.branch_template === undefined
-      ? {}
-      : { branchTemplate: raw.workspace.source.branch_template }),
-    ...(sourceCachePath === undefined ? {} : { cachePath: sourceCachePath }),
-    ...(raw.workspace?.source?.cleanup === undefined ? {} : { cleanup: raw.workspace.source.cleanup }),
+  const topLevelDefaults: TopLevelParseDependencyDefaults = {
+    tracker: normalizeTrackerConfigForProjectContext(raw.tracker, env, {
+      enabled: false,
+      contextPath: "workflow",
+    }),
+    workspace: normalizeWorkspaceConfigForProjectContext(raw.workspace, workflowDir, env, {
+      enabled: false,
+      contextPath: "workflow",
+      requireExplicitWorkspaceSource: false,
+    }),
   };
+  const projectContexts = normalizeWorkflowProjectContexts(raw, workflowDir, env);
+  const defaultContext = projectContexts.defaultContext;
+  const tracker = defaultContext.tracker;
+  const workspace = defaultContext.workspace;
+  const github = defaultContext.github;
+  const reviewLoop = defaultContext.reviewLoop;
+  const issueBreakdown = defaultContext.issueBreakdown;
+  const agent = defaultContext.agent;
   const promptTemplatesDir =
     raw.prompts?.templates_dir === undefined ? null : resolvePathValue(raw.prompts.templates_dir, workflowDir, env);
   const promptTemplates = normalizePromptTemplateMap(raw.prompts?.templates);
 
-  const agentHarness = normalizeAgentHarness(raw.agent?.harness);
-  const agentMaxTurns = raw.agent?.max_turns ?? 20;
-  const activeStates = raw.tracker?.active_states ?? DEFAULT_ACTIVE_STATES;
-  const handoffStates = raw.tracker?.handoff_states ?? [];
-  const terminalStates = raw.tracker?.terminal_states ?? DEFAULT_TERMINAL_STATES;
-  const githubOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.owner, env));
-  const githubRepo = normalizeOptionalConfigString(resolveConfigString(raw.github?.repo, env));
-  const githubToken = normalizeOptionalConfigString(
-    resolveConfigString(raw.github?.token, env) ?? resolveConfigString("$GITHUB_TOKEN", env),
-  );
-  const githubApp = normalizeGitHubAppConfig(raw.github?.app, workflowDir, env);
-  const githubHeadOwner = normalizeOptionalConfigString(resolveConfigString(raw.github?.head_owner, env)) ?? githubOwner;
-  const publishPullRequests = raw.github?.publish_pull_requests ?? false;
-  const githubOperatorApproval = {
-    requiredForPublication: raw.github?.operator_approval?.required_for_publication ?? false,
-    rejectPolicy: raw.github?.operator_approval?.reject_policy ?? "cancel",
-    pollIntervalMs: raw.github?.operator_approval?.poll_interval_ms ?? 2_000,
-    timeoutMs: raw.github?.operator_approval?.timeout_ms ?? null,
-  };
   const cursorModel = raw.cursor?.model ?? DEFAULT_CURSOR_MODEL;
   const cursorModelParams = normalizeCursorModelParams(raw.cursor?.model_params);
   const cursorAllowLargeContext = raw.cursor?.allow_large_context ?? false;
@@ -884,7 +1072,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       : resolvePathValue(raw.hermes.templates_dir, workflowDir, env);
   const hermesStateDir =
     raw.hermes?.state_dir === undefined
-      ? path.join(workspaceStateDir, "hermes")
+      ? path.join(workspace.stateDir, "hermes")
       : resolvePathValue(raw.hermes.state_dir, workflowDir, env);
   const legacyHermesAcpBinaryPath = normalizeOptionalConfigString(
     resolveConfigString(raw.hermes?.acp_binary_path ?? raw.hermes?.binary_path, env),
@@ -943,74 +1131,57 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
   const serverWebAssetsRoot = resolveOptionalPathValue(raw.server?.web_assets_root, workflowDir, env);
   const serverEnableStatusServer = raw.server?.enable_status_server ?? raw.server?.["enable-status-server"] ?? false;
   const database = normalizeDatabaseConfig(raw, workflowDir, env);
+  const credentialProfilesRaw = defaultContext.credentialProfiles;
   const credentialProfiles = createCredentialProfileRegistry({
-    raw: raw.credential_profiles,
+    raw: credentialProfilesRaw,
     env,
     workflowDir,
     fallbacks: {
-      githubToken,
-      linearApiKey: trackerApiKey,
+      githubToken: github.token,
+      linearApiKey: tracker.apiKey,
       cursorRuntimeApiKey,
       openWorkspaceToken: serverOpenWorkspaceToken,
     },
+    errorTransformer: (error) => attachDefaultProjectContextValidationSignal(error, raw, defaultContext.id),
   });
-  const reviewStates = raw.review_loop?.review_states ?? handoffStates;
-  const blockedStates = raw.review_loop?.blocked_states ?? [];
-  const reviewPassState = raw.review_loop?.review_pass_state ?? null;
-  const pullRequestHandoff = normalizePullRequestHandoff(raw, {
-    publishPullRequests,
-    handoffStates,
-    reviewStates,
-  });
-  const mergePolicy = normalizeMergePolicy(raw, reviewPassState);
+  const mergePolicy = normalizeMergePolicy(raw, reviewLoop.reviewPassState);
+
+
   validateStateBuckets({
-    activeStates,
-    handoffStates,
-    terminalStates,
-    reviewStates,
-    blockedStates,
-    reviewPassState,
+    activeStates: tracker.activeStates,
+    handoffStates: tracker.handoffStates,
+    terminalStates: tracker.terminalStates,
+    reviewStates: reviewLoop.reviewStates,
+    blockedStates: reviewLoop.blockedStates,
+    reviewPassState: reviewLoop.reviewPassState,
   });
   validatePullRequestHandoffPolicy({
-    publishPullRequests,
-    handoffStates,
-    reviewStates,
-    blockedStates,
-    reviewPassState,
-    prHandoff: pullRequestHandoff,
+    publishPullRequests: github.publishPullRequests,
+    handoffStates: tracker.handoffStates,
+    reviewStates: reviewLoop.reviewStates,
+    blockedStates: reviewLoop.blockedStates,
+    reviewPassState: reviewLoop.reviewPassState,
+    prHandoff: github.prHandoff,
   });
   const issueBoard = normalizeIssueBoardColumns(raw, {
-    activeStates,
-    handoffStates,
-    terminalStates,
-    reviewStates,
-    blockedStates,
-    reviewPassState,
+    activeStates: tracker.activeStates,
+    handoffStates: tracker.handoffStates,
+    terminalStates: tracker.terminalStates,
+    reviewStates: reviewLoop.reviewStates,
+    blockedStates: reviewLoop.blockedStates,
+    reviewPassState: reviewLoop.reviewPassState,
     mergePolicy,
   });
 
   return {
     workflowPath: path.resolve(workflowPath),
     workflowDir,
-    tracker: {
-      kind: "linear",
-      endpoint: raw.tracker?.endpoint ?? "https://api.linear.app/graphql",
-      apiKey: trackerApiKey,
-      projectSlug,
-      assignee: trackerAssignee.length === 0 ? null : trackerAssignee,
-      pageSize: raw.tracker?.page_size ?? 250,
-      activeStates,
-      handoffStates,
-      terminalStates,
-    },
+    environment: env,
+    tracker,
     polling: {
       intervalMs: raw.polling?.interval_ms ?? 30_000,
     },
-    workspace: {
-      root: workspaceRoot,
-      stateDir: workspaceStateDir,
-      source: workspaceSource,
-    },
+    workspace,
     hooks: {
       afterCreate: raw.hooks?.after_create ?? null,
       beforeRun: raw.hooks?.before_run ?? null,
@@ -1018,21 +1189,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       beforeRemove: raw.hooks?.before_remove ?? null,
       timeoutMs: raw.hooks?.timeout_ms ?? 60_000,
     },
-    agent: {
-      harness: agentHarness,
-      maxConcurrentAgents: raw.agent?.max_concurrent_agents ?? 10,
-      maxTurns: agentMaxTurns,
-      maxRetryBackoffMs: raw.agent?.max_retry_backoff_ms ?? 300_000,
-      maxSdkErrorRetries: raw.agent?.max_sdk_error_retries ?? 2,
-      maxInfraFailures: raw.agent?.max_infra_failures ?? 3,
-      maxConcurrentAgentsByState: normalizeStateLimitMap(raw.agent?.max_concurrent_agents_by_state),
-      requireLabels: normalizeLabels(raw.agent?.require_labels),
-      excludeLabels: normalizeLabels(raw.agent?.exclude_labels),
-      workerExcludeLabels: normalizeLabels(raw.agent?.worker_exclude_labels),
-      reviewerExcludeLabels: normalizeLabels(raw.agent?.reviewer_exclude_labels),
-      plannerExcludeLabels: normalizeLabels(raw.agent?.planner_exclude_labels),
-      protectedPaths: raw.agent?.protected_paths ?? [],
-    },
+    agent,
     prompts: {
       templatesDir: promptTemplatesDir,
       templates: promptTemplates,
@@ -1050,6 +1207,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       upstreamRoot: hermesUpstreamRoot,
       python: hermesPython,
       templatesDir: hermesTemplatesDir,
+
       stateDir: hermesStateDir,
       acpBinaryPath: legacyHermesAcpBinaryPath,
       acpSourceProfile: legacyHermesAcpSourceProfile,
@@ -1103,35 +1261,9 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       dispatchState: raw.writeback?.dispatch_state ?? "In Progress",
       maxBackoffMs: raw.writeback?.max_backoff_ms ?? 300_000,
     },
-    github: {
-      owner: githubOwner,
-      repo: githubRepo,
-      token: githubToken,
-      app: githubApp,
-      headOwner: githubHeadOwner,
-      apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(raw.github?.api_base_url, env)) ?? "https://api.github.com",
-      publishPullRequests,
-      operatorApproval: githubOperatorApproval,
-      prHandoff: pullRequestHandoff,
-    },
+    github,
     credentialProfiles,
-    reviewLoop: {
-      reviewStates,
-      blockedStates,
-      reviewPassState,
-      reviewerPromptTemplate: raw.review_loop?.reviewer_prompt ?? null,
-      reviewerPromptExtensions: normalizePromptExtensions(raw.review_loop?.reviewer_prompt_extensions),
-      workerPromptExtensions: normalizePromptExtensions(raw.review_loop?.worker_prompt_extensions),
-      maxReviewRounds: raw.review_loop?.max_review_rounds ?? 3,
-      failureLimits: {
-        reviewerFailures: raw.review_loop?.failure_limits?.reviewer_failures ?? raw.review_loop?.max_review_rounds ?? 3,
-        mergeGateFailures: raw.review_loop?.failure_limits?.merge_gate_failures ?? raw.review_loop?.max_review_rounds ?? 3,
-      },
-      maxIncompleteTurns: raw.review_loop?.max_incomplete_turns ?? 3,
-      continuationHistoryThreshold: raw.review_loop?.continuation_history_threshold ?? 5,
-      transcriptHistoryLimit: raw.review_loop?.transcript_history_limit ?? raw.review_loop?.continuation_history_threshold ?? 5,
-      prReviewEvidenceLimit: raw.review_loop?.pr_review_evidence_limit ?? 5,
-    },
+    reviewLoop,
     mergePolicy,
     issueBoard: {
       columns: issueBoard,
@@ -1149,23 +1281,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       },
     },
     database,
-    issueBreakdown: {
-      enabled: raw.issue_breakdown?.enabled ?? false,
-      cursorMode: raw.issue_breakdown?.cursor_mode ?? "plan",
-      promptTemplate: raw.issue_breakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
-      planningLabels: normalizeLabels(raw.issue_breakdown?.planning_labels),
-      applyToLinear: {
-        enabled: raw.issue_breakdown?.apply_to_linear?.enabled ?? false,
-        mode: raw.issue_breakdown?.apply_to_linear?.mode ?? "child_issues",
-        autoApply: raw.issue_breakdown?.apply_to_linear?.auto_apply ?? raw.issue_breakdown?.apply_to_linear?.enabled ?? false,
-      },
-      workspaceMode: issueBreakdownWorkspaceMode,
-      maxPlanningFailures: raw.issue_breakdown?.max_planning_failures ?? 3,
-      maxPlanningDispatchRetries:
-        raw.issue_breakdown?.max_planning_dispatch_retries ?? raw.issue_breakdown?.max_planning_failures ?? 3,
-      planningRetryBaseMs: raw.issue_breakdown?.planning_retry_base_ms ?? 5_000,
-      planningRetryMaxMs: raw.issue_breakdown?.planning_retry_max_ms ?? 60_000,
-    },
+    issueBreakdown,
     issueTriage: {
       enabled: raw.issue_triage?.enabled ?? false,
       mode: raw.issue_triage?.mode ?? "classify_only",
@@ -1183,15 +1299,1005 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       maxAttempts: raw.handoff_repair?.max_attempts ?? 1,
       phases: [...(raw.handoff_repair?.phases ?? DEFAULT_HANDOFF_REPAIR_PHASES)],
     },
+    projectContexts,
+    topLevelDefaults,
     raw,
   };
 }
+
+
+
+function normalizeWorkflowProjectContexts(
+  raw: RawWorkflowConfig,
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+): WorkflowProjectContextRegistry {
+  const legacyDefaultContext = normalizeLegacyDefaultProjectContext({
+    tracker: raw.tracker,
+    workspace: raw.workspace,
+    github: raw.github,
+    review_loop: raw.review_loop,
+    issue_breakdown: raw.issue_breakdown,
+    agent: raw.agent,
+    credential_profiles: raw.credential_profiles,
+  }) as RawProjectContextConfig;
+  const defaults = legacyDefaultContext as WorkflowProjectContextConfig;
+  const rawProjectContexts = raw.project_contexts ?? [];
+
+  const contexts =
+    rawProjectContexts.length > 0
+      ? rawProjectContexts.map((context, index) =>
+          normalizeWorkflowProjectContext(context, defaults, workflowDir, env, {
+            requireExplicitWorkspaceSource: true,
+            contextPath: rawProjectContextPath(rawProjectContexts, index),
+          }),
+        )
+      : [
+          normalizeWorkflowProjectContext(legacyDefaultContext, {}, workflowDir, env, {
+            requireExplicitWorkspaceSource: false,
+            contextPath: rawProjectContextPath([legacyDefaultContext], 0),
+          }),
+        ];
+
+  try {
+    return buildProjectContextRegistry(contexts);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Project contexts are invalid";
+    const duplicateProjectContextId = duplicateProjectContextIdFromMessage(message);
+    const projectContextPaths =
+      duplicateProjectContextId !== null
+        ? rawProjectContextPathsByNormalizedId(raw.project_contexts ?? [], duplicateProjectContextId)
+        : message === "At least one enabled project context is required"
+          ? rawProjectContextPaths(raw.project_contexts ?? [])
+          : [];
+    throw new SymphonyError(
+      "config_validation_error",
+      message,
+      projectContextPaths.length === 0 && duplicateProjectContextId === null
+        ? undefined
+        : {
+            ...(projectContextPaths.length === 0 ? {} : { projectContextPaths }),
+            ...(duplicateProjectContextId === null ? {} : { duplicateProjectContextId }),
+          },
+    );
+  }
+}
+
+function normalizeWorkflowProjectContext(
+  rawContext: RawProjectContextConfig,
+  defaults: Partial<WorkflowProjectContextConfig>,
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+  options: { requireExplicitWorkspaceSource: boolean; contextPath: string },
+): WorkflowProjectContext {
+  const { contextPath } = options;
+  try {
+    let id: string;
+    try {
+      id = normalizeProjectContextId(rawContext.id);
+    } catch (error) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `${contextPath}.id must contain at least one letter or number after normalization`,
+        { cause: error instanceof Error ? error.message : String(error) },
+      );
+    }
+
+    const enabled = rawContext.enabled ?? true;
+    const label = normalizeOptionalConfigString(rawContext.label) ?? defaultProjectContextLabel(id);
+    const merged = mergeWorkflowProjectContextDefaults(defaults, rawContext);
+    const tracker = normalizeTrackerConfigForProjectContext(merged.tracker, env, { enabled, contextPath });
+    const workspace = normalizeWorkspaceConfigForProjectContext(merged.workspace, workflowDir, env, {
+      enabled,
+      contextPath,
+      requireExplicitWorkspaceSource: options.requireExplicitWorkspaceSource,
+    });
+    const reviewLoop = normalizeReviewLoopConfigForProjectContext(merged.review_loop, tracker);
+    const github = normalizeGitHubConfigForProjectContext(
+      merged.github,
+      workflowDir,
+      env,
+      tracker.handoffStates,
+      reviewLoop.reviewStates,
+    );
+    const issueBreakdown = normalizeIssueBreakdownConfigForProjectContext(
+      merged.issue_breakdown,
+      workspace.source.kind,
+      contextPath,
+      enabled,
+    );
+    const agent = normalizeAgentConfigForProjectContext(merged.agent);
+
+    const credentialProfileRegistry = createCredentialProfileRegistry({
+      raw: merged.credential_profiles,
+      env,
+      workflowDir,
+      fallbacks: {
+        githubToken: github.token,
+        linearApiKey: tracker.apiKey,
+        cursorRuntimeApiKey: null,
+        openWorkspaceToken: null,
+      },
+      errorTransformer: (error) => prefixProjectContextValidationPath(error, contextPath),
+    });
+
+    if (enabled) {
+      validateStateBuckets({
+        activeStates: tracker.activeStates,
+        handoffStates: tracker.handoffStates,
+        terminalStates: tracker.terminalStates,
+        reviewStates: reviewLoop.reviewStates,
+        blockedStates: reviewLoop.blockedStates,
+        reviewPassState: reviewLoop.reviewPassState,
+        attachFieldPathDetails: true,
+      });
+      validatePullRequestHandoffPolicy({
+        publishPullRequests: github.publishPullRequests,
+        handoffStates: tracker.handoffStates,
+        reviewStates: reviewLoop.reviewStates,
+        blockedStates: reviewLoop.blockedStates,
+        reviewPassState: reviewLoop.reviewPassState,
+        prHandoff: github.prHandoff,
+        attachFieldPathDetails: true,
+      });
+    }
+
+    const publicMetadataRepository =
+      workspace.source.kind === "git" || workspace.source.kind === "git_worktree"
+        ? resolveOptionalConfigStringValue(merged.workspace?.source?.repository, env)
+        : undefined;
+    const publicSummary = projectContextSummaryForPublicRead({
+      id,
+      label,
+      enabled,
+      tracker: {
+        projectSlug: tracker.projectSlug,
+        apiKey: tracker.apiKey,
+      },
+      workspace: {
+        root: workspace.root,
+        source: {
+          kind: workspace.source.kind,
+          repository: publicMetadataRepository ?? null,
+          path: workspace.source.path ?? null,
+          ref: workspace.source.ref ?? null,
+          baseRef: workspace.source.baseRef ?? null,
+          branchTemplate: workspace.source.branchTemplate ?? null,
+          cachePath: workspace.source.cachePath ?? null,
+          cleanup: workspace.source.cleanup ?? null,
+        },
+      },
+      github: {
+        token: github.token,
+      },
+    });
+
+    return {
+      id,
+      label,
+      enabled,
+      source: options.requireExplicitWorkspaceSource ? "explicit" : "legacy_default",
+      tracker,
+      workspace,
+      github,
+      reviewLoop,
+      issueBreakdown,
+      agent,
+      ...(merged.credential_profiles === undefined ? {} : { credentialProfiles: merged.credential_profiles }),
+      credentialProfileRegistry,
+      publicMetadata: publicSummary.publicMetadata,
+      publicSummary,
+    };
+  } catch (error) {
+    throw attachProjectContextValidationSignal(error, contextPath);
+  }
+}
+
+function mergeWorkflowProjectContextDefaults(
+  defaults: Partial<WorkflowProjectContextConfig>,
+  context: RawProjectContextConfig,
+): WorkflowProjectContextConfig {
+  const tracker = mergeConfigObjects(defaults.tracker, context.tracker);
+  const workspace = mergeWorkspaceDefaults(defaults.workspace, context.workspace);
+  const github = mergeGitHubDefaults(defaults.github, context.github);
+  const reviewLoop = mergeConfigObjects(defaults.review_loop, context.review_loop);
+  const issueBreakdown = mergeIssueBreakdownDefaults(defaults.issue_breakdown, context.issue_breakdown);
+  const agent = mergeAgentDefaults(defaults.agent, context.agent);
+  const credentialProfiles = mergeCredentialProfileDefaults(defaults.credential_profiles, context.credential_profiles);
+
+  return {
+    id: context.id,
+    ...(context.label === undefined ? {} : { label: context.label }),
+    ...(context.enabled === undefined ? {} : { enabled: context.enabled }),
+    ...(tracker === undefined ? {} : { tracker }),
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(github === undefined ? {} : { github }),
+    ...(reviewLoop === undefined ? {} : { review_loop: reviewLoop }),
+    ...(issueBreakdown === undefined ? {} : { issue_breakdown: issueBreakdown }),
+    ...(agent === undefined ? {} : { agent }),
+    ...(credentialProfiles === undefined ? {} : { credential_profiles: credentialProfiles }),
+  };
+}
+
+function normalizeTrackerConfigForProjectContext(
+  rawTracker: RawWorkflowConfig["tracker"],
+  env: NodeJS.ProcessEnv,
+  options: { enabled: boolean; contextPath: string },
+): TrackerConfig {
+  const trackerKind = rawTracker?.kind ?? "linear";
+  if (trackerKind !== "linear") {
+    throw new SymphonyError(
+      "unsupported_tracker_kind",
+      `${options.contextPath}.tracker.kind must be linear; received ${trackerKind}`,
+    );
+  }
+
+  const apiKey = normalizeOptionalConfigString(
+    resolveConfigString(rawTracker?.api_key, env) ?? resolveConfigString("$LINEAR_API_KEY", env),
+  );
+  if (options.enabled && apiKey === null) {
+    throw new SymphonyError("missing_tracker_api_key", `${options.contextPath}.tracker.api_key is required`);
+  }
+
+  const projectSlug = normalizeOptionalConfigString(resolveConfigString(rawTracker?.project_slug, env));
+  if (options.enabled && projectSlug === null) {
+    throw new SymphonyError("missing_tracker_project_slug", `${options.contextPath}.tracker.project_slug is required`);
+  }
+
+  return {
+    kind: "linear",
+    endpoint: rawTracker?.endpoint ?? "https://api.linear.app/graphql",
+    apiKey: apiKey ?? "",
+    projectSlug: projectSlug ?? "",
+    assignee:
+      normalizeOptionalConfigString(resolveConfigString(rawTracker?.assignee, env)) ??
+      normalizeOptionalConfigString(resolveConfigString("$LINEAR_ASSIGNEE", env)),
+    pageSize: rawTracker?.page_size ?? 250,
+    activeStates: rawTracker?.active_states ?? DEFAULT_ACTIVE_STATES,
+    handoffStates: rawTracker?.handoff_states ?? [],
+    terminalStates: rawTracker?.terminal_states ?? DEFAULT_TERMINAL_STATES,
+  };
+}
+
+function normalizeWorkspaceConfigForProjectContext(
+  rawWorkspace: RawWorkflowConfig["workspace"],
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+  options: { enabled: boolean; contextPath: string; requireExplicitWorkspaceSource: boolean },
+): WorkspaceConfig {
+  const root = resolvePathValue(rawWorkspace?.root ?? "symphony_workspaces", workflowDir, env);
+  const stateDir = resolvePathValue(rawWorkspace?.state_dir ?? ".symphony", root, env);
+  const sourceKind = rawWorkspace?.source?.kind ?? "none";
+  const sourcePath = resolveOptionalPathValue(rawWorkspace?.source?.path, workflowDir, env) ?? undefined;
+  const sourceCachePath = resolveOptionalPathValue(rawWorkspace?.source?.cache_path, workflowDir, env) ?? undefined;
+  const sourceRepository = resolveOptionalRepositoryValue(rawWorkspace?.source?.repository, workflowDir, env);
+  const sourceRef = resolveOptionalConfigStringValue(rawWorkspace?.source?.ref, env);
+  const sourceBaseRef = resolveOptionalConfigStringValue(rawWorkspace?.source?.base_ref, env);
+  const sourceBranchTemplate = resolveOptionalConfigStringValue(rawWorkspace?.source?.branch_template, env);
+
+  if (options.enabled && options.requireExplicitWorkspaceSource && sourceKind === "none") {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${options.contextPath}.workspace.source is required for enabled project contexts`,
+    );
+  }
+  if (options.enabled && sourceKind === "copy" && sourcePath === undefined) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${options.contextPath}.workspace.source.path is required for copy`,
+    );
+  }
+  if (options.enabled && sourceKind === "git" && sourceRepository === undefined) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `${options.contextPath}.workspace.source.repository is required for git`,
+    );
+  }
+  if (options.enabled && sourceKind === "git_worktree") {
+    if (sourceRepository === undefined) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `${options.contextPath}.workspace.source.repository is required for git_worktree`,
+      );
+    }
+    if (sourceBaseRef === undefined) {
+      throw new SymphonyError(
+        "config_validation_error",
+        `${options.contextPath}.workspace.source.base_ref is required for git_worktree`,
+      );
+    }
+  }
+
+  const sourceCleanup = rawWorkspace?.source?.cleanup;
+  const source: WorkspaceSourceConfig = {
+    kind: sourceKind,
+    ...(sourceCleanup === undefined ? {} : { cleanup: sourceCleanup }),
+  };
+
+  switch (sourceKind) {
+    case "copy":
+      if (sourcePath !== undefined) {
+        source.path = sourcePath;
+      }
+      break;
+    case "git":
+      if (sourceRepository !== undefined) {
+        source.repository = sourceRepository;
+      }
+      if (sourceRef !== undefined) {
+        source.ref = sourceRef;
+      }
+      break;
+    case "git_worktree":
+      if (sourcePath !== undefined) {
+        source.path = sourcePath;
+      }
+      if (sourceRepository !== undefined) {
+        source.repository = sourceRepository;
+      }
+      if (sourceBaseRef !== undefined) {
+        source.baseRef = sourceBaseRef;
+      }
+      if (sourceBranchTemplate !== undefined) {
+        source.branchTemplate = sourceBranchTemplate;
+      }
+      if (sourceCachePath !== undefined) {
+        source.cachePath = sourceCachePath;
+      }
+      break;
+    case "none":
+      break;
+  }
+
+  return {
+    root,
+    stateDir,
+    source,
+  };
+}
+
+function normalizeGitHubConfigForProjectContext(
+  rawGithub: RawWorkflowConfig["github"],
+  workflowDir: string,
+  env: NodeJS.ProcessEnv,
+  handoffStates: string[],
+  reviewStates: string[],
+): GitHubConfig {
+  const owner = normalizeOptionalConfigString(resolveConfigString(rawGithub?.owner, env));
+  const repo = normalizeOptionalConfigString(resolveConfigString(rawGithub?.repo, env));
+  const token = normalizeOptionalConfigString(
+    resolveConfigString(rawGithub?.token, env) ?? resolveConfigString("$GITHUB_TOKEN", env),
+  );
+  const app = normalizeGitHubAppConfig(rawGithub?.app, workflowDir, env);
+  const headOwner = normalizeOptionalConfigString(resolveConfigString(rawGithub?.head_owner, env)) ?? owner;
+  const publishPullRequests = rawGithub?.publish_pull_requests ?? false;
+
+  return {
+    owner,
+    repo,
+    token,
+    app,
+    headOwner,
+    apiBaseUrl: normalizeOptionalConfigString(resolveConfigString(rawGithub?.api_base_url, env)) ?? "https://api.github.com",
+    publishPullRequests,
+    operatorApproval: {
+      requiredForPublication: rawGithub?.operator_approval?.required_for_publication ?? false,
+      rejectPolicy: rawGithub?.operator_approval?.reject_policy ?? "cancel",
+      pollIntervalMs: rawGithub?.operator_approval?.poll_interval_ms ?? 2_000,
+      timeoutMs: rawGithub?.operator_approval?.timeout_ms ?? null,
+    },
+    prHandoff: normalizePullRequestHandoff(
+      { github: rawGithub } as RawWorkflowConfig,
+      { publishPullRequests, handoffStates, reviewStates },
+    ),
+  };
+}
+
+function normalizeReviewLoopConfigForProjectContext(
+  rawReviewLoop: RawWorkflowConfig["review_loop"],
+  tracker: TrackerConfig,
+): ReviewLoopConfig {
+  const reviewStates = rawReviewLoop?.review_states ?? tracker.handoffStates;
+  return {
+    reviewStates,
+    blockedStates: rawReviewLoop?.blocked_states ?? [],
+    reviewPassState: rawReviewLoop?.review_pass_state ?? null,
+    reviewerPromptTemplate: rawReviewLoop?.reviewer_prompt ?? null,
+    reviewerPromptExtensions: normalizePromptExtensions(rawReviewLoop?.reviewer_prompt_extensions),
+    workerPromptExtensions: normalizePromptExtensions(rawReviewLoop?.worker_prompt_extensions),
+    maxReviewRounds: rawReviewLoop?.max_review_rounds ?? 3,
+    failureLimits: {
+      reviewerFailures: rawReviewLoop?.failure_limits?.reviewer_failures ?? rawReviewLoop?.max_review_rounds ?? 3,
+      mergeGateFailures: rawReviewLoop?.failure_limits?.merge_gate_failures ?? rawReviewLoop?.max_review_rounds ?? 3,
+    },
+    maxIncompleteTurns: rawReviewLoop?.max_incomplete_turns ?? 3,
+    continuationHistoryThreshold: rawReviewLoop?.continuation_history_threshold ?? 5,
+    transcriptHistoryLimit:
+      rawReviewLoop?.transcript_history_limit ?? rawReviewLoop?.continuation_history_threshold ?? 5,
+    prReviewEvidenceLimit: rawReviewLoop?.pr_review_evidence_limit ?? 5,
+  };
+}
+
+function normalizeIssueBreakdownConfigForProjectContext(
+  rawIssueBreakdown: RawWorkflowConfig["issue_breakdown"],
+  sourceKind: WorkspaceSourceConfig["kind"],
+  contextPath: string,
+  enabled: boolean,
+): IssueBreakdownConfig {
+  const workspaceMode = rawIssueBreakdown?.workspace_mode ?? "none";
+  if (enabled && (workspaceMode === "readonly_checkout" || workspaceMode === "writable_checkout")) {
+    if (sourceKind !== "git_worktree") {
+      throw new SymphonyError(
+        "config_validation_error",
+        `${contextPath}.issue_breakdown.workspace_mode ${workspaceMode} requires workspace.source.kind git_worktree`,
+      );
+    }
+  }
+  if (enabled && workspaceMode === "readonly_checkout") {
+    if (process.platform === "win32") {
+      throw new SymphonyError(
+        "config_validation_error",
+        "issue_breakdown.workspace_mode readonly_checkout is not supported on Windows; use workspace_mode none",
+      );
+    }
+  }
+
+  return {
+    enabled: rawIssueBreakdown?.enabled ?? false,
+    cursorMode: rawIssueBreakdown?.cursor_mode ?? "plan",
+    promptTemplate: rawIssueBreakdown?.prompt ?? DEFAULT_ISSUE_BREAKDOWN_PROMPT,
+    planningLabels: normalizeLabels(rawIssueBreakdown?.planning_labels),
+    applyToLinear: {
+      enabled: rawIssueBreakdown?.apply_to_linear?.enabled ?? false,
+      mode: rawIssueBreakdown?.apply_to_linear?.mode ?? "child_issues",
+      autoApply: rawIssueBreakdown?.apply_to_linear?.auto_apply ?? rawIssueBreakdown?.apply_to_linear?.enabled ?? false,
+    },
+    workspaceMode,
+    maxPlanningFailures: rawIssueBreakdown?.max_planning_failures ?? 3,
+    maxPlanningDispatchRetries:
+      rawIssueBreakdown?.max_planning_dispatch_retries ?? rawIssueBreakdown?.max_planning_failures ?? 3,
+    planningRetryBaseMs: rawIssueBreakdown?.planning_retry_base_ms ?? 5_000,
+    planningRetryMaxMs: rawIssueBreakdown?.planning_retry_max_ms ?? 60_000,
+  };
+}
+
+function normalizeAgentConfigForProjectContext(rawAgent: RawWorkflowConfig["agent"]): AgentConfig {
+  return {
+    harness: normalizeAgentHarness(rawAgent?.harness),
+    maxConcurrentAgents: rawAgent?.max_concurrent_agents ?? 10,
+    maxTurns: rawAgent?.max_turns ?? 20,
+    maxRetryBackoffMs: rawAgent?.max_retry_backoff_ms ?? 300_000,
+    maxSdkErrorRetries: rawAgent?.max_sdk_error_retries ?? 2,
+    maxInfraFailures: rawAgent?.max_infra_failures ?? 3,
+    maxConcurrentAgentsByState: normalizeStateLimitMap(rawAgent?.max_concurrent_agents_by_state),
+    requireLabels: normalizeLabels(rawAgent?.require_labels),
+    excludeLabels: normalizeLabels(rawAgent?.exclude_labels),
+    workerExcludeLabels: normalizeLabels(rawAgent?.worker_exclude_labels),
+    reviewerExcludeLabels: normalizeLabels(rawAgent?.reviewer_exclude_labels),
+    plannerExcludeLabels: normalizeLabels(rawAgent?.planner_exclude_labels),
+    protectedPaths: rawAgent?.protected_paths ?? [],
+  };
+}
+
+function mergeWorkspaceDefaults(
+  base: RawWorkflowConfig["workspace"] | undefined,
+  override: RawProjectContextConfig["workspace"] | undefined,
+): RawWorkflowConfig["workspace"] | undefined {
+  if (!base && !override) return undefined;
+  return {
+    ...base,
+    ...override,
+    source:
+      base?.source === undefined && override?.source === undefined
+        ? undefined
+        : {
+            ...base?.source,
+            ...override?.source,
+          },
+  };
+}
+
+function mergeGitHubDefaults(
+  base: RawWorkflowConfig["github"] | undefined,
+  override: RawProjectContextConfig["github"] | undefined,
+): RawWorkflowConfig["github"] | undefined {
+  if (!base && !override) return undefined;
+  return {
+    ...base,
+    ...override,
+    app:
+      base?.app === undefined && override?.app === undefined
+        ? undefined
+        : {
+            ...base?.app,
+            ...override?.app,
+          },
+    operator_approval:
+      base?.operator_approval === undefined && override?.operator_approval === undefined
+        ? undefined
+        : {
+            ...base?.operator_approval,
+            ...override?.operator_approval,
+          },
+    pr_handoff:
+      base?.pr_handoff === undefined && override?.pr_handoff === undefined
+        ? undefined
+        : {
+            ...base?.pr_handoff,
+            ...override?.pr_handoff,
+            no_ci:
+              base?.pr_handoff?.no_ci === undefined && override?.pr_handoff?.no_ci === undefined
+                ? undefined
+                : {
+                    ...base?.pr_handoff?.no_ci,
+                    ...override?.pr_handoff?.no_ci,
+                  },
+          },
+  };
+}
+
+function mergeIssueBreakdownDefaults(
+  base: RawWorkflowConfig["issue_breakdown"] | undefined,
+  override: RawProjectContextConfig["issue_breakdown"] | undefined,
+): RawWorkflowConfig["issue_breakdown"] | undefined {
+  if (!base && !override) return undefined;
+  return {
+    ...base,
+    ...override,
+    apply_to_linear:
+      base?.apply_to_linear === undefined && override?.apply_to_linear === undefined
+        ? undefined
+        : {
+            ...base?.apply_to_linear,
+            ...override?.apply_to_linear,
+          },
+  };
+}
+
+function mergeAgentDefaults(
+  base: RawWorkflowConfig["agent"] | undefined,
+  override: RawProjectContextConfig["agent"] | undefined,
+): RawWorkflowConfig["agent"] | undefined {
+  if (!base && !override) return undefined;
+  return {
+    ...base,
+    ...override,
+    max_concurrent_agents_by_state:
+      base?.max_concurrent_agents_by_state === undefined && override?.max_concurrent_agents_by_state === undefined
+        ? undefined
+        : {
+            ...base?.max_concurrent_agents_by_state,
+            ...override?.max_concurrent_agents_by_state,
+          },
+  };
+}
+
+function mergeCredentialProfileDefaults(
+  base: RawWorkflowConfig["credential_profiles"] | undefined,
+  override: RawProjectContextConfig["credential_profiles"] | undefined,
+): RawWorkflowConfig["credential_profiles"] | undefined {
+  if (!base && !override) return undefined;
+
+  const mergedProfiles = mergeCredentialProfileDefinitionMap(base?.profiles, override?.profiles);
+  const mergedRoles =
+    base?.roles === undefined && override?.roles === undefined
+        ? undefined
+        : {
+            worker: mergeCredentialProfileRoleAssignments(base?.roles?.worker, override?.roles?.worker),
+            reviewer: mergeCredentialProfileRoleAssignments(base?.roles?.reviewer, override?.roles?.reviewer),
+            triage: mergeCredentialProfileRoleAssignments(base?.roles?.triage, override?.roles?.triage),
+            planner: mergeCredentialProfileRoleAssignments(base?.roles?.planner, override?.roles?.planner),
+            post_mortem: mergeCredentialProfileRoleAssignments(base?.roles?.post_mortem, override?.roles?.post_mortem),
+            service: mergeCredentialProfileRoleAssignments(base?.roles?.service, override?.roles?.service),
+          };
+
+  const { profiles: _overrideProfiles, roles: _overrideRoles, ...overrideRest } = override ?? {};
+
+  return validateMergedCredentialProfiles({
+    ...(base ?? {}),
+    ...overrideRest,
+    ...(mergedProfiles === undefined ? {} : { profiles: mergedProfiles }),
+    ...(mergedRoles === undefined ? {} : { roles: mergedRoles }),
+  });
+}
+
+function mergeCredentialProfileDefinitionMap(
+  base: RawCredentialProfilesConfig["profiles"] | undefined,
+  override: RawCredentialProfilesOverrideConfig["profiles"] | undefined,
+): RawCredentialProfilesConfig["profiles"] | undefined {
+  if (base === undefined && override === undefined) return undefined;
+
+  const merged: NonNullable<RawCredentialProfilesConfig["profiles"]> = { ...(base ?? {}) };
+  for (const [name, profile] of Object.entries(override ?? {})) {
+    const baseProfile = base?.[name] as NonNullable<RawCredentialProfilesConfig["profiles"]>[string] | undefined;
+    const overrideProfile = profile as NonNullable<RawCredentialProfilesOverrideConfig["profiles"]>[string];
+    const overrideKind = inferRawCredentialProfileOverrideKind(overrideProfile);
+
+    merged[name] =
+      baseProfile !== undefined && overrideKind !== null && inferRawCredentialProfileKind(baseProfile) !== overrideKind
+        ? (overrideProfile as NonNullable<RawCredentialProfilesConfig["profiles"]>[string])
+        : ({
+            ...(baseProfile ?? {}),
+            ...overrideProfile,
+          } as NonNullable<RawCredentialProfilesConfig["profiles"]>[string]);
+  }
+  return merged;
+}
+
+function inferRawCredentialProfileKind(
+  profile: NonNullable<RawCredentialProfilesConfig["profiles"]>[string],
+): "github_app" | "static_token" {
+  return profile.kind === "github_app" ? "github_app" : "static_token";
+}
+
+function inferRawCredentialProfileOverrideKind(
+  profile: NonNullable<RawCredentialProfilesOverrideConfig["profiles"]>[string],
+): "github_app" | "static_token" | null {
+  if (profile.kind === "github_app") return "github_app";
+  if (profile.kind === "static_token") return "static_token";
+
+  const hasStaticFields = profile.value !== undefined;
+  const hasGitHubAppFields =
+    profile.app_id !== undefined ||
+    profile.client_id !== undefined ||
+    profile.installation_id !== undefined ||
+    profile.private_key !== undefined ||
+    profile.private_key_path !== undefined ||
+    profile.token_refresh_buffer_seconds !== undefined;
+  if (hasGitHubAppFields && !hasStaticFields) return "github_app";
+  if (hasStaticFields && !hasGitHubAppFields) return "static_token";
+  return null;
+}
+
+function validateMergedCredentialProfiles(
+  value: RawWorkflowConfig["credential_profiles"] | undefined,
+): RawWorkflowConfig["credential_profiles"] | undefined {
+  if (value === undefined) return undefined;
+  const parsed = rawCredentialProfilesSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+
+  const firstIssue = parsed.error.issues[0];
+  const issuePath = firstIssue ? formatZodIssuePath(firstIssue.path) : "";
+  const fieldPath =
+    issuePath.length === 0 ? "credential_profiles" : `credential_profiles.${issuePath}`;
+  throw configValidationError(
+    issuePath.length > 0
+      ? `credential_profiles.${issuePath} ${normalizeZodIssueMessage(firstIssue)}`
+      : `credential_profiles ${normalizeZodIssueMessage(firstIssue)}`,
+    [fieldPath],
+  );
+}
+
+function formatZodIssuePath(path: readonly PropertyKey[]): string {
+  return path
+    .map((segment) => (typeof segment === "number" ? `[${segment}]` : String(segment)))
+    .join(".")
+    .replace(/\.\[/g, "[");
+}
+
+function normalizeZodIssueMessage(issue: z.ZodIssue | undefined): string {
+  if (!issue) return "is invalid";
+  return issue.message;
+}
+
+function mergeCredentialProfileRoleAssignments(
+  base: Record<string, string> | undefined,
+  override: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (base === undefined && override === undefined) return undefined;
+  return {
+    ...(base ?? {}),
+    ...(override ?? {}),
+  };
+}
+
+function mergeConfigObjects<T extends Record<string, unknown> | undefined>(base: T, override: T): T {
+  if (!base && !override) return undefined as T;
+  return {
+    ...(base ?? {}),
+    ...(override ?? {}),
+  } as T;
+}
+
+function buildWorkflowConfigValidationDetails(rawInput: unknown, error: z.ZodError): Record<string, unknown> {
+  const signals = projectContextValidationSignalsFromZodIssues(rawInput, error.issues);
+  if (signals.projectContextPaths.length === 0) {
+    return error.flatten();
+  }
+  return {
+    ...error.flatten(),
+    issues: error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
+    projectContextPaths: signals.projectContextPaths,
+    ...(signals.projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths: signals.projectContextFieldPaths }),
+  };
+}
+
+function projectContextValidationSignalsFromZodIssues(
+  rawInput: unknown,
+  issues: readonly z.ZodIssue[],
+): { projectContextPaths: string[]; projectContextFieldPaths: string[] } {
+  const projectContextPaths: string[] = [];
+  const projectContextFieldPaths: string[] = [];
+  for (const issue of issues) {
+    const signal = projectContextValidationSignalFromIssuePath(rawInput, issue.path);
+    if (signal === null) continue;
+    projectContextPaths.push(signal.contextPath);
+    if (signal.fieldPath !== null) projectContextFieldPaths.push(signal.fieldPath);
+  }
+  return {
+    projectContextPaths: uniqueStringValues(projectContextPaths),
+    projectContextFieldPaths: uniqueStringValues(projectContextFieldPaths),
+  };
+}
+
+function projectContextValidationSignalFromIssuePath(
+  rawInput: unknown,
+  issuePath: readonly PropertyKey[],
+): { contextPath: string; fieldPath: string | null } | null {
+  if (issuePath[0] !== "project_contexts") return null;
+  const contextIndex = issuePath[1];
+  if (typeof contextIndex !== "number" || contextIndex < 0) return null;
+  return {
+    contextPath: rawProjectContextPathFromInput(rawInput, contextIndex),
+    fieldPath: fieldPathFromSegments(issuePath.slice(2)),
+  };
+}
+
+function rawProjectContextPathFromInput(rawInput: unknown, index: number): string {
+  const rawContexts = readRawProjectContextsFromValue(rawInput);
+  return rawProjectContextPath(rawContexts, index);
+}
+
+function rawProjectContextPath(rawContexts: readonly unknown[], index: number): string {
+  const rawId = readRawProjectContextIdFromValue(rawContexts[index]);
+  if (rawId === null || rawProjectContextIdIsAmbiguous(rawContexts, rawId)) {
+    return `project_contexts[${index}]`;
+  }
+  return `project_contexts[${JSON.stringify(rawId)}]`;
+}
+
+function rawProjectContextIdIsAmbiguous(rawContexts: readonly unknown[], rawId: string): boolean {
+  let matches = 0;
+  for (const rawContext of rawContexts) {
+    if (readRawProjectContextIdFromValue(rawContext) !== rawId) continue;
+    matches += 1;
+    if (matches > 1) return true;
+  }
+  return false;
+}
+
+const KNOWN_PROJECT_CONTEXT_VALIDATION_FIELD_PATHS = new Set<string>([
+  "id",
+  "enabled",
+  "tracker.kind",
+  "tracker.api_key",
+  "tracker.project_slug",
+  "tracker.active_states",
+  "tracker.handoff_states",
+  "tracker.terminal_states",
+  "workspace.source",
+  "workspace.source.kind",
+  "workspace.source.path",
+  "workspace.source.repository",
+  "workspace.source.base_ref",
+  "workspace.source.branch_template",
+  "review_loop.blocked_states",
+  "review_loop.review_states",
+  "review_loop.review_pass_state",
+  "github.pr_handoff.target_state",
+  "issue_breakdown.workspace_mode",
+  "agent.max_concurrent_agents_by_state",
+  "credential_profiles.roles.worker",
+  "credential_profiles.roles.reviewer",
+  "credential_profiles.roles.service",
+  "credential_profiles.profiles",
+]);
+
+export function normalizeProjectContextValidationFieldPath(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return longestKnownProjectContextFieldPath(projectContextFieldPathSegments(value));
+}
+
+function extractScopedProjectContextFieldPath(remainder: string): string | null {
+  const scopedMatch = /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(remainder);
+  return normalizeProjectContextValidationFieldPath(scopedMatch?.[1]);
+}
+
+function configValidationError(message: string, projectContextFieldPaths?: readonly string[]): SymphonyError {
+  const normalizedFieldPaths = uniqueStringValues(
+    (projectContextFieldPaths ?? []).flatMap((fieldPath) => {
+      const normalizedFieldPath = normalizeProjectContextValidationFieldPath(fieldPath);
+      return normalizedFieldPath === null ? [] : [normalizedFieldPath];
+    }),
+  );
+  return new SymphonyError(
+    "config_validation_error",
+    message,
+    normalizedFieldPaths.length === 0 ? undefined : { projectContextFieldPaths: normalizedFieldPaths },
+  );
+}
+
+function prefixProjectContextValidationPath(error: unknown, contextPath: string): SymphonyError {
+  const symphonyError =
+    error instanceof SymphonyError
+      ? error
+      : new SymphonyError("config_validation_error", error instanceof Error ? error.message : String(error));
+  return new SymphonyError(symphonyError.code, `${contextPath}.${symphonyError.message}`, symphonyError.details);
+}
+
+function attachProjectContextValidationSignal(error: unknown, contextPath: string): SymphonyError {
+  const symphonyError =
+    error instanceof SymphonyError
+      ? error
+      : new SymphonyError("config_validation_error", error instanceof Error ? error.message : String(error));
+  const existingDetails = isObjectRecord(symphonyError.details) ? { ...symphonyError.details } : {};
+  const projectContextPaths = uniqueStringValues([
+    ...readStringArrayValues(existingDetails.projectContextPaths),
+    contextPath,
+  ]);
+  const projectContextFieldPaths = uniqueStringValues([
+    ...readStringArrayValues(existingDetails.projectContextFieldPaths),
+    ...extractProjectContextFieldPaths(symphonyError.message, contextPath),
+  ]);
+  return new SymphonyError(symphonyError.code, symphonyError.message, {
+    ...existingDetails,
+    projectContextPaths,
+    ...(projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths }),
+  });
+}
+
+function attachDefaultProjectContextValidationSignal(
+  error: unknown,
+  raw: RawWorkflowConfig,
+  defaultContextId: string,
+): SymphonyError {
+  const symphonyError =
+    error instanceof SymphonyError
+      ? error
+      : new SymphonyError("config_validation_error", error instanceof Error ? error.message : String(error));
+  const contextPath = rawProjectContextPathsByNormalizedId(raw.project_contexts ?? [], defaultContextId)[0] ?? null;
+  if (contextPath === null) return symphonyError;
+
+  const existingDetails = isObjectRecord(symphonyError.details) ? { ...symphonyError.details } : {};
+  const projectContextPaths = uniqueStringValues([
+    ...readStringArrayValues(existingDetails.projectContextPaths),
+    contextPath,
+  ]);
+  const projectContextFieldPaths = uniqueStringValues([
+    ...readStringArrayValues(existingDetails.projectContextFieldPaths),
+    ...readLeadingProjectContextFieldPaths(symphonyError.message),
+  ]);
+  return new SymphonyError(symphonyError.code, symphonyError.message, {
+    ...existingDetails,
+    projectContextPaths,
+    ...(projectContextFieldPaths.length === 0 ? {} : { projectContextFieldPaths }),
+  });
+}
+
+function extractProjectContextFieldPaths(message: string, contextPath: string): string[] {
+  const prefix = `${contextPath}.`;
+  if (!message.startsWith(prefix)) return [];
+  const fieldPath = extractScopedProjectContextFieldPath(message.slice(prefix.length));
+  return fieldPath === null ? [] : [fieldPath];
+}
+
+function readLeadingProjectContextFieldPaths(message: string): string[] {
+  const fieldPath = normalizeProjectContextValidationFieldPath(
+    /^([a-z_]+(?:\.[a-z_]+|\[\d+\])*)/.exec(message)?.[1],
+  );
+  return fieldPath === null ? [] : [fieldPath];
+}
+
+function duplicateProjectContextIdFromMessage(message: string): string | null {
+  const match = /^Duplicate project context id: (.+)$/.exec(message);
+  return normalizeOptionalSignalString(match?.[1]);
+}
+
+function rawProjectContextPathsByNormalizedId(rawContexts: readonly unknown[], duplicateProjectContextId: string): string[] {
+  return uniqueStringValues(
+    rawContexts.flatMap((rawContext, index) => {
+      const rawId = readRawProjectContextIdFromValue(rawContext);
+      if (rawId === null) return [];
+      try {
+        return normalizeProjectContextId(rawId) === duplicateProjectContextId ? [rawProjectContextPath(rawContexts, index)] : [];
+      } catch {
+        return [];
+      }
+    }),
+  );
+}
+
+function rawProjectContextPaths(rawContexts: readonly unknown[]): string[] {
+  return uniqueStringValues(rawContexts.map((_, index) => rawProjectContextPath(rawContexts, index)));
+}
+
+function readRawProjectContextsFromValue(value: unknown): unknown[] {
+  return isObjectRecord(value) && Array.isArray(value.project_contexts) ? value.project_contexts : [];
+}
+
+function readRawProjectContextIdFromValue(value: unknown): string | null {
+  return isObjectRecord(value) && typeof value.id === "string" ? value.id : null;
+}
+
+function readStringArrayValues(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function normalizeOptionalSignalString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length === 0 ? null : normalized;
+}
+
+function fieldPathFromSegments(segments: readonly PropertyKey[]): string | null {
+  return longestKnownProjectContextFieldPath(
+    segments.flatMap((segment): Array<string | number> => {
+      if (typeof segment === "string" || typeof segment === "number") return [segment];
+      return [];
+    }),
+  );
+}
+
+function longestKnownProjectContextFieldPath(segments: readonly (string | number)[]): string | null {
+  if (segments.length === 0) return null;
+  let fieldPath = "";
+  let knownFieldPath: string | null = null;
+  for (const segment of segments) {
+    if (typeof segment === "number") {
+      fieldPath += `[${segment}]`;
+    } else {
+      fieldPath = fieldPath.length === 0 ? segment : `${fieldPath}.${segment}`;
+    }
+    if (KNOWN_PROJECT_CONTEXT_VALIDATION_FIELD_PATHS.has(fieldPath)) {
+      knownFieldPath = fieldPath;
+    }
+  }
+  return knownFieldPath;
+}
+
+function projectContextFieldPathSegments(value: string): Array<string | number> {
+  const segments: Array<string | number> = [];
+  for (const part of value.split(".")) {
+    if (part.length === 0) return [];
+    let remainder = part;
+    const baseMatch = /^([^\[]+)/.exec(remainder);
+    if (baseMatch?.[1]) {
+      segments.push(baseMatch[1]);
+      remainder = remainder.slice(baseMatch[1].length);
+    }
+    while (remainder.length > 0) {
+      const indexMatch = /^\[(\d+)\]/.exec(remainder);
+      if (!indexMatch?.[1]) return [];
+      segments.push(Number.parseInt(indexMatch[1], 10));
+      remainder = remainder.slice(indexMatch[0].length);
+    }
+  }
+  return segments;
+}
+
+function uniqueStringValues(values: readonly string[]): string[] {
+  return [...new Set(values.filter((value) => value.length > 0))];
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 
 export function resolveConfigString(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
   if (value === undefined) return undefined;
   const varMatch = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
   if (varMatch) return env[varMatch[1] ?? ""] ?? "";
   return value;
+}
+
+function resolveOptionalConfigStringValue(value: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
+  return normalizeOptionalConfigString(resolveConfigString(value, env)) ?? undefined;
+}
+
+function resolveOptionalRepositoryValue(value: string | undefined, baseDir: string, env: NodeJS.ProcessEnv): string | undefined {
+  const resolved = resolveOptionalConfigStringValue(value, env);
+  return resolved === undefined ? undefined : resolveRepositoryValue(resolved, baseDir, env);
 }
 
 export function resolvePathValue(value: string, baseDir: string, env: NodeJS.ProcessEnv): string {
@@ -1418,48 +2524,50 @@ function validatePullRequestHandoffPolicy(input: {
   blockedStates: string[];
   reviewPassState: string | null;
   prHandoff: GitHubPullRequestHandoffConfig;
+  attachFieldPathDetails?: boolean;
 }): void {
   if (!input.prHandoff.enabled) return;
   if (!input.publishPullRequests) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       "github.pr_handoff.enabled requires github.publish_pull_requests until a service PR verifier is configured",
     );
   }
   if (input.prHandoff.targetState === null) {
-    throw new SymphonyError("config_validation_error", "github.pr_handoff.target_state must resolve to a tracker.handoff_states value");
+    throw configValidationError(
+      "github.pr_handoff.target_state must resolve to a tracker.handoff_states value",
+      input.attachFieldPathDetails ? ["github.pr_handoff.target_state", "tracker.handoff_states"] : undefined,
+    );
   }
   if (!input.handoffStates.some((state) => statesEqual(state, input.prHandoff.targetState ?? ""))) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `github.pr_handoff.target_state must be listed in tracker.handoff_states: ${input.prHandoff.targetState}`,
+      input.attachFieldPathDetails ? ["github.pr_handoff.target_state", "tracker.handoff_states"] : undefined,
     );
   }
 
   const reviewOverlap = overlappingStates(input.handoffStates, input.reviewStates);
   if (reviewOverlap.length > 0) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `tracker.handoff_states must not overlap review_loop.review_states when github.pr_handoff is enabled: ${reviewOverlap.join(", ")}`,
+      input.attachFieldPathDetails ? ["tracker.handoff_states", "review_loop.review_states"] : undefined,
     );
   }
   const blockedOverlap = overlappingStates(input.handoffStates, input.blockedStates);
   if (blockedOverlap.length > 0) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `tracker.handoff_states must not overlap review_loop.blocked_states when github.pr_handoff is enabled: ${blockedOverlap.join(", ")}`,
+      input.attachFieldPathDetails ? ["tracker.handoff_states", "review_loop.blocked_states"] : undefined,
     );
   }
   const passOverlap = input.reviewPassState === null ? [] : overlappingStates(input.handoffStates, [input.reviewPassState]);
   if (passOverlap.length > 0) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `tracker.handoff_states must not overlap review_loop.review_pass_state when github.pr_handoff is enabled: ${passOverlap.join(", ")}`,
+      input.attachFieldPathDetails ? ["tracker.handoff_states", "review_loop.review_pass_state"] : undefined,
     );
   }
   if (input.prHandoff.requiredChecks.length === 0 && !input.prHandoff.noCiAllowed) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       "github.pr_handoff.required_checks is required when PR publication handoff is enabled unless github.pr_handoff.no_ci.allowed is true",
     );
   }
@@ -1556,20 +2664,21 @@ function validateStateBuckets(input: {
   reviewStates: string[];
   blockedStates: string[];
   reviewPassState: string | null;
+  attachFieldPathDetails?: boolean;
 }): void {
   const { activeStates, handoffStates, terminalStates, reviewStates, blockedStates, reviewPassState } = input;
   const activeHandoffOverlap = overlappingStates(activeStates, handoffStates);
   if (activeHandoffOverlap.length > 0) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `tracker.handoff_states must not overlap tracker.active_states: ${activeHandoffOverlap.join(", ")}`,
+      input.attachFieldPathDetails ? ["tracker.handoff_states", "tracker.active_states"] : undefined,
     );
   }
   const terminalHandoffOverlap = overlappingStates(terminalStates, handoffStates);
   if (terminalHandoffOverlap.length > 0) {
-    throw new SymphonyError(
-      "config_validation_error",
+    throw configValidationError(
       `tracker.handoff_states must not overlap tracker.terminal_states: ${terminalHandoffOverlap.join(", ")}`,
+      input.attachFieldPathDetails ? ["tracker.handoff_states", "tracker.terminal_states"] : undefined,
     );
   }
 
@@ -1588,9 +2697,9 @@ function validateStateBuckets(input: {
       const [rightName, rightStates] = buckets[rightIndex] ?? ["", []];
       const overlap = overlappingStates(leftStates, rightStates);
       if (overlap.length > 0) {
-        throw new SymphonyError(
-          "config_validation_error",
+        throw configValidationError(
           `${leftName} must not overlap ${rightName}: ${overlap.join(", ")}`,
+          input.attachFieldPathDetails ? [leftName, rightName] : undefined,
         );
       }
     }

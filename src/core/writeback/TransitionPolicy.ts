@@ -1,4 +1,6 @@
 import type { ServiceConfig } from "../config/Config.js";
+import { resolveServiceConfigForProjectContext } from "../config/ProjectContextServiceConfig.js";
+import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import type {
   IssueCompletionReportRecord,
   IssueMergeGateMergeabilityState,
@@ -15,6 +17,7 @@ import type { NewWritebackOperation } from "./WritebackOutbox.js";
 
 export interface RunWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   runId: string;
   sessionId: string | null;
   workspacePath: string | null;
@@ -23,6 +26,7 @@ export interface RunWritebackContext {
 
 export interface ReviewVerdictWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   runId: string;
   reviewer: string | null;
 }
@@ -38,6 +42,7 @@ export interface ReviewVerdictWritebackDetails {
 
 export interface BlockedEscalationWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   runId: string;
   reason: string;
   incompleteTurnCount?: number;
@@ -68,6 +73,7 @@ export interface IssuePostMortemReportWritebackContext {
 
 export interface MergeCompletedWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   mergeId: string;
   fromState: string;
   doneState: string;
@@ -82,6 +88,7 @@ export interface MergeGateCheckEvidence {
 
 export interface MergeGateWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   gateId: string;
   blockerFingerprint: string | null;
   fromState: string;
@@ -104,6 +111,7 @@ export interface MergeGateWritebackContext {
 
 export interface MergeConflictsWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   mergeId: string;
   fromState: string;
   conflictsState: string;
@@ -126,6 +134,7 @@ export interface MergeConflictResolvedWritebackContext {
 
 export interface BaseRefRepairWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   operationId: string;
   fromState: string;
   branchName: string;
@@ -138,6 +147,7 @@ export interface BaseRefRepairWritebackContext {
 
 export interface MergeGateHeadSupersessionWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   gateId: string;
   fromState: string;
   pullRequest: {
@@ -152,6 +162,7 @@ export interface MergeGateHeadSupersessionWritebackContext {
 
 export interface MergeGateHeadSupersessionRecoveryWritebackContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   gateId: string;
   pullRequest: {
     url: string | null;
@@ -204,16 +215,33 @@ export interface PublicationApprovalActionDetails {
   title: string;
 }
 
-export function planDispatchWriteback(issue: Issue, config: ServiceConfig): NewWritebackOperation | null {
-  if (!config.writeback.enabled || !sameName(issue.state, "Todo")) return null;
+function resolveTransitionPolicyConfig(
+  config: ServiceConfig,
+  projectContext?: ProjectContextResolution,
+): ServiceConfig {
+  return resolveServiceConfigForProjectContext(config, projectContext);
+}
+
+export function planDispatchWriteback(
+  issue: Issue,
+  config: ServiceConfig,
+  projectContext?: ProjectContextResolution,
+): NewWritebackOperation | null {
+  const resolvedConfig = resolveTransitionPolicyConfig(config, projectContext);
+  if (!resolvedConfig.writeback.enabled) return null;
+  const fromStates = sameName(resolvedConfig.writeback.dispatchState, "Todo")
+    ? [resolvedConfig.writeback.dispatchState]
+    : uniqueStates(resolvedConfig.tracker.activeStates.filter((state) => !sameName(state, resolvedConfig.writeback.dispatchState)));
+  if (!isStateIn(issue.state, fromStates)) return null;
   const dispatchStateVersion = safeKeySegment(issue.updatedAt ?? issue.createdAt ?? issue.state);
   return {
-    idempotencyKey: `transition:${issue.id}:dispatch:${dispatchStateVersion}:${config.writeback.dispatchState}`,
+    idempotencyKey: `transition:${issue.id}:dispatch:${dispatchStateVersion}:${resolvedConfig.writeback.dispatchState}`,
     kind: "transition",
     issueId: issue.id,
+    projectContext,
     payload: {
-      fromStates: ["Todo"],
-      toState: config.writeback.dispatchState,
+      fromStates,
+      toState: resolvedConfig.writeback.dispatchState,
       reason: "Symphony dispatch",
     },
   };
@@ -249,6 +277,7 @@ export function planRunStartedComment(context: RunWritebackContext, config: Serv
     idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-started`,
     kind: "comment",
     issueId: context.issue.id,
+    projectContext: context.projectContext,
     runId: context.runId,
     payload: {
       dedupeKey: `${context.runId}:run-started`,
@@ -271,6 +300,7 @@ export function planRunSucceededWritebacks(context: RunWritebackContext, config:
       idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-succeeded`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: `${context.runId}:run-succeeded`,
@@ -290,15 +320,16 @@ export function planCompletionReportAcceptedWritebacks(
   config: ServiceConfig,
   report: string | CompletionReportWritebackDetails | null = null,
 ): NewWritebackOperation[] {
-  const completionReportFromStates = completionReportAcceptedFromStates(config);
+  const resolvedConfig = resolveTransitionPolicyConfig(config, context.projectContext);
+  const completionReportFromStates = completionReportAcceptedFromStates(resolvedConfig);
   if (
-    !config.writeback.enabled ||
+    !resolvedConfig.writeback.enabled ||
     !isStateIn(context.issue.state, completionReportFromStates)
   ) {
     return [];
   }
 
-  const reviewState = config.reviewLoop.reviewStates[0];
+  const reviewState = resolvedConfig.reviewLoop.reviewStates[0];
   if (!reviewState) return [];
 
   const eventKey =
@@ -310,6 +341,7 @@ export function planCompletionReportAcceptedWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -332,6 +364,7 @@ export function planCompletionReportAcceptedWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${reviewState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         fromStates: completionReportFromStates,
@@ -391,11 +424,12 @@ export function planPullRequestHandoffWritebacks(
   config: ServiceConfig,
   details: PullRequestHandoffWritebackDetails,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled || !config.github.prHandoff.enabled) return [];
-  const handoffFromStates = pullRequestHandoffFromStates(config);
+  const resolvedConfig = resolveTransitionPolicyConfig(config, context.projectContext);
+  if (!resolvedConfig.writeback.enabled || !resolvedConfig.github.prHandoff.enabled) return [];
+  const handoffFromStates = pullRequestHandoffFromStates(resolvedConfig);
   if (!isStateIn(context.issue.state, handoffFromStates)) return [];
 
-  const targetState = config.github.prHandoff.targetState;
+  const targetState = resolvedConfig.github.prHandoff.targetState;
   if (targetState === null) return [];
 
   const pullRequestKey = pullRequestIdempotencySegment(details.pullRequest);
@@ -406,6 +440,7 @@ export function planPullRequestHandoffWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -434,6 +469,7 @@ export function planPullRequestHandoffWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${targetState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         fromStates: handoffFromStates,
@@ -450,15 +486,17 @@ export function planCompletionReportPublicationApprovalPendingWritebacks(
   report: CompletionReportWritebackDetails,
   action: PublicationApprovalActionDetails,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled || !isStateIn(context.issue.state, [config.writeback.dispatchState])) return [];
+  const resolvedConfig = resolveTransitionPolicyConfig(config, context.projectContext);
+  if (!resolvedConfig.writeback.enabled || !isStateIn(context.issue.state, [resolvedConfig.writeback.dispatchState])) return [];
 
-  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
+  const blockedState = resolvedConfig.reviewLoop.blockedStates[0] ?? null;
   const eventKey = `${context.runId}:completion-report:${safeKeySegment(report.idempotencyKey)}:publication-approval-pending`;
   const operations: NewWritebackOperation[] = [
     {
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -493,9 +531,10 @@ export function planCompletionReportPublicationApprovalPendingWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
-        fromStates: [config.writeback.dispatchState],
+        fromStates: [resolvedConfig.writeback.dispatchState],
         toState: blockedState,
         reason: "Symphony publication approval setup incomplete",
       },
@@ -512,9 +551,10 @@ export function planCompletionReportPublicationApprovalTerminalWritebacks(
   status: "rejected" | "stale" | "expired" | "cancelled",
   reason: string | null,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled) return [];
+  const resolvedConfig = resolveTransitionPolicyConfig(config, context.projectContext);
+  if (!resolvedConfig.writeback.enabled) return [];
 
-  const fromStates = uniqueStates([config.writeback.dispatchState, ...config.reviewLoop.blockedStates]);
+  const fromStates = uniqueStates([resolvedConfig.writeback.dispatchState, ...resolvedConfig.reviewLoop.blockedStates]);
   if (!isStateIn(context.issue.state, fromStates)) return [];
 
   const eventKey = `${context.runId}:completion-report:${safeKeySegment(report.idempotencyKey)}:publication-approval-${status}`;
@@ -523,6 +563,7 @@ export function planCompletionReportPublicationApprovalTerminalWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -551,7 +592,8 @@ export function planReviewFailWritebacks(
   requestedRevisions: string[] | ReviewVerdictWritebackDetails,
   reviewEvidence: PullRequestReviewEvidenceItem[] = [],
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
+  const resolvedConfig = resolveTransitionPolicyConfig(config, context.projectContext);
+  if (!resolvedConfig.writeback.enabled || !isStateIn(context.issue.state, resolvedConfig.reviewLoop.reviewStates)) return [];
 
   const details = reviewVerdictDetailsFromInput(requestedRevisions);
   const gateFindings = reviewGateFindingsForDetails(details);
@@ -562,6 +604,7 @@ export function planReviewFailWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -570,7 +613,7 @@ export function planReviewFailWritebacks(
           "",
           "Status: requested revisions",
           "Symphony review failed.",
-          `Next state: ${config.writeback.dispatchState}`,
+          `Next state: ${resolvedConfig.writeback.dispatchState}`,
           "",
           "Gate findings requiring worker repair:",
           "",
@@ -586,13 +629,14 @@ export function planReviewFailWritebacks(
       },
     },
     {
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${resolvedConfig.writeback.dispatchState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
-        fromStates: config.reviewLoop.reviewStates,
-        toState: config.writeback.dispatchState,
+        fromStates: resolvedConfig.reviewLoop.reviewStates,
+        toState: resolvedConfig.writeback.dispatchState,
         reason: "Symphony review requested revisions",
       },
     },
@@ -643,7 +687,8 @@ export function planReviewPassWritebacks(
   config: ServiceConfig,
   summary: string | ReviewVerdictWritebackDetails | null = null,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
+  const resolvedConfig = resolveTransitionPolicyConfig(config, context.projectContext);
+  if (!resolvedConfig.writeback.enabled || !isStateIn(context.issue.state, resolvedConfig.reviewLoop.reviewStates)) return [];
 
   const eventKey = `${context.runId}:review-verdict-pass`;
   const details = typeof summary === "object" && summary !== null ? summary : null;
@@ -653,6 +698,7 @@ export function planReviewPassWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -664,9 +710,9 @@ export function planReviewPassWritebacks(
           "",
           `Run: ${context.runId}`,
           `Reviewer: ${context.reviewer ?? "n/a"}`,
-          config.reviewLoop.reviewPassState === null
+          resolvedConfig.reviewLoop.reviewPassState === null
             ? "Review passed marker: review-passed"
-            : `Review pass state: ${config.reviewLoop.reviewPassState}`,
+            : `Review pass state: ${resolvedConfig.reviewLoop.reviewPassState}`,
           ...(summaryText === null || summaryText.trim().length === 0 ? [] : ["", "Summary:", summaryText.trim()]),
           ...(details === null ? [] : formatReviewVerdictDetails(details)),
         ].join("\n"),
@@ -674,15 +720,16 @@ export function planReviewPassWritebacks(
     },
   ];
 
-  if (config.reviewLoop.reviewPassState !== null) {
+  if (resolvedConfig.reviewLoop.reviewPassState !== null) {
     operations.push({
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.reviewLoop.reviewPassState}`,
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${resolvedConfig.reviewLoop.reviewPassState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
-        fromStates: config.reviewLoop.reviewStates,
-        toState: config.reviewLoop.reviewPassState,
+        fromStates: resolvedConfig.reviewLoop.reviewStates,
+        toState: resolvedConfig.reviewLoop.reviewPassState,
         reason: "Symphony review passed",
       },
     });
@@ -695,17 +742,20 @@ export function planBlockedEscalationWritebacks(
   context: BlockedEscalationWritebackContext,
   config: ServiceConfig,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled) return [];
+  const resolvedConfig = resolveTransitionPolicyConfig(config, context.projectContext);
+  if (!resolvedConfig.writeback.enabled) return [];
 
   const fromStates = uniqueStates([
-    ...config.tracker.activeStates,
-    ...config.tracker.handoffStates,
-    ...config.reviewLoop.reviewStates,
-    ...(config.mergePolicy.mode === "gated" && config.mergePolicy.conflictsState !== null ? [config.mergePolicy.conflictsState] : []),
+    ...resolvedConfig.tracker.activeStates,
+    ...resolvedConfig.tracker.handoffStates,
+    ...resolvedConfig.reviewLoop.reviewStates,
+    ...(resolvedConfig.mergePolicy.mode === "gated" && resolvedConfig.mergePolicy.conflictsState !== null
+      ? [resolvedConfig.mergePolicy.conflictsState]
+      : []),
   ]);
   if (!isStateIn(context.issue.state, fromStates)) return [];
 
-  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
+  const blockedState = resolvedConfig.reviewLoop.blockedStates[0] ?? null;
   const eventKey = `${context.runId}:blocked-escalation`;
   const requiredAction =
     config.issueTriage.enabled && isIssueTriageEligibleBlockedReason(context.reason)
@@ -717,6 +767,7 @@ export function planBlockedEscalationWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         dedupeKey: eventKey,
@@ -754,6 +805,7 @@ export function planBlockedEscalationWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       runId: context.runId,
       payload: {
         fromStates,
@@ -972,6 +1024,7 @@ export function planMergeCompletedWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${context.mergeId}:${context.doneState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: [context.fromState],
         toState: context.doneState,
@@ -985,7 +1038,8 @@ export function planMergeGateRepairWritebacks(
   context: MergeGateWritebackContext,
   config: ServiceConfig,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled) return [];
+  const resolvedConfig = resolveTransitionPolicyConfig(config, context.projectContext);
+  if (!resolvedConfig.writeback.enabled) return [];
   const eventKey = mergeGateWritebackEventKey(context, "repair");
   const conflict = context.mergeability?.status === "conflicted";
   const requiredAction = conflict
@@ -1006,16 +1060,17 @@ export function planMergeGateRepairWritebacks(
       context,
       eventKey,
       "repair required",
-      `Next state: ${config.writeback.dispatchState} (worker repair queue)`,
+      `Next state: ${resolvedConfig.writeback.dispatchState} (worker repair queue)`,
       requiredAction,
     ),
     {
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${resolvedConfig.writeback.dispatchState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: [context.fromState],
-        toState: config.writeback.dispatchState,
+        toState: resolvedConfig.writeback.dispatchState,
         reason: conflict ? "Symphony merge gate required PR repair" : "Symphony merge gate required CI repair",
       },
     },
@@ -1026,8 +1081,9 @@ export function planMergeGateBlockedWritebacks(
   context: MergeGateWritebackContext,
   config: ServiceConfig,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled) return [];
-  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
+  const resolvedConfig = resolveTransitionPolicyConfig(config, context.projectContext);
+  if (!resolvedConfig.writeback.enabled) return [];
+  const blockedState = resolvedConfig.reviewLoop.blockedStates[0] ?? null;
   const eventKey = mergeGateWritebackEventKey(context, "blocked");
   const conflict = context.mergeability?.status === "conflicted";
   const missingConflictState = conflict && config.mergePolicy.conflictsState === null;
@@ -1054,6 +1110,7 @@ export function planMergeGateBlockedWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${blockedState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: [context.fromState],
         toState: blockedState,
@@ -1073,20 +1130,22 @@ export function planMergeGateHeadSupersessionWritebacks(
   context: MergeGateHeadSupersessionWritebackContext,
   config: ServiceConfig,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled) return [];
+  const resolvedConfig = resolveTransitionPolicyConfig(config, context.projectContext);
+  if (!resolvedConfig.writeback.enabled) return [];
   const eventKey = `merge-gate:${safeKeySegment(context.gateId)}:head-superseded:${safeKeySegment(context.liveHeadSha)}`;
   return [
     {
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         dedupeKey: eventKey,
         body: [
           "## Symphony Merge Gate",
           "",
           "Status: head superseded, implementation rebind required",
-          `Next state: ${config.writeback.dispatchState} (worker queue)`,
+          `Next state: ${resolvedConfig.writeback.dispatchState} (worker queue)`,
           "",
           `PR: ${formatPullRequest(context.pullRequest)}`,
           `Previous PR head SHA: ${context.pullRequest.headSha ?? "n/a"}`,
@@ -1099,12 +1158,13 @@ export function planMergeGateHeadSupersessionWritebacks(
       },
     },
     {
-      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${resolvedConfig.writeback.dispatchState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
-        fromStates: uniqueStates([context.fromState, config.writeback.dispatchState]),
-        toState: config.writeback.dispatchState,
+        fromStates: uniqueStates([context.fromState, resolvedConfig.writeback.dispatchState]),
+        toState: resolvedConfig.writeback.dispatchState,
         reason: "Symphony merge gate head superseded",
       },
     },
@@ -1122,6 +1182,7 @@ export function planMergeGateHeadSupersessionRecoveryWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         dedupeKey: eventKey,
         body: [
@@ -1165,6 +1226,7 @@ export function planMergeConflictsWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         dedupeKey: eventKey,
         body: [
@@ -1187,6 +1249,7 @@ export function planMergeConflictsWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${context.conflictsState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: [context.fromState],
         toState: context.conflictsState,
@@ -1259,6 +1322,7 @@ export function planBaseRefRepairWritebacks(
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
       kind: "comment",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         dedupeKey: eventKey,
         body: [
@@ -1288,6 +1352,7 @@ export function planBaseRefRepairWritebacks(
       idempotencyKey: `transition:${context.issue.id}:${eventKey}:${config.writeback.dispatchState}`,
       kind: "transition",
       issueId: context.issue.id,
+      projectContext: context.projectContext,
       payload: {
         fromStates: uniqueStates([context.fromState, config.writeback.dispatchState]),
         toState: config.writeback.dispatchState,
@@ -1305,6 +1370,7 @@ export function planRunFailedComment(context: RunWritebackContext, config: Servi
     idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-failed`,
     kind: "comment",
     issueId: context.issue.id,
+    projectContext: context.projectContext,
     runId: context.runId,
     payload: {
       dedupeKey: `${context.runId}:run-failed`,
@@ -1319,6 +1385,7 @@ export function planRunCancelledComment(context: RunWritebackContext, config: Se
     idempotencyKey: `comment:${context.issue.id}:${context.runId}:run-cancelled`,
     kind: "comment",
     issueId: context.issue.id,
+    projectContext: context.projectContext,
     runId: context.runId,
     payload: {
       dedupeKey: `${context.runId}:run-cancelled`,
@@ -1566,6 +1633,7 @@ function mergeGateCommentOperation(
     idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
     kind: "comment",
     issueId: context.issue.id,
+    projectContext: context.projectContext,
     payload: {
       dedupeKey: eventKey,
       body: [

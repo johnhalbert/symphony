@@ -43,6 +43,61 @@ describe("web route contract fixtures", () => {
     expect(fixtures.issueBoard.lanes.review.map((issue) => issue.id)).toEqual(["ENG-177"]);
 
     expect(fixtures.issueDetail.issue).toEqual(fixtures.issueBoard.issues.find((issue) => issue.id === WEB_CONTRACT_ISSUE_ID));
+    expect(fixtures.issueDetail.issue).toMatchObject({
+      project: "Symphony",
+      projectContext: {
+        id: "symphony",
+        label: "Symphony",
+        linearProject: "ENG",
+        codebase: null,
+      },
+    });
+    expect(fixtures.issueDetail.workspace).toMatchObject({
+      workspaceKey: WEB_CONTRACT_ISSUE_ID,
+      path: fixtures.issueDetail.issue.workspace,
+      projectContext: {
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        linearProjectSlug: "ENG",
+        routingSource: "candidate_poll",
+      },
+    });
+    expect(fixtures.dashboard.providerGates[0]).toMatchObject({
+      projectContext: {
+        id: "symphony",
+        label: "Symphony",
+        linearProject: "ENG",
+        codebase: null,
+      },
+    });
+    expect(fixtures.dashboard.runningAgents[0]).toMatchObject({
+      projectContext: {
+        id: "symphony",
+        label: "Symphony",
+        linearProject: "ENG",
+        codebase: null,
+        projectContextId: "symphony",
+        projectContextLabel: "Symphony",
+        linearProjectSlug: "ENG",
+        routingSource: "candidate_poll",
+      },
+    });
+    expect(fixtures.dashboard.activity[0]).toMatchObject({
+      projectContext: {
+        id: "symphony",
+        label: "Symphony",
+        linearProject: "ENG",
+        codebase: null,
+      },
+    });
+    expect(fixtures.history.sessions[0]).toMatchObject({
+      projectContext: {
+        id: "symphony",
+        label: "Symphony",
+        linearProject: "ENG",
+        codebase: null,
+      },
+    });
     expect(fixtures.issueDetail.activity).toEqual(fixtures.dashboard.activity);
     expect(fixtures.issueDetail.runs).toEqual(fixtures.history.sessions);
     expect(fixtures.issueDetail.transcript).toEqual(fixtures.transcript.messages);

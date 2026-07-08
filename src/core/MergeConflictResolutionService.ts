@@ -1,5 +1,10 @@
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
+import {
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "./config/ProjectContexts.js";
 import { SymphonyError } from "./errors.js";
 import { createGitHubPullRequestClientForCapability } from "../integrations/github/GitHubCredentialResolver.js";
 import {
@@ -15,6 +20,7 @@ import {
 } from "./merge/ServiceOwnedMergeConflictGit.js";
 import type {
   CompletionReportPullRequestRef,
+  IssueLifecycleRecord,
   IssueLifecycleStore,
   IssueMergeConflictMetadata,
   IssueMergeConflictResolutionReportRecord,
@@ -83,6 +89,7 @@ export interface MergeConflictResolutionFinalizer {
 
 export interface MergeConflictResolutionActiveContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string;
   role: MergeConflictResolutionSubmitterRole;
   token?: string | null;
@@ -144,7 +151,12 @@ export class MergeConflictResolutionService {
     assertPullRequestMatchesConflict(report.pullRequest, mergeConflict);
     const finalReport = await this.normalizeReportForServicePreparation(report, mergeConflict, context);
     if (!finalReport.serviceRemediation) assertReportMatchesConflict(finalReport, mergeConflict);
-    const storedReport = buildMergeConflictResolutionReport({ report: finalReport, issue: context.issue });
+    const projectContext = resolveMergeConflictProjectContext(context, lifecycle);
+    const storedReport = buildMergeConflictResolutionReport({
+      report: finalReport,
+      issue: context.issue,
+      projectContext,
+    });
     const now = new Date().toISOString();
     const countedRunIds = new Set(mergeConflict.attemptRunIds);
     const shouldCountAttempt =
@@ -206,6 +218,7 @@ export class MergeConflictResolutionService {
         ? preservedWorktreeStashesOf(lifecycle)
         : upsertPreservedWorktreeStash(preservedWorktreeStashesOf(lifecycle), activeStash);
     const updated = await this.options.lifecycleStore.updateIssue(context.issue, {
+      projectContext,
       phase: blocked
         ? "blocked"
         : resolved
@@ -235,7 +248,9 @@ export class MergeConflictResolutionService {
       },
     });
 
-    await this.options.writebackProcessor?.processDue();
+    await this.options.writebackProcessor?.processDue({
+      projectContext,
+    });
     return {
       accepted: true,
       replayed: false,
@@ -281,6 +296,7 @@ export class MergeConflictResolutionService {
     const operations = planBlockedEscalationWritebacks(
       {
         issue: context.issue,
+        projectContext: resolveMergeConflictProjectContext(context),
         runId: context.activeRunId,
         reason: mergeConflict.blockedReason ?? conflictBlockedReason(mergeConflict.fixTurnCount, mergeConflict.maxFixTurns),
         requiredAction: [
@@ -536,9 +552,19 @@ type NormalizedMergeConflictResolutionInput = MergeConflictResolutionInput & {
   };
 };
 
+function resolveMergeConflictProjectContext(
+  context: MergeConflictResolutionActiveContext,
+  lifecycle: IssueLifecycleRecord | null = null,
+): ProjectContextResolution {
+  return normalizeProjectContextResolution(
+    context.projectContext ?? lifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
+}
+
 function buildMergeConflictResolutionReport(input: {
   report: NormalizedMergeConflictResolutionInput;
   issue: Issue;
+  projectContext: ProjectContextResolution;
 }): IssueMergeConflictResolutionReportRecord {
   return {
     id: `merge-conflict-resolution:${input.issue.id}:${input.report.idempotencyKey}`,
@@ -546,6 +572,7 @@ function buildMergeConflictResolutionReport(input: {
     runId: input.report.runId,
     issueId: input.issue.id,
     issueIdentifier: input.issue.identifier,
+    projectContext: input.projectContext,
     resolutionStatus: input.report.resolutionStatus,
     summary: input.report.summary,
     validationEvidence: input.report.validationEvidence,

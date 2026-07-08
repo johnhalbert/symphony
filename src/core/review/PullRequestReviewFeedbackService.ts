@@ -13,6 +13,12 @@ import type {
   PullRequestReviewFeedbackResult,
 } from "../../integrations/github/GitHubPullRequestClient.js";
 import type { ServiceConfig } from "../config/Config.js";
+import {
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  type ProjectContextResolution,
+} from "../config/ProjectContexts.js";
+import { resolveServiceConfigForProjectContext } from "../config/ProjectContextServiceConfig.js";
 import { SymphonyError } from "../errors.js";
 import type {
   CompletionReportPullRequestRef,
@@ -131,6 +137,7 @@ export interface PullRequestReviewFeedbackClient {
 
 export interface ReviewFeedbackActiveContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string;
   role: "reviewer" | string;
   token?: string | null;
@@ -221,7 +228,7 @@ export class PullRequestReviewFeedbackService {
   private async requireLifecycle(context: ReviewFeedbackActiveContext): Promise<IssueLifecycleRecord> {
     const lifecycle = await this.options.lifecycleStore.get(context.issue.id);
     if (!lifecycle) throw new SymphonyError("invalid_request", "Review feedback requires an existing issue lifecycle");
-    if (lifecycle.issueId !== context.issue.id && lifecycle.issueIdentifier !== context.issue.identifier) {
+    if (lifecycle.issueId !== context.issue.id || lifecycle.issueIdentifier !== context.issue.identifier) {
       throw new SymphonyError("invalid_request", "Review feedback issue does not match the lifecycle record");
     }
     return lifecycle;
@@ -240,11 +247,20 @@ export class PullRequestReviewFeedbackService {
     if (lifecycle.summaryPointers.lastRunId !== context.activeRunId) {
       throw new SymphonyError("invalid_request", "Review feedback run does not match the active reviewer run");
     }
-    const lifecyclePhase = context.phase ?? lifecycle.phase ?? phaseForIssueState(context.issue.state, this.options.config);
+    if (
+      context.projectContext &&
+      lifecycle.projectContext &&
+      !projectContextEquals(context.projectContext, lifecycle.projectContext)
+    ) {
+      throw new SymphonyError("invalid_request", "Review feedback issue project context does not match the lifecycle record");
+    }
+    const projectContext = resolveReviewFeedbackProjectContext(context, lifecycle);
+    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const lifecyclePhase = context.phase ?? lifecycle.phase ?? phaseForIssueState(context.issue.state, resolvedConfig);
     if (lifecyclePhase !== "review") {
       throw new SymphonyError("invalid_request", `Review feedback cannot be accepted while lifecycle phase is ${lifecyclePhase}`);
     }
-    if (context.ignoreStateGate !== true && !sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
+    if (context.ignoreStateGate !== true && !sameStateIn(context.issue.state, resolvedConfig.reviewLoop.reviewStates)) {
       throw new SymphonyError("invalid_request", "Review feedback requires the issue to be in a review state");
     }
   }
@@ -555,6 +571,29 @@ function stableJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function resolveReviewFeedbackProjectContext(
+  context: ReviewFeedbackActiveContext,
+  lifecycle: IssueLifecycleRecord | null | undefined,
+): ProjectContextResolution {
+  return normalizeProjectContextResolution(
+    context.projectContext ?? lifecycle?.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
+}
+
+function projectContextEquals(
+  left: ProjectContextResolution | undefined,
+  right: ProjectContextResolution | undefined,
+): boolean {
+  const normalizedLeft = normalizeProjectContextResolution(left);
+  const normalizedRight = normalizeProjectContextResolution(right);
+  return (
+    normalizedLeft.projectContextId === normalizedRight.projectContextId &&
+    normalizedLeft.projectContextLabel === normalizedRight.projectContextLabel &&
+    normalizedLeft.linearProjectSlug === normalizedRight.linearProjectSlug &&
+    normalizedLeft.routingSource === normalizedRight.routingSource
+  );
 }
 
 function resultFromRecord(record: IssueReviewFeedbackRecord, replayed: boolean): PullRequestReviewFeedbackSubmitResult {

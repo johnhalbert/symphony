@@ -573,7 +573,7 @@ describe("StatusServer durable API", () => {
       expect(pauseResponse.status).toBe(202);
       expect(continuationSummaryResponse.status).toBe(201);
       expect(continuationSummaryBody.summaryReference).toMatchObject({
-        id: "fake-summary:TEST-1",
+        id: "fake-summary:issue-1",
         transcriptPointers: ["/api/v1/runs/run-1/transcript"],
         statusApiPointers: ["/api/v1/issues/TEST-1"],
       });
@@ -846,6 +846,7 @@ describe("StatusServer durable API", () => {
         "lastEvent",
         "model",
         "msgCount",
+        "projectContext",
         "runSession",
         "startedAt",
         "state",
@@ -1686,7 +1687,7 @@ describe("StatusServer durable API", () => {
       expect(secondPage.activity[0]?.issue.identifier).toBe("TEST-A");
       expect(issueBody.activity.map((item) => item.issue.identifier)).toEqual(["TEST-A", "TEST-A"]);
       expect(issueBody.counts.distinctRunsConsidered).toBe(1);
-      const writebackItem = writebackBody.activity.find((item) => item.id === "writeback:comment:issue-b:report");
+      const writebackItem = writebackBody.activity.find((item) => item.id === "writeback:default:comment:issue-b:report");
       expect(writebackItem).toMatchObject({
         at: writebackOperation.updatedAt,
         kind: "writeback_operation",
@@ -3233,17 +3234,18 @@ describe("StatusServer durable API", () => {
       expect(runStore.latestRunForIssueCount).toBe(0);
       expect(lifecycleStore.getCount).toBe(0);
 
+      const fetchCountBeforeCachedResponse = tracker.fetchCount;
       const cachedResponse = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board`);
       const cachedBody = (await cachedResponse.json()) as { tracker: { cached: boolean } };
       expect(cachedResponse.status).toBe(200);
       expect(cachedBody.tracker.cached).toBe(true);
-      expect(tracker.fetchCount).toBe(1);
+      expect(tracker.fetchCount).toBe(fetchCountBeforeCachedResponse);
 
       const refreshResponse = await fetch(`http://${address.host}:${address.port}/api/v1/issue-board?refresh=1`);
       const refreshBody = (await refreshResponse.json()) as { tracker: { cached: boolean } };
       expect(refreshResponse.status).toBe(200);
       expect(refreshBody.tracker.cached).toBe(false);
-      expect(tracker.fetchCount).toBe(2);
+      expect(tracker.fetchCount).toBe(fetchCountBeforeCachedResponse + 1);
     } finally {
       await server.stop();
     }

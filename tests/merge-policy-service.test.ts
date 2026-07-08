@@ -25,7 +25,7 @@ import type { Issue } from "../src/core/types.js";
 import { FileWritebackOutboxStore, WritebackProcessor } from "../src/core/writeback/WritebackOutbox.js";
 import type { PullRequestCheckResult } from "../src/integrations/github/GitHubPullRequestClient.js";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
-import { issue } from "./helpers.js";
+import { issue, projectContextFixture } from "./helpers.js";
 
 let root: string;
 
@@ -3661,6 +3661,74 @@ describe("MergePolicyService", () => {
     expect(writer.transitions).toEqual([]);
   });
 
+  it("uses project-context service credentials and tracker routing for gated merges", async () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    };
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      github: { owner: "acme", repo: "symphony" },
+      projectContexts: [
+        projectContextFixture({ id: "symphony", label: "Symphony", projectSlug: "SYMPHONY", repository: "." }),
+        projectContextFixture({
+          id: "docs",
+          label: "Documentation Site",
+          projectSlug: "DOCS",
+          repository: "../docs-site",
+          github: { owner: "acme", repo: "symphony", token: "$DOCS_GITHUB_TOKEN" },
+        }),
+      ],
+      env: { GITHUB_TOKEN: "", DOCS_GITHUB_TOKEN: "docs-github-secret" },
+    });
+    const currentIssue = issue({
+      id: "issue-docs-1",
+      identifier: "DOCS-1",
+      state: "Ready to Merge",
+      labels: ["dogfood-ready"],
+      projectContext: docsProjectContext,
+      linearProjectIdentity: { kind: "linear", slug: "DOCS" },
+    });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const client = new FakeMergeClient();
+    const writer = new MemoryWriter(currentIssue);
+    const trackerContexts: string[] = [];
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      trackerResolver: (projectContext) => {
+        trackerContexts.push(projectContext?.projectContextId ?? "default");
+        return tracker(currentIssue);
+      },
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    const result = await service.reconcileIssue(currentIssue);
+
+    expect(result.status).toBe("merged");
+    expect(trackerContexts).toContain("docs");
+    expect(currentIssue.state).toBe("Done");
+    expect(client.mergeInput).toMatchObject({ pullRequestNumber: 42 });
+    await expect(lifecycleStore.get(currentIssue.id)).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+      merge: {
+        mergedBy: { capability: "github.merge" },
+      },
+    });
+  });
+
   it("enforces service-owned linear.writeback capability when writeback is injected", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",
@@ -3783,6 +3851,7 @@ function mergeConfig(input: {
   conflictsState?: string;
   credentialProfiles?: Record<string, unknown>;
   github?: Record<string, unknown>;
+  projectContexts?: Record<string, unknown>[];
   env?: NodeJS.ProcessEnv;
 }) {
   return parseServiceConfig(
@@ -3809,6 +3878,7 @@ function mergeConfig(input: {
             : { allowed: true, evidence: input.noCiEvidence },
       },
       github: input.github ?? { owner: "acme", repo: "symphony" },
+      ...(input.projectContexts === undefined ? {} : { project_contexts: input.projectContexts }),
       ...(input.credentialProfiles === undefined ? {} : { credential_profiles: input.credentialProfiles }),
     },
     path.join(root, "WORKFLOW.md"),

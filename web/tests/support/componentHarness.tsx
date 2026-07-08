@@ -162,6 +162,7 @@ export function createApiModeDataSource(options: ApiModeDataSourceOptions = {}):
   const issueDetails = options.issueDetails ?? {
     [primaryIssue.id]: {
       issue: primaryIssue,
+      workspace: null,
       activity: dashboard.activity,
       runs: history.sessions,
       transcript: history.transcriptBySession[history.defaultSessionId] ?? [],

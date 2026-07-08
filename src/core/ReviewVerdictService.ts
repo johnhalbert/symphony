@@ -1,5 +1,12 @@
 import { z } from "zod";
 import type { ServiceConfig } from "./config/Config.js";
+import {
+  normalizeProjectContextResolution,
+  projectContextResolutionFromIssue,
+  sameProjectContextIdentity,
+  type ProjectContextResolution,
+} from "./config/ProjectContexts.js";
+import { resolveServiceConfigForProjectContext } from "./config/ProjectContextServiceConfig.js";
 import { SymphonyError } from "./errors.js";
 import type {
   CompletionReportPullRequestRef,
@@ -25,7 +32,7 @@ import {
   planReviewFailWritebacks,
   planReviewPassWritebacks,
 } from "./writeback/TransitionPolicy.js";
-import type { NewWritebackOperation, WritebackOperation, WritebackOutboxStore } from "./writeback/WritebackOutbox.js";
+import { writebackIdentityKey, type NewWritebackOperation, type WritebackOperation, type WritebackOutboxStore } from "./writeback/WritebackOutbox.js";
 
 const PASS_REQUIRES_APPROVE_MESSAGE =
   'Pass review verdict requires prior submit_pull_request_review_feedback with kind="review" and event="APPROVE" for the active reviewer run and lifecycle-bound PR.';
@@ -99,6 +106,7 @@ export type ReviewVerdictSubmitterRole = "worker" | "orchestrator" | "reviewer" 
 
 export interface ReviewVerdictActiveContext {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string;
   role: ReviewVerdictSubmitterRole;
   token?: string | null;
@@ -145,6 +153,7 @@ export class ReviewVerdictService {
     this.validateCaller(verdict, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
+    validateReviewVerdictProjectContext(context, existingLifecycle);
     const existingSubmission = (existingLifecycle?.reviewVerdictSubmissions ?? []).find(
       (item) => item.runId === context.activeRunId && item.idempotencyKey === verdict.idempotencyKey,
     );
@@ -184,8 +193,13 @@ export class ReviewVerdictService {
       });
     }
 
-    const lifecyclePhase = context.phase ?? existingLifecycle?.phase ?? phaseForIssueState(context.issue.state, this.options.config);
-    this.validateIssueIsAcceptingVerdicts(context, lifecyclePhase);
+    const projectContext = resolveReviewVerdictProjectContext(context, existingLifecycle);
+    const resolvedConfig = resolveServiceConfigForProjectContext(this.options.config, projectContext);
+    const resolvedContext: ReviewVerdictActiveContext = { ...context, projectContext };
+
+    const lifecyclePhase =
+      resolvedContext.phase ?? existingLifecycle?.phase ?? phaseForIssueState(resolvedContext.issue.state, resolvedConfig);
+    this.validateIssueIsAcceptingVerdicts(resolvedContext, lifecyclePhase, resolvedConfig);
     this.validateVerdictPayload(verdict);
     const gateFindings = normalizeReviewGateFindings(verdict);
     const discoveryFindings = normalizeReviewDiscoveryFindings(verdict.discoveryFindings);
@@ -195,23 +209,24 @@ export class ReviewVerdictService {
         : gateFindings.map((finding) => finding.summary);
 
     const lifecycle = await this.options.lifecycleStore.ensureIssue(
-      context.issue,
-      existingLifecycle ? {} : { phase: lifecyclePhase },
+      resolvedContext.issue,
+      existingLifecycle ? { projectContext } : { projectContext, phase: lifecyclePhase },
     );
     this.validateReviewFeedbackAlignment(verdict, lifecycle);
     const submission: IssueReviewVerdictSubmissionRecord = {
-      id: verdictIdFor(context.issue.id, verdict.idempotencyKey),
+      id: verdictIdFor(resolvedContext.issue.id, verdict.idempotencyKey),
       idempotencyKey: verdict.idempotencyKey,
       runId: verdict.runId,
-      issueId: context.issue.id,
-      issueIdentifier: context.issue.identifier,
+      issueId: resolvedContext.issue.id,
+      issueIdentifier: resolvedContext.issue.identifier,
+      projectContext,
       verdict: verdict.verdict,
       acceptanceResults: normalizeAcceptanceResults(verdict.acceptanceResults),
       findings: storedFindings,
       gateFindings,
       discoveryFindings,
       evidence: verdict.evidence,
-      reviewer: context.reviewer ?? null,
+      reviewer: resolvedContext.reviewer ?? null,
       submittedAt: new Date().toISOString(),
       status: "pending",
       ignoreStateGate: context.ignoreStateGate === true,
@@ -220,7 +235,8 @@ export class ReviewVerdictService {
       supersededAt: null,
       supersededReason: null,
     };
-    await this.options.lifecycleStore.updateIssue(context.issue, {
+    await this.options.lifecycleStore.updateIssue(resolvedContext.issue, {
+      projectContext,
       reviewVerdictSubmissions: [...(lifecycle.reviewVerdictSubmissions ?? []), submission],
     });
 
@@ -248,11 +264,15 @@ export class ReviewVerdictService {
     }
   }
 
-  private validateIssueIsAcceptingVerdicts(context: ReviewVerdictActiveContext, lifecyclePhase: IssueLifecyclePhase): void {
+  private validateIssueIsAcceptingVerdicts(
+    context: ReviewVerdictActiveContext,
+    lifecyclePhase: IssueLifecyclePhase,
+    config: ServiceConfig,
+  ): void {
     if (lifecyclePhase !== "review") {
       throw new SymphonyError("invalid_request", `Review verdict cannot be accepted while lifecycle phase is ${lifecyclePhase}`);
     }
-    if (context.ignoreStateGate !== true && !sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
+    if (context.ignoreStateGate !== true && !sameStateIn(context.issue.state, config.reviewLoop.reviewStates)) {
       throw new SymphonyError("invalid_request", "Review verdict requires the issue to be in a review state");
     }
   }
@@ -301,8 +321,12 @@ export function planReviewVerdictSubmissionApplication(input: {
   submission: IssueReviewVerdictSubmissionRecord;
   appliedAt?: string;
 }): ReviewVerdictApplicationPlan {
+  const projectContext = normalizeProjectContextResolution(
+    input.submission.projectContext ?? input.lifecycle.projectContext ?? projectContextResolutionFromIssue(input.issue),
+  );
+  const config = resolveServiceConfigForProjectContext(input.config, projectContext);
   const reviewRound = input.submission.verdict === "fail" ? nextReviewRound(input.lifecycle) : input.lifecycle.reviewRound;
-  const maxReviewerFailures = input.config.reviewLoop.failureLimits.reviewerFailures;
+  const maxReviewerFailures = config.reviewLoop.failureLimits.reviewerFailures;
   const ceilingReached = input.submission.verdict === "fail" && reviewRound >= maxReviewerFailures;
   const provisionalVerdict = acceptedVerdictFromSubmission(input.submission, []);
   const writebackDetails = {
@@ -318,10 +342,11 @@ export function planReviewVerdictSubmissionApplication(input: {
     operations = planBlockedEscalationWritebacks(
       {
         issue: input.issue,
+        projectContext,
         runId: input.submission.runId,
         reason: `max reviewer failures reached (${reviewRound}/${maxReviewerFailures})`,
         incompleteTurnCount: input.lifecycle.incompleteTurnCount,
-        maxIncompleteTurns: input.config.reviewLoop.maxIncompleteTurns,
+        maxIncompleteTurns: config.reviewLoop.maxIncompleteTurns,
         reviewRound,
         maxReviewRounds: maxReviewerFailures,
         lastCompletionReport: latestCompletionReport(input.lifecycle),
@@ -329,14 +354,14 @@ export function planReviewVerdictSubmissionApplication(input: {
         requiredAction:
           "Review the requested changes, decide whether the worker should continue, and move the issue out of Blocked when it is ready for another implementation pass.",
       },
-      input.config,
+      config,
     );
   } else if (input.submission.verdict === "fail") {
-    operations = planReviewFailWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
+    operations = planReviewFailWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), config, writebackDetails);
   } else if (input.submission.verdict === "blocked") {
-    operations = planReviewBlockedWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
+    operations = planReviewBlockedWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), config, writebackDetails);
   } else {
-    operations = planReviewPassWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
+    operations = planReviewPassWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), config, writebackDetails);
   }
   if (operations.length === 0 && input.submission.ignoreStateGate !== true) {
     throw new SymphonyError("invalid_request", "Review verdict cannot be accepted for the current issue state");
@@ -344,7 +369,7 @@ export function planReviewVerdictSubmissionApplication(input: {
 
   const storedVerdict = acceptedVerdictFromSubmission(
     input.submission,
-    operations.map((operation) => operation.idempotencyKey),
+    operations.map((operation) => writebackIdentityKey(operation.idempotencyKey, operation.projectContext ?? projectContext)),
   );
   const appliedAt = input.appliedAt ?? new Date().toISOString();
   const reviewVerdictSubmissions = (input.lifecycle.reviewVerdictSubmissions ?? []).map((submission) =>
@@ -358,6 +383,7 @@ export function planReviewVerdictSubmissionApplication(input: {
       : submission,
   );
   const patch: IssueLifecyclePatch = {
+    projectContext,
     phase:
       input.submission.verdict === "pass"
         ? "passed"
@@ -391,6 +417,7 @@ function acceptedVerdictFromSubmission(
     runId: submission.runId,
     issueId: submission.issueId,
     issueIdentifier: submission.issueIdentifier,
+    projectContext: submission.projectContext,
     verdict: submission.verdict,
     acceptanceResults: submission.acceptanceResults,
     findings: submission.findings,
@@ -413,6 +440,7 @@ function submissionFromAcceptedVerdict(verdict: IssueReviewVerdictRecord): Issue
     runId: verdict.runId,
     issueId: verdict.issueId,
     issueIdentifier: verdict.issueIdentifier,
+    projectContext: normalizeProjectContextResolution(verdict.projectContext),
     verdict: verdict.verdict,
     acceptanceResults: verdict.acceptanceResults,
     findings: verdict.findings,
@@ -638,9 +666,31 @@ function normalizeAcceptanceResults(items: ReviewVerdictInput["acceptanceResults
   }));
 }
 
+function resolveReviewVerdictProjectContext(
+  context: ReviewVerdictActiveContext,
+  lifecycle: IssueLifecycleRecord | null | undefined,
+): ProjectContextResolution {
+  return normalizeProjectContextResolution(
+    lifecycle?.projectContext ?? context.projectContext ?? projectContextResolutionFromIssue(context.issue),
+  );
+}
+
+function validateReviewVerdictProjectContext(
+  context: ReviewVerdictActiveContext,
+  lifecycle: IssueLifecycleRecord | null | undefined,
+): void {
+  if (!context.projectContext || !lifecycle?.projectContext) return;
+  if (sameProjectContextIdentity(context.projectContext, lifecycle.projectContext)) return;
+  throw new SymphonyError(
+    "invalid_request",
+    "Review verdict issue project context does not match the lifecycle record",
+  );
+}
+
 function reviewWritebackContextForSubmission(issue: Issue, submission: IssueReviewVerdictSubmissionRecord) {
   return {
     issue,
+    projectContext: submission.projectContext ?? projectContextResolutionFromIssue(issue) ?? undefined,
     runId: submission.runId,
     reviewer: submission.reviewer,
   };

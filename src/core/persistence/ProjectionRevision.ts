@@ -1,5 +1,6 @@
 export type ProjectionChangeSource =
   | "runs"
+  | "run_metadata"
   | "workspaces"
   | "lifecycle"
   | "writeback"

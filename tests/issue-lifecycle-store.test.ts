@@ -9,7 +9,7 @@ import {
   FileIssueLifecycleStore,
   phaseForIssueState,
 } from "../src/core/persistence/IssueLifecycleStore.js";
-import { issue, testConfig } from "./helpers.js";
+import { issue, testConfig, trackerIssue } from "./helpers.js";
 
 describe("FileIssueLifecycleStore", () => {
   let root: string;
@@ -161,6 +161,38 @@ describe("FileIssueLifecycleStore", () => {
     await expect(store.get("TEST-404")).resolves.toBeNull();
   });
 
+  it("requires exact issue id once duplicate visible identifiers collide", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    await store.ensureIssue(
+      trackerIssue({
+        id: "issue-docs-1",
+        identifier: "ENG-123",
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+      }),
+      { phase: "implementation" },
+    );
+    await store.ensureIssue(
+      trackerIssue({
+        id: "issue-platform-1",
+        identifier: "ENG-123",
+        projectContextId: "platform",
+        projectContextLabel: "Platform Services",
+      }),
+      { phase: "implementation" },
+    );
+
+    await expect(store.get("ENG-123")).resolves.toBeNull();
+    await expect(store.get("issue-docs-1")).resolves.toMatchObject({
+      issueIdentifier: "ENG-123",
+      projectContext: { projectContextId: "docs" },
+    });
+    await expect(store.get("issue-platform-1")).resolves.toMatchObject({
+      issueIdentifier: "ENG-123",
+      projectContext: { projectContextId: "platform" },
+    });
+  });
+
   it("persists merge metadata for status API consumers", async () => {
     const store = new FileIssueLifecycleStore(root);
     await store.ensureIssue(issue(), {
@@ -272,6 +304,322 @@ describe("FileIssueLifecycleStore", () => {
       lastWorkerOutput: { reportId: "report-1" },
       lastReviewerOutput: { verdictId: "verdict-1" },
     });
+  });
+
+
+  it("infers project context from routed issue metadata when ensureIssue patch omits it", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const routedIssue = {
+      ...issue(),
+      projectContextId: " Docs Site ",
+      projectContextLabel: "Documentation Site",
+      linearProjectIdentity: { slug: "DOCS" },
+      routingSource: "candidate_poll",
+    };
+
+    const record = await store.ensureIssue(routedIssue, { phase: "implementation" });
+
+    expect(record.projectContext).toEqual({
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    });
+    expect(record.summaryPointers.projectContext).toEqual({
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    });
+  });
+
+  it("backfills project context attribution and falls back historical lifecycle metadata without mutating stored records", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const docsProjectContext = {
+      projectContextId: " Docs Site ",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const normalizedDocsProjectContext = {
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const legacyDefaultProjectContext = {
+      projectContextId: "default",
+      projectContextLabel: "Default",
+      linearProjectSlug: null,
+      routingSource: "legacy_default",
+    } as const;
+
+    await store.ensureIssue(issue(), {
+      projectContext: docsProjectContext,
+      lastCompletionReportId: "report-1",
+      lastReviewVerdictId: "verdict-1",
+      issueBreakdownPlans: [
+        {
+          id: "plan-1",
+          idempotencyKey: "plan-key",
+          requestHash: "plan-hash",
+          runId: "planner-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Split documentation updates into smaller issues.",
+          proposedIssues: [
+            {
+              title: "Add docs API examples",
+              description: "Document the docs-site API examples.",
+              acceptanceCriteria: ["Examples are documented"],
+              dependencies: [],
+              labels: ["docs"],
+            },
+          ],
+          transcriptPointers: ["/api/v1/runs/planner-run-1/transcript"],
+          statusApiPointers: ["/api/v1/issues/TEST-1"],
+          issueUpdatedAt: "2026-01-01T00:00:00.000Z",
+          issueContentFingerprint: "fingerprint-1",
+          configFingerprint: "config-fingerprint-1",
+          cursorMode: "review",
+          acceptedAt: "2026-01-01T00:00:15.000Z",
+          applicationStatus: "not_requested",
+          applicationOperationKeys: [],
+          createdIssueRefs: [],
+          appliedAt: null,
+          applicationBlockedReason: null,
+        },
+      ],
+      completionReports: [
+        {
+          id: "report-1",
+          idempotencyKey: "report-key",
+          runId: "worker-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Updated documentation routing.",
+          validationEvidence: ["npm run typecheck -- --pretty false"],
+          acceptanceChecklist: [],
+          changedFiles: ["src/core/config/Config.ts"],
+          branchName: "symphony/TEST-1",
+          pullRequest: null,
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      reviewVerdicts: [
+        {
+          id: "verdict-1",
+          idempotencyKey: "verdict-key",
+          runId: "reviewer-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          verdict: "pass",
+          acceptanceResults: [{ text: "Project context propagated", satisfied: true, evidence: "handoff memo" }],
+          findings: [],
+          gateFindings: [],
+          discoveryFindings: [],
+          evidence: ["reviewed transcript"],
+          reviewer: "reviewer:run",
+          submittedAt: "2026-01-01T00:01:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+      reviewFeedback: [
+        {
+          id: "feedback-1",
+          idempotencyKey: "feedback-key",
+          requestHash: "feedback-hash",
+          runId: "reviewer-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          kind: "review",
+          event: "APPROVE",
+          body: "Approved after context propagation review.",
+          pullRequest: { url: null, number: null, headSha: null, branch: null },
+          reviewer: "reviewer:run",
+          reviewUrl: null,
+          commentUrls: [],
+          submittedAt: "2026-01-01T00:01:30.000Z",
+        },
+      ],
+      mergeConflictResolutionReports: [
+        {
+          id: "merge-report-1",
+          idempotencyKey: "merge-key",
+          runId: "worker-run-2",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          resolutionStatus: "resolved",
+          summary: "Resolved merge conflicts.",
+          validationEvidence: ["git merge --continue"],
+          changedFiles: ["src/core/persistence/IssueLifecycleStore.ts"],
+          pullRequest: { url: null, number: null, headSha: null, branch: null },
+          previousHeadSha: null,
+          newHeadSha: null,
+          baseBranch: "main",
+          baseHeadSha: null,
+          blockedReason: null,
+          risks: [],
+          submittedAt: "2026-01-01T00:02:00.000Z",
+        },
+      ],
+    });
+
+    const reloaded = await store.get("TEST-1");
+    expect(reloaded).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.summaryPointers).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.issueBreakdownPlans[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.completionReports[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.reviewVerdicts[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.reviewFeedback[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.mergeConflictResolutionReports[0]).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.handoff.memo).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(reloaded?.handoff.memo.pointers).toMatchObject({ projectContext: normalizedDocsProjectContext });
+    expect(buildWorkerHandoffPacket(reloaded!, "2026-01-01T00:03:00.000Z")).toMatchObject({
+      projectContext: normalizedDocsProjectContext,
+      pointers: {
+        projectContext: normalizedDocsProjectContext,
+      },
+    });
+
+    const legacyPath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const topLevelMissingRecord = JSON.parse(await nodeFs.readFile(legacyPath, "utf8")) as Record<string, unknown>;
+    delete topLevelMissingRecord.projectContext;
+    await writeFile(legacyPath, `${JSON.stringify(topLevelMissingRecord, null, 2)}
+`, "utf8");
+    const beforeExplicitBackfillRead = await nodeFs.readFile(legacyPath, "utf8");
+
+    const explicitBackfilled = await store.get("TEST-1");
+    expect(explicitBackfilled).toMatchObject({
+      projectContext: normalizedDocsProjectContext,
+      summaryPointers: {
+        projectContext: normalizedDocsProjectContext,
+      },
+      issueBreakdownPlans: [{ projectContext: normalizedDocsProjectContext }],
+      completionReports: [{ projectContext: normalizedDocsProjectContext }],
+      reviewVerdicts: [{ projectContext: normalizedDocsProjectContext }],
+      reviewFeedback: [{ projectContext: normalizedDocsProjectContext }],
+      mergeConflictResolutionReports: [{ projectContext: normalizedDocsProjectContext }],
+      handoff: {
+        memo: {
+          projectContext: normalizedDocsProjectContext,
+          pointers: {
+            projectContext: normalizedDocsProjectContext,
+          },
+        },
+      },
+    });
+    expect(buildWorkerHandoffPacket(explicitBackfilled!, "2026-01-01T00:04:00.000Z")).toMatchObject({
+      projectContext: normalizedDocsProjectContext,
+      pointers: {
+        projectContext: normalizedDocsProjectContext,
+      },
+    });
+    expect(await nodeFs.readFile(legacyPath, "utf8")).toBe(beforeExplicitBackfillRead);
+
+    const legacyRecord = JSON.parse(beforeExplicitBackfillRead) as Record<string, unknown>;
+    const summaryPointers = legacyRecord.summaryPointers as Record<string, unknown> | undefined;
+    summaryPointers && delete summaryPointers.projectContext;
+    const issueBreakdownPlans = legacyRecord.issueBreakdownPlans as Array<Record<string, unknown>> | undefined;
+    issueBreakdownPlans?.forEach((plan) => delete plan.projectContext);
+    const completionReports = legacyRecord.completionReports as Array<Record<string, unknown>> | undefined;
+    completionReports?.forEach((report) => delete report.projectContext);
+    const reviewVerdicts = legacyRecord.reviewVerdicts as Array<Record<string, unknown>> | undefined;
+    reviewVerdicts?.forEach((verdict) => delete verdict.projectContext);
+    const reviewFeedback = legacyRecord.reviewFeedback as Array<Record<string, unknown>> | undefined;
+    reviewFeedback?.forEach((feedback) => delete feedback.projectContext);
+    const mergeConflictResolutionReports = legacyRecord.mergeConflictResolutionReports as Array<Record<string, unknown>> | undefined;
+    mergeConflictResolutionReports?.forEach((report) => delete report.projectContext);
+    const handoff = legacyRecord.handoff as { memo?: Record<string, unknown> } | undefined;
+    if (handoff?.memo) {
+      delete handoff.memo.projectContext;
+      const handoffPointers = handoff.memo.pointers as Record<string, unknown> | undefined;
+      handoffPointers && delete handoffPointers.projectContext;
+    }
+    await writeFile(legacyPath, `${JSON.stringify(legacyRecord, null, 2)}
+`, "utf8");
+    const beforeLegacyDefaultRead = await nodeFs.readFile(legacyPath, "utf8");
+
+    const legacyReloaded = await store.get("TEST-1");
+    expect(legacyReloaded).toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+      summaryPointers: {
+        projectContext: legacyDefaultProjectContext,
+      },
+      issueBreakdownPlans: [{ projectContext: legacyDefaultProjectContext }],
+      completionReports: [{ projectContext: legacyDefaultProjectContext }],
+      reviewVerdicts: [{ projectContext: legacyDefaultProjectContext }],
+      reviewFeedback: [{ projectContext: legacyDefaultProjectContext }],
+      mergeConflictResolutionReports: [{ projectContext: legacyDefaultProjectContext }],
+      handoff: {
+        memo: {
+          projectContext: legacyDefaultProjectContext,
+          pointers: {
+            projectContext: legacyDefaultProjectContext,
+          },
+        },
+      },
+    });
+    expect(buildWorkerHandoffPacket(legacyReloaded!, "2026-01-01T00:05:00.000Z")).toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+      pointers: {
+        projectContext: legacyDefaultProjectContext,
+      },
+    });
+    expect(await nodeFs.readFile(legacyPath, "utf8")).toBe(beforeLegacyDefaultRead);
+  });
+
+
+  it("rejects legacy lifecycle records with conflicting nested project contexts", async () => {
+    const store = new FileIssueLifecycleStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs-site",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const platformProjectContext = {
+      projectContextId: "platform-services",
+      projectContextLabel: "Platform Services",
+      linearProjectSlug: "PLAT",
+      routingSource: "workflow_default",
+    } as const;
+
+    await store.ensureIssue(issue(), {
+      projectContext: docsProjectContext,
+      completionReports: [
+        {
+          id: "report-1",
+          idempotencyKey: "report-key",
+          runId: "worker-run-1",
+          issueId: "issue-1",
+          issueIdentifier: "TEST-1",
+          summary: "Updated documentation routing.",
+          validationEvidence: ["npm run typecheck -- --pretty false"],
+          acceptanceChecklist: [],
+          changedFiles: ["src/core/persistence/IssueLifecycleStore.ts"],
+          branchName: "symphony/TEST-1",
+          pullRequest: null,
+          risks: [],
+          acceptedAt: "2026-01-01T00:00:00.000Z",
+          writebackOperationKeys: [],
+        },
+      ],
+    });
+
+    const lifecyclePath = path.join(root, "issue-lifecycle", "issue-1.json");
+    const conflictingRecord = JSON.parse(await nodeFs.readFile(lifecyclePath, "utf8")) as Record<string, unknown>;
+    delete conflictingRecord.projectContext;
+    const completionReports = conflictingRecord.completionReports as Array<Record<string, unknown>> | undefined;
+    if (completionReports?.[0]) {
+      completionReports[0].projectContext = platformProjectContext;
+    }
+    await writeFile(lifecyclePath, `${JSON.stringify(conflictingRecord, null, 2)}
+`, "utf8");
+
+    await expect(store.get("TEST-1")).rejects.toBeInstanceOf(SymphonyError);
   });
 
   it("surfaces corrupt lifecycle records", async () => {

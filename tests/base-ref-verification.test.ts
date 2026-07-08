@@ -98,6 +98,8 @@ describe("BaseRefVerifier", () => {
     const workspace = path.join(root, "workspace");
     await git(["init", "--bare", remote], root);
     await git(["init", workspace], root);
+    await git(["config", "user.name", "Symphony Test"], workspace);
+    await git(["config", "user.email", "symphony@example.com"], workspace);
     await git(["checkout", "-b", "main"], workspace);
     await writeFile(path.join(workspace, "README.md"), "initial\n", "utf8");
     await git(["add", "README.md"], workspace);

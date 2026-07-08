@@ -4,12 +4,14 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parseServiceConfig } from "../src/core/config/Config.js";
+import { normalizeProjectContextResolution } from "../src/core/config/ProjectContexts.js";
 import {
   buildMcpCliSpawnArgs,
   buildMcpSubprocessEnvironment,
   buildMcpSubprocessServerConfig,
   shouldIncludeNodeExecArgv,
 } from "../src/core/harness/McpSubprocessEnvironment.js";
+import { multiProjectWorkflowConfig, projectContextFixture } from "./helpers.js";
 
 describe("MCP subprocess environment", () => {
   it("includes Node execArgv for TypeScript CLI entrypoints only", () => {
@@ -961,7 +963,8 @@ describe("MCP subprocess environment", () => {
           kind: "git_worktree",
           path: "$WORKSPACE_SOURCE_PATH",
           repository: "$WORKSPACE_REPOSITORY",
-          base_ref: "main",
+          base_ref: "$WORKSPACE_BASE_REF",
+          branch_template: "$WORKSPACE_BRANCH_TEMPLATE",
           cache_path: "$WORKSPACE_CACHE_PATH",
         },
       },
@@ -979,6 +982,8 @@ describe("MCP subprocess environment", () => {
       WORKSPACE_STATE_DIR: "/tmp/symphony-state",
       WORKSPACE_SOURCE_PATH: "/tmp/source",
       WORKSPACE_REPOSITORY: "/tmp/repo",
+      WORKSPACE_BASE_REF: "origin/release",
+      WORKSPACE_BRANCH_TEMPLATE: "symphony/{{ issue.identifier }}",
       WORKSPACE_CACHE_PATH: "/tmp/cache",
       GITHUB_TOKEN: "decoy-github-secret",
       CURSOR_API_KEY: "cursor-secret",
@@ -998,6 +1003,8 @@ describe("MCP subprocess environment", () => {
       WORKSPACE_STATE_DIR: config.workspace.stateDir,
       WORKSPACE_SOURCE_PATH: config.workspace.source.path,
       WORKSPACE_REPOSITORY: config.workspace.source.repository,
+      WORKSPACE_BASE_REF: config.workspace.source.baseRef,
+      WORKSPACE_BRANCH_TEMPLATE: config.workspace.source.branchTemplate,
       WORKSPACE_CACHE_PATH: config.workspace.source.cachePath,
     });
     expect(env).not.toHaveProperty("GITHUB_TOKEN");
@@ -1006,6 +1013,1358 @@ describe("MCP subprocess environment", () => {
     const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
     expect(childConfig.tracker).toMatchObject(config.tracker);
     expect(childConfig.workspace).toEqual(config.workspace);
+  });
+
+  it("exports resolved git refs needed for child config parsing", () => {
+    const rawConfig = {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_PROFILED_KEY",
+        project_slug: "$LINEAR_PROJECT_SLUG",
+      },
+      workspace: {
+        root: "$WORKSPACE_ROOT",
+        source: {
+          kind: "git",
+          repository: "$WORKSPACE_REPOSITORY",
+          ref: "$WORKSPACE_SOURCE_REF",
+        },
+      },
+      github: {
+        owner: "acme",
+        repo: "symphony",
+        publish_pull_requests: false,
+      },
+    } as const;
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", {
+      LINEAR_PROFILED_KEY: "linear-secret",
+      LINEAR_PROJECT_SLUG: "TEST",
+      WORKSPACE_ROOT: "/tmp/symphony-workspaces",
+      WORKSPACE_REPOSITORY: "/tmp/repo",
+      WORKSPACE_SOURCE_REF: "feature/docs",
+    });
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "review-verdict-mcp",
+      parentEnv: { PATH: "/bin" },
+    });
+
+    expect(env).toMatchObject({
+      WORKSPACE_REPOSITORY: config.workspace.source.repository,
+      WORKSPACE_SOURCE_REF: config.workspace.source.ref,
+    });
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    expect(childConfig.workspace).toEqual(config.workspace);
+  });
+
+  it("preserves inherited top-level git_worktree parse refs when the default context overrides them", () => {
+    const rawConfig = {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_PROFILED_KEY",
+        project_slug: "$ROOT_PROJECT",
+        assignee: "$ROOT_ASSIGNEE",
+      },
+      workspace: {
+        root: "$ROOT_WORKSPACE_ROOT",
+        state_dir: "$ROOT_STATE_DIR",
+        source: {
+          kind: "git_worktree",
+          path: "$ROOT_SOURCE_PATH",
+          repository: "$ROOT_REPOSITORY",
+          base_ref: "$ROOT_BASE_REF",
+          branch_template: "$ROOT_BRANCH_TEMPLATE",
+          cache_path: "$ROOT_CACHE_PATH",
+        },
+      },
+      project_contexts: [
+        {
+          id: "symphony",
+          tracker: {
+            kind: "linear",
+            project_slug: "$DEFAULT_PROJECT",
+            assignee: "$DEFAULT_ASSIGNEE",
+          },
+          workspace: {
+            root: "$DEFAULT_WORKSPACE_ROOT",
+            state_dir: "$DEFAULT_STATE_DIR",
+            source: {
+              kind: "git_worktree",
+              path: "$DEFAULT_SOURCE_PATH",
+              repository: "$DEFAULT_REPOSITORY",
+              base_ref: "$DEFAULT_BASE_REF",
+              branch_template: "$DEFAULT_BRANCH_TEMPLATE",
+              cache_path: "$DEFAULT_CACHE_PATH",
+            },
+          },
+        },
+        {
+          id: "docs",
+        },
+      ],
+      github: {
+        owner: "acme",
+        repo: "symphony",
+        publish_pull_requests: false,
+      },
+    } as const;
+    const sourceEnv = {
+      LINEAR_PROFILED_KEY: "linear-secret",
+      ROOT_PROJECT: "ROOT",
+      ROOT_ASSIGNEE: "root-user",
+      ROOT_WORKSPACE_ROOT: "/tmp/root/workspaces",
+      ROOT_STATE_DIR: "/tmp/root/state",
+      ROOT_SOURCE_PATH: "/tmp/root/source",
+      ROOT_REPOSITORY: "/tmp/root/repo",
+      ROOT_BASE_REF: "origin/main",
+      ROOT_BRANCH_TEMPLATE: "root/{{ issue.identifier }}",
+      ROOT_CACHE_PATH: "/tmp/root/cache",
+      DEFAULT_PROJECT: "SYM",
+      DEFAULT_ASSIGNEE: "sym-user",
+      DEFAULT_WORKSPACE_ROOT: "/tmp/sym/workspaces",
+      DEFAULT_STATE_DIR: "/tmp/sym/state",
+      DEFAULT_SOURCE_PATH: "/tmp/sym/source",
+      DEFAULT_REPOSITORY: "/tmp/sym/repo",
+      DEFAULT_BASE_REF: "origin/symphony-main",
+      DEFAULT_BRANCH_TEMPLATE: "sym/{{ issue.identifier }}",
+      DEFAULT_CACHE_PATH: "/tmp/sym/cache",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    expect(config.topLevelDefaults).toBeDefined();
+    expect(config.workspace.source.baseRef).toBe("origin/symphony-main");
+    expect(config.projectContexts.byId.get("docs")?.workspace.source.baseRef).toBe("origin/main");
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "issue-breakdown-plan-mcp",
+      parentEnv: { PATH: "/bin" },
+    });
+
+    expect(env).toMatchObject({
+      ROOT_PROJECT: config.topLevelDefaults?.tracker.projectSlug,
+      ROOT_ASSIGNEE: config.topLevelDefaults?.tracker.assignee,
+      ROOT_WORKSPACE_ROOT: config.topLevelDefaults?.workspace.root,
+      ROOT_STATE_DIR: config.topLevelDefaults?.workspace.stateDir,
+      ROOT_SOURCE_PATH: config.topLevelDefaults?.workspace.source.path,
+      ROOT_REPOSITORY: config.topLevelDefaults?.workspace.source.repository,
+      ROOT_BASE_REF: config.topLevelDefaults?.workspace.source.baseRef,
+      ROOT_BRANCH_TEMPLATE: config.topLevelDefaults?.workspace.source.branchTemplate,
+      ROOT_CACHE_PATH: config.topLevelDefaults?.workspace.source.cachePath,
+      DEFAULT_PROJECT: config.projectContexts.byId.get("symphony")?.tracker.projectSlug,
+      DEFAULT_ASSIGNEE: config.projectContexts.byId.get("symphony")?.tracker.assignee,
+      DEFAULT_WORKSPACE_ROOT: config.projectContexts.byId.get("symphony")?.workspace.root,
+      DEFAULT_STATE_DIR: config.projectContexts.byId.get("symphony")?.workspace.stateDir,
+      DEFAULT_SOURCE_PATH: config.projectContexts.byId.get("symphony")?.workspace.source.path,
+      DEFAULT_REPOSITORY: config.projectContexts.byId.get("symphony")?.workspace.source.repository,
+      DEFAULT_BASE_REF: config.projectContexts.byId.get("symphony")?.workspace.source.baseRef,
+      DEFAULT_BRANCH_TEMPLATE: config.projectContexts.byId.get("symphony")?.workspace.source.branchTemplate,
+      DEFAULT_CACHE_PATH: config.projectContexts.byId.get("symphony")?.workspace.source.cachePath,
+    });
+    expect(env.ROOT_BASE_REF).toBe("origin/main");
+    expect(env.ROOT_BASE_REF).not.toBe(config.workspace.source.baseRef);
+    expect(env.ROOT_BRANCH_TEMPLATE).toBe("root/{{ issue.identifier }}");
+    expect(env.ROOT_BRANCH_TEMPLATE).not.toBe(config.workspace.source.branchTemplate);
+    expect(env.ROOT_SOURCE_PATH).toBe(config.topLevelDefaults?.workspace.source.path);
+    expect(env.ROOT_SOURCE_PATH).not.toBe(config.workspace.source.path);
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    expect(childConfig.workspace).toEqual(config.workspace);
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("symphony"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("symphony")),
+    );
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("docs")),
+    );
+  });
+
+  it("preserves inherited top-level git refs when the default context overrides them", () => {
+    const rawConfig = {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_PROFILED_KEY",
+        project_slug: "$ROOT_PROJECT",
+      },
+      workspace: {
+        root: "$ROOT_WORKSPACE_ROOT",
+        source: {
+          kind: "git",
+          repository: "$ROOT_REPOSITORY",
+          ref: "$ROOT_REF",
+        },
+      },
+      project_contexts: [
+        {
+          id: "symphony",
+          workspace: {
+            source: {
+              kind: "git",
+              repository: "$DEFAULT_REPOSITORY",
+              ref: "$DEFAULT_REF",
+            },
+          },
+        },
+        {
+          id: "docs",
+        },
+      ],
+      github: {
+        owner: "acme",
+        repo: "symphony",
+        publish_pull_requests: false,
+      },
+    } as const;
+    const sourceEnv = {
+      LINEAR_PROFILED_KEY: "linear-secret",
+      ROOT_PROJECT: "ROOT",
+      ROOT_WORKSPACE_ROOT: "/tmp/root/workspaces",
+      ROOT_REPOSITORY: "/tmp/root/repo",
+      ROOT_REF: "refs/heads/root-main",
+      DEFAULT_REPOSITORY: "/tmp/sym/repo",
+      DEFAULT_REF: "refs/heads/symphony-main",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    expect(config.topLevelDefaults).toBeDefined();
+    expect(config.workspace.source.ref).toBe("refs/heads/symphony-main");
+    expect(config.projectContexts.byId.get("docs")?.workspace.source.ref).toBe("refs/heads/root-main");
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "review-verdict-mcp",
+      parentEnv: { PATH: "/bin" },
+    });
+
+    expect(env).toMatchObject({
+      ROOT_PROJECT: config.topLevelDefaults?.tracker.projectSlug,
+      ROOT_WORKSPACE_ROOT: config.topLevelDefaults?.workspace.root,
+      ROOT_REPOSITORY: config.topLevelDefaults?.workspace.source.repository,
+      ROOT_REF: config.topLevelDefaults?.workspace.source.ref,
+      DEFAULT_REPOSITORY: config.projectContexts.byId.get("symphony")?.workspace.source.repository,
+      DEFAULT_REF: config.projectContexts.byId.get("symphony")?.workspace.source.ref,
+    });
+    expect(env.ROOT_REF).toBe("refs/heads/root-main");
+    expect(env.ROOT_REF).not.toBe(config.workspace.source.ref);
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    expect(childConfig.workspace).toEqual(config.workspace);
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("symphony"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("symphony")),
+    );
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toEqual(
+      comparableProjectContext(config.projectContexts.byId.get("docs")),
+    );
+  });
+
+  it("carries project-context parse dependencies needed for child config parsing", () => {
+    const rawConfig = {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_PROFILED_KEY",
+        project_slug: "$LINEAR_PROJECT_SLUG",
+      },
+      workspace: {
+        root: "$WORKSPACE_ROOT",
+        source: {
+          kind: "git_worktree",
+          repository: "$WORKSPACE_REPOSITORY",
+          base_ref: "main",
+        },
+      },
+      project_contexts: [
+        {
+          id: "docs",
+          tracker: {
+            kind: "linear",
+            api_key: "$DOCS_LINEAR_KEY",
+            project_slug: "$DOCS_LINEAR_PROJECT",
+            assignee: "$DOCS_LINEAR_ASSIGNEE",
+          },
+          workspace: {
+            root: "$DOCS_WORKSPACE_ROOT",
+            state_dir: "$DOCS_WORKSPACE_STATE_DIR",
+            source: {
+              kind: "git_worktree",
+              path: "$DOCS_WORKSPACE_SOURCE_PATH",
+              repository: "$DOCS_WORKSPACE_REPOSITORY",
+              base_ref: "$DOCS_WORKSPACE_BASE_REF",
+              branch_template: "$DOCS_WORKSPACE_BRANCH_TEMPLATE",
+              cache_path: "$DOCS_WORKSPACE_CACHE_PATH",
+            },
+          },
+          github: {
+            owner: "$DOCS_GITHUB_OWNER",
+            repo: "$DOCS_GITHUB_REPO",
+            head_owner: "$DOCS_GITHUB_HEAD_OWNER",
+            api_base_url: "$DOCS_GITHUB_API_BASE_URL",
+          },
+        },
+      ],
+      github: {
+        owner: "acme",
+        repo: "symphony",
+        publish_pull_requests: false,
+      },
+    } as const;
+    const sourceEnv = {
+      LINEAR_PROFILED_KEY: "linear-secret",
+      LINEAR_PROJECT_SLUG: "TEST",
+      WORKSPACE_ROOT: "/tmp/symphony-workspaces",
+      WORKSPACE_REPOSITORY: "/tmp/repo",
+      DOCS_LINEAR_KEY: "docs-linear-secret",
+      DOCS_LINEAR_PROJECT: "DOCS",
+      DOCS_LINEAR_ASSIGNEE: "writer",
+      DOCS_WORKSPACE_ROOT: "/tmp/docs-workspaces",
+      DOCS_WORKSPACE_STATE_DIR: "/tmp/docs-state",
+      DOCS_WORKSPACE_SOURCE_PATH: "/tmp/docs/source",
+      DOCS_WORKSPACE_REPOSITORY: "/tmp/docs/repo",
+      DOCS_WORKSPACE_BASE_REF: "origin/docs-main",
+      DOCS_WORKSPACE_BRANCH_TEMPLATE: "docs/{{ issue.identifier }}",
+      DOCS_WORKSPACE_CACHE_PATH: "/tmp/docs/cache",
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "john",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "issue-breakdown-plan-mcp",
+      parentEnv: { PATH: "/bin" },
+    });
+
+    expect(env).toMatchObject({
+      DOCS_LINEAR_KEY: "docs-linear-secret",
+      DOCS_LINEAR_PROJECT: "DOCS",
+      DOCS_LINEAR_ASSIGNEE: "writer",
+      DOCS_WORKSPACE_ROOT: config.projectContexts.byId.get("docs")?.workspace.root,
+      DOCS_WORKSPACE_STATE_DIR: config.projectContexts.byId.get("docs")?.workspace.stateDir,
+      DOCS_WORKSPACE_SOURCE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.path,
+      DOCS_WORKSPACE_REPOSITORY: config.projectContexts.byId.get("docs")?.workspace.source.repository,
+      DOCS_WORKSPACE_BASE_REF: config.projectContexts.byId.get("docs")?.workspace.source.baseRef,
+      DOCS_WORKSPACE_BRANCH_TEMPLATE: config.projectContexts.byId.get("docs")?.workspace.source.branchTemplate,
+      DOCS_WORKSPACE_CACHE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.cachePath,
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "john",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+    });
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    const expectedDocsContext = config.projectContexts.byId.get("docs");
+    expect(expectedDocsContext).toBeDefined();
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toMatchObject(
+      comparableProjectContext(expectedDocsContext!),
+    );
+  });
+
+  it("keeps non-GitHub MCPs free of default GitHub parse refs while preserving explicit project-context refs", () => {
+    const rawConfig = {
+      tracker: {
+        kind: "linear",
+        api_key: "$LINEAR_PROFILED_KEY",
+        project_slug: "$LINEAR_PROJECT_SLUG",
+      },
+      workspace: {
+        root: "$WORKSPACE_ROOT",
+        source: {
+          kind: "git_worktree",
+          repository: "$WORKSPACE_REPOSITORY",
+          base_ref: "main",
+        },
+      },
+      github: {
+        owner: "$GITHUB_OWNER",
+        repo: "$GITHUB_REPO",
+        head_owner: "$GITHUB_HEAD_OWNER",
+        api_base_url: "$GITHUB_API_BASE_URL",
+        publish_pull_requests: false,
+      },
+      project_contexts: [
+        {
+          id: "docs",
+          tracker: {
+            kind: "linear",
+            api_key: "$DOCS_LINEAR_KEY",
+            project_slug: "$DOCS_LINEAR_PROJECT",
+          },
+          workspace: {
+            root: "$DOCS_WORKSPACE_ROOT",
+            state_dir: "$DOCS_WORKSPACE_STATE_DIR",
+            source: {
+              kind: "git_worktree",
+              path: "$DOCS_WORKSPACE_SOURCE_PATH",
+              repository: "$DOCS_WORKSPACE_REPOSITORY",
+              base_ref: "main",
+              cache_path: "$DOCS_WORKSPACE_CACHE_PATH",
+            },
+          },
+          github: {
+            owner: "$DOCS_GITHUB_OWNER",
+            repo: "$DOCS_GITHUB_REPO",
+            head_owner: "$DOCS_GITHUB_HEAD_OWNER",
+            api_base_url: "$DOCS_GITHUB_API_BASE_URL",
+          },
+        },
+      ],
+    } as const;
+    const sourceEnv = {
+      LINEAR_PROFILED_KEY: "linear-secret",
+      LINEAR_PROJECT_SLUG: "TEST",
+      WORKSPACE_ROOT: "/tmp/symphony-workspaces",
+      WORKSPACE_REPOSITORY: "/tmp/repo",
+      GITHUB_OWNER: "acme",
+      GITHUB_REPO: "symphony",
+      GITHUB_HEAD_OWNER: "john",
+      GITHUB_API_BASE_URL: "https://api.github.test",
+      DOCS_LINEAR_KEY: "docs-linear-secret",
+      DOCS_LINEAR_PROJECT: "DOCS",
+      DOCS_WORKSPACE_ROOT: "/tmp/docs-workspaces",
+      DOCS_WORKSPACE_STATE_DIR: "/tmp/docs-state",
+      DOCS_WORKSPACE_SOURCE_PATH: "/tmp/docs/source",
+      DOCS_WORKSPACE_REPOSITORY: "/tmp/docs/repo",
+      DOCS_WORKSPACE_CACHE_PATH: "/tmp/docs/cache",
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "john",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "issue-breakdown-plan-mcp",
+      parentEnv: { PATH: "/bin", ...sourceEnv, GITHUB_TOKEN: "decoy-parent-github-secret" },
+    });
+
+    expect(env).toMatchObject({
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "john",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+    });
+    expect(env).not.toHaveProperty("GITHUB_OWNER");
+    expect(env).not.toHaveProperty("GITHUB_REPO");
+    expect(env).not.toHaveProperty("GITHUB_HEAD_OWNER");
+    expect(env).not.toHaveProperty("GITHUB_API_BASE_URL");
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    const expectedDocsContext = config.projectContexts.byId.get("docs");
+    expect(expectedDocsContext).toBeDefined();
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toMatchObject(
+      comparableProjectContext(expectedDocsContext!),
+    );
+  });
+
+  it("exports only non-secret project-context parse refs while omitting project-context GitHub secrets and profile values", () => {
+    const rawConfig = multiProjectWorkflowConfig({
+      projectContexts: [
+        projectContextFixture({
+          id: "symphony",
+          label: "Symphony",
+          projectSlug: "SYMPHONY",
+          repository: ".",
+        }),
+        projectContextFixture({
+          id: "docs",
+          label: "Documentation Site",
+          projectSlug: "DOCS",
+          repository: "../docs-site",
+          tracker: {
+            api_key: "$DOCS_LINEAR_KEY",
+            project_slug: "$DOCS_LINEAR_PROJECT",
+            assignee: "$DOCS_LINEAR_ASSIGNEE",
+          },
+          workspace: {
+            root: "$DOCS_WORKSPACE_ROOT",
+            state_dir: "$DOCS_WORKSPACE_STATE_DIR",
+            source: {
+              path: "$DOCS_WORKSPACE_SOURCE_PATH",
+              repository: "$DOCS_WORKSPACE_REPOSITORY",
+              cache_path: "$DOCS_WORKSPACE_CACHE_PATH",
+            },
+          },
+          github: {
+            owner: "$DOCS_GITHUB_OWNER",
+            repo: "$DOCS_GITHUB_REPO",
+            head_owner: "$DOCS_GITHUB_HEAD_OWNER",
+            api_base_url: "$DOCS_GITHUB_API_BASE_URL",
+            token: "$DOCS_GITHUB_TOKEN",
+            app: {
+              private_key: "$DOCS_GITHUB_APP_PRIVATE_KEY",
+            },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+            },
+            roles: {
+              service: {
+                "github.publication": "publication",
+              },
+            },
+          },
+        }),
+      ],
+    });
+    const sourceEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      DOCS_LINEAR_KEY: "docs-linear-secret",
+      DOCS_LINEAR_PROJECT: "DOCS",
+      DOCS_LINEAR_ASSIGNEE: "writer",
+      DOCS_WORKSPACE_ROOT: "/tmp/docs-workspaces",
+      DOCS_WORKSPACE_STATE_DIR: "/tmp/docs-state",
+      DOCS_WORKSPACE_SOURCE_PATH: "/tmp/docs/source",
+      DOCS_WORKSPACE_REPOSITORY: "/tmp/docs/repo",
+      DOCS_WORKSPACE_CACHE_PATH: "/tmp/docs/cache",
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "john",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+      DOCS_GITHUB_TOKEN: "docs-token-secret",
+      DOCS_GITHUB_APP_PRIVATE_KEY: "docs-app-private-key",
+      DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "issue-breakdown-plan-mcp",
+      parentEnv: {
+        PATH: "/bin",
+        ...sourceEnv,
+        GITHUB_TOKEN: "decoy-parent-github-secret",
+        CURSOR_API_KEY: "ambient-cursor-secret",
+      },
+    });
+
+    expect(env).toMatchObject({
+      DOCS_LINEAR_KEY: "docs-linear-secret",
+      DOCS_LINEAR_PROJECT: "DOCS",
+      DOCS_LINEAR_ASSIGNEE: "writer",
+      DOCS_WORKSPACE_ROOT: config.projectContexts.byId.get("docs")?.workspace.root,
+      DOCS_WORKSPACE_STATE_DIR: config.projectContexts.byId.get("docs")?.workspace.stateDir,
+      DOCS_WORKSPACE_SOURCE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.path,
+      DOCS_WORKSPACE_REPOSITORY: config.projectContexts.byId.get("docs")?.workspace.source.repository,
+      DOCS_WORKSPACE_CACHE_PATH: config.projectContexts.byId.get("docs")?.workspace.source.cachePath,
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "john",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+    });
+    expect(githubEnvKeys(env)).toEqual([
+      "DOCS_GITHUB_API_BASE_URL",
+      "DOCS_GITHUB_HEAD_OWNER",
+      "DOCS_GITHUB_OWNER",
+      "DOCS_GITHUB_REPO",
+    ]);
+    expect(env).not.toHaveProperty("DOCS_GITHUB_TOKEN");
+    expect(env).not.toHaveProperty("DOCS_GITHUB_APP_PRIVATE_KEY");
+    expect(env).not.toHaveProperty("DOCS_GITHUB_PUBLICATION_TOKEN");
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+    expect(env).not.toHaveProperty("CURSOR_API_KEY");
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    const expectedDocsContext = config.projectContexts.byId.get("docs");
+    const childDocsContext = childConfig.projectContexts.byId.get("docs");
+    expect(expectedDocsContext).toBeDefined();
+    expect(childDocsContext).toBeDefined();
+    expect(childDocsContext).toMatchObject({
+      tracker: {
+        apiKey: expectedDocsContext!.tracker.apiKey,
+        projectSlug: expectedDocsContext!.tracker.projectSlug,
+        assignee: expectedDocsContext!.tracker.assignee,
+      },
+      workspace: {
+        root: expectedDocsContext!.workspace.root,
+        stateDir: expectedDocsContext!.workspace.stateDir,
+        source: {
+          path: expectedDocsContext!.workspace.source.path,
+          repository: expectedDocsContext!.workspace.source.repository,
+          cachePath: expectedDocsContext!.workspace.source.cachePath,
+        },
+      },
+      github: {
+        owner: expectedDocsContext!.github.owner,
+        repo: expectedDocsContext!.github.repo,
+        headOwner: expectedDocsContext!.github.headOwner,
+        apiBaseUrl: expectedDocsContext!.github.apiBaseUrl,
+        token: null,
+      },
+    });
+    expect(childDocsContext?.github.app).toMatchObject({
+      privateKey: null,
+      privateKeyEnvVar: "DOCS_GITHUB_APP_PRIVATE_KEY",
+    });
+  });
+
+  it("projects a resolved non-default context onto compatibility parse refs for child MCP config parsing", () => {
+    const rawConfig = {
+      tracker: {
+        kind: "linear",
+        api_key: "$ROOT_LINEAR_KEY",
+        project_slug: "$ROOT_LINEAR_PROJECT",
+        assignee: "$ROOT_LINEAR_ASSIGNEE",
+      },
+      workspace: {
+        root: "$ROOT_WORKSPACE_ROOT",
+        state_dir: "$ROOT_WORKSPACE_STATE_DIR",
+        source: {
+          kind: "git_worktree",
+          path: "$ROOT_WORKSPACE_SOURCE_PATH",
+          repository: "$ROOT_WORKSPACE_REPOSITORY",
+          base_ref: "$ROOT_WORKSPACE_BASE_REF",
+          branch_template: "$ROOT_WORKSPACE_BRANCH_TEMPLATE",
+          cache_path: "$ROOT_WORKSPACE_CACHE_PATH",
+        },
+      },
+      github: {
+        owner: "$ROOT_GITHUB_OWNER",
+        repo: "$ROOT_GITHUB_REPO",
+        head_owner: "$ROOT_GITHUB_HEAD_OWNER",
+        api_base_url: "$ROOT_GITHUB_API_BASE_URL",
+        publish_pull_requests: false,
+      },
+      project_contexts: [
+        {
+          id: "symphony",
+          tracker: {
+            kind: "linear",
+            api_key: "$SYMPHONY_LINEAR_KEY",
+            project_slug: "$SYMPHONY_LINEAR_PROJECT",
+            assignee: "$SYMPHONY_LINEAR_ASSIGNEE",
+          },
+          workspace: {
+            root: "$SYMPHONY_WORKSPACE_ROOT",
+            state_dir: "$SYMPHONY_WORKSPACE_STATE_DIR",
+            source: {
+              kind: "git_worktree",
+              path: "$SYMPHONY_WORKSPACE_SOURCE_PATH",
+              repository: "$SYMPHONY_WORKSPACE_REPOSITORY",
+              base_ref: "$SYMPHONY_WORKSPACE_BASE_REF",
+              branch_template: "$SYMPHONY_WORKSPACE_BRANCH_TEMPLATE",
+              cache_path: "$SYMPHONY_WORKSPACE_CACHE_PATH",
+            },
+          },
+          github: {
+            owner: "$SYMPHONY_GITHUB_OWNER",
+            repo: "$SYMPHONY_GITHUB_REPO",
+            head_owner: "$SYMPHONY_GITHUB_HEAD_OWNER",
+            api_base_url: "$SYMPHONY_GITHUB_API_BASE_URL",
+          },
+        },
+        {
+          id: "docs",
+          tracker: {
+            kind: "linear",
+            api_key: "$DOCS_LINEAR_KEY",
+            project_slug: "$DOCS_LINEAR_PROJECT",
+            assignee: "$DOCS_LINEAR_ASSIGNEE",
+          },
+          workspace: {
+            root: "$DOCS_WORKSPACE_ROOT",
+            state_dir: "$DOCS_WORKSPACE_STATE_DIR",
+            source: {
+              kind: "git_worktree",
+              path: "$DOCS_WORKSPACE_SOURCE_PATH",
+              repository: "$DOCS_WORKSPACE_REPOSITORY",
+              base_ref: "$DOCS_WORKSPACE_BASE_REF",
+              branch_template: "$DOCS_WORKSPACE_BRANCH_TEMPLATE",
+              cache_path: "$DOCS_WORKSPACE_CACHE_PATH",
+            },
+          },
+          github: {
+            owner: "$DOCS_GITHUB_OWNER",
+            repo: "$DOCS_GITHUB_REPO",
+            head_owner: "$DOCS_GITHUB_HEAD_OWNER",
+            api_base_url: "$DOCS_GITHUB_API_BASE_URL",
+          },
+        },
+      ],
+    } as const;
+    const sourceEnv = {
+      ROOT_LINEAR_KEY: "root-linear-secret",
+      ROOT_LINEAR_PROJECT: "ROOT",
+      ROOT_LINEAR_ASSIGNEE: "root-user",
+      ROOT_WORKSPACE_ROOT: "/tmp/root/workspaces",
+      ROOT_WORKSPACE_STATE_DIR: "/tmp/root/state",
+      ROOT_WORKSPACE_SOURCE_PATH: "/tmp/root/source",
+      ROOT_WORKSPACE_REPOSITORY: "/tmp/root/repo",
+      ROOT_WORKSPACE_BASE_REF: "origin/root-main",
+      ROOT_WORKSPACE_BRANCH_TEMPLATE: "root/{{ issue.identifier }}",
+      ROOT_WORKSPACE_CACHE_PATH: "/tmp/root/cache",
+      ROOT_GITHUB_OWNER: "acme-root",
+      ROOT_GITHUB_REPO: "root-repo",
+      ROOT_GITHUB_HEAD_OWNER: "root-owner",
+      ROOT_GITHUB_API_BASE_URL: "https://api.github.root.test",
+      SYMPHONY_LINEAR_KEY: "symphony-linear-secret",
+      SYMPHONY_LINEAR_PROJECT: "SYM",
+      SYMPHONY_LINEAR_ASSIGNEE: "sym-user",
+      SYMPHONY_WORKSPACE_ROOT: "/tmp/symphony/workspaces",
+      SYMPHONY_WORKSPACE_STATE_DIR: "/tmp/symphony/state",
+      SYMPHONY_WORKSPACE_SOURCE_PATH: "/tmp/symphony/source",
+      SYMPHONY_WORKSPACE_REPOSITORY: "/tmp/symphony/repo",
+      SYMPHONY_WORKSPACE_BASE_REF: "origin/symphony-main",
+      SYMPHONY_WORKSPACE_BRANCH_TEMPLATE: "sym/{{ issue.identifier }}",
+      SYMPHONY_WORKSPACE_CACHE_PATH: "/tmp/symphony/cache",
+      SYMPHONY_GITHUB_OWNER: "acme",
+      SYMPHONY_GITHUB_REPO: "symphony",
+      SYMPHONY_GITHUB_HEAD_OWNER: "sym-owner",
+      SYMPHONY_GITHUB_API_BASE_URL: "https://api.github.sym.test",
+      DOCS_LINEAR_KEY: "docs-linear-secret",
+      DOCS_LINEAR_PROJECT: "DOCS",
+      DOCS_LINEAR_ASSIGNEE: "writer",
+      DOCS_WORKSPACE_ROOT: "/tmp/docs/workspaces",
+      DOCS_WORKSPACE_STATE_DIR: "/tmp/docs/state",
+      DOCS_WORKSPACE_SOURCE_PATH: "/tmp/docs/source",
+      DOCS_WORKSPACE_REPOSITORY: "/tmp/docs/repo",
+      DOCS_WORKSPACE_BASE_REF: "origin/docs-main",
+      DOCS_WORKSPACE_BRANCH_TEMPLATE: "docs/{{ issue.identifier }}",
+      DOCS_WORKSPACE_CACHE_PATH: "/tmp/docs/cache",
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "docs-owner",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "issue-breakdown-plan-mcp",
+      parentEnv: { PATH: "/bin" },
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+    });
+    const expectedDocsContext = config.projectContexts.byId.get("docs")!;
+
+    expect(env).toMatchObject({
+      ROOT_LINEAR_PROJECT: expectedDocsContext.tracker.projectSlug,
+      ROOT_LINEAR_ASSIGNEE: expectedDocsContext.tracker.assignee,
+      ROOT_WORKSPACE_ROOT: expectedDocsContext.workspace.root,
+      ROOT_WORKSPACE_BASE_REF: expectedDocsContext.workspace.source.baseRef,
+      ROOT_WORKSPACE_BRANCH_TEMPLATE: expectedDocsContext.workspace.source.branchTemplate,
+      ROOT_GITHUB_OWNER: expectedDocsContext.github.owner,
+      ROOT_GITHUB_REPO: expectedDocsContext.github.repo,
+      ROOT_GITHUB_HEAD_OWNER: expectedDocsContext.github.headOwner,
+      ROOT_GITHUB_API_BASE_URL: expectedDocsContext.github.apiBaseUrl,
+      SYMPHONY_LINEAR_PROJECT: expectedDocsContext.tracker.projectSlug,
+      SYMPHONY_WORKSPACE_BASE_REF: expectedDocsContext.workspace.source.baseRef,
+      SYMPHONY_GITHUB_OWNER: expectedDocsContext.github.owner,
+      DOCS_LINEAR_PROJECT: expectedDocsContext.tracker.projectSlug,
+      DOCS_WORKSPACE_BASE_REF: expectedDocsContext.workspace.source.baseRef,
+      DOCS_GITHUB_OWNER: expectedDocsContext.github.owner,
+    });
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    expect(childConfig.tracker).toMatchObject({
+      projectSlug: expectedDocsContext.tracker.projectSlug,
+      assignee: expectedDocsContext.tracker.assignee,
+    });
+    expect(childConfig.workspace).toMatchObject({
+      root: expectedDocsContext.workspace.root,
+      stateDir: expectedDocsContext.workspace.stateDir,
+      source: {
+        path: expectedDocsContext.workspace.source.path,
+        repository: expectedDocsContext.workspace.source.repository,
+        baseRef: expectedDocsContext.workspace.source.baseRef,
+        branchTemplate: expectedDocsContext.workspace.source.branchTemplate,
+        cachePath: expectedDocsContext.workspace.source.cachePath,
+      },
+    });
+    expect(childConfig.github).toMatchObject({
+      owner: expectedDocsContext.github.owner,
+      repo: expectedDocsContext.github.repo,
+      headOwner: expectedDocsContext.github.headOwner,
+      apiBaseUrl: expectedDocsContext.github.apiBaseUrl,
+    });
+    expect(comparableProjectContext(childConfig.projectContexts.byId.get("docs"))).toEqual(
+      comparableProjectContext(expectedDocsContext),
+    );
+  });
+
+  it.each([
+    {
+      command: "completion-report-mcp",
+      envVar: "DOCS_GITHUB_PUBLICATION_TOKEN",
+      excludedEnvVar: "SYMPHONY_GITHUB_PUBLICATION_TOKEN",
+      expectedSecret: "docs-publication-secret",
+    },
+    {
+      command: "review-feedback-mcp",
+      envVar: "DOCS_GITHUB_FEEDBACK_TOKEN",
+      excludedEnvVar: "SYMPHONY_GITHUB_FEEDBACK_TOKEN",
+      expectedSecret: "docs-feedback-secret",
+    },
+  ] as const)("uses resolved non-default project-context credential slices for %s", ({ command, envVar, excludedEnvVar, expectedSecret }) => {
+    const rawConfig = multiProjectWorkflowConfig({
+      projectContexts: [
+        projectContextFixture({
+          id: "symphony",
+          label: "Symphony",
+          projectSlug: "SYMPHONY",
+          repository: ".",
+          github: {
+            owner: "$SYMPHONY_GITHUB_OWNER",
+            repo: "$SYMPHONY_GITHUB_REPO",
+            head_owner: "$SYMPHONY_GITHUB_HEAD_OWNER",
+            api_base_url: "$SYMPHONY_GITHUB_API_BASE_URL",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$SYMPHONY_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              feedback: { value: "$SYMPHONY_GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+              reviewer: { "github.review_feedback_write": "feedback" },
+            },
+          },
+        }),
+        projectContextFixture({
+          id: "docs",
+          label: "Documentation Site",
+          projectSlug: "DOCS",
+          repository: "../docs-site",
+          github: {
+            owner: "$DOCS_GITHUB_OWNER",
+            repo: "$DOCS_GITHUB_REPO",
+            head_owner: "$DOCS_GITHUB_HEAD_OWNER",
+            api_base_url: "$DOCS_GITHUB_API_BASE_URL",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+              feedback: { value: "$DOCS_GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+            },
+            roles: {
+              service: { "github.publication": "publication" },
+              reviewer: { "github.review_feedback_write": "feedback" },
+            },
+          },
+        }),
+      ],
+    });
+    const sourceEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      SYMPHONY_GITHUB_OWNER: "acme",
+      SYMPHONY_GITHUB_REPO: "symphony",
+      SYMPHONY_GITHUB_HEAD_OWNER: "sym-owner",
+      SYMPHONY_GITHUB_API_BASE_URL: "https://api.github.sym.test",
+      SYMPHONY_GITHUB_PUBLICATION_TOKEN: "symphony-publication-secret",
+      SYMPHONY_GITHUB_FEEDBACK_TOKEN: "symphony-feedback-secret",
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "docs-owner",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+      DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+      DOCS_GITHUB_FEEDBACK_TOKEN: "docs-feedback-secret",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command,
+      parentEnv: { PATH: "/bin", ...sourceEnv, GITHUB_TOKEN: "decoy-parent-github-secret" },
+      projectContext: {
+        projectContextId: "docs",
+        projectContextLabel: "Documentation Site",
+        linearProjectSlug: "DOCS",
+        routingSource: "candidate_poll",
+      },
+    });
+
+    expect(env).toMatchObject({
+      DOCS_GITHUB_OWNER: "acme-docs",
+      DOCS_GITHUB_REPO: "docs-site",
+      DOCS_GITHUB_HEAD_OWNER: "docs-owner",
+      DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+      [envVar]: expectedSecret,
+    });
+    expect(env).not.toHaveProperty(excludedEnvVar);
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+  });
+
+  it.each([
+    {
+      command: "completion-report-mcp",
+      role: "service",
+      capability: "github.publication",
+      envVar: "DOCS_GITHUB_PUBLICATION_TOKEN",
+      excludedEnvVar: "SYMPHONY_GITHUB_PUBLICATION_TOKEN",
+      expectedSecret: "docs-publication-secret",
+      profileName: "publication",
+    },
+    {
+      command: "review-feedback-mcp",
+      role: "reviewer",
+      capability: "github.review_feedback_write",
+      envVar: "DOCS_GITHUB_FEEDBACK_TOKEN",
+      excludedEnvVar: "SYMPHONY_GITHUB_FEEDBACK_TOKEN",
+      expectedSecret: "docs-feedback-secret",
+      profileName: "feedback",
+    },
+  ] as const)(
+    "maps persisted legacy-default project context to the configured default credential slice for %s",
+    ({ command, role, capability, envVar, excludedEnvVar, expectedSecret, profileName }) => {
+      const rawConfig = multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "docs",
+            label: "Documentation Site",
+            projectSlug: "DOCS",
+            repository: "../docs-site",
+            github: {
+              owner: "$DOCS_GITHUB_OWNER",
+              repo: "$DOCS_GITHUB_REPO",
+              head_owner: "$DOCS_GITHUB_HEAD_OWNER",
+              api_base_url: "$DOCS_GITHUB_API_BASE_URL",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+            },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$DOCS_GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+                feedback: { value: "$DOCS_GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+            github: {
+              owner: "$SYMPHONY_GITHUB_OWNER",
+              repo: "$SYMPHONY_GITHUB_REPO",
+              head_owner: "$SYMPHONY_GITHUB_HEAD_OWNER",
+              api_base_url: "$SYMPHONY_GITHUB_API_BASE_URL",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+            },
+            credential_profiles: {
+              profiles: {
+                publication: {
+                  value: "$SYMPHONY_GITHUB_PUBLICATION_TOKEN",
+                  capabilities: ["github.publication"],
+                },
+                feedback: {
+                  value: "$SYMPHONY_GITHUB_FEEDBACK_TOKEN",
+                  capabilities: ["github.review_feedback_write"],
+                },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+        ],
+      });
+      const sourceEnv = {
+        LINEAR_API_KEY: "linear-secret",
+        DOCS_GITHUB_OWNER: "acme-docs",
+        DOCS_GITHUB_REPO: "docs-site",
+        DOCS_GITHUB_HEAD_OWNER: "docs-owner",
+        DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+        DOCS_GITHUB_PUBLICATION_TOKEN: "docs-publication-secret",
+        DOCS_GITHUB_FEEDBACK_TOKEN: "docs-feedback-secret",
+        SYMPHONY_GITHUB_OWNER: "acme",
+        SYMPHONY_GITHUB_REPO: "symphony",
+        SYMPHONY_GITHUB_HEAD_OWNER: "sym-owner",
+        SYMPHONY_GITHUB_API_BASE_URL: "https://api.github.sym.test",
+        SYMPHONY_GITHUB_PUBLICATION_TOKEN: "symphony-publication-secret",
+        SYMPHONY_GITHUB_FEEDBACK_TOKEN: "symphony-feedback-secret",
+      };
+      const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+      expect(config.projectContexts.defaultContextId).toBe("docs");
+
+      const env = buildMcpSubprocessEnvironment({
+        config,
+        command,
+        parentEnv: { PATH: "/bin", ...sourceEnv, GITHUB_TOKEN: "decoy-parent-github-secret" },
+        projectContext: normalizeProjectContextResolution(undefined),
+      });
+
+      expect(env).toMatchObject({
+        DOCS_GITHUB_OWNER: "acme-docs",
+        DOCS_GITHUB_REPO: "docs-site",
+        DOCS_GITHUB_HEAD_OWNER: "docs-owner",
+        DOCS_GITHUB_API_BASE_URL: "https://api.github.docs.test",
+        [envVar]: expectedSecret,
+      });
+      expect(env).not.toHaveProperty(excludedEnvVar);
+      expect(env).not.toHaveProperty("GITHUB_TOKEN");
+
+      const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+      expect(childConfig.credentialProfiles.resolveForRole(role, capability)).toMatchObject({
+        kind: "static_token",
+        source: "profile",
+        profileName,
+        value: expectedSecret,
+      });
+    },
+  );
+
+  it.each([
+    {
+      command: "completion-report-mcp",
+      role: "service",
+      capability: "github.publication",
+      envVar: "GITHUB_PUBLICATION_TOKEN",
+      excludedEnvVar: "GITHUB_FEEDBACK_TOKEN",
+      expectedSecret: "publication-secret",
+      profileName: "publication",
+    },
+    {
+      command: "review-feedback-mcp",
+      role: "reviewer",
+      capability: "github.review_feedback_write",
+      envVar: "GITHUB_FEEDBACK_TOKEN",
+      excludedEnvVar: "GITHUB_PUBLICATION_TOKEN",
+      expectedSecret: "feedback-secret",
+      profileName: "feedback",
+    },
+  ] as const)(
+    "exports default project-context credential profiles through %s and preserves child reparse attribution",
+    ({ command, role, capability, envVar, excludedEnvVar, expectedSecret, profileName }) => {
+      const rawConfig = multiProjectWorkflowConfig({
+        projectContexts: [
+          projectContextFixture({
+            id: "symphony",
+            label: "Symphony",
+            projectSlug: "SYMPHONY",
+            repository: ".",
+            github: {
+              owner: "acme",
+              repo: "symphony",
+              publish_pull_requests: true,
+              pr_handoff: { enabled: false },
+            },
+            credential_profiles: {
+              profiles: {
+                publication: { value: "$GITHUB_PUBLICATION_TOKEN", capabilities: ["github.publication"] },
+                feedback: { value: "$GITHUB_FEEDBACK_TOKEN", capabilities: ["github.review_feedback_write"] },
+              },
+              roles: {
+                service: { "github.publication": "publication" },
+                reviewer: { "github.review_feedback_write": "feedback" },
+              },
+            },
+          }),
+          projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+        ],
+      });
+      const sourceEnv = {
+        LINEAR_API_KEY: "linear-secret",
+        GITHUB_PUBLICATION_TOKEN: "publication-secret",
+        GITHUB_FEEDBACK_TOKEN: "feedback-secret",
+      };
+      const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+      const env = buildMcpSubprocessEnvironment({
+        config,
+        command,
+        parentEnv: { PATH: "/bin", GITHUB_TOKEN: "decoy-parent-github-secret" },
+      });
+
+      expect(env[envVar]).toBe(expectedSecret);
+      expect(env).not.toHaveProperty(excludedEnvVar);
+      expect(env).not.toHaveProperty("GITHUB_TOKEN");
+
+      const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+      expect(childConfig.credentialProfiles.assignmentRolesFor(capability)).toEqual([role]);
+      expect(childConfig.credentialProfiles.resolveForRole(role, capability)).toMatchObject({
+        source: "profile",
+        profileName,
+        value: expectedSecret,
+      });
+    },
+  );
+
+  it("merges inherited default-context GitHub app profile refs before exporting publication capability env", () => {
+    const rawConfig = multiProjectWorkflowConfig({
+      topLevel: {
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          publish_pull_requests: true,
+          pr_handoff: { enabled: false },
+        },
+        credential_profiles: {
+          profiles: {
+            publication: {
+              kind: "github_app",
+              app_id: "$GLOBAL_GITHUB_APP_ID",
+              client_id: "$GLOBAL_GITHUB_APP_CLIENT_ID",
+              private_key_path: "$GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.publication"],
+            },
+          },
+          roles: {
+            service: {
+              "github.publication": "publication",
+            },
+          },
+        },
+      },
+      projectContexts: [
+        projectContextFixture({
+          id: "symphony",
+          label: "Symphony",
+          projectSlug: "SYMPHONY",
+          repository: ".",
+          github: {
+            owner: "acme",
+            repo: "symphony",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: {
+                kind: "github_app",
+                installation_id: "$CONTEXT_GITHUB_APP_INSTALLATION_ID",
+                private_key: "$CONTEXT_GITHUB_APP_PRIVATE_KEY",
+                capabilities: ["github.publication"],
+              },
+            },
+          },
+        }),
+        projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+      ],
+    });
+    const sourceEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      GLOBAL_GITHUB_APP_ID: "111",
+      GLOBAL_GITHUB_APP_CLIENT_ID: "Iv1.publication",
+      GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH: "/secrets/publication.pem",
+      CONTEXT_GITHUB_APP_INSTALLATION_ID: "222",
+      CONTEXT_GITHUB_APP_PRIVATE_KEY: "publication-private-key",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+    const publicationCredential = config.credentialProfiles.resolveForRole("service", "github.publication");
+
+    expect(publicationCredential).toMatchObject({
+      kind: "github_app",
+      source: "profile",
+      profileName: "publication",
+      app: {
+        appId: "111",
+        clientId: "Iv1.publication",
+        installationId: "222",
+        privateKeyEnvVar: "CONTEXT_GITHUB_APP_PRIVATE_KEY",
+      },
+    });
+
+    const env = buildMcpSubprocessEnvironment({
+      config,
+      command: "completion-report-mcp",
+      parentEnv: { PATH: "/bin", ...sourceEnv, GITHUB_TOKEN: "decoy-github-secret" },
+    });
+
+    expect(env).toMatchObject({
+      GLOBAL_GITHUB_APP_ID: "111",
+      GLOBAL_GITHUB_APP_CLIENT_ID: "Iv1.publication",
+      CONTEXT_GITHUB_APP_INSTALLATION_ID: "222",
+      CONTEXT_GITHUB_APP_PRIVATE_KEY: "publication-private-key",
+      GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH: publicationCredential?.app?.privateKeyPath,
+    });
+    expect(env).not.toHaveProperty("GITHUB_TOKEN");
+
+    const childConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", env);
+    expect(childConfig.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "github_app",
+      source: "profile",
+      profileName: "publication",
+      app: {
+        appId: "111",
+        clientId: "Iv1.publication",
+        installationId: "222",
+        privateKeyEnvVar: "CONTEXT_GITHUB_APP_PRIVATE_KEY",
+        privateKeyPath: publicationCredential?.app?.privateKeyPath,
+      },
+    });
+  });
+
+  it("exports default-context static-token kind switches through MCP env and child reparse", () => {
+    const rawConfig = multiProjectWorkflowConfig({
+      topLevel: {
+        github: {
+          owner: "acme",
+          repo: "symphony",
+          publish_pull_requests: true,
+          pr_handoff: { enabled: false },
+        },
+        credential_profiles: {
+          profiles: {
+            publication: {
+              kind: "github_app",
+              app_id: "$GLOBAL_GITHUB_APP_ID",
+              client_id: "$GLOBAL_GITHUB_APP_CLIENT_ID",
+              installation_id: "$GLOBAL_GITHUB_APP_INSTALLATION_ID",
+              private_key_path: "$GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.publication", "github.merge"],
+            },
+            feedback: {
+              kind: "github_app",
+              app_id: "$GLOBAL_GITHUB_REVIEW_APP_ID",
+              client_id: "$GLOBAL_GITHUB_REVIEW_APP_CLIENT_ID",
+              installation_id: "$GLOBAL_GITHUB_REVIEW_APP_INSTALLATION_ID",
+              private_key_path: "$GLOBAL_GITHUB_REVIEW_APP_PRIVATE_KEY_PATH",
+              capabilities: ["github.review_feedback_write"],
+            },
+          },
+          roles: {
+            service: {
+              "github.publication": "publication",
+              "github.merge": "publication",
+            },
+            reviewer: {
+              "github.review_feedback_write": "feedback",
+            },
+          },
+        },
+      },
+      projectContexts: [
+        projectContextFixture({
+          id: "symphony",
+          label: "Symphony",
+          projectSlug: "SYMPHONY",
+          repository: ".",
+          github: {
+            owner: "acme",
+            repo: "symphony",
+            publish_pull_requests: true,
+            pr_handoff: { enabled: false },
+          },
+          credential_profiles: {
+            profiles: {
+              publication: {
+                value: "$CONTEXT_GITHUB_PUBLICATION_TOKEN",
+                capabilities: ["github.publication", "github.merge"],
+              },
+              feedback: {
+                value: "$CONTEXT_GITHUB_FEEDBACK_TOKEN",
+                capabilities: ["github.review_feedback_write"],
+              },
+            },
+          },
+        }),
+        projectContextFixture({ id: "docs", label: "Documentation Site", projectSlug: "DOCS", repository: "../docs-site" }),
+      ],
+    });
+    const sourceEnv = {
+      LINEAR_API_KEY: "linear-secret",
+      GLOBAL_GITHUB_APP_ID: "111",
+      GLOBAL_GITHUB_APP_CLIENT_ID: "Iv1.publication",
+      GLOBAL_GITHUB_APP_INSTALLATION_ID: "222",
+      GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH: "/secrets/publication.pem",
+      GLOBAL_GITHUB_REVIEW_APP_ID: "333",
+      GLOBAL_GITHUB_REVIEW_APP_CLIENT_ID: "Iv1.review",
+      GLOBAL_GITHUB_REVIEW_APP_INSTALLATION_ID: "444",
+      GLOBAL_GITHUB_REVIEW_APP_PRIVATE_KEY_PATH: "/secrets/reviewer.pem",
+      CONTEXT_GITHUB_PUBLICATION_TOKEN: "context-publication-secret",
+      CONTEXT_GITHUB_FEEDBACK_TOKEN: "context-feedback-secret",
+    };
+    const config = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", sourceEnv);
+
+    expect(config.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("service", "github.merge")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+    expect(config.credentialProfiles.resolveForRole("reviewer", "github.review_feedback_write")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "feedback",
+      value: "context-feedback-secret",
+    });
+
+    const completionEnv = buildMcpSubprocessEnvironment({
+      config,
+      command: "completion-report-mcp",
+      parentEnv: { PATH: "/bin", ...sourceEnv, GITHUB_TOKEN: "decoy-github-secret" },
+    });
+
+    expect(completionEnv).toMatchObject({
+      CONTEXT_GITHUB_PUBLICATION_TOKEN: "context-publication-secret",
+    });
+    expect(completionEnv).not.toHaveProperty("GITHUB_TOKEN");
+    expect(completionEnv).not.toHaveProperty("CONTEXT_GITHUB_FEEDBACK_TOKEN");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_CLIENT_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_INSTALLATION_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_CLIENT_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_INSTALLATION_ID");
+    expect(completionEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_PRIVATE_KEY_PATH");
+
+    const childCompletionConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", completionEnv);
+    expect(childCompletionConfig.credentialProfiles.resolveForRole("service", "github.publication")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+    expect(childCompletionConfig.credentialProfiles.resolveForRole("service", "github.merge")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "publication",
+      value: "context-publication-secret",
+    });
+
+    const reviewEnv = buildMcpSubprocessEnvironment({
+      config,
+      command: "review-feedback-mcp",
+      parentEnv: { PATH: "/bin", ...sourceEnv, GITHUB_TOKEN: "decoy-github-secret" },
+    });
+
+    expect(reviewEnv).toMatchObject({
+      CONTEXT_GITHUB_FEEDBACK_TOKEN: "context-feedback-secret",
+    });
+    expect(reviewEnv).not.toHaveProperty("GITHUB_TOKEN");
+    expect(reviewEnv).not.toHaveProperty("CONTEXT_GITHUB_PUBLICATION_TOKEN");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_CLIENT_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_INSTALLATION_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_APP_PRIVATE_KEY_PATH");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_CLIENT_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_INSTALLATION_ID");
+    expect(reviewEnv).not.toHaveProperty("GLOBAL_GITHUB_REVIEW_APP_PRIVATE_KEY_PATH");
+
+    const childReviewConfig = parseServiceConfig(rawConfig, "/repo/WORKFLOW.md", reviewEnv);
+    expect(childReviewConfig.credentialProfiles.resolveForRole("reviewer", "github.review_feedback_write")).toMatchObject({
+      kind: "static_token",
+      source: "profile",
+      profileName: "feedback",
+      value: "context-feedback-secret",
+    });
   });
 
   it("reports missing assigned publication profile secrets without falling back to legacy GITHUB_TOKEN", () => {
@@ -1045,6 +2404,38 @@ describe("MCP subprocess environment", () => {
     ).toThrow(/MISSING_GITHUB_PUBLICATION_TOKEN/);
   });
 });
+
+
+type ComparableProjectContext = {
+  workspace?: { source?: { repository?: string | null } };
+  publicMetadata?: { repository?: string | null } | null;
+  publicSummary?: { publicMetadata?: { repository?: string | null } | null } | null;
+};
+
+function comparableProjectContext<T extends ComparableProjectContext | undefined>(context: T): T {
+  if (!context) return context;
+  const repository = context.workspace?.source?.repository ?? null;
+  return {
+    ...context,
+    publicMetadata: context.publicMetadata
+      ? {
+          ...context.publicMetadata,
+          repository,
+        }
+      : context.publicMetadata,
+    publicSummary: context.publicSummary
+      ? {
+          ...context.publicSummary,
+          publicMetadata: context.publicSummary.publicMetadata
+            ? {
+                ...context.publicSummary.publicMetadata,
+                repository,
+              }
+            : context.publicSummary.publicMetadata,
+        }
+      : context.publicSummary,
+  };
+}
 
 function githubEnvKeys(env: Record<string, string>): string[] {
   return Object.keys(env)

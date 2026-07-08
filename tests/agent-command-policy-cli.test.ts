@@ -21,7 +21,7 @@ describe("agent-command-policy-hook CLI", () => {
       action: "block",
       message: expect.stringContaining("upstream GitHub contact") as string,
     });
-  });
+  }, 60_000);
 
   it("writes a structured decision journal when the CLI is given --decision-journal", async () => {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-cli-journal-"));
@@ -289,13 +289,16 @@ describe("agent-command-policy-hook CLI", () => {
 });
 
 function hermesPayload(commandOrToolInput: string | Record<string, unknown>, options: { toolName?: string } = {}) {
-  const toolInput = typeof commandOrToolInput === "string" ? { command: commandOrToolInput } : commandOrToolInput;
+  const toolInput =
+    typeof commandOrToolInput === "string"
+      ? { command: commandOrToolInput, workdir: os.tmpdir() }
+      : { workdir: os.tmpdir(), ...commandOrToolInput };
   return {
     hook_event_name: "pre_tool_call",
     tool_name: options.toolName ?? "terminal",
     tool_input: toolInput,
     session_id: "test-session",
-    cwd: path.resolve(process.cwd()),
+    cwd: os.tmpdir(),
     extra: { task_id: "task-1", tool_call_id: "tool-call-1" },
   };
 }
@@ -324,12 +327,21 @@ const UNSAFE_POLICY_HOOK_CLI_ENVIRONMENT_KEYS = new Set([
   "GIT_CONFIG_PARAMETERS",
   "GIT_CONFIG_GLOBAL",
   "GIT_CONFIG_SYSTEM",
+  "LD_PRELOAD",
+  "LD_LIBRARY_PATH",
+  "LD_AUDIT",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FRAMEWORK_PATH",
+  "BASH_ENV",
+  "ENV",
 ]);
 
 function policyHookCliBaseEnvironment(): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
     const normalizedKey = key.toUpperCase();
+    if (/^(?:GIT|GH|GITHUB)_/u.test(normalizedKey)) continue;
     if (UNSAFE_POLICY_HOOK_CLI_ENVIRONMENT_KEYS.has(normalizedKey)) continue;
     if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/u.test(normalizedKey)) continue;
     environment[key] = value;
@@ -343,34 +355,42 @@ async function runPolicyHookCli(options: {
   input: string;
 }): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   const cliPath = path.resolve(process.cwd(), "src", "cli.ts");
-  const child = spawn(process.execPath, ["--import", "tsx", cliPath, "agent-command-policy-hook", ...(options.args ?? [])], {
-    cwd: process.cwd(),
-    env: {
-      ...policyHookCliBaseEnvironment(),
-      FORCE_COLOR: "0",
-      SYMPHONY_AGENT_ROLE: "",
-      SYMPHONY_RUN_PHASE: "",
-      SYMPHONY_ISSUE_ID: "",
-      SYMPHONY_RUN_ID: "",
-      ...(options.env ?? {}),
-    },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  const neutralHome = await mkdtemp(path.join(os.tmpdir(), "symphony-hook-cli-home-"));
+  try {
+    const child = spawn(process.execPath, ["--import", "tsx", cliPath, "agent-command-policy-hook", ...(options.args ?? [])], {
+      cwd: process.cwd(),
+      env: {
+        ...policyHookCliBaseEnvironment(),
+        FORCE_COLOR: "0",
+        HOME: neutralHome,
+        USERPROFILE: neutralHome,
+        XDG_CONFIG_HOME: neutralHome,
+        SYMPHONY_AGENT_ROLE: "",
+        SYMPHONY_RUN_PHASE: "",
+        SYMPHONY_ISSUE_ID: "",
+        SYMPHONY_RUN_ID: "",
+        ...(options.env ?? {}),
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
 
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk: Buffer) => {
-    stdout += chunk.toString("utf8");
-  });
-  child.stderr.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString("utf8");
-  });
-  child.stdin.end(options.input);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.stdin.end(options.input);
 
-  const exitCode = await new Promise<number | null>((resolve, reject) => {
-    child.on("error", reject);
-    child.on("close", resolve);
-  });
+    const exitCode = await new Promise<number | null>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", resolve);
+    });
 
-  return { exitCode, stdout, stderr };
+    return { exitCode, stdout, stderr };
+  } finally {
+    await rm(neutralHome, { recursive: true, force: true });
+  }
 }

@@ -10,9 +10,26 @@ export interface CreateWorktreeOptions {
   source: WorkspaceSourceConfig;
   stateDir: string;
   workspacePath: string;
-  branchName: string;
+  branch: ResolvedGitBranchSelection;
   timeoutMs: number;
   logger: Logger;
+}
+
+export type GitBranchSelectionSource = "tracker_metadata" | "branch_template" | "default_fallback";
+
+export type GitBranchCollisionReason =
+  | "template_already_contextualized"
+  | "already_contextualized_before_identifier"
+  | "scoped_before_identifier"
+  | "appended_context_suffix";
+
+export interface ResolvedGitBranchSelection {
+  branchName: string;
+  candidateBranchName: string;
+  source: GitBranchSelectionSource;
+  collisionReason: GitBranchCollisionReason | null;
+  trackerBranchName: string | null;
+  branchTemplate: string | null;
 }
 
 export interface RemoveWorktreeOptions {
@@ -48,16 +65,26 @@ export async function createGitWorktree(options: CreateWorktreeOptions): Promise
   if (!repository) throw new SymphonyError("workspace_error", "workspace.source.repository is required");
   if (!baseRef) throw new SymphonyError("workspace_error", "workspace.source.base_ref is required");
 
-  await fs.mkdir(options.stateDir, { recursive: true });
-  const repoPath = await ensureSharedRepo(repository, options.source.cachePath, options.stateDir, options.timeoutMs);
-  await withBranchLock(options.stateDir, repoPath, options.branchName, options.timeoutMs, async () => {
-    await runGit(["check-ref-format", "--branch", options.branchName], repoPath, options.timeoutMs);
-    await fetchRepo(repoPath, options.timeoutMs, options.logger);
-    await ensureBranch(repoPath, options.branchName, baseRef, options.timeoutMs);
-    await runGit(["worktree", "add", options.workspacePath, options.branchName], repoPath, options.timeoutMs);
+  options.logger.debug("git worktree branch prepared", {
+    workspace_path: options.workspacePath,
+    branch_name: options.branch.branchName,
+    branch_candidate_name: options.branch.candidateBranchName,
+    branch_source: options.branch.source,
+    branch_collision_reason: options.branch.collisionReason,
+    tracker_branch_name: options.branch.trackerBranchName,
+    branch_template: options.branch.branchTemplate,
   });
 
-  return { repoPath, branchName: options.branchName, baseRef };
+  await fs.mkdir(options.stateDir, { recursive: true });
+  const repoPath = await ensureSharedRepo(repository, options.source.cachePath, options.stateDir, options.timeoutMs);
+  await withBranchLock(options.stateDir, repoPath, options.branch.branchName, options.timeoutMs, async () => {
+    await runGit(["check-ref-format", "--branch", options.branch.branchName], repoPath, options.timeoutMs);
+    await fetchRepo(repoPath, options.timeoutMs, options.logger);
+    await ensureBranch(repoPath, options.branch.branchName, baseRef, options.timeoutMs);
+    await runGit(["worktree", "add", options.workspacePath, options.branch.branchName], repoPath, options.timeoutMs);
+  });
+
+  return { repoPath, branchName: options.branch.branchName, baseRef };
 }
 
 export async function createGitPlanningCheckout(options: CreatePlanningCheckoutOptions): Promise<PlanningCheckoutResult> {

@@ -56,6 +56,8 @@ describe("completion report MCP handoff", () => {
       repoPath: "/repo",
       baseRef: "main",
     });
+    await seedCompletionLifecycle(stateDir, "run-1");
+    stubLinearIssueFetch();
     await writeCompletionReportMcpContext(contextFile, {
       issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
       activeRunId: "run-1",
@@ -163,6 +165,7 @@ describe("completion report MCP handoff", () => {
       repoPath: workspace,
       baseRef: "main",
     });
+    await seedCompletionLifecycle(stateDir, "run-publication-profile", { workspacePath: workspace, repoPath: workspace });
     await writeCompletionReportMcpContext(contextFile, {
       issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
       activeRunId: "run-publication-profile",
@@ -186,6 +189,7 @@ describe("completion report MCP handoff", () => {
     const authorizations: string[] = [];
     vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
       const url = new URL(String(input));
+      if (url.hostname === "api.linear.app") return linearIssueResponse();
       authorizations.push(String((init?.headers as Record<string, string> | undefined)?.authorization));
       if (init?.method === "POST") {
         return jsonResponse(
@@ -244,6 +248,8 @@ describe("completion report MCP handoff", () => {
       repoPath: "/repo",
       baseRef: "main",
     });
+    await seedCompletionLifecycle(stateDir, "run-stdio-1");
+    stubLinearIssueFetch();
     await writeCompletionReportMcpContext(contextFile, {
       issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
       activeRunId: "run-stdio-1",
@@ -352,6 +358,26 @@ async function listWritebacks(stateDir: string) {
   } finally {
     await store.close();
   }
+}
+
+async function seedCompletionLifecycle(
+  stateDir: string,
+  runId: string,
+  overrides: { workspacePath?: string; repoPath?: string } = {},
+) {
+  const lifecycleStore = new FileIssueLifecycleStore(stateDir);
+  await lifecycleStore.ensureIssue(issue({ state: "In Progress", branchName: "symphony/TEST-1" }), {
+    phase: "implementation",
+    summaryPointers: {
+      workspaceKey: "TEST-1",
+      workspacePath: overrides.workspacePath ?? "/tmp/workspace",
+      branchName: "symphony/TEST-1",
+      gitBranchName: "symphony/TEST-1",
+      repoPath: overrides.repoPath ?? "/repo",
+      baseRef: "main",
+      lastRunId: runId,
+    },
+  });
 }
 
 function workflow(stateDir: string, publishPullRequests = true): string {
@@ -465,6 +491,44 @@ function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json" },
+  });
+}
+
+function stubLinearIssueFetch(): void {
+  vi.stubGlobal("fetch", async (input: unknown) => {
+    const url = new URL(String(input));
+    if (url.hostname === "api.linear.app") return linearIssueResponse();
+    throw new Error(`Unexpected fetch in completion MCP test: ${String(input)}`);
+  });
+}
+
+function linearIssueResponse(): Response {
+  return jsonResponse({
+    data: {
+      issues: {
+        nodes: [
+          {
+            id: "issue-1",
+            identifier: "TEST-1",
+            title: "Do work",
+            description: null,
+            priority: 1,
+            branchName: "symphony/TEST-1",
+            url: "https://linear.app/acme/issue/TEST-1/do-work",
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            state: { name: "In Progress" },
+            assignee: null,
+            delegate: null,
+            labels: { nodes: [] },
+            children: { nodes: [] },
+            project: { id: "project-TEST", slugId: "TEST" },
+            inverseRelations: { nodes: [] },
+          },
+        ],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    },
   });
 }
 

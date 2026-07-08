@@ -5,6 +5,7 @@ import {
   type MergeConflictResolutionActiveContext,
 } from "../MergeConflictResolutionService.js";
 import { FileIssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
+import type { ProjectContextResolution } from "../config/ProjectContexts.js";
 import type { Issue, Workspace } from "../types.js";
 import { WorkflowLoader } from "../workflow/WorkflowLoader.js";
 import { SqliteWritebackOutboxStore } from "../writeback/WritebackOutbox.js";
@@ -15,6 +16,7 @@ export const MERGE_CONFLICT_RESOLUTION_TOOL_NAME = "submit_merge_conflict_resolu
 
 export interface MergeConflictResolutionMcpContextFile {
   issue: Issue;
+  projectContext?: ProjectContextResolution | undefined;
   activeRunId: string | null;
   role: "worker";
   token?: string | null;
@@ -56,6 +58,7 @@ export async function submitMergeConflictResolutionFromMcp(input: unknown, optio
     });
     const context: MergeConflictResolutionActiveContext = {
       issue: loadedContext.issue,
+      projectContext: loadedContext.projectContext,
       activeRunId: loadedContext.activeRunId,
       role: loadedContext.role,
       token: loadedContext.token ?? null,

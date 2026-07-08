@@ -339,7 +339,7 @@ describe("/api/v1/web collection endpoints shared projection context", () => {
         warm: {
           status: 200,
           delta: { getRun: 1, listRuns: 0, readTranscript: 0, readTranscriptTail: 0, readTranscriptEventCount: 0 },
-          selectors: [warmTranscriptSelector.scopeKey],
+          selectors: [`pc=default|${warmTranscriptSelector.scopeKey}`, warmTranscriptSelector.scopeKey],
         },
         refresh: {
           status: 200,
@@ -821,6 +821,7 @@ function projectionPayloadRecord<TPayload>(
     revision: {
       projectionRevisionId: `test:${selector.projectionName}:${selector.scopeKey}`,
       projectionName: selector.projectionName as ProjectionPayloadRecord<TPayload>["revision"]["projectionName"],
+      projectContextId: /^pc=([^|]+)\|/.exec(selector.scopeKey)?.[1] ?? "default",
       scopeKind: selector.scopeKind,
       scopeKey: selector.scopeKey,
       revision: 1,
@@ -866,14 +867,23 @@ class StaticProjectionRecordReader {
   async readCurrentTranscriptDefaultPayload<TPayload = unknown>(selector: {
     runId: string;
     limit: number;
+    scopeKey?: string | null | undefined;
   }): Promise<ProjectionPayloadRecord<TPayload> | null> {
+    const requestedProjectContextId = /^pc=([^|]+)\|/.exec(selector.scopeKey ?? "")?.[1] ?? null;
     const record = [...this.records.values()]
       .filter((candidate) => {
         if (candidate.revision.projectionName !== "transcript_projection" || candidate.revision.scopeKind !== "run_page") return false;
-        const match = /^(.+):(offset:\d+|tail):limit:(\d+)$/.exec(candidate.revision.scopeKey);
+        const scopedMatch = /^pc=([^|]+)\|(.*)$/.exec(candidate.revision.scopeKey);
+        const projectContextId = scopedMatch?.[1] ?? null;
+        const unscopedScopeKey = scopedMatch?.[2] ?? candidate.revision.scopeKey;
+        const match = /^(.+):(offset:\d+|tail):limit:(\d+)$/.exec(unscopedScopeKey);
         if (!match) return false;
-        const [, runId, pageKind, limitText] = match;
-        return runId === selector.runId && Number(limitText) == selector.limit && pageKind == "tail"
+        const [, runId, _pageKind, limitText] = match;
+        return (
+          runId === selector.runId &&
+          Number(limitText) == selector.limit &&
+          projectContextId === requestedProjectContextId
+        );
       })
       .at(0);
     if (record) {
@@ -886,7 +896,7 @@ class StaticProjectionRecordReader {
       this.selectors.push({
         projectionName: "transcript_projection",
         scopeKind: "run_page",
-        scopeKey: `${selector.runId}:tail:limit:${selector.limit}`,
+        scopeKey: selector.scopeKey ?? `${selector.runId}:tail:limit:${selector.limit}`,
       });
     }
     return record ? (JSON.parse(JSON.stringify(record)) as ProjectionPayloadRecord<TPayload>) : null;
@@ -911,6 +921,7 @@ function recordingProjectionWriter(): StatusServerProjectionWriter {
         revision: {
           projectionRevisionId: `test-write:${input.projectionName}:${input.scopeKey ?? "global"}`,
           projectionName: input.projectionName,
+          projectContextId: input.projectContextId ?? (/^pc=([^|]+)\|/.exec(input.scopeKey ?? "global")?.[1] ?? "default"),
           scopeKind: input.scopeKind ?? "global",
           scopeKey: input.scopeKey ?? "global",
           revision: 1,

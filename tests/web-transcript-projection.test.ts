@@ -664,6 +664,79 @@ describe("projectWebTranscript", () => {
     expect(messages.map((message) => message.kind)).not.toContain("assistant");
   });
 
+  it("adds service-owned project context attribution to projected system and status messages", () => {
+    const messages = projectWebTranscript([
+      event({
+        eventType: "status",
+        source: "cursor",
+        message: "Cursor status running",
+        payload: { kind: "status", status: "running", messagePreview: "workspace ready" },
+      }),
+      event({
+        eventType: "system",
+        source: "cursor",
+        message: "Cursor system event: startup",
+        payload: { kind: "system", subtype: "startup", messagePreview: "system public preview", truncated: false },
+      }),
+      event({ eventType: "some_new_cursor_kind", source: "cursor" }),
+    ], {
+      run: runRecord({
+        repoPath: "https://buildbot:ghp_SECRET_REPO_TOKEN@github.com/acme/symphony",
+        projectContext: {
+          projectContextId: "red",
+          projectContextLabel: "Red Team",
+          linearProjectSlug: "ENG",
+          routingSource: "candidate_poll",
+        },
+      }),
+      includeRunPrelude: false,
+    });
+
+    expect(messages).toEqual([
+      {
+        kind: "status",
+        state: "running",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "workspace ready · Project context: Red Team [red]",
+        projectContext: {
+          id: "red",
+          label: "Red Team",
+          linearProject: "ENG",
+          codebase: "https://github.com/acme/symphony",
+        },
+      },
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.000Z",
+        model: "",
+        cwd: "",
+        workspace: "",
+        session: "run-1",
+        tools: [],
+        note: "system public preview. Project context: Red Team [red].",
+        projectContext: {
+          id: "red",
+          label: "Red Team",
+          linearProject: "ENG",
+          codebase: "https://github.com/acme/symphony",
+        },
+      },
+      {
+        kind: "status",
+        state: "some_new_cursor_kind",
+        ts: "2026-01-01T00:00:00.000Z",
+        text: "some_new_cursor_kind · Project context: Red Team [red]",
+        projectContext: {
+          id: "red",
+          label: "Red Team",
+          linearProject: "ENG",
+          codebase: "https://github.com/acme/symphony",
+        },
+      },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain("ghp_SECRET_REPO_TOKEN");
+  });
+
   it("groups display taxonomy events while surfacing tool/token/rate telemetry and hiding metadata", () => {
     const messages = projectWebTranscript([
       event({
@@ -1511,6 +1584,120 @@ describe("projectWebTranscript", () => {
     expect(cursorMessages[0]).toMatchObject({ kind: "system", model: "cursor-model" });
   });
 
+  it("includes safe project context metadata in persisted run preludes", () => {
+    const messages = projectWebTranscript([], {
+      run: runRecord({
+        status: "succeeded",
+        prompt: "Replay the completed transcript safely with ghr_ABCDEFGH5 ghs_ABCDEFGH2 github_pat_ABCDEFGH3 lin_ABCDEFGH4 sk_live_ABCDEFGH6",
+        repoPath: "https://buildbot:ghp_SECRET_REPO_TOKEN@github.com/acme/symphony",
+        projectContext: {
+          projectContextId: "red",
+          projectContextLabel: "Red Team",
+          linearProjectSlug: "ENG",
+          routingSource: "candidate_poll",
+        },
+      }),
+    });
+
+    expect(messages.slice(0, 2)).toEqual([
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.000Z",
+        model: "gpt-5-test",
+        cwd: "/tmp/workspaces/TEST-1",
+        workspace: "TEST-1",
+        session: "session-1",
+        tools: [],
+        note: "Initialized implementation run from persisted run metadata. System prompt redacted. Project context: Red Team [red] · Linear ENG · https://github.com/acme/symphony.",
+        projectContext: {
+          id: "red",
+          label: "Red Team",
+          linearProject: "ENG",
+          codebase: "https://github.com/acme/symphony",
+        },
+      },
+      {
+        kind: "user",
+        ts: "2026-01-01T00:00:00.000Z",
+        from: "orchestrator",
+        issue: "TEST-1",
+        text: "Replay the completed transcript safely with [redacted] [redacted] [redacted] [redacted] [redacted]",
+        projectContext: {
+          id: "red",
+          label: "Red Team",
+          linearProject: "ENG",
+          codebase: "https://github.com/acme/symphony",
+        },
+      },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain("ghp_SECRET_REPO_TOKEN");
+    expect(JSON.stringify(messages)).not.toContain("ghr_ABCDEFGH5");
+    expect(JSON.stringify(messages)).not.toContain("ghs_ABCDEFGH2");
+    expect(JSON.stringify(messages)).not.toContain("github_pat_ABCDEFGH3");
+    expect(JSON.stringify(messages)).not.toContain("lin_ABCDEFGH4");
+    expect(JSON.stringify(messages)).not.toContain("sk_live_ABCDEFGH6");
+  });
+
+  it("preserves legacy default context attribution while omitting local repo paths", () => {
+    const run = runRecord({
+      repoPath: "/var/lib/symphony/state/repos/acme-shared-cache",
+      projectContext: {
+        projectContextId: "default",
+        projectContextLabel: "Default",
+        linearProjectSlug: null,
+        routingSource: "legacy_default",
+      },
+    });
+
+    const messages = projectWebTranscript([], { run });
+    expect(messages.slice(0, 2)).toEqual([
+      {
+        kind: "system",
+        ts: "2026-01-01T00:00:00.000Z",
+        model: "gpt-5-test",
+        cwd: "/tmp/workspaces/TEST-1",
+        workspace: "TEST-1",
+        session: "session-1",
+        tools: [],
+        note: "Initialized implementation run from persisted run metadata. System prompt redacted. Project context: Default.",
+        projectContext: {
+          id: "default",
+          label: "Default",
+          linearProject: null,
+          codebase: null,
+        },
+      },
+      {
+        kind: "user",
+        ts: "2026-01-01T00:00:00.000Z",
+        from: "orchestrator",
+        issue: "TEST-1",
+        text: "Implement TEST-1",
+        projectContext: {
+          id: "default",
+          label: "Default",
+          linearProject: null,
+          codebase: null,
+        },
+      },
+    ]);
+
+    const payload = projectWebTranscriptWindow(transcriptPage({ offset: 0, limit: 100, nextOffset: null, total: 1, windowKind: "page" }), [], {
+      run,
+      kind: "page",
+      requestedPage: { offset: 0, limit: 100 },
+      tailLimit: 500,
+    });
+
+    expect(payload.source.projectContext).toEqual({
+      id: "default",
+      label: "Default",
+      linearProject: null,
+      codebase: null,
+    });
+    expect(JSON.stringify(payload)).not.toContain("/var/lib/symphony/state/repos/acme-shared-cache");
+  });
+
   it("wraps explicit transcript pages with window metadata and inactive tail state", () => {
     const payload = projectWebTranscriptWindow(
       transcriptPage({ offset: 25, limit: 100, nextOffset: 125, total: 250, windowKind: "page" }),
@@ -1539,6 +1726,62 @@ describe("projectWebTranscript", () => {
       recovery: { strategy: "refetch", reason: "tail-gap" },
       compatibility: { responseShape: "transcript_window", messagesField: "messages" },
     });
+  });
+
+  it("includes safe project context source metadata in transcript window payloads", () => {
+    const payload = projectWebTranscriptWindow(
+      transcriptPage({ offset: 25, limit: 100, nextOffset: 125, total: 250, windowKind: "page" }),
+      [{ kind: "assistant", ts: "2026-01-01T00:00:01.000Z", text: "paged message" }],
+      {
+        run: runRecord({
+          status: "succeeded",
+          repoPath: "https://buildbot:ghp_SECRET_REPO_TOKEN@github.com/acme/symphony",
+          projectContext: {
+            projectContextId: "red",
+            projectContextLabel: "Red Team",
+            linearProjectSlug: "ENG",
+            routingSource: "candidate_poll",
+          },
+        }),
+        kind: "page",
+        requestedPage: { offset: 25, limit: 100 },
+        tailLimit: 500,
+      },
+    );
+
+    expect(payload).toMatchObject({
+      source: {
+        runId: "run-1",
+        sessionId: "session-1",
+        issueId: "test-1",
+        issueIdentifier: "TEST-1",
+        projectContext: {
+          id: "red",
+          label: "Red Team",
+          linearProject: "ENG",
+          codebase: "https://github.com/acme/symphony",
+        },
+        workspace: {
+          key: "TEST-1",
+          path: "/tmp/workspaces/TEST-1",
+        },
+        cursors: {
+          offset: 25,
+          limit: 100,
+          nextOffset: 125,
+          previousOffset: 0,
+          total: 250,
+          windowKind: "page",
+          hasNext: true,
+          hasPrevious: true,
+          eventCount: 1,
+          firstSequence: 26,
+          lastSequence: 26,
+          lastEventAt: "2026-01-01T00:00:26.000Z",
+        },
+      },
+    });
+    expect(JSON.stringify(payload)).not.toContain("ghp_SECRET_REPO_TOKEN");
   });
 
   it("enables active append metadata for running transcript tails", () => {

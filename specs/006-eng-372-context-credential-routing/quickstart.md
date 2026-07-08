@@ -1,49 +1,76 @@
-# Quickstart: ENG-372 Context Credential Routing
+# ENG-372 routing validation matrix quickstart
 
-## Scenario 1: Distinct context credentials resolve correctly
+Use this guide to capture deterministic validation evidence for ENG-372 child issues that cover credential routing, live tracker routing, redacted route evidence, identifier fallback, and issue-contract lint coverage.
 
-1. Configure two test contexts with distinct tracker credentials for the same capability.
-2. Run:
+## Requirement-to-validation matrix
 
-   ```powershell
-   npm test -- tests/credential-profiles.test.ts tests/linear-credential-resolver.test.ts tests/github-credential-resolver.test.ts
-   ```
+| Requirement ID | Validation task | Primary evidence |
+| --- | --- | --- |
+| REQ-ENG372C-001 | Prove distinct worker tracker credentials and live tracker routing across Symphony and docs contexts. | `tests/linear.test.ts`, `tests/status-api.test.ts` |
+| REQ-ENG372C-002 | Verify redacted `routeEvidence` for resolved, ambiguous, missing, wrong-context, and `credential_unavailable` outcomes from orchestrator and status routes. | `tests/orchestrator.test.ts`, `tests/status-api.test.ts` |
+| REQ-ENG372C-003 | Keep ENG-372 child contract examples lintable and mapped to stable requirement IDs. | `tests/issue-contract-lint.test.ts`, contract examples, this quickstart |
 
-3. Confirm each context resolves only its assigned profile and no secret values appear in output.
+## Required validation commands
 
-## Scenario 2: Live tracker paths do not use default fallback
-
-1. Seed a default context and a secondary context with separate tracker clients.
-2. Exercise candidate polling, reviewer polling, and status lookup for the secondary context.
-3. Run:
-
-   ```powershell
-   npm test -- tests/linear.test.ts tests/orchestrator.test.ts tests/status-api.test.ts
-   ```
-
-4. Confirm the secondary tracker is selected before live reads.
-
-## Scenario 3: Identifier-only fallback resolves before fetch
-
-1. Trigger a status or workspace action with a visible identifier.
-2. Confirm Symphony resolves context and canonical tracker identity before fetching live state.
-3. Include a duplicate-identifier case and confirm ambiguous input fails closed.
-
-## Scenario 4: Issue-breakdown uses the same route contract
-
-1. Run issue-breakdown request and apply flows for a non-default context.
-2. Run:
-
-   ```powershell
-   npm test -- tests/issue-breakdown-plan-service.test.ts tests/issue-breakdown-plan-apply-service.test.ts
-   ```
-
-3. Confirm tracker reads and writeback preparation use the resolved context.
-
-## Full Validation
-
-After child tasks complete, run:
-
-```powershell
-npm test -- tests/credential-profiles.test.ts tests/linear-credential-resolver.test.ts tests/github-credential-resolver.test.ts tests/linear.test.ts tests/orchestrator.test.ts tests/status-api.test.ts tests/workspace.test.ts tests/issue-breakdown-plan-service.test.ts tests/issue-breakdown-plan-apply-service.test.ts tests/mcp-subprocess-environment.test.ts
+```bash
+npm test -- tests/linear.test.ts tests/orchestrator.test.ts tests/status-api.test.ts tests/workspace.test.ts
+npm test -- tests/issue-contract-lint.test.ts
 ```
+
+## Route matrix to exercise
+
+| Route | Context | Expected routeEvidence status | Key evidence notes |
+| --- | --- | --- | --- |
+| `/api/v1/issues/docs:ENG-179/planning-run` | docs | `resolved` or `credential_unavailable` | Proves context-qualified worker tracker routing and candidate fallback. |
+| `/api/v1/issues/docs:ENG-179/planning-run/apply` | docs | `resolved`, `wrong_context`, or `credential_unavailable` | Proves apply routing stays fail-closed when the resolved context does not match or lacks credentials. |
+| `/api/v1/issues/ENG-179/open-workspace` | default alias | `ambiguous` | Proves bare aliases do not cross project-context boundaries. |
+| `/api/v1/issues/docs:ENG-179/open-workspace` | docs | `resolved` or `missing` | Proves qualified workspace fallback preserves the requested context. |
+
+## Route evidence fields
+
+Every recorded `routeEvidence` payload should document:
+
+- `kind`
+- `requestKey`
+- `requestAlias`
+- `requestedProjectContextId`
+- `resolvedProjectContextId`
+- `lookupKey`
+- `sources`
+- `status`
+- `reason`
+- `redacted`
+
+Expected statuses include `resolved`, `ambiguous`, `missing`, `wrong_context`, and `credential_unavailable`.
+
+## Redaction rules
+
+- Never emit tokens, private keys, raw profile values, or raw environment values.
+- Replace any operator-facing secret excerpt with `[REDACTED]`.
+- Keep `reason` values stable and secret-free.
+- Preserve only routing metadata such as context IDs, lookup keys, source categories, and redaction markers.
+
+## Example redacted evidence snippet
+
+```json
+{
+  "routeEvidence": {
+    "kind": "issue_breakdown",
+    "requestKey": "docs:ENG-179",
+    "requestAlias": "ENG-179",
+    "requestedProjectContextId": "docs",
+    "resolvedProjectContextId": "docs",
+    "lookupKey": "issue-docs-179",
+    "sources": ["tracker_direct", "tracker_candidate"],
+    "status": "credential_unavailable",
+    "reason": "resolved_project_context_tracker_unavailable",
+    "redacted": true
+  },
+  "operatorNote": "Rejected raw secret sample: [REDACTED]"
+}
+```
+
+## Contract-example maintenance
+
+- Keep the fenced examples in `specs/006-eng-372-context-credential-routing/contracts/live-tracker-routing.md` aligned with the stable requirement IDs above.
+- When a validation task changes, update the matching requirement row in this quickstart and the matching child-contract example together.

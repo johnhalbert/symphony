@@ -8,6 +8,19 @@ export interface IssueAssigneeRef {
   id: string | null;
 }
 
+export interface IssueLinearProjectIdentity {
+  kind: "linear";
+  slug: string;
+  id?: string | null;
+}
+
+export interface IssueProjectContextMetadata {
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string | null;
+  routingSource: string;
+}
+
 export interface Issue {
   id: string;
   identifier: string;
@@ -25,6 +38,12 @@ export interface Issue {
   hasChildren?: boolean;
   createdAt: string | null;
   updatedAt: string | null;
+  projectContext?: IssueProjectContextMetadata;
+  projectContextId?: string;
+  projectContextLabel?: string;
+  linearProjectSlug?: string | null;
+  linearProjectIdentity?: IssueLinearProjectIdentity;
+  routingSource?: string;
 }
 
 export interface IssueStatusView {
@@ -43,6 +62,12 @@ export interface IssueStatusView {
   hasChildren?: boolean;
   createdAt: string | null;
   updatedAt: string | null;
+  projectContext?: IssueProjectContextMetadata;
+  projectContextId?: string;
+  projectContextLabel?: string;
+  linearProjectSlug?: string | null;
+  linearProjectIdentity?: IssueLinearProjectIdentity;
+  routingSource?: string;
 }
 
 export type IssueDetailsSource = "live" | "durable" | "tracker";
@@ -87,6 +112,37 @@ export interface IssueWorkspaceSummary {
   gitBranchName: string | null;
   repoPath: string | null;
   baseRef: string | null;
+}
+
+export type IssueRouteEvidenceKind = "issue_breakdown" | "issue_breakdown_apply" | "open_workspace";
+export type IssueRouteEvidenceStatus = "resolved" | "ambiguous" | "wrong_context" | "missing" | "credential_unavailable";
+export type IssueRouteEvidenceSource =
+  | "alias_live"
+  | "alias_workspace"
+  | "alias_run"
+  | "alias_lifecycle"
+  | "tracker_direct"
+  | "tracker_candidate"
+  | "workspace_live"
+  | "workspace_record"
+  | "workspace_run"
+  | "workspace_lifecycle"
+  | "workspace_filesystem_fallback";
+
+export interface IssueRouteEvidenceBase {
+  requestKey: string;
+  requestAlias: string;
+  requestedProjectContextId: string | null;
+  resolvedProjectContextId: string | null;
+  lookupKey: string | null;
+  sources: IssueRouteEvidenceSource[];
+}
+
+export interface IssueRouteEvidence extends IssueRouteEvidenceBase {
+  kind: IssueRouteEvidenceKind;
+  status: IssueRouteEvidenceStatus;
+  reason: string | null;
+  redacted: true;
 }
 
 export interface IssuePullRequestSummary {
@@ -175,7 +231,38 @@ export interface IssueDetailsEnvelope {
   latestRun: IssueLatestRunSummary;
 }
 
+function projectContextIdForIssueStatusView(issue: Issue): string | undefined {
+  return issue.projectContext?.projectContextId ?? issue.projectContextId;
+}
+
+function projectContextLabelForIssueStatusView(issue: Issue): string | undefined {
+  return issue.projectContext?.projectContextLabel ?? issue.projectContextLabel;
+}
+
+function linearProjectSlugForIssueStatusView(issue: Issue): string | null | undefined {
+  return issue.projectContext?.linearProjectSlug ?? issue.linearProjectSlug;
+}
+
+function routingSourceForIssueStatusView(issue: Issue): string | undefined {
+  return issue.projectContext?.routingSource ?? issue.routingSource;
+}
+
+function linearProjectIdentityForIssueStatusView(issue: Issue): IssueLinearProjectIdentity | undefined {
+  if (issue.linearProjectIdentity) {
+    return { ...issue.linearProjectIdentity };
+  }
+
+  const slug = issue.projectContext?.linearProjectSlug;
+  return slug === undefined || slug === null ? undefined : { kind: "linear", slug };
+}
+
 export function toIssueStatusView(issue: Issue): IssueStatusView {
+  const projectContextId = projectContextIdForIssueStatusView(issue);
+  const projectContextLabel = projectContextLabelForIssueStatusView(issue);
+  const linearProjectSlug = linearProjectSlugForIssueStatusView(issue);
+  const linearProjectIdentity = linearProjectIdentityForIssueStatusView(issue);
+  const routingSource = routingSourceForIssueStatusView(issue);
+
   return {
     id: issue.id,
     identifier: issue.identifier,
@@ -191,6 +278,12 @@ export function toIssueStatusView(issue: Issue): IssueStatusView {
     blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
+    ...(issue.projectContext === undefined ? {} : { projectContext: { ...issue.projectContext } }),
+    ...(projectContextId === undefined ? {} : { projectContextId }),
+    ...(projectContextLabel === undefined ? {} : { projectContextLabel }),
+    ...(linearProjectSlug === undefined ? {} : { linearProjectSlug }),
+    ...(linearProjectIdentity === undefined ? {} : { linearProjectIdentity }),
+    ...(routingSource === undefined ? {} : { routingSource }),
   };
 }
 

@@ -1,10 +1,11 @@
-import type { IssueModel } from "../../types/symphony";
+import type { IssueModel, WorkspaceModel } from "../../types/symphony";
 import { Avatar, Icon, Label, Priority, STATUS_LABEL, StatusIcon, UnavailableButton } from "../common";
 import { useReferenceData } from "../../data/referenceDataContext";
 import { referenceDisplayName } from "../../data/referenceData";
 
 interface DetailColumnProps {
   issue: IssueModel | null;
+  workspace?: WorkspaceModel | null;
   issueId?: string | null;
   loading?: boolean;
   error?: string | null;
@@ -19,6 +20,7 @@ function priorityLabel(priority: IssueModel["priority"]): string {
 
 export function DetailColumn({
   issue,
+  workspace = null,
   issueId = issue?.id ?? null,
   loading = false,
   error = null,
@@ -50,6 +52,7 @@ export function DetailColumn({
   }
 
   const assigneeName = referenceDisplayName(issue.assignee, users[issue.assignee]);
+  const workspaceLabel = workspace?.path ?? issue.workspace ?? "not assigned";
 
   return (
     <div className="issues__col">
@@ -137,7 +140,7 @@ export function DetailColumn({
             <div className="symphony-block">
               <div className="row">
                 <span className="k">Workspace</span>
-                <span className="v">{issue.workspace || "not assigned"}</span>
+                <span className="v">{workspaceLabel}</span>
               </div>
               <div className="row">
                 <span className="k">Session</span>

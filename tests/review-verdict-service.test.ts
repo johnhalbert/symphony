@@ -624,6 +624,7 @@ function lifecycle(
     issueTriageReports: [],
     postMortemReports: [],
     reviewEvidence: { pullRequest: null, lastIngestedCursor: null, lastWorkerEvidenceCursor: null, items: [], updatedAt: null },
+    events: [],
     mergeGate: mergeGate(),
     mergeConflict: null,
     mergeConflictResolutionReports: [],

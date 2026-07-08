@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { IssueDetailsEnvelope } from "../src/core/types.js";
+import {
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+  LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+} from "../src/core/config/ProjectContexts.js";
 import type { IssueLifecycleRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import type { RunRecord, TranscriptEvent, TranscriptPage } from "../src/core/persistence/RunTranscriptStore.js";
 import {
@@ -160,6 +165,91 @@ function webCard(
     live: overrides.live ?? null,
     operatorLiveness: overrides.operatorLiveness ?? null,
   });
+}
+
+function contextualIssueDetails(input: {
+  issueId: string;
+  identifier: string;
+  title: string;
+  state: string;
+  projectContextId: string;
+  projectContextLabel: string;
+  linearProjectSlug: string;
+}): IssueDetailsEnvelope {
+  const base = issueDetails();
+  return issueDetails({
+    issue: {
+      ...base.issue,
+      id: input.issueId,
+      identifier: input.identifier,
+      title: input.title,
+      state: input.state,
+      labels: [],
+      projectContext: {
+        projectContextId: input.projectContextId,
+        projectContextLabel: input.projectContextLabel,
+        linearProjectSlug: input.linearProjectSlug,
+        routingSource: "explicit",
+      },
+    },
+  });
+}
+
+function contextualBoardCard(
+  input: {
+    issueId: string;
+    identifier: string;
+    title: string;
+    lane: IssueBoardCardProjectionInput["lane"];
+    state: string;
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string;
+  },
+): IssueBoardCardProjectionInput {
+  return card({
+    key: input.issueId,
+    issueId: input.issueId,
+    issueIdentifier: input.identifier,
+    lane: input.lane,
+    issueDetails: contextualIssueDetails(input),
+    live: null,
+    operatorLiveness: null,
+  });
+}
+
+function displayProjectContext(
+  input: {
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string | null;
+  },
+  options: { codebase?: string | null } = {},
+) {
+  return {
+    id: input.projectContextId,
+    label: input.projectContextLabel,
+    linearProject: input.linearProjectSlug,
+    codebase: options.codebase ?? null,
+  };
+}
+
+function runningAgentProjectContext(
+  input: {
+    projectContextId: string;
+    projectContextLabel: string;
+    linearProjectSlug: string | null;
+    routingSource?: string | null;
+  },
+  options: { codebase?: string | null } = {},
+) {
+  return {
+    ...displayProjectContext(input, options),
+    projectContextId: input.projectContextId,
+    projectContextLabel: input.projectContextLabel,
+    linearProjectSlug: input.linearProjectSlug,
+    routingSource: input.routingSource ?? null,
+  };
 }
 
 function run(overrides: Partial<RunRecord> = {}): RunRecord {
@@ -455,6 +545,66 @@ describe("web projection foundation", () => {
     expect(board.lanes.review.map((issue) => issue.id)).toEqual(["TEST-REVIEW"]);
   });
 
+  it("projects project attribution for duplicate issue identifiers on the React issue board", () => {
+    const board = projectWebIssueBoard({
+      issues: [
+        contextualBoardCard({
+          issueId: "issue-docs-179",
+          identifier: "ENG-179",
+          title: "Docs issue",
+          lane: "todo",
+          state: "Todo",
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectSlug: "DOCS",
+        }),
+        contextualBoardCard({
+          issueId: "issue-symphony-179",
+          identifier: "ENG-179",
+          title: "Symphony issue",
+          lane: "progress",
+          state: "In Progress",
+          projectContextId: "symphony",
+          projectContextLabel: "Symphony",
+          linearProjectSlug: "ENG",
+        }),
+      ],
+    });
+
+    expect(board).toMatchObject({ selectedIssueId: "symphony:ENG-179" });
+    expect(board.issues).toHaveLength(2);
+    expect(board.issues.map(({ id, title, project, projectContext, status }) => ({ id, title, project, projectContext, status }))).toEqual([
+      {
+        id: "docs:ENG-179",
+        title: "Docs issue",
+        project: "Documentation Site",
+        projectContext: displayProjectContext({
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectSlug: "DOCS",
+        }),
+        status: "todo",
+      },
+      {
+        id: "symphony:ENG-179",
+        title: "Symphony issue",
+        project: "Symphony",
+        projectContext: displayProjectContext({
+          projectContextId: "symphony",
+          projectContextLabel: "Symphony",
+          linearProjectSlug: "ENG",
+        }),
+        status: "progress",
+      },
+    ]);
+    expect(board.lanes.todo.map(({ id, title, project }) => ({ id, title, project }))).toEqual([
+      { id: "docs:ENG-179", title: "Docs issue", project: "Documentation Site" },
+    ]);
+    expect(board.lanes.progress.map(({ id, title, project }) => ({ id, title, project }))).toEqual([
+      { id: "symphony:ENG-179", title: "Symphony issue", project: "Symphony" },
+    ]);
+  });
+
   it("normalizes canceled backend board cards to cancelled for the React issue board", () => {
     const board = projectWebIssueBoard({
       issues: [webCard("TEST-CANCELED", { lane: "canceled", state: "Canceled", title: "Canceled issue" })],
@@ -595,7 +745,177 @@ describe("web projection foundation", () => {
     expect(normalizeDescription(" one  two \n\n three ")).toEqual(["one two", "three"]);
   });
 
+  it("projects issue detail project attribution for duplicate issue identifiers", () => {
+    const docsCard = contextualBoardCard({
+      issueId: "issue-docs-179",
+      identifier: "ENG-179",
+      title: "Docs issue",
+      lane: "todo",
+      state: "Todo",
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+    });
+    const symphonyCard = contextualBoardCard({
+      issueId: "issue-symphony-179",
+      identifier: "ENG-179",
+      title: "Symphony issue",
+      lane: "progress",
+      state: "In Progress",
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+    });
+
+    const docsDetail = projectIssueDetailModel({
+      issue: "docs:ENG-179",
+      boardCard: docsCard,
+      issueDetails: docsCard.issueDetails,
+      latestRun: run({ issueId: "issue-docs-179", issueIdentifier: "ENG-179" }),
+      runs: [],
+      operatorLiveness: null,
+    });
+    const symphonyDetail = projectIssueDetailModel({
+      issue: "symphony:ENG-179",
+      boardCard: symphonyCard,
+      issueDetails: symphonyCard.issueDetails,
+      latestRun: run({ issueId: "issue-symphony-179", issueIdentifier: "ENG-179" }),
+      runs: [],
+      operatorLiveness: null,
+    });
+
+    expect([docsDetail.issue, symphonyDetail.issue].map(({ id, title, project, projectContext }) => ({ id, title, project, projectContext }))).toEqual([
+      {
+        id: "docs:ENG-179",
+        title: "Docs issue",
+        project: "Documentation Site",
+        projectContext: displayProjectContext({
+          projectContextId: "docs",
+          projectContextLabel: "Documentation Site",
+          linearProjectSlug: "DOCS",
+        }),
+      },
+      {
+        id: "symphony:ENG-179",
+        title: "Symphony issue",
+        project: "Symphony",
+        projectContext: displayProjectContext({
+          projectContextId: "symphony",
+          projectContextLabel: "Symphony",
+          linearProjectSlug: "ENG",
+        }),
+      },
+    ]);
+  });
+
+  it("prefers explicit issue project context over legacy run defaults when projecting issue-detail workspaces", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const detail = projectIssueDetailModel({
+      issue: "docs:TEST-1",
+      boardCard: null,
+      issueDetails: issueDetails({
+        issue: {
+          ...issueDetails().issue,
+          projectContextId: docsProjectContext.projectContextId,
+          projectContextLabel: docsProjectContext.projectContextLabel,
+          linearProjectSlug: docsProjectContext.linearProjectSlug,
+          routingSource: docsProjectContext.routingSource,
+        },
+        workspace: {
+          workspaceKey: null,
+          path: null,
+          sourceKind: null,
+          branchName: null,
+          gitBranchName: null,
+          repoPath: null,
+          baseRef: null,
+        },
+      }),
+      latestRun: run({
+        workspaceKey: "TEST-1",
+        workspacePath: "/tmp/workspaces/TEST-1",
+        gitBranchName: "symphony/docs/TEST-1",
+        repoPath: "/repo/docs",
+        baseRef: "origin/main",
+        projectContext: {
+          projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+          projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+          linearProjectSlug: null,
+          routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+        },
+      }),
+      runs: [],
+      operatorLiveness: null,
+    });
+
+    expect(detail.workspace).toMatchObject({
+      workspaceKey: "TEST-1",
+      path: "/tmp/workspaces/TEST-1",
+      gitBranchName: "symphony/docs/TEST-1",
+      repoPath: "/repo/docs",
+      baseRef: "origin/main",
+      projectContext: docsProjectContext,
+    });
+  });
+
+  it("projects legacy default tracker attribution onto board and detail issues without changing blank project labels or unqualified ids", () => {
+    const legacyDefaultProjectContext = {
+      projectContextId: LEGACY_DEFAULT_PROJECT_CONTEXT_ID,
+      projectContextLabel: LEGACY_DEFAULT_PROJECT_CONTEXT_LABEL,
+      linearProjectSlug: "ENG",
+      routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+    } as const;
+    const legacyDefaultDetails = issueDetails({
+      issue: {
+        ...issueDetails().issue,
+        linearProjectIdentity: { kind: "linear", slug: "ENG" },
+        linearProjectSlug: "ENG",
+        routingSource: LEGACY_DEFAULT_PROJECT_CONTEXT_ROUTING_SOURCE,
+      },
+    });
+    const board = projectWebIssueBoard({
+      issues: [
+        card({
+          issueDetails: legacyDefaultDetails,
+          live: null,
+          operatorLiveness: null,
+        }),
+      ],
+    });
+    const detail = projectIssueDetailModel({
+      issue: "TEST-1",
+      boardCard: null,
+      issueDetails: legacyDefaultDetails,
+      latestRun: run(),
+      runs: [],
+      operatorLiveness: null,
+    });
+
+    expect(board.issues[0]).toMatchObject({
+      id: "TEST-1",
+      project: "",
+      projectContext: displayProjectContext(legacyDefaultProjectContext),
+    });
+    expect(detail.issue).toMatchObject({
+      id: "TEST-1",
+      project: "",
+      projectContext: displayProjectContext(legacyDefaultProjectContext),
+    });
+  });
+
   it("projects dashboard, detail, history, activity, and transcript models without runtime side effects", () => {
+    const runtimeProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
     const activityInput: ActivityFeedResponseProjectionInput = {
       generatedAt: "2026-01-01T00:11:00.000Z",
       activity: [
@@ -604,6 +924,7 @@ describe("web projection foundation", () => {
           at: "2026-01-01T00:00:00.000Z",
           kind: "run_started",
           source: "run",
+          projectContext: runtimeProjectContext,
           issue: { id: "issue-1", identifier: "TEST-1" },
           run: { runId: "run-1", role: "worker", runPhase: "implementation", runKind: "implementation", status: "running", agentId: "agent-1", sessionId: "session-1" },
           transcript: null,
@@ -614,6 +935,7 @@ describe("web projection foundation", () => {
           at: "2026-01-01T00:01:00.000Z",
           kind: "transcript_event",
           source: "cursor",
+          projectContext: runtimeProjectContext,
           issue: { id: "issue-1", identifier: "TEST-1" },
           run: { runId: "run-1", role: "worker", runPhase: "implementation", runKind: "implementation", status: "running", agentId: "agent-1", sessionId: "session-1" },
           transcript: { sequence: 1, eventType: "tool_call", message: "read_file" },
@@ -643,7 +965,7 @@ describe("web projection foundation", () => {
           updatedAt: "2026-01-01T00:00:00.000Z",
           affectedRoles: ["worker", "reviewer"],
           affectedRunPhases: ["implementation", "review"],
-          source: { issueIdentifier: "TEST-1", runId: "run-1" },
+          source: { issueIdentifier: "TEST-1", runId: "run-1", projectContext: runtimeProjectContext },
         },
       ],
       providerGateCounts: { active: 1, manual: 0, autoResume: 1 },
@@ -652,6 +974,7 @@ describe("web projection foundation", () => {
           issueId: "issue-1",
           issueIdentifier: "TEST-1",
           runId: "run-1",
+          projectContext: runtimeProjectContext,
           startedAt: "2026-01-01T00:01:00.000Z",
           lastEvent: "progress",
           lastMessage: "Implementing dashboard route",
@@ -695,8 +1018,9 @@ describe("web projection foundation", () => {
         concurrencyCap: 2,
       },
     });
-    const detail = projectIssueDetailModel({ issue: "TEST-1", boardCard: card(), issueDetails: issueDetails(), latestRun: run(), runs: [run()], operatorLiveness: { agentId: "agent-1", sessionId: "session-1", workspacePath: "/tmp/workspaces/TEST-1", runId: "run-1", activeRunId: "run-1", status: "active" } });
-    const history = projectHistoryModel({ runs: [run()], transcript: transcriptPage, selectedRunId: "run-1" });
+    const detailRun = run({ projectContext: runtimeProjectContext, repoPath: "https://github.com/acme/docs.git" });
+    const detail = projectIssueDetailModel({ issue: "TEST-1", boardCard: card(), issueDetails: issueDetails(), latestRun: detailRun, runs: [detailRun], operatorLiveness: { agentId: "agent-1", sessionId: "session-1", workspacePath: "/tmp/workspaces/TEST-1", runId: "run-1", activeRunId: "run-1", status: "active" } });
+    const history = projectHistoryModel({ runs: [detailRun], transcript: transcriptPage, selectedRunId: "run-1" });
 
     expect(dashboard).toMatchObject({
       projectName: "Symphony",
@@ -731,12 +1055,14 @@ describe("web projection foundation", () => {
       step: "Implementing dashboard route",
       duration: "10m",
       tokens: "12",
+      projectContext: runningAgentProjectContext(runtimeProjectContext),
     });
     expect(dashboard.providerGates[0]).toMatchObject({
       provider: "openai-codex",
       kind: "windowed_bucket_exhausted",
       resumeAt: "2026-01-01T05:00:00.000Z",
       sourceIssue: "TEST-1",
+      projectContext: displayProjectContext(runtimeProjectContext),
     });
     expect(dashboard.activity.map((item) => item.verb)).toEqual(["run_started", "tool_call"]);
     expect(JSON.stringify(dashboard)).not.toContain("openai/symphony");
@@ -744,9 +1070,20 @@ describe("web projection foundation", () => {
     expect(JSON.stringify(dashboard)).not.toContain("mock");
     expect(detail.issue.id).toBe("TEST-1");
     expect(detail.runs).toHaveLength(1);
+    expect(detail.runs[0]).toMatchObject({
+      projectContext: displayProjectContext(runtimeProjectContext, { codebase: "https://github.com/acme/docs.git" }),
+    });
+    expect(history.sessions[0]).toMatchObject({
+      projectContext: displayProjectContext(runtimeProjectContext, { codebase: "https://github.com/acme/docs.git" }),
+    });
     expect(history.selectedSessionId).toBe("run-1");
     expect(history.transcript.map((message) => message.kind)).toEqual(["tool_call", "request"]);
-    expect(projectActivityModels(activityInput)[1]).toMatchObject({ who: "agent-1", id: "TEST-1", extra: "read_file" });
+    expect(projectActivityModels(activityInput)[1]).toMatchObject({
+      who: "agent-1",
+      id: "TEST-1",
+      extra: "read_file",
+      projectContext: displayProjectContext(runtimeProjectContext),
+    });
     expect(projectTranscriptMessages(transcriptEvents)[0]).toMatchObject({
       kind: "tool_call",
       call_id: "run-1:1",
@@ -755,6 +1092,63 @@ describe("web projection foundation", () => {
       args: {},
       result: null,
     });
+  });
+
+  it("uses issue ids as context-safe fallback ids for live same-identifier siblings before run ids exist", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
+    const dashboard = projectWebDashboard({
+      generatedAt: "2026-01-01T00:15:00.000Z",
+      runtime: {
+        generatedAt: "2026-01-01T00:15:00.000Z",
+        running: [
+          {
+            issueId: "issue-docs-123",
+            issueIdentifier: "ENG-123",
+            runId: null,
+            projectContext: docsProjectContext,
+            startedAt: "2026-01-01T00:05:00.000Z",
+            issueDetails: { title: "Docs live duplicate" },
+            liveness: { status: "active" },
+            lastMessage: "docs heartbeat",
+            state: "running",
+            tokens: { totalTokens: 10 },
+          },
+          {
+            issueId: "issue-symphony-123",
+            issueIdentifier: "ENG-123",
+            runId: null,
+            projectContext: symphonyProjectContext,
+            startedAt: "2026-01-01T00:06:00.000Z",
+            issueDetails: { title: "Symphony live duplicate" },
+            liveness: { status: "active" },
+            lastMessage: "symphony heartbeat",
+            state: "running",
+            tokens: { totalTokens: 12 },
+          },
+        ],
+        providerGates: [],
+      } as any,
+      config: { concurrencyCap: 2 },
+    });
+
+    expect(dashboard.runningAgents.map((agent) => agent.id)).toEqual(["issue-docs-123", "issue-symphony-123"]);
+    expect(new Set(dashboard.runningAgents.map((agent) => agent.id)).size).toBe(2);
+    expect(dashboard.runningAgents.map((agent) => agent.projectContext)).toEqual([
+      runningAgentProjectContext(docsProjectContext),
+      runningAgentProjectContext(symphonyProjectContext),
+    ]);
   });
 
   it("does not project stale Cursor model as legacy session model for explicit Hermes ACP runs", () => {
@@ -806,6 +1200,13 @@ describe("web projection foundation", () => {
   });
 
   it("derives dashboard totals and active agents from durable run and lifecycle state when board/runtime data is incomplete", () => {
+    const durableProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
     const dashboard = projectWebDashboard({
       generatedAt: "2026-01-01T00:15:00.000Z",
       board: {
@@ -821,6 +1222,7 @@ describe("web projection foundation", () => {
           issueId: "issue-running",
           issueIdentifier: "TEST-RUNNING",
           workspaceKey: "TEST-RUNNING",
+          projectContext: durableProjectContext,
           status: "running",
           completedAt: null,
           startedAt: "2026-01-01T00:00:00.000Z",
@@ -877,13 +1279,153 @@ describe("web projection foundation", () => {
         step: "implementation",
         duration: "15m",
         tokens: "25",
+        projectContext: runningAgentProjectContext(durableProjectContext),
       },
     ]);
     expect(dashboard.agentUsageLabel).toBe("1/3 agents");
     expect(JSON.stringify(dashboard)).not.toContain("mock");
   });
 
+  it("uses issue ids as context-safe fallback ids for durable same-identifier siblings when run ids are unavailable", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
+    const dashboard = projectWebDashboard({
+      generatedAt: "2026-01-01T00:15:00.000Z",
+      runtime: null,
+      runs: [
+        run({
+          runId: "",
+          issueId: "issue-docs-123",
+          issueIdentifier: "ENG-123",
+          workspaceKey: "docs-ENG-123",
+          projectContext: docsProjectContext,
+          status: "running",
+          completedAt: null,
+          startedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:14:00.000Z",
+          tokens: { inputTokens: 10, outputTokens: 15, totalTokens: 25 },
+        }),
+        run({
+          runId: "",
+          issueId: "issue-symphony-123",
+          issueIdentifier: "ENG-123",
+          workspaceKey: "symphony-ENG-123",
+          projectContext: symphonyProjectContext,
+          status: "running",
+          completedAt: null,
+          startedAt: "2026-01-01T00:01:00.000Z",
+          updatedAt: "2026-01-01T00:13:00.000Z",
+          tokens: { inputTokens: 9, outputTokens: 9, totalTokens: 18 },
+        }),
+      ],
+      config: { concurrencyCap: 2 },
+    });
+
+    expect(dashboard.runningAgents.map((agent) => agent.id)).toEqual(["issue-docs-123", "issue-symphony-123"]);
+    expect(new Set(dashboard.runningAgents.map((agent) => agent.id)).size).toBe(2);
+    expect(dashboard.runningAgents.map((agent) => agent.projectContext)).toEqual([
+      runningAgentProjectContext(docsProjectContext),
+      runningAgentProjectContext(symphonyProjectContext),
+    ]);
+  });
+
+  it("dedupes contextual board issues against durable totals by raw issue id without collapsing same-identifier sibling contexts", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+    const dashboard = projectWebDashboard({
+      generatedAt: "2026-01-01T00:15:00.000Z",
+      board: {
+        issues: [
+          contextualBoardCard({
+            issueId: "issue-docs-179",
+            identifier: "ENG-179",
+            title: "Docs issue",
+            lane: "todo",
+            state: "Todo",
+            projectContextId: "docs",
+            projectContextLabel: "Documentation Site",
+            linearProjectSlug: "DOCS",
+          }),
+        ],
+      },
+      runtime: null,
+      runs: [
+        run({
+          runId: "run-docs-179",
+          issueId: "issue-docs-179",
+          issueIdentifier: "ENG-179",
+          workspaceKey: "ENG-179",
+          status: "running",
+          completedAt: null,
+          updatedAt: "2026-01-01T00:14:00.000Z",
+          projectContext: docsProjectContext,
+        }),
+      ],
+      lifecycleRecords: [
+        lifecycle({
+          issueId: "issue-docs-179",
+          issueIdentifier: "ENG-179",
+          phase: "implementation",
+          projectContext: docsProjectContext,
+        }),
+        lifecycle({
+          issueId: "issue-symphony-179",
+          issueIdentifier: "ENG-179",
+          phase: "review",
+          projectContext: symphonyProjectContext,
+        }),
+      ],
+      config: { concurrencyCap: 2 },
+    });
+
+    expect(dashboard.totals).toEqual({
+      backlog: 0,
+      todo: 1,
+      progress: 0,
+      review: 1,
+      done: 0,
+      cancelled: 0,
+      open: 2,
+      all: 2,
+      completeness: 0,
+    });
+  });
+
   it("prefers live runtime agent rows over matching durable running records without double-counting usage", () => {
+    const runtimeProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const durableProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
     const dashboard = projectWebDashboard({
       generatedAt: "2026-01-01T00:15:00.000Z",
       runtime: {
@@ -893,6 +1435,7 @@ describe("web projection foundation", () => {
             issueId: "issue-running",
             issueIdentifier: "TEST-RUNNING",
             runId: "run-running",
+            projectContext: runtimeProjectContext,
             startedAt: "2026-01-01T00:05:00.000Z",
             lastMessage: "runtime heartbeat",
             state: "running",
@@ -907,6 +1450,7 @@ describe("web projection foundation", () => {
           issueId: "issue-running",
           issueIdentifier: "TEST-RUNNING",
           workspaceKey: "TEST-RUNNING",
+          projectContext: durableProjectContext,
           status: "running",
           completedAt: null,
           tokens: { inputTokens: 9, outputTokens: 9, totalTokens: 18 },
@@ -924,6 +1468,7 @@ describe("web projection foundation", () => {
         step: "runtime heartbeat",
         duration: "10m",
         tokens: "10",
+        projectContext: runningAgentProjectContext(runtimeProjectContext),
       },
     ]);
     expect(dashboard.agentUsageLabel).toBe("1/2 agents");
@@ -957,10 +1502,25 @@ describe("web projection foundation", () => {
   });
 
   it("composes the web sidebar model directly from dashboard, issue, history, and chat projections", () => {
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
     const issues = projectWebIssueBoard({
       issues: [
         webCard("TEST-TODO", { lane: "todo", state: "Todo" }),
-        webCard("TEST-REVIEW", { lane: "review", state: "In Review" }),
+        contextualBoardCard({
+          issueId: "issue-review",
+          identifier: "TEST-REVIEW",
+          title: "Review issue",
+          lane: "review",
+          state: "In Review",
+          projectContextId: docsProjectContext.projectContextId,
+          projectContextLabel: docsProjectContext.projectContextLabel,
+          linearProjectSlug: docsProjectContext.linearProjectSlug,
+        }),
       ],
     });
     const providerGates = [
@@ -1004,7 +1564,7 @@ describe("web projection foundation", () => {
       totals,
       source: emptyDashboardModel().source,
     };
-    const history = projectWebHistory([run({ runId: "run-sidebar", issueIdentifier: "TEST-REVIEW" })], []);
+    const history = projectWebHistory([run({ runId: "run-sidebar", issueIdentifier: "TEST-REVIEW", projectContext: docsProjectContext })], []);
     const chat = [{ who: "user" as const, text: "show the sidebar" }];
 
     const sidebar = projectWebSidebar(dashboard, issues, history, chat);
@@ -1012,6 +1572,7 @@ describe("web projection foundation", () => {
     expect(sidebar.providerGates).toBe(providerGates);
     expect(sidebar.runningAgents).toBe(runningAgents);
     expect(sidebar.reviewIssues).toEqual(issues.lanes.review);
+    expect(sidebar.reviewIssues[0]).toMatchObject({ projectContext: displayProjectContext(docsProjectContext) });
     expect(sidebar.activity).toBe(activity);
     expect(sidebar.sessions).toBe(history.sessions);
     expect(sidebar.chat).toBe(chat);

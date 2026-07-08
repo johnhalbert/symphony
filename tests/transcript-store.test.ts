@@ -11,8 +11,6 @@ async function startBasicRun(
   overrides: Partial<Parameters<FileRunTranscriptStore["startRun"]>[0]> = {},
 ): Promise<void> {
   await store.startRun({
-    ...overrides,
-    runId,
     role: "worker",
     issueId: "issue-1",
     issueIdentifier: "TEST-1",
@@ -27,6 +25,8 @@ async function startBasicRun(
     gitBranchName: "symphony/TEST-1",
     repoPath: "/repo",
     baseRef: "main",
+    ...overrides,
+    runId,
   });
 }
 
@@ -399,7 +399,7 @@ describe("FileRunTranscriptStore", () => {
       source: "harness",
       eventType: "progress",
       message:
-        "assistant token=SECRET_TOKEN access_token=legacy-access refreshToken: legacy-refresh github_token=legacy-github client_secret: legacy-client private_key=legacy-private ghp_ABCDEFGH1 sk-ABCDEFGH1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
+        "assistant token=SECRET_TOKEN access_token=legacy-access refreshToken: legacy-refresh github_token=legacy-github client_secret: legacy-client private_key=legacy-private ghp_ABCDEFGH1 ghr_ABCDEFGH5 ghs_ABCDEFGH2 github_pat_ABCDEFGH3 lin_ABCDEFGH4 sk_live_ABCDEFGH6 sk-ABCDEFGH1 inputTokens: 7 totalTokens: 9 tokenConfigured: true",
       payload: {
         token: "SECRET_PAYLOAD",
         nested: {
@@ -434,6 +434,11 @@ describe("FileRunTranscriptStore", () => {
     expect(JSON.stringify(page)).not.toContain("legacy-client");
     expect(JSON.stringify(page)).not.toContain("legacy-private");
     expect(JSON.stringify(page)).not.toContain("ghp_ABCDEFGH1");
+    expect(JSON.stringify(page)).not.toContain("ghr_ABCDEFGH5");
+    expect(JSON.stringify(page)).not.toContain("ghs_ABCDEFGH2");
+    expect(JSON.stringify(page)).not.toContain("github_pat_ABCDEFGH3");
+    expect(JSON.stringify(page)).not.toContain("lin_ABCDEFGH4");
+    expect(JSON.stringify(page)).not.toContain("sk_live_ABCDEFGH6");
     expect(JSON.stringify(page)).not.toContain("sk-ABCDEFGH1");
     expect(page.events[0]).toMatchObject({
       message: expect.stringContaining("token=[redacted]"),
@@ -1156,6 +1161,91 @@ describe("FileRunTranscriptStore", () => {
     await expect(store.latestRunForIssue("TEST-1", { role: "worker" })).resolves.toMatchObject({ runId: "worker-run" });
   });
 
+  it("scopes workspace and run readback by project context when identifiers collide", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const symphonyProjectContext = {
+      projectContextId: "symphony",
+      projectContextLabel: "Symphony",
+      linearProjectSlug: "ENG",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await store.upsertWorkspace({
+      workspaceKey: "docs__ENG-123",
+      issueId: "issue-docs-1",
+      issueIdentifier: "ENG-123",
+      projectContext: docsProjectContext,
+      path: "/tmp/docs-eng-123",
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/docs/ENG-123",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await store.upsertWorkspace({
+      workspaceKey: "symphony__ENG-123",
+      issueId: "issue-symphony-1",
+      issueIdentifier: "ENG-123",
+      projectContext: symphonyProjectContext,
+      path: "/tmp/symphony-eng-123",
+      sourceKind: "git_worktree",
+      gitBranchName: "symphony/symphony/ENG-123",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:10:00.000Z",
+    });
+    await startBasicRun(store, "docs-run-1", {
+      issueId: "issue-docs-1",
+      issueIdentifier: "ENG-123",
+      projectContext: docsProjectContext,
+      workspaceKey: "docs__ENG-123",
+      workspacePath: "/tmp/docs-eng-123",
+      gitBranchName: "symphony/docs/ENG-123",
+    });
+    await startBasicRun(store, "symphony-run-1", {
+      issueId: "issue-symphony-1",
+      issueIdentifier: "ENG-123",
+      projectContext: symphonyProjectContext,
+      workspaceKey: "symphony__ENG-123",
+      workspacePath: "/tmp/symphony-eng-123",
+      gitBranchName: "symphony/symphony/ENG-123",
+    });
+
+    await expect(store.findWorkspace("ENG-123", { projectContext: docsProjectContext })).resolves.toMatchObject({
+      workspaceKey: "docs__ENG-123",
+      issueId: "issue-docs-1",
+      projectContext: { projectContextId: "docs" },
+    });
+    await expect(store.findWorkspace("ENG-123", { projectContext: symphonyProjectContext })).resolves.toMatchObject({
+      workspaceKey: "symphony__ENG-123",
+      issueId: "issue-symphony-1",
+      projectContext: { projectContextId: "symphony" },
+    });
+    await expect(store.findWorkspace("issue-docs-1", { projectContext: docsProjectContext })).resolves.toMatchObject({
+      workspaceKey: "docs__ENG-123",
+    });
+    await expect(store.listRunsForIssue("ENG-123", { projectContext: docsProjectContext })).resolves.toMatchObject([
+      { runId: "docs-run-1", issueId: "issue-docs-1", projectContext: { projectContextId: "docs" } },
+    ]);
+    await expect(store.listRunsForIssue("ENG-123", { projectContext: symphonyProjectContext })).resolves.toMatchObject([
+      { runId: "symphony-run-1", issueId: "issue-symphony-1", projectContext: { projectContextId: "symphony" } },
+    ]);
+    await expect(store.latestRunForIssue("ENG-123", { projectContext: docsProjectContext })).resolves.toMatchObject({
+      runId: "docs-run-1",
+      issueId: "issue-docs-1",
+      projectContext: { projectContextId: "docs" },
+    });
+    await expect(store.latestRunForIssue("ENG-123", { projectContext: symphonyProjectContext })).resolves.toMatchObject({
+      runId: "symphony-run-1",
+      issueId: "issue-symphony-1",
+      projectContext: { projectContextId: "symphony" },
+    });
+  });
+
   it("orders equal-timestamp issue runs deterministically", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
@@ -1225,4 +1315,208 @@ describe("FileRunTranscriptStore", () => {
       runId: "run-c-worker-retry",
     });
   });
+
+  it("normalizes explicit and legacy project context attribution for runs and workspaces", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const legacyDefaultProjectContext = {
+      projectContextId: "default",
+      projectContextLabel: "Default",
+      linearProjectSlug: null,
+      routingSource: "legacy_default",
+    } as const;
+
+    await store.upsertWorkspace({
+      workspaceKey: "docs-workspace",
+      issueId: "issue-docs-1",
+      issueIdentifier: "DOCS-1",
+      projectContext: docsProjectContext,
+      path: "/tmp/docs-workspace",
+      sourceKind: "git_worktree",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await startBasicRun(store, "run-explicit", {
+      issueId: "issue-docs-1",
+      issueIdentifier: "DOCS-1",
+      workspaceKey: "docs-workspace",
+      workspacePath: "/tmp/docs-workspace",
+      projectContext: docsProjectContext,
+    });
+
+    await startBasicRun(store, "run-legacy", {
+      issueId: "issue-legacy-1",
+      issueIdentifier: "LEGACY-1",
+      workspaceKey: "legacy-workspace",
+      workspacePath: "/tmp/legacy-workspace",
+    });
+    await store.upsertWorkspace({
+      workspaceKey: "legacy-workspace",
+      issueId: "issue-legacy-1",
+      issueIdentifier: "LEGACY-1",
+      path: "/tmp/legacy-workspace",
+      sourceKind: "git_worktree",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const legacyRunPath = path.join(root, "runs", "run-legacy", "meta.json");
+    const legacyRun = JSON.parse(await readFile(legacyRunPath, "utf8")) as Record<string, unknown>;
+    delete legacyRun.projectContext;
+    await writeFile(legacyRunPath, `${JSON.stringify(legacyRun, null, 2)}
+`, "utf8");
+
+    const legacyWorkspacePath = path.join(root, "workspaces", "legacy-workspace.json");
+    const legacyWorkspace = JSON.parse(await readFile(legacyWorkspacePath, "utf8")) as Record<string, unknown>;
+    delete legacyWorkspace.projectContext;
+    await writeFile(legacyWorkspacePath, `${JSON.stringify(legacyWorkspace, null, 2)}
+`, "utf8");
+    const legacyRunBeforeRead = await readFile(legacyRunPath, "utf8");
+    const legacyWorkspaceBeforeRead = await readFile(legacyWorkspacePath, "utf8");
+
+    await expect(store.getRun("run-explicit")).resolves.toMatchObject({ projectContext: docsProjectContext });
+    await expect(store.getWorkspace("docs-workspace")).resolves.toMatchObject({ projectContext: docsProjectContext });
+    await expect(store.getRun("run-legacy")).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+    await expect(store.getWorkspace("legacy-workspace")).resolves.toMatchObject({
+      projectContext: legacyDefaultProjectContext,
+    });
+    await expect(store.listRuns()).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ runId: "run-legacy", projectContext: legacyDefaultProjectContext })]),
+    );
+    await expect(store.listWorkspaces()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ workspaceKey: "legacy-workspace", projectContext: legacyDefaultProjectContext }),
+      ]),
+    );
+    await expect(readFile(legacyRunPath, "utf8")).resolves.toBe(legacyRunBeforeRead);
+    await expect(readFile(legacyWorkspacePath, "utf8")).resolves.toBe(legacyWorkspaceBeforeRead);
+  });
+
+  it("drops unexpected project context metadata fields when reading persisted runs and workspaces", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const expectedProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+
+    await store.upsertWorkspace({
+      workspaceKey: "docs-workspace-redacted",
+      issueId: "issue-docs-redacted",
+      issueIdentifier: "DOCS-REDACTED-1",
+      projectContext: expectedProjectContext,
+      path: "/tmp/docs-redacted-workspace",
+      sourceKind: "git_worktree",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await startBasicRun(store, "run-docs-redacted", {
+      issueId: "issue-docs-redacted",
+      issueIdentifier: "DOCS-REDACTED-1",
+      workspaceKey: "docs-workspace-redacted",
+      workspacePath: "/tmp/docs-redacted-workspace",
+      projectContext: expectedProjectContext,
+    });
+
+    const injectedProjectContext = {
+      ...expectedProjectContext,
+      repository: "https://x-access-token:repo-secret@example.com/org/docs.git",
+      path: "packages/site",
+      token: "workspace-secret",
+      githubToken: "gh-secret",
+    };
+    const runPath = path.join(root, "runs", "run-docs-redacted", "meta.json");
+    const rawRun = JSON.parse(await readFile(runPath, "utf8")) as Record<string, unknown>;
+    rawRun.projectContext = injectedProjectContext;
+    await writeFile(runPath, `${JSON.stringify(rawRun, null, 2)}\n`, "utf8");
+
+    const workspacePath = path.join(root, "workspaces", "docs-workspace-redacted.json");
+    const rawWorkspace = JSON.parse(await readFile(workspacePath, "utf8")) as Record<string, unknown>;
+    rawWorkspace.projectContext = injectedProjectContext;
+    await writeFile(workspacePath, `${JSON.stringify(rawWorkspace, null, 2)}\n`, "utf8");
+
+    const runRecord = await store.getRun("run-docs-redacted");
+    const workspaceRecord = await store.getWorkspace("docs-workspace-redacted");
+    const listedRun = (await store.listRuns()).find((run) => run.runId === "run-docs-redacted") ?? null;
+    const listedWorkspace =
+      (await store.listWorkspaces()).find((workspace) => workspace.workspaceKey === "docs-workspace-redacted") ?? null;
+
+    expect(runRecord?.projectContext).toEqual(expectedProjectContext);
+    expect(workspaceRecord?.projectContext).toEqual(expectedProjectContext);
+    expect(listedRun?.projectContext).toEqual(expectedProjectContext);
+    expect(listedWorkspace?.projectContext).toEqual(expectedProjectContext);
+
+    const serialized = JSON.stringify({ runRecord, workspaceRecord, listedRun, listedWorkspace });
+    expect(serialized).not.toContain("repo-secret");
+    expect(serialized).not.toContain("x-access-token");
+    expect(serialized).not.toContain("workspace-secret");
+    expect(serialized).not.toContain("gh-secret");
+  });
+
+  it("updates run project context attribution while preserving existing context on unrelated updates", async () => {
+    const store = new FileRunTranscriptStore(root);
+    const docsProjectContext = {
+      projectContextId: "docs",
+      projectContextLabel: "Documentation Site",
+      linearProjectSlug: "DOCS",
+      routingSource: "candidate_poll",
+    } as const;
+    const platformProjectContext = {
+      projectContextId: "platform",
+      projectContextLabel: "Platform Services",
+      linearProjectSlug: "PLAT",
+      routingSource: "workflow_default",
+    } as const;
+
+    await startBasicRun(store, "run-explicit-update", { projectContext: docsProjectContext });
+    await expect(
+      store.updateRun("run-explicit-update", {
+        status: "succeeded",
+        completedAt: "2026-01-01T00:00:02.000Z",
+      }),
+    ).resolves.toMatchObject({
+      projectContext: docsProjectContext,
+      status: "succeeded",
+    });
+
+    await startBasicRun(store, "run-legacy-update", {
+      issueId: "issue-legacy-update",
+      issueIdentifier: "LEGACY-UPDATE-1",
+      workspaceKey: "legacy-update-workspace",
+      workspacePath: "/tmp/legacy-update-workspace",
+    });
+
+    const legacyRunPath = path.join(root, "runs", "run-legacy-update", "meta.json");
+    const legacyRun = JSON.parse(await readFile(legacyRunPath, "utf8")) as Record<string, unknown>;
+    delete legacyRun.projectContext;
+    await writeFile(legacyRunPath, `${JSON.stringify(legacyRun, null, 2)}
+`, "utf8");
+
+    await expect(
+      store.updateRun("run-legacy-update", {
+        projectContext: platformProjectContext,
+        status: "failed",
+        completedAt: "2026-01-01T00:00:03.000Z",
+      }),
+    ).resolves.toMatchObject({
+      projectContext: platformProjectContext,
+      status: "failed",
+    });
+
+    const persistedUpdatedRun = JSON.parse(await readFile(legacyRunPath, "utf8")) as Record<string, unknown>;
+    expect(persistedUpdatedRun.projectContext).toEqual(platformProjectContext);
+    await expect(store.getRun("run-legacy-update")).resolves.toMatchObject({
+      projectContext: platformProjectContext,
+      status: "failed",
+    });
+  });
+
 });

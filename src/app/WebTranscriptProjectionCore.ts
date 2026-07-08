@@ -15,7 +15,8 @@ const UNSAFE_TOOL_DETAIL_TEXT_FIELDS = [
   "errorPreview",
   "summary",
 ] as const;
-const TOKEN_PREFIX_PATTERN = /\b(?:ghp_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,})\b/g;
+const TOKEN_PREFIX_PATTERN =
+  /\b(?:ghp_[A-Za-z0-9_-]{8,}|gho_[A-Za-z0-9_-]{8,}|ghr_[A-Za-z0-9_-]{8,}|ghu_[A-Za-z0-9_-]{8,}|ghs_[A-Za-z0-9_-]{8,}|github_pat_[A-Za-z0-9_-]{8,}|lin_[A-Za-z0-9_-]{8,}|sk(?:-|_)[A-Za-z0-9_-]{8,})\b/g;
 const URL_USERINFO_PATTERN = /\b((?:https?|ssh|git):\/\/)([^\s/@"']+(?::[^\s/@"']*)?)@/gi;
 const SENSITIVE_NORMALIZED_KEYS = new Set([
   "apikey",
