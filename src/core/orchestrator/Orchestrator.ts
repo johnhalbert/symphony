@@ -8448,6 +8448,8 @@ export class Orchestrator {
       snapshot.incompleteTurnCount >= this.config.reviewLoop.maxIncompleteTurns
     )
       return false;
+    if (runPhase === "implementation" && snapshot.mergeConflict?.status === "open")
+      return false;
     if (runPhase === "merge_conflict_resolution") {
       const conflict = snapshot.mergeConflict;
       if (!conflict || conflict.status !== "open") return false;

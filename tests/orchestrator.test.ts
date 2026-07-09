@@ -6645,6 +6645,54 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
+  it("does not dispatch normal implementation while an open merge conflict is pending", async () => {
+    const config = mergePolicyOrchestratorConfig(root);
+    config.tracker.activeStates = ["Todo", "In Progress"];
+    config.mergePolicy.conflictsState = "Conflict Repair";
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const workerRuleset = orchestrator
+      .registeredTransitionRulesets()
+      .find(
+        (ruleset) =>
+          ruleset.id === "orchestrator.dispatch.worker.implementation",
+      );
+    expect(workerRuleset).toBeDefined();
+    const candidate = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+    });
+    const base = issueCurrentSnapshotForTest(candidate, {
+      trackerState: "In Progress",
+      phase: "implementation",
+      latestPrNumber: null,
+      latestPrHeadSha: null,
+      latestPrBranch: null,
+      latestGitBranchName: null,
+      currentMergePolicyObservationInputFingerprint: null,
+      candidateSource: "tick_candidates",
+      mergeConflict: {
+        ...openMergeConflict(candidate),
+        sourceState: "In Progress",
+        conflictsState: "Conflict Repair",
+      },
+    });
+
+    expect(workerRuleset?.evaluate(base, [])).toBeNull();
+    await orchestrator.stop();
+  });
+
   it("restores active preserved stashes before normal worker dispatch", async () => {
     const config = mergePolicyOrchestratorConfig(root);
     const logger = new StructuredLogger(() => undefined);
