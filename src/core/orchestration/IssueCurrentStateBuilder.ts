@@ -170,6 +170,8 @@ type TrackerFields = Pick<
   | "labels"
   | "blockedBy"
   | "hasChildren"
+  | "children"
+  | "childrenTruncated"
   | "trackerCreatedAt"
   | "trackerUpdatedAt"
   | "currentIssueContentFingerprint"
@@ -756,6 +758,8 @@ export class IssueCurrentStateBuilder {
         labels: [...issue.labels],
         blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
         hasChildren: issue.hasChildren === true,
+        children: (issue.children ?? []).map((child) => ({ ...child })),
+        childrenTruncated: issue.childrenTruncated === true,
         trackerCreatedAt: issue.createdAt,
         trackerUpdatedAt: issue.updatedAt,
         currentIssueContentFingerprint: issueContentFingerprint(issue),
@@ -1564,6 +1568,8 @@ export class IssueCurrentStateBuilder {
       labels: [...issue.labels],
       blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
       hasChildren: issue.hasChildren === true,
+      children: (issue.children ?? []).map((child) => ({ ...child })),
+      childrenTruncated: issue.childrenTruncated === true,
       trackerCreatedAt: issue.createdAt,
       trackerUpdatedAt: issue.updatedAt,
       currentIssueContentFingerprint: context.currentIssueFingerprint,
@@ -2019,6 +2025,8 @@ function issueFromTrackerObservationSnapshot(
     labels,
     blockedBy,
     hasChildren: snapshot.observedHasChildren === true,
+    children: issueChildrenFromUnknown(snapshot.observedChildren) ?? [],
+    childrenTruncated: snapshot.observedChildrenTruncated === true,
     createdAt: stringFromUnknown(snapshot.observedTrackerCreatedAt),
     updatedAt: stringFromUnknown(snapshot.observedTrackerUpdatedAt),
   };
@@ -2451,6 +2459,34 @@ function issueBlockersFromUnknown(value: unknown): Issue["blockedBy"] | null {
     });
   }
   return blockers;
+}
+
+function issueChildrenFromUnknown(value: unknown): NonNullable<Issue["children"]> | null {
+  if (!Array.isArray(value)) return null;
+  const children: NonNullable<Issue["children"]> = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+    const record = item as Record<string, unknown>;
+    const id = record.id;
+    const identifier = record.identifier;
+    const state = record.state;
+    if (id !== null && id !== undefined && typeof id !== "string")
+      return null;
+    if (
+      identifier !== null &&
+      identifier !== undefined &&
+      typeof identifier !== "string"
+    )
+      return null;
+    if (state !== null && state !== undefined && typeof state !== "string")
+      return null;
+    children.push({
+      id: typeof id === "string" ? id : null,
+      identifier: typeof identifier === "string" ? identifier : null,
+      state: typeof state === "string" ? state : null,
+    });
+  }
+  return children;
 }
 
 function buildRunSummariesFromHistory(

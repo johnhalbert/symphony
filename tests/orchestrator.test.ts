@@ -542,6 +542,67 @@ describe("Orchestrator", () => {
     }
   });
 
+  it("adds an explicit organizational parent completion tick lane when enabled", async () => {
+    const config = testConfig(root);
+    config.agent.requireLabels = ["dogfood-ready"];
+    config.agent.excludeLabels = ["dogfood-blocked"];
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.organizationalParents.enabled = true;
+    config.organizationalParents.sourceStates = ["In Review"];
+    config.organizationalParents.doneState = "Done";
+    const filteredInputs: TrackerIssueCandidateFilterInput[] = [];
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [];
+      },
+      async fetchIssueCandidatesByFilter(input) {
+        filteredInputs.push(input);
+        return [];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    try {
+      await (
+        orchestrator as unknown as {
+          fetchTickIssueCandidates(): Promise<Issue[]>;
+        }
+      ).fetchTickIssueCandidates();
+
+      expect(filteredInputs).toHaveLength(1);
+      expect(
+        filteredInputs[0]?.branches.find(
+          (branch) => branch.id === "organizational_parent_completion:In Review",
+        ),
+      ).toMatchObject({
+        stateNames: ["In Review"],
+        requireLabels: ["dogfood-ready"],
+        excludeLabels: ["dogfood-blocked"],
+        requireHasChildren: true,
+      });
+    } finally {
+      await orchestrator.stop();
+    }
+  });
+
   it("pages tick candidates by priority lane with exclusions", async () => {
     const config = testConfig(root);
     config.agent.maxConcurrentAgents = 1;
@@ -3391,6 +3452,166 @@ describe("Orchestrator", () => {
     await new Promise((resolve) => setTimeout(resolve, 25));
     await orchestrator.stop();
 
+    expect(harness.runs).toHaveLength(0);
+  });
+
+  it("completes organizational parents when all children are terminal", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.organizationalParents.enabled = true;
+    config.organizationalParents.sourceStates = [
+      "Todo",
+      "In Progress",
+      "In Review",
+      "Blocked",
+      "Ready to Merge",
+    ];
+    config.organizationalParents.doneState = "Done";
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+
+    let trackerState = "In Review";
+    const currentParent = () =>
+      issue({
+        id: "parent-issue",
+        identifier: "TEST-1",
+        state: trackerState,
+        assignedToWorker: false,
+        hasChildren: true,
+        children: [
+          { id: "child-1", identifier: "TEST-2", state: "Done" },
+          { id: "child-2", identifier: "TEST-3", state: "Closed" },
+        ],
+        blockedBy: [
+          { id: "child-1", identifier: "TEST-2", state: "Done" },
+          { id: "child-2", identifier: "TEST-3", state: "Closed" },
+        ],
+      });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([currentParent()], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [currentParent()];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const writer = new StateChangingWriter((state) => {
+      trackerState = state;
+    });
+    const writeback = new WritebackProcessor(
+      new FileWritebackOutboxStore(config.workspace.stateDir),
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+      lifecycleStore,
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      lifecycleStore,
+      writeback,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(harness.runs).toHaveLength(0);
+    expect(writer.transitions).toEqual([
+      {
+        issueId: "parent-issue",
+        toState: "Done",
+        fromStates: config.organizationalParents.sourceStates,
+        reason:
+          "Symphony completed organizational parent after all child issues reached a terminal state",
+      },
+    ]);
+    const lifecycle = await lifecycleStore.get("parent-issue");
+    expect(lifecycle).toMatchObject({
+      issueId: "parent-issue",
+      phase: "terminal",
+      blockedReason: null,
+    });
+  });
+
+  it("does not dispatch reviewers or complete organizational parents with open children", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.organizationalParents.enabled = true;
+    config.organizationalParents.sourceStates = ["In Review"];
+    config.organizationalParents.doneState = "Done";
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+
+    const parent = issue({
+      id: "parent-open-child",
+      identifier: "TEST-4",
+      state: "In Review",
+      assignedToWorker: false,
+      hasChildren: true,
+      children: [{ id: "child-open", identifier: "TEST-5", state: "Todo" }],
+      blockedBy: [{ id: "child-open", identifier: "TEST-5", state: "Todo" }],
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([parent], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [parent];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const writer = new StateChangingWriter(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      lifecycleStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+        lifecycleStore,
+      ),
+      promptTemplate: "Review {{ issue.identifier }}",
+    });
+
+    await orchestrator.refreshNow();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await orchestrator.stop();
+
+    expect(writer.transitions).toEqual([]);
     expect(harness.runs).toHaveLength(0);
   });
 

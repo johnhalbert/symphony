@@ -40,10 +40,23 @@ describe("LinearTrackerClient", () => {
       identifier: "T-1",
       title: "Title",
       state: { name: "Todo" },
-      children: { nodes: [{ id: "child-1" }] },
+      children: {
+        nodes: [
+          {
+            id: "child-1",
+            identifier: "T-2",
+            state: { name: "Done" },
+          },
+        ],
+        pageInfo: { hasNextPage: true, endCursor: "child-cursor" },
+      },
     });
 
     expect(normalized?.hasChildren).toBe(true);
+    expect(normalized?.children).toEqual([
+      { id: "child-1", identifier: "T-2", state: "Done" },
+    ]);
+    expect(normalized?.childrenTruncated).toBe(true);
   });
 
   it("routes to worker when an assignee route matches the assignee", () => {
@@ -238,6 +251,13 @@ describe("LinearTrackerClient", () => {
             requireLabels: ["dogfood-ready"],
             excludeLabels: ["dogfood-blocked"],
           },
+          {
+            id: "organizational_parent_completion",
+            stateNames: ["In Review"],
+            requireLabels: ["dogfood-ready"],
+            excludeLabels: ["dogfood-blocked"],
+            requireHasChildren: true,
+          },
         ],
       },
       { projectSlug: "TEST", assignee: "me" },
@@ -276,6 +296,18 @@ describe("LinearTrackerClient", () => {
                     every: { name: { nin: ["dogfood-blocked"] } },
                   },
                 },
+              ],
+            },
+            {
+              and: [
+                { state: { name: { in: ["In Review"] } } },
+                { labels: { name: { eq: "dogfood-ready" } } },
+                {
+                  labels: {
+                    every: { name: { nin: ["dogfood-blocked"] } },
+                  },
+                },
+                { children: { length: { gt: 0 } } },
               ],
             },
           ],

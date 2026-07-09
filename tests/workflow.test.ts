@@ -82,6 +82,11 @@ Work on {{ issue.identifier }}.`,
         keepLatestRuns: 1,
       },
     });
+    expect(config.organizationalParents).toEqual({
+      enabled: false,
+      sourceStates: ["Todo", "In Progress"],
+      doneState: "Done",
+    });
     expect(config.database).toEqual({
       postgres: {
         connectionString: null,
@@ -585,6 +590,11 @@ Work on {{ issue.identifier }}.
           prompt: "Plan {{ issue.identifier }}",
           planning_labels: ["Planning"],
         },
+        organizational_parents: {
+          enabled: true,
+          source_states: ["In Review", "Blocked"],
+          done_state: "Done",
+        },
       },
       "/repo/WORKFLOW.md",
       { LINEAR_API_KEY: "secret" },
@@ -638,6 +648,11 @@ Work on {{ issue.identifier }}.
       maxPlanningDispatchRetries: 3,
       planningRetryBaseMs: 5_000,
       planningRetryMaxMs: 60_000,
+    });
+    expect(config.organizationalParents).toEqual({
+      enabled: true,
+      sourceStates: ["In Review", "Blocked"],
+      doneState: "Done",
     });
     expect(config.issueTriage).toEqual({
       enabled: false,

@@ -73,6 +73,12 @@ export interface MergeCompletedWritebackContext {
   doneState: string;
 }
 
+export interface OrganizationalParentCompletionWritebackContext {
+  issue: Issue;
+  sourceStates: string[];
+  doneState: string;
+}
+
 export interface MergeGateCheckEvidence {
   name: string;
   status: string;
@@ -982,6 +988,23 @@ export function planMergeCompletedWritebacks(
       },
     },
   ];
+}
+
+export function planOrganizationalParentCompletionWriteback(
+  context: OrganizationalParentCompletionWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation | null {
+  if (!config.writeback.enabled) return null;
+  return {
+    idempotencyKey: `transition:${context.issue.id}:organizational-parent-complete:${context.doneState}`,
+    kind: "transition",
+    issueId: context.issue.id,
+    payload: {
+      fromStates: context.sourceStates,
+      toState: context.doneState,
+      reason: "Symphony completed organizational parent after all child issues reached a terminal state",
+    },
+  };
 }
 
 export function planMergeGateRepairWritebacks(

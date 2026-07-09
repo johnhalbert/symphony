@@ -4,6 +4,12 @@ export interface IssueBlockerRef {
   state: string | null;
 }
 
+export interface IssueChildRef {
+  id: string | null;
+  identifier: string | null;
+  state: string | null;
+}
+
 export interface IssueAssigneeRef {
   id: string | null;
 }
@@ -23,6 +29,8 @@ export interface Issue {
   labels: string[];
   blockedBy: IssueBlockerRef[];
   hasChildren?: boolean;
+  children?: IssueChildRef[];
+  childrenTruncated?: boolean;
   createdAt: string | null;
   updatedAt: string | null;
 }
@@ -41,6 +49,8 @@ export interface IssueStatusView {
   labels: string[];
   blockedBy: IssueBlockerRef[];
   hasChildren?: boolean;
+  children?: IssueChildRef[];
+  childrenTruncated?: boolean;
   createdAt: string | null;
   updatedAt: string | null;
 }
@@ -189,6 +199,13 @@ export function toIssueStatusView(issue: Issue): IssueStatusView {
     delegateId: issue.delegateId,
     labels: [...issue.labels],
     blockedBy: issue.blockedBy.map((blocker) => ({ ...blocker })),
+    ...(issue.hasChildren === undefined ? {} : { hasChildren: issue.hasChildren }),
+    ...(issue.children === undefined
+      ? {}
+      : { children: issue.children.map((child) => ({ ...child })) }),
+    ...(issue.childrenTruncated === undefined
+      ? {}
+      : { childrenTruncated: issue.childrenTruncated }),
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
   };
@@ -243,4 +260,3 @@ export interface TokenCounts {
 export interface RuntimeTotals extends TokenCounts {
   secondsRunning: number;
 }
-

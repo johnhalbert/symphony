@@ -223,7 +223,10 @@ import {
   SqliteWritebackOutboxStore,
   type WritebackProcessor,
 } from "../writeback/WritebackOutbox.js";
-import type { NewWritebackOperation } from "../writeback/WritebackOutbox.js";
+import type {
+  EnqueueWritebackOptions,
+  NewWritebackOperation,
+} from "../writeback/WritebackOutbox.js";
 import {
   planBlockedEscalationWritebacks,
   planDispatchWriteback,
@@ -231,6 +234,7 @@ import {
   planIssueTriageBlockedReboundWriteback,
   planIssueTriageReportWritebacks,
   planMergeGateHeadSupersessionRecoveryWritebacks,
+  planOrganizationalParentCompletionWriteback,
   planRunCancelledComment,
   planRunFailedComment,
   planRunStartedComment,
@@ -506,6 +510,7 @@ interface OrchestratorTransitionContext {
   mergeConflictBlock: MergeConflictBlockTransitionScratch;
   headSupersessionRecovery: HeadSupersessionRecoveryTransitionScratch;
   triageRebound: TriageReboundTransitionScratch;
+  organizationalParent: OrganizationalParentTransitionScratch;
   mergePolicy: MergePolicyTransitionScratch;
   handoffRepair: HandoffRepairTransitionScratch;
   handoffReconciliation: HandoffReconciliationTransitionScratch;
@@ -581,6 +586,11 @@ interface TriageReboundTransitionScratch {
   lifecycle?: IssueLifecycleRecord;
   report?: IssueTriageReportRecord;
   reason?: string;
+  operation?: NewWritebackOperation | null;
+}
+
+interface OrganizationalParentTransitionScratch {
+  latestIssue?: Issue;
   operation?: NewWritebackOperation | null;
 }
 
@@ -3310,6 +3320,7 @@ export class Orchestrator {
           stateNames: [state],
           requireLabels: globalRequiredLabels,
           excludeLabels: globalExcludeLabels,
+          requireNoChildren: true,
         },
       });
     }
@@ -3326,8 +3337,26 @@ export class Orchestrator {
           stateNames: [conflictsState],
           requireLabels: globalRequiredLabels,
           excludeLabels: globalExcludeLabels,
+          requireNoChildren: true,
         },
       });
+    }
+    if (this.config.organizationalParents.enabled) {
+      for (const state of uniqueStateNames(
+        this.config.organizationalParents.sourceStates,
+      )) {
+        lanes.push({
+          id: `organizational_parent_completion:${state}`,
+          requiresAgentSlot: false,
+          branch: {
+            id: `organizational_parent_completion:${state}`,
+            stateNames: [state],
+            requireLabels: globalRequiredLabels,
+            excludeLabels: globalExcludeLabels,
+            requireHasChildren: true,
+          },
+        });
+      }
     }
     for (const state of uniqueStateNames(this.config.reviewLoop.reviewStates)) {
       lanes.push({
@@ -3339,6 +3368,7 @@ export class Orchestrator {
           requireLabels: globalRequiredLabels,
           excludeLabels: globalExcludeLabels,
           requireNoOpenBlockers: true,
+          requireNoChildren: true,
         },
       });
     }
@@ -3380,6 +3410,7 @@ export class Orchestrator {
           stateNames: [state],
           requireLabels: globalRequiredLabels,
           excludeLabels: globalExcludeLabels,
+          requireNoChildren: true,
         },
       });
     }
@@ -3399,6 +3430,7 @@ export class Orchestrator {
               ...globalExcludeLabels,
               ...this.config.postMortem.excludeLabels,
             ],
+            requireNoChildren: true,
           },
         });
       }
@@ -3416,6 +3448,9 @@ export class Orchestrator {
       ...this.config.tracker.activeStates,
       ...this.config.reviewLoop.reviewStates,
       ...this.config.reviewLoop.blockedStates,
+      ...(this.config.organizationalParents.enabled
+        ? this.config.organizationalParents.sourceStates
+        : []),
       ...this.config.postMortem.doneStates,
       ...(this.config.mergePolicy.mode === "gated"
         ? this.config.mergePolicy.sourceStates
@@ -5053,6 +5088,31 @@ export class Orchestrator {
             id: "update_lifecycle_issue_triage_rebound",
             execute: (context) =>
               this.updateLifecycleIssueTriageReboundAction(context),
+          },
+        ],
+      },
+      {
+        kind: "complete_organizational_parent",
+        actions: [
+          {
+            id: "plan_organizational_parent_completion_writeback",
+            execute: (context) =>
+              this.planOrganizationalParentCompletionWritebackAction(context),
+          },
+          {
+            id: "apply_organizational_parent_completion_writeback",
+            execute: (context) =>
+              this.applyOrganizationalParentCompletionWritebackAction(context),
+          },
+          {
+            id: "verify_organizational_parent_done_state",
+            execute: (context) =>
+              this.verifyOrganizationalParentDoneStateAction(context),
+          },
+          {
+            id: "record_organizational_parent_terminal_lifecycle",
+            execute: (context) =>
+              this.recordOrganizationalParentTerminalLifecycleAction(context),
           },
         ],
       },
@@ -6723,6 +6783,124 @@ export class Orchestrator {
     return { details: { reportId: report.id, reason } };
   }
 
+  private async planOrganizationalParentCompletionWritebackAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const latest =
+      (await this.options.tracker.fetchIssueStatesByIds([context.issue.id]))[0] ??
+      null;
+    if (
+      latest === null ||
+      !this.issueCanCompleteOrganizationalParent(latest)
+    ) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message:
+          "Organizational parent completion preconditions no longer match",
+      };
+    }
+    const operation = planOrganizationalParentCompletionWriteback(
+      {
+        issue: latest,
+        sourceStates: this.config.organizationalParents.sourceStates,
+        doneState: this.config.organizationalParents.doneState,
+      },
+      this.config,
+    );
+    if (operation === null) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "No organizational parent completion writeback was planned",
+      };
+    }
+    context.organizationalParent.latestIssue = latest;
+    context.organizationalParent.operation = operation;
+    return {
+      details: {
+        sourceState: latest.state,
+        doneState: this.config.organizationalParents.doneState,
+        operationKey: operation.idempotencyKey,
+        children: (latest.children ?? []).map((child) => ({
+          id: child.id,
+          identifier: child.identifier,
+          state: child.state,
+        })),
+      },
+    };
+  }
+
+  private async applyOrganizationalParentCompletionWritebackAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const operation = context.organizationalParent.operation ?? null;
+    if (!operation)
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "No organizational parent completion writeback was planned",
+      };
+    const applied = await this.applyWriteback(
+      operation,
+      "organizational parent completion",
+      context.organizationalParent.latestIssue ?? context.issue,
+      { retrySkipped: true },
+    );
+    return applied
+      ? { details: { operationKey: operation.idempotencyKey } }
+      : {
+          status: "skipped" as const,
+          stop: true,
+          message:
+            "Organizational parent completion writeback did not complete successfully",
+        };
+  }
+
+  private async verifyOrganizationalParentDoneStateAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const latest =
+      (await this.options.tracker.fetchIssueStatesByIds([context.issue.id]))[0] ??
+      null;
+    if (
+      latest === null ||
+      !statesEqual(
+        latest.state,
+        this.config.organizationalParents.doneState,
+      )
+    ) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Organizational parent done writeback could not be verified",
+      };
+    }
+    context.organizationalParent.latestIssue = latest;
+    return { details: { state: latest.state } };
+  }
+
+  private async recordOrganizationalParentTerminalLifecycleAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const latest = context.organizationalParent.latestIssue ?? context.issue;
+    const lifecycle = await this.updateIssueLifecycleWithEvidence(
+      latest,
+      {
+        phase: "terminal",
+        blockedReason: null,
+      },
+      "organizational_parent_children_complete",
+      latest.id,
+    );
+    return {
+      details: {
+        phase: lifecycle?.phase ?? "terminal",
+        blockedReason: lifecycle?.blockedReason ?? null,
+      },
+    };
+  }
+
   private async verifyPublicationApprovalRecoveryConfigAction(
     context: OrchestratorTransitionContext,
   ) {
@@ -7938,6 +8116,19 @@ export class Orchestrator {
             : null,
       },
       {
+        id: "orchestrator.complete_organizational_parent",
+        priority: issueTransitionRulesetPriority(
+          "complete_organizational_parent",
+        ),
+        evaluate: (snapshot) =>
+          this.rulesetShouldCompleteOrganizationalParent(snapshot)
+            ? {
+                transitionKind: "complete_organizational_parent",
+                reason: "organizational_parent_children_complete",
+              }
+            : null,
+      },
+      {
         id: "orchestrator.dispatch.merge_conflict_worker",
         priority: 40,
         evaluate: (snapshot) =>
@@ -8452,6 +8643,7 @@ export class Orchestrator {
       return false;
     if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
       return false;
+    if (snapshot.hasChildren) return false;
     if (this.rulesetBlockedByLifecycle(snapshot)) return false;
     if (
       !this.isWorkerStateActiveForRunPhase(snapshotAsIssue(snapshot), runPhase)
@@ -8531,6 +8723,7 @@ export class Orchestrator {
       return false;
     if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
       return false;
+    if (snapshot.hasChildren) return false;
     if (!isIssueTriageBlockedReason(snapshot.blockedReason)) return false;
     if (
       snapshot.issueTriageCurrentTriggerReportIds.length >=
@@ -8551,6 +8744,7 @@ export class Orchestrator {
     if (!this.rulesetCommonDispatchGate(snapshot)) return false;
     if (!isStateIn(snapshot.trackerState, this.config.postMortem.doneStates))
       return false;
+    if (snapshot.hasChildren) return false;
     if (
       snapshot.latestCompletionReport === null ||
       snapshot.latestApprovalPassVerdict === null
@@ -8719,6 +8913,44 @@ export class Orchestrator {
     const activeBlockers = this.rulesetActiveIssueTriageBlockers(snapshot);
     if (activeBlockers.length === 0) return false;
     return !activeBlockers.every((blocker) => blocker.nextActor === "worker");
+  }
+
+  private rulesetShouldCompleteOrganizationalParent(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick") return false;
+    if (!this.config.organizationalParents.enabled) return false;
+    if (snapshot.running || snapshot.paused) return false;
+    if (!snapshot.allowExistingClaim && snapshot.claimed) return false;
+    if (this.rulesetRetryBackoffActive(snapshot)) return false;
+    return this.issueCanCompleteOrganizationalParent(snapshotAsIssue(snapshot));
+  }
+
+  private issueCanCompleteOrganizationalParent(issue: Issue): boolean {
+    if (!this.config.organizationalParents.enabled) return false;
+    if (isStateIn(issue.state, this.config.tracker.terminalStates))
+      return false;
+    if (
+      !isStateIn(issue.state, this.config.organizationalParents.sourceStates)
+    )
+      return false;
+    if (issue.hasChildren !== true) return false;
+    if (issue.childrenTruncated === true) return false;
+    const children = issue.children ?? [];
+    if (children.length === 0) return false;
+    if (
+      children.some(
+        (child) =>
+          child.state === null ||
+          !isStateIn(child.state, this.config.tracker.terminalStates),
+      )
+    ) {
+      return false;
+    }
+    if (hasOpenBlocker(issue, this.config.tracker.terminalStates))
+      return false;
+    if (!this.passesLabelGuardrails(issue, "merge_policy")) return false;
+    return true;
   }
 
   private rulesetShouldBlockPlanningFailureLimit(
@@ -8949,6 +9181,7 @@ export class Orchestrator {
     if (!triggerAllowed) return false;
     if (snapshot.mergePolicyMode !== "gated") return false;
     if (!this.rulesetIsMergePolicyTrackedState(snapshot)) return false;
+    if (snapshot.hasChildren) return false;
     if (
       this.rulesetIsMergePolicySourceState(snapshot) &&
       snapshot.mergeQueueStatus !== "active_current_issue"
@@ -8970,6 +9203,7 @@ export class Orchestrator {
     if (!triggerAllowed) return false;
     if (snapshot.mergePolicyMode !== "gated") return false;
     if (!this.rulesetIsMergePolicySourceState(snapshot)) return false;
+    if (snapshot.hasChildren) return false;
     if (snapshot.running || snapshot.paused) return false;
     return this.rulesetPassesLabelGuardrails(snapshot, "merge_policy");
   }
@@ -9407,6 +9641,8 @@ export class Orchestrator {
         assignedToWorker: input.issue.assignedToWorker,
         blockedBy: input.issue.blockedBy,
         hasChildren: input.issue.hasChildren === true,
+        children: (input.issue.children ?? []).map((child) => ({ ...child })),
+        childrenTruncated: input.issue.childrenTruncated === true,
         createdAt: input.issue.createdAt,
         updatedAt: input.issue.updatedAt,
       },
@@ -9941,6 +10177,7 @@ export class Orchestrator {
       mergeConflictBlock: {},
       headSupersessionRecovery: {},
       triageRebound: {},
+      organizationalParent: {},
       mergePolicy: {},
       handoffRepair: {},
       handoffReconciliation: {},
@@ -10621,6 +10858,7 @@ export class Orchestrator {
       return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates))
       return false;
+    if (issue.hasChildren) return false;
     if (!this.passesLabelGuardrails(issue, "reviewer", options)) return false;
     if (hasOpenBlocker(issue, this.config.tracker.terminalStates)) return false;
     return this.hasStateSlot(issue.state);
@@ -10640,6 +10878,7 @@ export class Orchestrator {
       return false;
     if (isStateIn(issue.state, this.config.tracker.terminalStates))
       return false;
+    if (issue.hasChildren) return false;
     if (!this.passesLabelGuardrails(issue, "triage", options)) return false;
     return this.hasStateSlot(issue.state);
   }
@@ -10656,6 +10895,7 @@ export class Orchestrator {
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
     if (!isStateIn(issue.state, this.config.postMortem.doneStates))
       return false;
+    if (issue.hasChildren) return false;
     if (!this.passesLabelGuardrails(issue, "post_mortem", options))
       return false;
     return this.hasStateSlot(issue.state);
@@ -12993,6 +13233,7 @@ export class Orchestrator {
     operation: Parameters<WritebackProcessor["enqueueAndProcess"]>[0] | null,
     reason: string,
     issue: Issue | null = null,
+    options: EnqueueWritebackOptions = {},
   ): Promise<boolean> {
     if (!operation) return true;
     if (!this.options.writeback) {
@@ -13006,7 +13247,10 @@ export class Orchestrator {
       );
       return !this.config.writeback.enabled;
     }
-    const result = await this.options.writeback.enqueueAndProcess(operation);
+    const result = await this.options.writeback.enqueueAndProcess(
+      operation,
+      options,
+    );
     if (issue !== null) {
       await this.recordIssueEvidenceSnapshot({
         issue,
@@ -15999,6 +16243,8 @@ function issueTransitionRulesetPriority(kind: IssueTransitionKind): number {
       return 39;
     case "preserved_stash_restore":
       return 39.5;
+    case "complete_organizational_parent":
+      return 55;
     case "dispatch_worker":
     case "dispatch_planner":
     case "dispatch_reviewer":
@@ -16316,6 +16562,8 @@ function currentFieldsAsIssue(
     labels: [...current.labels],
     blockedBy: current.blockedBy.map((blocker) => ({ ...blocker })),
     hasChildren: current.hasChildren,
+    children: (current.children ?? []).map((child) => ({ ...child })),
+    childrenTruncated: current.childrenTruncated === true,
     createdAt: current.trackerCreatedAt,
     updatedAt: current.trackerUpdatedAt,
   };

@@ -17,7 +17,7 @@ import type {
   TrackerWriteResult,
   TrackerWriter,
 } from "../../core/tracker/TrackerWriter.js";
-import type { Issue, IssueBlockerRef } from "../../core/types.js";
+import type { Issue, IssueBlockerRef, IssueChildRef } from "../../core/types.js";
 
 type FetchLike = typeof fetch;
 
@@ -73,7 +73,12 @@ interface LinearIssueNode {
     nodes?: Array<{ name?: unknown }>;
   } | null;
   children?: {
-    nodes?: Array<{ id?: unknown }>;
+    nodes?: Array<{
+      id?: unknown;
+      identifier?: unknown;
+      state?: { name?: unknown } | null;
+    }>;
+    pageInfo?: LinearPageInfoNode;
   } | null;
   inverseRelations?: {
     nodes?: LinearRelationNode[];
@@ -165,7 +170,7 @@ const ISSUE_FIELDS = `
   assignee { id }
   delegate { id }
   labels { nodes { name } }
-  children(first: 1) { nodes { id } }
+  children(first: 100) { nodes { id identifier state { name } } pageInfo { hasNextPage endCursor } }
   inverseRelations { nodes { type issue { id identifier state { name } } } }
 `;
 
@@ -851,6 +856,9 @@ function linearFilterForCandidateBranch(
   if (branch.requireNoChildren === true) {
     filters.push({ children: { length: { eq: 0 } } });
   }
+  if (branch.requireHasChildren === true) {
+    filters.push({ children: { length: { gt: 0 } } });
+  }
 
   return filters.length === 1 ? filters[0] ?? null : { and: filters };
 }
@@ -940,6 +948,8 @@ export function normalizeIssue(node: LinearIssueNode, assigneeFilter: AssigneeFi
     labels: normalizeLabels(node.labels?.nodes),
     blockedBy: normalizeBlockers(node.inverseRelations?.nodes),
     hasChildren: (node.children?.nodes ?? []).length > 0,
+    children: normalizeChildren(node.children?.nodes),
+    childrenTruncated: node.children?.pageInfo?.hasNextPage === true,
     createdAt: asNullableString(node.createdAt),
     updatedAt: asNullableString(node.updatedAt),
   };
@@ -958,6 +968,23 @@ function normalizeBlockers(nodes: LinearRelationNode[] | undefined): IssueBlocke
       identifier: asNullableString(node.issue?.identifier),
       state: asNullableString(node.issue?.state?.name),
     }));
+}
+
+function normalizeChildren(
+  nodes:
+    | Array<{
+        id?: unknown;
+        identifier?: unknown;
+        state?: { name?: unknown } | null;
+      }>
+    | undefined,
+): IssueChildRef[] {
+  if (!Array.isArray(nodes)) return [];
+  return nodes.map((node) => ({
+    id: asNullableString(node.id),
+    identifier: asNullableString(node.identifier),
+    state: asNullableString(node.state?.name),
+  }));
 }
 
 function assignedToWorker(

@@ -49,10 +49,10 @@ merge_policy:
   max_conflict_fix_turns: 3
   done_state: Done
   merge_method: merge
-  required_checks:
-    - Typecheck and test
+  required_checks: []
   no_ci:
-    allowed: false
+    allowed: true
+    evidence: "No CI workflows exist in this repository yet."
 
 continuation_context:
   search_enabled: false
@@ -97,6 +97,9 @@ issue_breakdown:
     mode: child_issues
     auto_apply: true
 
+organizational_parents:
+  enabled: true
+
 prompts:
   templates_dir: ./prompts
   templates:
@@ -133,13 +136,13 @@ polling:
   interval_ms: 30000
 
 workspace:
-  root: ./symphony_workspaces
-  state_dir: ./.symphony
+  root: ./.symphony
+  state_dir: ./state
   source:
     kind: git_worktree
-    repository: .
+    repository: /src/github.com/johnhalbert/build-measure-learn
     base_ref: origin/main
-    branch_template: "symphony/{{ issue.identifier }}"
+    branch_template: "bml/{{ issue.identifier }}"
     cleanup: refuse_dirty
 
 agent:
@@ -149,22 +152,18 @@ agent:
   max_retry_backoff_ms: 300000
   max_infra_failures: 1
   require_labels:
-    - dogfood-ready
+    - symphony-ready
   exclude_labels:
-    - dogfood-blocked
+    - symphony-blocked
     - safety-blocked
   worker_exclude_labels:
     - review_only
   protected_paths:
-    - WORKFLOW.md
-    - docs/dogfood-runbook.md
-    - docs/trust-and-safety.md
-    - src/core/orchestrator/**
-    - src/core/config/**
-    - src/core/workflow/**
-    - src/integrations/linear/**
-    - cursor/src/**
-    - hermes/src/**
+    - design-system/**
+    - docs
+    - specs/**
+    - .agents/**
+    - .specify/**
 
 cursor:
   model: gpt-5.5
@@ -177,6 +176,7 @@ cursor:
 
 hermes:
   upstream_root: ./hermes/upstream-src
+  python: /usr/local/lib/hermes-agent/venv/bin/python
   templates_dir: ./hermes/templates
   provider: openai-codex
   model: gpt-5.4
@@ -204,7 +204,7 @@ writeback:
 
 github:
   owner: johnhalbert
-  repo: symphony
+  repo: build-measure-learn
   head_owner: johnhalbert
   publish_pull_requests: true
   pr_handoff:
@@ -241,7 +241,7 @@ credential_profiles:
       github.review_feedback_write: reviewer-app
 ---
 
-# Symphony Dogfood Worker
+# Symphony Worker
 
 You are a runtime-harness worker operating under Symphony for the `{{ issue.identifier }}` Linear issue.
 

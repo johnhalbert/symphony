@@ -71,6 +71,14 @@ const rawConfigSchema = z
       })
       .passthrough()
       .optional(),
+    organizational_parents: z
+      .object({
+        enabled: z.boolean().optional(),
+        source_states: stringArray.optional(),
+        done_state: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
     issue_board: z
       .object({
         columns: z
@@ -665,6 +673,12 @@ export interface PostMortemConfig {
   maxAttemptsPerTrigger: number;
 }
 
+export interface OrganizationalParentsConfig {
+  enabled: boolean;
+  sourceStates: string[];
+  doneState: string;
+}
+
 export interface HandoffRepairConfig {
   enabled: boolean;
   maxAttempts: number;
@@ -709,6 +723,7 @@ export interface ServiceConfig {
   issueBreakdown: IssueBreakdownConfig;
   issueTriage: IssueTriageConfig;
   postMortem: PostMortemConfig;
+  organizationalParents: OrganizationalParentsConfig;
   handoffRepair: HandoffRepairConfig;
   raw: RawWorkflowConfig;
 }
@@ -988,6 +1003,15 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
     reviewPassState,
     mergePolicy,
   });
+  const organizationalParents = normalizeOrganizationalParents(raw, {
+    activeStates,
+    reviewStates,
+    blockedStates,
+    reviewPassState,
+    terminalStates,
+    mergePolicy,
+  });
+  validateOrganizationalParents(organizationalParents, terminalStates);
 
   return {
     workflowPath: path.resolve(workflowPath),
@@ -1178,6 +1202,7 @@ export function parseServiceConfig(rawInput: unknown, workflowPath: string, env 
       excludeLabels: normalizeLabels(raw.post_mortem?.exclude_labels),
       maxAttemptsPerTrigger: raw.post_mortem?.max_attempts_per_trigger ?? 1,
     },
+    organizationalParents,
     handoffRepair: {
       enabled: raw.handoff_repair?.enabled ?? false,
       maxAttempts: raw.handoff_repair?.max_attempts ?? 1,
@@ -1409,6 +1434,55 @@ function normalizePullRequestHandoff(
     noCiAllowed: rawPolicy?.no_ci?.allowed ?? false,
     noCiEvidence,
   };
+}
+
+function normalizeOrganizationalParents(
+  raw: RawWorkflowConfig,
+  input: {
+    activeStates: string[];
+    reviewStates: string[];
+    blockedStates: string[];
+    reviewPassState: string | null;
+    terminalStates: string[];
+    mergePolicy: MergePolicyConfig;
+  },
+): OrganizationalParentsConfig {
+  const rawParents = raw.organizational_parents;
+  const defaultSourceStates = uniqueStateNames([
+    ...input.activeStates,
+    ...input.reviewStates,
+    ...input.blockedStates,
+    ...(input.reviewPassState === null ? [] : [input.reviewPassState]),
+    ...(input.mergePolicy.mode === "gated" ? input.mergePolicy.sourceStates : []),
+  ]);
+  return {
+    enabled: rawParents?.enabled ?? false,
+    sourceStates: uniqueStateNames(rawParents?.source_states ?? defaultSourceStates),
+    doneState:
+      normalizeOptionalConfigString(rawParents?.done_state) ??
+      preferredDoneState(input.terminalStates, input.mergePolicy.doneState),
+  };
+}
+
+function preferredDoneState(terminalStates: string[], fallback: string): string {
+  return (
+    terminalStates.find((state) => statesEqual(state, "Done")) ??
+    terminalStates[0] ??
+    fallback
+  );
+}
+
+function validateOrganizationalParents(
+  config: OrganizationalParentsConfig,
+  terminalStates: string[],
+): void {
+  if (!config.enabled) return;
+  if (!terminalStates.some((state) => statesEqual(state, config.doneState))) {
+    throw new SymphonyError(
+      "config_validation_error",
+      `organizational_parents.done_state must be one of tracker.terminal_states: ${config.doneState}`,
+    );
+  }
 }
 
 function validatePullRequestHandoffPolicy(input: {

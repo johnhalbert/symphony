@@ -12,6 +12,7 @@ export interface TrackerIssueCandidateFilterBranch {
   requireAssignedToWorker?: boolean;
   requireNoOpenBlockers?: boolean;
   requireNoChildren?: boolean;
+  requireHasChildren?: boolean;
 }
 
 export interface TrackerIssueCandidateFilterInput {

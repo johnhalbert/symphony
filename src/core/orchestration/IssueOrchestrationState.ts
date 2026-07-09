@@ -65,6 +65,7 @@ export type IssueTransitionKind =
   | "merge_policy_block_failure"
   | "merge_policy_merge_pull_request"
   | "merge_policy_recover_already_merged_pull_request"
+  | "complete_organizational_parent"
   | "reconcile_issue_triage_report_writeback"
   | "reconcile_post_mortem_report_writeback"
   | "reconcile_completion_report_handoff"
@@ -187,6 +188,8 @@ export interface IssueCurrentFields {
   labels: string[];
   blockedBy: Issue["blockedBy"];
   hasChildren: boolean;
+  children?: NonNullable<Issue["children"]>;
+  childrenTruncated?: boolean;
   trackerCreatedAt: string | null;
   trackerUpdatedAt: string | null;
   phase: string;
@@ -439,6 +442,8 @@ export interface TrackerObservedIssueSnapshot extends IssueEvidenceHistorySnapsh
   observedAssignedToWorker: boolean;
   observedBlockedBy: Issue["blockedBy"];
   observedHasChildren: boolean;
+  observedChildren?: NonNullable<Issue["children"]>;
+  observedChildrenTruncated?: boolean;
   observedTrackerCreatedAt: string | null;
   observedTrackerUpdatedAt: string | null;
 }
@@ -644,6 +649,12 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
           arrayField(payload, "blockedBy") ?? snapshot.blockedBy,
         observedHasChildren:
           booleanField(payload, "hasChildren") ?? snapshot.hasChildren,
+        observedChildren:
+          issueChildrenField(payload, "children") ?? snapshot.children ?? [],
+        observedChildrenTruncated:
+          booleanField(payload, "childrenTruncated") ??
+          snapshot.childrenTruncated ??
+          false,
         observedTrackerCreatedAt:
           stringField(payload, "createdAt") ?? snapshot.trackerCreatedAt,
         observedTrackerUpdatedAt:
@@ -981,6 +992,46 @@ function arrayField(
 ): unknown[] | null {
   const value = payload?.[key];
   return Array.isArray(value) ? value : null;
+}
+
+function issueChildrenField(
+  payload: Record<string, unknown> | null,
+  key: string,
+): NonNullable<Issue["children"]> | null {
+  const value = payload?.[key];
+  if (!Array.isArray(value)) return null;
+  const children: NonNullable<Issue["children"]> = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+    const record = item as Record<string, unknown>;
+    const id = record.id;
+    const identifier = record.identifier;
+    const state = record.state;
+    if (
+      id !== null &&
+      id !== undefined &&
+      typeof id !== "string"
+    )
+      return null;
+    if (
+      identifier !== null &&
+      identifier !== undefined &&
+      typeof identifier !== "string"
+    )
+      return null;
+    if (
+      state !== null &&
+      state !== undefined &&
+      typeof state !== "string"
+    )
+      return null;
+    children.push({
+      id: typeof id === "string" ? id : null,
+      identifier: typeof identifier === "string" ? identifier : null,
+      state: typeof state === "string" ? state : null,
+    });
+  }
+  return children;
 }
 
 function stringArrayField(
