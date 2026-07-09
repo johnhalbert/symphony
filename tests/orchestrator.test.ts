@@ -4287,25 +4287,28 @@ describe("Orchestrator", () => {
     });
   });
 
-  it("dispatches issue triage for reviewer-blocked issues that remain in review", async () => {
+  it("blocks reviewer-blocked review issues before dispatching issue triage", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;
     config.writeback.enabled = true;
+    config.writeback.mode = "live";
     config.reviewLoop.reviewStates = ["In Review"];
     config.reviewLoop.blockedStates = ["Blocked"];
+    let currentState = "In Review";
     const candidate = issue({
-      state: "In Review",
+      state: currentState,
       branchName: "symphony/TEST-1",
     });
+    const currentIssue = (): Issue => ({ ...candidate, state: currentState });
     const tracker: TrackerClient = {
       async fetchCandidateIssues() {
-        return [candidate];
+        return [currentIssue()];
       },
       async fetchIssuesByStates(states) {
-        return states.includes("In Review") ? [candidate] : [];
+        return issuesInStates([currentIssue()], states);
       },
       async fetchIssueStatesByIds() {
-        return [candidate];
+        return [currentIssue()];
       },
     };
     const logger = new StructuredLogger(() => undefined);
@@ -4340,6 +4343,15 @@ describe("Orchestrator", () => {
       lifecycleStore,
       outboxStore,
     );
+    const writer = new StateChangingWriter((state) => {
+      currentState = state;
+    });
+    const writeback = new WritebackProcessor(
+      outboxStore,
+      writer,
+      logger,
+      config.writeback.maxBackoffMs,
+    );
     const workspaceManager = new WorkspaceManager({
       workspace: config.workspace,
       hooks: config.hooks,
@@ -4354,10 +4366,31 @@ describe("Orchestrator", () => {
       promptTemplate: "Work on {{ issue.identifier }}",
       lifecycleStore,
       runStore,
+      writeback,
     });
 
     await orchestrator.refreshNow();
-    await waitFor(() => harness.runs.length === 1, "review-blocked issue triage dispatch");
+    await waitFor(
+      () => currentState === "Blocked",
+      "review-blocked issue transition",
+    );
+    expect(harness.runs).toHaveLength(0);
+    expect(writer.transitions.map((transition) => transition.toState)).toEqual([
+      "Blocked",
+    ]);
+    expect(writer.comments[0]?.body).toContain(
+      "review blocked: Required validation is unavailable to reviewer command surfaces.",
+    );
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: "review blocked: Required validation is unavailable to reviewer command surfaces.",
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(
+      () => harness.runs.length === 1,
+      "review-blocked issue triage dispatch",
+    );
     await waitFor(
       () => orchestrator.snapshot().counts.running === 0,
       "review-blocked issue triage completion",
@@ -4371,7 +4404,7 @@ describe("Orchestrator", () => {
       "review blocked: Required validation is unavailable to reviewer command surfaces.",
     );
     await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
-      phase: "review",
+      phase: "blocked",
       blockedReason: "review blocked: Required validation is unavailable to reviewer command surfaces.",
       lastIssueTriageReportId: "issue-triage-report:issue-1:triage-run-1",
       issueTriageReports: [
@@ -4388,7 +4421,20 @@ describe("Orchestrator", () => {
       ],
     });
     const writebacks = await outboxStore.list();
-    expect(writebacks.map((item) => item.kind)).toEqual(["comment"]);
+    expect(writebacks).toHaveLength(3);
+    expect(writebacks.filter((item) => item.kind === "comment")).toHaveLength(
+      2,
+    );
+    expect(writebacks.filter((item) => item.kind === "transition")).toHaveLength(
+      1,
+    );
+    expect(
+      writebacks.some(
+        (item) =>
+          item.kind === "comment" &&
+          item.payload.body.includes("## Symphony Issue Triage"),
+      ),
+    ).toBe(true);
   });
 
   it("resets stale reviewer-blocked lifecycles in active states before worker dispatch", async () => {
@@ -6390,6 +6436,9 @@ describe("Orchestrator", () => {
     const triageRuleset = rulesets.find(
       (ruleset) => ruleset.id === "orchestrator.dispatch.triage.issue_triage",
     );
+    const reviewerBlockedRuleset = rulesets.find(
+      (ruleset) => ruleset.id === "orchestrator.block.reviewer_blocked",
+    );
     const observation = baseRefObservationForTest({
       operation: "review_feedback",
     });
@@ -6420,6 +6469,7 @@ describe("Orchestrator", () => {
       role: "triage",
       runPhase: "issue_triage",
     });
+    expect(reviewerBlockedRuleset?.evaluate(base, [])).toBeNull();
     expect(
       new IssueOrchestrationEngine(rulesets).decide(base, []),
     ).toMatchObject({
@@ -6438,6 +6488,7 @@ describe("Orchestrator", () => {
       baseRefObservationFingerprint: observation.inputFingerprint,
       baseRefObservationClassification: "branch_not_based_on_live_base",
     });
+    expect(reviewerBlockedRuleset?.evaluate(paraphrasedBase, [])).toBeNull();
     expect(
       new IssueOrchestrationEngine(rulesets).decide(paraphrasedBase, []),
     ).toMatchObject({

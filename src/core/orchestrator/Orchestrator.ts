@@ -7911,6 +7911,22 @@ export class Orchestrator {
         },
       },
       {
+        id: "orchestrator.block.reviewer_blocked",
+        priority: 48,
+        evaluate: (snapshot) => {
+          if (!this.rulesetShouldBlockReviewerBlockedReview(snapshot))
+            return null;
+          const blockedReason =
+            nonEmptyString(snapshot.blockedReason) ?? "review blocked";
+          return {
+            transitionKind: "block_issue",
+            reason: blockedReason,
+            blockedReason,
+            runId: snapshot.latestRunId ?? snapshot.issueId,
+          };
+        },
+      },
+      {
         id: "orchestrator.preserved_stash.restore",
         priority: issueTransitionRulesetPriority("preserved_stash_restore"),
         evaluate: (snapshot) =>
@@ -8759,6 +8775,33 @@ export class Orchestrator {
       snapshot.reviewRound >=
       this.config.reviewLoop.failureLimits.reviewerFailures
     );
+  }
+
+  private rulesetShouldBlockReviewerBlockedReview(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick") return false;
+    if (!snapshot.lifecyclePersistenceAvailable) return false;
+    if (snapshot.running || snapshot.paused) return false;
+    if (!snapshot.allowExistingClaim && snapshot.claimed) return false;
+    if (this.rulesetRetryBackoffActive(snapshot)) return false;
+    if (this.config.reviewLoop.blockedStates.length === 0) return false;
+    if (!isStateIn(snapshot.trackerState, this.config.reviewLoop.reviewStates))
+      return false;
+    if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
+      return false;
+    if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
+      return false;
+    if (!isReviewerBlockedTriageReason(snapshot.blockedReason)) return false;
+
+    const observation = snapshot.lastBaseRefObservation ?? null;
+    if (observation !== null && observation.classification !== "ok") {
+      const blockedReason = baseRefBlockedReason(observation);
+      if (observedBaseRefBlockerApplies(snapshot, observation, blockedReason))
+        return false;
+    }
+
+    return true;
   }
 
   private rulesetBlockedByLifecycle(

@@ -607,6 +607,7 @@ export function planReviewBlockedWritebacks(
   if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
 
   const details = reviewVerdictDetailsFromInput(summary);
+  const blockedState = config.reviewLoop.blockedStates[0] ?? null;
   const eventKey = `${context.runId}:review-verdict-blocked`;
   return [
     {
@@ -621,7 +622,9 @@ export function planReviewBlockedWritebacks(
           "",
           "Status: review blocked, triage required",
           "Symphony review could not complete because the reviewer identified a non-worker-owned blocker.",
-          "Next state: unchanged; Symphony will decide the next action from lifecycle evidence.",
+          blockedState === null
+            ? "Next state: unchanged; no blocked state is configured, so operator routing is required."
+            : `Next state: ${blockedState}; Symphony will transition the issue before triage or operator routing.`,
           "",
           `Run: ${context.runId}`,
           `Reviewer: ${context.reviewer ?? "n/a"}`,
@@ -709,7 +712,7 @@ export function planBlockedEscalationWritebacks(
   const eventKey = `${context.runId}:blocked-escalation`;
   const requiredAction =
     config.issueTriage.enabled && isIssueTriageEligibleBlockedReason(context.reason)
-      ? "Symphony will run issue triage for this max-failure block and publish a follow-up recommendation on the issue. Inspect the latest output only if the triage run does not complete or calls for immediate manual intervention."
+      ? "Symphony will run issue triage for this blocker and publish a follow-up recommendation on the issue. Inspect the latest output only if the triage run does not complete or calls for immediate manual intervention."
       : context.requiredAction ??
         "Inspect the latest worker output and reviewer feedback, then move the issue out of the blocked state when it is safe for Symphony to continue.";
   const operations: NewWritebackOperation[] = [
@@ -1666,6 +1669,7 @@ function safeKeySegment(value: string): string {
 function isIssueTriageEligibleBlockedReason(reason: string | null | undefined): boolean {
   const normalized = (reason ?? "").toLowerCase();
   return (
+    normalized.startsWith("review blocked:") ||
     normalized.includes("max reviewer failures") ||
     normalized.includes("max review rounds") ||
     normalized.includes("max merge gate failures") ||
