@@ -723,7 +723,7 @@ describe("MergePolicyService", () => {
         new StructuredLogger(() => undefined),
         60_000,
       ),
-      client: new FakeMergeClient(),
+      client: new FakeMergeClient({ liveBaseHeadSha: "base-sha-2" }),
       conflictGit,
     });
 
@@ -769,6 +769,53 @@ describe("MergePolicyService", () => {
     });
   });
 
+  it("repairs stale worktree base against the current live base when the observation is stale", async () => {
+    const config = mergeConfig({
+      noCiEvidence: "Repository intentionally has no CI for this test.",
+      conflictsState: "Approved with Conflicts",
+    });
+    const currentIssue = issue({ state: "In Review", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const conflictGit = new FakeConflictGit({
+      status: "clean",
+      originalHeadSha: "head-sha-1",
+      observedPrBaseHeadSha: "base-sha-1",
+      liveBaseHeadSha: "base-sha-3",
+      preparedBaseHeadSha: "base-sha-3",
+      mergeBaseSha: "base-sha-1",
+      squashCommitSha: "squash-sha-1",
+      rebasedHeadSha: "rebased-head-sha",
+      conflictedFiles: [],
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client: new FakeMergeClient({ liveBaseHeadSha: "base-sha-3" }),
+      conflictGit,
+    });
+
+    const result = await service.repairBaseRefDrift(currentIssue, baseRefObservation());
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+
+    expect(result).toEqual({ status: "base_ref_repaired", headSha: "rebased-head-sha" });
+    expect(conflictGit.prepareInput).toMatchObject({
+      liveBaseHeadSha: "base-sha-3",
+    });
+    expect(writer.comments[0]?.body).toContain("base-sha-3");
+    expect(lifecycle?.summaryPointers.prHeadSha).toBe("rebased-head-sha");
+  });
+
   it("uses the current lifecycle PR head for base-ref repair when the latest completion report is historical", async () => {
     const config = mergeConfig({
       noCiEvidence: "Repository intentionally has no CI for this test.",
@@ -804,7 +851,7 @@ describe("MergePolicyService", () => {
         new StructuredLogger(() => undefined),
         60_000,
       ),
-      client: new FakeMergeClient(),
+      client: new FakeMergeClient({ liveBaseHeadSha: "base-sha-2" }),
       conflictGit,
     });
 
@@ -864,7 +911,7 @@ describe("MergePolicyService", () => {
         new StructuredLogger(() => undefined),
         60_000,
       ),
-      client: new FakeMergeClient(),
+      client: new FakeMergeClient({ liveBaseHeadSha: "base-sha-2" }),
       conflictGit,
     });
 
@@ -930,7 +977,7 @@ describe("MergePolicyService", () => {
         new StructuredLogger(() => undefined),
         60_000,
       ),
-      client: new FakeMergeClient(),
+      client: new FakeMergeClient({ liveBaseHeadSha: "base-sha-2" }),
       conflictGit,
     });
 
@@ -1028,7 +1075,7 @@ describe("MergePolicyService", () => {
         new StructuredLogger(() => undefined),
         60_000,
       ),
-      client: new FakeMergeClient(),
+      client: new FakeMergeClient({ liveBaseHeadSha: "base-sha-2" }),
       conflictGit,
     });
 
@@ -1094,7 +1141,7 @@ describe("MergePolicyService", () => {
         new StructuredLogger(() => undefined),
         60_000,
       ),
-      client: new FakeMergeClient(),
+      client: new FakeMergeClient({ liveBaseHeadSha: "base-sha-2" }),
       conflictGit,
     });
 
@@ -1178,7 +1225,7 @@ describe("MergePolicyService", () => {
         new StructuredLogger(() => undefined),
         60_000,
       ),
-      client: new FakeMergeClient(),
+      client: new FakeMergeClient({ liveBaseHeadSha: "base-sha-2" }),
       conflictGit,
     });
 

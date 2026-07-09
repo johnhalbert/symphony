@@ -989,17 +989,17 @@ export class MergePolicyService {
       observation.normalizedBaseBranch ??
       observation.baseRef ??
       lifecycle.summaryPointers.baseRef;
-    const liveBaseHeadSha =
-      observation.localBaseHeadShaAfterFetch ??
-      observation.githubBaseHeadSha;
     const requiredBranchName = requireValue(branchName, "Base ref repair requires a branch name");
     const requiredOriginalHeadSha = requireValue(originalHeadSha, "Base ref repair requires the worktree head SHA");
     const requiredBaseBranch = requireValue(baseBranch, "Base ref repair requires a base branch");
-    const requiredLiveBaseHeadSha = requireValue(liveBaseHeadSha, "Base ref repair requires the live base head SHA");
     const pullRequest = pullRequestForBaseRefRepair(lifecycle, requiredBranchName, requiredOriginalHeadSha);
     const sourceState = latestIssue.state;
 
     const github = this.options.client ?? createGitHubPullRequestClientForCapability(this.options.config, "github.merge");
+    const requiredLiveBaseHeadSha = requireValue(
+      await github.getBranchHeadSha({ branchName: requiredBaseBranch }),
+      "Base ref repair requires the live base head SHA",
+    );
     const authHeader = await github.gitAuthHeader();
     const conflictGit = this.options.conflictGit ?? new ServiceOwnedMergeConflictGit();
     const operationId = `base-ref:${issue.id}:${requiredOriginalHeadSha}:${requiredLiveBaseHeadSha}`;
