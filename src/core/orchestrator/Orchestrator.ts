@@ -8793,7 +8793,9 @@ export class Orchestrator {
       return null;
 
     const blockedReason = baseRefBlockedReason(observation);
-    if (!reasonContainsBaseRefBlocker(snapshot.blockedReason, blockedReason))
+    if (
+      !observedBaseRefBlockerApplies(snapshot, observation, blockedReason)
+    )
       return null;
 
     const refreshRequest =
@@ -16109,6 +16111,30 @@ function reasonContainsBaseRefBlocker(
   return (reason ?? "")
     .toLowerCase()
     .includes(blockedReason.toLowerCase());
+}
+
+function observedBaseRefBlockerApplies(
+  snapshot: IssueCurrentStateSnapshot,
+  observation: IssueBaseRefObservation,
+  blockedReason: string,
+): boolean {
+  if (reasonContainsBaseRefBlocker(snapshot.blockedReason, blockedReason))
+    return true;
+  if (observation.operation !== "review_feedback") return false;
+  if (snapshot.phase !== "review") return false;
+  if (!isReviewerBlockedTriageReason(snapshot.blockedReason)) return false;
+  return reasonMentionsReviewFeedbackBaseRefBlocker(snapshot.blockedReason);
+}
+
+function reasonMentionsReviewFeedbackBaseRefBlocker(
+  reason: string | null | undefined,
+): boolean {
+  const normalized = (reason ?? "").toLowerCase();
+  return (
+    normalized.includes("base ref verification fail") ||
+    normalized.includes("base-ref verification fail") ||
+    normalized.includes("worktree needs rebase over latest origin base")
+  );
 }
 
 function tickTransitionShouldContinue(kind: IssueTransitionKind): boolean {

@@ -6426,6 +6426,38 @@ describe("Orchestrator", () => {
       transitionKind: "base_ref_repair",
       baseRefObservationFingerprint: observation.inputFingerprint,
     });
+    const paraphrasedReviewFeedbackBlocker =
+      "review blocked: Symphony PR review feedback submission is blocked because base ref verification fails: `worktree needs rebase over latest origin base`, so the reviewer cannot complete the required GitHub review writeback for this run.";
+    const paraphrasedBase = {
+      ...base,
+      blockedReason: paraphrasedReviewFeedbackBlocker,
+    };
+    expect(repairRuleset?.evaluate(paraphrasedBase, [])).toMatchObject({
+      transitionKind: "base_ref_repair",
+      reason: blockedReason,
+      baseRefObservationFingerprint: observation.inputFingerprint,
+      baseRefObservationClassification: "branch_not_based_on_live_base",
+    });
+    expect(
+      new IssueOrchestrationEngine(rulesets).decide(paraphrasedBase, []),
+    ).toMatchObject({
+      transitionKind: "base_ref_repair",
+      baseRefObservationFingerprint: observation.inputFingerprint,
+    });
+    const dispatchObservation = baseRefObservationForTest({
+      operation: "dispatch_reviewer",
+    });
+    expect(
+      repairRuleset?.evaluate(
+        {
+          ...paraphrasedBase,
+          lastBaseRefObservation: dispatchObservation,
+          lastBaseRefObservationFingerprint: dispatchObservation.inputFingerprint,
+          lastBaseRefObservationClassification: dispatchObservation.classification,
+        },
+        [],
+      ),
+    ).toBeNull();
     expect(
       new IssueOrchestrationEngine(rulesets).decide(
         { ...base, availableSlots: 0 },
