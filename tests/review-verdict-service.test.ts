@@ -102,6 +102,127 @@ describe("ReviewVerdictService", () => {
     expect(await outbox.list()).toHaveLength(0);
   });
 
+  it("rejects blocked verdicts for failed validation without non-worker-owned evidence", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+    });
+
+    await expect(
+      service.submitReviewVerdict(
+        blockedVerdict({
+          acceptanceResults: [
+            {
+              text: "Validation requirement: npm run test:backend.",
+              satisfied: false,
+              evidence:
+                "`npm run test:backend` exited 1 with failures in src/services/shared.test.ts.",
+            },
+          ],
+          findings: [
+            "Required `npm run test:backend` validation failed in files outside the PR diff.",
+          ],
+          evidence: ["reviewer observed failing tests"],
+        }),
+        context(),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message:
+        "Blocked review verdicts for failed validation, tests, CI, or checks require discoveryFindings evidence proving the blocker is not worker-owned; use a fail verdict when the failure may be caused by the worker's changes.",
+    });
+  });
+
+  it("rejects blocked failed-validation verdicts when evidence only says the file was unchanged", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+    });
+
+    await expect(
+      service.submitReviewVerdict(
+        blockedVerdict({
+          acceptanceResults: [
+            {
+              text: "Validation requirement: npm run test:backend.",
+              satisfied: false,
+              evidence:
+                "`npm run test:backend` exited 1 with failures in src/services/shared.test.ts.",
+            },
+          ],
+          findings: ["Backend validation failed in unchanged test files."],
+          discoveryFindings: [
+            discoveryFinding({
+              relationship: "sibling_issue_scope",
+              summary: "The failing test file is not in the PR diff.",
+              discoveryReason:
+                "Reviewer found only that src/services/shared.test.ts was not changed by this PR.",
+              evidence: ["git diff --name-only did not list src/services/shared.test.ts."],
+              suggestedDisposition: "operator_decision",
+            }),
+          ],
+        }),
+        context(),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+  });
+
+  it("accepts blocked failed-validation verdicts with explicit sibling-scope evidence", async () => {
+    const { service, lifecycleStore } = fixture();
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+    });
+
+    await service.submitReviewVerdict(
+      blockedVerdict({
+        acceptanceResults: [
+          {
+            text: "Validation requirement: npm run test:backend.",
+            satisfied: false,
+            evidence:
+              "`npm run test:backend` exited 1 because T020 generated-packet tests are still red.",
+          },
+        ],
+        findings: [
+          "Required `npm run test:backend` validation failed on explicit sibling T020 scope.",
+        ],
+        discoveryFindings: [
+          discoveryFinding({
+            relationship: "sibling_issue_scope",
+            summary:
+              "The red backend suite is blocked by explicit sibling T020 generated-packet scope.",
+            discoveryReason:
+              "The failure maps to T020, which is a sibling task outside this issue contract.",
+            scenarioAxes: ["T020 generated-packet validation"],
+            evidence: [
+              "tasks.md assigns generated-packet persistence to T020.",
+              "The current issue contract only owns review verdict submission behavior.",
+            ],
+            suggestedDisposition: "followup_issue",
+          }),
+        ],
+      }),
+      context(),
+    );
+
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      reviewVerdictSubmissions: [
+        {
+          idempotencyKey: "blocked-verdict-1",
+          verdict: "blocked",
+          discoveryFindings: [
+            {
+              relationship: "sibling_issue_scope",
+              suggestedDisposition: "followup_issue",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
   it("stores structured gate and discovery findings while deriving legacy findings from gate summaries", async () => {
     const { service, lifecycleStore } = fixture();
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {

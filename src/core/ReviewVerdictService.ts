@@ -33,6 +33,8 @@ const FAIL_AFTER_APPROVE_MESSAGE =
   "Fail review verdict cannot follow APPROVE review feedback in the same reviewer run; submit a pass verdict or start a fresh review run.";
 const BLOCKED_AFTER_APPROVE_MESSAGE =
   "Blocked review verdict cannot follow APPROVE review feedback in the same reviewer run; submit a pass verdict or start a fresh review run.";
+const BLOCKED_VALIDATION_FAILURE_REQUIRES_NON_WORKER_EVIDENCE_MESSAGE =
+  "Blocked review verdicts for failed validation, tests, CI, or checks require discoveryFindings evidence proving the blocker is not worker-owned; use a fail verdict when the failure may be caused by the worker's changes.";
 
 const REVIEW_GATE_SCENARIO_ENTITLEMENTS = [
   "explicit_requirement",
@@ -269,6 +271,16 @@ export class ReviewVerdictService {
       throw new SymphonyError(
         "invalid_request",
         "Blocked review verdicts cannot include gate findings; use findings or discoveryFindings for non-worker-owned blockers",
+      );
+    }
+    if (
+      verdict.verdict === "blocked" &&
+      blockedVerdictReportsValidationFailure(verdict) &&
+      !blockedVerdictHasNonWorkerOwnedValidationFailureEvidence(verdict)
+    ) {
+      throw new SymphonyError(
+        "invalid_request",
+        BLOCKED_VALIDATION_FAILURE_REQUIRES_NON_WORKER_EVIDENCE_MESSAGE,
       );
     }
   }
@@ -636,6 +648,72 @@ function normalizeAcceptanceResults(items: ReviewVerdictInput["acceptanceResults
     satisfied: item.satisfied,
     evidence: item.evidence,
   }));
+}
+
+function blockedVerdictReportsValidationFailure(verdict: ReviewVerdictInput): boolean {
+  const unsatisfiedAcceptanceText = verdict.acceptanceResults
+    .filter((item) => !item.satisfied)
+    .flatMap((item) => [item.text, item.evidence ?? ""]);
+  return [
+    ...unsatisfiedAcceptanceText,
+    ...verdict.findings,
+    ...verdict.evidence,
+  ].some(mentionsValidationFailure);
+}
+
+function mentionsValidationFailure(value: string): boolean {
+  const normalized = value.toLowerCase();
+  const mentionsValidationSurface =
+    /\b(?:validation|test|tests|suite|ci|check|checks|typecheck|lint|build|vitest|jest|pytest)\b/.test(normalized) ||
+    /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|typecheck|lint|build|check)\b/.test(normalized);
+  if (!mentionsValidationSurface) return false;
+  return /\b(?:fail(?:ed|ing|s|ure)?|red|broken|regression)\b/.test(normalized) ||
+    /\b(?:exited|exit(?:ed)? code|status)\s+(?:1|non[- ]zero)\b/.test(normalized) ||
+    /\bnon[- ]zero\b/.test(normalized);
+}
+
+function blockedVerdictHasNonWorkerOwnedValidationFailureEvidence(
+  verdict: ReviewVerdictInput,
+): boolean {
+  return verdict.discoveryFindings.some((finding) => {
+    if (
+      finding.relationship !== "sibling_issue_scope" &&
+      finding.relationship !== "out_of_scope"
+    ) {
+      return false;
+    }
+    if ((finding.ownerIssueIdentifier ?? null) !== null) return true;
+    return mentionsNonWorkerOwnedValidationFailureEvidence([
+      finding.summary,
+      finding.discoveryReason,
+      finding.suggestedDisposition,
+      ...finding.scenarioAxes,
+      ...finding.evidence,
+    ]);
+  });
+}
+
+function mentionsNonWorkerOwnedValidationFailureEvidence(values: string[]): boolean {
+  const normalized = values.join("\n").toLowerCase();
+  return (
+    /\bsibling[-\s]?(?:issues?|tasks?|scopes?|surfaces?|work|branches?|prs?)\b/.test(normalized) ||
+    /\beng-\d+\b/.test(normalized) ||
+    /\bt\d{2,}\b/.test(normalized) ||
+    /\bbase branch\b/.test(normalized) ||
+    /\borigin\/main\b/.test(normalized) ||
+    /\breproduc(?:e|es|ed|ible|ing).*\b(?:base|main)\b/.test(normalized) ||
+    /\b(?:base|main)\b.*\breproduc(?:e|es|ed|ible|ing)\b/.test(normalized) ||
+    /\balready fail(?:ed|ing|s)?\b/.test(normalized) ||
+    /\bunmerged\b/.test(normalized) ||
+    /\bpr\s*#?\d+\b/.test(normalized) ||
+    /\bowner issue\b/.test(normalized) ||
+    /\boutside (?:this|the current) issue\b/.test(normalized) ||
+    /\bnot (?:worker|current issue)[-\s]?owned\b/.test(normalized) ||
+    /\bservice[-\s]?owned\b/.test(normalized) ||
+    /\btool(?:ing)?\b/.test(normalized) ||
+    /\bcredential(?:s)?\b/.test(normalized) ||
+    /\bservice outage\b/.test(normalized)
+  );
 }
 
 function reviewWritebackContextForSubmission(issue: Issue, submission: IssueReviewVerdictSubmissionRecord) {

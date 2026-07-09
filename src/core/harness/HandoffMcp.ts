@@ -172,7 +172,11 @@ export function renderReviewMcpHandoffPrompt(input: RuntimeHandoffPromptInput): 
     "- Do not run gh pr review, gh pr comment, git push, direct GitHub API/curl writes, or otherwise write to GitHub directly from the reviewer command surface.",
     "- After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence, then call submit_review_verdict before ending the run.",
     "- Use verdict \"blocked\" when review cannot complete because required validation, tooling, credentials, or service-owned evidence is unavailable to the worker/reviewer and the bounded repair is not worker-owned.",
+    "- A failed validation command, red test suite, failed CI check, typecheck/lint/build failure, or failing test file is fail by default unless you prove it is not worker-owned; an unchanged failing test file is only a triage clue, not proof.",
+    "- If the PR changed production code that the failing test exercises, treat the failure as worker-owned and use fail.",
+    "- Use blocked for failed validation only when discoveryFindings prove non-worker ownership, such as base-branch reproduction, explicit sibling issue/task scope, unmerged sibling work, or service/tooling/credential outage.",
     "- Use gateFindings only for contract-entitled defects that may block the worker. Put inferred scope, hidden matrix axes, sibling issue scope, future hardening, and out-of-scope observations in discoveryFindings; discoveryFindings do not make a verdict fail by themselves.",
+    "- A blocked verdict for failed validation/tests/CI must include discoveryFindings with relationship \"sibling_issue_scope\" or \"out_of_scope\" and concrete non-worker ownership evidence; \"the failing file was not changed\" is insufficient by itself.",
     "- The MCP servers are scoped to this issue, active reviewer run, and lifecycle-bound PR; Symphony injects runId, issueId, PR number, repository, token, and commit identity when a tool needs them.",
     "- Do not comment on Linear, transition Linear state, or request broad Linear or GitHub credentials. Symphony handles review writeback after the tools accept the report.",
   ].join("\n");
