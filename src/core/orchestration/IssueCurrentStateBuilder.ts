@@ -13,7 +13,6 @@ import {
 import {
   activeIssueTriageBlockers,
   issueTriageTriggerFingerprint,
-  latestIssueTriageReport,
   latestIssueTriageReportForFingerprint,
 } from "../IssueTriageService.js";
 import {
@@ -379,7 +378,6 @@ interface IssueCurrentStateBuildContext {
   currentIssueTriageFingerprint: string | null;
   issueTriageCurrentTriggerReports: IssueTriageReport[];
   lastIssueTriageReport: IssueTriageReport | null;
-  latestAnyIssueTriageReport: IssueTriageReport | null;
   currentPostMortemFingerprint: string | null;
   postMortemCurrentTriggerReports: IssuePostMortemReport[];
   lastPostMortemReport: IssuePostMortemReport | null;
@@ -1222,10 +1220,6 @@ export class IssueCurrentStateBuilder {
             issueTriageReports,
             currentFingerprint,
           );
-    const latestAnyReport = latestIssueTriageReportFromReports(
-      issueTriageReports,
-      lastIssueTriageReportId,
-    );
     return {
       complete: true,
       sourceSnapshotId: snapshot.historySnapshotId,
@@ -1241,7 +1235,7 @@ export class IssueCurrentStateBuilder {
           (report) => report.id,
         ),
         latestIssueTriageReportBlockers: activeIssueTriageBlockers(
-          latestAnyReport,
+          lastReport,
         ).map((blocker) => ({
           ...blocker,
           evidence: [...blocker.evidence],
@@ -1448,7 +1442,6 @@ export class IssueCurrentStateBuilder {
             lifecycle,
             currentIssueTriageFingerprint,
           );
-    const latestAnyIssueTriageReport = latestIssueTriageReport(lifecycle);
     const currentPostMortemFingerprint =
       lifecycle === null
         ? null
@@ -1532,7 +1525,6 @@ export class IssueCurrentStateBuilder {
       currentIssueTriageFingerprint,
       issueTriageCurrentTriggerReports,
       lastIssueTriageReport,
-      latestAnyIssueTriageReport,
       currentPostMortemFingerprint,
       postMortemCurrentTriggerReports,
       lastPostMortemReport,
@@ -1621,7 +1613,7 @@ export class IssueCurrentStateBuilder {
       issueTriageCurrentTriggerReportIds:
         context.issueTriageCurrentTriggerReports.map((report) => report.id),
       latestIssueTriageReportBlockers: activeIssueTriageBlockers(
-        context.latestAnyIssueTriageReport,
+        context.lastIssueTriageReport,
       ).map((blocker) => ({
         ...blocker,
         evidence: [...blocker.evidence],
@@ -2410,20 +2402,6 @@ function latestIssueTriageReportForFingerprintFromReports(
     ) {
       return report;
     }
-  }
-  return null;
-}
-
-function latestIssueTriageReportFromReports(
-  reports: readonly IssueTriageReport[],
-  lastReportId: string | null,
-): IssueTriageReport | null {
-  if (lastReportId !== null) {
-    const exact = reports.find((report) => report.id === lastReportId);
-    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
-  }
-  for (const report of reports.slice().reverse()) {
-    if (!isSupersededLifecycleRecord(report)) return report;
   }
   return null;
 }

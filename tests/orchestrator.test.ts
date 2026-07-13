@@ -4508,6 +4508,112 @@ describe("Orchestrator", () => {
     });
   });
 
+  it("does not reuse stale triage decomposition blockers for a new blocked trigger", async () => {
+    const config = testConfig(root);
+    config.issueTriage.enabled = true;
+    config.issueBreakdown.enabled = true;
+    config.writeback.enabled = true;
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const candidate = issue({
+      state: "Blocked",
+      branchName: "symphony/TEST-1",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return states.includes("Blocked") ? [candidate] : [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const oldTrigger = await lifecycleStore.ensureIssue(candidate, {
+      phase: "blocked",
+      blockedReason: "review blocked: old reviewer blocker",
+      reviewRound: 1,
+    });
+    const staleReport = {
+      id: "issue-triage-report:issue-1:old-triage",
+      idempotencyKey: "old-triage",
+      requestHash: "old-triage-hash",
+      runId: "old-triage-run",
+      issueId: candidate.id,
+      issueIdentifier: candidate.identifier,
+      triggerFingerprint: issueTriageTriggerFingerprint(oldTrigger),
+      disposition: "decompose_issue" as const,
+      confidence: "high" as const,
+      summary: "Old blocked episode required decomposition.",
+      evidence: ["review blocked: old reviewer blocker"],
+      recommendedAction: "Decompose the old blocked episode.",
+      blockers: [
+        {
+          kind: "under_specified_needs_decomposition" as const,
+          status: "active" as const,
+          nextActor: "planner" as const,
+          confidence: "high" as const,
+          summary: "Old blocked episode required decomposition.",
+          evidence: ["review blocked: old reviewer blocker"],
+          recommendedAction: "Decompose the old blocked episode.",
+        },
+      ],
+      submittedAt: "2026-01-01T00:00:01.000Z",
+      writebackOperationKeys: ["comment:issue-1:old-triage"],
+    };
+    await lifecycleStore.updateIssue(candidate, {
+      lastIssueTriageReportId: staleReport.id,
+      issueTriageReports: [staleReport],
+    });
+    await lifecycleStore.updateIssue(candidate, {
+      blockedReason: "review blocked: new reviewer blocker",
+      reviewRound: 0,
+      lastCompletionReportId: "new-completion-report",
+      lastReviewVerdictId: "new-review-verdict",
+      lastIssueTriageReportId: null,
+    });
+    const harness = new IssueTriageAcceptingHarness(
+      lifecycleStore,
+      outboxStore,
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+
+    await orchestrator.refreshNow();
+    await waitFor(() => harness.runs.length === 1, "fresh issue triage dispatch");
+    await waitFor(
+      () => orchestrator.snapshot().counts.running === 0,
+      "fresh issue triage completion",
+    );
+    await orchestrator.stop();
+
+    expect(harness.runs[0]?.ctx).toMatchObject({
+      role: "triage",
+      runPhase: "issue_triage",
+    });
+    expect(
+      harness.runs.filter((run) => run.ctx.runPhase === "issue_breakdown"),
+    ).toHaveLength(0);
+  });
+
   it("blocks reviewer-blocked review issues before dispatching issue triage", async () => {
     const config = testConfig(root);
     config.issueTriage.enabled = true;

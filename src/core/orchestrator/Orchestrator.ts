@@ -9133,6 +9133,9 @@ export class Orchestrator {
   ): boolean {
     return (
       isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates) &&
+      snapshot.currentIssueTriageTriggerFingerprint !== null &&
+      snapshot.lastIssueTriageReportTriggerFingerprint ===
+        snapshot.currentIssueTriageTriggerFingerprint &&
       this.rulesetHasActiveIssueTriageBlocker(
         snapshot,
         "under_specified_needs_decomposition",

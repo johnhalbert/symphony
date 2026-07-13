@@ -1418,6 +1418,92 @@ describe("IssueCurrentStateBuilder", () => {
     });
   });
 
+  it("does not expose triage blockers from a stale trigger", async () => {
+    const config = builderConfig(root);
+    const issue = issueFixture({ state: "Blocked" });
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const initial = await lifecycleStore.ensureIssue(issue, {
+      phase: "blocked",
+      blockedReason: "old review blocker",
+      reviewRound: 1,
+    });
+    const staleFingerprint = issueTriageTriggerFingerprint(initial);
+    const staleReport = {
+      id: "triage-report-stale",
+      idempotencyKey: "triage-report-stale",
+      requestHash: "triage-hash-stale",
+      runId: "triage-run-stale",
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      triggerFingerprint: staleFingerprint,
+      disposition: "decompose_issue" as const,
+      confidence: "high" as const,
+      summary: "Old decomposition recommendation",
+      evidence: ["old blocker evidence"],
+      recommendedAction: "Decompose the old blocker",
+      blockers: [
+        {
+          kind: "under_specified_needs_decomposition" as const,
+          status: "active" as const,
+          nextActor: "planner" as const,
+          confidence: "high" as const,
+          summary: "Old decomposition recommendation",
+          evidence: ["old blocker evidence"],
+          recommendedAction: "Decompose the old blocker",
+        },
+      ],
+      submittedAt: "2026-01-01T00:00:01.000Z",
+      writebackOperationKeys: [],
+    };
+    await lifecycleStore.updateIssue(issue, {
+      lastIssueTriageReportId: staleReport.id,
+      issueTriageReports: [staleReport],
+    });
+    const currentLifecycle = await lifecycleStore.updateIssue(issue, {
+      blockedReason: "new review blocker",
+    });
+    const historyStore = new MemoryIssueStateStore();
+    const storeBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+    });
+
+    const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+
+    expect(storeCurrent.currentIssueTriageTriggerFingerprint).not.toBe(
+      staleFingerprint,
+    );
+    expect(storeCurrent.issueTriageCurrentTriggerReportIds).toEqual([]);
+    expect(storeCurrent.latestIssueTriageReportBlockers).toEqual([]);
+
+    historyStore.record = {
+      ...storeCurrent,
+      history: [lifecycleEvidenceSnapshot(storeCurrent, currentLifecycle)],
+    };
+    const historyBackedBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: historyStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: ["lifecycleTriage"],
+    });
+
+    const historyCurrent = await historyBackedBuilder.build(
+      issue,
+      emptyRuntime(),
+    );
+
+    expect(historyCurrent.currentIssueTriageTriggerFingerprint).not.toBe(
+      staleFingerprint,
+    );
+    expect(historyCurrent.issueTriageCurrentTriggerReportIds).toEqual([]);
+    expect(historyCurrent.latestIssueTriageReportBlockers).toEqual([]);
+  });
+
   it("can build lifecycle post-mortem fields from typed history evidence", async () => {
     const config = builderConfig(root);
     const issue = issueFixture({ state: "Done" });
