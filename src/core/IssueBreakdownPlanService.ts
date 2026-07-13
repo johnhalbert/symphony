@@ -227,8 +227,30 @@ export function issueBreakdownPlanFingerprintsMatch(
 ): boolean {
   if (plan.configFingerprint !== issueBreakdownConfigFingerprint(config)) return false;
   if (plan.issueContentFingerprint.length === 0) return false;
-  if (plan.issueContentFingerprint !== issueContentFingerprint(issue)) return false;
+  if (
+    plan.issueContentFingerprint !==
+    issueContentFingerprint(issueWithoutPlanCreatedBlockers(issue, plan))
+  ) {
+    return false;
+  }
   return issueBreakdownPlanSatisfiesCurrentValidation(plan, config);
+}
+
+function issueWithoutPlanCreatedBlockers(issue: Issue, plan: IssueBreakdownPlanRecord): Issue {
+  if (plan.createdIssueRefs.length === 0 || issue.blockedBy.length === 0) return issue;
+  const createdIds = new Set(
+    plan.createdIssueRefs.flatMap((ref) =>
+      [ref.id, ref.identifier].filter(
+        (value): value is string => Boolean(value),
+      ),
+    ),
+  );
+  return {
+    ...issue,
+    blockedBy: issue.blockedBy.filter(
+      (blocker) => !createdIds.has(blocker.id ?? "") && !createdIds.has(blocker.identifier ?? ""),
+    ),
+  };
 }
 
 export function issueBreakdownPlanSatisfiesCurrentValidation(

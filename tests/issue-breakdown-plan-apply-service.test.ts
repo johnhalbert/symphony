@@ -44,6 +44,7 @@ describe("IssueBreakdownPlanApplyService", () => {
     const config = testConfig(root);
     config.issueBreakdown.applyToLinear.enabled = true;
     config.writeback.enabled = true;
+    config.reviewLoop.reviewStates = ["In Review"];
     const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
     const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
     await new IssueBreakdownPlanService({ config, lifecycleStore }).submit_issue_breakdown_plan(
@@ -85,11 +86,110 @@ describe("IssueBreakdownPlanApplyService", () => {
       issueId: candidate.id,
       payload: { body: expect.stringContaining("TEST-2"), issueBreakdownPlanId: expect.any(String) },
     });
+    expect(writeback.operations.find((operation) => operation.kind === "transition")).toMatchObject({
+      kind: "transition",
+      issueId: candidate.id,
+      payload: { toState: "In Review", issueBreakdownPlanId: expect.any(String) },
+    });
     expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
     expect(lifecycle?.issueBreakdownPlans[0]?.createdIssueRefs[0]).toMatchObject({
       id: "child-1",
       identifier: "TEST-2",
       status: "created",
+    });
+  });
+
+  it("keeps a plan fresh while its own child blocker relations are applied", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    config.reviewLoop.reviewStates = ["In Review"];
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    await submitTwoChildPlan(config, lifecycleStore, candidate);
+    let liveIssue = candidate;
+    const writer = new FakeWriter();
+    const mutatingWriter = trackerWriterWithRelationEffect(writer, (input) => {
+      if (input.targetIssueId !== candidate.id) return;
+      liveIssue = {
+        ...liveIssue,
+        blockedBy: [
+          ...liveIssue.blockedBy,
+          { id: input.sourceIssueId, identifier: null, state: "Backlog" },
+        ],
+      };
+    });
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const processor = new WritebackProcessor(
+      store,
+      mutatingWriter,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      dynamicFreshnessGuard(() => liveIssue, config),
+    );
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore, writeback: processor }).applyLatestFreshPlan(
+      candidate,
+    );
+    const lifecycle = await lifecycleStore.get(candidate.id);
+    const records = await store.list();
+
+    expect(result.status).toBe("applied");
+    expect(lifecycle?.issueBreakdownPlans[0]?.applicationStatus).toBe("applied");
+    expect(writer.issueCreates).toHaveLength(2);
+    expect(writer.issueRelations).toHaveLength(3);
+    expect(writer.comments).toHaveLength(1);
+    expect(writer.transitions).toHaveLength(1);
+    expect(records.every((record) => record.status === "succeeded")).toBe(true);
+  });
+
+  it("blocks all remaining finalization writes including transition after external parent drift", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    config.reviewLoop.reviewStates = ["In Review"];
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({ labels: ["planning"], updatedAt: "2026-01-02T00:00:00Z" });
+    await submitTwoChildPlan(config, lifecycleStore, candidate);
+    let liveIssue = candidate;
+    let relationWrites = 0;
+    const writer = new FakeWriter();
+    const mutatingWriter = trackerWriterWithRelationEffect(writer, () => {
+      relationWrites += 1;
+      if (relationWrites !== 1) return;
+      liveIssue = {
+        ...liveIssue,
+        blockedBy: [
+          ...liveIssue.blockedBy,
+          { id: "external-blocker", identifier: "TEST-99", state: "In Progress" },
+        ],
+      };
+    });
+    const store = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const processor = new WritebackProcessor(
+      store,
+      mutatingWriter,
+      new StructuredLogger(() => undefined),
+      300_000,
+      lifecycleStore,
+      false,
+      dynamicFreshnessGuard(() => liveIssue, config),
+    );
+
+    const result = await new IssueBreakdownPlanApplyService({ config, lifecycleStore, writeback: processor }).applyLatestFreshPlan(
+      candidate,
+    );
+    const records = await store.list();
+
+    expect(result).toMatchObject({ status: "blocked", reason: ISSUE_BREAKDOWN_PLAN_STALE_REASON });
+    expect(writer.issueRelations).toHaveLength(1);
+    expect(writer.comments).toHaveLength(0);
+    expect(writer.transitions).toHaveLength(0);
+    expect(records.find((record) => record.kind === "transition")).toMatchObject({
+      status: "skipped",
+      lastError: ISSUE_BREAKDOWN_PLAN_STALE_REASON,
     });
   });
 
@@ -773,6 +873,29 @@ function issueCreateResult(operation: IssueCreateWriteback): TrackerWriteResult 
       payloadHash: operation.payload.payloadHash,
       unresolvedLabelNames: [],
     },
+  };
+}
+
+function trackerWriterWithRelationEffect(
+  writer: FakeWriter,
+  onRelation: (input: TrackerIssueRelationInput) => void,
+): TrackerWriter {
+  return {
+    transitionIssueState: (input) => writer.transitionIssueState(input),
+    createIssueComment: (input) => writer.createIssueComment(input),
+    createIssueFromPlan: (input) => writer.createIssueFromPlan(input),
+    createIssueRelation: async (input) => {
+      const result = await writer.createIssueRelation(input);
+      onRelation(input);
+      return result;
+    },
+  };
+}
+
+function dynamicFreshnessGuard(resolve: () => Issue, config: ServiceConfig) {
+  return {
+    getConfig: () => config,
+    resolveIssue: async () => ({ status: "ok" as const, issue: resolve() }),
   };
 }
 

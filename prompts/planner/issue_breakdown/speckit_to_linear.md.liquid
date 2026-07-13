@@ -16,6 +16,8 @@ Complete the full planning workflow in this single session:
 6. Convert the final tasks into proposed Linear child issues.
 7. Call `submit_issue_breakdown_plan` before ending the run.
 
+Before proposing children, compare the parent contract, accepted completion reports, current branch diff, and named sibling owners. Never create a child whose scope is already implemented on the parent branch. An unmet dependency owned by an existing sibling issue must remain a dependency/sequence recommendation rather than being copied into a new child. In particular, do not decompose an accepted expected-red test artifact into duplicate test children while it waits for its named implementation issue.
+
 ## Linear Child Issue Requirements
 
 - Each proposed child must be parented to this issue by Symphony service-owned writeback.

@@ -10,6 +10,10 @@ Lower-precedence PR, CI, merge, or review-gate blockers must not mask active imp
 
 Prefer `under_specified_needs_decomposition` when review history shows scope discovery: repeated review failures across distinct sibling surfaces, hidden matrix axes, or reviewer discovery findings that suggest planner decomposition. Keep the latest concrete implementation defect as a separate blocker when useful, but do not collapse a broad scope-discovery pattern into another narrow repair loop.
 
+Do not classify an already-implemented current issue as `under_specified_needs_decomposition` merely because validation is waiting on behavior owned by an existing sibling issue. That is a sequencing or dependency-graph blocker: name the existing owner, recommend linking/waiting or correcting the dependency direction, and do not trigger child creation that repeats the current branch's completed work.
+
+For an explicitly test-first issue whose owned test artifact has been accepted and is intentionally red on a named implementation gap, treat the red validation as publication sequencing rather than a defect to repair in the test branch. Recommend waiting for or dispatching the concrete implementation owner, then rebasing and rerunning the test PR. Do not decompose the test task or send it through repeated worker repair unless the test artifact itself is wrong.
+
 ## Deterministic Blocker Ledger
 
 {{ triageLedger }}

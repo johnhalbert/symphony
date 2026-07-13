@@ -295,6 +295,7 @@ export function planIssueBreakdownFinalizationWritebacks(
         toState: reviewState,
         fromStates: [...config.reviewLoop.blockedStates, ...config.tracker.activeStates],
         reason: "Symphony issue breakdown created blocking child issues; parent is ready for gated review",
+        issueBreakdownPlanId: plan.id,
       },
     });
   }

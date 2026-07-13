@@ -30,7 +30,12 @@ export type WritebackOperation =
       resultStatus: TrackerWriteResult["status"] | null;
       resultMessage: string | null;
       resultEvidence: TrackerWriteEvidence | null;
-      payload: { toState: string; fromStates?: string[]; reason?: string };
+      payload: {
+        toState: string;
+        fromStates?: string[];
+        reason?: string;
+        issueBreakdownPlanId?: string;
+      };
     }
   | {
       idempotencyKey: string;
@@ -865,8 +870,11 @@ export class WritebackProcessor {
       if (!plan.applicationOperationKeys.includes(record.idempotencyKey)) {
         return { status: "blocked", message: "issue breakdown writeback is not registered on the current plan" };
       }
-      if ((record.kind === "comment" || record.kind === "issue_relation") && plan.createdIssueRefs.length < plan.proposedIssues.length) {
-        return { status: "blocked", message: "issue breakdown relation/comment writeback requires durable child refs" };
+      if (
+        (record.kind === "comment" || record.kind === "issue_relation" || record.kind === "transition") &&
+        plan.createdIssueRefs.length < plan.proposedIssues.length
+      ) {
+        return { status: "blocked", message: "issue breakdown finalization writeback requires durable child refs" };
       }
       if (!this.issueBreakdownFreshnessGuard) {
         return { status: "blocked", message: "issue breakdown writeback requires freshness guard" };
@@ -981,6 +989,10 @@ type IssueBreakdownPlanBinding =
   | { status: "blocked"; message: string };
 
 function issueBreakdownPlanBindingForOperation(record: WritebackOperation): IssueBreakdownPlanBinding {
+  if (record.kind === "transition") {
+    const planId = record.payload.issueBreakdownPlanId?.trim();
+    return planId ? { status: "bound", planId } : { status: "none" };
+  }
   if (record.kind === "issue_create") return { status: "bound", planId: record.payload.planId };
   if (record.kind === "issue_relation") return { status: "bound", planId: record.payload.planId };
   if (record.kind === "comment") return issueBreakdownPlanBindingForComment(record);
@@ -1049,6 +1061,7 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
     return (
       record.payload.toState === operation.payload.toState &&
       record.payload.reason === operation.payload.reason &&
+      record.payload.issueBreakdownPlanId === operation.payload.issueBreakdownPlanId &&
       stringArraysEqual(record.payload.fromStates, operation.payload.fromStates)
     );
   }
