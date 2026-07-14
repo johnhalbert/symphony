@@ -6,11 +6,12 @@ import { errorMessage } from "./errors.js";
 import type { Logger } from "./logging/StructuredLogger.js";
 import { IssueLifecycleEvidenceRecorder } from "./orchestration/IssueLifecycleEvidenceRecorder.js";
 import type { IssueStateStore } from "./orchestration/IssueOrchestrationState.js";
-import type {
-  IssueCompletionReportRecord,
-  IssueLifecyclePatch,
-  IssueLifecycleRecord,
-  IssueLifecycleStore,
+import {
+  latestCurrentCompletionReport,
+  type IssueCompletionReportRecord,
+  type IssueLifecyclePatch,
+  type IssueLifecycleRecord,
+  type IssueLifecycleStore,
 } from "./persistence/IssueLifecycleStore.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "./tracker/TrackerClient.js";
@@ -113,7 +114,7 @@ export class LifecyclePrHeadRebindService {
     const lifecycle = await this.loadLifecycle(input.issueIdOrIdentifier, issue);
     if (lifecycle === null) return emptyResult("not_found", "lifecycle_not_found", issue);
 
-    const latestReport = latestCompletionReport(lifecycle);
+    const latestReport = latestCurrentCompletionReport(lifecycle);
     const oldSummaryPrHeadSha = lifecycle.summaryPointers.prHeadSha;
     const oldLatestCompletionReportPrHeadSha = latestReport?.pullRequest?.headSha ?? null;
     const oldHandoffPrHeadSha = lifecycle.handoff.memo.pointers.prHeadSha;
@@ -324,13 +325,6 @@ function buildPatch(
     patch,
     changed: Object.keys(patch).length > 0,
   };
-}
-
-function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {
-  if (lifecycle.lastCompletionReportId) {
-    return lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId) ?? null;
-  }
-  return lifecycle.completionReports.at(-1) ?? null;
 }
 
 function baseResult(

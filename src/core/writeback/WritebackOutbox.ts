@@ -7,7 +7,11 @@ import type { Logger } from "../logging/StructuredLogger.js";
 import type { ServiceConfig } from "../config/Config.js";
 import { latestFreshIssueBreakdownPlan } from "../IssueBreakdownPlanService.js";
 import { mapWithFileReadConcurrency } from "../persistence/FileReadConcurrency.js";
-import type { IssueLifecycleStore } from "../persistence/IssueLifecycleStore.js";
+import {
+  isSupersededLifecycleRecord,
+  latestCurrentCompletionReport,
+  type IssueLifecycleStore,
+} from "../persistence/IssueLifecycleStore.js";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "../persistence/ProjectionRevision.js";
 import type { TrackerWriteEvidence, TrackerWriteResult, TrackerWriter } from "../tracker/TrackerWriter.js";
 import type { Issue } from "../types.js";
@@ -35,6 +39,7 @@ export type WritebackOperation =
         fromStates?: string[];
         reason?: string;
         issueBreakdownPlanId?: string;
+        acceptedArtifactId?: string;
       };
     }
   | {
@@ -51,7 +56,7 @@ export type WritebackOperation =
       resultStatus: TrackerWriteResult["status"] | null;
       resultMessage: string | null;
       resultEvidence: TrackerWriteEvidence | null;
-      payload: { body: string; dedupeKey: string; issueBreakdownPlanId?: string };
+      payload: { body: string; dedupeKey: string; issueBreakdownPlanId?: string; acceptedArtifactId?: string };
     }
   | {
       idempotencyKey: string;
@@ -127,6 +132,8 @@ export type NewWritebackOperation =
 
 export const ISSUE_BREAKDOWN_PLAN_STALE_REASON = "issue breakdown plan is no longer fresh";
 export const ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON = "issue breakdown writeback is not bound to the current plan";
+export const ACCEPTED_ARTIFACT_WRITEBACK_NOT_CURRENT_REASON =
+  "accepted-artifact writeback is not bound to the current completed artifact";
 
 export type IssueBreakdownIssueLookupResult =
   | { status: "ok"; issue: Issue }
@@ -852,6 +859,37 @@ export class WritebackProcessor {
   }
 
   private async verifyLifecycleBoundOperation(record: WritebackOperation): Promise<LifecycleGuardResult> {
+    const acceptedArtifactBinding = acceptedArtifactBindingForOperation(record);
+    if (acceptedArtifactBinding.status === "blocked") {
+      return { status: "blocked", message: acceptedArtifactBinding.message };
+    }
+    if (acceptedArtifactBinding.status === "bound") {
+      const acceptedArtifactId = acceptedArtifactBinding.artifactId;
+      if (!this.lifecycleStore) {
+        return { status: "blocked", message: "accepted-artifact writeback requires lifecycle guard" };
+      }
+      const lifecycle = await this.lifecycleStore.get(record.issueId);
+      const artifact = lifecycle?.acceptedArtifact ?? null;
+      if (!artifact || artifact.id !== acceptedArtifactId) {
+        return { status: "blocked", message: ACCEPTED_ARTIFACT_WRITEBACK_NOT_CURRENT_REASON };
+      }
+      if (isSupersededLifecycleRecord(artifact)) {
+        return { status: "blocked", message: ACCEPTED_ARTIFACT_WRITEBACK_NOT_CURRENT_REASON };
+      }
+      if (artifact.status !== "completed_unmerged") {
+        return { status: "retry", message: "accepted-artifact writeback is waiting for verified PR closure" };
+      }
+      const registeredKey =
+        record.kind === "comment"
+          ? artifact.commentOperationKey
+          : record.kind === "transition"
+            ? artifact.doneTransitionOperationKey
+            : null;
+      if (registeredKey !== record.idempotencyKey) {
+        return { status: "blocked", message: "accepted-artifact writeback is not registered on the current artifact" };
+      }
+      return { status: "ready" };
+    }
     const issueBreakdownBinding = issueBreakdownPlanBindingForOperation(record);
     if (issueBreakdownBinding.status === "blocked") {
       return { status: "blocked", message: issueBreakdownBinding.message };
@@ -895,7 +933,9 @@ export class WritebackProcessor {
     }
     if (!isPullRequestHandoffOperation(record) || !this.lifecycleStore) return { status: "ready" };
     const lifecycle = await this.lifecycleStore.get(record.issueId);
-    const acceptedReport = lifecycle?.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
+    const acceptedReport = lifecycle === null
+      ? null
+      : latestCurrentCompletionReport(lifecycle);
     if (!acceptedReport || !acceptedReport.writebackOperationKeys.includes(record.idempotencyKey) || acceptedReport.pullRequest === null) {
       return {
         status: "blocked",
@@ -910,6 +950,15 @@ export class WritebackProcessor {
       return dryRunResult(record);
     }
     if (record.kind === "transition") {
+      if (acceptedArtifactBindingForOperation(record).status === "bound") {
+        const freshGuard = await this.verifyLifecycleBoundOperation(record);
+        if (freshGuard.status === "blocked") {
+          return { status: "skipped" as const, message: freshGuard.message };
+        }
+        if (freshGuard.status === "retry") {
+          throw new Error(freshGuard.message);
+        }
+      }
       return this.writer.transitionIssueState({
         issueId: record.issueId,
         toState: record.payload.toState,
@@ -953,6 +1002,25 @@ export class WritebackProcessor {
       payloadHash: record.payload.payloadHash,
     });
   }
+}
+
+export function acceptedArtifactIdForOperation(record: WritebackOperation): string | null {
+  const binding = acceptedArtifactBindingForOperation(record);
+  return binding.status === "bound" ? binding.artifactId : null;
+}
+
+type AcceptedArtifactBinding =
+  | { status: "none" }
+  | { status: "bound"; artifactId: string }
+  | { status: "blocked"; message: string };
+
+function acceptedArtifactBindingForOperation(record: WritebackOperation): AcceptedArtifactBinding {
+  if (record.kind !== "comment" && record.kind !== "transition") return { status: "none" };
+  if (!("acceptedArtifactId" in record.payload)) return { status: "none" };
+  const artifactId = record.payload.acceptedArtifactId?.trim() ?? "";
+  return artifactId.length > 0
+    ? { status: "bound", artifactId }
+    : { status: "blocked", message: "accepted-artifact writeback has an invalid lifecycle binding" };
 }
 
 function dryRunResult(record: WritebackOperation): TrackerWriteResult {
@@ -1062,6 +1130,7 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
       record.payload.toState === operation.payload.toState &&
       record.payload.reason === operation.payload.reason &&
       record.payload.issueBreakdownPlanId === operation.payload.issueBreakdownPlanId &&
+      record.payload.acceptedArtifactId === operation.payload.acceptedArtifactId &&
       stringArraysEqual(record.payload.fromStates, operation.payload.fromStates)
     );
   }
@@ -1069,7 +1138,8 @@ function matchesNewWritebackOperation(record: WritebackOperation, operation: New
     return (
       record.payload.body === operation.payload.body &&
       record.payload.dedupeKey === operation.payload.dedupeKey &&
-      record.payload.issueBreakdownPlanId === operation.payload.issueBreakdownPlanId
+      record.payload.issueBreakdownPlanId === operation.payload.issueBreakdownPlanId &&
+      record.payload.acceptedArtifactId === operation.payload.acceptedArtifactId
     );
   }
   if (record.kind === "issue_create" && operation.kind === "issue_create") {

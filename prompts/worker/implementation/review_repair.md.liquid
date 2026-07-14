@@ -9,5 +9,7 @@ The reviewer found contract-entitled gate defects in the previous implementation
 - Address only the reviewer gate findings appended below.
 - Treat discovery findings as non-directed context unless the current run directive explicitly asks you to repair them.
 - Revalidate the full issue contract, not only the changed lines.
+- For an accepted expected-red artifact, repair the test artifact only; do not absorb its implementation successor. Re-run the declared command and replace `artifactEvidence` with the corrected intended failure.
+- For an implementation seeded from a `Dependency Artifact Checkpoint`, preserve the inherited tests and prove the checkpoint command is green in `dependencyArtifactResult`.
 - Preserve correct completed work unless the reviewer evidence proves it is wrong.
 - Submit completion only after validation evidence proves every requirement and reviewer finding.

@@ -16,7 +16,7 @@ Complete the full planning workflow in this single session:
 6. Convert the final tasks into proposed Linear child issues.
 7. Call `submit_issue_breakdown_plan` before ending the run.
 
-Before proposing children, compare the parent contract, accepted completion reports, current branch diff, and named sibling owners. Never create a child whose scope is already implemented on the parent branch. An unmet dependency owned by an existing sibling issue must remain a dependency/sequence recommendation rather than being copied into a new child. In particular, do not decompose an accepted expected-red test artifact into duplicate test children while it waits for its named implementation issue.
+Before proposing children, compare the parent contract, accepted completion reports, current branch diff, and named sibling owners. Never create a child whose scope is already implemented on the parent branch. An unmet dependency owned by an existing sibling issue must remain a dependency/sequence recommendation rather than being copied into a new child. In particular, do not decompose an accepted expected-red test artifact into duplicate test children; its completed checkpoint is inherited by its declared implementation successors.
 
 ## Linear Child Issue Requirements
 
@@ -25,5 +25,6 @@ Before proposing children, compare the parent contract, accepted completion repo
 - Child-to-child task dependencies must be represented in `dependencies`.
 - Each child description must include: `Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`.
 - Each `Issue Contract` must include fenced JSON with `schemaVersion`, `contractVersion`, and non-empty stable `requirements`.
+- A deliberately unmerged expected-red test issue must declare `delivery: {"mode":"accepted_artifact","artifact":"expected_red_tests"}`. Its implementation sibling successors (children of the same decomposition parent), never children of the artifact issue, use merge delivery and directly depend on the test issue so Symphony can seed them from the accepted checkpoint.
 - Do not include `dogfood-ready`; operators add readiness labels after review.
 - Do not create Linear issues directly, transition Linear, comment on Linear, commit, or push.

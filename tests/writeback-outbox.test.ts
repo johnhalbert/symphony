@@ -31,6 +31,7 @@ import type {
 import type { Issue } from "../src/core/types.js";
 import type { IssueBreakdownFreshnessGuard } from "../src/core/writeback/WritebackOutbox.js";
 import {
+  ACCEPTED_ARTIFACT_WRITEBACK_NOT_CURRENT_REASON,
   FileWritebackOutboxStore,
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
   SqliteWritebackOutboxStore,
@@ -77,6 +78,133 @@ describe("FileWritebackOutboxStore", () => {
     expect(records).toHaveLength(1);
     expect(records[0]?.status).toBe("succeeded");
     expect(writer.transitions).toHaveLength(1);
+  });
+
+  it("executes only writebacks registered on the current completed accepted artifact", async () => {
+    const store = new FileWritebackOutboxStore(root);
+    const writer = new FakeWriter();
+    const artifact = {
+      id: "accepted-artifact-current",
+      status: "completed_unmerged",
+      commentOperationKey: "comment:issue-1:artifact-current",
+      doneTransitionOperationKey: "transition:issue-1:artifact-current:Done",
+    };
+    const processor = new WritebackProcessor(
+      store,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      { get: async () => ({ acceptedArtifact: artifact }) as unknown as IssueLifecycleRecord },
+    );
+
+    const stale = await processor.enqueueAndProcess({
+      idempotencyKey: "transition:issue-1:artifact-stale:Done",
+      kind: "transition",
+      issueId: "issue-1",
+      payload: {
+        acceptedArtifactId: "accepted-artifact-stale",
+        fromStates: ["In Review"],
+        toState: "Done",
+      },
+    });
+    const current = await processor.enqueueAndProcess({
+      idempotencyKey: artifact.doneTransitionOperationKey,
+      kind: "transition",
+      issueId: "issue-1",
+      payload: {
+        acceptedArtifactId: artifact.id,
+        fromStates: ["In Review"],
+        toState: "Done",
+      },
+    });
+
+    expect(stale).toMatchObject({ status: "skipped", lastError: ACCEPTED_ARTIFACT_WRITEBACK_NOT_CURRENT_REASON });
+    expect(current.status).toBe("succeeded");
+    expect(writer.transitions).toHaveLength(1);
+
+    const supersededStore = new FileWritebackOutboxStore(
+      path.join(root, "superseded-artifact"),
+    );
+    const supersededProcessor = new WritebackProcessor(
+      supersededStore,
+      writer,
+      new StructuredLogger(() => undefined),
+      300_000,
+      {
+        get: async () =>
+          ({
+            acceptedArtifact: {
+              ...artifact,
+              supersededAt: "2026-07-14T00:00:00.000Z",
+              supersededBy: "fresh-review",
+              supersededReason: "head drift",
+            },
+          }) as unknown as IssueLifecycleRecord,
+      },
+    );
+    const superseded = await supersededProcessor.enqueueAndProcess(
+      {
+        idempotencyKey: artifact.doneTransitionOperationKey,
+        kind: "transition",
+        issueId: "issue-1",
+        payload: {
+          acceptedArtifactId: artifact.id,
+          fromStates: ["In Review"],
+          toState: "Done",
+        },
+      },
+      { retrySkipped: true },
+    );
+    expect(superseded).toMatchObject({
+      status: "skipped",
+      lastError: ACCEPTED_ARTIFACT_WRITEBACK_NOT_CURRENT_REASON,
+    });
+    expect(writer.transitions).toHaveLength(1);
+
+    const racingStore = new FileWritebackOutboxStore(
+      path.join(root, "racing-artifact"),
+    );
+    const racingWriter = new FakeWriter();
+    let lifecycleReads = 0;
+    const racingProcessor = new WritebackProcessor(
+      racingStore,
+      racingWriter,
+      new StructuredLogger(() => undefined),
+      300_000,
+      {
+        get: async () => {
+          lifecycleReads += 1;
+          return {
+            acceptedArtifact:
+              lifecycleReads === 1
+                ? artifact
+                : {
+                    ...artifact,
+                    supersededAt: "2026-07-14T00:01:00.000Z",
+                    supersededBy: "source_reopened",
+                    supersededReason: "Source reopened before transition execution",
+                  },
+          } as unknown as IssueLifecycleRecord;
+        },
+      },
+    );
+    const raced = await racingProcessor.enqueueAndProcess({
+      idempotencyKey: artifact.doneTransitionOperationKey,
+      kind: "transition",
+      issueId: "issue-1",
+      payload: {
+        acceptedArtifactId: artifact.id,
+        fromStates: ["In Review"],
+        toState: "Done",
+      },
+    });
+
+    expect(raced).toMatchObject({
+      status: "skipped",
+      lastError: ACCEPTED_ARTIFACT_WRITEBACK_NOT_CURRENT_REASON,
+    });
+    expect(lifecycleReads).toBe(2);
+    expect(racingWriter.transitions).toHaveLength(0);
   });
 
 

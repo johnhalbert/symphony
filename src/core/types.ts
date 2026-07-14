@@ -4,6 +4,33 @@ export interface IssueBlockerRef {
   state: string | null;
 }
 
+export interface ArtifactFileManifestEntry {
+  path: string;
+  status: "added" | "modified" | "deleted" | "renamed";
+  blobSha: string | null;
+}
+
+export interface AcceptedArtifactWorkspaceSeed {
+  version: 1;
+  kind: "accepted_artifact";
+  artifactId: string;
+  sourceIssueId: string;
+  sourceIssueIdentifier: string;
+  repositoryFingerprint: string;
+  sourceBranch: string;
+  sourceHeadSha: string;
+  sourceBaseHeadSha: string;
+  configuredBaseRef: string;
+  fileManifest: ArtifactFileManifestEntry[];
+}
+
+export interface WorkspaceSeedBinding extends AcceptedArtifactWorkspaceSeed {
+  targetBranch: string;
+  preparedBaseHeadSha: string;
+  preparedHeadSha: string | null;
+  conflictedFiles: string[];
+}
+
 export interface IssueChildRef {
   id: string | null;
   identifier: string | null;
@@ -108,6 +135,25 @@ export interface IssuePullRequestSummary {
   lastPushedAt: string | null;
 }
 
+export interface IssueAcceptedArtifactSummary {
+  id: string;
+  status: "checkpointed" | "completed_unmerged";
+  sourceIssueId: string;
+  sourceIssueIdentifier: string;
+  sourceHeadSha: string;
+}
+
+export interface IssueWorkspaceSeedSummary {
+  id: string;
+  status: "planned" | "preparing" | "conflicted" | "prepared" | "invalid";
+  artifactId: string;
+  sourceIssueId: string;
+  sourceIssueIdentifier: string;
+  sourceHeadSha: string;
+  preparedHeadSha: string | null;
+  conflictedFiles: string[];
+}
+
 export type IssueMergeGateViewStatus = "observing" | "repair_dispatched" | "blocked" | "resolved" | "superseded";
 export type IssueMergeGateViewCheckOutcome =
   | "passing"
@@ -182,6 +228,8 @@ export interface IssueDetailsEnvelope {
   workspace: IssueWorkspaceSummary;
   pullRequest: IssuePullRequestSummary;
   mergeGate?: IssueMergeGateSummary | null;
+  acceptedArtifact?: IssueAcceptedArtifactSummary | null;
+  workspaceSeed?: IssueWorkspaceSeedSummary | null;
   latestRun: IssueLatestRunSummary;
 }
 
@@ -221,6 +269,7 @@ export interface Workspace {
   gitBranchName?: string;
   repoPath?: string;
   baseRef?: string;
+  seed?: WorkspaceSeedBinding;
 }
 
 export type AgentRunRole = "worker" | "reviewer" | "triage" | "planner" | "post_mortem";

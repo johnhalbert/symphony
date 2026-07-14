@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ServiceConfig } from "./config/Config.js";
 import type { Issue } from "./types.js";
 
@@ -92,6 +93,43 @@ export interface IssueContractPromptSummary extends IssueContractAnalysis {
   validationRequirements: string | null;
 }
 
+export interface IssueContractRequirement {
+  id: string;
+  requirement: string;
+  proofHint?: string;
+  [key: string]: unknown;
+}
+
+export type IssueContractDelivery =
+  | { mode: "merge" }
+  | { mode: "accepted_artifact"; artifact: "expected_red_tests" };
+
+export interface ParsedIssueContract {
+  schemaVersion: number;
+  contractVersion: string;
+  requirements: IssueContractRequirement[];
+  delivery: IssueContractDelivery;
+  [key: string]: unknown;
+}
+
+export interface ParsedIssueContractSnapshot extends ParsedIssueContract {
+  document: Record<string, unknown>;
+  canonicalJson: string;
+  fingerprint: string;
+}
+
+export type ParsedIssueContractResult =
+  | {
+      valid: true;
+      contract: ParsedIssueContract;
+      canonicalJson: string;
+      fingerprint: string;
+    }
+  | {
+      valid: false;
+      errors: string[];
+    };
+
 export function lintAgentEligibleIssueContract(issue: Issue, config: ServiceConfig): IssueContractLintResult {
   const applicable = requiresAgentEligibleIssueContract(issue, config);
   const analysis = applicable
@@ -154,6 +192,79 @@ export function summarizeIssueContractForPrompt(
   };
 }
 
+export function parseIssueContractFromDescription(
+  description: string | null | undefined,
+): ParsedIssueContractSnapshot | null {
+  const result = parseIssueContract(description);
+  if (!result.valid) return null;
+  return {
+    ...result.contract,
+    document: result.contract,
+    canonicalJson: result.canonicalJson,
+    fingerprint: result.fingerprint,
+  };
+}
+
+export function parseIssueContract(description: string | null | undefined): ParsedIssueContractResult {
+  const sections = markdownSections(description ?? "");
+  const section = sections.get(normalizeHeading(ISSUE_CONTRACT_HEADING));
+  if (section === undefined) {
+    return { valid: false, errors: ["Issue Contract section is missing"] };
+  }
+  const fencedJson = extractFencedJsonBlock(section);
+  if (fencedJson === null) {
+    return { valid: false, errors: ["Issue Contract must contain a fenced `json` block"] };
+  }
+  return parseIssueContractJsonResult(fencedJson);
+}
+
+export function parseIssueContractJson(value: string): ParsedIssueContractSnapshot | null {
+  const result = parseIssueContractJsonResult(value);
+  if (!result.valid) return null;
+  return {
+    ...result.contract,
+    document: result.contract,
+    canonicalJson: result.canonicalJson,
+    fingerprint: result.fingerprint,
+  };
+}
+
+function parseIssueContractJsonResult(value: string): ParsedIssueContractResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return { valid: false, errors: ["Issue Contract fenced `json` must parse as valid JSON"] };
+  }
+  if (!isRecord(parsed)) return { valid: false, errors: ["Issue Contract JSON must be an object"] };
+  const errors = validateIssueContractObject(parsed);
+  if (errors.length > 0) return { valid: false, errors };
+
+  const delivery = parseIssueContractDelivery(parsed.delivery);
+  if (delivery === null) {
+    return { valid: false, errors: ["Issue Contract delivery is invalid"] };
+  }
+  const contract: ParsedIssueContract = {
+    ...parsed,
+    schemaVersion: parsed.schemaVersion as number,
+    contractVersion: (parsed.contractVersion as string).trim(),
+    requirements: (parsed.requirements as Record<string, unknown>[]).map((requirement) => ({
+      ...requirement,
+      id: (requirement.id as string).trim(),
+      requirement: (requirement.requirement as string).trim(),
+      ...(typeof requirement.proofHint === "string" ? { proofHint: requirement.proofHint.trim() } : {}),
+    })),
+    delivery,
+  };
+  const canonicalJson = stableJson(contract);
+  return {
+    valid: true,
+    contract,
+    canonicalJson,
+    fingerprint: createHash("sha256").update(canonicalJson).digest("hex"),
+  };
+}
+
 export function hasMeaningfulRemainingBlocker(remainingBlocker: string | null | undefined): boolean {
   if (!remainingBlocker) return false;
 
@@ -188,6 +299,10 @@ function validateIssueContractSection(section: string | undefined): string[] {
     return ["Issue Contract JSON must be an object"];
   }
 
+  return validateIssueContractObject(parsed);
+}
+
+function validateIssueContractObject(parsed: Record<string, unknown>): string[] {
   const errors: string[] = [];
   const schemaVersion = parsed.schemaVersion;
   if (typeof schemaVersion !== "number" || !Number.isInteger(schemaVersion) || schemaVersion <= 0) {
@@ -198,6 +313,8 @@ function validateIssueContractSection(section: string | undefined): string[] {
   if (contractVersion.length === 0) {
     errors.push("Issue Contract must include a non-empty `contractVersion`");
   }
+
+  errors.push(...validateIssueContractDelivery(parsed.delivery));
 
   const requirements = parsed.requirements;
   if (!Array.isArray(requirements) || requirements.length === 0) {
@@ -247,9 +364,40 @@ function validateIssueContractSection(section: string | undefined): string[] {
   return errors;
 }
 
+function validateIssueContractDelivery(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!isRecord(value)) {
+    return ["Issue Contract `delivery` must be an object"];
+  }
+
+  if (value.mode !== "merge" && value.mode !== "accepted_artifact") {
+    return ["Issue Contract `delivery.mode` must be `merge` or `accepted_artifact`"];
+  }
+
+  const allowedKeys = value.mode === "merge" ? new Set(["mode"]) : new Set(["mode", "artifact"]);
+  const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
+  const errors: string[] = [];
+  if (unknownKeys.length > 0) {
+    errors.push(`Issue Contract \`delivery\` contains unsupported fields: ${unknownKeys.sort().join(", ")}`);
+  }
+  if (value.mode === "accepted_artifact" && value.artifact !== "expected_red_tests") {
+    errors.push("Issue Contract accepted-artifact delivery requires `artifact: expected_red_tests`");
+  }
+  return errors;
+}
+
+function parseIssueContractDelivery(value: unknown): IssueContractDelivery | null {
+  if (value === undefined) return { mode: "merge" };
+  const errors = validateIssueContractDelivery(value);
+  if (errors.length > 0 || !isRecord(value)) return null;
+  return value.mode === "accepted_artifact"
+    ? { mode: "accepted_artifact", artifact: "expected_red_tests" }
+    : { mode: "merge" };
+}
+
 function validateIssueContractSpecificity(section: string | undefined): string[] {
   if (section === undefined) return [];
-  const parsed = parseIssueContractJson(section);
+  const parsed = parseIssueContractSectionJson(section);
   if (!parsed || !isRecord(parsed)) return [];
   const requirements = parsed.requirements;
   if (!Array.isArray(requirements) || requirements.length !== 1) return [];
@@ -430,7 +578,7 @@ function parseRemainingBlocker(section: string): string | null {
   return null;
 }
 
-function parseIssueContractJson(section: string): unknown | null {
+function parseIssueContractSectionJson(section: string): unknown | null {
   const fencedJson = extractFencedJsonBlock(section);
   if (!fencedJson) return null;
   try {
@@ -620,6 +768,17 @@ function isJsonFence(fence: MarkdownFenceDelimiter): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  if (isRecord(value)) {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 function normalizeBlockerText(value: string): string {

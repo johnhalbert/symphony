@@ -7,6 +7,7 @@ The previous implementation turn did not satisfy all required completion expecta
 ## Required Behavior
 
 - Re-check the fenced JSON Issue Contract and satisfy every requirement ID.
+- Honor its delivery mode: expected-red artifact work must submit structured `artifactEvidence`; a seeded implementation must submit a green `dependencyArtifactResult` for the injected checkpoint.
 - Treat this as incomplete work, not a broad repair pass.
 - Preserve correct completed work unless the evidence proves it conflicts with the contract.
 - Submit completion only after validation evidence proves each requirement.

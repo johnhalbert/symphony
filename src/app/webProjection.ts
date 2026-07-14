@@ -1632,6 +1632,8 @@ function projectIssueDescription(
   const description = normalizeDescription(details.issue.description);
   const blockerText = issueBlockerDescription(details);
   if (blockerText) description.push(blockerText);
+  addUniqueText(description, acceptedArtifactDescription(details));
+  addUniqueText(description, workspaceSeedDescription(details));
   addUniqueText(description, reviewLoop?.blockedReason ?? null);
   addUniqueText(description, reviewLoop?.lastCompletionReport?.summary ?? null);
   addUniqueText(description, reviewLoop?.lastIssueTriageReport?.summary ?? null);
@@ -1680,6 +1682,20 @@ function projectIssueDescription(
   }
   if (details.latestRun.error) addUniqueText(description, details.latestRun.error);
   return description;
+}
+
+function acceptedArtifactDescription(details: IssueDetailsEnvelope): string | null {
+  const artifact = details.acceptedArtifact;
+  if (!artifact) return null;
+  return `Accepted artifact ${artifact.id}: ${artifact.status} from ${artifact.sourceIssueIdentifier} at ${artifact.sourceHeadSha}`;
+}
+
+function workspaceSeedDescription(details: IssueDetailsEnvelope): string | null {
+  const seed = details.workspaceSeed;
+  if (!seed) return null;
+  const head = seed.preparedHeadSha ?? "not prepared";
+  const conflicts = seed.conflictedFiles.length > 0 ? `; conflicts: ${seed.conflictedFiles.join(", ")}` : "";
+  return `Accepted artifact seed ${seed.status} from ${seed.sourceIssueIdentifier} at ${head}${conflicts}`;
 }
 
 function issueBlockerDescription(details: IssueDetailsEnvelope): string | null {

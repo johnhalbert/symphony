@@ -222,6 +222,37 @@ function lifecycle(overrides: Partial<IssueLifecycleRecord> = {}): IssueLifecycl
 }
 
 describe("web projection foundation", () => {
+  it("describes accepted artifacts and dependency workspace seeds", () => {
+    const model = projectIssueModel(
+      issueDetails({
+        acceptedArtifact: {
+          id: "accepted-artifact-1",
+          status: "completed_unmerged",
+          sourceIssueId: "issue-source",
+          sourceIssueIdentifier: "TEST-SOURCE",
+          sourceHeadSha: "source-head-sha",
+        },
+        workspaceSeed: {
+          id: "workspace-seed-1",
+          status: "conflicted",
+          artifactId: "accepted-artifact-1",
+          sourceIssueId: "issue-source",
+          sourceIssueIdentifier: "TEST-SOURCE",
+          sourceHeadSha: "source-head-sha",
+          preparedHeadSha: "prepared-head-sha",
+          conflictedFiles: ["src/service.ts", "tests/service.test.ts"],
+        },
+      }),
+    );
+
+    expect(model.desc).toEqual(
+      expect.arrayContaining([
+        "Accepted artifact accepted-artifact-1: completed_unmerged from TEST-SOURCE at source-head-sha",
+        "Accepted artifact seed conflicted from TEST-SOURCE at prepared-head-sha; conflicts: src/service.ts, tests/service.test.ts",
+      ]),
+    );
+  });
+
   it("projects issue board cards into stable design-system issue models", () => {
     const boardInput: IssueBoardResponseProjectionInput = {
       generatedAt: "2026-01-01T00:06:00.000Z",

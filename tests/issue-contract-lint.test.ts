@@ -3,6 +3,8 @@ import {
   analyzeIssueContractDescription,
   hasMeaningfulRemainingBlocker,
   missingRequiredIssueContractSections,
+  parseIssueContractFromDescription,
+  parseIssueContractJson,
 } from "../src/core/IssueContractLint.js";
 import { agentEligibleIssueContract, fencedAuthoringSectionSpoof, nestedFencedIssueContractSpoof } from "./helpers.js";
 
@@ -62,6 +64,82 @@ describe("IssueContractLint", () => {
     ],
   ])("reports invalid Issue Contract content for %s", (_label, description, expectedError) => {
     const analysis = analyzeIssueContractDescription(description, []);
+
+    expect(analysis.issueContractErrors).toEqual(expect.arrayContaining([expect.stringContaining(expectedError)]));
+  });
+
+  it("defaults legacy contracts to merge delivery and exposes a canonical fingerprint", () => {
+    const implicit = parseIssueContractFromDescription(agentEligibleIssueContract());
+    const explicit = parseIssueContractFromDescription(
+      agentEligibleIssueContract({ issueContractDelivery: { mode: "merge" } }),
+    );
+
+    expect(implicit).toMatchObject({
+      schemaVersion: 1,
+      delivery: { mode: "merge" },
+      fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(implicit?.document).toMatchObject({ delivery: { mode: "merge" } });
+    expect(implicit?.fingerprint).toBe(explicit?.fingerprint);
+  });
+
+  it("parses the accepted expected-red artifact delivery mode", () => {
+    const parsed = parseIssueContractFromDescription(
+      agentEligibleIssueContract({
+        issueContractDelivery: { mode: "accepted_artifact", artifact: "expected_red_tests" },
+      }),
+    );
+
+    expect(parsed?.delivery).toEqual({ mode: "accepted_artifact", artifact: "expected_red_tests" });
+  });
+
+  it("canonicalizes object key ordering while fingerprinting the entire contract", () => {
+    const first = parseIssueContractJson(
+      JSON.stringify({
+        schemaVersion: 1,
+        contractVersion: "v1",
+        requirements: [{ id: "REQ-001", requirement: "Write the expected-red test." }],
+        delivery: { mode: "accepted_artifact", artifact: "expected_red_tests" },
+      }),
+    );
+    const reordered = parseIssueContractJson(
+      JSON.stringify({
+        delivery: { artifact: "expected_red_tests", mode: "accepted_artifact" },
+        requirements: [{ requirement: "Write the expected-red test.", id: "REQ-001" }],
+        contractVersion: "v1",
+        schemaVersion: 1,
+      }),
+    );
+    const changed = parseIssueContractJson(
+      JSON.stringify({
+        schemaVersion: 1,
+        contractVersion: "v1",
+        requirements: [{ id: "REQ-001", requirement: "Write a different expected-red test." }],
+        delivery: { mode: "accepted_artifact", artifact: "expected_red_tests" },
+      }),
+    );
+
+    expect(first?.fingerprint).toBe(reordered?.fingerprint);
+    expect(first?.fingerprint).not.toBe(changed?.fingerprint);
+  });
+
+  it.each([
+    [{ mode: "artifact" }, "delivery.mode"],
+    [{ mode: "accepted_artifact", artifact: "test_bundle" }, "expected_red_tests"],
+    [{ mode: "merge", artifact: "expected_red_tests" }, "unsupported fields"],
+    [{ mode: "accepted_artifact", artifact: "expected_red_tests", branch: "feature" }, "unsupported fields"],
+  ])("rejects invalid strict delivery metadata %#", (delivery, expectedError) => {
+    const analysis = analyzeIssueContractDescription(
+      agentEligibleIssueContract({
+        issueContractJson: JSON.stringify({
+          schemaVersion: 1,
+          contractVersion: "v1",
+          requirements: [{ id: "REQ-001", requirement: "Write the expected-red test." }],
+          delivery,
+        }),
+      }),
+      [],
+    );
 
     expect(analysis.issueContractErrors).toEqual(expect.arrayContaining([expect.stringContaining(expectedError)]));
   });

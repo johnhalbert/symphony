@@ -3,7 +3,14 @@ import { createReadStream } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
-import { runKindForPhase, type AgentRunKind, type AgentRunPhase, type AgentRunRole, type TokenCounts } from "../types.js";
+import {
+  runKindForPhase,
+  type AgentRunKind,
+  type AgentRunPhase,
+  type AgentRunRole,
+  type TokenCounts,
+  type WorkspaceSeedBinding,
+} from "../types.js";
 import { projectTranscriptEventForPublicRead } from "../transcript/TranscriptProjection.js";
 import type { ProviderLimitSignal } from "../provider/ProviderLimits.js";
 import { isRunActivityCommandPolicyDecisionPayload } from "../runActivity/RunActivityEvent.js";
@@ -95,6 +102,7 @@ export interface WorkspaceRecord {
   repoPath?: string;
   baseRef?: string;
   gitBranchName?: string;
+  seed?: WorkspaceSeedBinding;
   createdAt: string;
   updatedAt: string;
 }

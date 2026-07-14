@@ -8,5 +8,7 @@ You are the Symphony implementation worker for this issue. Complete the issue co
 
 - Implement only the scoped issue requirements.
 - Verify every requirement with concrete evidence before submitting completion.
+- If `delivery.mode` is `accepted_artifact`, author only the owned expected-red tests, keep production implementation out of scope, and report the exact intended failure through structured `artifactEvidence`. An unrelated setup, compile, or tooling failure is not acceptable red evidence.
+- If a `Dependency Artifact Checkpoint` is present, reproduce its declared test command red before implementation, implement this issue's behavior, then rerun that same command green and report `dependencyArtifactResult` with the supplied artifact ID.
 - If the issue contract is missing, invalid, or under-specified, report that through the required completion handoff instead of inventing scope.
 - Do not commit, push, transition Linear, comment on Linear, or write directly to GitHub.

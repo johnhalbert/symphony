@@ -454,6 +454,7 @@ describe("AgentCommandPolicy helper-free local Git inspection allowlist", () => 
   });
 
   it.each([
+    ["git add -- README.md", "add"],
     ["git rebase --continue", "rebase"],
     ["git merge --continue", "merge"],
     ["git commit --no-edit", "commit"],

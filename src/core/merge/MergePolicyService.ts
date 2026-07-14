@@ -30,7 +30,11 @@ import type {
   IssueMergeGateResultRecord,
   IssueReviewVerdictRecord,
 } from "../persistence/IssueLifecycleStore.js";
-import { isSupersededLifecycleRecord, latestCurrentApprovalPassVerdict } from "../persistence/IssueLifecycleStore.js";
+import {
+  isSupersededLifecycleRecord,
+  latestCurrentApprovalPassVerdict,
+  latestCurrentCompletionReport,
+} from "../persistence/IssueLifecycleStore.js";
 import type { RunRecord, RunTranscriptStore } from "../persistence/RunTranscriptStore.js";
 import type { TrackerClient } from "../tracker/TrackerClient.js";
 import type { Issue } from "../types.js";
@@ -370,7 +374,7 @@ export class MergePolicyService {
       return this.skippedObservation(latestIssue, inputFingerprint, observedAt, `issue is not in a merge source state: ${latestIssue.state}`);
     }
 
-    const report = latestCompletionReport(lifecycle);
+    const report = latestCurrentCompletionReport(lifecycle);
     if (!report) throw new SymphonyError("invalid_request", "Gated merge requires a latest completion report");
 
     const approvedPullRequest = requirePullRequest(report);
@@ -984,7 +988,7 @@ export class MergePolicyService {
     const originalHeadSha =
       observation.worktreeHeadSha ??
       lifecycle.summaryPointers.prHeadSha ??
-      latestCompletionReport(lifecycle)?.pullRequest?.headSha;
+      latestCurrentCompletionReport(lifecycle)?.pullRequest?.headSha;
     const baseBranch =
       observation.normalizedBaseBranch ??
       observation.baseRef ??
@@ -2091,7 +2095,7 @@ export class MergePolicyService {
     if (staleConflictResult !== null) return staleConflictResult;
     if (sourceState === null) return { status: "skipped", reason: `issue is not in a merge source state: ${latestIssue.state}` };
 
-    const report = latestCompletionReport(lifecycle);
+    const report = latestCurrentCompletionReport(lifecycle);
     if (!report) throw new SymphonyError("invalid_request", "Gated merge requires a latest completion report");
 
     const approvedPullRequest = requirePullRequest(report);
@@ -2632,7 +2636,7 @@ export class MergePolicyService {
     ) {
       return null;
     }
-    const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+    const reportPullRequest = latestCurrentCompletionReport(lifecycle)?.pullRequest ?? null;
     if (
       reportPullRequest === null ||
       conflict.pullRequest.number !== reportPullRequest.number ||
@@ -2727,14 +2731,6 @@ export class MergePolicyService {
     }
     return { kind: "passed", checkStatus: { requiredChecks, passedChecks: requiredChecks, noCiEvidence: null }, gate: baseGate };
   }
-}
-
-function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {
-  if (lifecycle.lastCompletionReportId) {
-    const exact = lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
-    if (exact) return exact;
-  }
-  return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
 }
 
 function findMergeGateFailure(lifecycle: IssueLifecycleRecord, gateId: string): MergeGateFailureRecord | null {
@@ -2856,7 +2852,7 @@ function pullRequestForBaseRefRepair(
   branchName: string,
   headSha: string,
 ): CompletionReportPullRequestRef | null {
-  const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+  const reportPullRequest = latestCurrentCompletionReport(lifecycle)?.pullRequest ?? null;
   const hasSummaryRemoteMetadata =
     lifecycle.summaryPointers.prUrl !== null ||
     lifecycle.summaryPointers.prNumber !== null ||
@@ -2906,7 +2902,7 @@ function pullRequestRefForPreservedStashRestore(
   branchName: string,
   headSha: string,
 ): CompletionReportPullRequestRef {
-  const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+  const reportPullRequest = latestCurrentCompletionReport(lifecycle)?.pullRequest ?? null;
   return {
     url: reportPullRequest?.url ?? lifecycle.summaryPointers.prUrl,
     number: reportPullRequest?.number ?? lifecycle.summaryPointers.prNumber,
@@ -3472,7 +3468,7 @@ function shouldRefreshSameMergeGateBlocker(lifecycle: IssueLifecycleRecord, gate
 function hasCompletedRepairApproval(lifecycle: IssueLifecycleRecord, gate: IssueMergeGateState): boolean {
   if (!gate.repairRunId || !gate.repairReportId) return false;
   if (lifecycle.lastCompletionReportId !== gate.repairReportId) return false;
-  const repairReport = lifecycle.completionReports.find((report) => report.id === gate.repairReportId) ?? null;
+  const repairReport = latestCurrentCompletionReport(lifecycle);
   if (!repairReport || repairReport.runId !== gate.repairRunId) return false;
   if (repairReport.acceptedAt.trim().length === 0) return false;
   if (repairReport.pullRequest?.number !== gate.pullRequest.number) return false;

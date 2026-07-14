@@ -13,6 +13,7 @@ export const DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE = [
   "Use a blocked verdict instead of a fail verdict when required validation, tooling, credentials, or service-owned evidence is unavailable to worker/reviewer roles and the bounded repair is not worker-owned.",
   "Use discovery findings for inferred scope, adjacent sibling scenarios, hidden matrix axes, sibling issue scope, future hardening, or out-of-scope concerns. Discovery findings are valuable backlog/decomposition evidence, but they must not gate the worker unless they also satisfy the gate-finding entitlement rubric.",
   "A pass verdict is allowed when all written contract requirements are satisfied, even if important discovery findings remain. If satisfying a concern requires broad new scenario expansion or multiple child workstreams, report planner_decomposition discovery instead of forcing another repair loop.",
+  "When the Issue Contract explicitly declares accepted expected-red artifact delivery, judge the test artifact and its structured failure evidence rather than the intentionally absent production implementation. A correct artifact passes with non-merge COMMENT feedback; do not block it merely because its implementation successor has not run.",
   "If the issue is missing `Contract Checklist` or `Validation Requirements`, describe the missing issue contract as an authoring/decomposition signal. Fail only for missed behavior or validation that is directly entitled by the current issue contract.",
 ].join("\n\n");
 
@@ -23,6 +24,7 @@ export const DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE = [
   "",
   "Before reporting completion, build a small scenario matrix for the touched gate behavior and use it to guide implementation and validation. Do not repair reviewer discovery findings unless the current directive explicitly makes them worker-owned.",
   "If the issue lacks `Contract Checklist` or `Validation Requirements`, derive a conservative checklist from the acceptance criteria, touched surfaces, repository invariants, and the general scenario matrix. Mention the issue-authoring gap in the completion report without reducing validation scope.",
+  "Honor structured TDD context. Accepted expected-red artifact work reports its intended nonzero test result through artifactEvidence without implementing successor scope. A worker given a Dependency Artifact Checkpoint must reproduce red, implement the owned behavior, rerun green, and submit dependencyArtifactResult.",
   "",
   "General software change matrix:",
   ...GENERAL_REVIEW_SCENARIO_MATRIX.map((item) => `- ${item}`),

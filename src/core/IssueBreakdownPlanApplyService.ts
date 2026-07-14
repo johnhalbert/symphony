@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ServiceConfig } from "./config/Config.js";
+import { parseIssueContract } from "./IssueContractLint.js";
 import { issueBreakdownPlanFingerprintsMatch, latestFreshIssueBreakdownPlan } from "./IssueBreakdownPlanService.js";
 import type {
   IssueBreakdownCreatedIssueRef,
@@ -43,6 +44,16 @@ export class IssueBreakdownPlanApplyService {
   ): Promise<IssueBreakdownPlanApplyResult> {
     if (!this.options.config.issueBreakdown.applyToLinear.enabled) {
       return { status: "not_required", reason: "apply_to_linear_disabled" };
+    }
+    const contract = parseIssueContract(issue.description);
+    if (
+      contract.valid &&
+      contract.contract.delivery.mode === "accepted_artifact"
+    ) {
+      return {
+        status: "no_fresh_plan",
+        reason: "accepted_artifact_contract_cannot_be_decomposed",
+      };
     }
     const lifecycle = await this.options.lifecycleStore.get(issue.id);
     const plan = latestFreshIssueBreakdownPlan(lifecycle, issue, this.options.config);

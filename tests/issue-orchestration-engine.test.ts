@@ -194,6 +194,8 @@ function snapshot(): IssueCurrentStateSnapshot {
     lastMergeGateResultId: null,
     latestCompletionReport: null,
     latestApprovalPassVerdict: null,
+    acceptedArtifact: null,
+    workspaceSeed: null,
     mergeGate: null,
     mergeConflict: null,
     lifecycleSummaryCiStatus: null,

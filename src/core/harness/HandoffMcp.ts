@@ -42,6 +42,9 @@ export function symphonyRoleMcpServers(
   const applyCwd = (server: McpSubprocessServerConfig): McpSubprocessServerConfig =>
     options.mcpCwd === undefined ? server : { ...server, cwd: options.mcpCwd };
   if (ctx.role === "worker" && currentRunPhase(ctx) === "implementation") {
+    if (ctx.suppressCompletionHandoff === true) {
+      return transcriptRecallMcpServerEntry(ctx, options, applyCwd);
+    }
     return {
       symphony: applyCwd(completionReportMcpServerConfig(ctx, completionReportContextFilePath(ctx), options)),
       ...transcriptRecallMcpServerEntry(ctx, options, applyCwd),
@@ -147,10 +150,12 @@ export function renderCompletionMcpHandoffPrompt(input: RuntimeHandoffPromptInpu
     `- Branch: ${input.branchName ?? input.issue.branchName ?? "n/a"}`,
     `- Repository path: ${input.repoPath ?? "n/a"}`,
     `- Base ref: ${input.baseRef ?? "n/a"}`,
-    "- Before ending the run, call the submit_completion_report MCP tool with summary, validationEvidence, acceptanceChecklist, changedFiles, branchName, pullRequest, risks, and idempotencyKey.",
+    "- Before ending the run, call the submit_completion_report MCP tool with summary, validationEvidence, acceptanceChecklist, changedFiles, branchName, pullRequest, risks, and idempotencyKey, plus artifactEvidence or dependencyArtifactResult when the contract context requires it.",
     "- Submit a completion report only for review-ready work: every acceptanceChecklist item must be satisfied with durable evidence. If a required implementation or validation step cannot be completed, do not mark it satisfied or claim review readiness.",
     "- If the issue description contains a fenced JSON Issue Contract, treat its requirements as the authoritative acceptance contract: include one acceptanceChecklist item for every requirement `id`, start the item text with that `id`, and mark it satisfied only when the evidence proves the exact required behavior.",
     "- Evidence must cite durable proof such as commands run, emitted artifact fields, API responses, logs, tests, or file paths. When the issue asks for operator instructions or recorded artifacts, verify that the documented command invocation actually produces the documented fields; do not rely on inferred behavior or nearby implementation details.",
+    "- When the Issue Contract declares delivery.mode=accepted_artifact and artifact=expected_red_tests, submit structured artifactEvidence with kind=expected_red_tests, the exact command, every changed test file, the expected failure, a stable exact observedFailure excerpt copied from that command's output, and its positive nonzero exitCode. That intended red result is review-ready evidence for the test artifact; do not implement the out-of-scope production behavior merely to make it green.",
+    "- When the prompt contains a Dependency Artifact Checkpoint, first reproduce its expected-red command, implement the owned behavior, rerun the same command to green, and submit dependencyArtifactResult with the checkpoint artifactId, exact command, exitCode=0, and concrete passing evidence.",
     "- Leave implementation changes uncommitted and unpushed in the assigned worktree. Do not run git commit, git push, gh pr create, or gh pr edit; the allowed GitHub path is the Symphony service-owned GitHub workflow through submit_completion_report, and Symphony performs service-owned commit, push, and PR creation/reuse after the completion report is accepted.",
     "- The MCP server is scoped to this issue and the current runtime run; Symphony injects runId and issueId for you.",
     "- Do not comment on Linear, transition Linear state, or request broad Linear write credentials. Symphony handles writeback after the tool accepts the report.",
@@ -168,11 +173,12 @@ export function renderReviewMcpHandoffPrompt(input: RuntimeHandoffPromptInput): 
     `- Repository path: ${input.repoPath ?? "n/a"}`,
     `- Base ref: ${input.baseRef ?? "n/a"}`,
     "- Use submit_pull_request_review_feedback for GitHub PR review feedback before submit_review_verdict; the allowed GitHub review-write path is the Symphony service-owned review feedback workflow against the lifecycle-bound PR.",
-    "- Never call submit_pull_request_review_feedback with {}; Symphony supplies PR context only, and you must still provide a feedback payload such as {\"kind\":\"review\",\"event\":\"APPROVE\",\"body\":\"...\",\"idempotencyKey\":\"...\"}.",
+    "- Never call submit_pull_request_review_feedback with {}; Symphony supplies PR context only. For merge delivery provide {\"kind\":\"review\",\"event\":\"APPROVE\",\"body\":\"...\",\"idempotencyKey\":\"...\"}; for an accepted expected-red artifact use event=COMMENT so acceptance cannot authorize merging red tests.",
     "- Do not run gh pr review, gh pr comment, git push, direct GitHub API/curl writes, or otherwise write to GitHub directly from the reviewer command surface.",
     "- After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence, then call submit_review_verdict before ending the run.",
     "- Use verdict \"blocked\" when review cannot complete because required validation, tooling, credentials, or service-owned evidence is unavailable to the worker/reviewer and the bounded repair is not worker-owned.",
-    "- A failed validation command, red test suite, failed CI check, typecheck/lint/build failure, or failing test file is fail by default unless you prove it is not worker-owned; an unchanged failing test file is only a triage clue, not proof.",
+    "- A failed validation command, red test suite, failed CI check, typecheck/lint/build failure, or failing test file is fail by default unless you prove it is not worker-owned. The explicit exception is delivery.mode=accepted_artifact with artifact=expected_red_tests and matching structured artifactEvidence: its intended assertion failure is the deliverable and may pass review.",
+    "- Do not use blocked merely because an accepted expected-red artifact awaits its implementation successor. Pass a correct artifact with COMMENT feedback; Symphony checkpoints it, completes the test issue unmerged, and releases the successor dependency.",
     "- If the PR changed production code that the failing test exercises, treat the failure as worker-owned and use fail.",
     "- Use blocked for failed validation only when discoveryFindings prove non-worker ownership, such as base-branch reproduction, explicit sibling issue/task scope, unmerged sibling work, or service/tooling/credential outage.",
     "- Use gateFindings only for contract-entitled defects that may block the worker. Put inferred scope, hidden matrix axes, sibling issue scope, future hardening, and out-of-scope observations in discoveryFindings; discoveryFindings do not make a verdict fail by themselves.",
@@ -193,6 +199,7 @@ export function renderIssueBreakdownMcpHandoffPrompt(input: RuntimeHandoffPrompt
     "- Each proposed issue must include title, description, acceptanceCriteria, dependencies, and labels.",
     "- Each proposed issue description must use the required agent-eligible section headings: `Problem / Goal`, `Issue Contract`, `Touched Surfaces`, `Acceptance Criteria`, `Contract Checklist`, `Validation Requirements`, `Out Of Scope`, and `Promotion Readiness`.",
     "- In `Issue Contract`, include a fenced `json` block with a positive integer `schemaVersion`, a non-empty `contractVersion`, and a non-empty `requirements` array whose entries have stable unique `id` values and non-empty `requirement` text.",
+    "- Use `delivery: {\"mode\":\"accepted_artifact\",\"artifact\":\"expected_red_tests\"}` only for a deliberately unmerged expected-red test deliverable. Create implementation sibling successors (children of the same decomposition parent), never children of the artifact issue. Give those successors merge delivery and make each directly depend on the test-artifact issue instead of duplicating its tests.",
     "- In `Touched Surfaces`, list the exact repo paths or globs for any protected or high-risk workflow areas. If a proposed issue touches protected workflow areas, keep \"Ready for `dogfood-ready`: no\", record a non-empty remaining blocker that explains the manual-only requirement, and do not include `dogfood-ready` in labels.",
     "- Use the same section names for docs-only and implementation issue drafts; do not include secrets, tokens, private keys, or credential values.",
     "- Do not include `dogfood-ready` automatically in proposed labels. Operators add readiness labels only after reviewing the contract checklist and validation plan.",
@@ -217,6 +224,7 @@ export function renderIssueTriageMcpHandoffPrompt(input: RuntimeHandoffPromptInp
     "- Do not collapse blockers into one category. Lower-precedence PR, CI, merge, or review-gate blockers must not mask active implementation, validation, decomposition, or orchestration-context blockers.",
     "- Each blocker must include kind, status, nextActor, confidence, summary, evidence, and recommendedAction.",
     "- Evidence must name concrete lifecycle records, review findings, merge-gate facts, commands, logs, or code paths that support each blocker.",
+    "- A correct accepted expected-red artifact is not blocked by its missing implementation. If it remains non-terminal after reviewer pass, classify the failed artifact-completion transition or missing durable checkpoint evidence; recommend reconciliation, not worker repair, decomposition, or waiting for implementation.",
     "- After the MCP tool accepts the report, Symphony publishes a service-owned Linear triage comment with the recommendation. Do not write to Linear directly.",
   ].join("\n");
 }
@@ -233,6 +241,7 @@ export function renderIssuePostMortemMcpHandoffPrompt(input: RuntimeHandoffPromp
     `- Base ref: ${input.baseRef ?? "n/a"}`,
     "- Before ending the run, call the submit_issue_post_mortem_report MCP tool with summary, completionJudgment, specificationAssessment, reviewAssessment, followUpCandidates, processLessons, and idempotencyKey.",
     "- This is an exhaustive read-only post-mortem. Inspect the issue contract, lifecycle evidence, final worker report, final review, PR, tests, and repository context as needed.",
+    "- For delivery.mode=accepted_artifact, a durable completed_unmerged expected-red artifact followed by Done is an intentional valid completion. Assess its reviewed checkpoint evidence; do not treat the missing merge or closed draft PR as a defect.",
     "- Do not edit files, create commits, push branches, transition Linear state, comment on Linear, create subissues, or reopen work.",
     "- Keep the gate assessment bounded: missedGateFindings are only for defects that should have blocked Done under the explicit contract standard.",
     "- Put hardening opportunities, hidden scope, weak specifications, missing matrix lanes, and future work in followUpCandidates or missedDiscoveryFindings instead of treating them as retroactive gate failures.",
@@ -286,6 +295,7 @@ async function writeHandoffMcpContexts(
     });
   }
   if (ctx.role === "worker" && phase === "implementation") {
+    if (ctx.suppressCompletionHandoff === true) return;
     await writeCompletionReportMcpContext(completionReportContextFilePath(ctx), {
       issue: ctx.issue,
       activeRunId: input.activeRunId,

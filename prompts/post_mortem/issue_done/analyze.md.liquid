@@ -6,6 +6,8 @@ Perform a read-only post-mortem for the completed issue. Do not reopen work, edi
 
 Use the explicit issue contract and final lifecycle evidence as the gate standard. Hidden scope, hardening opportunities, missing matrix axes, and process lessons should become follow-up candidates unless they prove a contract-entitled defect that should have blocked Done.
 
+When `delivery.mode=accepted_artifact` and the durable accepted artifact is `completed_unmerged`, Done without a merge is the intended valid completion. Judge the reviewed checkpoint and expected-red evidence; do not report the intentionally closed draft PR or missing merge as a completion defect.
+
 ## Post-Mortem Trigger
 
 - Trigger fingerprint: {{ triggerFingerprint }}
@@ -18,6 +20,7 @@ Use the explicit issue contract and final lifecycle evidence as the gate standar
 - `completionJudgment.status=valid_done` only when Done appears correct and no material follow-up is worth tracking.
 - `completionJudgment.status=valid_with_followups` when Done appears valid under the explicit contract but follow-up work should be tracked.
 - `completionJudgment.status=questionable_done` only when there is a likely explicit-contract or necessary-core defect that should have blocked Done.
+- A `completed_unmerged` accepted expected-red artifact may be `valid_done` or `valid_with_followups`; it does not require a merge or green implementation in the source issue.
 - `missedGateFindings` are only for missed blocker-level issues under the bounded reviewer standard.
 - `missedDiscoveryFindings` and `followUpCandidates` are for non-gating hardening, weak specification, overbroad/underspecified contracts, hidden axes, sibling scope, or future work.
 - Use `speckitRecommended=true` when the follow-up needs specify, plan, tasks, and analyze before implementation.

@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FileIssueLifecycleStore, type IssueCompletionReportRecord } from "../src/core/persistence/IssueLifecycleStore.js";
 import {
+  boundPullRequestForLifecycle,
   PullRequestReviewFeedbackService,
   type PullRequestReviewFeedbackClient,
   type ReviewFeedbackActiveContext,
@@ -110,6 +111,60 @@ describe("PullRequestReviewFeedbackService", () => {
     ).rejects.toMatchObject({
       code: "invalid_request",
     });
+    expect(client.calls).toHaveLength(0);
+  });
+
+  it("accepts COMMENT whole-PR review events for expected-red artifacts", async () => {
+    const { service, lifecycleStore, client } = fixture();
+    await seedLifecycle(lifecycleStore, { acceptedArtifact: true });
+
+    await expect(
+      service.submitPullRequestReviewFeedback(
+        {
+          kind: "review",
+          event: "COMMENT",
+          body: "Expected-red artifact accepted.",
+          idempotencyKey: "artifact-comment-1",
+        },
+        context(),
+      ),
+    ).resolves.toMatchObject({ accepted: true });
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0]).toMatchObject({
+      kind: "review",
+      input: { event: "COMMENT", headSha: "abc123" },
+    });
+  });
+
+  it("does not review a superseded accepted artifact or reuse its stale pull request", async () => {
+    const { service, lifecycleStore, client } = fixture();
+    await seedLifecycle(lifecycleStore, { acceptedArtifact: true });
+    const lifecycle = await lifecycleStore.get("issue-1");
+    const reopened = await lifecycleStore.updateIssue(
+      issue({ state: "In Review", branchName: "symphony/TEST-1" }),
+      {
+        lastCompletionReportId: null,
+        completionReports: lifecycle!.completionReports.map((report) => ({
+          ...report,
+          supersededAt: "2026-07-14T11:00:00.000Z",
+          supersededBy: "accepted_artifact_reopened",
+          supersededReason: "The accepted artifact source checkpoint changed.",
+        })),
+      },
+    );
+
+    expect(boundPullRequestForLifecycle(reopened)).toBeNull();
+    await expect(
+      service.submitPullRequestReviewFeedback(
+        {
+          kind: "review",
+          event: "COMMENT",
+          body: "Expected-red artifact accepted.",
+          idempotencyKey: "artifact-comment-reopened",
+        },
+        context(),
+      ),
+    ).rejects.toThrow(/reserved for accepted expected-red artifacts/);
     expect(client.calls).toHaveLength(0);
   });
 
@@ -268,9 +323,20 @@ class RecordingFeedbackClient implements PullRequestReviewFeedbackClient {
 
 async function seedLifecycle(
   lifecycleStore: FileIssueLifecycleStore,
-  options: { headSha?: string | null } = {},
+  options: { headSha?: string | null; acceptedArtifact?: boolean } = {},
 ): Promise<void> {
   const report = completionReportRecord(options.headSha === undefined ? "abc123" : options.headSha);
+  if (options.acceptedArtifact === true) {
+    report.contractSnapshot = {
+      schemaVersion: 1,
+      contractVersion: "accepted-artifact-review",
+      fingerprint: "accepted-artifact-fingerprint",
+      delivery: {
+        mode: "accepted_artifact",
+        artifact: "expected_red_tests",
+      },
+    };
+  }
   await lifecycleStore.ensureIssue(issue({ state: "In Review", branchName: "symphony/TEST-1" }), {
     phase: "review",
     lastCompletionReportId: report.id,

@@ -8,6 +8,8 @@ import type {
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import {
   planBlockedEscalationWritebacks,
+  planAcceptedArtifactCompletionWritebacks,
+  planAcceptedArtifactHandoffWritebacks,
   planCompletionReportAcceptedWritebacks,
   planCompletionReportRejectedWritebacks,
   planIssuePostMortemReportWritebacks,
@@ -177,6 +179,112 @@ describe("TransitionPolicy review-loop planners", () => {
         fromStates: ["In Progress"],
         toState: "Human Review",
       },
+    });
+  });
+
+  it("plans an expected-red draft PR handoff without treating its nonzero result as failed CI", () => {
+    const config = reviewLoopConfig();
+    config.tracker.handoffStates = ["Human Review"];
+    config.github.prHandoff.enabled = true;
+    config.github.prHandoff.targetState = "Human Review";
+    const operations = planAcceptedArtifactHandoffWritebacks(
+      {
+        issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
+        runId: "run-red-1",
+        sessionId: "session-1",
+        workspacePath: "/tmp/workspace",
+      },
+      config,
+      {
+        pullRequest: {
+          url: "https://github.com/acme/symphony/pull/42",
+          number: 42,
+          headSha: "abc123",
+          branch: "symphony/TEST-1",
+          draft: true,
+        },
+        artifactEvidence: {
+          kind: "expected_red_tests",
+          command: "npm test -- tests/feature.test.ts",
+          testFiles: ["tests/feature.test.ts"],
+          expectedFailure: "implementation is absent",
+          observedFailure: "expected enabled, received disabled",
+          exitCode: 1,
+        },
+      },
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:pull-request-handoff:accepted-artifact:pr-42:abc123",
+      payload: { dedupeKey: "pull-request-handoff:accepted-artifact:pr-42:abc123" },
+    });
+    expect(commentBody(operations, 0)).toContain("intentionally unmerged test artifact");
+    expect(commentBody(operations, 0)).toContain("Intentional nonzero exit code: 1");
+    expect(operations[1]).toMatchObject({
+      kind: "transition",
+      payload: { fromStates: ["In Progress"], toState: "Human Review" },
+    });
+  });
+
+  it("binds accepted-artifact completion writebacks to the durable artifact id", () => {
+    const config = reviewLoopConfig();
+    const operations = planAcceptedArtifactCompletionWritebacks(
+      {
+        issue: issue({ state: "In Review" }),
+        fromStates: ["In Review"],
+        doneState: "Done",
+        artifact: {
+          version: 1,
+          id: "accepted-artifact-1",
+          kind: "expected_red_tests",
+          status: "completed_unmerged",
+          sourceIssueId: "issue-1",
+          sourceIssueIdentifier: "TEST-1",
+          contractFingerprint: "sha256:contract",
+          completionReportId: "report-1",
+          reviewVerdictId: "verdict-1",
+          reviewFeedbackId: "feedback-1",
+          repositoryFingerprint: "sha256:repo",
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "abc123",
+            branch: "symphony/TEST-1",
+            draft: true,
+          },
+          sourceBaseHeadSha: "base123",
+          sourceHeadSha: "abc123",
+          baseRef: "main",
+          changedFiles: ["tests/feature.test.ts"],
+          fileManifest: [{ path: "tests/feature.test.ts", status: "added", blobSha: "blob123" }],
+          artifactEvidence: {
+            kind: "expected_red_tests",
+            command: "npm test",
+            testFiles: ["tests/feature.test.ts"],
+            expectedFailure: "red",
+            observedFailure: "red",
+            exitCode: 1,
+          },
+          commentOperationKey: "comment:issue-1:artifact-complete",
+          doneTransitionOperationKey: "transition:issue-1:artifact-complete:Done",
+          acceptedAt: "2026-07-14T00:00:00.000Z",
+          checkpointedAt: "2026-07-14T00:00:01.000Z",
+          prClosedAt: "2026-07-14T00:00:02.000Z",
+          completedAt: "2026-07-14T00:00:02.000Z",
+        },
+      },
+      config,
+    );
+
+    expect(operations).toHaveLength(2);
+    expect(operations[0]).toMatchObject({
+      idempotencyKey: "comment:issue-1:artifact-complete",
+      payload: { acceptedArtifactId: "accepted-artifact-1" },
+    });
+    expect(operations[1]).toMatchObject({
+      idempotencyKey: "transition:issue-1:artifact-complete:Done",
+      payload: { acceptedArtifactId: "accepted-artifact-1", fromStates: ["In Review"], toState: "Done" },
     });
   });
 

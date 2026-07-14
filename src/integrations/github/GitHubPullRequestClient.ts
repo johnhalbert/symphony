@@ -80,12 +80,41 @@ export interface PullRequestPublicationInput {
   body: string;
   evidenceCursor: string;
   forceEmptyCommit?: boolean;
+  draft?: boolean;
 }
 
 export interface PullRequestPublicationResult extends PullRequestMetadata {
   headSha: string;
   action: "reused" | "created";
   evidenceCursor: string;
+}
+
+export interface PullRequestCloseInput {
+  pullRequestNumber: number;
+  expectedHeadSha: string;
+}
+
+export interface PullRequestCloseResult {
+  pullRequestNumber: number;
+  headSha: string;
+  state: "closed";
+  merged: false;
+}
+
+export type GitHubHttpFailureKind =
+  | "not_found"
+  | "authentication_or_access"
+  | "rate_limit"
+  | "server_error"
+  | "permanent_request";
+
+export interface GitHubHttpFailureDetails {
+  source: "github_http";
+  action: string;
+  status: number;
+  failureKind: GitHubHttpFailureKind;
+  retryable: boolean;
+  target: "pull_request" | "branch" | null;
 }
 
 export type GitHubPullRequestReviewEvidenceSource = "review" | "review_comment" | "issue_comment";
@@ -156,6 +185,7 @@ export interface PullRequestReviewFeedbackResult {
 }
 
 interface GitHubPullRequestNode {
+  node_id?: unknown;
   html_url?: unknown;
   number?: unknown;
   state?: unknown;
@@ -368,10 +398,10 @@ export class GitHubPullRequestClient {
       headers: await this.requestHeaders(),
     });
     if (!response.ok) {
-      throw new SymphonyError("tracker_error", `GitHub PR inspection returned HTTP ${response.status}`);
+      throw await this.githubHttpError(response, "GitHub PR inspection", "pull_request");
     }
     const pullRequest = normalizePullRequestDetails((await response.json()) as GitHubPullRequestNode);
-    if (!pullRequest) throw new SymphonyError("tracker_error", "GitHub PR inspection response is invalid");
+    if (!pullRequest) throw new SymphonyError("invalid_request", "GitHub PR inspection response is invalid");
     return pullRequest;
   }
 
@@ -401,12 +431,12 @@ export class GitHubPullRequestClient {
       headers: await this.requestHeaders(),
     });
     if (!response.ok) {
-      throw new SymphonyError("tracker_error", `GitHub branch head lookup returned HTTP ${response.status}`);
+      throw await this.githubHttpError(response, "GitHub branch head lookup", "branch");
     }
     const body = (await response.json()) as Record<string, unknown>;
     const object = isRecord(body.object) ? body.object : null;
     const sha = asNullableString(object?.sha);
-    if (sha === null) throw new SymphonyError("tracker_error", "GitHub branch head lookup response is invalid");
+    if (sha === null) throw new SymphonyError("invalid_request", "GitHub branch head lookup response is invalid");
     return sha;
   }
 
@@ -593,8 +623,11 @@ export class GitHubPullRequestClient {
     const headSha = await git.headSha();
 
     if (existing) {
+      const prepared = input.draft === true
+        ? await this.ensurePullRequestDraft(existing.number, headSha)
+        : existing;
       return {
-        ...existing,
+        ...prepared,
         headSha,
         action: "reused",
         evidenceCursor: input.evidenceCursor,
@@ -606,12 +639,64 @@ export class GitHubPullRequestClient {
       baseBranch,
       title: input.title,
       body: input.body,
+      draft: input.draft === true,
     });
+    const prepared = input.draft === true
+      ? await this.ensurePullRequestDraft(created.number, headSha)
+      : created;
     return {
-      ...created,
+      ...prepared,
       headSha,
       action: "created",
       evidenceCursor: input.evidenceCursor,
+    };
+  }
+
+  async closePullRequest(input: PullRequestCloseInput): Promise<PullRequestCloseResult> {
+    this.assertConfiguredForPublication();
+    assertPullRequestNumber(input.pullRequestNumber, "PR close");
+    const expectedHeadSha = requireNonEmpty(input.expectedHeadSha, "An expected PR head SHA is required for PR close");
+    const current = await this.getPullRequest({ pullRequestNumber: input.pullRequestNumber });
+    if (current.headSha !== expectedHeadSha) {
+      throw new SymphonyError(
+        "conflict",
+        `GitHub PR close expected head ${expectedHeadSha}, observed ${current.headSha ?? "unknown"}`,
+      );
+    }
+    if (current.merged === true) {
+      throw new SymphonyError("conflict", "Accepted-artifact pull request was merged unexpectedly");
+    }
+    if (current.draft !== true) {
+      throw new SymphonyError("conflict", "Accepted-artifact pull request is no longer a draft");
+    }
+    const currentState = current.state?.toLowerCase() ?? "";
+    if (currentState !== "open" && currentState !== "closed") {
+      throw new SymphonyError("conflict", `Accepted-artifact pull request has unexpected state ${current.state ?? "unknown"}`);
+    }
+    if (currentState !== "closed") {
+      const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}`), {
+        method: "PATCH",
+        headers: await this.requestHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ state: "closed" }),
+      });
+      if (!response.ok) {
+        throw await this.githubHttpError(response, "GitHub PR close", "pull_request");
+      }
+    }
+    const closed = await this.getPullRequest({ pullRequestNumber: input.pullRequestNumber });
+    if (
+      closed.headSha !== expectedHeadSha ||
+      closed.merged === true ||
+      closed.draft !== true ||
+      closed.state?.toLowerCase() !== "closed"
+    ) {
+      throw new SymphonyError("tracker_error", "GitHub PR close could not be verified");
+    }
+    return {
+      pullRequestNumber: input.pullRequestNumber,
+      headSha: expectedHeadSha,
+      state: "closed",
+      merged: false,
     };
   }
 
@@ -730,11 +815,26 @@ export class GitHubPullRequestClient {
     return detail.length === 0 ? `${action} returned HTTP ${status}` : `${action} returned HTTP ${status}: ${detail}`;
   }
 
+  private async githubHttpError(
+    response: Response,
+    action: string,
+    target: GitHubHttpFailureDetails["target"] = null,
+  ): Promise<SymphonyError> {
+    const details = classifyGitHubHttpFailure(response, action, target);
+    const code = details.failureKind === "not_found"
+      ? "not_found"
+      : details.retryable
+        ? "tracker_error"
+        : "invalid_request";
+    return new SymphonyError(code, await this.githubWriteError(response, action), details);
+  }
+
   private async createPullRequest(input: {
     branchName: string;
     baseBranch: string;
     title: string;
     body: string;
+    draft: boolean;
   }): Promise<PullRequestMetadata> {
     const response = await this.fetchImpl(
       new URL(
@@ -750,6 +850,7 @@ export class GitHubPullRequestClient {
           head: pullRequestHeadRef(this.config, input.branchName),
           base: input.baseBranch,
           maintainer_can_modify: false,
+          draft: input.draft,
         }),
       },
     );
@@ -768,6 +869,71 @@ export class GitHubPullRequestClient {
     const pullRequest = normalizePullRequest((await response.json()) as GitHubPullRequestNode);
     if (!pullRequest) throw new SymphonyError("tracker_error", "GitHub PR creation response is invalid");
     return pullRequest;
+  }
+
+  private async ensurePullRequestDraft(
+    pullRequestNumber: number,
+    expectedHeadSha: string,
+  ): Promise<PullRequestMetadata> {
+    const current = await this.getPullRequest({ pullRequestNumber });
+    if (current.headSha !== expectedHeadSha) {
+      throw new SymphonyError(
+        "conflict",
+        `GitHub draft conversion expected head ${expectedHeadSha}, observed ${current.headSha ?? "unknown"}`,
+      );
+    }
+    if (current.draft === true) return current;
+    if (current.merged === true || current.state?.toLowerCase() !== "open") {
+      throw new SymphonyError("conflict", "Only an open, unmerged pull request can be converted to draft");
+    }
+
+    const lookup = await this.fetchImpl(graphQlApiUrl(this.config.apiBaseUrl), {
+      method: "POST",
+      headers: await this.requestHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        query: `query SymphonyPullRequestNode($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id isDraft headRefOid } }
+        }`,
+        variables: { owner: this.config.owner, repo: this.config.repo, number: pullRequestNumber },
+      }),
+    });
+    if (!lookup.ok) {
+      throw new SymphonyError("tracker_error", "GitHub draft conversion lookup failed");
+    }
+    const lookupBody = (await lookup.json()) as {
+      data?: { repository?: { pullRequest?: { id?: unknown; isDraft?: unknown; headRefOid?: unknown } | null } | null };
+      errors?: unknown;
+    };
+    const node = lookupBody.data?.repository?.pullRequest ?? null;
+    const nodeId = asNullableString(node?.id);
+    const headRefOid = asNullableString(node?.headRefOid);
+    if (!nodeId || headRefOid !== expectedHeadSha) {
+      throw new SymphonyError("conflict", "GitHub draft conversion lookup did not match the reviewed PR head");
+    }
+    if (node?.isDraft !== true) {
+      const mutation = await this.fetchImpl(graphQlApiUrl(this.config.apiBaseUrl), {
+        method: "POST",
+        headers: await this.requestHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({
+          query: `mutation SymphonyConvertPullRequestToDraft($pullRequestId: ID!) {
+            convertPullRequestToDraft(input: {pullRequestId: $pullRequestId}) { pullRequest { isDraft headRefOid } }
+          }`,
+          variables: { pullRequestId: nodeId },
+        }),
+      });
+      if (!mutation.ok) {
+        throw new SymphonyError("tracker_error", "GitHub draft conversion failed");
+      }
+      const mutationBody = (await mutation.json()) as {
+        data?: { convertPullRequestToDraft?: { pullRequest?: { isDraft?: unknown; headRefOid?: unknown } | null } | null };
+        errors?: unknown;
+      };
+      const converted = mutationBody.data?.convertPullRequestToDraft?.pullRequest ?? null;
+      if (converted?.isDraft !== true || asNullableString(converted.headRefOid) !== expectedHeadSha) {
+        throw new SymphonyError("tracker_error", "GitHub draft conversion could not be verified");
+      }
+    }
+    return { ...current, draft: true };
   }
 
   async getAuthenticatedLogin(): Promise<string | null> {
@@ -1297,12 +1463,43 @@ function githubDiagnosticHeaders(headers: Headers): Array<[string, string]> {
       normalized === "x-ratelimit-remaining" ||
       normalized === "x-ratelimit-reset" ||
       normalized === "x-ratelimit-resource" ||
-      normalized === "x-ratelimit-used"
+      normalized === "x-ratelimit-used" ||
+      normalized === "retry-after"
     ) {
       result.push([normalized, value]);
     }
   });
   return result.sort(([left], [right]) => left.localeCompare(right));
+}
+
+function classifyGitHubHttpFailure(
+  response: Response,
+  action: string,
+  target: GitHubHttpFailureDetails["target"],
+): GitHubHttpFailureDetails {
+  const failureKind: GitHubHttpFailureKind = response.status === 404 && target !== null
+    ? "not_found"
+    : isGitHubRateLimitResponse(response)
+      ? "rate_limit"
+      : response.status >= 500
+        ? "server_error"
+        : response.status === 401 || response.status === 403
+          ? "authentication_or_access"
+          : "permanent_request";
+  return {
+    source: "github_http",
+    action,
+    status: response.status,
+    failureKind,
+    retryable: failureKind === "rate_limit" || failureKind === "server_error",
+    target,
+  };
+}
+
+function isGitHubRateLimitResponse(response: Response): boolean {
+  if (response.status === 429) return true;
+  if (response.status !== 403) return false;
+  return response.headers.get("retry-after") !== null || response.headers.get("x-ratelimit-remaining")?.trim() === "0";
 }
 
 function sanitizeSecret(value: string, secret: string | null): string {

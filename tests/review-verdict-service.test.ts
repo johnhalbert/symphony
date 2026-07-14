@@ -371,6 +371,8 @@ describe("ReviewVerdictService", () => {
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
       phase: "review",
       reviewRound: 1,
+      lastCompletionReportId: "completion-report:issue-1:report-1",
+      completionReports: [completionReport()],
       summaryPointers: { prUrl: "https://github.com/acme/symphony/pull/42", prNumber: 42, prHeadSha: "head-sha-1" },
       reviewFeedback: [approvalFeedback()],
     });
@@ -400,6 +402,8 @@ describe("ReviewVerdictService", () => {
     await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
       phase: "review",
       reviewRound: 1,
+      lastCompletionReportId: "completion-report:issue-1:report-1",
+      completionReports: [completionReport()],
       summaryPointers: { prUrl: "https://github.com/acme/symphony/pull/42", prNumber: 42, prHeadSha: "head-sha-1" },
       reviewFeedback: [approvalFeedback()],
     });
@@ -437,6 +441,44 @@ describe("ReviewVerdictService", () => {
           ],
         },
       ],
+    });
+  });
+
+  it("rejects a pass verdict when the accepted-artifact completion report was superseded", async () => {
+    const { service, lifecycleStore } = fixture();
+    const report = completionReport({
+      contractSnapshot: {
+        schemaVersion: 1,
+        contractVersion: "accepted-artifact-review",
+        fingerprint: "accepted-artifact-fingerprint",
+        delivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+      },
+      supersededAt: "2026-07-14T11:00:00.000Z",
+      supersededBy: "accepted_artifact_reopened",
+      supersededReason: "The accepted artifact source checkpoint changed.",
+    });
+    await lifecycleStore.ensureIssue(issue({ state: "In Review" }), {
+      phase: "review",
+      reviewRound: 1,
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      summaryPointers: {
+        prUrl: "https://github.com/acme/symphony/pull/42",
+        prNumber: 42,
+        prHeadSha: "head-sha-1",
+      },
+      reviewFeedback: [approvalFeedback()],
+    });
+
+    await expect(
+      service.submitReviewVerdict(passVerdict(), context()),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      reviewVerdicts: [],
+      reviewVerdictSubmissions: [],
     });
   });
 
@@ -887,6 +929,33 @@ function reviewFeedback(overrides: Partial<IssueReviewFeedbackRecord> = {}): Iss
     reviewUrl: "https://github.com/acme/symphony/pull/42#pullrequestreview-1",
     commentUrls: [],
     submittedAt: "2026-01-01T00:00:02.000Z",
+    ...overrides,
+  };
+}
+
+function completionReport(
+  overrides: Partial<IssueLifecycleRecord["completionReports"][number]> = {},
+): IssueLifecycleRecord["completionReports"][number] {
+  return {
+    id: "completion-report:issue-1:report-1",
+    idempotencyKey: "report-1",
+    runId: "worker-run-1",
+    issueId: "issue-1",
+    issueIdentifier: "TEST-1",
+    summary: "Implemented the requested change.",
+    validationEvidence: ["npm test"],
+    acceptanceChecklist: [],
+    changedFiles: ["src/index.ts"],
+    branchName: "symphony/TEST-1",
+    pullRequest: {
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headSha: "head-sha-1",
+      branch: "symphony/TEST-1",
+    },
+    risks: [],
+    acceptedAt: "2026-01-01T00:00:01.000Z",
+    writebackOperationKeys: [],
     ...overrides,
   };
 }

@@ -225,6 +225,17 @@ describe("Cursor event mapping", () => {
     );
   });
 
+  it("does not mount completion MCP during service-owned seed conflict preparation", () => {
+    const config = testConfig("/tmp/symphony-cursor-harness");
+    const ctx: AgentRunContext = {
+      ...agentContext(config, "worker"),
+      runPhase: "implementation",
+      suppressCompletionHandoff: true,
+    };
+
+    expect(Object.keys(cursorRoleMcpServers(ctx, { cliPath: "/repo/src/cli.ts" }))).toEqual([]);
+  });
+
   it("mounts worker MCP servers on Cursor agent create/resume options", () => {
     const config = testConfig("/tmp/symphony-cursor-harness");
     const ctx: AgentRunContext = {

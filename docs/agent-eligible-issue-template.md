@@ -23,6 +23,9 @@ within the issue. Update `contractVersion` when obligations materially change.
 {
   "schemaVersion": 1,
   "contractVersion": "2026-06-04.1",
+  "delivery": {
+    "mode": "merge"
+  },
   "requirements": [
     {
       "id": "REQ-001",
@@ -32,6 +35,14 @@ within the issue. Update `contractVersion` when obligations materially change.
   ]
 }
 ```
+
+Use `"delivery": {"mode":"merge"}` for normal implementation work. A
+deliberately test-only TDD issue whose reviewed expected-red tests should finish
+without merging must instead use
+`"delivery": {"mode":"accepted_artifact","artifact":"expected_red_tests"}`.
+Its implementation sibling successors (children of the same decomposition
+parent), never children of the artifact issue, use merge delivery and depend on
+the test issue so Symphony can seed each successor from the reviewed checkpoint.
 
 ## Touched Surfaces
 

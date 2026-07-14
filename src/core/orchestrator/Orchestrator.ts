@@ -44,11 +44,13 @@ import {
   type AgentRunPhase,
   type AgentRunKind,
   type AgentRunRole,
+  type AcceptedArtifactWorkspaceSeed,
   type Issue,
   type IssueStatusView,
   type RuntimeTotals,
   type TokenCounts,
   type Workspace,
+  type WorkspaceSeedBinding,
 } from "../types.js";
 import type {
   IssueWorkspaceRecord,
@@ -90,7 +92,10 @@ import {
   shouldIssuePostMortemRun,
 } from "../IssuePostMortemService.js";
 import { PromptRenderer } from "../workflow/PromptRenderer.js";
-import { summarizeIssueContractForPrompt } from "../IssueContractLint.js";
+import {
+  parseIssueContract,
+  summarizeIssueContractForPrompt,
+} from "../IssueContractLint.js";
 import {
   DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE,
   DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE,
@@ -160,12 +165,15 @@ import { appendLaneMemoTelemetry } from "../persistence/LaneMemoTelemetry.js";
 import {
   buildWorkerHandoffPacket,
   isSupersededLifecycleRecord,
+  latestCurrentCompletionReport,
   latestCurrentApprovalPassVerdict,
   phaseForIssueState,
   type IssueBreakdownPlanRecord,
   type IssueCompletionReportRejectionRecord,
   type IssueCompletionReportRecord,
+  type IssueAcceptedArtifactRecord,
   type IssueLifecyclePatch,
+  type IssueLifecyclePhase,
   type IssueLifecycleRecord,
   type IssueLifecycleSummaryReference,
   type IssueLifecycleStore,
@@ -176,6 +184,7 @@ import {
   type IssueReviewerOutputContract,
   type IssueReviewVerdictRecord,
   type IssueReviewVerdictSubmissionRecord,
+  type IssueWorkspaceSeedRecord,
   type IssueTriageBlockerKind,
   type IssueTriageBlockerRecord,
   type IssueTriageReportRecord,
@@ -241,6 +250,11 @@ import {
   planRunSucceededWritebacks,
 } from "../writeback/TransitionPolicy.js";
 import { createGitHubPullRequestClientForCapability } from "../../integrations/github/GitHubCredentialResolver.js";
+import {
+  AcceptedArtifactService,
+  classifyAcceptedArtifactCompletionError,
+  type AcceptedArtifactGitHubClient,
+} from "../AcceptedArtifactService.js";
 import type { PullRequestMergeResult } from "../../integrations/github/GitHubPullRequestClient.js";
 import {
   OPERATOR_REJECTED_PUBLICATION_ERROR,
@@ -270,6 +284,7 @@ export interface OrchestratorOptions {
   pullRequestReviewClient?: PullRequestReviewEvidenceClient;
   pullRequestMergeClient?: MergePolicyGitHubClient;
   completionReportPublisher?: CompletionReportPullRequestPublisher;
+  acceptedArtifactClient?: AcceptedArtifactGitHubClient;
   operatorApproval?: Pick<
     OperatorApprovalService,
     "requestPublicationApproval" | "waitForPublicationApprovalRequest"
@@ -443,6 +458,15 @@ export interface RunningEntry {
   pullRequestHandoffAccepted: boolean;
   reviewVerdictAccepted: boolean;
   reviewEvidence: ReviewerDispatchEvidence | null;
+  dependencyArtifactSeed: AcceptedArtifactWorkspaceSeed | null;
+  dependencyArtifact: IssueAcceptedArtifactRecord | null;
+  dependencyArtifactSeedConflict: WorkspaceSeedBinding | null;
+  acceptedArtifactSeedPreparationActive: boolean;
+  acceptedArtifactSeedFreshDispatch: boolean;
+  acceptedArtifactSeedFailureDisposition:
+    | "retry"
+    | "human_action_required"
+    | null;
   manualDispatch: {
     stage: ManualAgentRunStage;
     forceLabels: boolean;
@@ -521,6 +545,8 @@ interface DispatchTransitionScratch {
   reviewEvidence?: ReviewerDispatchEvidence | null;
   dispatchWriteback?: NewWritebackOperation | null;
   entry?: RunningEntry;
+  dependencyArtifactSeed?: AcceptedArtifactWorkspaceSeed | null;
+  dependencyArtifact?: IssueAcceptedArtifactRecord | null;
 }
 
 interface BaseRefTransitionScratch {
@@ -674,6 +700,12 @@ interface IssueEvidenceSnapshotInput {
   triggerType?: IssueTriggerType;
   triggerSource?: IssueTriggerSource;
 }
+
+type DependencyArtifactFreshness =
+  | { status: "fresh" }
+  | { status: "unavailable"; reason: string }
+  | { status: "deferred"; reason: string }
+  | { status: "invalid"; reason: string };
 
 interface LifecycleEvidenceInput {
   issue: Issue;
@@ -851,7 +883,7 @@ const PROJECT_REVIEWER_PROMPT_EXTENSIONS_MARKER =
   "[[SYMPHONY_PROJECT_REVIEWER_PROMPT_EXTENSIONS]]";
 const EPHEMERAL_SYSTEM_PROMPT_MAX_CHARS = 12_000;
 const PROMPT_SUMMARY_BLOCK_MAX_CHARS = 1_600;
-const ORCHESTRATOR_RULESET_VERSION = "2026-06-21.issue-history-v1";
+const ORCHESTRATOR_RULESET_VERSION = "2026-07-14.accepted-artifact-v1";
 const STARTUP_TERMINAL_CLEANUP_CONCURRENCY = 4;
 
 const DEFAULT_EPHEMERAL_SYSTEM_PROMPT_TEMPLATE = `
@@ -884,9 +916,9 @@ You are a reviewer agent for {{ issue.identifier }}.
 
 Inspect only. Do not modify files, create commits, push branches, comment on Linear, transition Linear state, or otherwise change workspace or lifecycle state directly.
 
-Use the linked GitHub pull request as the primary detailed review surface. Call the submit_pull_request_review_feedback MCP tool before any verdict submission to leave concrete feedback directly on the lifecycle-bound PR by submitting a GitHub PR review and/or posting PR review comments. A pass verdict requires a prior whole-PR review with kind "review" and event "APPROVE" in this reviewer run. Requested changes should use kind "review" with event "REQUEST_CHANGES" when PR feedback is submitted, and must point to the relevant files, lines, or threads on GitHub.
+Use the linked GitHub pull request as the primary detailed review surface. Call the submit_pull_request_review_feedback MCP tool before any verdict submission to leave concrete feedback directly on the lifecycle-bound PR. A merge-delivery pass requires a prior whole-PR review with kind "review" and event "APPROVE" in this reviewer run. An explicit accepted expected-red artifact pass instead requires kind "review" and event "COMMENT" so it cannot authorize a merge. Requested changes should use kind "review" with event "REQUEST_CHANGES" and must point to the relevant files, lines, or threads on GitHub.
 
-After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence. Then call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" only for worker-owned, contract-entitled gate findings; use verdict "blocked" when review cannot complete because required validation, tooling, credentials, or service-owned evidence is unavailable to worker/reviewer roles; use verdict "pass" when all written acceptance criteria are satisfied, even if non-gating discovery findings remain. A failed validation command, red test suite, failed CI check, typecheck/lint/build failure, or failing test file is fail by default unless you prove it is not worker-owned; an unchanged failing test file is only a triage clue, not proof. If the PR changed production code that the failing test exercises, treat the failure as worker-owned and use fail. Use blocked for failed validation only when discoveryFindings prove non-worker ownership, such as base-branch reproduction, explicit sibling issue/task scope, unmerged sibling work, or service/tooling/credential outage. The MCP servers supply the active run, issue, and lifecycle-bound PR context; include runId, issueId, PR number, repository, token, or commit identity only if a tool explicitly asks for it.
+After submit_pull_request_review_feedback succeeds, pass the returned reviewUrl/commentUrls/urls into submit_review_verdict.evidence. Then call the submit_review_verdict MCP tool before ending the run. Use verdict "fail" only for worker-owned, contract-entitled gate findings; use verdict "blocked" when review cannot complete because required validation, tooling, credentials, or service-owned evidence is unavailable; use verdict "pass" when all written acceptance criteria are satisfied. A failed validation command, red test suite, failed CI check, typecheck/lint/build failure, or failing test file is fail by default. The explicit exception is an Issue Contract with delivery.mode="accepted_artifact", artifact="expected_red_tests", and matching structured artifactEvidence: verify that its intended assertion failure is the reviewed deliverable, then pass with COMMENT feedback. Do not block or decompose that accepted artifact merely because its implementation belongs to a dependent issue. The MCP servers supply active context; include identifiers only if a tool explicitly asks for them.
 
 ${DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE}
 
@@ -905,10 +937,11 @@ Tool payload guidance:
 Feedback tool payload guidance:
 - Never call submit_pull_request_review_feedback with {}. The MCP server supplies the active PR context only; you must still provide the feedback payload.
 - Minimal pass approval payload: {"kind":"review","event":"APPROVE","body":"...","idempotencyKey":"..."}.
+- Minimal accepted-artifact pass payload: {"kind":"review","event":"COMMENT","body":"...","idempotencyKey":"..."}.
 - Minimal requested-changes payload: {"kind":"review","event":"REQUEST_CHANGES","body":"...","idempotencyKey":"..."}.
-- For a pass verdict, first use kind "review" with event "APPROVE" for whole-PR approval feedback; include inline comments when helpful.
+- For a merge-delivery pass, first use kind "review" with event "APPROVE". For an accepted expected-red artifact pass, use event "COMMENT" instead; include inline comments when helpful.
 - For a fail verdict, use kind "review" with event "REQUEST_CHANGES" when submitting whole-PR review feedback; include inline comments when helpful.
-- Use kind "review_comment" for a single inline comment or reply, and "issue_comment" only for supplemental high-level PR comments. These supplemental comments do not satisfy pass approval.
+- Use kind "review_comment" for a single inline comment or reply, and "issue_comment" only for supplemental high-level PR comments. These supplemental comments do not satisfy either whole-PR pass feedback requirement.
 - Use a stable idempotencyKey; reuse returned URLs as verdict evidence on retry.
 
 Report a verdict in this format:
@@ -2725,6 +2758,12 @@ export class Orchestrator {
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence: null,
+      dependencyArtifactSeed: null,
+      dependencyArtifact: null,
+      dependencyArtifactSeedConflict: null,
+      acceptedArtifactSeedPreparationActive: false,
+      acceptedArtifactSeedFreshDispatch: false,
+      acceptedArtifactSeedFailureDisposition: null,
       manualDispatch: null,
       handoffRepair: null,
       hermesResume: null,
@@ -2823,6 +2862,8 @@ export class Orchestrator {
           ? {}
           : { writebackProcessor: this.options.writeback }),
         pullRequestPublisher: publisher,
+        resolveIssuesByIds: (issueIds) =>
+          this.options.tracker.fetchIssueStatesByIds(issueIds),
       }).resumeApprovedPublication({ approval: request, issue }),
     );
     if (!result) return false;
@@ -2864,6 +2905,8 @@ export class Orchestrator {
         ...(this.options.writeback === undefined
           ? {}
           : { writebackProcessor: this.options.writeback }),
+        resolveIssuesByIds: (issueIds) =>
+          this.options.tracker.fetchIssueStatesByIds(issueIds),
       }).recordPublicationApprovalTerminal({ approval: request, issue }),
     );
     if (result.length > 0) {
@@ -4198,6 +4241,11 @@ export class Orchestrator {
         kind: "merge_policy_merge_pull_request",
         actions: [
           {
+            id: "validate_dependency_artifact_before_merge",
+            execute: (context) =>
+              this.validateDependencyArtifactBeforeReviewOrMerge(context),
+          },
+          {
             id: "plan_pull_request_merge",
             execute: async (context) => {
               const service = this.mergePolicyServiceForContext(context);
@@ -4644,6 +4692,11 @@ export class Orchestrator {
         kind: "dispatch_worker",
         actions: [
           {
+            id: "resolve_dependency_artifact_seed",
+            execute: (context) =>
+              this.resolveDependencyArtifactSeedAction(context),
+          },
+          {
             id: "plan_worker_dispatch_writeback",
             execute: (context) =>
               this.planWorkerDispatchWritebackAction(context),
@@ -4718,6 +4771,11 @@ export class Orchestrator {
       {
         kind: "dispatch_reviewer",
         actions: [
+          {
+            id: "validate_dependency_artifact_before_reviewer_dispatch",
+            execute: (context) =>
+              this.validateDependencyArtifactBeforeReviewOrMerge(context),
+          },
           {
             id: "load_reviewer_dispatch_evidence",
             execute: (context) =>
@@ -5013,6 +5071,44 @@ export class Orchestrator {
         ],
       },
       {
+        kind: "reconcile_completed_accepted_artifact",
+        actions: [
+          {
+            id: "reconcile_completed_accepted_artifact_lifecycle",
+            execute: (context) =>
+              this.reconcileCompletedAcceptedArtifactAction(context),
+          },
+        ],
+      },
+      {
+        kind: "supersede_reopened_accepted_artifact",
+        actions: [
+          {
+            id: "supersede_reopened_accepted_artifact_evidence",
+            execute: (context) =>
+              this.supersedeReopenedAcceptedArtifactAction(context),
+          },
+          {
+            id: "release_merge_queue_after_accepted_artifact_reopen",
+            execute: (context) =>
+              this.releaseMergeQueueAction(
+                context,
+                "accepted_artifact_source_reopened",
+              ),
+          },
+        ],
+      },
+      {
+        kind: "complete_accepted_artifact",
+        actions: [
+          {
+            id: "complete_accepted_artifact_unmerged",
+            execute: (context) =>
+              this.completeAcceptedArtifactAction(context),
+          },
+        ],
+      },
+      {
         kind: "reset_lifecycle_after_operator_resume",
         actions: [
           {
@@ -5249,6 +5345,313 @@ export class Orchestrator {
     ];
   }
 
+  private async resolveDependencyArtifactSeedAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    if (context.transition.runPhase !== "implementation") {
+      context.dispatch.dependencyArtifactSeed = null;
+      context.dispatch.dependencyArtifact = null;
+      return {
+        status: "skipped" as const,
+        message: "Dependency artifacts only seed implementation workers",
+      };
+    }
+    const lifecycleStore = this.options.lifecycleStore;
+    if (!lifecycleStore) {
+      context.dispatch.dependencyArtifactSeed = null;
+      context.dispatch.dependencyArtifact = null;
+      return {
+        status: "skipped" as const,
+        message: "Dependency artifact resolution requires lifecycle persistence",
+      };
+    }
+
+    const targetLifecycle = await lifecycleStore.get(context.issue.id);
+    const blockerIds = uniqueNonEmptyStrings(
+      context.issue.blockedBy.map((blocker) => blocker.id),
+    );
+    const blockerStates =
+      blockerIds.length === 0
+        ? []
+        : await this.options.tracker.fetchIssueStatesByIds(blockerIds);
+    const fetchedBlockerIds = new Set(blockerStates.map((blocker) => blocker.id));
+    const missingBlockerIds = blockerIds.filter(
+      (blockerId) => !fetchedBlockerIds.has(blockerId),
+    );
+    if (missingBlockerIds.length > 0) {
+      context.dispatch.dependencyArtifactSeed = null;
+      context.dispatch.dependencyArtifact = null;
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: `Dependency artifact resolution is waiting for fresh Linear state for: ${missingBlockerIds.join(", ")}`,
+      };
+    }
+    const blockerStatesById = new Map(
+      blockerStates.map((blocker) => [blocker.id, blocker]),
+    );
+    const completedArtifactSourceIds = new Set(
+      blockerStates
+        .filter((blocker) =>
+          isStateIn(blocker.state, [this.config.mergePolicy.doneState]),
+        )
+        .map((blocker) => blocker.id),
+    );
+
+    const artifactsById = new Map<string, IssueAcceptedArtifactRecord>();
+    const invalidatedArtifacts: IssueAcceptedArtifactRecord[] = [];
+    const waitingArtifactSources: string[] = [];
+    for (const blockerId of blockerIds) {
+      const sourceIssue = blockerStatesById.get(blockerId);
+      if (!sourceIssue) continue;
+      const sourceLifecycle = await lifecycleStore.get(blockerId);
+      const artifact = sourceLifecycle?.acceptedArtifact ?? null;
+      if (
+        artifact?.status === "completed_unmerged" &&
+        !isSupersededLifecycleRecord(artifact)
+      ) {
+        const sourceContract = parseIssueContract(sourceIssue.description);
+        const sourceIsCurrent =
+          completedArtifactSourceIds.has(blockerId) &&
+          sourceContract.valid &&
+          sourceContract.fingerprint === artifact.contractFingerprint;
+        if (sourceIsCurrent) {
+          artifactsById.set(artifact.id, artifact);
+          continue;
+        }
+        invalidatedArtifacts.push(artifact);
+        if (this.acceptedArtifactSourceMayCompleteAgain(sourceIssue.state)) {
+          waitingArtifactSources.push(sourceIssue.identifier);
+        }
+      } else if (
+        artifact?.status === "completed_unmerged" &&
+        isSupersededLifecycleRecord(artifact)
+      ) {
+        invalidatedArtifacts.push(artifact);
+        if (this.acceptedArtifactSourceMayCompleteAgain(sourceIssue.state)) {
+          waitingArtifactSources.push(sourceIssue.identifier);
+        }
+      }
+    }
+    const existingSeed = targetLifecycle?.workspaceSeed ?? null;
+    if (
+      existingSeed !== null &&
+      !blockerIds.includes(existingSeed.sourceIssueId)
+    ) {
+      const reason = `persisted workspace seed ${existingSeed.artifactId} no longer has a direct Linear dependency on ${existingSeed.sourceIssueIdentifier}`;
+      await this.blockDependencyArtifactDispatch(
+        context.issue,
+        targetLifecycle,
+        reason,
+        `Restore the direct blocked-by relationship to ${existingSeed.sourceIssueIdentifier}, or discard this issue's seeded worktree and durable workspace-seed record before continuing.`,
+      );
+      return { status: "skipped" as const, stop: true, message: reason };
+    }
+    if (
+      existingSeed !== null &&
+      !completedArtifactSourceIds.has(existingSeed.sourceIssueId)
+    ) {
+      context.dispatch.dependencyArtifactSeed = null;
+      context.dispatch.dependencyArtifact = null;
+      const source = blockerStatesById.get(existingSeed.sourceIssueId);
+      if (
+        source &&
+        !this.acceptedArtifactSourceMayCompleteAgain(source.state)
+      ) {
+        const reason = `accepted-artifact source ${existingSeed.sourceIssueIdentifier} is ${source.state}, not ${this.config.mergePolicy.doneState}`;
+        await this.blockDependencyArtifactDispatch(
+          context.issue,
+          targetLifecycle,
+          reason,
+          `Move ${existingSeed.sourceIssueIdentifier} back into active work to produce a fresh accepted artifact, or remove the dependency and discard this issue's seeded worktree; then move this issue out of Blocked.`,
+        );
+        return { status: "skipped" as const, stop: true, message: reason };
+      }
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: `Accepted-artifact source ${existingSeed.sourceIssueIdentifier} is not in ${this.config.mergePolicy.doneState}; waiting for it to complete again`,
+      };
+    }
+
+    const artifacts = [...artifactsById.values()];
+    if (artifacts.length === 0) {
+      if (invalidatedArtifacts.length > 0) {
+        const invalidated = invalidatedArtifacts
+          .map((artifact) => artifact.id)
+          .sort()
+          .join(", ");
+        if (waitingArtifactSources.length > 0) {
+          context.dispatch.dependencyArtifactSeed = null;
+          context.dispatch.dependencyArtifact = null;
+          return {
+            status: "skipped" as const,
+            stop: true,
+            message: `Waiting for fresh accepted-artifact evidence from: ${[
+              ...new Set(waitingArtifactSources),
+            ].join(", ")}`,
+          };
+        }
+        const reason = `direct dependency has only superseded accepted-artifact evidence: ${invalidated}`;
+        await this.blockDependencyArtifactDispatch(
+          context.issue,
+          targetLifecycle,
+          reason,
+          "Reopen the accepted-artifact source and produce a fresh reviewed checkpoint, or remove the dependency if this successor should no longer consume it; then move this issue out of Blocked.",
+        );
+        return { status: "skipped" as const, stop: true, message: reason };
+      }
+      if (existingSeed !== null) {
+        const reason = `persisted workspace seed ${existingSeed.artifactId} has no matching completed accepted-artifact checkpoint`;
+        await this.blockDependencyArtifactDispatch(
+          context.issue,
+          targetLifecycle,
+          reason,
+          `Inspect ${existingSeed.sourceIssueIdentifier}, restore its completed accepted-artifact checkpoint, or discard this issue's seeded worktree and durable workspace-seed record before continuing.`,
+        );
+        return { status: "skipped" as const, stop: true, message: reason };
+      }
+      context.dispatch.dependencyArtifactSeed = null;
+      context.dispatch.dependencyArtifact = null;
+      return {
+        status: "skipped" as const,
+        message: "No completed accepted-artifact dependency applies",
+      };
+    }
+    if (artifacts.length > 1) {
+      const reason = `multiple accepted artifacts require integration before dispatch: ${artifacts
+        .map((artifact) => artifact.id)
+        .sort()
+        .join(", ")}`;
+      await this.blockDependencyArtifactDispatch(context.issue, targetLifecycle, reason);
+      return { status: "skipped" as const, stop: true, message: reason };
+    }
+
+    const artifact = artifacts[0]!;
+    const configuredBaseRef = nonEmptyString(this.config.workspace.source.baseRef);
+    if (
+      configuredBaseRef === null ||
+      artifact.baseRef.trim() !== configuredBaseRef
+    ) {
+      const reason =
+        configuredBaseRef === null
+          ? "accepted-artifact successor has no configured workspace base ref"
+          : `accepted artifact ${artifact.id} was reviewed for base ref ${artifact.baseRef}, but Symphony is configured for ${configuredBaseRef}`;
+      await this.blockDependencyArtifactDispatch(
+        context.issue,
+        targetLifecycle,
+        reason,
+        `Restore workspace.source.base_ref to ${artifact.baseRef}, or supersede and recreate the source artifact against ${configuredBaseRef}; then move this issue out of Blocked.`,
+      );
+      return { status: "skipped" as const, stop: true, message: reason };
+    }
+    const targetContract = parseIssueContract(context.issue.description);
+    if (
+      !targetContract.valid ||
+      targetContract.contract.delivery.mode !== "merge"
+    ) {
+      const contractReason = targetContract.valid
+        ? `delivery mode is ${targetContract.contract.delivery.mode}`
+        : targetContract.errors.join("; ");
+      const reason = `accepted-artifact successor must have a valid merge-delivery Issue Contract: ${contractReason}`;
+      await this.blockDependencyArtifactDispatch(
+        context.issue,
+        targetLifecycle,
+        reason,
+        "Correct this issue's fenced JSON Issue Contract to use `delivery: { \"mode\": \"merge\" }`, then move it out of Blocked.",
+      );
+      return { status: "skipped" as const, stop: true, message: reason };
+    }
+    if (existingSeed !== null && existingSeed.artifactId !== artifact.id) {
+      const reason = `persisted workspace seed ${existingSeed.artifactId} conflicts with dependency artifact ${artifact.id}`;
+      await this.blockDependencyArtifactDispatch(context.issue, targetLifecycle, reason);
+      return { status: "skipped" as const, stop: true, message: reason };
+    }
+    const seed = acceptedArtifactWorkspaceSeed(artifact, this.config);
+    const targetBranch = await this.options.workspaceManager.resolveBranchNameForIssue(
+      context.issue,
+    );
+    const plannedAt = existingSeed?.plannedAt ?? new Date().toISOString();
+    const seedRecord: IssueWorkspaceSeedRecord = existingSeed ?? {
+      version: 1,
+      id: `workspace-seed:${context.issue.id}:${artifact.id}`,
+      kind: "accepted_artifact",
+      status: "planned",
+      artifactId: artifact.id,
+      sourceIssueId: artifact.sourceIssueId,
+      sourceIssueIdentifier: artifact.sourceIssueIdentifier,
+      repositoryFingerprint: artifact.repositoryFingerprint,
+      sourceBranch: seed.sourceBranch,
+      sourceHeadSha: artifact.sourceHeadSha,
+      sourceBaseHeadSha: artifact.sourceBaseHeadSha,
+      configuredBaseRef: seed.configuredBaseRef,
+      preparedBaseHeadSha: null,
+      preparedHeadSha: null,
+      targetBranch,
+      conflictedFiles: [],
+      plannedAt,
+      preparedAt: null,
+      failureReason: null,
+    };
+    assertWorkspaceSeedMatchesArtifact(seedRecord, seed, targetBranch);
+    if (existingSeed === null) {
+      await this.updateIssueLifecycleWithEvidence(
+        context.issue,
+        { workspaceSeed: seedRecord },
+        "accepted_artifact_seed_planned",
+        artifact.id,
+      );
+    }
+    context.dispatch.dependencyArtifactSeed = seed;
+    context.dispatch.dependencyArtifact = artifact;
+    return {
+      details: {
+        artifactId: artifact.id,
+        sourceIssueIdentifier: artifact.sourceIssueIdentifier,
+        sourceHeadSha: artifact.sourceHeadSha,
+        targetBranch,
+        seedStatus: seedRecord.status,
+      },
+    };
+  }
+
+  private async blockDependencyArtifactDispatch(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord | null,
+    reason: string,
+    requiredAction =
+      "Create or select one integration issue that combines these accepted artifacts, then leave this issue blocked by only that integration issue.",
+  ): Promise<void> {
+    const runId = `accepted-artifact-seed:${issue.id}`;
+    await this.updateIssueLifecycleWithEvidence(
+      issue,
+      { phase: "blocked", blockedReason: reason },
+      "accepted_artifact_seed_requires_human_integration",
+      runId,
+    );
+    await this.applyWritebacks(
+      planBlockedEscalationWritebacks(
+        {
+          issue,
+          runId,
+          reason,
+          ...(lifecycle === null
+            ? {}
+            : { incompleteTurnCount: lifecycle.incompleteTurnCount }),
+          maxIncompleteTurns: this.config.reviewLoop.maxIncompleteTurns,
+          ...(lifecycle === null ? {} : { reviewRound: lifecycle.reviewRound }),
+          maxReviewRounds: this.config.reviewLoop.failureLimits.reviewerFailures,
+          lastCompletionReport: latestCompletionReportFromLifecycle(lifecycle),
+          lastReviewVerdict: latestReviewVerdictFromLifecycle(lifecycle),
+          requiredAction,
+        },
+        this.config,
+      ),
+      "accepted artifact dependency integration required",
+      issue,
+    );
+  }
+
   private async planWorkerDispatchWritebackAction(
     context: OrchestratorTransitionContext,
   ) {
@@ -5430,6 +5833,8 @@ export class Orchestrator {
       manualDispatch,
       context.transition.historySnapshotId,
     );
+    entry.dependencyArtifactSeed = context.dispatch.dependencyArtifactSeed ?? null;
+    entry.dependencyArtifact = context.dispatch.dependencyArtifact ?? null;
     context.dispatch.entry = entry;
     this.running.set(issue.id, entry);
     await this.recordRuntimeControlEvidenceSnapshot({
@@ -6357,6 +6762,9 @@ export class Orchestrator {
   private async requestMergePolicyAfterPassVerdictAction(
     context: OrchestratorTransitionContext,
   ) {
+    const dependencyGuard =
+      await this.validateDependencyArtifactBeforeReviewOrMerge(context);
+    if (dependencyGuard !== true) return dependencyGuard;
     const verdict = context.handoffReconciliation.reviewVerdict;
     if (!verdict)
       return {
@@ -6369,8 +6777,692 @@ export class Orchestrator {
         status: "skipped" as const,
         message: "Review verdict did not pass",
       };
+    if (verdict.passDisposition === "accepted_artifact") {
+      return this.completeAcceptedArtifactAction(context);
+    }
     await this.processMergePolicyTransitionCandidate(context.issue);
     return { details: { verdictId: verdict.id, verdict: verdict.verdict } };
+  }
+
+  private async completeAcceptedArtifactAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const lifecycleStore = this.options.lifecycleStore;
+    if (!lifecycleStore) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "Accepted-artifact completion requires lifecycle persistence",
+      };
+    }
+    const latestIssues = await this.options.tracker.fetchIssueStatesByIds([
+      context.issue.id,
+    ]);
+    const issue = latestIssues[0] ?? context.issue;
+    const lifecycle = await lifecycleStore.get(issue.id);
+    const verdict =
+      context.handoffReconciliation.reviewVerdict ??
+      latestReviewVerdictFromLifecycle(lifecycle);
+    if (
+      !verdict ||
+      verdict.verdict !== "pass" ||
+      verdict.passDisposition !== "accepted_artifact" ||
+      isSupersededLifecycleRecord(verdict)
+    ) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "No current accepted-artifact pass verdict is ready to complete",
+      };
+    }
+
+    await this.releaseMergeQueueLease(issue, "accepted_artifact_completion");
+    const writebackOutbox = new SqliteWritebackOutboxStore(
+      this.config.workspace.stateDir,
+    );
+    try {
+      const service = new AcceptedArtifactService({
+        config: this.config,
+        lifecycleStore,
+        writebackOutbox,
+        ...(this.options.writeback === undefined
+          ? {}
+          : { writebackProcessor: this.options.writeback }),
+        client: this.acceptedArtifactGitHubClient(),
+      });
+      const result = await service.completeAcceptedArtifact({
+        issue,
+        workspacePath: lifecycle?.summaryPointers.workspacePath ?? null,
+      });
+      const refreshed = await this.options.tracker.fetchIssueStatesByIds([
+        issue.id,
+      ]);
+      const latest = refreshed[0];
+      if (!latest) {
+        throw new SymphonyError(
+          "tracker_unavailable",
+          "Accepted-artifact completion could not refresh the source issue after writeback",
+        );
+      }
+      const completionLifecycle = await lifecycleStore.get(latest.id);
+      const completedArtifact = completionLifecycle?.acceptedArtifact ?? null;
+      if (
+        completionLifecycle &&
+        completedArtifact &&
+        !isSupersededLifecycleRecord(completedArtifact) &&
+        this.acceptedArtifactSourceNeedsSupersession(
+          latest,
+          completedArtifact,
+          completionLifecycle.phase,
+        )
+      ) {
+        const reason = `Accepted-artifact completion was invalidated because the source is now ${latest.state} or its Issue Contract changed`;
+        await this.supersedeAcceptedArtifactEvidence(
+          latest,
+          completionLifecycle,
+          {
+            reason,
+            sourceId: completedArtifact.reviewVerdictId,
+            nextPhase: phaseForIssueState(latest.state, this.config),
+            expectedArtifactId: completedArtifact.id,
+          },
+        );
+        return {
+          details: {
+            artifactId: completedArtifact.id,
+            status: result.status,
+            disposition: "superseded_after_source_change",
+            writebacksSettled: result.writebacksSettled,
+            trackerState: latest.state,
+          },
+        };
+      }
+      if (
+        result.writebacksSettled ||
+        isStateIn(latest.state, this.config.tracker.terminalStates)
+      ) {
+        await this.updateIssueLifecycleWithEvidence(
+          latest,
+          { phase: "terminal", blockedReason: null },
+          "accepted_artifact_completed_unmerged",
+          result.artifact.id,
+        );
+      }
+      return {
+        details: {
+          artifactId: result.artifact.id,
+          status: result.status,
+          replayed: result.replayed,
+          pullRequestNumber: result.artifact.pullRequest.number,
+          sourceHeadSha: result.artifact.sourceHeadSha,
+          writebacksSettled: result.writebacksSettled,
+          trackerState: latest.state,
+        },
+      };
+    } catch (error) {
+      const category = classifyAcceptedArtifactCompletionError(error);
+      if (category === "contract_or_head_drift") {
+        await this.returnAcceptedArtifactToImplementation(
+          issue,
+          lifecycle,
+          verdict,
+          errorMessage(error),
+        );
+        return {
+          details: {
+            disposition: "returned_to_implementation",
+            reason: errorMessage(error),
+          },
+        };
+      }
+      if (category === "permanent_github_access_or_configuration") {
+        const reason = `accepted-artifact completion cannot access GitHub: ${errorMessage(error)}`;
+        await this.blockDependencyArtifactDispatch(
+          issue,
+          lifecycle,
+          reason,
+          "Repair the configured GitHub owner/repository, credentials, or GitHub App installation permissions, then move the issue out of Blocked so Symphony can reconcile the same reviewed checkpoint.",
+        );
+        return {
+          status: "skipped" as const,
+          stop: true,
+          message: reason,
+        };
+      }
+      if (category === "unexpected_merged_or_irrecoverable_checkpoint") {
+        const reason = `accepted-artifact completion requires human intervention: ${errorMessage(error)}`;
+        await this.blockDependencyArtifactDispatch(
+          issue,
+          lifecycle,
+          reason,
+          "Inspect the unexpected merge or irrecoverable checkpoint mismatch, restore a trustworthy source checkpoint, then move the issue out of Blocked.",
+        );
+        return {
+          status: "skipped" as const,
+          stop: true,
+          message: reason,
+        };
+      }
+      throw error;
+    } finally {
+      await writebackOutbox.close();
+    }
+  }
+
+  private async supersedeReopenedAcceptedArtifactAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const artifact = lifecycle?.acceptedArtifact ?? null;
+    if (
+      !lifecycle ||
+      !artifact ||
+      artifact.status !== "completed_unmerged" ||
+      isSupersededLifecycleRecord(artifact) ||
+      !this.acceptedArtifactSourceNeedsSupersession(
+        context.issue,
+        artifact,
+        lifecycle.phase,
+      )
+    ) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "No current accepted artifact requires reopen supersession",
+      };
+    }
+    const parsed = parseIssueContract(context.issue.description);
+    const reason =
+      !parsed.valid || parsed.fingerprint !== artifact.contractFingerprint
+        ? "The accepted-artifact source Issue Contract changed after review"
+        : `The accepted-artifact source moved from ${this.config.mergePolicy.doneState} to ${context.issue.state}`;
+    const updated = await this.supersedeAcceptedArtifactEvidence(
+      context.issue,
+      lifecycle,
+      {
+        reason,
+        sourceId: artifact.reviewVerdictId,
+        nextPhase: phaseForIssueState(context.issue.state, this.config),
+        expectedArtifactId: artifact.id,
+      },
+    );
+    return {
+      details: {
+        artifactId: artifact.id,
+        reason,
+        trackerState: context.issue.state,
+        nextPhase: updated?.phase ?? null,
+      },
+    };
+  }
+
+  private async reconcileCompletedAcceptedArtifactAction(
+    context: OrchestratorTransitionContext,
+  ) {
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const artifact = lifecycle?.acceptedArtifact ?? null;
+    if (
+      !lifecycle ||
+      !artifact ||
+      artifact.status !== "completed_unmerged" ||
+      isSupersededLifecycleRecord(artifact)
+    ) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: "No completed accepted artifact requires reconciliation",
+      };
+    }
+
+    const parsed = parseIssueContract(context.issue.description);
+    if (
+      !parsed.valid ||
+      parsed.fingerprint !== artifact.contractFingerprint
+    ) {
+      return this.supersedeReopenedAcceptedArtifactAction(context);
+    }
+
+    if (isStateIn(context.issue.state, [this.config.mergePolicy.doneState])) {
+      const updated = await this.updateIssueLifecycleWithEvidence(
+        context.issue,
+        { phase: "terminal", blockedReason: null },
+        "accepted_artifact_done_state_reconciled",
+        artifact.id,
+      );
+      return {
+        details: {
+          artifactId: artifact.id,
+          disposition: "terminal_reconciled",
+          nextPhase: updated?.phase ?? null,
+        },
+      };
+    }
+
+    if (
+      lifecycle.phase !== "passed" ||
+      !isStateIn(
+        context.issue.state,
+        acceptedArtifactCompletionSourceStates(this.config),
+      )
+    ) {
+      return this.supersedeReopenedAcceptedArtifactAction(context);
+    }
+
+    const doneWriteback = await this.withTemporaryWritebackOutbox((outbox) =>
+      outbox.get(artifact.doneTransitionOperationKey),
+    );
+    if (doneWriteback?.status === "succeeded") {
+      const reason = `The accepted-artifact source moved from ${this.config.mergePolicy.doneState} to ${context.issue.state}`;
+      const updated = await this.supersedeAcceptedArtifactEvidence(
+        context.issue,
+        lifecycle,
+        {
+          reason,
+          sourceId: artifact.reviewVerdictId,
+          nextPhase: phaseForIssueState(context.issue.state, this.config),
+          expectedArtifactId: artifact.id,
+        },
+      );
+      return {
+        details: {
+          artifactId: artifact.id,
+          disposition: "superseded_after_reopen",
+          reason,
+          nextPhase: updated?.phase ?? null,
+        },
+      };
+    }
+
+    return this.completeAcceptedArtifactAction(context);
+  }
+
+  private acceptedArtifactSourceNeedsSupersession(
+    issue: Pick<Issue, "state" | "description">,
+    artifact: IssueAcceptedArtifactRecord,
+    lifecyclePhase: IssueLifecyclePhase,
+  ): boolean {
+    const parsed = parseIssueContract(issue.description);
+    if (!parsed.valid || parsed.fingerprint !== artifact.contractFingerprint)
+      return true;
+    if (isStateIn(issue.state, [this.config.mergePolicy.doneState]))
+      return false;
+    if (lifecyclePhase === "terminal") return true;
+    return !isStateIn(
+      issue.state,
+      acceptedArtifactCompletionSourceStates(this.config),
+    );
+  }
+
+  private acceptedArtifactSourceMayCompleteAgain(state: string): boolean {
+    return isStateIn(state, [
+      ...this.config.tracker.activeStates,
+      ...this.config.tracker.handoffStates,
+      ...this.config.reviewLoop.reviewStates,
+      ...(this.config.reviewLoop.reviewPassState === null
+        ? []
+        : [this.config.reviewLoop.reviewPassState]),
+      ...this.config.mergePolicy.sourceStates,
+    ]);
+  }
+
+  private async dependencyArtifactFreshness(
+    issue: Issue,
+    lifecycle?: IssueLifecycleRecord | null,
+  ): Promise<DependencyArtifactFreshness> {
+    const currentLifecycle =
+      lifecycle ?? (await this.options.lifecycleStore?.get(issue.id)) ?? null;
+    const seed = currentLifecycle?.workspaceSeed ?? null;
+    if (!seed) return { status: "fresh" };
+    let liveIssues: Issue[];
+    try {
+      liveIssues = await this.options.tracker.fetchIssueStatesByIds([
+        issue.id,
+        seed.sourceIssueId,
+      ]);
+    } catch (error) {
+      return {
+        status: "unavailable",
+        reason: `Live dependency refresh failed: ${errorMessage(error)}`,
+      };
+    }
+    const liveTarget = liveIssues.find((candidate) => candidate.id === issue.id);
+    const liveSource = liveIssues.find(
+      (candidate) => candidate.id === seed.sourceIssueId,
+    );
+    if (!liveTarget || !liveSource) {
+      return {
+        status: "unavailable",
+        reason:
+          "Live target or accepted-artifact source state was not returned",
+      };
+    }
+    if (
+      !liveTarget.blockedBy.some(
+        (blocker) => blocker.id === seed.sourceIssueId,
+      )
+    ) {
+      return {
+        status: "invalid",
+        reason: `The direct dependency on ${seed.sourceIssueIdentifier} was removed after workspace seeding`,
+      };
+    }
+    if (
+      !isStateIn(liveSource.state, [this.config.mergePolicy.doneState])
+    ) {
+      const reason = `Accepted-artifact source ${seed.sourceIssueIdentifier} is ${liveSource.state}, not ${this.config.mergePolicy.doneState}`;
+      return this.acceptedArtifactSourceMayCompleteAgain(liveSource.state)
+        ? { status: "deferred", reason }
+        : { status: "invalid", reason };
+    }
+    const sourceContract = parseIssueContract(liveSource.description);
+    const sourceLifecycle =
+      (await this.options.lifecycleStore?.get(seed.sourceIssueId)) ?? null;
+    const artifact = sourceLifecycle?.acceptedArtifact ?? null;
+    if (
+      !sourceContract.valid ||
+      !artifact ||
+      isSupersededLifecycleRecord(artifact) ||
+      artifact.status !== "completed_unmerged" ||
+      artifact.id !== seed.artifactId ||
+      artifact.sourceHeadSha !== seed.sourceHeadSha ||
+      sourceContract.fingerprint !== artifact.contractFingerprint
+    ) {
+      return {
+        status: "invalid",
+        reason: `Workspace seed ${seed.artifactId} no longer matches the current reviewed checkpoint for ${seed.sourceIssueIdentifier}`,
+      };
+    }
+    return { status: "fresh" };
+  }
+
+  private async validateDependencyArtifactBeforeReviewOrMerge(
+    context: OrchestratorTransitionContext,
+  ) {
+    const lifecycle = await this.options.lifecycleStore?.get(context.issue.id);
+    const freshness = await this.dependencyArtifactFreshness(
+      context.issue,
+      lifecycle,
+    );
+    if (freshness.status === "fresh") return true;
+    if (freshness.status === "unavailable") {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: freshness.reason,
+      };
+    }
+    if (!lifecycle?.workspaceSeed) {
+      return {
+        status: "skipped" as const,
+        stop: true,
+        message: freshness.reason,
+      };
+    }
+    if (freshness.status === "deferred") {
+      await this.invalidateSeededTargetReview(
+        context.issue,
+        lifecycle,
+        freshness.reason,
+      );
+    } else {
+      await this.blockDependencyArtifactDispatch(
+        context.issue,
+        lifecycle,
+        freshness.reason,
+        `Reconcile or discard the workspace seeded from ${lifecycle.workspaceSeed.sourceIssueIdentifier}, restore a direct dependency on a current ${this.config.mergePolicy.doneState} accepted artifact, then move this issue out of Blocked.`,
+      );
+    }
+    return {
+      status: "skipped" as const,
+      stop: true,
+      message: freshness.reason,
+    };
+  }
+
+  private async invalidateSeededTargetReview(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    reason: string,
+  ): Promise<void> {
+    const seed = lifecycle.workspaceSeed;
+    if (!seed) return;
+    const updated = await this.supersedeAcceptedArtifactEvidence(
+      issue,
+      lifecycle,
+      {
+        reason,
+        sourceId: seed.artifactId,
+        nextPhase: "implementation",
+        ...(lifecycle.lastCompletionReportId === null
+          ? {}
+          : {
+              expectedCompletionReportId:
+                lifecycle.lastCompletionReportId,
+            }),
+        ...(lifecycle.lastReviewVerdictId === null
+          ? {}
+          : { expectedReviewVerdictId: lifecycle.lastReviewVerdictId }),
+      },
+    );
+    if (updated?.workspaceSeed) {
+      await this.updateIssueLifecycleWithEvidence(
+        issue,
+        {
+          workspaceSeed: {
+            ...updated.workspaceSeed,
+            failureReason: reason,
+          },
+        },
+        "dependency_artifact_review_invalidated",
+        seed.artifactId,
+      );
+    }
+    await this.releaseMergeQueueLease(
+      issue,
+      "dependency_artifact_review_invalidated",
+    );
+    const eventKey = `dependency-artifact:${safeArtifactSegment(seed.artifactId)}:review-invalidated`;
+    const runId = lifecycle.summaryPointers.lastRunId;
+    const fromStates = [
+      ...this.config.reviewLoop.reviewStates,
+      ...(this.config.reviewLoop.reviewPassState === null
+        ? []
+        : [this.config.reviewLoop.reviewPassState]),
+      ...this.config.mergePolicy.sourceStates,
+    ];
+    await this.applyWritebacks(
+      [
+        {
+          idempotencyKey: `comment:${issue.id}:${eventKey}`,
+          kind: "comment",
+          issueId: issue.id,
+          ...(runId === null ? {} : { runId }),
+          payload: {
+            dedupeKey: eventKey,
+            body: [
+              "## Symphony Dependency Artifact Invalidated",
+              "",
+              reason,
+              "The current completion and review evidence was retired. Symphony will wait for a current accepted-artifact checkpoint before this implementation can be reviewed again.",
+            ].join("\n"),
+          },
+        },
+        {
+          idempotencyKey: `transition:${issue.id}:${eventKey}:${safeArtifactSegment(this.config.writeback.dispatchState)}`,
+          kind: "transition",
+          issueId: issue.id,
+          ...(runId === null ? {} : { runId }),
+          payload: {
+            fromStates,
+            toState: this.config.writeback.dispatchState,
+            reason: "Symphony dependency artifact was invalidated",
+          },
+        },
+      ],
+      "dependency artifact review invalidated",
+      issue,
+    );
+  }
+
+  private async supersedeAcceptedArtifactEvidence(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord,
+    input: {
+      reason: string;
+      sourceId: string;
+      nextPhase: IssueLifecyclePhase;
+      expectedArtifactId?: string;
+      expectedCompletionReportId?: string;
+      expectedReviewVerdictId?: string;
+    },
+  ): Promise<IssueLifecycleRecord | null> {
+    const currentLifecycle =
+      (await this.options.lifecycleStore?.get(issue.id)) ?? lifecycle;
+    const now = new Date().toISOString();
+    const artifact = currentLifecycle.acceptedArtifact;
+    if (
+      input.expectedArtifactId !== undefined &&
+      (artifact?.id !== input.expectedArtifactId ||
+        isSupersededLifecycleRecord(artifact))
+    ) {
+      return currentLifecycle;
+    }
+    if (
+      input.expectedCompletionReportId !== undefined &&
+      currentLifecycle.lastCompletionReportId !==
+        input.expectedCompletionReportId
+    ) {
+      return currentLifecycle;
+    }
+    if (
+      input.expectedReviewVerdictId !== undefined &&
+      currentLifecycle.lastReviewVerdictId !== input.expectedReviewVerdictId
+    ) {
+      return currentLifecycle;
+    }
+    const completionReportId =
+      artifact?.completionReportId ?? currentLifecycle.lastCompletionReportId;
+    const reviewVerdictId =
+      artifact?.reviewVerdictId ?? currentLifecycle.lastReviewVerdictId;
+    const completionReports = currentLifecycle.completionReports.map((candidate) =>
+      candidate.id === completionReportId
+        ? {
+            ...candidate,
+            supersededAt: candidate.supersededAt ?? now,
+            supersededBy:
+              candidate.supersededBy ?? "accepted_artifact_source_invalidated",
+            supersededReason: candidate.supersededReason ?? input.reason,
+          }
+        : candidate,
+    );
+    const reviewVerdicts = currentLifecycle.reviewVerdicts.map((candidate) =>
+      candidate.id === reviewVerdictId
+        ? {
+            ...candidate,
+            supersededAt: candidate.supersededAt ?? now,
+            supersededBy:
+              candidate.supersededBy ?? "accepted_artifact_source_invalidated",
+            supersededReason: candidate.supersededReason ?? input.reason,
+          }
+        : candidate,
+    );
+    const acceptedArtifact = artifact
+      ? {
+          ...artifact,
+          supersededAt: artifact.supersededAt ?? now,
+          supersededBy:
+            artifact.supersededBy ?? "accepted_artifact_source_invalidated",
+          supersededReason: artifact.supersededReason ?? input.reason,
+        }
+      : null;
+    return this.updateIssueLifecycleWithEvidence(
+      issue,
+      {
+        phase: input.nextPhase,
+        blockedReason: null,
+        reviewRound: 0,
+        incompleteTurnCount: 0,
+        lastCompletionReportId: null,
+        lastReviewVerdictId: null,
+        completionReports,
+        reviewVerdicts,
+        acceptedArtifact,
+      },
+      "accepted_artifact_evidence_superseded",
+      input.sourceId,
+    );
+  }
+
+  private acceptedArtifactGitHubClient(): AcceptedArtifactGitHubClient {
+    if (this.options.acceptedArtifactClient) {
+      return this.options.acceptedArtifactClient;
+    }
+    return createGitHubPullRequestClientForCapability(
+      this.config,
+      "github.merge",
+    );
+  }
+
+  private async returnAcceptedArtifactToImplementation(
+    issue: Issue,
+    lifecycle: IssueLifecycleRecord | null,
+    verdict: IssueReviewVerdictRecord,
+    reason: string,
+  ): Promise<void> {
+    if (lifecycle) {
+      await this.supersedeAcceptedArtifactEvidence(issue, lifecycle, {
+        reason,
+        sourceId: verdict.id,
+        nextPhase: "implementation",
+        ...(lifecycle.acceptedArtifact == null
+          ? {}
+          : { expectedArtifactId: lifecycle.acceptedArtifact.id }),
+        ...(lifecycle.lastCompletionReportId === null
+          ? {}
+          : {
+              expectedCompletionReportId:
+                lifecycle.lastCompletionReportId,
+            }),
+        expectedReviewVerdictId: verdict.id,
+      });
+    }
+    const eventKey = `accepted-artifact:${safeArtifactSegment(verdict.id)}:returned-to-implementation`;
+    const operations: NewWritebackOperation[] = [
+      {
+        idempotencyKey: `comment:${issue.id}:${eventKey}`,
+        kind: "comment",
+        issueId: issue.id,
+        runId: verdict.runId,
+        payload: {
+          dedupeKey: eventKey,
+          body: [
+            "## Symphony Accepted-Artifact Evidence Superseded",
+            "",
+            "Status: returned to implementation",
+            "The reviewed expected-red artifact can no longer be completed from its persisted evidence.",
+            "",
+            `Reason: ${reason}`,
+            "Submit a fresh completion report and review against the current Issue Contract and branch head.",
+          ].join("\n"),
+        },
+      },
+      {
+        idempotencyKey: `transition:${issue.id}:${eventKey}:${safeArtifactSegment(this.config.writeback.dispatchState)}`,
+        kind: "transition",
+        issueId: issue.id,
+        runId: verdict.runId,
+        payload: {
+          fromStates: acceptedArtifactCompletionSourceStates(this.config),
+          toState: this.config.writeback.dispatchState,
+          reason: "Symphony accepted-artifact evidence was superseded",
+        },
+      },
+    ];
+    await this.applyWritebacks(
+      operations,
+      "accepted artifact returned to implementation",
+      issue,
+    );
   }
 
   private async loadHandoffReconciliationEntry(
@@ -6936,6 +8028,8 @@ export class Orchestrator {
           "github.publication",
         ),
       operatorApproval: this.options.operatorApproval,
+      resolveIssuesByIds: (issueIds) =>
+        this.options.tracker.fetchIssueStatesByIds(issueIds),
     });
     return true;
   }
@@ -8204,6 +9298,62 @@ export class Orchestrator {
             : null,
       },
       {
+        id: "orchestrator.reconcile_completed_accepted_artifact",
+        priority: 93,
+        evaluate: (snapshot) =>
+          this.rulesetShouldReconcileCompletedAcceptedArtifact(snapshot)
+            ? {
+                transitionKind: "reconcile_completed_accepted_artifact",
+                reason: "accepted_artifact_lifecycle_reconciliation",
+                runId: snapshot.acceptedArtifact?.reviewVerdictId ?? null,
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.supersede_reopened_accepted_artifact",
+        priority: 94,
+        evaluate: (snapshot) =>
+          this.rulesetShouldSupersedeReopenedAcceptedArtifact(snapshot)
+            ? {
+                transitionKind: "supersede_reopened_accepted_artifact",
+                reason: "accepted_artifact_source_reopened_or_invalidated",
+                runId: snapshot.acceptedArtifact?.reviewVerdictId ?? null,
+              }
+            : null,
+      },
+      {
+        id: "orchestrator.complete_accepted_artifact",
+        priority: 95,
+        evaluate: (snapshot) => {
+          const acceptedArtifactReport =
+            snapshot.latestCompletionReport?.contractSnapshot?.delivery.mode ===
+            "accepted_artifact";
+          if (
+            snapshot.triggerType !== "orchestrator.tick" ||
+            snapshot.running ||
+            snapshot.paused ||
+            snapshot.claimed ||
+            !snapshot.lifecyclePersistenceAvailable ||
+            snapshot.phase !== "passed" ||
+            !isStateIn(
+              snapshot.trackerState,
+              acceptedArtifactCompletionSourceStates(this.config),
+            ) ||
+            !acceptedArtifactReport
+          ) {
+            return null;
+          }
+          return {
+            transitionKind: "complete_accepted_artifact",
+            reason: "accepted_artifact_completion_reconciliation",
+            runId:
+              snapshot.lastReviewVerdictId ??
+              snapshot.latestApprovalPassVerdict?.id ??
+              null,
+          };
+        },
+      },
+      {
         id: "orchestrator.dispatch.worker.implementation",
         priority: 100,
         evaluate: (snapshot) =>
@@ -8767,6 +9917,7 @@ export class Orchestrator {
     )
       return false;
     if (!this.rulesetCommonDispatchGate(snapshot)) return false;
+    if (descriptionDeclaresAcceptedArtifact(snapshot.description)) return false;
     if (!snapshot.assignedToWorker) return false;
     if (this.isMergeConflictState(snapshot.trackerState)) return false;
     if (isStateIn(snapshot.trackerState, this.config.tracker.terminalStates))
@@ -8821,6 +9972,58 @@ export class Orchestrator {
       ]) &&
       (conflict.status === "blocked" ||
         conflict.resolutionStatus === "blocked"),
+    );
+  }
+
+  private rulesetShouldSupersedeReopenedAcceptedArtifact(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick") return false;
+    if (!snapshot.lifecyclePersistenceAvailable) return false;
+    const artifact = snapshot.acceptedArtifact;
+    if (
+      !artifact ||
+      artifact.status !== "completed_unmerged" ||
+      isSupersededLifecycleRecord(artifact)
+    ) {
+      return false;
+    }
+    return this.acceptedArtifactSourceNeedsSupersession(
+      {
+        state: snapshot.trackerState,
+        description: snapshot.description,
+      },
+      artifact,
+      snapshot.phase as IssueLifecyclePhase,
+    );
+  }
+
+  private rulesetShouldReconcileCompletedAcceptedArtifact(
+    snapshot: IssueCurrentStateSnapshot,
+  ): boolean {
+    if (snapshot.triggerType !== "orchestrator.tick") return false;
+    if (!snapshot.lifecyclePersistenceAvailable) return false;
+    const artifact = snapshot.acceptedArtifact;
+    if (
+      !artifact ||
+      artifact.status !== "completed_unmerged" ||
+      isSupersededLifecycleRecord(artifact)
+    ) {
+      return false;
+    }
+    const parsed = parseIssueContract(snapshot.description);
+    if (!parsed.valid || parsed.fingerprint !== artifact.contractFingerprint) {
+      return false;
+    }
+    if (isStateIn(snapshot.trackerState, [this.config.mergePolicy.doneState])) {
+      return snapshot.phase !== "terminal";
+    }
+    return (
+      snapshot.phase === "passed" &&
+      isStateIn(
+        snapshot.trackerState,
+        acceptedArtifactCompletionSourceStates(this.config),
+      )
     );
   }
 
@@ -9183,6 +10386,7 @@ export class Orchestrator {
         snapshot.transitionRequestContext?.kind === "merge_policy_chain");
     if (!triggerAllowed) return false;
     if (snapshot.mergePolicyMode !== "gated") return false;
+    if (snapshotIsAcceptedArtifactDelivery(snapshot)) return false;
     if (!this.rulesetIsMergePolicyTrackedState(snapshot)) return false;
     if (snapshot.hasChildren) return false;
     if (
@@ -9205,6 +10409,7 @@ export class Orchestrator {
         snapshot.transitionRequestContext?.kind === "merge_policy_chain");
     if (!triggerAllowed) return false;
     if (snapshot.mergePolicyMode !== "gated") return false;
+    if (snapshotIsAcceptedArtifactDelivery(snapshot)) return false;
     if (!this.rulesetIsMergePolicySourceState(snapshot)) return false;
     if (snapshot.hasChildren) return false;
     if (snapshot.running || snapshot.paused) return false;
@@ -10911,6 +12116,7 @@ export class Orchestrator {
   ): boolean {
     if (!this.config.issueBreakdown.enabled || !this.options.lifecycleStore)
       return false;
+    if (descriptionDeclaresAcceptedArtifact(issue.description)) return false;
     if (this.running.has(issue.id)) return false;
     if (this.pausedIssues.has(issue.id)) return false;
     if (!allowExistingClaim && this.claimed.has(issue.id)) return false;
@@ -11318,6 +12524,12 @@ export class Orchestrator {
       pullRequestHandoffAccepted: false,
       reviewVerdictAccepted: false,
       reviewEvidence,
+      dependencyArtifactSeed: null,
+      dependencyArtifact: null,
+      dependencyArtifactSeedConflict: null,
+      acceptedArtifactSeedPreparationActive: false,
+      acceptedArtifactSeedFreshDispatch: false,
+      acceptedArtifactSeedFailureDisposition: null,
       manualDispatch,
       handoffRepair: null,
       hermesResume: null,
@@ -11406,13 +12618,74 @@ export class Orchestrator {
     attempt: number | null,
   ): Promise<void> {
     let workspace: Workspace | null = null;
+    if (entry.dependencyArtifactSeed !== null) {
+      entry.acceptedArtifactSeedPreparationActive = true;
+      entry.acceptedArtifactSeedFailureDisposition = "retry";
+      const lifecycle =
+        (await this.options.lifecycleStore?.get(entry.issue.id)) ??
+        entry.lifecycle;
+      const workspaceSeed = lifecycle?.workspaceSeed ?? null;
+      if (
+        workspaceSeed !== null &&
+        (workspaceSeed.status === "planned" ||
+          workspaceSeed.status === "preparing")
+      ) {
+        await this.updateLifecycle(entry, {
+          workspaceSeed: {
+            ...workspaceSeed,
+            status: "preparing",
+            failureReason: null,
+          },
+        });
+      }
+    }
     try {
       workspace =
         entry.runPhase === "issue_breakdown"
           ? await this.options.workspaceManager.createForPlanning(entry.issue)
-          : await this.options.workspaceManager.createForIssue(entry.issue);
+          : await this.options.workspaceManager.createForIssue(entry.issue, {
+              seed: entry.dependencyArtifactSeed,
+            });
       entry.workspacePath = workspace.path;
       entry.workspace = workspace;
+      let preparedWorkspaceSeed: IssueWorkspaceSeedRecord | null = null;
+      let seedConflictPending = false;
+      if (workspace.seed) {
+        const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
+        const planned = lifecycle?.workspaceSeed ?? null;
+        if (!planned || planned.artifactId !== workspace.seed.artifactId) {
+          throw new SymphonyError(
+            "conflict",
+            "Prepared accepted-artifact workspace does not match its durable seed plan",
+          );
+        }
+        seedConflictPending = workspace.seed.conflictedFiles.length > 0;
+        entry.dependencyArtifactSeedConflict = seedConflictPending
+          ? workspace.seed
+          : null;
+        preparedWorkspaceSeed = seedConflictPending
+          ? {
+              ...planned,
+              status: "conflicted",
+              preparedBaseHeadSha: workspace.seed.preparedBaseHeadSha,
+              preparedHeadSha: null,
+              targetBranch: workspace.seed.targetBranch,
+              conflictedFiles: [...workspace.seed.conflictedFiles],
+              preparedAt: null,
+              failureReason:
+                "Accepted-artifact seed rebase requires automated worker conflict resolution",
+            }
+          : {
+              ...planned,
+              status: "prepared",
+              preparedBaseHeadSha: workspace.seed.preparedBaseHeadSha,
+              preparedHeadSha: workspace.seed.preparedHeadSha,
+              targetBranch: workspace.seed.targetBranch,
+              conflictedFiles: [],
+              preparedAt: planned.preparedAt ?? new Date().toISOString(),
+              failureReason: null,
+            };
+      }
       await this.recordWorkspaceEvidenceSnapshot(
         entry,
         "workspace_created",
@@ -11440,9 +12713,12 @@ export class Orchestrator {
                 repoPath: workspace.repoPath ?? null,
                 baseRef: workspace.baseRef ?? null,
               },
+              ...(preparedWorkspaceSeed === null
+                ? {}
+                : { workspaceSeed: preparedWorkspaceSeed }),
             },
       );
-      if (entry.runPhase !== "issue_breakdown") {
+      if (entry.runPhase !== "issue_breakdown" && !seedConflictPending) {
         await this.options.workspaceManager.beforeRun(workspace.path);
         await this.recordWorkspaceEvidenceSnapshot(
           entry,
@@ -11489,6 +12765,101 @@ export class Orchestrator {
         return;
       }
 
+      let firstImplementationTurn = 1;
+      if (seedConflictPending) {
+        entry.turnCount = 1;
+        const promptBundle =
+          await this.renderAcceptedArtifactSeedConflictPromptBundle(
+            entry,
+            attempt,
+            1,
+          );
+        this.assertPromptBundleSupported(promptBundle);
+        const context = this.buildRunContext(
+          entry,
+          workspace,
+          attempt,
+          1,
+          promptBundle,
+        );
+        await this.consumeHarnessEvents(
+          entry,
+          this.options.harness.run(context, promptBundle.userPrompt),
+          {
+            workspace,
+            prompt: promptBundle.userPrompt,
+            promptBundle,
+            attempt,
+            turnNumber: 1,
+          },
+        );
+        if (entry.lastEvent !== "completed") {
+          throw new SymphonyError(
+            "agent_error",
+            `Accepted-artifact seed conflict turn ended with ${entry.lastEvent ?? "no terminal event"}`,
+          );
+        }
+        if (entry.abortController.signal.aborted) {
+          throw new SymphonyError("agent_error", "Run was cancelled");
+        }
+        const finalizedSeed =
+          await this.options.workspaceManager.finalizeAcceptedArtifactSeedConflict(
+            entry.issue,
+          );
+        workspace = { ...workspace, seed: finalizedSeed };
+        entry.workspace = workspace;
+        entry.dependencyArtifactSeedConflict = null;
+        const lifecycle = await this.options.lifecycleStore?.get(entry.issue.id);
+        const planned = lifecycle?.workspaceSeed ?? null;
+        if (!planned || planned.artifactId !== finalizedSeed.artifactId) {
+          throw new SymphonyError(
+            "conflict",
+            "Finalized accepted-artifact workspace does not match its durable seed plan",
+          );
+        }
+        await this.updateLifecycle(entry, {
+          workspaceSeed: {
+            ...planned,
+            status: "prepared",
+            preparedBaseHeadSha: finalizedSeed.preparedBaseHeadSha,
+            preparedHeadSha: finalizedSeed.preparedHeadSha,
+            targetBranch: finalizedSeed.targetBranch,
+            conflictedFiles: [],
+            preparedAt: new Date().toISOString(),
+            failureReason: null,
+          },
+        });
+        await this.recordWorkspaceEvidenceSnapshot(
+          entry,
+          "accepted_artifact_seed_conflict_resolved",
+          workspace,
+          {
+            artifactId: finalizedSeed.artifactId,
+            preparedBaseHeadSha: finalizedSeed.preparedBaseHeadSha,
+            preparedHeadSha: finalizedSeed.preparedHeadSha,
+          },
+        );
+        await this.options.workspaceManager.beforeRun(workspace.path);
+        await this.recordWorkspaceEvidenceSnapshot(
+          entry,
+          "workspace_before_run_completed",
+          workspace,
+        );
+        firstImplementationTurn = 2;
+        if (
+          this.config.agent.maxTurns < firstImplementationTurn ||
+          !harnessSupportsContinuation(this.options.harness)
+        ) {
+          await this.terminalizeAcceptedArtifactSeedPreparationRun(entry);
+          entry.acceptedArtifactSeedFreshDispatch = true;
+          return;
+        }
+      }
+
+      entry.acceptedArtifactSeedPreparationActive = false;
+      entry.failureKind = null;
+      entry.acceptedArtifactSeedFailureDisposition = null;
+
       if (
         this.shouldDiscoverPullRequestBeforeFirstWorkerPrompt(entry.lifecycle)
       ) {
@@ -11496,7 +12867,7 @@ export class Orchestrator {
       }
 
       for (
-        let turnNumber = 1;
+        let turnNumber = firstImplementationTurn;
         turnNumber <= this.config.agent.maxTurns;
         turnNumber += 1
       ) {
@@ -11513,7 +12884,7 @@ export class Orchestrator {
         }
         entry.turnCount = turnNumber;
         const promptBundle =
-          turnNumber === 1
+          turnNumber === firstImplementationTurn
             ? await this.renderWorkerPromptBundle(entry, attempt, turnNumber)
             : await this.renderWorkerContinuationPromptBundle(
                 entry,
@@ -11582,9 +12953,27 @@ export class Orchestrator {
           break;
         }
       }
+    } catch (error) {
+      if (
+        entry.acceptedArtifactSeedPreparationActive &&
+        entry.dependencyArtifactSeedConflict === null &&
+        entry.turnCount === 0
+      ) {
+        entry.acceptedArtifactSeedFailureDisposition =
+          acceptedArtifactSeedPreparationErrorDisposition(error);
+      }
+      throw error;
     } finally {
       if (workspace) {
-        if (entry.runPhase !== "issue_breakdown") {
+        if (entry.runPhase === "issue_breakdown") {
+          await this.capturePlannerArtifacts(entry, workspace);
+          await this.options.workspaceManager.removeForPlanning(entry.issue);
+          await this.recordWorkspaceEvidenceSnapshot(
+            entry,
+            "planning_workspace_removed",
+            workspace,
+          );
+        } else if (entry.dependencyArtifactSeedConflict === null) {
           await this.options.workspaceManager.afterRun(workspace.path);
           await this.recordWorkspaceEvidenceSnapshot(
             entry,
@@ -11592,12 +12981,16 @@ export class Orchestrator {
             workspace,
           );
         } else {
-          await this.capturePlannerArtifacts(entry, workspace);
-          await this.options.workspaceManager.removeForPlanning(entry.issue);
           await this.recordWorkspaceEvidenceSnapshot(
             entry,
-            "planning_workspace_removed",
+            "accepted_artifact_seed_conflict_preserved",
             workspace,
+            {
+              artifactId: entry.dependencyArtifactSeedConflict.artifactId,
+              conflictedFiles: [
+                ...entry.dependencyArtifactSeedConflict.conflictedFiles,
+              ],
+            },
           );
         }
         if (entry.cleanupWorkspaceOnExit) {
@@ -12058,10 +13451,17 @@ export class Orchestrator {
               context.promptBundle?.metadata.templateKeys ?? null,
           },
         });
-        if (entry.runPhase !== "issue_breakdown") {
+        if (
+          entry.runPhase !== "issue_breakdown" &&
+          entry.dependencyArtifactSeedConflict === null
+        ) {
           await this.discoverPullRequestForEntry(entry, context.workspace);
         }
-        if (entry.role === "worker" && entry.runPhase === "implementation") {
+        if (
+          entry.role === "worker" &&
+          entry.runPhase === "implementation" &&
+          entry.dependencyArtifactSeedConflict === null
+        ) {
           await this.applyWriteback(
             planRunStartedComment(
               {
@@ -12218,6 +13618,25 @@ export class Orchestrator {
           if (!terminal.updated) return;
           continue;
         }
+        if (entry.dependencyArtifactSeedConflict !== null) {
+          const runId = entry.activeRunId ?? entry.runId;
+          if (runId !== null) {
+            await this.options.runStore?.appendEvent({
+              runId,
+              at: eventAt.toISOString(),
+              source: "orchestrator",
+              eventType: "accepted_artifact_seed_conflict_turn_completed",
+              message:
+                event.message ??
+                "Accepted-artifact seed conflict turn completed",
+              payload: {
+                artifactId: entry.dependencyArtifactSeedConflict.artifactId,
+                turnNumber: context.turnNumber,
+              },
+            });
+          }
+          continue;
+        }
         const terminal = await this.updateRunTerminalStateIfRunning(
           entry.activeRunId ?? entry.runId ?? "",
           {
@@ -12260,7 +13679,9 @@ export class Orchestrator {
           return;
         }
         const acceptedFailedHandoffKind =
-          await this.acceptedTerminalHandoffKind(entry);
+          entry.dependencyArtifactSeedConflict === null
+            ? await this.acceptedTerminalHandoffKind(entry)
+            : null;
         if (acceptedFailedHandoffKind) {
           const terminal = await this.terminalizeAcceptedHandoff(
             entry,
@@ -12272,7 +13693,8 @@ export class Orchestrator {
         }
         if (
           entry.role === "worker" &&
-          entry.runPhase !== "merge_conflict_resolution"
+          entry.runPhase !== "merge_conflict_resolution" &&
+          entry.dependencyArtifactSeedConflict === null
         ) {
           await this.reconcileCompletionReportRejection(entry);
         }
@@ -12301,7 +13723,9 @@ export class Orchestrator {
           return;
         }
         const acceptedCancelledHandoffKind =
-          await this.acceptedTerminalHandoffKind(entry);
+          entry.dependencyArtifactSeedConflict === null
+            ? await this.acceptedTerminalHandoffKind(entry)
+            : null;
         if (acceptedCancelledHandoffKind) {
           const terminal = await this.terminalizeAcceptedHandoff(
             entry,
@@ -12313,7 +13737,8 @@ export class Orchestrator {
         }
         if (
           entry.role === "worker" &&
-          entry.runPhase !== "merge_conflict_resolution"
+          entry.runPhase !== "merge_conflict_resolution" &&
+          entry.dependencyArtifactSeedConflict === null
         ) {
           await this.reconcileCompletionReportRejection(entry);
         }
@@ -12717,6 +14142,40 @@ export class Orchestrator {
       }
 
       if (
+        kind === "normal" &&
+        entry.role === "worker" &&
+        entry.acceptedArtifactSeedFreshDispatch
+      ) {
+        await this.completeAcceptedArtifactSeedPreparationRun(entry);
+        return;
+      }
+
+      if (
+        kind === "abnormal" &&
+        entry.role === "worker" &&
+        entry.acceptedArtifactSeedPreparationActive &&
+        entry.suppressRetryOnExit
+      ) {
+        await this.cancelAcceptedArtifactSeedPreparationRun(
+          entry,
+          error ?? "Accepted-artifact workspace preparation was cancelled",
+        );
+        return;
+      }
+
+      if (
+        kind === "abnormal" &&
+        entry.role === "worker" &&
+        entry.acceptedArtifactSeedPreparationActive
+      ) {
+        await this.handleAcceptedArtifactSeedPreparationFailure(
+          entry,
+          error ?? "accepted-artifact workspace preparation failed",
+        );
+        return;
+      }
+
+      if (
         entry.role === "worker" &&
         ((entry.runPhase === "merge_conflict_resolution" &&
           (await this.reconcileMergeConflictResolutionHandoff(entry))) ||
@@ -13073,6 +14532,131 @@ export class Orchestrator {
     } finally {
       await this.releaseRunningEntryForExit(issueId, entry);
     }
+  }
+
+  private async completeAcceptedArtifactSeedPreparationRun(
+    entry: RunningEntry,
+  ): Promise<void> {
+    entry.acceptedArtifactSeedPreparationActive = false;
+    await this.releaseRunningEntryForExit(entry.issue.id, entry);
+    await this.scheduleRetryTransition(
+      entry.issue,
+      1,
+      1_000,
+      null,
+      "implementation",
+    );
+  }
+
+  private async terminalizeAcceptedArtifactSeedPreparationRun(
+    entry: RunningEntry,
+  ): Promise<void> {
+    if (!entry.runId) return;
+    await this.updateRunTerminalStateIfRunning(
+      entry.runId,
+      {
+        status: "succeeded",
+        completedAt: new Date().toISOString(),
+        tokens: entry.activeRunTokens,
+        metadata: terminalRunMetadata(entry, "succeeded"),
+      },
+      entry.issue,
+    );
+  }
+
+  private async cancelAcceptedArtifactSeedPreparationRun(
+    entry: RunningEntry,
+    reason: string,
+  ): Promise<void> {
+    if (entry.runId) {
+      await this.updateRunTerminalStateIfRunning(
+        entry.runId,
+        {
+          status: "cancelled",
+          completedAt: new Date().toISOString(),
+          error: reason,
+          tokens: entry.activeRunTokens,
+          metadata: terminalRunMetadata(entry, "cancelled"),
+        },
+        entry.issue,
+      );
+    }
+    await this.releaseIssueClaim(
+      entry.issue,
+      "accepted_artifact_seed_cancelled_released_claim",
+      entry.activeRunId ?? entry.runId ?? entry.issue.id,
+    );
+  }
+
+  private async handleAcceptedArtifactSeedPreparationFailure(
+    entry: RunningEntry,
+    reason: string,
+  ): Promise<void> {
+    if (entry.runId) {
+      await this.updateRunTerminalStateIfRunning(
+        entry.runId,
+        {
+          status: "failed",
+          completedAt: new Date().toISOString(),
+          error: reason,
+          tokens: entry.activeRunTokens,
+          metadata: terminalRunMetadata(entry, "failed"),
+        },
+        entry.issue,
+      );
+    }
+
+    const lifecycle =
+      (await this.options.lifecycleStore?.get(entry.issue.id)) ??
+      entry.lifecycle;
+    const seed = lifecycle?.workspaceSeed ?? null;
+    const disposition =
+      entry.acceptedArtifactSeedFailureDisposition ?? "retry";
+    if (seed !== null) {
+      const status =
+        disposition === "human_action_required"
+          ? "invalid"
+          : seed.status === "conflicted" || seed.status === "prepared"
+            ? seed.status
+            : "planned";
+      await this.updateLifecycle(entry, {
+        workspaceSeed: {
+          ...seed,
+          status,
+          failureReason: reason,
+        },
+      });
+    }
+
+    if (disposition === "human_action_required") {
+      const blockedReason = `accepted-artifact workspace seed is invalid: ${reason}`;
+      await this.blockDependencyArtifactDispatch(
+        entry.issue,
+        entry.lifecycle,
+        blockedReason,
+        "Repair or supersede the accepted-artifact checkpoint or its durable workspace binding, remove any invalid seeded worktree if necessary, then move this issue out of Blocked.",
+      );
+      await this.releaseIssueClaim(
+        entry.issue,
+        "accepted_artifact_seed_invalid_released_claim",
+        entry.activeRunId ?? entry.runId ?? entry.issue.id,
+      );
+      return;
+    }
+
+    const nextAttempt = Math.max(entry.retryAttempt + 1, 1);
+    const delayMs = Math.min(
+      10_000 * 2 ** (nextAttempt - 1),
+      this.config.agent.maxRetryBackoffMs,
+    );
+    await this.releaseRunningEntryForExit(entry.issue.id, entry);
+    await this.scheduleRetryTransition(
+      entry.issue,
+      nextAttempt,
+      delayMs,
+      reason,
+      "implementation",
+    );
   }
 
   private async releaseRunningEntryForExit(
@@ -13501,13 +15085,24 @@ export class Orchestrator {
         }
         return;
       }
-      const dispatched = await this.processIssueTransitionCandidate({
+      const dispatchResult = await this.processIssueTransitionCandidateEvent({
         issue,
         candidateSource: "retry_timer",
         attempt: retry.attempt,
         allowExistingClaim: true,
       });
+      const dispatched = transitionActionSucceeded(
+        dispatchResult.transition,
+        "start_agent_run_monitor",
+      );
       if (!dispatched) {
+        const partialEntry = this.running.get(issue.id);
+        if (
+          partialEntry !== undefined &&
+          !this.activeWorkers.has(partialEntry.worker)
+        ) {
+          await this.releaseRunningEntryForExit(issue.id, partialEntry);
+        }
         if (retry.runPhase === "issue_breakdown") {
           await this.recordPlanningDispatchRetry(
             issue,
@@ -13667,6 +15262,9 @@ export class Orchestrator {
       ...(entry.manualDispatch?.ignoreState === true
         ? { manualDispatchIgnoreState: true }
         : {}),
+      ...(entry.dependencyArtifactSeedConflict === null
+        ? {}
+        : { suppressCompletionHandoff: true }),
       ...(entry.hermesResume === null
         ? {}
         : { hermesResume: entry.hermesResume }),
@@ -14168,6 +15766,31 @@ export class Orchestrator {
     const store = this.options.lifecycleStore;
     if (!store) return;
     if (await this.hasPendingPublicationApprovalHandoff(entry)) return;
+    const lifecycle = (await store.get(entry.issue.id)) ?? entry.lifecycle;
+    entry.lifecycle = lifecycle;
+    const dependencyFreshness = await this.dependencyArtifactFreshness(
+      entry.issue,
+      lifecycle,
+    );
+    if (dependencyFreshness.status !== "fresh" && lifecycle?.workspaceSeed) {
+      if (dependencyFreshness.status === "invalid") {
+        await this.blockDependencyArtifactDispatch(
+          entry.issue,
+          lifecycle,
+          dependencyFreshness.reason,
+          `Reconcile or discard the workspace seeded from ${lifecycle.workspaceSeed.sourceIssueIdentifier}, restore a direct dependency on a current ${this.config.mergePolicy.doneState} accepted artifact, then move this issue out of Blocked.`,
+        );
+        entry.lifecycle = await store.get(entry.issue.id);
+      } else {
+        await this.updateLifecycle(entry, {
+          workspaceSeed: {
+            ...lifecycle.workspaceSeed,
+            failureReason: dependencyFreshness.reason,
+          },
+        });
+      }
+      return;
+    }
     const refreshed = await this.refreshEntryIssue(
       entry,
       "incomplete turn refresh",
@@ -14547,6 +16170,25 @@ export class Orchestrator {
   private async processMergePolicyTransitionCandidate(
     issue: Issue,
   ): Promise<void> {
+    const lifecycle = await this.options.lifecycleStore?.get(issue.id);
+    const freshness = await this.dependencyArtifactFreshness(issue, lifecycle);
+    if (freshness.status !== "fresh") {
+      if (freshness.status === "deferred" && lifecycle?.workspaceSeed) {
+        await this.invalidateSeededTargetReview(
+          issue,
+          lifecycle,
+          freshness.reason,
+        );
+      } else if (freshness.status === "invalid" && lifecycle?.workspaceSeed) {
+        await this.blockDependencyArtifactDispatch(
+          issue,
+          lifecycle,
+          freshness.reason,
+          `Reconcile or discard the workspace seeded from ${lifecycle.workspaceSeed.sourceIssueIdentifier}, restore a direct dependency on a current ${this.config.mergePolicy.doneState} accepted artifact, then move this issue out of Blocked.`,
+        );
+      }
+      return;
+    }
     await this.continueMergePolicyTransitionChain(issue, null);
   }
 
@@ -15172,6 +16814,52 @@ export class Orchestrator {
     );
   }
 
+  private async renderAcceptedArtifactSeedConflictPromptBundle(
+    entry: RunningEntry,
+    attempt: number | null,
+    turnNumber: number,
+  ): Promise<AgentPromptBundle> {
+    const conflict = entry.dependencyArtifactSeedConflict;
+    if (!conflict) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Accepted-artifact seed conflict prompt requires a persisted conflict binding",
+      );
+    }
+    const userPrompt = formatUserPromptPacket(
+      "Accepted Artifact Seed Conflict Resolution",
+      [
+        [
+          "Recovery Assignment",
+          [
+            `Resolve the service-prepared rebase conflict for ${entry.issue.identifier}.`,
+            "The worktree is intentionally paused inside `git rebase`. Restore every listed accepted-artifact file to the reviewed artifact version byte-for-byte; do not blend live-base edits into those files. The rebase preserves the live base elsewhere.",
+            `Conflicted files: ${formatList(conflict.conflictedFiles)}`,
+            `Target branch: ${conflict.targetBranch}`,
+            `Live base head: ${conflict.preparedBaseHeadSha}`,
+            `Reviewed artifact head: ${conflict.sourceHeadSha}`,
+            "Edit only the listed conflicted files and remove every conflict marker. Do not stage, commit, reset, or run any rebase command.",
+            "Do not implement the target issue yet and do not submit an MCP handoff in this turn. Symphony will validate and stage the bounded resolution, continue the rebase, and schedule another conflict-only turn if a later commit conflicts.",
+          ].join("\n"),
+        ],
+      ],
+    );
+    return this.renderPromptBundle(
+      entry,
+      userPrompt,
+      "worker.accepted_artifact_seed_conflict.resolve",
+      {
+        issue: entry.issue,
+        attempt,
+        role: entry.role,
+        lifecycle: entry.lifecycle,
+        workspace: entry.workspace,
+        conflict,
+      },
+      { attempt, turnNumber },
+    );
+  }
+
   private async renderIssueBreakdownPrompt(
     entry: RunningEntry,
     attempt: number | null,
@@ -15363,6 +17051,7 @@ export class Orchestrator {
       `- Pull request: ${formatPullRequest(lifecycle.summaryPointers.prNumber, lifecycle.summaryPointers.prUrl)}`,
       `- PR head SHA: ${lifecycle.summaryPointers.prHeadSha ?? "n/a"}`,
       `- CI status: ${lifecycle.summaryPointers.ciStatus ?? "n/a"}`,
+      `- Accepted artifact: ${lifecycle.acceptedArtifact?.id ?? "n/a"} (${lifecycle.acceptedArtifact?.status ?? "n/a"})`,
       "",
       "Latest completion report:",
       ...(report
@@ -15551,6 +17240,7 @@ export class Orchestrator {
       "- completionJudgment.status=valid_done only when Done appears correct and no material follow-up is worth tracking.",
       "- completionJudgment.status=valid_with_followups when Done appears valid under the explicit contract but hardening, tests, decomposition, or process follow-up should be tracked.",
       "- completionJudgment.status=questionable_done only when there is a likely contract-entitled defect that should have blocked Done.",
+      "- For accepted expected-red delivery, completed_unmerged plus Done is intentional; assess the reviewed checkpoint and do not treat its closed draft PR or missing merge as a defect.",
       "- missedGateFindings are only for explicit-contract defects or necessary core behavior failures that should have blocked final approval.",
       "- missedDiscoveryFindings and followUpCandidates are for non-gating hardening, hidden scope, weak specification, matrix gaps, sibling scope, or future work.",
       "- Use speckitRecommended when follow-up work should go through specify, plan, tasks, and analyze before implementation.",
@@ -16310,6 +18000,12 @@ function issueTransitionRulesetPriority(kind: IssueTransitionKind): number {
       return 258;
     case "reconcile_review_verdict_handoff":
       return 259;
+    case "complete_accepted_artifact":
+      return 95;
+    case "reconcile_completed_accepted_artifact":
+      return 93;
+    case "supersede_reopened_accepted_artifact":
+      return 94;
     case "block_issue":
       return 300;
     case "record_evidence":
@@ -16430,7 +18126,11 @@ function reasonMentionsReviewFeedbackBaseRefBlocker(
 }
 
 function tickTransitionShouldContinue(kind: IssueTransitionKind): boolean {
-  return kind === "reset_merge_conflict_after_operator_resume";
+  return (
+    kind === "reset_merge_conflict_after_operator_resume" ||
+    kind === "reconcile_completed_accepted_artifact" ||
+    kind === "supersede_reopened_accepted_artifact"
+  );
 }
 
 function dispatchTransitionKindForRole(
@@ -16769,15 +18469,7 @@ function workspaceLooksLikeGitWorktree(workspacePath: string): boolean {
 function latestCompletionReport(
   lifecycle: IssueLifecycleRecord,
 ): IssueCompletionReportRecord | null {
-  if (lifecycle.lastCompletionReportId) {
-    const exact = lifecycle.completionReports.find(
-      (report) => report.id === lifecycle.lastCompletionReportId,
-    );
-    if (exact) return exact;
-  }
-  return (
-    lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null
-  );
+  return latestCurrentCompletionReport(lifecycle);
 }
 
 function latestCompletionReportRejection(
@@ -16817,16 +18509,11 @@ function latestCurrentCompletionReportRejection(
 function latestReviewVerdict(
   lifecycle: IssueLifecycleRecord,
 ): IssueReviewVerdictRecord | null {
-  if (lifecycle.lastReviewVerdictId) {
-    const exact = lifecycle.reviewVerdicts.find(
-      (verdict) => verdict.id === lifecycle.lastReviewVerdictId,
-    );
-    if (exact && !isSupersededLifecycleRecord(exact)) return exact;
-  }
-  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
-    if (!isSupersededLifecycleRecord(verdict)) return verdict;
-  }
-  return null;
+  if (!lifecycle.lastReviewVerdictId) return null;
+  const exact = lifecycle.reviewVerdicts.find(
+    (verdict) => verdict.id === lifecycle.lastReviewVerdictId,
+  );
+  return exact && !isSupersededLifecycleRecord(exact) ? exact : null;
 }
 
 function acceptanceCriteriaForReport(
@@ -17471,6 +19158,12 @@ function currentObjectiveDirective(
   if (entry.runPhase === "merge_conflict_resolution") {
     return "Resolve only the lifecycle-bound pull request merge conflict and submit the merge-conflict resolution handoff.";
   }
+  if (entry.dependencyArtifactSeedConflict) {
+    return "Resolve only the service-prepared accepted-artifact seed rebase, finish the rebase, and leave implementation for the verified follow-on turn.";
+  }
+  if (entry.dependencyArtifact) {
+    return "Use the reviewed dependency artifact as the TDD starting point: reproduce its declared test command red, implement this issue's behavior, then prove the same command is green.";
+  }
   if (options.turnNumber > 1) {
     return "Continue the incomplete implementation turn, satisfy the unmet requirements, and submit the required completion handoff.";
   }
@@ -17514,18 +19207,66 @@ function activeDirectiveForRun(
     ].join("\n");
   }
   if (entry.runPhase === "review" && options.reviewerEvidence) {
+    const report = options.reviewerEvidence.completionReport;
     return [
-      `- Completion report: ${options.reviewerEvidence.completionReport.id}`,
-      `- Worker run: ${options.reviewerEvidence.completionReport.runId}`,
-      `- Summary: ${options.reviewerEvidence.completionReport.summary}`,
-      `- Changed files: ${formatList(options.reviewerEvidence.completionReport.changedFiles)}`,
-      `- Validation evidence: ${formatList(options.reviewerEvidence.completionReport.validationEvidence)}`,
+      `- Completion report: ${report.id}`,
+      `- Worker run: ${report.runId}`,
+      `- Summary: ${report.summary}`,
+      `- Changed files: ${formatList(report.changedFiles)}`,
+      `- Validation evidence: ${formatList(report.validationEvidence)}`,
+      ...(report.contractSnapshot?.delivery.mode === "accepted_artifact" && report.artifactEvidence
+        ? [
+            "- Delivery: accepted expected-red test artifact; review the intentional failure as the deliverable and use whole-PR COMMENT feedback for a pass.",
+            `- Artifact command: ${report.artifactEvidence.command}`,
+            `- Expected failure: ${report.artifactEvidence.expectedFailure}`,
+            `- Observed failure: ${report.artifactEvidence.observedFailure}`,
+            `- Intentional exit code: ${report.artifactEvidence.exitCode}`,
+            `- Test files: ${formatList(report.artifactEvidence.testFiles)}`,
+          ]
+        : []),
+    ].join("\n");
+  }
+  if (entry.dependencyArtifactSeedConflict) {
+    const conflict = entry.dependencyArtifactSeedConflict;
+    return [
+      "Accepted-artifact seed conflict:",
+      `- Artifact ID: ${conflict.artifactId}`,
+      `- Source issue: ${conflict.sourceIssueIdentifier}`,
+      `- Reviewed source head: ${conflict.sourceHeadSha}`,
+      `- Live base head: ${conflict.preparedBaseHeadSha}`,
+      `- Target branch: ${conflict.targetBranch}`,
+      `- Conflicted files: ${formatList(conflict.conflictedFiles)}`,
+      "- The worktree is paused in a service-prepared rebase. Restore each listed artifact file to its reviewed blob byte-for-byte; do not blend live-base edits into those files.",
+      "- Edit only the listed conflicted files and remove every conflict marker. Symphony will validate and stage them, then continue the rebase.",
+      "- Do not run git add, git commit, git reset, or any git rebase command. A later rebase conflict may require another bounded conflict-only turn.",
+      "- Do not implement production behavior or submit a completion report in this conflict-only turn.",
     ].join("\n");
   }
   const triage = latestIssueTriageReport(lifecycle);
   const verdict = lifecycle ? latestReviewVerdict(lifecycle) : null;
   const gate = lifecycle?.mergeGate ?? null;
   const sections: string[] = [];
+  if (entry.dependencyArtifact) {
+    const artifact = entry.dependencyArtifact;
+    const seed = lifecycle?.workspaceSeed ?? null;
+    sections.push(
+      [
+        "Dependency Artifact Checkpoint:",
+        `- Artifact ID: ${artifact.id}`,
+        `- Source issue: ${artifact.sourceIssueIdentifier}`,
+        `- Source branch: ${artifact.pullRequest.branch ?? "n/a"}`,
+        `- Reviewed source head: ${artifact.sourceHeadSha}`,
+        `- Source base head: ${artifact.sourceBaseHeadSha}`,
+        `- Prepared target base head: ${seed?.preparedBaseHeadSha ?? "n/a"}`,
+        `- Prepared target head: ${seed?.preparedHeadSha ?? "n/a"}`,
+        `- Required command: ${artifact.artifactEvidence.command}`,
+        `- Expected pre-implementation failure: ${artifact.artifactEvidence.expectedFailure}`,
+        `- Reviewed observed failure: ${artifact.artifactEvidence.observedFailure}`,
+        `- Inherited test files: ${formatList(artifact.artifactEvidence.testFiles)}`,
+        "- Reproduce the inherited command red before implementing, preserve the reviewed tests, then make that exact command exit 0 through this issue's implementation.",
+      ].join("\n"),
+    );
+  }
   if (triage) {
     sections.push(
       [
@@ -17748,9 +19489,24 @@ function successConditionsForRun(
       "- Call submit_merge_conflict_resolution, inspect the tool result, and continue if it returns continuation.required=true.",
     ].join("\n");
   }
+  if (entry.dependencyArtifactSeedConflict) {
+    return [
+      "- Resolve every persisted accepted-artifact seed conflict.",
+      "- Remove conflict markers from only the listed files; Symphony will stage the resolution and continue the rebase.",
+      "- Restore reviewed artifact files byte-for-byte. The service-owned rebase preserves the current live base outside those files.",
+      "- Do not call submit_completion_report in this turn; Symphony validates the bounded edit after the turn ends and may schedule another conflict-only turn.",
+    ].join("\n");
+  }
   const triage = latestIssueTriageReport(lifecycle);
   const workerBlockers = activeWorkerOwnedIssueTriageBlockers(triage);
   return [
+    ...(entry.dependencyArtifact
+      ? [
+          `- Reproduce dependency artifact ${entry.dependencyArtifact.id} with the exact command: ${entry.dependencyArtifact.artifactEvidence.command}`,
+          "- Preserve the reviewed inherited tests while implementing the current issue's production behavior.",
+          "- Make the inherited command exit 0 and include matching dependencyArtifactResult in submit_completion_report.",
+        ]
+      : []),
     workerBlockers.length > 0
       ? `- Complete every active worker-owned triage blocker: ${workerBlockers.map((blocker) => `${blocker.kind}: ${blocker.recommendedAction}`).join(" | ")}`
       : "- Satisfy every Issue Contract requirement.",
@@ -17789,8 +19545,20 @@ function scopeGuardsForRun(
       ...common,
     ].join("\n");
   }
+  if (entry.dependencyArtifactSeedConflict) {
+    return [
+      "- Edit only what is necessary to resolve the persisted rebase conflicts.",
+      "- Restore each listed accepted-artifact file to its reviewed byte-for-byte contents; do not synthesize a merged variant.",
+      "- Do not start target implementation, publish a PR, or call any Symphony handoff tool in this turn.",
+      "- Do not run git add, git commit, git reset, or any git rebase command; Symphony owns staging and rebase continuation.",
+      ...common,
+    ].join("\n");
+  }
   return [
     "- Keep the change scoped to the current issue contract and active repair evidence.",
+    ...(entry.dependencyArtifact
+      ? ["- Do not delete, weaken, skip, or rewrite the inherited expected-red tests merely to obtain a green result."]
+      : []),
     "- Do not broaden scope from stale conversation history.",
     ...common,
   ].join("\n");
@@ -17799,6 +19567,9 @@ function scopeGuardsForRun(
 function requiredHandoffForRun(entry: RunningEntry): string {
   if (entry.handoffRepair)
     return `Call ${repairToolName(entry.handoffRepair.kind)} and then stop.`;
+  if (entry.dependencyArtifactSeedConflict) {
+    return "No MCP handoff is permitted in this conflict-only turn; resolve only the listed files and stop so Symphony can validate, stage, and continue the rebase.";
+  }
   switch (entry.runPhase) {
     case "review":
       return "Call submit_review_verdict before ending the run.";
@@ -18276,6 +20047,146 @@ function failureKindForDiagnostic(code: string): string {
   return "harness_diagnostic";
 }
 
+function acceptedArtifactWorkspaceSeed(
+  artifact: IssueAcceptedArtifactRecord,
+  config: ServiceConfig,
+): AcceptedArtifactWorkspaceSeed {
+  const sourceBranch = nonEmptyString(artifact.pullRequest.branch);
+  const configuredBaseRef = nonEmptyString(config.workspace.source.baseRef);
+  if (sourceBranch === null || configuredBaseRef === null) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Accepted-artifact seed requires source branch and configured base ref",
+    );
+  }
+  return {
+    version: 1,
+    kind: "accepted_artifact",
+    artifactId: artifact.id,
+    sourceIssueId: artifact.sourceIssueId,
+    sourceIssueIdentifier: artifact.sourceIssueIdentifier,
+    repositoryFingerprint: artifact.repositoryFingerprint,
+    sourceBranch,
+    sourceHeadSha: artifact.sourceHeadSha,
+    sourceBaseHeadSha: artifact.sourceBaseHeadSha,
+    configuredBaseRef,
+    fileManifest: artifact.fileManifest.map((entry) => ({ ...entry })),
+  };
+}
+
+function acceptedArtifactSeedPreparationErrorDisposition(
+  error: unknown,
+): "retry" | "human_action_required" {
+  if (!(error instanceof SymphonyError)) return "retry";
+  if (
+    error.code === "tracker_unavailable" ||
+    error.code === "tracker_error" ||
+    error.code === "hook_error" ||
+    error.code === "agent_error"
+  ) {
+    return "retry";
+  }
+  if (error.code !== "workspace_error") return "human_action_required";
+  const message = error.message.toLowerCase();
+  if (
+    /permission denied|authentication failed|authorization failed|unauthorized|forbidden|publickey|repository not found|http 40[13]/.test(
+      message,
+    )
+  ) {
+    return "human_action_required";
+  }
+  return /(?:fetch|clone) failed|timed? out|timeout|temporar(?:y|ily) unavailable|network|connection (?:reset|refused|closed)|could not resolve|name or service not known|eai_again|enotfound|econn|rate limit|lock (?:timeout|contention)/.test(
+    message,
+  )
+    ? "retry"
+    : "human_action_required";
+}
+
+function transitionActionSucceeded(
+  transition: IssueHistorySnapshot | null,
+  actionType: string,
+): boolean {
+  return (
+    transition?.actions.some(
+      (action) =>
+        action.actionType === actionType && action.status === "succeeded",
+    ) === true
+  );
+}
+
+function acceptedArtifactCompletionSourceStates(config: ServiceConfig): string[] {
+  return [
+    ...new Set([
+      ...config.reviewLoop.reviewStates,
+      ...(config.reviewLoop.reviewPassState === null
+        ? []
+        : [config.reviewLoop.reviewPassState]),
+      ...config.mergePolicy.sourceStates,
+    ]),
+  ];
+}
+
+function snapshotIsAcceptedArtifactDelivery(
+  snapshot: IssueCurrentStateSnapshot,
+): boolean {
+  return (
+    snapshot.latestApprovalPassVerdict?.passDisposition ===
+      "accepted_artifact" ||
+    snapshot.latestCompletionReport?.contractSnapshot?.delivery.mode ===
+      "accepted_artifact"
+  );
+}
+
+function descriptionDeclaresAcceptedArtifact(
+  description: string | null | undefined,
+): boolean {
+  const parsed = parseIssueContract(description);
+  return (
+    parsed.valid &&
+    parsed.contract.delivery.mode === "accepted_artifact" &&
+    parsed.contract.delivery.artifact === "expected_red_tests"
+  );
+}
+
+function assertWorkspaceSeedMatchesArtifact(
+  record: IssueWorkspaceSeedRecord,
+  seed: AcceptedArtifactWorkspaceSeed,
+  targetBranch: string,
+): void {
+  const matches =
+    record.artifactId === seed.artifactId &&
+    record.sourceIssueId === seed.sourceIssueId &&
+    record.sourceIssueIdentifier === seed.sourceIssueIdentifier &&
+    record.repositoryFingerprint === seed.repositoryFingerprint &&
+    record.sourceBranch === seed.sourceBranch &&
+    record.sourceHeadSha === seed.sourceHeadSha &&
+    record.sourceBaseHeadSha === seed.sourceBaseHeadSha &&
+    record.configuredBaseRef === seed.configuredBaseRef &&
+    record.targetBranch === targetBranch;
+  if (!matches) {
+    throw new SymphonyError(
+      "conflict",
+      "Persisted accepted-artifact workspace seed no longer matches its source checkpoint or target branch",
+    );
+  }
+}
+
+function uniqueNonEmptyStrings(values: readonly (string | null | undefined)[]): string[] {
+  return [...new Set(values.map((value) => nonEmptyString(value)).filter((value): value is string => value !== null))];
+}
+
+function latestCompletionReportFromLifecycle(
+  lifecycle: IssueLifecycleRecord | null,
+): IssueCompletionReportRecord | null {
+  return lifecycle ? latestCurrentCompletionReport(lifecycle) : null;
+}
+
+function latestReviewVerdictFromLifecycle(
+  lifecycle: IssueLifecycleRecord | null,
+): IssueReviewVerdictRecord | null {
+  return lifecycle ? latestReviewVerdict(lifecycle) : null;
+}
+
 function countConsecutiveWorkerRuns(
   runs: RunRecord[],
   predicate: (run: RunRecord) => boolean,
@@ -18371,12 +20282,7 @@ function issueFromPendingPublicationLifecycle(
   lifecycle: IssueLifecycleRecord,
   state: string,
 ): Issue {
-  const report =
-    (lifecycle.lastCompletionReportId === null
-      ? undefined
-      : lifecycle.completionReports.find(
-          (item) => item.id === lifecycle.lastCompletionReportId,
-        )) ?? lifecycle.completionReports.at(-1);
+  const report = latestCurrentCompletionReport(lifecycle);
   return {
     id: lifecycle.issueId,
     identifier: lifecycle.issueIdentifier,

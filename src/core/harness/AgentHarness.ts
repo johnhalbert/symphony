@@ -64,6 +64,7 @@ export interface AgentRunContext {
   } | null;
   manualDispatch?: boolean;
   manualDispatchIgnoreState?: boolean;
+  suppressCompletionHandoff?: boolean;
   hermesResume?: AgentHermesResumeContext | null;
   ephemeralSystemPrompt?: string | null;
   abortSignal: AbortSignal;

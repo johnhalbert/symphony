@@ -62,6 +62,9 @@ export function agentEligibleIssueContract(
       requirement: string;
       proofHint?: string;
     }>;
+    issueContractDelivery?:
+      | { mode: "merge" }
+      | { mode: "accepted_artifact"; artifact: "expected_red_tests" };
     touchedSurfaces?: string[];
     acceptanceCriteria?: string[];
     contractChecklist?: string[];
@@ -85,6 +88,7 @@ export function agentEligibleIssueContract(
         proofHint: "Focused validation checks the named docs artifact and confirms no implementation files changed.",
       },
     ],
+    issueContractDelivery,
     touchedSurfaces = ["- [X] Docs only"],
     acceptanceCriteria = ["- Done."],
     contractChecklist = [
@@ -109,6 +113,7 @@ export function agentEligibleIssueContract(
         schemaVersion: issueContractSchemaVersion,
         contractVersion: issueContractContractVersion,
         requirements: issueContractRequirements,
+        ...(issueContractDelivery === undefined ? {} : { delivery: issueContractDelivery }),
       },
       null,
       2,

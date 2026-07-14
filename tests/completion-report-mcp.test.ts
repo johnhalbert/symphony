@@ -301,6 +301,34 @@ describe("completion report MCP handoff", () => {
       "idempotencyKey",
     ]);
     expect(asRecord(asRecord(schema.properties).summary).description).toContain("implementation");
+    const artifactEvidence = asRecord(asRecord(schema.properties).artifactEvidence);
+    expect(artifactEvidence.description).toContain("delivery.mode=accepted_artifact");
+    expect(artifactEvidence.required).toEqual([
+      "kind",
+      "command",
+      "testFiles",
+      "expectedFailure",
+      "observedFailure",
+      "exitCode",
+    ]);
+    expect(asRecord(asRecord(artifactEvidence.properties).kind)).toMatchObject({
+      const: "expected_red_tests",
+    });
+    expect(asRecord(asRecord(artifactEvidence.properties).exitCode)).toMatchObject({
+      type: "integer",
+      minimum: 1,
+    });
+    expect(
+      asRecord(asRecord(artifactEvidence.properties).observedFailure)
+        .description,
+    ).toContain("Stable exact excerpt copied from command output");
+    const dependencyArtifactResult = asRecord(asRecord(schema.properties).dependencyArtifactResult);
+    expect(dependencyArtifactResult.description).toContain("Dependency Artifact Checkpoint");
+    expect(dependencyArtifactResult.required).toEqual(["artifactId", "command", "exitCode", "evidence"]);
+    expect(asRecord(asRecord(dependencyArtifactResult.properties).exitCode)).toMatchObject({
+      type: "integer",
+      const: 0,
+    });
 
     writeJsonRpc(input, {
       jsonrpc: "2.0",

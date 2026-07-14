@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ServiceConfig } from "../config/Config.js";
 import type { IssueBaseRefObservation } from "../BaseRefVerification.js";
 import { SymphonyError, errorMessage } from "../errors.js";
-import type { Issue } from "../types.js";
+import type { ArtifactFileManifestEntry, Issue } from "../types.js";
 import { mapWithFileReadConcurrency } from "./FileReadConcurrency.js";
 import { ProjectionRevisionNotifier, type ProjectionChangeListener, type ProjectionChangeUnsubscribe } from "./ProjectionRevision.js";
 
@@ -127,6 +127,32 @@ export interface CompletionReportAcceptanceContext {
   unmergedFiles: string[] | null;
 }
 
+export interface IssueContractSnapshot {
+  schemaVersion: number;
+  contractVersion: string;
+  fingerprint: string;
+  delivery: {
+    mode: "merge" | "accepted_artifact";
+    artifact: "expected_red_tests" | null;
+  };
+}
+
+export interface ExpectedRedArtifactEvidence {
+  kind: "expected_red_tests";
+  command: string;
+  testFiles: string[];
+  expectedFailure: string;
+  observedFailure: string;
+  exitCode: number;
+}
+
+export interface DependencyArtifactResult {
+  artifactId: string;
+  command: string;
+  exitCode: number;
+  evidence: string;
+}
+
 export type PullRequestReviewEvidenceSource = "review" | "review_comment" | "issue_comment";
 
 export interface PullRequestReviewEvidenceItem {
@@ -161,7 +187,7 @@ export interface PullRequestReviewEvidenceState {
   updatedAt: string | null;
 }
 
-export interface IssueCompletionReportRecord {
+export interface IssueCompletionReportRecord extends LifecycleSupersessionFields {
   id: string;
   idempotencyKey: string;
   runId: string;
@@ -174,6 +200,9 @@ export interface IssueCompletionReportRecord {
   branchName: string | null;
   pullRequest: CompletionReportPullRequestRef | null;
   acceptanceContext?: CompletionReportAcceptanceContext | null;
+  contractSnapshot?: IssueContractSnapshot | null;
+  artifactEvidence?: ExpectedRedArtifactEvidence | null;
+  dependencyArtifactResult?: DependencyArtifactResult | null;
   risks: string[];
   acceptedAt: string;
   writebackOperationKeys: string[];
@@ -194,6 +223,9 @@ export interface IssueCompletionReportRejectionRecord {
   changedFiles: string[];
   branchName: string | null;
   pullRequest: CompletionReportPullRequestRef | null;
+  contractSnapshot?: IssueContractSnapshot | null;
+  artifactEvidence?: ExpectedRedArtifactEvidence | null;
+  dependencyArtifactResult?: DependencyArtifactResult | null;
   risks: string[];
   rejectedAt: string;
   writebackOperationKeys: string[];
@@ -267,6 +299,7 @@ export interface IssueReviewVerdictRecord extends LifecycleSupersessionFields {
   issueId: string;
   issueIdentifier: string;
   verdict: IssueReviewVerdict;
+  passDisposition?: "merge" | "accepted_artifact" | null;
   acceptanceResults: ReviewVerdictAcceptanceResult[];
   findings: string[];
   gateFindings: ReviewGateFindingRecord[];
@@ -286,6 +319,7 @@ export interface IssueReviewVerdictSubmissionRecord {
   issueId: string;
   issueIdentifier: string;
   verdict: IssueReviewVerdict;
+  passDisposition?: "merge" | "accepted_artifact" | null;
   acceptanceResults: ReviewVerdictAcceptanceResult[];
   findings: string[];
   gateFindings: ReviewGateFindingRecord[];
@@ -460,6 +494,55 @@ export interface IssueMergeMetadata {
   };
   mergeOperationKey: string;
   doneTransitionOperationKey: string;
+}
+
+export interface IssueAcceptedArtifactRecord extends LifecycleSupersessionFields {
+  version: 1;
+  id: string;
+  kind: "expected_red_tests";
+  status: "checkpointed" | "completed_unmerged";
+  sourceIssueId: string;
+  sourceIssueIdentifier: string;
+  contractFingerprint: string;
+  completionReportId: string;
+  reviewVerdictId: string;
+  reviewFeedbackId: string;
+  repositoryFingerprint: string;
+  pullRequest: CompletionReportPullRequestRef;
+  sourceBaseHeadSha: string;
+  sourceHeadSha: string;
+  baseRef: string;
+  changedFiles: string[];
+  fileManifest: ArtifactFileManifestEntry[];
+  artifactEvidence: ExpectedRedArtifactEvidence;
+  commentOperationKey: string;
+  doneTransitionOperationKey: string;
+  acceptedAt: string;
+  checkpointedAt: string;
+  prClosedAt: string | null;
+  completedAt: string | null;
+}
+
+export interface IssueWorkspaceSeedRecord {
+  version: 1;
+  id: string;
+  kind: "accepted_artifact";
+  status: "planned" | "preparing" | "conflicted" | "prepared" | "invalid";
+  artifactId: string;
+  sourceIssueId: string;
+  sourceIssueIdentifier: string;
+  repositoryFingerprint: string;
+  sourceBranch: string;
+  sourceHeadSha: string;
+  sourceBaseHeadSha: string;
+  configuredBaseRef: string;
+  preparedBaseHeadSha: string | null;
+  preparedHeadSha: string | null;
+  targetBranch: string;
+  conflictedFiles: string[];
+  plannedAt: string;
+  preparedAt: string | null;
+  failureReason: string | null;
 }
 
 export type IssueMergeGateStatus = "observing" | "repair_dispatched" | "blocked" | "resolved" | "superseded";
@@ -748,6 +831,8 @@ export interface IssueLifecycleRecord {
   mergeConflict: IssueMergeConflictMetadata | null;
   mergeConflictResolutionReports: IssueMergeConflictResolutionReportRecord[];
   preservedWorktreeStashes?: IssuePreservedWorktreeStash[];
+  acceptedArtifact?: IssueAcceptedArtifactRecord | null;
+  workspaceSeed?: IssueWorkspaceSeedRecord | null;
   handoff: IssueHandoffState;
   createdAt: string;
   updatedAt: string;
@@ -787,6 +872,8 @@ export interface IssueLifecyclePatch {
   mergeConflict?: IssueMergeConflictMetadata | null;
   mergeConflictResolutionReports?: IssueMergeConflictResolutionReportRecord[];
   preservedWorktreeStashes?: IssuePreservedWorktreeStash[];
+  acceptedArtifact?: IssueAcceptedArtifactRecord | null;
+  workspaceSeed?: IssueWorkspaceSeedRecord | null;
   handoff?: IssueHandoffState;
 }
 
@@ -871,6 +958,16 @@ export class FileIssueLifecycleStore {
         patch.mergeConflictResolutionReports ?? existing?.mergeConflictResolutionReports ?? [],
       preservedWorktreeStashes:
         patch.preservedWorktreeStashes ?? existing?.preservedWorktreeStashes ?? [],
+      acceptedArtifact: patchValue(
+        patch,
+        "acceptedArtifact",
+        existing?.acceptedArtifact ?? null,
+      ),
+      workspaceSeed: patchValue(
+        patch,
+        "workspaceSeed",
+        existing?.workspaceSeed ?? null,
+      ),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
@@ -960,6 +1057,19 @@ export function isSupersededLifecycleRecord(record: LifecycleSupersessionFields 
   return typeof record?.supersededAt === "string" && record.supersededAt.trim().length > 0;
 }
 
+export function latestCurrentCompletionReport(
+  record: Pick<IssueLifecycleRecord, "completionReports" | "lastCompletionReportId">,
+): IssueCompletionReportRecord | null {
+  if (record.lastCompletionReportId === null) return null;
+  return (
+    record.completionReports.find(
+      (report) =>
+        report.id === record.lastCompletionReportId &&
+        !isSupersededLifecycleRecord(report),
+    ) ?? null
+  );
+}
+
 export function buildWorkerHandoffPacket(
   record: IssueLifecycleRecord,
   generatedAt = new Date().toISOString(),
@@ -978,7 +1088,7 @@ export function buildWorkerHandoffPacket(
 }
 
 export function buildIssueHandoffState(record: Omit<IssueLifecycleRecord, "handoff">): IssueHandoffState {
-  const lastWorkerOutput = workerOutputFromReport(latestCompletionReport(record));
+  const lastWorkerOutput = workerOutputFromReport(latestCurrentCompletionReport(record));
   const lastReviewerOutput = reviewerOutputFromVerdict(latestHumanReviewVerdict(record));
   return {
     version: 1,
@@ -1049,15 +1159,6 @@ function buildLaneMemo(
   };
 }
 
-function latestCompletionReport(
-  record: Pick<IssueLifecycleRecord, "completionReports" | "lastCompletionReportId">,
-): IssueCompletionReportRecord | null {
-  if (record.lastCompletionReportId) {
-    return record.completionReports.find((report) => report.id === record.lastCompletionReportId) ?? null;
-  }
-  return record.completionReports.at(-1) ?? null;
-}
-
 function latestCompletionReportRejection(
   record: Pick<IssueLifecycleRecord, "completionReportRejections" | "lastCompletionReportRejectionId">,
 ): IssueCompletionReportRejectionRecord | null {
@@ -1079,6 +1180,7 @@ export function latestCurrentApprovalPassVerdict(
     | "summaryPointers"
   >,
 ): IssueReviewVerdictRecord | null {
+  if (latestCurrentCompletionReport(record) === null) return null;
   const pullRequest = currentPullRequestForReview(record);
   if (!pullRequest) return latestHumanPassVerdict(record);
   for (const verdict of record.reviewVerdicts.slice().reverse()) {
@@ -1158,6 +1260,7 @@ function isHumanPassVerdictForIssue(
 ): boolean {
   return (
     verdict.verdict === "pass" &&
+    verdict.passDisposition !== "accepted_artifact" &&
     !isMergeGateVerdict(verdict) &&
     !isSupersededLifecycleRecord(verdict) &&
     verdict.issueId === record.issueId &&
@@ -1168,7 +1271,8 @@ function isHumanPassVerdictForIssue(
 function currentPullRequestForReview(
   record: Pick<IssueLifecycleRecord, "completionReports" | "lastCompletionReportId" | "summaryPointers">,
 ): CompletionReportPullRequestRef | null {
-  const reportPullRequest = latestCompletionReport(record)?.pullRequest ?? null;
+  const reportPullRequest = latestCurrentCompletionReport(record)?.pullRequest ?? null;
+  if (reportPullRequest === null) return null;
   const pointerPullRequest =
     record.summaryPointers.prNumber !== null && record.summaryPointers.prUrl !== null && record.summaryPointers.prHeadSha !== null
       ? {
@@ -1393,6 +1497,8 @@ function normalizeLifecycleRecord(value: unknown, filePath: string): IssueLifecy
       value.preservedWorktreeStashes,
       filePath,
     ),
+    acceptedArtifact: normalizeAcceptedArtifact(value.acceptedArtifact, filePath),
+    workspaceSeed: normalizeWorkspaceSeed(value.workspaceSeed, filePath),
     createdAt: requiredString(value.createdAt, filePath, "createdAt"),
     updatedAt: requiredString(value.updatedAt, filePath, "updatedAt"),
   };
@@ -1824,13 +1930,7 @@ function normalizeReviewerOutputContract(value: unknown, filePath: string): Issu
 
 function normalizeReviewEvidencePullRequest(value: unknown, filePath: string): CompletionReportPullRequestRef | null {
   if (value === undefined || value === null) return null;
-  if (!isRecord(value)) throw corruptLifecycle(filePath, "reviewEvidence.pullRequest is invalid");
-  return {
-    url: nullableString(value.url, filePath, "reviewEvidence.pullRequest.url"),
-    number: nullableNumber(value.number, filePath, "reviewEvidence.pullRequest.number"),
-    headSha: optionalNullableString(value.headSha, filePath, "reviewEvidence.pullRequest.headSha"),
-    branch: optionalNullableString(value.branch, filePath, "reviewEvidence.pullRequest.branch"),
-  };
+  return normalizeRequiredPullRequest(value, filePath, "reviewEvidence.pullRequest");
 }
 
 function normalizeReviewEvidenceItems(value: unknown, filePath: string): PullRequestReviewEvidenceItem[] {
@@ -1885,9 +1985,25 @@ function normalizeCompletionReport(value: unknown, filePath: string, index: numb
     branchName: nullableString(value.branchName, filePath, `completionReports[${index}].branchName`),
     pullRequest: normalizePullRequest(value.pullRequest, filePath, index),
     acceptanceContext: normalizeCompletionReportAcceptanceContext(value.acceptanceContext, filePath, index),
+    contractSnapshot: normalizeIssueContractSnapshot(
+      value.contractSnapshot,
+      filePath,
+      `completionReports[${index}].contractSnapshot`,
+    ),
+    artifactEvidence: normalizeExpectedRedArtifactEvidence(
+      value.artifactEvidence,
+      filePath,
+      `completionReports[${index}].artifactEvidence`,
+    ),
+    dependencyArtifactResult: normalizeDependencyArtifactResult(
+      value.dependencyArtifactResult,
+      filePath,
+      `completionReports[${index}].dependencyArtifactResult`,
+    ),
     risks: requiredStringArray(value.risks, filePath, `completionReports[${index}].risks`),
     acceptedAt: requiredString(value.acceptedAt, filePath, `completionReports[${index}].acceptedAt`),
     writebackOperationKeys: requiredStringArray(value.writebackOperationKeys, filePath, `completionReports[${index}].writebackOperationKeys`),
+    ...normalizeSupersessionFields(value, filePath, `completionReports[${index}]`),
   };
 }
 
@@ -1919,6 +2035,21 @@ function normalizeCompletionReportRejection(
     changedFiles: requiredStringArray(value.changedFiles, filePath, `completionReportRejections[${index}].changedFiles`),
     branchName: nullableString(value.branchName, filePath, `completionReportRejections[${index}].branchName`),
     pullRequest: normalizePullRequest(value.pullRequest, filePath, index),
+    contractSnapshot: normalizeIssueContractSnapshot(
+      value.contractSnapshot,
+      filePath,
+      `completionReportRejections[${index}].contractSnapshot`,
+    ),
+    artifactEvidence: normalizeExpectedRedArtifactEvidence(
+      value.artifactEvidence,
+      filePath,
+      `completionReportRejections[${index}].artifactEvidence`,
+    ),
+    dependencyArtifactResult: normalizeDependencyArtifactResult(
+      value.dependencyArtifactResult,
+      filePath,
+      `completionReportRejections[${index}].dependencyArtifactResult`,
+    ),
     risks: requiredStringArray(value.risks, filePath, `completionReportRejections[${index}].risks`),
     rejectedAt: requiredString(value.rejectedAt, filePath, `completionReportRejections[${index}].rejectedAt`),
     writebackOperationKeys: requiredStringArray(
@@ -1955,6 +2086,7 @@ function normalizeReviewVerdict(value: unknown, filePath: string, index: number)
     issueId: requiredString(value.issueId, filePath, `reviewVerdicts[${index}].issueId`),
     issueIdentifier: requiredString(value.issueIdentifier, filePath, `reviewVerdicts[${index}].issueIdentifier`),
     verdict: value.verdict,
+    passDisposition: normalizePassDisposition(value.passDisposition, filePath, `reviewVerdicts[${index}].passDisposition`),
     acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, index),
     findings,
     gateFindings,
@@ -2007,6 +2139,11 @@ function normalizeReviewVerdictSubmission(
       `reviewVerdictSubmissions[${index}].issueIdentifier`,
     ),
     verdict: value.verdict,
+    passDisposition: normalizePassDisposition(
+      value.passDisposition,
+      filePath,
+      `reviewVerdictSubmissions[${index}].passDisposition`,
+    ),
     acceptanceResults: normalizeReviewVerdictAcceptanceResults(value.acceptanceResults, filePath, index),
     findings,
     gateFindings,
@@ -2638,13 +2775,7 @@ function normalizeMergeGateMergeability(
 }
 
 function normalizeMergeGatePullRequest(value: unknown, filePath: string): CompletionReportPullRequestRef {
-  if (!isRecord(value)) throw corruptLifecycle(filePath, "mergeGate.pullRequest is invalid");
-  return {
-    url: nullableString(value.url, filePath, "mergeGate.pullRequest.url"),
-    number: nullableNumber(value.number, filePath, "mergeGate.pullRequest.number"),
-    headSha: optionalNullableString(value.headSha, filePath, "mergeGate.pullRequest.headSha"),
-    branch: optionalNullableString(value.branch, filePath, "mergeGate.pullRequest.branch"),
-  };
+  return normalizeRequiredPullRequest(value, filePath, "mergeGate.pullRequest");
 }
 
 function normalizeMergeMetadata(value: unknown, filePath: string): IssueMergeMetadata | null {
@@ -2678,6 +2809,168 @@ function normalizeMergeMetadata(value: unknown, filePath: string): IssueMergeMet
       "merge.doneTransitionOperationKey",
     ),
   };
+}
+
+function normalizeAcceptedArtifact(value: unknown, filePath: string): IssueAcceptedArtifactRecord | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "acceptedArtifact is invalid");
+  if (value.version !== 1) throw corruptLifecycle(filePath, "acceptedArtifact.version is invalid");
+  if (value.kind !== "expected_red_tests") throw corruptLifecycle(filePath, "acceptedArtifact.kind is invalid");
+  if (value.status !== "checkpointed" && value.status !== "completed_unmerged") {
+    throw corruptLifecycle(filePath, "acceptedArtifact.status is invalid");
+  }
+  return {
+    version: 1,
+    id: requiredString(value.id, filePath, "acceptedArtifact.id"),
+    kind: "expected_red_tests",
+    status: value.status,
+    sourceIssueId: requiredString(value.sourceIssueId, filePath, "acceptedArtifact.sourceIssueId"),
+    sourceIssueIdentifier: requiredString(
+      value.sourceIssueIdentifier,
+      filePath,
+      "acceptedArtifact.sourceIssueIdentifier",
+    ),
+    contractFingerprint: requiredString(
+      value.contractFingerprint,
+      filePath,
+      "acceptedArtifact.contractFingerprint",
+    ),
+    completionReportId: requiredString(
+      value.completionReportId,
+      filePath,
+      "acceptedArtifact.completionReportId",
+    ),
+    reviewVerdictId: requiredString(value.reviewVerdictId, filePath, "acceptedArtifact.reviewVerdictId"),
+    reviewFeedbackId: requiredString(value.reviewFeedbackId, filePath, "acceptedArtifact.reviewFeedbackId"),
+    repositoryFingerprint: requiredString(
+      value.repositoryFingerprint,
+      filePath,
+      "acceptedArtifact.repositoryFingerprint",
+    ),
+    pullRequest: normalizeRequiredPullRequest(value.pullRequest, filePath, "acceptedArtifact.pullRequest"),
+    sourceBaseHeadSha: requiredString(
+      value.sourceBaseHeadSha,
+      filePath,
+      "acceptedArtifact.sourceBaseHeadSha",
+    ),
+    sourceHeadSha: requiredString(value.sourceHeadSha, filePath, "acceptedArtifact.sourceHeadSha"),
+    baseRef: requiredString(value.baseRef, filePath, "acceptedArtifact.baseRef"),
+    changedFiles: requiredStringArray(value.changedFiles, filePath, "acceptedArtifact.changedFiles"),
+    fileManifest: normalizeArtifactFileManifest(value.fileManifest, filePath),
+    artifactEvidence: requireExpectedRedArtifactEvidence(
+      value.artifactEvidence,
+      filePath,
+      "acceptedArtifact.artifactEvidence",
+    ),
+    commentOperationKey: requiredString(
+      value.commentOperationKey,
+      filePath,
+      "acceptedArtifact.commentOperationKey",
+    ),
+    doneTransitionOperationKey: requiredString(
+      value.doneTransitionOperationKey,
+      filePath,
+      "acceptedArtifact.doneTransitionOperationKey",
+    ),
+    acceptedAt: requiredString(value.acceptedAt, filePath, "acceptedArtifact.acceptedAt"),
+    checkpointedAt: requiredString(value.checkpointedAt, filePath, "acceptedArtifact.checkpointedAt"),
+    prClosedAt: nullableString(value.prClosedAt, filePath, "acceptedArtifact.prClosedAt"),
+    completedAt: nullableString(value.completedAt, filePath, "acceptedArtifact.completedAt"),
+    ...normalizeSupersessionFields(value, filePath, "acceptedArtifact"),
+  };
+}
+
+function normalizeWorkspaceSeed(value: unknown, filePath: string): IssueWorkspaceSeedRecord | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, "workspaceSeed is invalid");
+  if (value.version !== 1) throw corruptLifecycle(filePath, "workspaceSeed.version is invalid");
+  if (value.kind !== "accepted_artifact") throw corruptLifecycle(filePath, "workspaceSeed.kind is invalid");
+  if (
+    value.status !== "planned" &&
+    value.status !== "preparing" &&
+    value.status !== "conflicted" &&
+    value.status !== "prepared" &&
+    value.status !== "invalid"
+  ) {
+    throw corruptLifecycle(filePath, "workspaceSeed.status is invalid");
+  }
+  return {
+    version: 1,
+    id: requiredString(value.id, filePath, "workspaceSeed.id"),
+    kind: "accepted_artifact",
+    status: value.status,
+    artifactId: requiredString(value.artifactId, filePath, "workspaceSeed.artifactId"),
+    sourceIssueId: requiredString(value.sourceIssueId, filePath, "workspaceSeed.sourceIssueId"),
+    sourceIssueIdentifier: requiredString(
+      value.sourceIssueIdentifier,
+      filePath,
+      "workspaceSeed.sourceIssueIdentifier",
+    ),
+    repositoryFingerprint: requiredString(
+      value.repositoryFingerprint,
+      filePath,
+      "workspaceSeed.repositoryFingerprint",
+    ),
+    sourceBranch: requiredString(value.sourceBranch, filePath, "workspaceSeed.sourceBranch"),
+    sourceHeadSha: requiredString(value.sourceHeadSha, filePath, "workspaceSeed.sourceHeadSha"),
+    sourceBaseHeadSha: requiredString(
+      value.sourceBaseHeadSha,
+      filePath,
+      "workspaceSeed.sourceBaseHeadSha",
+    ),
+    configuredBaseRef: requiredString(value.configuredBaseRef, filePath, "workspaceSeed.configuredBaseRef"),
+    preparedBaseHeadSha: nullableString(
+      value.preparedBaseHeadSha,
+      filePath,
+      "workspaceSeed.preparedBaseHeadSha",
+    ),
+    preparedHeadSha: nullableString(value.preparedHeadSha, filePath, "workspaceSeed.preparedHeadSha"),
+    targetBranch: requiredString(value.targetBranch, filePath, "workspaceSeed.targetBranch"),
+    conflictedFiles: requiredStringArray(value.conflictedFiles, filePath, "workspaceSeed.conflictedFiles"),
+    plannedAt: requiredString(value.plannedAt, filePath, "workspaceSeed.plannedAt"),
+    preparedAt: nullableString(value.preparedAt, filePath, "workspaceSeed.preparedAt"),
+    failureReason: nullableString(value.failureReason, filePath, "workspaceSeed.failureReason"),
+  };
+}
+
+function normalizeArtifactFileManifest(value: unknown, filePath: string): ArtifactFileManifestEntry[] {
+  if (!Array.isArray(value)) throw corruptLifecycle(filePath, "acceptedArtifact.fileManifest is invalid");
+  return value.map((item, index) => {
+    if (!isRecord(item)) {
+      throw corruptLifecycle(filePath, `acceptedArtifact.fileManifest[${index}] is invalid`);
+    }
+    if (
+      item.status !== "added" &&
+      item.status !== "modified" &&
+      item.status !== "deleted" &&
+      item.status !== "renamed"
+    ) {
+      throw corruptLifecycle(filePath, `acceptedArtifact.fileManifest[${index}].status is invalid`);
+    }
+    return {
+      path: requiredString(item.path, filePath, `acceptedArtifact.fileManifest[${index}].path`),
+      status: item.status,
+      blobSha: nullableString(item.blobSha, filePath, `acceptedArtifact.fileManifest[${index}].blobSha`),
+    };
+  });
+}
+
+function normalizeRequiredPullRequest(
+  value: unknown,
+  filePath: string,
+  field: string,
+): CompletionReportPullRequestRef {
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `${field} is invalid`);
+  const pullRequest: CompletionReportPullRequestRef = {
+    url: nullableString(value.url, filePath, `${field}.url`),
+    number: nullableNumber(value.number, filePath, `${field}.number`),
+    headSha: optionalNullableString(value.headSha, filePath, `${field}.headSha`),
+    branch: optionalNullableString(value.branch, filePath, `${field}.branch`),
+  };
+  if (value.draft !== undefined) {
+    pullRequest.draft = optionalNullableBoolean(value.draft, filePath, `${field}.draft`);
+  }
+  return pullRequest;
 }
 
 function normalizeMergeConflictMetadata(value: unknown, filePath: string): IssueMergeConflictMetadata | null {
@@ -2950,13 +3243,7 @@ function normalizeMergePullRequest(
   filePath: string,
   field = "merge.pullRequest",
 ): CompletionReportPullRequestRef {
-  if (!isRecord(value)) throw corruptLifecycle(filePath, `${field} is invalid`);
-  return {
-    url: nullableString(value.url, filePath, `${field}.url`),
-    number: nullableNumber(value.number, filePath, `${field}.number`),
-    headSha: optionalNullableString(value.headSha, filePath, `${field}.headSha`),
-    branch: optionalNullableString(value.branch, filePath, `${field}.branch`),
-  };
+  return normalizeRequiredPullRequest(value, filePath, field);
 }
 
 function normalizeReviewFeedbackPullRequest(
@@ -2964,13 +3251,7 @@ function normalizeReviewFeedbackPullRequest(
   filePath: string,
   index: number,
 ): CompletionReportPullRequestRef {
-  if (!isRecord(value)) throw corruptLifecycle(filePath, `reviewFeedback[${index}].pullRequest is invalid`);
-  return {
-    url: nullableString(value.url, filePath, `reviewFeedback[${index}].pullRequest.url`),
-    number: nullableNumber(value.number, filePath, `reviewFeedback[${index}].pullRequest.number`),
-    headSha: optionalNullableString(value.headSha, filePath, `reviewFeedback[${index}].pullRequest.headSha`),
-    branch: optionalNullableString(value.branch, filePath, `reviewFeedback[${index}].pullRequest.branch`),
-  };
+  return normalizeRequiredPullRequest(value, filePath, `reviewFeedback[${index}].pullRequest`);
 }
 
 function normalizeChecklist(value: unknown, filePath: string, reportIndex: number): CompletionReportChecklistItem[] {
@@ -3198,13 +3479,7 @@ function isReviewDiscoverySuggestedDisposition(value: string): value is ReviewDi
 
 function normalizePullRequest(value: unknown, filePath: string, reportIndex: number): CompletionReportPullRequestRef | null {
   if (value === null) return null;
-  if (!isRecord(value)) throw corruptLifecycle(filePath, `completionReports[${reportIndex}].pullRequest is invalid`);
-  return {
-    url: nullableString(value.url, filePath, `completionReports[${reportIndex}].pullRequest.url`),
-    number: nullableNumber(value.number, filePath, `completionReports[${reportIndex}].pullRequest.number`),
-    headSha: optionalNullableString(value.headSha, filePath, `completionReports[${reportIndex}].pullRequest.headSha`),
-    branch: optionalNullableString(value.branch, filePath, `completionReports[${reportIndex}].pullRequest.branch`),
-  };
+  return normalizeRequiredPullRequest(value, filePath, `completionReports[${reportIndex}].pullRequest`);
 }
 
 function normalizeCompletionReportAcceptanceContext(
@@ -3238,6 +3513,88 @@ function normalizeCompletionReportAcceptanceContext(
   };
 }
 
+function normalizeIssueContractSnapshot(
+  value: unknown,
+  filePath: string,
+  field: string,
+): IssueContractSnapshot | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `${field} is invalid`);
+  if (!isRecord(value.delivery)) throw corruptLifecycle(filePath, `${field}.delivery is invalid`);
+  const schemaVersion = positiveInteger(value.schemaVersion, filePath, `${field}.schemaVersion`);
+  const mode = value.delivery.mode;
+  if (mode !== "merge" && mode !== "accepted_artifact") {
+    throw corruptLifecycle(filePath, `${field}.delivery.mode is invalid`);
+  }
+  let artifact: "expected_red_tests" | null;
+  if (
+    (mode === "merge" && value.delivery.artifact !== null) ||
+    (mode === "accepted_artifact" && value.delivery.artifact !== "expected_red_tests")
+  ) {
+    throw corruptLifecycle(filePath, `${field}.delivery.artifact is invalid`);
+  }
+  artifact = mode === "merge" ? null : "expected_red_tests";
+  return {
+    schemaVersion,
+    contractVersion: requiredString(value.contractVersion, filePath, `${field}.contractVersion`),
+    fingerprint: requiredString(value.fingerprint, filePath, `${field}.fingerprint`),
+    delivery: { mode, artifact },
+  };
+}
+
+function normalizeExpectedRedArtifactEvidence(
+  value: unknown,
+  filePath: string,
+  field: string,
+): ExpectedRedArtifactEvidence | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `${field} is invalid`);
+  if (value.kind !== "expected_red_tests") throw corruptLifecycle(filePath, `${field}.kind is invalid`);
+  return {
+    kind: "expected_red_tests",
+    command: requiredString(value.command, filePath, `${field}.command`),
+    testFiles: requiredStringArray(value.testFiles, filePath, `${field}.testFiles`),
+    expectedFailure: requiredString(value.expectedFailure, filePath, `${field}.expectedFailure`),
+    observedFailure: requiredString(value.observedFailure, filePath, `${field}.observedFailure`),
+    exitCode: nonNegativeInteger(value.exitCode, filePath, `${field}.exitCode`),
+  };
+}
+
+function requireExpectedRedArtifactEvidence(
+  value: unknown,
+  filePath: string,
+  field: string,
+): ExpectedRedArtifactEvidence {
+  const evidence = normalizeExpectedRedArtifactEvidence(value, filePath, field);
+  if (evidence === null) throw corruptLifecycle(filePath, `${field} is missing`);
+  return evidence;
+}
+
+function normalizeDependencyArtifactResult(
+  value: unknown,
+  filePath: string,
+  field: string,
+): DependencyArtifactResult | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value)) throw corruptLifecycle(filePath, `${field} is invalid`);
+  return {
+    artifactId: requiredString(value.artifactId, filePath, `${field}.artifactId`),
+    command: requiredString(value.command, filePath, `${field}.command`),
+    exitCode: nonNegativeInteger(value.exitCode, filePath, `${field}.exitCode`),
+    evidence: requiredString(value.evidence, filePath, `${field}.evidence`),
+  };
+}
+
+function normalizePassDisposition(
+  value: unknown,
+  filePath: string,
+  field: string,
+): "merge" | "accepted_artifact" | null {
+  if (value === undefined || value === null) return null;
+  if (value === "merge" || value === "accepted_artifact") return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
 function normalizeCompletionReportWorktreeStatus(
   value: unknown,
   filePath: string,
@@ -3250,6 +3607,11 @@ function normalizeCompletionReportWorktreeStatus(
 
 function nonNegativeInteger(value: unknown, filePath: string, field: string): number {
   if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
+  throw corruptLifecycle(filePath, `${field} is invalid`);
+}
+
+function positiveInteger(value: unknown, filePath: string, field: string): number {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
   throw corruptLifecycle(filePath, `${field} is invalid`);
 }
 

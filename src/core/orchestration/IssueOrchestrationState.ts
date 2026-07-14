@@ -5,6 +5,7 @@ import type { IssueBaseRefObservation } from "../BaseRefVerification.js";
 import type { MergePolicyObservation } from "../merge/MergePolicyService.js";
 import type {
   IssueBreakdownPlanRecord,
+  IssueAcceptedArtifactRecord,
   IssueCompletionReportRecord,
   IssueLifecyclePatch,
   IssueMergeConflictMetadata,
@@ -17,6 +18,7 @@ import type {
   IssueReviewVerdictRecord,
   IssueTriageReportRecord,
   IssueTriageBlockerRecord,
+  IssueWorkspaceSeedRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import type { RunRecord } from "../persistence/RunTranscriptStore.js";
 import type {
@@ -75,6 +77,9 @@ export type IssueTransitionKind =
   | "reconcile_issue_triage_report_handoff"
   | "reconcile_issue_post_mortem_handoff"
   | "reconcile_review_verdict_handoff"
+  | "reconcile_completed_accepted_artifact"
+  | "supersede_reopened_accepted_artifact"
+  | "complete_accepted_artifact"
   | "reset_lifecycle_after_operator_resume"
   | "reset_merge_conflict_after_operator_resume"
   | "block_merge_conflict_attempt_limit"
@@ -224,6 +229,8 @@ export interface IssueCurrentFields {
   lastMergeGateResultId: string | null;
   latestCompletionReport: IssueCompletionReportRecord | null;
   latestApprovalPassVerdict: IssueReviewVerdictRecord | null;
+  acceptedArtifact: IssueAcceptedArtifactRecord | null;
+  workspaceSeed: IssueWorkspaceSeedRecord | null;
   mergeGate: IssueMergeGateState | null;
   mergeConflict: IssueMergeConflictMetadata | null;
   lifecycleSummaryCiStatus: string | null;
@@ -476,6 +483,8 @@ export interface LifecycleMutationEvidenceSnapshot extends IssueEvidenceHistoryS
   lifecyclePendingPublicationApprovalReason: string | null;
   lifecycleLatestCompletionReport: IssueCompletionReportRecord | null;
   lifecycleLatestApprovalPassVerdict: IssueReviewVerdictRecord | null;
+  lifecycleAcceptedArtifact: IssueAcceptedArtifactRecord | null;
+  lifecycleWorkspaceSeed: IssueWorkspaceSeedRecord | null;
   lifecycleMerge: IssueMergeMetadata | null;
   lifecycleMergeGate: IssueMergeGateState | null;
   lifecycleMergeGateResults: IssueMergeGateResultRecord[] | null;
@@ -747,6 +756,14 @@ export function normalizeIssueHistorySnapshotEvidenceFields(
             payload,
             "latestApprovalPassVerdict",
           ),
+        lifecycleAcceptedArtifact: recordField<IssueAcceptedArtifactRecord>(
+          payload,
+          "acceptedArtifact",
+        ),
+        lifecycleWorkspaceSeed: recordField<IssueWorkspaceSeedRecord>(
+          payload,
+          "workspaceSeed",
+        ),
         lifecycleMerge: recordField<IssueMergeMetadata>(payload, "merge"),
         lifecycleMergeGate: recordField<IssueMergeGateState>(
           payload,

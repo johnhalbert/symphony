@@ -1,5 +1,7 @@
 import type { ServiceConfig } from "../config/Config.js";
 import type {
+  ExpectedRedArtifactEvidence,
+  IssueAcceptedArtifactRecord,
   IssueCompletionReportRecord,
   IssueMergeGateMergeabilityState,
   IssueMergeConflictResolutionReportRecord,
@@ -201,6 +203,19 @@ export interface PullRequestHandoffWritebackDetails {
     passedChecks: string[];
     noCiEvidence: string | null;
   } | null;
+}
+
+export interface AcceptedArtifactHandoffWritebackDetails {
+  pullRequest: PullRequestHandoffWritebackDetails["pullRequest"];
+  report?: CompletionReportWritebackDetails | null;
+  artifactEvidence: ExpectedRedArtifactEvidence;
+}
+
+export interface AcceptedArtifactCompletionWritebackContext {
+  issue: Issue;
+  artifact: IssueAcceptedArtifactRecord;
+  fromStates: string[];
+  doneState: string;
 }
 
 export interface PublicationApprovalActionDetails {
@@ -445,6 +460,125 @@ export function planPullRequestHandoffWritebacks(
         fromStates: handoffFromStates,
         toState: targetState,
         reason: "Symphony verified pull request handoff",
+      },
+    },
+  ];
+}
+
+export function planAcceptedArtifactHandoffWritebacks(
+  context: RunWritebackContext,
+  config: ServiceConfig,
+  details: AcceptedArtifactHandoffWritebackDetails,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || !config.github.prHandoff.enabled) return [];
+  const handoffFromStates = pullRequestHandoffFromStates(config);
+  if (!isStateIn(context.issue.state, handoffFromStates)) return [];
+  const targetState = config.github.prHandoff.targetState;
+  if (targetState === null) return [];
+  if (
+    details.pullRequest.draft !== true ||
+    details.artifactEvidence.kind !== "expected_red_tests" ||
+    !Number.isInteger(details.artifactEvidence.exitCode) ||
+    details.artifactEvidence.exitCode <= 0
+  ) {
+    return [];
+  }
+
+  const pullRequestKey = pullRequestIdempotencySegment(details.pullRequest);
+  const headKey = safeKeySegment(details.pullRequest.headSha ?? "no-head-sha");
+  const eventKey = `pull-request-handoff:accepted-artifact:${pullRequestKey}:${headKey}`;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Accepted-Artifact Handoff",
+          "",
+          "Status: expected-red test artifact ready for review",
+          "This draft PR is an intentionally unmerged test artifact. Its expected nonzero test result is the deliverable, not a merge-readiness failure.",
+          `Next state: ${targetState} (artifact review handoff)`,
+          "",
+          `Run: ${context.runId}`,
+          `Session: ${context.sessionId ?? "n/a"}`,
+          `Workspace: ${context.workspacePath ?? context.workspace?.path ?? "n/a"}`,
+          `Branch: ${context.workspace?.gitBranchName ?? context.issue.branchName ?? details.pullRequest.branch ?? "n/a"}`,
+          "",
+          "Draft pull request:",
+          `- PR: ${formatPullRequest(details.pullRequest)}`,
+          ...(details.pullRequest.headSha ? [`- PR head SHA: ${details.pullRequest.headSha}`] : []),
+          "- Draft: yes",
+          "",
+          "Expected-red evidence:",
+          `- Command: ${details.artifactEvidence.command}`,
+          `- Expected failure: ${details.artifactEvidence.expectedFailure}`,
+          `- Observed failure: ${details.artifactEvidence.observedFailure}`,
+          `- Intentional nonzero exit code: ${details.artifactEvidence.exitCode}`,
+          `- Test files: ${details.artifactEvidence.testFiles.join(", ")}`,
+          ...(details.report ? formatCompletionReportForComment(details.report) : []),
+        ].join("\n"),
+      },
+    },
+    {
+      idempotencyKey: `transition:${context.issue.id}:${eventKey}:${targetState}`,
+      kind: "transition",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        fromStates: handoffFromStates,
+        toState: targetState,
+        reason: "Symphony verified accepted-artifact draft PR handoff",
+      },
+    },
+  ];
+}
+
+export function planAcceptedArtifactCompletionWritebacks(
+  context: AcceptedArtifactCompletionWritebackContext,
+  config: ServiceConfig,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || !isStateIn(context.issue.state, context.fromStates)) return [];
+  const artifact = context.artifact;
+  const eventKey = `accepted-artifact:${safeKeySegment(artifact.id)}:completed-unmerged`;
+  return [
+    {
+      idempotencyKey: artifact.commentOperationKey,
+      kind: "comment",
+      issueId: context.issue.id,
+      payload: {
+        acceptedArtifactId: artifact.id,
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Accepted Test Artifact",
+          "",
+          "Status: completed without merge",
+          "The reviewed expected-red tests were checkpointed for dependent implementation issues, and the draft pull request was closed unmerged.",
+          "",
+          `Artifact: ${artifact.id}`,
+          `Source head: ${artifact.sourceHeadSha}`,
+          `Source base: ${artifact.sourceBaseHeadSha}`,
+          `Source branch: ${artifact.pullRequest.branch ?? "n/a"}`,
+          `Draft PR: ${formatPullRequest(artifact.pullRequest)}`,
+          `Test command: ${artifact.artifactEvidence.command}`,
+          `Intentional nonzero exit code: ${artifact.artifactEvidence.exitCode}`,
+          `Test files: ${artifact.artifactEvidence.testFiles.join(", ")}`,
+          "",
+          "Dependent implementation issues may now seed their workspaces from this reviewed artifact.",
+        ].join("\n"),
+      },
+    },
+    {
+      idempotencyKey: artifact.doneTransitionOperationKey,
+      kind: "transition",
+      issueId: context.issue.id,
+      payload: {
+        acceptedArtifactId: artifact.id,
+        fromStates: context.fromStates,
+        toState: context.doneState,
+        reason: "Symphony accepted reviewed expected-red test artifact without merge",
       },
     },
   ];
@@ -698,6 +832,41 @@ export function planReviewPassWritebacks(
   }
 
   return operations;
+}
+
+export function planReviewAcceptedArtifactPassWritebacks(
+  context: ReviewVerdictWritebackContext,
+  config: ServiceConfig,
+  summary: string | ReviewVerdictWritebackDetails | null = null,
+): NewWritebackOperation[] {
+  if (!config.writeback.enabled || !isStateIn(context.issue.state, config.reviewLoop.reviewStates)) return [];
+
+  const eventKey = `${context.runId}:review-verdict-pass-artifact`;
+  const details = typeof summary === "object" && summary !== null ? summary : null;
+  const summaryText = typeof summary === "string" ? summary : null;
+  return [
+    {
+      idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
+      kind: "comment",
+      issueId: context.issue.id,
+      runId: context.runId,
+      payload: {
+        dedupeKey: eventKey,
+        body: [
+          "## Symphony Review Verdict: Accepted Artifact",
+          "",
+          "Status: passed",
+          "The expected-red test artifact passed review without merge authorization.",
+          "Symphony will checkpoint the reviewed head, close the draft PR unmerged, and complete this issue through the accepted-artifact transition.",
+          "",
+          `Run: ${context.runId}`,
+          `Reviewer: ${context.reviewer ?? "n/a"}`,
+          ...(summaryText === null || summaryText.trim().length === 0 ? [] : ["", "Summary:", summaryText.trim()]),
+          ...(details === null ? [] : formatReviewVerdictDetails(details)),
+        ].join("\n"),
+      },
+    },
+  ];
 }
 
 export function planBlockedEscalationWritebacks(

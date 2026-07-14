@@ -10,5 +10,9 @@ describe("review loop prompt guidance", () => {
     expect(DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE).toContain("issue-authoring gap");
     expect(DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE).toContain("keep gate authority narrow");
     expect(DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE).toContain("authoring/decomposition signal");
+    expect(DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE).toContain("accepted expected-red artifact delivery");
+    expect(DEFAULT_REVIEWER_REVIEW_LOOP_GUIDANCE).toContain("non-merge COMMENT feedback");
+    expect(DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE).toContain("Dependency Artifact Checkpoint");
+    expect(DEFAULT_WORKER_INVARIANT_REPAIR_GUIDANCE).toContain("dependencyArtifactResult");
   });
 });

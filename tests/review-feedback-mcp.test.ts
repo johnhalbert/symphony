@@ -37,7 +37,7 @@ describe("review feedback MCP handoff", () => {
     expect(output).toContain(REVIEW_FEEDBACK_TOOL_NAME);
     expect(output).toContain("APPROVE");
     expect(output).toContain("REQUEST_CHANGES");
-    expect(output).not.toContain('"COMMENT"');
+    expect(output).toContain('"COMMENT"');
     expect(output).toContain("idempotencyKey");
     expect(output).toContain("Arguments are required");
     expect(output).toContain("Never call this tool with an empty object");

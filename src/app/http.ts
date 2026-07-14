@@ -47,7 +47,10 @@ import type {
   IssueReviewVerdictRecord,
   IssueTriageReportRecord,
 } from "../core/persistence/IssueLifecycleStore.js";
-import { latestCurrentApprovalPassVerdict } from "../core/persistence/IssueLifecycleStore.js";
+import {
+  latestCurrentApprovalPassVerdict,
+  latestCurrentCompletionReport,
+} from "../core/persistence/IssueLifecycleStore.js";
 import type { FileMcpExposureDiagnosticsStore } from "../core/persistence/McpExposureDiagnosticsStore.js";
 import type { OperatorApprovalService, OperatorApprovalRecord } from "../core/approval/OperatorApprovalService.js";
 import { OPERATOR_REJECTED_PUBLICATION_ERROR, approvalResolve } from "../core/approval/OperatorApprovalService.js";
@@ -7328,6 +7331,8 @@ function buildIssueDetailsEnvelope(input: {
       workspace: buildIssueWorkspaceSummary(sanitizedInput, metadata),
       pullRequest: buildIssuePullRequestSummary(metadata),
       mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(metadata)),
+      acceptedArtifact: buildIssueAcceptedArtifactSummary(lifecycle),
+      workspaceSeed: buildIssueWorkspaceSeedSummary(lifecycle),
       latestRun: buildIssueLatestRunSummary(input.summaryRun),
     };
   }
@@ -7341,7 +7346,40 @@ function buildIssueDetailsEnvelope(input: {
     workspace: buildIssueWorkspaceSummary(sanitizedInput, metadata),
     pullRequest: buildIssuePullRequestSummary(metadata),
     mergeGate: mergeGateStatus(lifecycle, buildIssuePullRequestSummary(metadata)),
+    acceptedArtifact: buildIssueAcceptedArtifactSummary(lifecycle),
+    workspaceSeed: buildIssueWorkspaceSeedSummary(lifecycle),
     latestRun: buildIssueLatestRunSummary(input.summaryRun),
+  };
+}
+
+function buildIssueAcceptedArtifactSummary(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+): NonNullable<IssueDetailsEnvelope["acceptedArtifact"]> | null {
+  const artifact = lifecycle?.acceptedArtifact;
+  if (!artifact) return null;
+  return {
+    id: artifact.id,
+    status: artifact.status,
+    sourceIssueId: artifact.sourceIssueId,
+    sourceIssueIdentifier: artifact.sourceIssueIdentifier,
+    sourceHeadSha: artifact.sourceHeadSha,
+  };
+}
+
+function buildIssueWorkspaceSeedSummary(
+  lifecycle: IssueLifecycleRecord | null | undefined,
+): NonNullable<IssueDetailsEnvelope["workspaceSeed"]> | null {
+  const seed = lifecycle?.workspaceSeed;
+  if (!seed) return null;
+  return {
+    id: seed.id,
+    status: seed.status,
+    artifactId: seed.artifactId,
+    sourceIssueId: seed.sourceIssueId,
+    sourceIssueIdentifier: seed.sourceIssueIdentifier,
+    sourceHeadSha: seed.sourceHeadSha,
+    preparedHeadSha: seed.preparedHeadSha,
+    conflictedFiles: [...seed.conflictedFiles],
   };
 }
 
@@ -7807,11 +7845,7 @@ function reviewLoopStatus(input: {
 
 function latestCompletionReport(lifecycle: IssueLifecycleRecord | null): IssueCompletionReportRecord | null {
   if (!lifecycle) return null;
-  if (lifecycle.lastCompletionReportId) {
-    const exact = lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
-    if (exact) return exact;
-  }
-  return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
+  return latestCurrentCompletionReport(lifecycle);
 }
 
 function latestReviewVerdict(lifecycle: IssueLifecycleRecord | null): IssueReviewVerdictRecord | null {

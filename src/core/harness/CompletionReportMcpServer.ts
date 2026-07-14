@@ -15,7 +15,10 @@ import { createGitHubPullRequestClientForCapability } from "../../integrations/g
 import { SymphonyError } from "../errors.js";
 import { FileOperatorApprovalStore, OperatorApprovalService } from "../approval/OperatorApprovalService.js";
 import { runSingleToolMcpServer } from "./McpSdkStdioServer.js";
-import { createRuntimeWritebackProcessor } from "../../app/RuntimeDependencies.js";
+import {
+  createRuntimeTrackerClient,
+  createRuntimeWritebackProcessor,
+} from "../../app/RuntimeDependencies.js";
 
 export const COMPLETION_REPORT_TOOL_NAME = "submit_completion_report";
 
@@ -68,6 +71,7 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       store: new FileOperatorApprovalStore(config.workspace.stateDir),
       runStore,
     });
+    const tracker = createRuntimeTrackerClient(config);
     const approvalRequiredForPublication = config.github.operatorApproval?.requiredForPublication ?? false;
     const pullRequestPublisher =
       options.pullRequestPublisher ??
@@ -82,6 +86,8 @@ export async function submitCompletionReportFromMcp(input: unknown, options: {
       runStore,
       ...(pullRequestPublisher === undefined ? {} : { pullRequestPublisher }),
       operatorApproval,
+      resolveIssuesByIds: (issueIds) =>
+        tracker.fetchIssueStatesByIds(issueIds),
     });
     const context: CompletionReportActiveContext = {
       issue: loadedContext.issue,
@@ -123,7 +129,7 @@ export async function runCompletionReportMcpServer(options: {
     tool: {
       name: COMPLETION_REPORT_TOOL_NAME,
       description:
-        "Submit a Symphony worker completion report for review handoff. For implementation runs, this is the publication handoff; leave changes uncommitted and unpushed so Symphony can perform the service-owned commit, push, and PR creation/reuse.",
+        "Submit a Symphony worker completion report for review handoff. Merge deliveries report green validation; accepted expected-red test artifacts report structured artifactEvidence. Leave changes uncommitted and unpushed so Symphony can perform the service-owned commit, push, and PR creation/reuse.",
       inputSchema: completionReportInputSchema(),
       handler: (input) => submitCompletionReportFromMcp(input, options),
     },
@@ -156,12 +162,14 @@ function completionReportInputSchema(): Record<string, unknown> {
       summary: {
         type: "string",
         minLength: 1,
-        description: "Concise summary of the review-ready implementation completed in the active worker run.",
+        description:
+          "Concise summary of the review-ready implementation or accepted test-artifact deliverable completed in the active worker run.",
       },
       validationEvidence: {
         type: "array",
         minItems: 1,
-        description: "Successful commands, checks, or manual verification performed before handoff; blocked attempts alone are not review-ready evidence.",
+        description:
+          "Commands, checks, or manual verification performed before handoff. Merge deliveries require successful evidence. An accepted expected-red test artifact may cite its intentional failure here only when artifactEvidence records the exact command and failure.",
         items: { type: "string", minLength: 1 },
       },
       acceptanceChecklist: {
@@ -192,6 +200,73 @@ function completionReportInputSchema(): Record<string, unknown> {
         type: "array",
         description: "Files materially changed by the worker run.",
         items: { type: "string", minLength: 1 },
+      },
+      artifactEvidence: {
+        description:
+          "Required only when the Issue Contract declares delivery.mode=accepted_artifact and artifact=expected_red_tests; omit it for merge delivery. Every testFiles entry must also appear in changedFiles.",
+        type: "object",
+        additionalProperties: false,
+        required: ["kind", "command", "testFiles", "expectedFailure", "observedFailure", "exitCode"],
+        properties: {
+          kind: { type: "string", const: "expected_red_tests" },
+          command: {
+            type: "string",
+            minLength: 1,
+            description: "Exact deterministic command used to exercise the new tests.",
+          },
+          testFiles: {
+            type: "array",
+            minItems: 1,
+            uniqueItems: true,
+            items: { type: "string", minLength: 1 },
+            description: "New or changed test files that produced the expected failure.",
+          },
+          expectedFailure: {
+            type: "string",
+            minLength: 1,
+            description: "Assertion or missing behavior the test contract expects to fail before implementation.",
+          },
+          observedFailure: {
+            type: "string",
+            minLength: 1,
+            description:
+              "Stable exact excerpt copied from command output that proves the intended assertion, not an unrelated setup or tooling error.",
+          },
+          exitCode: {
+            type: "integer",
+            minimum: 1,
+            description: "Positive nonzero exit code returned by the expected-red command.",
+          },
+        },
+      },
+      dependencyArtifactResult: {
+        description:
+          "Required when Symphony seeded this workspace from a Dependency Artifact Checkpoint; proves the inherited expected-red command is green after implementation. Omit when no checkpoint was supplied.",
+        type: "object",
+        additionalProperties: false,
+        required: ["artifactId", "command", "exitCode", "evidence"],
+        properties: {
+          artifactId: {
+            type: "string",
+            minLength: 1,
+            description: "Artifact identifier from the injected Dependency Artifact Checkpoint.",
+          },
+          command: {
+            type: "string",
+            minLength: 1,
+            description: "The inherited artifact's declared test command.",
+          },
+          exitCode: {
+            type: "integer",
+            const: 0,
+            description: "Successful exit code from the inherited expected-red command after implementation.",
+          },
+          evidence: {
+            type: "string",
+            minLength: 1,
+            description: "Concrete output or test summary proving the inherited tests now pass.",
+          },
+        },
       },
       branchName: {
         description: "Current implementation branch, or null if no branch is available.",
@@ -248,4 +323,3 @@ function completionReportInputFromMcp(input: unknown, context: CompletionReportA
     issueId: context.issue.id,
   };
 }
-

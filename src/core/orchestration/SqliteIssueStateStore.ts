@@ -963,6 +963,8 @@ function normalizeIssueCurrentFields(
       : [],
     latestCompletionReport: record.latestCompletionReport ?? null,
     latestApprovalPassVerdict: record.latestApprovalPassVerdict ?? null,
+    acceptedArtifact: record.acceptedArtifact ?? null,
+    workspaceSeed: record.workspaceSeed ?? null,
     mergeGate: record.mergeGate ?? null,
     mergeConflict: record.mergeConflict ?? null,
     lifecycleSummaryCiStatus:

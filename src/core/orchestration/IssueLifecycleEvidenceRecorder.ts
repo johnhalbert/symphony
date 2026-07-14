@@ -3,6 +3,7 @@ import { pendingPublicationHandoffForRun } from "../CompletionReportService.js";
 import type { Logger } from "../logging/StructuredLogger.js";
 import {
   latestCurrentApprovalPassVerdict,
+  latestCurrentCompletionReport,
   type IssueLifecyclePatch,
   type IssueLifecycleRecord,
   type IssueLifecycleStore,
@@ -140,8 +141,10 @@ function lifecycleEvidencePayload(
     pendingPublicationApprovalRunId: pendingPublication?.pendingReport.runId ?? null,
     pendingPublicationApprovalReportId: pendingPublication?.pendingReport.id ?? null,
     pendingPublicationApprovalReason: pendingPublication === null ? null : lifecycle.blockedReason ?? null,
-    latestCompletionReport: latestCompletionReport(lifecycle),
+    latestCompletionReport: latestCurrentCompletionReport(lifecycle),
     latestApprovalPassVerdict: latestCurrentApprovalPassVerdict(lifecycle),
+    acceptedArtifact: lifecycle.acceptedArtifact ?? null,
+    workspaceSeed: lifecycle.workspaceSeed ?? null,
     merge: lifecycle.merge ?? null,
     mergeGate: lifecycle.mergeGate ?? null,
     mergeGateResults: lifecycle.mergeGateResults ?? [],
@@ -152,13 +155,6 @@ function lifecycleEvidencePayload(
     summaryPointers: lifecycle.summaryPointers,
     ...(audit === undefined ? {} : { audit }),
   };
-}
-
-function latestCompletionReport(lifecycle: IssueLifecycleRecord) {
-  if (lifecycle.lastCompletionReportId) {
-    return lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId) ?? null;
-  }
-  return lifecycle.completionReports.at(-1) ?? null;
 }
 
 function emptyRuntimeState() {

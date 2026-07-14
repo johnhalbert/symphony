@@ -14,7 +14,10 @@ import type {
   IssuePostMortemSpecificationClassification,
   IssuePostMortemSpecificationQuality,
 } from "./persistence/IssueLifecycleStore.js";
-import { latestCurrentApprovalPassVerdict } from "./persistence/IssueLifecycleStore.js";
+import {
+  latestCurrentApprovalPassVerdict,
+  latestCurrentCompletionReport,
+} from "./persistence/IssueLifecycleStore.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type { Issue } from "./types.js";
 import { planIssuePostMortemReportWritebacks } from "./writeback/TransitionPolicy.js";
@@ -313,7 +316,7 @@ export function latestIssuePostMortemReport(
 }
 
 export function issuePostMortemTriggerFingerprint(lifecycle: IssueLifecycleRecord, issue: Issue): string {
-  const completion = latestCompletionReport(lifecycle);
+  const completion = latestCurrentCompletionReport(lifecycle);
   const passVerdict = latestCurrentApprovalPassVerdict(lifecycle);
   return createHash("sha256")
     .update(
@@ -471,16 +474,7 @@ function issuePostMortemIdempotencyConflict(
 }
 
 function hasPostMortemEvidence(lifecycle: IssueLifecycleRecord): boolean {
-  return latestCompletionReport(lifecycle) !== null && latestCurrentApprovalPassVerdict(lifecycle) !== null;
-}
-
-function latestCompletionReport(
-  record: Pick<IssueLifecycleRecord, "completionReports" | "lastCompletionReportId">,
-): IssueCompletionReportRecord | null {
-  if (record.lastCompletionReportId) {
-    return record.completionReports.find((report) => report.id === record.lastCompletionReportId) ?? null;
-  }
-  return record.completionReports[record.completionReports.length - 1] ?? null;
+  return latestCurrentCompletionReport(lifecycle) !== null && latestCurrentApprovalPassVerdict(lifecycle) !== null;
 }
 
 function issuePostMortemReportIdFor(issueId: string, idempotencyKey: string): string {

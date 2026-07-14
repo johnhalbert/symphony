@@ -40,6 +40,45 @@ describe("IssueBreakdownPlanApplyService", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it("refuses direct application of a plan for an accepted expected-red artifact", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.applyToLinear.enabled = true;
+    config.writeback.enabled = true;
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const candidate = issue({
+      labels: ["planning"],
+      description: agentEligibleIssueContract({
+        issueContractDelivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+      }),
+      updatedAt: "2026-01-02T00:00:00Z",
+    });
+    await submitSingleChildPlan(config, lifecycleStore, candidate);
+    const writeback = new CapturingWriteback();
+    const service = new IssueBreakdownPlanApplyService({
+      config,
+      lifecycleStore,
+      writeback,
+    });
+
+    await expect(service.previewLatestFreshPlan(candidate)).resolves.toEqual({
+      status: "no_fresh_plan",
+      reason: "accepted_artifact_contract_cannot_be_decomposed",
+    });
+    await expect(service.applyLatestFreshPlan(candidate)).resolves.toEqual({
+      status: "no_fresh_plan",
+      reason: "accepted_artifact_contract_cannot_be_decomposed",
+    });
+    expect(writeback.operations).toHaveLength(0);
+    await expect(lifecycleStore.get(candidate.id)).resolves.toMatchObject({
+      issueBreakdownPlans: [
+        expect.objectContaining({ applicationStatus: "not_requested" }),
+      ],
+    });
+  });
+
   it("applies fresh accepted plans through idempotent issue create writebacks", async () => {
     const config = testConfig(root);
     config.issueBreakdown.applyToLinear.enabled = true;

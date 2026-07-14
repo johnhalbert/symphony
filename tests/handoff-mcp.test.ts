@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   renderCompletionMcpHandoffPrompt,
   renderIssueBreakdownMcpHandoffPrompt,
+  renderIssuePostMortemMcpHandoffPrompt,
+  renderIssueTriageMcpHandoffPrompt,
   renderMergeConflictResolutionMcpHandoffPrompt,
   renderReviewMcpHandoffPrompt,
 } from "../src/core/harness/HandoffMcp.js";
@@ -56,6 +58,13 @@ describe("MCP handoff prompt rendering", () => {
     expect(prompt).toContain("start the item text with that `id`");
     expect(prompt).toContain("documented command invocation actually produces the documented fields");
     expect(prompt).toContain("do not rely on inferred behavior");
+    expect(prompt).toContain("delivery.mode=accepted_artifact");
+    expect(prompt).toContain("structured artifactEvidence");
+    expect(prompt).toContain("stable exact observedFailure excerpt copied");
+    expect(prompt).toContain("positive nonzero exitCode");
+    expect(prompt).toContain("Dependency Artifact Checkpoint");
+    expect(prompt).toContain("dependencyArtifactResult");
+    expect(prompt).toContain("exitCode=0");
   });
 
   it("identifies review-feedback MCP as the only allowed reviewer GitHub review-write path", () => {
@@ -76,6 +85,33 @@ describe("MCP handoff prompt rendering", () => {
     expect(prompt).toContain("reviewUrl/commentUrls/urls");
     expect(prompt).toContain("Never call submit_pull_request_review_feedback with {}");
     expect(prompt).toContain('{"kind":"review","event":"APPROVE","body":"...","idempotencyKey":"..."}');
+    expect(prompt).toContain("accepted expected-red artifact use event=COMMENT");
+    expect(prompt).toContain("Do not use blocked merely because an accepted expected-red artifact awaits");
+  });
+
+  it("requires planners to declare accepted-artifact delivery and dependency ownership explicitly", () => {
+    const prompt = renderIssueBreakdownMcpHandoffPrompt({ issue: issue({ identifier: "ENG-1" }) });
+
+    expect(prompt).toContain('delivery: {"mode":"accepted_artifact","artifact":"expected_red_tests"}');
+    expect(prompt).toContain("implementation sibling successors (children of the same decomposition parent)");
+    expect(prompt).toContain("never children of the artifact issue");
+    expect(prompt).toContain("make each directly depend on the test-artifact issue");
+  });
+
+  it("routes an accepted artifact stuck after pass to lifecycle reconciliation", () => {
+    const prompt = renderIssueTriageMcpHandoffPrompt({ issue: issue({ identifier: "ENG-1" }) });
+
+    expect(prompt).toContain("not blocked by its missing implementation");
+    expect(prompt).toContain("failed artifact-completion transition");
+    expect(prompt).toContain("recommend reconciliation");
+  });
+
+  it("treats completed unmerged artifacts as valid post-mortem completion", () => {
+    const prompt = renderIssuePostMortemMcpHandoffPrompt({ issue: issue({ identifier: "ENG-1" }) });
+
+    expect(prompt).toContain("completed_unmerged expected-red artifact");
+    expect(prompt).toContain("intentional valid completion");
+    expect(prompt).toContain("do not treat the missing merge or closed draft PR as a defect");
   });
 
   it("requires merge-conflict workers to continue when the MCP result prepares a follow-up conflict", () => {

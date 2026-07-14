@@ -1,18 +1,32 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CompletionReportService, type CompletionReportActiveContext, type CompletionReportInput } from "../src/core/CompletionReportService.js";
+import {
+  CompletionReportService,
+  verifyDependencyArtifactManifest,
+  type CompletionReportActiveContext,
+  type CompletionReportInput,
+  type DependencyArtifactManifestVerificationInput,
+} from "../src/core/CompletionReportService.js";
 import type {
   BaseRefVerificationInput,
   IssueBaseRefObservation,
 } from "../src/core/BaseRefVerification.js";
 import { SymphonyError } from "../src/core/errors.js";
-import { FileIssueLifecycleStore, buildWorkerHandoffPacket, type IssueMergeGateState } from "../src/core/persistence/IssueLifecycleStore.js";
+import { parseIssueContract } from "../src/core/IssueContractLint.js";
+import {
+  FileIssueLifecycleStore,
+  buildWorkerHandoffPacket,
+  type ExpectedRedArtifactEvidence,
+  type IssueAcceptedArtifactRecord,
+  type IssueMergeGateState,
+  type IssueWorkspaceSeedRecord,
+} from "../src/core/persistence/IssueLifecycleStore.js";
 import { FileRunTranscriptStore } from "../src/core/persistence/RunTranscriptStore.js";
 import { FileWritebackOutboxStore, type NewWritebackOperation, type WritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
-import { issue, testConfig } from "./helpers.js";
+import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 import type { OperatorApprovalRecord } from "../src/core/approval/OperatorApprovalService.js";
 import type {
   CompletionReportPullRequestCheckResult,
@@ -577,6 +591,429 @@ describe("CompletionReportService", () => {
     });
   });
 
+  it("requires structured expected-red evidence for accepted-artifact delivery", async () => {
+    const { service } = fixture();
+
+    await expect(
+      service.submitCompletionReport(
+        report(),
+        context({ issue: acceptedArtifactIssue() }),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Accepted expected-red artifact delivery requires structured artifactEvidence",
+    });
+  });
+
+  it("forbids expected-red evidence for merge delivery", async () => {
+    const { service } = fixture();
+
+    await expect(
+      service.submitCompletionReport(
+        report({
+          artifactEvidence: expectedRedEvidence(),
+          changedFiles: ["tests/new-behavior.test.ts"],
+        }),
+        context({
+          issue: issue({
+            state: "In Progress",
+            branchName: "symphony/TEST-1",
+            description: mergeIssueContract(),
+          }),
+        }),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "artifactEvidence is only valid for an explicit accepted expected-red artifact delivery contract",
+    });
+  });
+
+  it("requires every expected-red test file to be declared in changedFiles", async () => {
+    const { service } = fixture();
+
+    await expect(
+      service.submitCompletionReport(
+        report({
+          artifactEvidence: expectedRedEvidence(),
+          changedFiles: ["src/unrelated.ts"],
+        }),
+        context({ issue: acceptedArtifactIssue() }),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Every expected-red test file must be included in completion report changedFiles",
+      details: { missingTestFiles: ["tests/new-behavior.test.ts"] },
+    });
+  });
+
+  it("publishes accepted expected-red artifacts as draft PRs without requiring green checks", async () => {
+    const publisher = new FakePublisher(
+      {
+        action: "created",
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headBranch: "symphony/TEST-1",
+        headSha: "abc123",
+        lastPushedAt: "2026-01-01T00:00:01Z",
+        evidenceCursor: "idem-1",
+        draft: true,
+      },
+      null,
+      [{ name: "Typecheck and test", status: "failure", conclusion: "failure", url: null }],
+    );
+    const { service, lifecycleStore, runStore } = fixture({
+      publisher,
+      configure(config) {
+        config.github.prHandoff.requiredChecks = ["Typecheck and test"];
+        config.github.prHandoff.noCiAllowed = false;
+        config.github.prHandoff.noCiEvidence = null;
+      },
+    });
+    await startRun(runStore);
+
+    const result = await service.submitCompletionReport(
+      report({
+        artifactEvidence: expectedRedEvidence(),
+        changedFiles: ["tests/new-behavior.test.ts"],
+      }),
+      contextWithWorkspace({ issue: acceptedArtifactIssue() }),
+    );
+
+    expect(publisher.inputs).toHaveLength(1);
+    expect(publisher.inputs[0]).toMatchObject({ draft: true });
+    expect(publisher.checkInputs).toEqual([]);
+    expect(result.report).toMatchObject({
+      contractSnapshot: {
+        schemaVersion: 1,
+        contractVersion: "2026-07-14.accepted-artifact",
+        fingerprint: expect.any(String),
+        delivery: { mode: "accepted_artifact", artifact: "expected_red_tests" },
+      },
+      artifactEvidence: expectedRedEvidence(),
+    });
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      completionReports: [
+        {
+          contractSnapshot: {
+            delivery: { mode: "accepted_artifact", artifact: "expected_red_tests" },
+          },
+          artifactEvidence: expectedRedEvidence(),
+        },
+      ],
+    });
+  });
+
+  it("rejects an accepted expected-red artifact when the verified PR is not draft", async () => {
+    const publisher = new FakePublisher({
+      action: "created",
+      url: "https://github.com/acme/symphony/pull/42",
+      number: 42,
+      headBranch: "symphony/TEST-1",
+      headSha: "abc123",
+      lastPushedAt: "2026-01-01T00:00:01Z",
+      evidenceCursor: "idem-1",
+      draft: false,
+    });
+    const { service, lifecycleStore, outbox } = fixture({ publisher });
+
+    await expect(
+      service.submitCompletionReport(
+        report({
+          artifactEvidence: expectedRedEvidence(),
+          changedFiles: ["tests/new-behavior.test.ts"],
+        }),
+        contextWithWorkspace({ issue: acceptedArtifactIssue() }),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Accepted expected-red artifacts require a verified draft pull request handoff",
+    });
+
+    expect(publisher.inputs[0]).toMatchObject({ draft: true });
+    expect(await lifecycleStore.get("issue-1")).toBeNull();
+    expect(await outbox.list()).toHaveLength(0);
+  });
+
+  it("requires seeded implementations to prove the completed source artifact now passes", async () => {
+    const { service, lifecycleStore } = fixture();
+    const targetIssue = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    await lifecycleStore.ensureIssue(sourceArtifactIssue(), {
+      phase: "terminal",
+      acceptedArtifact: completedAcceptedArtifact(),
+    });
+    await lifecycleStore.ensureIssue(targetIssue, {
+      phase: "implementation",
+      workspaceSeed: preparedWorkspaceSeed(),
+    });
+    const targetContext = context({ issue: targetIssue });
+
+    await expect(service.submitCompletionReport(report(), targetContext)).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Seeded implementation completion requires dependencyArtifactResult proving the inherited expected-red tests pass",
+    });
+    await expect(
+      service.submitCompletionReport(
+        report({
+          dependencyArtifactResult: passingDependencyArtifactResult({ artifactId: "artifact:wrong" }),
+        }),
+        targetContext,
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "dependencyArtifactResult must match the seeded artifact id and declared expected-red command",
+    });
+    await expect(
+      service.submitCompletionReport(
+        report({
+          dependencyArtifactResult: passingDependencyArtifactResult({ command: "npm test -- tests/other.test.ts" }),
+        }),
+        targetContext,
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "dependencyArtifactResult must match the seeded artifact id and declared expected-red command",
+    });
+    await expect(
+      service.submitCompletionReport(
+        {
+          ...report(),
+          dependencyArtifactResult: {
+            ...passingDependencyArtifactResult(),
+            exitCode: 1,
+          },
+        },
+        targetContext,
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request", message: "Completion report is invalid" });
+
+    const result = await service.submitCompletionReport(
+      report({ dependencyArtifactResult: passingDependencyArtifactResult() }),
+      targetContext,
+    );
+
+    expect(result.report.dependencyArtifactResult).toEqual(passingDependencyArtifactResult());
+    await expect(lifecycleStore.get("issue-1")).resolves.toMatchObject({
+      phase: "review",
+      completionReports: [
+        { dependencyArtifactResult: passingDependencyArtifactResult() },
+      ],
+    });
+  });
+
+  it("verifies the inherited artifact manifest before accepting seeded completion", async () => {
+    const verifierInputs: DependencyArtifactManifestVerificationInput[] = [];
+    const { service, lifecycleStore } = fixture({
+      dependencyArtifactManifestVerifier: async (input) => {
+        verifierInputs.push(input);
+      },
+    });
+    const source = sourceArtifactIssue();
+    const target = liveSeededTarget(source);
+    const artifact = completedAcceptedArtifact();
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      acceptedArtifact: artifact,
+    });
+    await lifecycleStore.ensureIssue(target, {
+      phase: "implementation",
+      workspaceSeed: preparedWorkspaceSeed(),
+    });
+
+    await service.submitCompletionReport(
+      report({ dependencyArtifactResult: passingDependencyArtifactResult() }),
+      context({ issue: target, workspacePath: "/tmp/seeded-worktree" }),
+    );
+
+    expect(verifierInputs).toEqual([
+      {
+        workspacePath: "/tmp/seeded-worktree",
+        artifact: expect.objectContaining({ id: artifact.id }),
+      },
+    ]);
+  });
+
+  it("detects inherited artifact file changes in both the worktree and committed HEAD", async () => {
+    const workspacePath = await createGitWorkspace(root);
+    const testFile = "tests/new-behavior.test.ts";
+    await mkdir(path.join(workspacePath, "tests"), { recursive: true });
+    await writeFile(path.join(workspacePath, testFile), "test('reviewed', () => true);\n", "utf8");
+    await git(["add", testFile], workspacePath);
+    await git(
+      [
+        "-c",
+        "user.name=Symphony Test",
+        "-c",
+        "user.email=symphony@example.test",
+        "commit",
+        "-m",
+        "accepted tests",
+      ],
+      workspacePath,
+    );
+    const reviewedBlob = await gitOutput(
+      ["rev-parse", `HEAD:${testFile}`],
+      workspacePath,
+    );
+    const artifact: IssueAcceptedArtifactRecord = {
+      ...completedAcceptedArtifact(),
+      changedFiles: [testFile],
+      fileManifest: [
+        { path: testFile, status: "added", blobSha: reviewedBlob },
+      ],
+    };
+
+    await expect(
+      verifyDependencyArtifactManifest({ workspacePath, artifact }),
+    ).resolves.toBeUndefined();
+
+    await writeFile(path.join(workspacePath, testFile), "test('weakened', () => true);\n", "utf8");
+    await expect(
+      verifyDependencyArtifactManifest({ workspacePath, artifact }),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: "Inherited accepted-artifact files have uncommitted changes",
+    });
+
+    await git(["add", testFile], workspacePath);
+    await git(
+      [
+        "-c",
+        "user.name=Symphony Test",
+        "-c",
+        "user.email=symphony@example.test",
+        "commit",
+        "-m",
+        "weaken tests",
+      ],
+      workspacePath,
+    );
+    await expect(
+      verifyDependencyArtifactManifest({ workspacePath, artifact }),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: `Inherited accepted-artifact file ${testFile} no longer matches the reviewed checkpoint`,
+    });
+  });
+
+  it("rejects dependency completion evidence for a superseded accepted artifact", async () => {
+    const { service, lifecycleStore } = fixture();
+    const targetIssue = issue({ state: "In Progress", branchName: "symphony/TEST-1" });
+    await lifecycleStore.ensureIssue(sourceArtifactIssue(), {
+      phase: "terminal",
+      acceptedArtifact: {
+        ...completedAcceptedArtifact(),
+        supersededAt: "2026-07-14T00:10:00.000Z",
+        supersededBy: "issue_contract_or_head_drift",
+        supersededReason: "The source contract changed after review.",
+      },
+    });
+    await lifecycleStore.ensureIssue(targetIssue, {
+      phase: "implementation",
+      workspaceSeed: preparedWorkspaceSeed(),
+    });
+
+    await expect(
+      service.submitCompletionReport(
+        report({ dependencyArtifactResult: passingDependencyArtifactResult() }),
+        context({ issue: targetIssue }),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "Seeded implementation completion requires the matching completed accepted artifact checkpoint",
+    });
+  });
+
+  it("defers seeded implementation completion when the accepted-artifact source is reopened", async () => {
+    const reopenedSource = sourceArtifactIssue("In Progress");
+    const liveTarget = liveSeededTarget(reopenedSource);
+    const { service, lifecycleStore } = fixture({
+      resolveIssuesByIds: async (ids) =>
+        [liveTarget, reopenedSource].filter((candidate) =>
+          ids.includes(candidate.id),
+        ),
+    });
+    await lifecycleStore.ensureIssue(reopenedSource, {
+      phase: "terminal",
+      acceptedArtifact: completedAcceptedArtifact(),
+    });
+    await lifecycleStore.ensureIssue(liveTarget, {
+      phase: "implementation",
+      workspaceSeed: preparedWorkspaceSeed(),
+    });
+
+    await expect(
+      service.submitCompletionReport(
+        report({ dependencyArtifactResult: passingDependencyArtifactResult() }),
+        context({ issue: liveTarget }),
+      ),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: expect.stringContaining(
+        "waiting for accepted-artifact source TEST-0 to become terminal again",
+      ),
+    });
+    await expect(lifecycleStore.get(liveTarget.id)).resolves.toMatchObject({
+      phase: "implementation",
+      incompleteTurnCount: 0,
+    });
+  });
+
+  it("rejects chaining an accepted-artifact source onto another accepted artifact", async () => {
+    const { service, lifecycleStore } = fixture();
+    const targetIssue = acceptedArtifactIssue();
+    await lifecycleStore.ensureIssue(sourceArtifactIssue(), {
+      phase: "terminal",
+      acceptedArtifact: completedAcceptedArtifact(),
+    });
+    await lifecycleStore.ensureIssue(targetIssue, {
+      phase: "implementation",
+      workspaceSeed: preparedWorkspaceSeed(),
+    });
+
+    await expect(
+      service.submitCompletionReport(
+        report({
+          artifactEvidence: expectedRedEvidence(),
+          changedFiles: ["tests/new-behavior.test.ts"],
+          dependencyArtifactResult: passingDependencyArtifactResult(),
+        }),
+        context({ issue: targetIssue }),
+      ),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message:
+        "Accepted-artifact source issues cannot themselves consume another accepted artifact; use a merge-delivery integration issue",
+    });
+  });
+
+  it("rejects idempotent completion replay after the Issue Contract fingerprint changes", async () => {
+    const { service, lifecycleStore } = fixture();
+    const firstIssue = issue({
+      state: "In Progress",
+      branchName: "symphony/TEST-1",
+      description: mergeIssueContract("2026-07-14.first"),
+    });
+    const first = await service.submitCompletionReport(report(), context({ issue: firstIssue }));
+    const changedIssue = {
+      ...firstIssue,
+      description: mergeIssueContract("2026-07-14.changed"),
+      updatedAt: "2026-07-14T01:00:00Z",
+    };
+
+    await expect(
+      service.submitCompletionReport(report(), context({ issue: changedIssue })),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: "Issue Contract changed after this completion report was persisted; submit a fresh completion report against the current contract",
+      details: {
+        previousFingerprint: first.report.contractSnapshot?.fingerprint,
+        currentFingerprint: expect.any(String),
+      },
+    });
+    expect((await lifecycleStore.get("issue-1"))?.completionReports).toHaveLength(1);
+  });
+
   it("publishes a new service-owned PR before accepting a completion report", async () => {
     const publisher = new FakePublisher({
       action: "created",
@@ -1060,6 +1497,10 @@ describe("CompletionReportService", () => {
     publisher?: CompletionReportPullRequestPublisher;
     baseRefVerifier?: { verify(input: BaseRefVerificationInput): Promise<IssueBaseRefObservation> };
     configure?: (config: ReturnType<typeof testConfig>) => void;
+    resolveIssuesByIds?: (issueIds: string[]) => Promise<ReturnType<typeof issue>[]>;
+    dependencyArtifactManifestVerifier?: (
+      input: DependencyArtifactManifestVerificationInput,
+    ) => Promise<void>;
   } = {}) {
     const config = testConfig(root);
     config.writeback.enabled = true;
@@ -1080,6 +1521,8 @@ describe("CompletionReportService", () => {
     const lifecycleStore = new FileIssueLifecycleStore(root);
     const runStore = new FileRunTranscriptStore(root);
     const outbox = new FileWritebackOutboxStore(root);
+    const defaultSource = sourceArtifactIssue();
+    const defaultTarget = liveSeededTarget(defaultSource);
     const service = new CompletionReportService({
       config,
       lifecycleStore,
@@ -1087,6 +1530,14 @@ describe("CompletionReportService", () => {
       runStore,
       ...(options.publisher === undefined ? {} : { pullRequestPublisher: options.publisher }),
       ...(options.baseRefVerifier === undefined ? {} : { baseRefVerifier: options.baseRefVerifier }),
+      resolveIssuesByIds:
+        options.resolveIssuesByIds ??
+        (async (ids) =>
+          [defaultTarget, defaultSource].filter((candidate) =>
+            ids.includes(candidate.id),
+          )),
+      dependencyArtifactManifestVerifier:
+        options.dependencyArtifactManifestVerifier ?? (async () => undefined),
     });
     return { service, lifecycleStore, outbox, runStore };
   }
@@ -1142,6 +1593,147 @@ function contextWithWorkspace(overrides: Partial<CompletionReportActiveContext> 
     },
     ...overrides,
   });
+}
+
+function acceptedArtifactIssue() {
+  return issue({
+    state: "In Progress",
+    branchName: "symphony/TEST-1",
+    description: agentEligibleIssueContract({
+      issueContractContractVersion: "2026-07-14.accepted-artifact",
+      issueContractDelivery: { mode: "accepted_artifact", artifact: "expected_red_tests" },
+    }),
+  });
+}
+
+function mergeIssueContract(contractVersion = "2026-07-14.merge"): string {
+  return agentEligibleIssueContract({
+    issueContractContractVersion: contractVersion,
+    issueContractDelivery: { mode: "merge" },
+  });
+}
+
+function expectedRedEvidence(
+  overrides: Partial<ExpectedRedArtifactEvidence> = {},
+): ExpectedRedArtifactEvidence {
+  return {
+    kind: "expected_red_tests",
+    command: "npm test -- tests/new-behavior.test.ts",
+    testFiles: ["tests/new-behavior.test.ts"],
+    expectedFailure: "The implementation does not support the new behavior yet.",
+    observedFailure: "Expected true, received false.",
+    exitCode: 1,
+    ...overrides,
+  };
+}
+
+function sourceArtifactIssue(state = "Done") {
+  return issue({
+    id: "source-issue-1",
+    identifier: "TEST-0",
+    state,
+    branchName: "symphony/TEST-0",
+    description: agentEligibleIssueContract({
+      issueContractContractVersion: "2026-07-14.source-artifact",
+      issueContractDelivery: {
+        mode: "accepted_artifact",
+        artifact: "expected_red_tests",
+      },
+    }),
+  });
+}
+
+function liveSeededTarget(source = sourceArtifactIssue()) {
+  return issue({
+    state: "In Progress",
+    branchName: "symphony/TEST-1",
+    blockedBy: [
+      {
+        id: source.id,
+        identifier: source.identifier,
+        state: source.state,
+      },
+    ],
+  });
+}
+
+function completedAcceptedArtifact(): IssueAcceptedArtifactRecord {
+  const parsedContract = parseIssueContract(sourceArtifactIssue().description);
+  if (!parsedContract.valid) throw new Error("Source artifact test contract is invalid");
+  return {
+    version: 1,
+    id: "accepted-artifact:source-issue-1:abc123",
+    kind: "expected_red_tests",
+    status: "completed_unmerged",
+    sourceIssueId: "source-issue-1",
+    sourceIssueIdentifier: "TEST-0",
+    contractFingerprint: parsedContract.fingerprint,
+    completionReportId: "completion-report:source-issue-1:run-source:report-source",
+    reviewVerdictId: "review-verdict:source-issue-1:review-source:verdict-source",
+    reviewFeedbackId: "review-feedback:source-issue-1:review-source:comment-source",
+    repositoryFingerprint: "repo-fingerprint",
+    pullRequest: {
+      url: "https://github.com/acme/symphony/pull/41",
+      number: 41,
+      headSha: "source-head-sha",
+      branch: "symphony/TEST-0",
+      draft: true,
+    },
+    sourceBaseHeadSha: "source-base-sha",
+    sourceHeadSha: "source-head-sha",
+    baseRef: "main",
+    changedFiles: ["tests/new-behavior.test.ts"],
+    fileManifest: [
+      {
+        path: "tests/new-behavior.test.ts",
+        status: "added",
+        blobSha: "test-file-blob-sha",
+      },
+    ],
+    artifactEvidence: expectedRedEvidence(),
+    commentOperationKey: "comment:source-issue-1:accepted-artifact",
+    doneTransitionOperationKey: "transition:source-issue-1:accepted-artifact:Done",
+    acceptedAt: "2026-07-14T00:00:00.000Z",
+    checkpointedAt: "2026-07-14T00:00:01.000Z",
+    prClosedAt: "2026-07-14T00:00:02.000Z",
+    completedAt: "2026-07-14T00:00:03.000Z",
+  };
+}
+
+function preparedWorkspaceSeed(): IssueWorkspaceSeedRecord {
+  return {
+    version: 1,
+    id: "workspace-seed:issue-1:accepted-artifact-source",
+    kind: "accepted_artifact",
+    status: "prepared",
+    artifactId: completedAcceptedArtifact().id,
+    sourceIssueId: "source-issue-1",
+    sourceIssueIdentifier: "TEST-0",
+    repositoryFingerprint: "repo-fingerprint",
+    sourceBranch: "symphony/TEST-0",
+    sourceHeadSha: "source-head-sha",
+    sourceBaseHeadSha: "source-base-sha",
+    configuredBaseRef: "main",
+    preparedBaseHeadSha: "live-base-sha",
+    preparedHeadSha: "prepared-target-head-sha",
+    targetBranch: "symphony/TEST-1",
+    conflictedFiles: [],
+    plannedAt: "2026-07-14T00:01:00.000Z",
+    preparedAt: "2026-07-14T00:01:01.000Z",
+    failureReason: null,
+  };
+}
+
+function passingDependencyArtifactResult(
+  overrides: Partial<NonNullable<CompletionReportInput["dependencyArtifactResult"]>> = {},
+): NonNullable<CompletionReportInput["dependencyArtifactResult"]> {
+  return {
+    artifactId: completedAcceptedArtifact().id,
+    command: expectedRedEvidence().command,
+    exitCode: 0,
+    evidence: "Inherited expected-red suite passes after the implementation change.",
+    ...overrides,
+  };
 }
 
 function mergeGate(overrides: Partial<IssueMergeGateState> = {}): IssueMergeGateState {

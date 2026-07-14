@@ -224,7 +224,11 @@ function bindRepairCompletionReport(
   if (lifecycle.lastCompletionReportId !== gate.repairReportId) return null;
 
   const repairReport = lifecycle.completionReports.find((report) => report.id === gate.repairReportId) ?? null;
-  if (!repairReport || repairReport.runId !== gate.repairRunId) return null;
+  if (
+    !repairReport ||
+    isSupersededLifecycleRecord(repairReport) ||
+    repairReport.runId !== gate.repairRunId
+  ) return null;
   if (repairReport.acceptedAt.trim().length === 0) return null;
   if (repairReport.pullRequest?.number !== gate.pullRequest.number) return null;
   if (repairReport.pullRequest?.headSha !== gate.headSha) return null;

@@ -28,6 +28,8 @@ import {
 } from "../src/core/orchestration/IssueOrchestrationState.js";
 import {
   FileIssueLifecycleStore,
+  latestCurrentApprovalPassVerdict,
+  latestCurrentCompletionReport,
   type IssueLifecycleRecord,
   type IssuePreservedWorktreeStash,
 } from "../src/core/persistence/IssueLifecycleStore.js";
@@ -925,12 +927,75 @@ describe("IssueCurrentStateBuilder", () => {
       submittedAt: "2026-01-01T00:00:02.000Z",
       writebackOperationKeys: [],
     };
+    const artifactEvidence = {
+      kind: "expected_red_tests" as const,
+      command: "npm test -- artifact.test.ts",
+      testFiles: ["tests/artifact.test.ts"],
+      expectedFailure: "Implementation is pending.",
+      observedFailure: "Expected true, received false.",
+      exitCode: 1,
+    };
+    const acceptedArtifact = {
+      version: 1 as const,
+      id: "artifact-store",
+      kind: "expected_red_tests" as const,
+      status: "checkpointed" as const,
+      sourceIssueId: issue.id,
+      sourceIssueIdentifier: issue.identifier,
+      contractFingerprint: "contract-fingerprint",
+      completionReportId: completionReport.id,
+      reviewVerdictId: passVerdict.id,
+      reviewFeedbackId: "feedback-1",
+      repositoryFingerprint: "repository-fingerprint",
+      pullRequest: completionReport.pullRequest,
+      sourceBaseHeadSha: "base-head-sha",
+      sourceHeadSha: "source-head-sha",
+      baseRef: "origin/main",
+      changedFiles: ["tests/artifact.test.ts"],
+      fileManifest: [
+        {
+          path: "tests/artifact.test.ts",
+          status: "added" as const,
+          blobSha: "blob-sha",
+        },
+      ],
+      artifactEvidence,
+      commentOperationKey: "comment:artifact-store",
+      doneTransitionOperationKey: "transition:artifact-store:done",
+      acceptedAt: "2026-01-01T00:00:03.000Z",
+      checkpointedAt: "2026-01-01T00:00:04.000Z",
+      prClosedAt: null,
+      completedAt: null,
+    };
+    const workspaceSeed = {
+      version: 1 as const,
+      id: "seed-store",
+      kind: "accepted_artifact" as const,
+      status: "planned" as const,
+      artifactId: acceptedArtifact.id,
+      sourceIssueId: issue.id,
+      sourceIssueIdentifier: issue.identifier,
+      repositoryFingerprint: "repository-fingerprint",
+      sourceBranch: "feature/test-1",
+      sourceHeadSha: "source-head-sha",
+      sourceBaseHeadSha: "base-head-sha",
+      configuredBaseRef: "origin/main",
+      preparedBaseHeadSha: null,
+      preparedHeadSha: null,
+      targetBranch: "feature/test-2",
+      conflictedFiles: [],
+      plannedAt: "2026-01-01T00:00:05.000Z",
+      preparedAt: null,
+      failureReason: null,
+    };
     const lifecycle = await lifecycleStore.ensureIssue(issue, {
       phase: "passed",
       lastCompletionReportId: completionReport.id,
       lastReviewVerdictId: passVerdict.id,
       completionReports: [completionReport],
       reviewVerdicts: [passVerdict],
+      acceptedArtifact,
+      workspaceSeed,
     });
     const historyStore = new MemoryIssueStateStore();
     const storeBuilder = new IssueCurrentStateBuilder({
@@ -941,6 +1006,8 @@ describe("IssueCurrentStateBuilder", () => {
       logger: silentLogger(),
     });
     const storeCurrent = await storeBuilder.build(issue, emptyRuntime());
+    expect(storeCurrent.acceptedArtifact).toMatchObject({ id: "artifact-store" });
+    expect(storeCurrent.workspaceSeed).toMatchObject({ id: "seed-store", status: "planned" });
     const historyCompletionReport = {
       ...completionReport,
       summary: "History completion summary",
@@ -956,6 +1023,20 @@ describe("IssueCurrentStateBuilder", () => {
       ...lifecycle,
       completionReports: [historyCompletionReport],
       reviewVerdicts: [historyPassVerdict],
+      acceptedArtifact: {
+        ...acceptedArtifact,
+        id: "artifact-history",
+        status: "completed_unmerged",
+        completedAt: "2026-01-01T00:00:06.000Z",
+      },
+      workspaceSeed: {
+        ...workspaceSeed,
+        id: "seed-history",
+        status: "prepared",
+        preparedBaseHeadSha: "live-base-sha",
+        preparedHeadSha: "prepared-head-sha",
+        preparedAt: "2026-01-01T00:00:07.000Z",
+      },
     };
     historyStore.record = {
       ...storeCurrent,
@@ -993,6 +1074,15 @@ describe("IssueCurrentStateBuilder", () => {
     expect(current.mergePolicyLatestApprovalVerdict).toMatchObject({
       id: "verdict-1",
       reviewer: "history-reviewer",
+    });
+    expect(current.acceptedArtifact).toMatchObject({
+      id: "artifact-history",
+      status: "completed_unmerged",
+    });
+    expect(current.workspaceSeed).toMatchObject({
+      id: "seed-history",
+      status: "prepared",
+      preparedHeadSha: "prepared-head-sha",
     });
   });
 
@@ -1836,6 +1926,104 @@ describe("IssueCurrentStateBuilder", () => {
     } finally {
       await historyStore.close();
     }
+  });
+
+  it("does not restore superseded accepted-artifact completion evidence from lifecycle history", async () => {
+    const config = builderConfig(root);
+    const lifecycleStore = new FileIssueLifecycleStore(root);
+    const issue = issueFixture({
+      state: "In Progress",
+      branchName: "feature/reopened-artifact",
+    });
+    const report = completionReportFixture(issue, "worker-accepted-artifact", {
+      id: "completion-accepted-artifact",
+      branchName: "feature/reopened-artifact",
+      pullRequest: pullRequestFixture({
+        branch: "feature/reopened-artifact",
+        draft: true,
+      }),
+      contractSnapshot: {
+        schemaVersion: 1,
+        contractVersion: "accepted-artifact-review",
+        fingerprint: "accepted-artifact-fingerprint",
+        delivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+      },
+      supersededAt: "2026-07-14T11:00:00.000Z",
+      supersededBy: "accepted_artifact_reopened",
+      supersededReason: "The accepted artifact source checkpoint changed.",
+    });
+    const verdict = reviewVerdictFixture(issue, "review-accepted-artifact", {
+      id: "verdict-accepted-artifact",
+      verdict: "pass",
+      passDisposition: "accepted_artifact",
+    });
+    const lifecycle = await lifecycleStore.ensureIssue(issue, {
+      phase: "implementation",
+      lastCompletionReportId: null,
+      lastReviewVerdictId: verdict.id,
+      completionReports: [report],
+      reviewVerdicts: [verdict],
+    });
+    const stateStore = new MemoryIssueStateStore();
+    const liveBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: stateStore,
+      logger: silentLogger(),
+    });
+    const liveCurrent = await liveBuilder.build(issue, emptyRuntime());
+    const recordedHistorySnapshot = lifecycleEvidenceSnapshot(
+      liveCurrent,
+      lifecycle,
+    );
+    const staleHistorySnapshot = {
+      ...recordedHistorySnapshot,
+      lifecycleLatestCompletionReport: report,
+      lifecycleLatestApprovalPassVerdict: verdict,
+    };
+    expect(staleHistorySnapshot.lifecycleLatestCompletionReport).toMatchObject({
+      id: report.id,
+      supersededAt: report.supersededAt,
+    });
+    stateStore.record = {
+      ...liveCurrent,
+      history: [staleHistorySnapshot],
+    };
+    const historyBuilder = new IssueCurrentStateBuilder({
+      config,
+      lifecycleStore,
+      runStore: undefined,
+      issueStateStore: stateStore,
+      logger: silentLogger(),
+      historyBackedFieldGroups: [
+        "lifecycleReports",
+        "mergePolicyCompletionRun",
+      ],
+    });
+
+    const current = await historyBuilder.build(issue, emptyRuntime());
+    const rebuilt = await historyBuilder.rebuildHistoryBackedFields(
+      issue,
+      emptyRuntime(),
+      ["lifecycleReports", "mergePolicyCompletionRun"],
+    );
+
+    expect(liveCurrent.latestCompletionReport).toBeNull();
+    expect(liveCurrent.mergePolicyLatestCompletionReport).toBeNull();
+    expect(current.latestCompletionReport).toBeNull();
+    expect(current.latestApprovalPassVerdict).toBeNull();
+    expect(current.mergePolicyLatestCompletionReport).toBeNull();
+    expect(current.mergePolicyLatestApprovalVerdict).toBeNull();
+    expect(rebuilt.fields.latestCompletionReport).toBeNull();
+    expect(rebuilt.fields.latestApprovalPassVerdict).toBeNull();
+    expect(rebuilt.fields.mergePolicyLatestCompletionReport).toBeNull();
+    expect(rebuilt.fields.mergePolicyLatestApprovalVerdict).toBeNull();
+    expect(rebuilt.fields.mergePolicyLatestCompletionRun).toBeNull();
+    expect(rebuilt.incompleteGroups).toEqual([]);
   });
 
   it("rebuilds active runtime control fields from durable runtime evidence", async () => {
@@ -2896,6 +3084,8 @@ function lifecycleEvidenceSnapshot(
         pendingPublication === null ? null : lifecycle.blockedReason,
       latestCompletionReport,
       latestApprovalPassVerdict,
+      acceptedArtifact: lifecycle.acceptedArtifact ?? null,
+      workspaceSeed: lifecycle.workspaceSeed ?? null,
       merge: lifecycle.merge,
       mergeGate: lifecycle.mergeGate,
       mergeGateResults: lifecycle.mergeGateResults ?? [],
@@ -2931,6 +3121,8 @@ function lifecycleEvidenceSnapshot(
       pendingPublication === null ? null : lifecycle.blockedReason,
     lifecycleLatestCompletionReport: latestCompletionReport,
     lifecycleLatestApprovalPassVerdict: latestApprovalPassVerdict,
+    lifecycleAcceptedArtifact: lifecycle.acceptedArtifact ?? null,
+    lifecycleWorkspaceSeed: lifecycle.workspaceSeed ?? null,
     lifecycleMerge: lifecycle.merge,
     lifecycleMergeGate: lifecycle.mergeGate,
     lifecycleMergeGateResults: lifecycle.mergeGateResults ?? [],
@@ -3022,30 +3214,13 @@ function runtimeEvidenceSnapshot(
 function latestCompletionReportForTestLifecycle(
   lifecycle: IssueLifecycleRecord,
 ): IssueLifecycleRecord["completionReports"][number] | null {
-  if (lifecycle.lastCompletionReportId) {
-    return (
-      lifecycle.completionReports.find(
-        (report) => report.id === lifecycle.lastCompletionReportId,
-      ) ?? null
-    );
-  }
-  return lifecycle.completionReports.at(-1) ?? null;
+  return latestCurrentCompletionReport(lifecycle);
 }
 
 function latestApprovalPassVerdictForTestLifecycle(
   lifecycle: IssueLifecycleRecord,
 ): IssueLifecycleRecord["reviewVerdicts"][number] | null {
-  for (const verdict of lifecycle.reviewVerdicts.slice().reverse()) {
-    if (
-      verdict.verdict === "pass" &&
-      verdict.issueId === lifecycle.issueId &&
-      verdict.issueIdentifier === lifecycle.issueIdentifier &&
-      !verdict.supersededAt
-    ) {
-      return verdict;
-    }
-  }
-  return null;
+  return latestCurrentApprovalPassVerdict(lifecycle);
 }
 
 function runEvidenceSnapshots(

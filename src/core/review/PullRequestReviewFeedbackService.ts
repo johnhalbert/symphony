@@ -23,10 +23,13 @@ import type {
   IssueReviewFeedbackRecord,
   PullRequestReviewFeedbackEvent,
 } from "../persistence/IssueLifecycleStore.js";
-import { phaseForIssueState } from "../persistence/IssueLifecycleStore.js";
+import {
+  latestCurrentCompletionReport,
+  phaseForIssueState,
+} from "../persistence/IssueLifecycleStore.js";
 import type { Issue } from "../types.js";
 
-const reviewEventSchema = z.enum(["APPROVE", "REQUEST_CHANGES"]);
+const reviewEventSchema = z.enum(["APPROVE", "REQUEST_CHANGES", "COMMENT"]);
 const reviewSideSchema = z.enum(["LEFT", "RIGHT"]);
 const inlineReviewCommentSchema = z
   .object({
@@ -95,6 +98,12 @@ const REVIEW_FEEDBACK_PAYLOAD_EXAMPLES: Record<string, unknown>[] = [
     body: "Requested changes.",
     comments: [{ path: "src/file.ts", body: "Inline note.", line: 42, side: "RIGHT" }],
     idempotencyKey: "review-request-changes-<run-id>",
+  },
+  {
+    kind: "review",
+    event: "COMMENT",
+    body: "Expected-red test artifact accepted without merge authorization.",
+    idempotencyKey: "review-artifact-comment-<run-id>",
   },
   {
     kind: "review_comment",
@@ -178,6 +187,7 @@ export class PullRequestReviewFeedbackService {
     const feedback = parseReviewFeedback(input);
     const lifecycle = await this.requireLifecycle(context);
     this.validateCaller(context, lifecycle);
+    this.validateFeedbackForDelivery(feedback, lifecycle);
     const pullRequest = requireBoundPullRequest(lifecycle);
     const requestHash = requestHashFor(feedback, pullRequest);
     const existing = lifecycle.reviewFeedback.find(
@@ -246,6 +256,28 @@ export class PullRequestReviewFeedbackService {
     }
     if (context.ignoreStateGate !== true && !sameStateIn(context.issue.state, this.options.config.reviewLoop.reviewStates)) {
       throw new SymphonyError("invalid_request", "Review feedback requires the issue to be in a review state");
+    }
+  }
+
+  private validateFeedbackForDelivery(
+    feedback: PullRequestReviewFeedbackInputValue,
+    lifecycle: IssueLifecycleRecord,
+  ): void {
+    if (feedback.kind !== "review") return;
+    const report = latestCurrentCompletionReport(lifecycle);
+    const acceptedArtifact =
+      report?.contractSnapshot?.delivery.mode === "accepted_artifact";
+    if (feedback.event === "COMMENT" && !acceptedArtifact) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Whole-PR COMMENT review feedback is reserved for accepted expected-red artifacts",
+      );
+    }
+    if (feedback.event === "APPROVE" && acceptedArtifact) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Accepted expected-red artifacts require a head-bound COMMENT review; APPROVE is reserved for merge authorization",
+      );
     }
   }
 
@@ -344,12 +376,12 @@ export function reviewFeedbackInputSchema(): Record<string, unknown> {
         type: "object",
         title: "Whole-PR review",
         description:
-          'Submit a whole-PR GitHub review. Use event "APPROVE" for pass review evidence or "REQUEST_CHANGES" for fail review feedback.',
+          'Submit a whole-PR GitHub review. Use event "APPROVE" for merge-authorizing pass evidence, "COMMENT" for accepted expected-red artifact evidence, or "REQUEST_CHANGES" for fail review feedback.',
         additionalProperties: false,
         required: ["kind", "event", "body", "idempotencyKey"],
         properties: {
           kind: { const: "review", description: 'Required discriminator for a whole-PR review.' },
-          event: { enum: ["APPROVE", "REQUEST_CHANGES"], description: "Required GitHub review event." },
+          event: { enum: ["APPROVE", "REQUEST_CHANGES", "COMMENT"], description: "Required GitHub review event." },
           body: { type: "string", minLength: 1, description: "Required review body to publish on the PR." },
           comments: {
             type: "array",
@@ -420,7 +452,8 @@ export function reviewFeedbackInputSchema(): Record<string, unknown> {
 }
 
 export function boundPullRequestForLifecycle(lifecycle: IssueLifecycleRecord): CompletionReportPullRequestRef | null {
-  const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+  const reportPullRequest = latestCurrentCompletionReport(lifecycle)?.pullRequest ?? null;
+  if (reportPullRequest === null) return null;
   if (reportPullRequest?.number) return reportPullRequest;
   if (lifecycle.summaryPointers.prNumber === null) return null;
   return {
@@ -521,14 +554,6 @@ function baseRefClientFromReviewFeedbackClient(
     };
   }
   return null;
-}
-
-function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {
-  if (lifecycle.lastCompletionReportId) {
-    const exact = lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
-    if (exact) return exact;
-  }
-  return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
 }
 
 function feedbackIdFor(issueId: string, runId: string, idempotencyKey: string): string {

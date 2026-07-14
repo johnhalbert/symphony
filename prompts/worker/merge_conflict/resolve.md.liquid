@@ -4,4 +4,6 @@ Resolve only the merge conflict on the lifecycle-bound pull request.
 
 {% include "partials/issue_context.md.liquid" %}
 
+If the run directive identifies an `artifact_seed` conflict, preserve the reviewed test artifact while replaying it onto the target issue base. Do not implement the target issue during conflict preparation.
+
 Do not perform unrelated implementation work, request review, move Linear state, or call the normal completion handoff.

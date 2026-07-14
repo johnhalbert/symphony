@@ -9,17 +9,25 @@ import {
 } from "./BaseRefVerification.js";
 import type { ServiceConfig } from "./config/Config.js";
 import { SymphonyError, errorMessage } from "./errors.js";
+import { parseIssueContract } from "./IssueContractLint.js";
 import type {
   CompletionReportAcceptanceContext,
   CompletionReportChecklistItem,
   CompletionReportPullRequestRef,
+  DependencyArtifactResult,
+  ExpectedRedArtifactEvidence,
   IssueCompletionReportRejectionRecord,
   IssueCompletionReportRecord,
+  IssueContractSnapshot,
   IssueLifecycleRecord,
   IssueLifecyclePhase,
   IssueLifecycleStore,
 } from "./persistence/IssueLifecycleStore.js";
-import { phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
+import {
+  isSupersededLifecycleRecord,
+  latestCurrentCompletionReport,
+  phaseForIssueState,
+} from "./persistence/IssueLifecycleStore.js";
 import { appendLaneMemoTelemetry } from "./persistence/LaneMemoTelemetry.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
 import type {
@@ -34,6 +42,7 @@ import {
   planCompletionReportRejectedWritebacks,
   planCompletionReportPublicationApprovalPendingWritebacks,
   planCompletionReportPublicationApprovalTerminalWritebacks,
+  planAcceptedArtifactHandoffWritebacks,
   planPullRequestHandoffWritebacks,
 } from "./writeback/TransitionPolicy.js";
 import { shouldSilentlyRetireMergeGate, supersededMergeGateLifecyclePatch } from "./merge/MergeGateLifecycle.js";
@@ -72,6 +81,24 @@ const completionReportSchema = z.object({
     )
     .min(1),
   changedFiles: z.array(z.string().trim().min(1)),
+  artifactEvidence: z
+    .object({
+      kind: z.literal("expected_red_tests"),
+      command: z.string().trim().min(1),
+      testFiles: z.array(z.string().trim().min(1)).min(1),
+      expectedFailure: z.string().trim().min(1),
+      observedFailure: z.string().trim().min(1),
+      exitCode: z.number().int().positive(),
+    })
+    .optional(),
+  dependencyArtifactResult: z
+    .object({
+      artifactId: z.string().trim().min(1),
+      command: z.string().trim().min(1),
+      exitCode: z.literal(0),
+      evidence: z.string().trim().min(1),
+    })
+    .optional(),
   branchName: z.string().trim().min(1).nullable(),
   pullRequest: z
     .object({
@@ -113,6 +140,29 @@ export interface CompletionReportServiceOptions {
   baseRefVerifier?: Pick<BaseRefVerifier, "verify">;
   operatorApproval?: Pick<OperatorApprovalService, "requestPublicationApproval" | "waitForPublicationApprovalRequest"> &
     Partial<Pick<OperatorApprovalService, "get" | "getByDedupe">>;
+  resolveIssuesByIds?: (issueIds: string[]) => Promise<Issue[]>;
+  dependencyArtifactManifestVerifier?: (
+    input: DependencyArtifactManifestVerificationInput,
+  ) => Promise<void>;
+}
+
+export interface DependencyArtifactManifestVerificationInput {
+  workspacePath: string;
+  artifact: NonNullable<IssueLifecycleRecord["acceptedArtifact"]>;
+}
+
+export class DependencyArtifactDeferredError extends SymphonyError {
+  constructor(
+    readonly reason:
+      | "live_lookup_unavailable"
+      | "live_issue_missing"
+      | "source_not_done",
+    message: string,
+    details?: unknown,
+  ) {
+    super("conflict", message, details);
+    this.name = "DependencyArtifactDeferredError";
+  }
 }
 
 export interface CompletionReportPullRequestPublisher {
@@ -140,6 +190,7 @@ export interface CompletionReportPullRequestPublicationInput {
   body: string;
   evidenceCursor: string;
   forceEmptyCommit?: boolean;
+  draft?: boolean;
 }
 
 export interface CompletionReportPullRequestPublication {
@@ -223,7 +274,31 @@ export class CompletionReportService {
     this.validateCaller(report, context);
 
     const existingLifecycle = await this.options.lifecycleStore.get(context.issue.id);
+    const contractSnapshot = contractSnapshotForIssue(context.issue);
+    await validateCompletionDeliveryEvidence({
+      report,
+      contractSnapshot,
+      lifecycle: existingLifecycle,
+      lifecycleStore: this.options.lifecycleStore,
+      config: this.options.config,
+      targetIssueId: context.issue.id,
+      workspacePath:
+        context.workspacePath ??
+        context.workspace?.path ??
+        existingLifecycle?.summaryPointers.workspacePath ??
+        null,
+      ...(this.options.resolveIssuesByIds === undefined
+        ? {}
+        : { resolveIssuesByIds: this.options.resolveIssuesByIds }),
+      ...(this.options.dependencyArtifactManifestVerifier === undefined
+        ? {}
+        : {
+            dependencyArtifactManifestVerifier:
+              this.options.dependencyArtifactManifestVerifier,
+          }),
+    });
     let existing = findCompletionReportForRun(existingLifecycle, report.runId, report.idempotencyKey);
+    assertCompletionContractHasNotDrifted(existing, contractSnapshot);
     const inputPullRequest = normalizeInputPullRequest(report.pullRequest, report.branchName);
     const localSnapshot = await captureCompletionReportLocalGitSnapshot(report, context, existingLifecycle, this.options.config);
     if (existing && isFinalizedCompletionReport(existing)) {
@@ -235,7 +310,10 @@ export class CompletionReportService {
         baseRefObservation: null,
         localSnapshot,
       });
-      if (completionReplayMatchesAuthoritativeState(existing, currentAcceptanceContext)) {
+      if (
+        completionReplayMatchesAuthoritativeState(existing, currentAcceptanceContext) &&
+        completionReplayMatchesDeliveryEvidence(existing, report, contractSnapshot)
+      ) {
         return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
       }
       existing = undefined;
@@ -349,6 +427,7 @@ export class CompletionReportService {
           baseRefObservation: null,
           localSnapshot,
         }),
+        contractSnapshot,
         acceptedAt: existing?.acceptedAt ?? null,
         writebackOperationKeys: [],
       });
@@ -404,7 +483,17 @@ export class CompletionReportService {
         rejection: completionReportPublicationRejection(publicationError),
       });
     }
-    return this.finalizeCompletionReport({ report, context, inputPullRequest, publication, baseRefObservation, localSnapshot, lifecycle, existing });
+    return this.finalizeCompletionReport({
+      report,
+      context,
+      inputPullRequest,
+      publication,
+      baseRefObservation,
+      localSnapshot,
+      lifecycle,
+      existing,
+      contractSnapshot,
+    });
   }
 
   async resumeApprovedPublication(input: PublicationApprovalResumeInput): Promise<CompletionReportResult | null> {
@@ -415,10 +504,14 @@ export class CompletionReportService {
     }
 
     const lifecycle = await this.options.lifecycleStore.get(input.approval.issueId);
-    const existing = lifecycle?.completionReports.find(
-      (item) => item.runId === input.approval.runId && item.idempotencyKey === input.approval.evidenceCursor,
-    );
+    const existing = lifecycle === null
+      ? null
+      : latestCurrentCompletionReport(lifecycle);
     if (!lifecycle || !existing) return null;
+    if (
+      existing.runId !== input.approval.runId ||
+      existing.idempotencyKey !== input.approval.evidenceCursor
+    ) return null;
     if (isFinalizedCompletionReport(existing)) {
       return { accepted: true, replayed: true, report: existing, writebackOperations: [] };
     }
@@ -435,6 +528,26 @@ export class CompletionReportService {
     }
 
     const report = completionReportInputFromRecord(existing);
+    const contractSnapshot = contractSnapshotForIssue(input.issue);
+    assertCompletionContractHasNotDrifted(existing, contractSnapshot);
+    await validateCompletionDeliveryEvidence({
+      report,
+      contractSnapshot,
+      lifecycle,
+      lifecycleStore: this.options.lifecycleStore,
+      config: this.options.config,
+      targetIssueId: input.issue.id,
+      workspacePath: input.approval.action.workspacePath,
+      ...(this.options.resolveIssuesByIds === undefined
+        ? {}
+        : { resolveIssuesByIds: this.options.resolveIssuesByIds }),
+      ...(this.options.dependencyArtifactManifestVerifier === undefined
+        ? {}
+        : {
+            dependencyArtifactManifestVerifier:
+              this.options.dependencyArtifactManifestVerifier,
+          }),
+    });
     const context: CompletionReportActiveContext = {
       issue: input.issue,
       activeRunId: input.approval.runId,
@@ -457,6 +570,7 @@ export class CompletionReportService {
       localSnapshot,
       lifecycle,
       existing,
+      contractSnapshot,
     });
     await this.processDueForOperations(result.writebackOperations);
     return result;
@@ -465,10 +579,14 @@ export class CompletionReportService {
   async recordPublicationApprovalTerminal(input: PublicationApprovalResumeInput): Promise<WritebackOperation[]> {
     if (!isTerminalApprovalStatus(input.approval.status)) return [];
     const lifecycle = await this.options.lifecycleStore.get(input.approval.issueId);
-    const existing = lifecycle?.completionReports.find(
-      (item) => item.runId === input.approval.runId && item.idempotencyKey === input.approval.evidenceCursor,
-    );
+    const existing = lifecycle === null
+      ? null
+      : latestCurrentCompletionReport(lifecycle);
     if (!lifecycle || !existing || isFinalizedCompletionReport(existing)) return [];
+    if (
+      existing.runId !== input.approval.runId ||
+      existing.idempotencyKey !== input.approval.evidenceCursor
+    ) return [];
     const alreadyRecorded = lifecycle.blockedReason === `publication approval ${input.approval.status}`;
     const pendingReport =
       pendingPublicationHandoffForRun(lifecycle, {
@@ -593,7 +711,16 @@ export class CompletionReportService {
     localSnapshot: CompletionReportLocalGitSnapshot;
     lifecycle: ExistingIssueLifecycle;
     existing: IssueCompletionReportRecord | undefined;
+    contractSnapshot: IssueContractSnapshot | null;
   }): Promise<CompletionReportResult> {
+    const acceptedLocalSnapshot = input.publication
+      ? await captureCompletionReportLocalGitSnapshot(
+          input.report,
+          input.context,
+          input.lifecycle,
+          this.options.config,
+        )
+      : input.localSnapshot;
     const pullRequest = input.publication
       ? pullRequestRefFromPublication(input.publication)
       : input.inputPullRequest;
@@ -604,8 +731,17 @@ export class CompletionReportService {
             draft: input.publication.draft ?? null,
           }
         : null;
-    const handoffChecks = await this.evaluatePullRequestHandoffChecks(verifiedPullRequest);
-    if (this.options.config.github.prHandoff.enabled && (!verifiedPullRequest || !handoffChecks)) {
+    const acceptedArtifact = isAcceptedArtifactContract(input.contractSnapshot);
+    const handoffChecks = acceptedArtifact
+      ? null
+      : await this.evaluatePullRequestHandoffChecks(verifiedPullRequest);
+    if (acceptedArtifact && (!this.options.config.github.prHandoff.enabled || !verifiedPullRequest || verifiedPullRequest.draft !== true)) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Accepted expected-red artifacts require a verified draft pull request handoff",
+      );
+    }
+    if (!acceptedArtifact && this.options.config.github.prHandoff.enabled && (!verifiedPullRequest || !handoffChecks)) {
       throw new SymphonyError(
         "invalid_request",
         "Completion report handoff requires a verified pull request that satisfies the handoff policy",
@@ -616,20 +752,30 @@ export class CompletionReportService {
     });
     const writebackContext = runWritebackContext(input.context, input.report.runId);
     const writebackReport = completionReportWritebackDetails(input.report, input.context.issue, pullRequest);
-    const operations = this.options.config.github.prHandoff.enabled
-      ? verifiedPullRequest && handoffChecks
+    const operations = acceptedArtifact
+      ? verifiedPullRequest && input.report.artifactEvidence
+        ? planAcceptedArtifactHandoffWritebacks(writebackContext, this.options.config, {
+            pullRequest: verifiedPullRequest,
+            report: writebackReport,
+            artifactEvidence: input.report.artifactEvidence,
+          })
+        : []
+      : this.options.config.github.prHandoff.enabled
+        ? verifiedPullRequest && handoffChecks
         ? planPullRequestHandoffWritebacks(writebackContext, this.options.config, {
             pullRequest: verifiedPullRequest,
             report: writebackReport,
             ci: handoffChecks,
           })
         : []
-      : planCompletionReportAcceptedWritebacks(writebackContext, this.options.config, writebackReport);
+        : planCompletionReportAcceptedWritebacks(writebackContext, this.options.config, writebackReport);
     if (operations.length === 0) {
       if (input.context.ignoreStateGate !== true || this.options.config.github.prHandoff.enabled) {
         throw new SymphonyError(
           "invalid_request",
-          this.options.config.github.prHandoff.enabled
+          acceptedArtifact
+            ? "Accepted expected-red artifact handoff requires a verified draft pull request"
+            : this.options.config.github.prHandoff.enabled
             ? "Completion report handoff requires a verified pull request that satisfies the handoff policy"
             : "Completion report cannot be accepted for the current issue state",
         );
@@ -646,8 +792,9 @@ export class CompletionReportService {
         pullRequest,
         publication: input.publication,
         baseRefObservation: input.baseRefObservation,
-        localSnapshot: input.localSnapshot,
+        localSnapshot: acceptedLocalSnapshot,
       }),
+      contractSnapshot: input.contractSnapshot,
       writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
       acceptedAt: input.existing?.acceptedAt ?? null,
     });
@@ -712,6 +859,7 @@ export class CompletionReportService {
       report: input.report,
       issue: input.context.issue,
       pullRequest: inputPullRequest,
+      contractSnapshot: contractSnapshotForIssue(input.context.issue),
       rejection: input.rejection,
       writebackOperationKeys: operations.map((operation) => operation.idempotencyKey),
     });
@@ -921,9 +1069,19 @@ export class CompletionReportService {
       const approval = await this.options.operatorApproval!.waitForPublicationApprovalRequest(input.approvalRequest);
       if (approval.status === "approved") {
         const lifecycle = await this.options.lifecycleStore.get(input.context.issue.id);
-        const finalized = lifecycle?.completionReports.find(
-          (item) => item.runId === input.report.runId && item.idempotencyKey === input.report.idempotencyKey,
-        );
+        const finalized = lifecycle === null
+          ? null
+          : latestCurrentCompletionReport(lifecycle);
+        if (
+          finalized === null ||
+          finalized.runId !== input.report.runId ||
+          finalized.idempotencyKey !== input.report.idempotencyKey
+        ) {
+          throw new SymphonyError(
+            "conflict",
+            "Approved completion report is no longer the current lifecycle evidence",
+          );
+        }
         if (finalized && isFinalizedCompletionReport(finalized)) {
           return { accepted: true, replayed: true, report: finalized, writebackOperations: [] };
         }
@@ -970,6 +1128,7 @@ export class CompletionReportService {
       body: formatPullRequestBody(report, context),
       evidenceCursor: report.idempotencyKey,
       forceEmptyCommit: shouldForceFreshHeadForNoChangeMergeGateRepair(report, existingLifecycle),
+      draft: report.artifactEvidence?.kind === "expected_red_tests",
     };
   }
 
@@ -1161,6 +1320,264 @@ function parseCompletionReport(input: unknown): CompletionReportInput {
   return parsed.data;
 }
 
+function contractSnapshotForIssue(issue: Issue): IssueContractSnapshot | null {
+  const parsed = parseIssueContract(issue.description);
+  if (!parsed.valid) return null;
+  const delivery = parsed.contract.delivery;
+  return {
+    schemaVersion: parsed.contract.schemaVersion,
+    contractVersion: parsed.contract.contractVersion,
+    fingerprint: parsed.fingerprint,
+    delivery: {
+      mode: delivery.mode,
+      artifact: delivery.mode === "accepted_artifact" ? delivery.artifact : null,
+    },
+  };
+}
+
+function isAcceptedArtifactContract(
+  snapshot: IssueContractSnapshot | null | undefined,
+): snapshot is IssueContractSnapshot & {
+  delivery: { mode: "accepted_artifact"; artifact: "expected_red_tests" };
+} {
+  return snapshot?.delivery.mode === "accepted_artifact" && snapshot.delivery.artifact === "expected_red_tests";
+}
+
+async function validateCompletionDeliveryEvidence(input: {
+  report: CompletionReportInput;
+  contractSnapshot: IssueContractSnapshot | null;
+  lifecycle: ExistingIssueLifecycle;
+  lifecycleStore: Pick<IssueLifecycleStore, "get">;
+  config: ServiceConfig;
+  targetIssueId: string;
+  workspacePath: string | null;
+  resolveIssuesByIds?: (issueIds: string[]) => Promise<Issue[]>;
+  dependencyArtifactManifestVerifier?: (
+    input: DependencyArtifactManifestVerificationInput,
+  ) => Promise<void>;
+}): Promise<void> {
+  const acceptedArtifact = isAcceptedArtifactContract(input.contractSnapshot);
+  const artifactEvidence = input.report.artifactEvidence;
+  if (acceptedArtifact) {
+    if (!artifactEvidence) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Accepted expected-red artifact delivery requires structured artifactEvidence",
+      );
+    }
+    if (new Set(artifactEvidence.testFiles).size !== artifactEvidence.testFiles.length) {
+      throw new SymphonyError("invalid_request", "artifactEvidence.testFiles must not contain duplicates");
+    }
+    const changedFiles = new Set(input.report.changedFiles);
+    const missingTestFiles = artifactEvidence.testFiles.filter((file) => !changedFiles.has(file));
+    if (missingTestFiles.length > 0) {
+      throw new SymphonyError(
+        "invalid_request",
+        "Every expected-red test file must be included in completion report changedFiles",
+        { missingTestFiles },
+      );
+    }
+  } else if (artifactEvidence !== undefined) {
+    throw new SymphonyError(
+      "invalid_request",
+      "artifactEvidence is only valid for an explicit accepted expected-red artifact delivery contract",
+    );
+  }
+
+  const seed = input.lifecycle?.workspaceSeed ?? null;
+  const dependencyResult = input.report.dependencyArtifactResult;
+  if (acceptedArtifact && (seed !== null || dependencyResult !== undefined)) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Accepted-artifact source issues cannot themselves consume another accepted artifact; use a merge-delivery integration issue",
+    );
+  }
+  if (seed === null) {
+    if (dependencyResult !== undefined) {
+      throw new SymphonyError(
+        "invalid_request",
+        "dependencyArtifactResult is only valid for a workspace with a durable accepted-artifact seed",
+      );
+    }
+    return;
+  }
+  if (seed.status !== "prepared") {
+    throw new SymphonyError(
+      "invalid_request",
+      `Completion report cannot be accepted while accepted-artifact workspace seed is ${seed.status}`,
+    );
+  }
+  if (!dependencyResult) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Seeded implementation completion requires dependencyArtifactResult proving the inherited expected-red tests pass",
+    );
+  }
+  const sourceLifecycle = await input.lifecycleStore.get(seed.sourceIssueId);
+  const artifact = sourceLifecycle?.acceptedArtifact ?? null;
+  if (
+    !artifact ||
+    isSupersededLifecycleRecord(artifact) ||
+    artifact.status !== "completed_unmerged" ||
+    artifact.id !== seed.artifactId
+  ) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Seeded implementation completion requires the matching completed accepted artifact checkpoint",
+    );
+  }
+  if (!input.resolveIssuesByIds) {
+    throw new DependencyArtifactDeferredError(
+      "live_lookup_unavailable",
+      "Seeded implementation completion requires live dependency-state verification",
+    );
+  }
+  let liveIssues: Issue[];
+  try {
+    liveIssues = await input.resolveIssuesByIds([
+      input.targetIssueId,
+      seed.sourceIssueId,
+    ]);
+  } catch (error) {
+    throw new DependencyArtifactDeferredError(
+      "live_lookup_unavailable",
+      `Seeded implementation completion could not refresh live dependency state: ${errorMessage(error)}`,
+    );
+  }
+  const liveTarget = liveIssues.find(
+    (candidate) => candidate.id === input.targetIssueId,
+  );
+  const liveSource = liveIssues.find(
+    (candidate) => candidate.id === seed.sourceIssueId,
+  );
+  if (!liveTarget || !liveSource) {
+    throw new DependencyArtifactDeferredError(
+      "live_issue_missing",
+      "Seeded implementation completion could not verify the live target and accepted-artifact source issues",
+    );
+  }
+  if (
+    !liveTarget.blockedBy.some(
+      (blocker) => blocker.id === seed.sourceIssueId,
+    )
+  ) {
+    throw new SymphonyError(
+      "conflict",
+      "Seeded implementation completion requires the accepted-artifact source to remain a direct dependency",
+    );
+  }
+  if (
+    liveSource.state.toLowerCase() !==
+    input.config.mergePolicy.doneState.toLowerCase()
+  ) {
+    const retryableState = [
+      ...input.config.tracker.activeStates,
+      ...input.config.tracker.handoffStates,
+      ...input.config.reviewLoop.reviewStates,
+      ...(input.config.reviewLoop.reviewPassState === null
+        ? []
+        : [input.config.reviewLoop.reviewPassState]),
+    ].some((state) => state.toLowerCase() === liveSource.state.toLowerCase());
+    if (!retryableState) {
+      throw new SymphonyError(
+        "conflict",
+        `Seeded implementation completion requires accepted-artifact source ${seed.sourceIssueIdentifier} to remain in ${input.config.mergePolicy.doneState}; current state is ${liveSource.state}`,
+      );
+    }
+    throw new DependencyArtifactDeferredError(
+      "source_not_done",
+      `Seeded implementation completion is waiting for accepted-artifact source ${seed.sourceIssueIdentifier} to become terminal again`,
+    );
+  }
+  const sourceContract = parseIssueContract(liveSource.description);
+  if (
+    !sourceContract.valid ||
+    sourceContract.fingerprint !== artifact.contractFingerprint
+  ) {
+    throw new SymphonyError(
+      "conflict",
+      "Seeded implementation completion requires the live source Issue Contract to match the reviewed accepted artifact",
+    );
+  }
+  if (dependencyResult.artifactId !== artifact.id || dependencyResult.command !== artifact.artifactEvidence.command) {
+    throw new SymphonyError(
+      "invalid_request",
+      "dependencyArtifactResult must match the seeded artifact id and declared expected-red command",
+    );
+  }
+  if (!input.workspacePath) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Seeded implementation completion requires a worktree to verify the inherited artifact manifest",
+    );
+  }
+  await (
+    input.dependencyArtifactManifestVerifier ??
+    verifyDependencyArtifactManifest
+  )({
+    workspacePath: input.workspacePath,
+    artifact,
+  });
+}
+
+function assertCompletionContractHasNotDrifted(
+  existing: IssueCompletionReportRecord | undefined,
+  current: IssueContractSnapshot | null,
+): void {
+  if (!existing) return;
+  const previous = existing.contractSnapshot ?? null;
+  if (previous === null && current === null) return;
+  if (previous?.fingerprint === current?.fingerprint) return;
+  throw new SymphonyError(
+    "conflict",
+    "Issue Contract changed after this completion report was persisted; submit a fresh completion report against the current contract",
+    {
+      previousFingerprint: previous?.fingerprint ?? null,
+      currentFingerprint: current?.fingerprint ?? null,
+    },
+  );
+}
+
+function completionReplayMatchesDeliveryEvidence(
+  existing: IssueCompletionReportRecord,
+  report: CompletionReportInput,
+  contractSnapshot: IssueContractSnapshot | null,
+): boolean {
+  return (
+    sameJson(existing.contractSnapshot ?? null, contractSnapshot) &&
+    sameJson(existing.artifactEvidence ?? null, normalizeArtifactEvidence(report.artifactEvidence)) &&
+    sameJson(existing.dependencyArtifactResult ?? null, normalizeDependencyArtifactResult(report.dependencyArtifactResult))
+  );
+}
+
+function normalizeArtifactEvidence(
+  evidence: CompletionReportInput["artifactEvidence"],
+): ExpectedRedArtifactEvidence | null {
+  return evidence
+    ? {
+        kind: evidence.kind,
+        command: evidence.command,
+        testFiles: [...evidence.testFiles],
+        expectedFailure: evidence.expectedFailure,
+        observedFailure: evidence.observedFailure,
+        exitCode: evidence.exitCode,
+      }
+    : null;
+}
+
+function normalizeDependencyArtifactResult(
+  result: CompletionReportInput["dependencyArtifactResult"],
+): DependencyArtifactResult | null {
+  return result
+    ? {
+        artifactId: result.artifactId,
+        command: result.command,
+        exitCode: result.exitCode,
+        evidence: result.evidence,
+      }
+    : null;
+}
+
 function completionReportReadinessRejection(report: CompletionReportInput): CompletionReportReadinessRejection | null {
   const unsatisfied = report.acceptanceChecklist.filter((item) => !item.satisfied);
   if (unsatisfied.length === 0) return null;
@@ -1211,11 +1628,8 @@ export function isAwaitingPublicationApprovalLifecycle(
 }
 
 export function pendingPublicationReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {
-  const lastPending =
-    lifecycle.lastCompletionReportId === null
-      ? undefined
-      : lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId && !isFinalizedCompletionReport(report));
-  return lastPending ?? [...lifecycle.completionReports].reverse().find((report) => !isFinalizedCompletionReport(report)) ?? null;
+  const current = latestCurrentCompletionReport(lifecycle);
+  return current !== null && !isFinalizedCompletionReport(current) ? current : null;
 }
 
 export function pendingPublicationHandoffForRun(
@@ -1254,9 +1668,11 @@ function findCompletionReportForRun(
   runId: string,
   idempotencyKey: string,
 ): IssueCompletionReportRecord | undefined {
-  return lifecycle?.completionReports.find(
-    (item) => item.runId === runId && item.idempotencyKey === idempotencyKey,
-  );
+  if (!lifecycle) return undefined;
+  const current = latestCurrentCompletionReport(lifecycle);
+  return current?.runId === runId && current.idempotencyKey === idempotencyKey
+    ? current
+    : undefined;
 }
 
 function buildCompletionReportRecord(input: {
@@ -1264,6 +1680,7 @@ function buildCompletionReportRecord(input: {
   issue: Issue;
   pullRequest: CompletionReportPullRequestRef | null;
   acceptanceContext: CompletionReportAcceptanceContext | null;
+  contractSnapshot: IssueContractSnapshot | null;
   acceptedAt: string | null;
   writebackOperationKeys: string[];
 }): IssueCompletionReportRecord {
@@ -1280,6 +1697,9 @@ function buildCompletionReportRecord(input: {
     branchName: input.report.branchName,
     pullRequest: input.pullRequest,
     acceptanceContext: input.acceptanceContext,
+    contractSnapshot: input.contractSnapshot,
+    artifactEvidence: normalizeArtifactEvidence(input.report.artifactEvidence),
+    dependencyArtifactResult: normalizeDependencyArtifactResult(input.report.dependencyArtifactResult),
     risks: input.report.risks,
     acceptedAt: input.acceptedAt ?? new Date().toISOString(),
     writebackOperationKeys: input.writebackOperationKeys,
@@ -1368,6 +1788,7 @@ function buildCompletionReportRejectionRecord(input: {
   report: CompletionReportInput;
   issue: Issue;
   pullRequest: CompletionReportPullRequestRef | null;
+  contractSnapshot: IssueContractSnapshot | null;
   rejection: CompletionReportReadinessRejection;
   writebackOperationKeys: string[];
 }): IssueCompletionReportRejectionRecord {
@@ -1386,6 +1807,9 @@ function buildCompletionReportRejectionRecord(input: {
     changedFiles: input.report.changedFiles,
     branchName: input.report.branchName,
     pullRequest: input.pullRequest,
+    contractSnapshot: input.contractSnapshot,
+    artifactEvidence: normalizeArtifactEvidence(input.report.artifactEvidence),
+    dependencyArtifactResult: normalizeDependencyArtifactResult(input.report.dependencyArtifactResult),
     risks: input.report.risks,
     rejectedAt: new Date().toISOString(),
     writebackOperationKeys: input.writebackOperationKeys,
@@ -1559,6 +1983,75 @@ function runGit(workspacePath: string, args: string[]): Promise<string | null> {
   });
 }
 
+export async function verifyDependencyArtifactManifest(
+  input: DependencyArtifactManifestVerificationInput,
+): Promise<void> {
+  const manifest = input.artifact.fileManifest;
+  if (manifest.length === 0) {
+    throw new SymphonyError(
+      "conflict",
+      "Accepted-artifact manifest is empty and cannot be verified",
+    );
+  }
+  const literalPaths = manifest.map((entry) => `:(literal)${entry.path}`);
+  const status = await runGit(input.workspacePath, [
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "--untracked-files=all",
+    "--",
+    ...literalPaths,
+  ]);
+  if (status === null) {
+    throw new SymphonyError(
+      "conflict",
+      "Unable to inspect inherited accepted-artifact files in the implementation worktree",
+    );
+  }
+  if (status.length > 0) {
+    throw new SymphonyError(
+      "conflict",
+      "Inherited accepted-artifact files have uncommitted changes",
+    );
+  }
+
+  for (const entry of manifest) {
+    const treeEntry = await runGit(input.workspacePath, [
+      "ls-tree",
+      "-z",
+      "HEAD",
+      "--",
+      `:(literal)${entry.path}`,
+    ]);
+    if (treeEntry === null) {
+      throw new SymphonyError(
+        "conflict",
+        `Unable to inspect inherited accepted-artifact file ${entry.path}`,
+      );
+    }
+    const tab = treeEntry.indexOf("\t");
+    const actualBlob =
+      tab < 0
+        ? null
+        : (treeEntry.slice(0, tab).trim().split(/\s+/)[2] ?? null);
+    if (entry.status === "deleted") {
+      if (actualBlob !== null) {
+        throw new SymphonyError(
+          "conflict",
+          `Inherited accepted-artifact deleted path ${entry.path} was restored`,
+        );
+      }
+      continue;
+    }
+    if (actualBlob?.toLowerCase() !== entry.blobSha?.toLowerCase()) {
+      throw new SymphonyError(
+        "conflict",
+        `Inherited accepted-artifact file ${entry.path} no longer matches the reviewed checkpoint`,
+      );
+    }
+  }
+}
+
 function normalizeChecklist(items: CompletionReportInput["acceptanceChecklist"]): CompletionReportChecklistItem[] {
   return items.map((item) => ({
     text: item.text,
@@ -1677,6 +2170,17 @@ function assertPendingPublicationReplayMatches(input: {
   }
   if (!sameStringSet(input.incomingReport.risks, input.storedReport.risks)) mismatchedFields.push("risks");
   if (!sameJson(input.incomingReport.pullRequest, input.storedReport.pullRequest)) mismatchedFields.push("pullRequest");
+  if (!sameJson(input.incomingReport.artifactEvidence ?? null, input.storedReport.artifactEvidence ?? null)) {
+    mismatchedFields.push("artifactEvidence");
+  }
+  if (
+    !sameJson(
+      input.incomingReport.dependencyArtifactResult ?? null,
+      input.storedReport.dependencyArtifactResult ?? null,
+    )
+  ) {
+    mismatchedFields.push("dependencyArtifactResult");
+  }
   if (input.incomingPublicationInput.workspacePath !== input.storedPublicationInput.workspacePath) {
     mismatchedFields.push("workspacePath");
   }
@@ -1690,6 +2194,9 @@ function assertPendingPublicationReplayMatches(input: {
   if (input.incomingPublicationInput.body !== input.storedPublicationInput.body) mismatchedFields.push("body");
   if ((input.incomingPublicationInput.forceEmptyCommit ?? false) !== (input.storedPublicationInput.forceEmptyCommit ?? false)) {
     mismatchedFields.push("forceEmptyCommit");
+  }
+  if ((input.incomingPublicationInput.draft ?? false) !== (input.storedPublicationInput.draft ?? false)) {
+    mismatchedFields.push("draft");
   }
   if (mismatchedFields.length > 0) {
     throw new SymphonyError("conflict", "Completion report replay differs from persisted pending publication handoff", {
@@ -1716,6 +2223,15 @@ function completionReportInputFromRecord(record: IssueCompletionReportRecord): C
     validationEvidence: record.validationEvidence,
     acceptanceChecklist: record.acceptanceChecklist,
     changedFiles: record.changedFiles,
+    ...(record.artifactEvidence == null ? {} : { artifactEvidence: record.artifactEvidence }),
+    ...(record.dependencyArtifactResult == null
+      ? {}
+      : {
+          dependencyArtifactResult: {
+            ...record.dependencyArtifactResult,
+            exitCode: 0 as const,
+          },
+        }),
     branchName: record.branchName,
     pullRequest: record.pullRequest,
     risks: record.risks,
@@ -1759,8 +2275,11 @@ function approvalRecordFromDetails(details: unknown): OperatorApprovalRecord | n
 }
 
 function formatPullRequestBody(report: CompletionReportInput, context: CompletionReportActiveContext): string {
+  const artifactEvidence = report.artifactEvidence;
   return [
-    "Symphony published this pull request from an accepted worker completion report.",
+    artifactEvidence
+      ? "Symphony published this draft pull request for review of an accepted expected-red test artifact."
+      : "Symphony published this pull request from an accepted worker completion report.",
     "",
     `Issue: ${context.issue.identifier}`,
     `Run: ${report.runId}`,
@@ -1771,6 +2290,17 @@ function formatPullRequestBody(report: CompletionReportInput, context: Completio
     "",
     "Validation evidence:",
     ...report.validationEvidence.map((item) => `- ${item}`),
+    ...(artifactEvidence
+      ? [
+          "",
+          "Expected-red artifact evidence:",
+          `- Command: ${artifactEvidence.command}`,
+          `- Exit code: ${artifactEvidence.exitCode}`,
+          `- Expected failure: ${artifactEvidence.expectedFailure}`,
+          `- Observed failure: ${artifactEvidence.observedFailure}`,
+          ...artifactEvidence.testFiles.map((file) => `- Test file: ${file}`),
+        ]
+      : []),
     "",
     "Changed files:",
     ...(report.changedFiles.length === 0 ? ["- n/a"] : report.changedFiles.map((item) => `- ${item}`)),

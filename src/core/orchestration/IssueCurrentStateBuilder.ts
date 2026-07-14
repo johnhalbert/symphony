@@ -22,7 +22,9 @@ import {
 import {
   isSupersededLifecycleRecord,
   latestCurrentApprovalPassVerdict,
+  latestCurrentCompletionReport,
   phaseForIssueState,
+  type IssueAcceptedArtifactRecord,
   type IssueCompletionReportRecord,
   type IssueLifecycleRecord,
   type IssueLifecycleStore,
@@ -33,6 +35,7 @@ import {
   type IssuePreservedWorktreeStash,
   type IssueReviewFeedbackRecord,
   type IssueReviewVerdictRecord,
+  type IssueWorkspaceSeedRecord,
 } from "../persistence/IssueLifecycleStore.js";
 import {
   compareRunChronology,
@@ -208,6 +211,8 @@ type LifecycleFields = Pick<
   | "lastMergeGateResultId"
   | "latestCompletionReport"
   | "latestApprovalPassVerdict"
+  | "acceptedArtifact"
+  | "workspaceSeed"
   | "mergeGate"
   | "mergeConflict"
   | "lifecycleSummaryCiStatus"
@@ -245,6 +250,8 @@ type LifecycleReportFields = Pick<
   | "lastCompletionReportRejectionId"
   | "latestCompletionReport"
   | "latestApprovalPassVerdict"
+  | "acceptedArtifact"
+  | "workspaceSeed"
   | "mergePolicyLatestCompletionReport"
   | "mergePolicyLatestApprovalVerdict"
 >;
@@ -979,14 +986,35 @@ export class IssueCurrentStateBuilder {
     const lastCompletionReportRejectionId = stringFromUnknown(
       snapshot.lifecycleLastCompletionReportRejectionId,
     );
-    const latestCompletionReport =
+    const lastCompletionReportId = stringFromUnknown(
+      snapshot.lifecycleLastCompletionReportId,
+    );
+    const completionReportCandidate =
       recordFromUnknown<IssueCompletionReportRecord>(
         snapshot.lifecycleLatestCompletionReport,
       );
-    const latestApprovalPassVerdict =
+    const latestCompletionReport =
+      lastCompletionReportId !== null &&
+      completionReportCandidate?.id === lastCompletionReportId &&
+      !isSupersededLifecycleRecord(completionReportCandidate)
+        ? completionReportCandidate
+        : null;
+    const approvalPassCandidate =
       recordFromUnknown<IssueReviewVerdictRecord>(
         snapshot.lifecycleLatestApprovalPassVerdict,
       );
+    const latestApprovalPassVerdict =
+      latestCompletionReport !== null &&
+      approvalPassCandidate !== null &&
+      !isSupersededLifecycleRecord(approvalPassCandidate)
+        ? approvalPassCandidate
+        : null;
+    const acceptedArtifact = recordFromUnknown<IssueAcceptedArtifactRecord>(
+      snapshot.lifecycleAcceptedArtifact,
+    );
+    const workspaceSeed = recordFromUnknown<IssueWorkspaceSeedRecord>(
+      snapshot.lifecycleWorkspaceSeed,
+    );
     return {
       complete: true,
       sourceSnapshotId: snapshot.historySnapshotId,
@@ -994,6 +1022,8 @@ export class IssueCurrentStateBuilder {
         lastCompletionReportRejectionId,
         latestCompletionReport,
         latestApprovalPassVerdict,
+        acceptedArtifact,
+        workspaceSeed,
         mergePolicyLatestCompletionReport: latestCompletionReport,
         mergePolicyLatestApprovalVerdict: latestApprovalPassVerdict,
       },
@@ -1636,6 +1666,8 @@ export class IssueCurrentStateBuilder {
       lastMergeGateResultId: lifecycle?.lastMergeGateResultId ?? null,
       latestCompletionReport: context.mergePolicyLatestCompletionReport,
       latestApprovalPassVerdict: context.mergePolicyLatestApprovalVerdict,
+      acceptedArtifact: lifecycle?.acceptedArtifact ?? null,
+      workspaceSeed: lifecycle?.workspaceSeed ?? null,
       mergeGate: lifecycle?.mergeGate ?? null,
       mergeConflict: lifecycle?.mergeConflict ?? null,
       lifecycleSummaryCiStatus: lifecycle?.summaryPointers.ciStatus ?? null,
@@ -1945,18 +1977,34 @@ function buildHistoryEvidenceContext(
     lifecycleSnapshot === null
       ? null
       : lifecycleRecordFromHistorySnapshot(lifecycleSnapshot);
-  const mergePolicyLatestCompletionReport =
+  const lastCompletionReportId =
+    lifecycleSnapshot === null
+      ? null
+      : stringFromUnknown(lifecycleSnapshot.lifecycleLastCompletionReportId);
+  const completionReportCandidate =
     lifecycleSnapshot === null
       ? null
       : recordFromUnknown<IssueCompletionReportRecord>(
           lifecycleSnapshot.lifecycleLatestCompletionReport,
         );
-  const mergePolicyLatestApprovalVerdict =
+  const mergePolicyLatestCompletionReport =
+    lastCompletionReportId !== null &&
+    completionReportCandidate?.id === lastCompletionReportId &&
+    !isSupersededLifecycleRecord(completionReportCandidate)
+      ? completionReportCandidate
+      : null;
+  const approvalPassCandidate =
     lifecycleSnapshot === null
       ? null
       : recordFromUnknown<IssueReviewVerdictRecord>(
           lifecycleSnapshot.lifecycleLatestApprovalPassVerdict,
         );
+  const mergePolicyLatestApprovalVerdict =
+    mergePolicyLatestCompletionReport !== null &&
+    approvalPassCandidate !== null &&
+    !isSupersededLifecycleRecord(approvalPassCandidate)
+      ? approvalPassCandidate
+      : null;
   const pendingPublication = pendingPublicationHandoffForRun(lifecycle);
   const currentIssueTriageFingerprint =
     lifecycle === null ? null : issueTriageTriggerFingerprint(lifecycle);
@@ -2056,14 +2104,29 @@ function lifecycleRecordFromHistorySnapshot(
   const summaryPointers = lifecycleSummaryPointersFromUnknown(
     snapshot.lifecycleSummaryPointers,
   );
-  const latestCompletionReport =
+  const lastCompletionReportId = stringFromUnknown(
+    snapshot.lifecycleLastCompletionReportId,
+  );
+  const completionReportCandidate =
     recordFromUnknown<IssueCompletionReportRecord>(
       snapshot.lifecycleLatestCompletionReport,
     );
-  const latestApprovalPassVerdict =
+  const latestCompletionReport =
+    lastCompletionReportId !== null &&
+    completionReportCandidate?.id === lastCompletionReportId &&
+    !isSupersededLifecycleRecord(completionReportCandidate)
+      ? completionReportCandidate
+      : null;
+  const approvalPassCandidate =
     recordFromUnknown<IssueReviewVerdictRecord>(
       snapshot.lifecycleLatestApprovalPassVerdict,
     );
+  const latestApprovalPassVerdict =
+    latestCompletionReport !== null &&
+    approvalPassCandidate !== null &&
+    !isSupersededLifecycleRecord(approvalPassCandidate)
+      ? approvalPassCandidate
+      : null;
   const issueBreakdownPlans =
     recordArrayFromUnknown<IssueBreakdownPlan>(
       snapshot.lifecycleIssueBreakdownPlans,
@@ -2109,9 +2172,7 @@ function lifecycleRecordFromHistorySnapshot(
     lastPostMortemReportId: stringFromUnknown(
       snapshot.lifecycleLastPostMortemReportId,
     ),
-    lastCompletionReportId: stringFromUnknown(
-      snapshot.lifecycleLastCompletionReportId,
-    ),
+    lastCompletionReportId,
     lastCompletionReportRejectionId: stringFromUnknown(
       snapshot.lifecycleLastCompletionReportRejectionId,
     ),
@@ -2133,6 +2194,12 @@ function lifecycleRecordFromHistorySnapshot(
     mergeGateResults,
     reviewFeedback,
     preservedWorktreeStashes,
+    acceptedArtifact: recordFromUnknown<IssueAcceptedArtifactRecord>(
+      snapshot.lifecycleAcceptedArtifact,
+    ),
+    workspaceSeed: recordFromUnknown<IssueWorkspaceSeedRecord>(
+      snapshot.lifecycleWorkspaceSeed,
+    ),
     issueTriageReports,
     postMortemReports,
     reviewEvidence: emptyHistoryReviewEvidence(),
@@ -2861,15 +2928,7 @@ function compareFieldGroup(
 function latestLifecycleCompletionReport(
   lifecycle: IssueLifecycleRecord,
 ): IssueCompletionReportRecord | null {
-  if (lifecycle.lastCompletionReportId) {
-    const exact = lifecycle.completionReports.find(
-      (report) => report.id === lifecycle.lastCompletionReportId,
-    );
-    if (exact) return exact;
-  }
-  return (
-    lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null
-  );
+  return latestCurrentCompletionReport(lifecycle);
 }
 
 function mergePolicyConfigFingerprint(config: ServiceConfig): string {

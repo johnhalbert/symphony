@@ -9,7 +9,10 @@ import type {
   IssueTriageReportRecord,
   IssueLifecycleStore,
 } from "./persistence/IssueLifecycleStore.js";
-import { isSupersededLifecycleRecord } from "./persistence/IssueLifecycleStore.js";
+import {
+  isSupersededLifecycleRecord,
+  latestCurrentCompletionReport,
+} from "./persistence/IssueLifecycleStore.js";
 import {
   compareRunChronology,
   type RunRecord,
@@ -473,11 +476,7 @@ function latestRunFrom(runs: readonly RunRecord[]): RunRecord | null {
 
 function latestCompletionReport(lifecycle: IssueLifecycleRecord | null): IssueCompletionReportRecord | null {
   if (!lifecycle) return null;
-  if (lifecycle.lastCompletionReportId) {
-    const exact = lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
-    if (exact) return exact;
-  }
-  return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
+  return latestCurrentCompletionReport(lifecycle);
 }
 
 function latestReviewVerdict(lifecycle: IssueLifecycleRecord | null): IssueReviewVerdictRecord | null {

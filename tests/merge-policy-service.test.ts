@@ -88,6 +88,54 @@ describe("MergePolicyService", () => {
     expect(lifecycle?.merge?.doneTransitionOperationKey).toBe("transition:issue-1:merge:issue-1:head-sha-1:Done");
   });
 
+  it("does not merge a superseded accepted-artifact completion report", async () => {
+    const config = mergeConfig({ requiredChecks: ["test"] });
+    const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    await seedLifecycle(lifecycleStore, runStore, currentIssue);
+    const lifecycle = await lifecycleStore.get(currentIssue.id);
+    await lifecycleStore.updateIssue(currentIssue, {
+      lastCompletionReportId: null,
+      completionReports: lifecycle!.completionReports.map((report) => ({
+        ...report,
+        contractSnapshot: {
+          schemaVersion: 1,
+          contractVersion: "accepted-artifact-review",
+          fingerprint: "accepted-artifact-fingerprint",
+          delivery: {
+            mode: "accepted_artifact" as const,
+            artifact: "expected_red_tests" as const,
+          },
+        },
+        supersededAt: "2026-07-14T11:00:00.000Z",
+        supersededBy: "accepted_artifact_reopened",
+        supersededReason: "The accepted artifact source checkpoint changed.",
+      })),
+    });
+    const writer = new MemoryWriter(currentIssue);
+    const client = new FakeMergeClient();
+    const service = new MergePolicyService({
+      config,
+      tracker: tracker(currentIssue),
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        new StructuredLogger(() => undefined),
+        60_000,
+      ),
+      client,
+    });
+
+    await expect(service.reconcileIssue(currentIssue)).rejects.toThrow(
+      "Gated merge requires a latest completion report",
+    );
+    expect(client.mergeInput).toBeNull();
+    expect(writer.transitions).toEqual([]);
+  });
+
   it("supersedes a stale PR head and routes the issue back to implementation", async () => {
     const config = mergeConfig({ noCiEvidence: "Repository intentionally has no CI for this test." });
     const currentIssue = issue({ state: "Ready to Merge", labels: ["dogfood-ready"] });

@@ -1,11 +1,12 @@
-import type {
-  CompletionReportPullRequestRef,
-  IssueCompletionReportRecord,
-  IssueLifecycleRecord,
-  IssueLifecycleStore,
-  PullRequestReviewEvidenceItem,
-  PullRequestReviewEvidenceState,
-  PullRequestReviewEvidenceSource,
+import {
+  latestCurrentCompletionReport,
+  type CompletionReportPullRequestRef,
+  type IssueCompletionReportRecord,
+  type IssueLifecycleRecord,
+  type IssueLifecycleStore,
+  type PullRequestReviewEvidenceItem,
+  type PullRequestReviewEvidenceState,
+  type PullRequestReviewEvidenceSource,
 } from "../persistence/IssueLifecycleStore.js";
 import type { Issue } from "../types.js";
 
@@ -119,7 +120,7 @@ export function buildWorkerReviewEvidencePromptContext(
   lifecycle: IssueLifecycleRecord,
   fullHistoryThreshold: number,
 ): WorkerReviewEvidencePromptContext | null {
-  const pullRequest = lifecycle.reviewEvidence.pullRequest ?? pullRequestForLifecycle(lifecycle);
+  const pullRequest = pullRequestForLifecycle(lifecycle);
   if (!pullRequest) return null;
   const visibleEvidence = selectEvidenceForWorker(lifecycle.reviewEvidence, fullHistoryThreshold);
   if (visibleEvidence.length === 0) return null;
@@ -127,7 +128,7 @@ export function buildWorkerReviewEvidencePromptContext(
   return {
     pullRequest,
     verdict: activeEvidence.some((item) => item.state === "CHANGES_REQUESTED") ? "fail" : "feedback",
-    acceptanceCriteriaGaps: acceptanceCriteriaGaps(latestCompletionReport(lifecycle)),
+    acceptanceCriteriaGaps: acceptanceCriteriaGaps(latestCurrentCompletionReport(lifecycle)),
     evidence: visibleEvidence,
   };
 }
@@ -234,7 +235,8 @@ function mergeEvidence(
 }
 
 function pullRequestForLifecycle(lifecycle: IssueLifecycleRecord): CompletionReportPullRequestRef | null {
-  const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+  const reportPullRequest = latestCurrentCompletionReport(lifecycle)?.pullRequest ?? null;
+  if (reportPullRequest === null) return null;
   if (reportPullRequest?.number) return reportPullRequest;
   if (lifecycle.summaryPointers.prNumber === null) return null;
   return {
@@ -243,14 +245,6 @@ function pullRequestForLifecycle(lifecycle: IssueLifecycleRecord): CompletionRep
     headSha: lifecycle.summaryPointers.prHeadSha,
     branch: lifecycle.summaryPointers.prBranch ?? lifecycle.summaryPointers.gitBranchName,
   };
-}
-
-function latestCompletionReport(lifecycle: IssueLifecycleRecord): IssueCompletionReportRecord | null {
-  if (lifecycle.lastCompletionReportId) {
-    const exact = lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
-    if (exact) return exact;
-  }
-  return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
 }
 
 function acceptanceCriteriaGaps(report: IssueCompletionReportRecord | null): string[] {

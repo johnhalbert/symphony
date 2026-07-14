@@ -4,9 +4,23 @@ import { spawn } from "node:child_process";
 import { Liquid } from "liquidjs";
 import type { HookConfig, WorkspaceConfig } from "../config/Config.js";
 import { SymphonyError, errorMessage } from "../errors.js";
-import type { Issue, Workspace } from "../types.js";
+import type {
+  AcceptedArtifactWorkspaceSeed,
+  Issue,
+  Workspace,
+  WorkspaceSeedBinding,
+} from "../types.js";
 import type { Logger } from "../logging/StructuredLogger.js";
-import { createGitPlanningCheckout, createGitWorktree, removeGitWorktree } from "./GitWorktreeManager.js";
+import {
+  AcceptedArtifactSeedConflictError,
+  createGitPlanningCheckout,
+  createGitWorktree,
+  completeGitWorktreeCreation,
+  finalizeGitWorktreeSeedConflict,
+  removeGitWorktree,
+  rollbackGitWorktreeCreation,
+  verifyGitWorktreeSeedBinding,
+} from "./GitWorktreeManager.js";
 import { FileRunTranscriptStore, type WorkspaceRecord } from "../persistence/RunTranscriptStore.js";
 
 export interface WorkspaceManagerOptions {
@@ -27,6 +41,11 @@ export interface WorkspaceMetadata {
   repoPath?: string;
   baseRef?: string;
   gitBranchName?: string;
+  seed?: WorkspaceSeedBinding;
+}
+
+export interface CreateIssueWorkspaceOptions {
+  seed?: AcceptedArtifactWorkspaceSeed | null;
 }
 
 export interface IssueWorkspaceRecord {
@@ -45,7 +64,10 @@ export class WorkspaceManager {
     this.store = new FileRunTranscriptStore(options.workspace.stateDir);
   }
 
-  async createForIssue(issueInput: WorkspaceIssueInput): Promise<Workspace> {
+  async createForIssue(
+    issueInput: WorkspaceIssueInput,
+    options: CreateIssueWorkspaceOptions = {},
+  ): Promise<Workspace> {
     const issue = normalizeIssueInput(issueInput);
     const issueIdentifier = issue.identifier;
     const workspaceKey = sanitizeWorkspaceKey(issueIdentifier);
@@ -56,32 +78,82 @@ export class WorkspaceManager {
     await fs.mkdir(this.options.workspace.stateDir, { recursive: true });
     await assertWorkspaceParentInsideRoot(workspacePath, this.options.workspace.root);
     const createdNow = !(await pathExists(workspacePath));
-    if (createdNow && this.options.workspace.source.kind === "git_worktree") {
+    if (this.options.workspace.source.kind === "git_worktree") {
       const branchName = await this.resolveBranchName(issue);
-      const result = await createGitWorktree({
-        source: this.options.workspace.source,
-        stateDir: this.options.workspace.stateDir,
-        workspacePath,
-        branchName,
-        timeoutMs: this.options.hooks.timeoutMs,
-        logger: this.options.logger,
-      });
-      await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
-      await this.writeMetadata({
-        workspaceKey,
-        issueId: issue.id,
-        issueIdentifier,
-        path: workspacePath,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        sourceKind: this.options.workspace.source.kind,
-        repoPath: result.repoPath,
-        baseRef: result.baseRef,
-        gitBranchName: result.branchName,
-      });
-      await this.runHook("after_create", this.options.hooks.afterCreate, workspacePath, true);
-    } else if (!createdNow && this.options.workspace.source.kind === "git_worktree") {
-      await this.assertExistingWorktree(workspaceKey, workspacePath);
+      const existing = await this.store.getWorkspace(workspaceKey);
+      const recoverSeedCreation =
+        !createdNow && existing === null && options.seed != null;
+      if (createdNow || recoverSeedCreation) {
+        const result = await createGitWorktree({
+          source: this.options.workspace.source,
+          stateDir: this.options.workspace.stateDir,
+          workspacePath,
+          branchName,
+          ...(options.seed == null ? {} : { seed: options.seed }),
+          timeoutMs: this.options.hooks.timeoutMs,
+          logger: this.options.logger,
+        });
+        await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+        try {
+          await this.writeMetadata({
+            workspaceKey,
+            issueId: issue.id,
+            issueIdentifier,
+            path: workspacePath,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            sourceKind: this.options.workspace.source.kind,
+            repoPath: result.repoPath,
+            baseRef: result.baseRef,
+            gitBranchName: result.branchName,
+            ...(result.seed === undefined ? {} : { seed: result.seed }),
+          });
+        } catch (error) {
+          if (options.seed != null) {
+            try {
+              await rollbackGitWorktreeCreation({
+                stateDir: this.options.workspace.stateDir,
+                repoPath: result.repoPath,
+                workspacePath,
+                branchName,
+                seed: options.seed,
+                timeoutMs: this.options.hooks.timeoutMs,
+              });
+            } catch (cleanupError) {
+              this.options.logger.error("seeded worktree rollback failed", {
+                workspace_path: workspacePath,
+                branch_name: branchName,
+                error: errorMessage(cleanupError),
+              });
+            }
+          }
+          throw error;
+        }
+        if (options.seed != null) {
+          await completeGitWorktreeCreation({
+            stateDir: this.options.workspace.stateDir,
+            repoPath: result.repoPath,
+            workspacePath,
+            branchName,
+            seed: options.seed,
+            timeoutMs: this.options.hooks.timeoutMs,
+          });
+        }
+        if ((result.seed?.conflictedFiles.length ?? 0) === 0) {
+          await this.runHook("after_create", this.options.hooks.afterCreate, workspacePath, true);
+        }
+      } else {
+        await this.assertExistingWorktree(
+          workspaceKey,
+          workspacePath,
+          options.seed ?? null,
+        );
+      }
+    } else if (options.seed != null) {
+      throw new SymphonyError(
+        "workspace_error",
+        "Accepted-artifact workspace seeds require workspace.source.kind git_worktree",
+      );
     } else {
       await ensureDirectory(workspacePath);
       await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
@@ -106,6 +178,7 @@ export class WorkspaceManager {
       ...(existing?.repoPath === undefined ? {} : { repoPath: existing.repoPath }),
       ...(existing?.baseRef === undefined ? {} : { baseRef: existing.baseRef }),
       ...(existing?.gitBranchName === undefined ? {} : { gitBranchName: existing.gitBranchName }),
+      ...(existing?.seed === undefined ? {} : { seed: existing.seed }),
     };
     await this.writeMetadata(metadata);
 
@@ -119,7 +192,54 @@ export class WorkspaceManager {
       ...(metadata.gitBranchName === undefined ? {} : { gitBranchName: metadata.gitBranchName }),
       ...(metadata.repoPath === undefined ? {} : { repoPath: metadata.repoPath }),
       ...(metadata.baseRef === undefined ? {} : { baseRef: metadata.baseRef }),
+      ...(metadata.seed === undefined ? {} : { seed: metadata.seed }),
     };
+  }
+
+  async resolveBranchNameForIssue(issueInput: WorkspaceIssueInput): Promise<string> {
+    return this.resolveBranchName(normalizeIssueInput(issueInput));
+  }
+
+  async finalizeAcceptedArtifactSeedConflict(
+    issueInput: WorkspaceIssueInput,
+  ): Promise<WorkspaceSeedBinding> {
+    const issue = normalizeIssueInput(issueInput);
+    const workspaceKey = sanitizeWorkspaceKey(issue.identifier);
+    const workspacePath = path.resolve(this.options.workspace.root, workspaceKey);
+    assertPathInsideRoot(workspacePath, this.options.workspace.root);
+    await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
+    const metadata = await this.store.getWorkspace(workspaceKey);
+    if (
+      metadata?.sourceKind !== "git_worktree" ||
+      !metadata.repoPath ||
+      !metadata.gitBranchName ||
+      !metadata.seed
+    ) {
+      throw new SymphonyError(
+        "workspace_error",
+        `Workspace has no managed accepted-artifact seed conflict: ${workspacePath}`,
+      );
+    }
+    const seed = await finalizeGitWorktreeSeedConflict(
+      workspacePath,
+      metadata.seed,
+      this.options.hooks.timeoutMs,
+    );
+    if (seed.conflictedFiles.length > 0 || seed.preparedHeadSha === null) {
+      await this.writeMetadata({
+        ...metadata,
+        seed,
+        updatedAt: new Date().toISOString(),
+      });
+      throw AcceptedArtifactSeedConflictError.fromBinding(seed);
+    }
+    await this.runHook("after_create", this.options.hooks.afterCreate, workspacePath, true);
+    await this.writeMetadata({
+      ...metadata,
+      seed,
+      updatedAt: new Date().toISOString(),
+    });
+    return seed;
   }
 
   async createForPlanning(issueInput: WorkspaceIssueInput): Promise<Workspace> {
@@ -263,6 +383,16 @@ export class WorkspaceManager {
     await this.runHook("before_remove", this.options.hooks.beforeRemove, workspacePath, false);
     const metadata = await this.store.getWorkspace(workspaceKey);
     if (metadata?.sourceKind === "git_worktree" && metadata.repoPath) {
+      if (metadata.seed && metadata.gitBranchName) {
+        await completeGitWorktreeCreation({
+          stateDir: this.options.workspace.stateDir,
+          repoPath: metadata.repoPath,
+          workspacePath,
+          branchName: metadata.gitBranchName,
+          seed: metadata.seed,
+          timeoutMs: this.options.hooks.timeoutMs,
+        });
+      }
       await removeGitWorktree({
         repoPath: metadata.repoPath,
         workspacePath,
@@ -445,7 +575,11 @@ export class WorkspaceManager {
     return trimmed;
   }
 
-  private async assertExistingWorktree(workspaceKey: string, workspacePath: string): Promise<void> {
+  private async assertExistingWorktree(
+    workspaceKey: string,
+    workspacePath: string,
+    requestedSeed: AcceptedArtifactWorkspaceSeed | null,
+  ): Promise<void> {
     await ensureDirectory(workspacePath);
     await assertRealPathInsideRoot(workspacePath, this.options.workspace.root);
     const metadata = await this.store.getWorkspace(workspaceKey);
@@ -455,7 +589,90 @@ export class WorkspaceManager {
     if (!(await pathExists(path.join(workspacePath, ".git")))) {
       throw new SymphonyError("workspace_error", `Existing workspace is missing git worktree metadata: ${workspacePath}`);
     }
+    assertMatchingWorkspaceSeed(metadata.seed, requestedSeed, workspacePath);
+    if (metadata.seed !== undefined) {
+      const seed = await verifyGitWorktreeSeedBinding(
+        workspacePath,
+        metadata.seed,
+        this.options.hooks.timeoutMs,
+      );
+      if (!sameWorkspaceSeedBinding(seed, metadata.seed)) {
+        await this.writeMetadata({
+          ...metadata,
+          seed,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+      await completeGitWorktreeCreation({
+        stateDir: this.options.workspace.stateDir,
+        repoPath: metadata.repoPath,
+        workspacePath,
+        branchName: metadata.gitBranchName,
+        seed,
+        timeoutMs: this.options.hooks.timeoutMs,
+      });
+    }
   }
+}
+
+function assertMatchingWorkspaceSeed(
+  existing: WorkspaceSeedBinding | undefined,
+  requested: AcceptedArtifactWorkspaceSeed | null,
+  workspacePath: string,
+): void {
+  if (requested === null) return;
+  if (existing === undefined) {
+    throw new SymphonyError(
+      "workspace_error",
+      `Existing workspace has no persisted accepted-artifact seed binding: ${workspacePath}`,
+    );
+  }
+  const fields: Array<keyof AcceptedArtifactWorkspaceSeed> = [
+    "version",
+    "kind",
+    "artifactId",
+    "sourceIssueId",
+    "sourceIssueIdentifier",
+    "repositoryFingerprint",
+    "sourceBranch",
+    "sourceHeadSha",
+    "sourceBaseHeadSha",
+    "configuredBaseRef",
+  ];
+  const mismatch = fields.find((field) => existing[field] !== requested[field]);
+  if (mismatch !== undefined || !sameArtifactManifest(existing.fileManifest, requested.fileManifest)) {
+    throw new SymphonyError(
+      "workspace_error",
+      `Existing workspace accepted-artifact seed does not match requested seed: ${workspacePath}`,
+    );
+  }
+}
+
+function sameArtifactManifest(
+  left: AcceptedArtifactWorkspaceSeed["fileManifest"],
+  right: AcceptedArtifactWorkspaceSeed["fileManifest"],
+): boolean {
+  if (left.length !== right.length) return false;
+  const normalize = (entries: AcceptedArtifactWorkspaceSeed["fileManifest"]) =>
+    entries
+      .map((entry) => `${entry.path}\0${entry.status}\0${entry.blobSha ?? ""}`)
+      .sort();
+  const normalizedLeft = normalize(left);
+  const normalizedRight = normalize(right);
+  return normalizedLeft.every((entry, index) => entry === normalizedRight[index]);
+}
+
+function sameWorkspaceSeedBinding(
+  left: WorkspaceSeedBinding,
+  right: WorkspaceSeedBinding,
+): boolean {
+  return (
+    left.preparedHeadSha === right.preparedHeadSha &&
+    left.preparedBaseHeadSha === right.preparedBaseHeadSha &&
+    left.targetBranch === right.targetBranch &&
+    left.conflictedFiles.length === right.conflictedFiles.length &&
+    left.conflictedFiles.every((filePath, index) => filePath === right.conflictedFiles[index])
+  );
 }
 
 export interface WorkspaceIssue {

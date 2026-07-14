@@ -12,7 +12,7 @@ Prefer `under_specified_needs_decomposition` when review history shows scope dis
 
 Do not classify an already-implemented current issue as `under_specified_needs_decomposition` merely because validation is waiting on behavior owned by an existing sibling issue. That is a sequencing or dependency-graph blocker: name the existing owner, recommend linking/waiting or correcting the dependency direction, and do not trigger child creation that repeats the current branch's completed work.
 
-For an explicitly test-first issue whose owned test artifact has been accepted and is intentionally red on a named implementation gap, treat the red validation as publication sequencing rather than a defect to repair in the test branch. Recommend waiting for or dispatching the concrete implementation owner, then rebasing and rerunning the test PR. Do not decompose the test task or send it through repeated worker repair unless the test artifact itself is wrong.
+For an issue with `delivery.mode=accepted_artifact`, distinguish artifact correctness from lifecycle reconciliation. A reviewer-approved expected-red artifact should be checkpointed, have its draft PR closed unmerged, and reach Done without waiting for implementation. If it remains Blocked, identify the missing or failed artifact-completion transition, checkpoint, PR-close, or Linear writeback evidence. Recommend service reconciliation; do not decompose the test task, send it through worker repair, or wait for its implementation successor unless the artifact itself failed review.
 
 ## Deterministic Blocker Ledger
 

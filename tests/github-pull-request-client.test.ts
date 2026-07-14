@@ -739,6 +739,36 @@ describe("GitHubPullRequestClient", () => {
     });
   });
 
+  it("closes a head-bound draft pull request and verifies it remained unmerged", async () => {
+    const calls: Array<{ method: string; body: unknown }> = [];
+    let state = "open";
+    const client = new GitHubPullRequestClient(config(), async (_input, init) => {
+      const method = init?.method ?? "GET";
+      calls.push({ method, body: init?.body === undefined ? null : JSON.parse(String(init.body)) });
+      if (method === "PATCH") state = "closed";
+      return jsonResponse(pullRequestNode({ state, draft: true, merged: false, headSha: "head-sha-1" }));
+    });
+
+    await expect(
+      client.closePullRequest({ pullRequestNumber: 42, expectedHeadSha: "head-sha-1" }),
+    ).resolves.toEqual({ pullRequestNumber: 42, headSha: "head-sha-1", state: "closed", merged: false });
+    expect(calls).toEqual([
+      { method: "GET", body: null },
+      { method: "PATCH", body: { state: "closed" } },
+      { method: "GET", body: null },
+    ]);
+  });
+
+  it("refuses to close an accepted-artifact pull request that is no longer a draft", async () => {
+    const client = new GitHubPullRequestClient(config(), async () =>
+      jsonResponse(pullRequestNode({ state: "open", draft: false, merged: false, headSha: "head-sha-1" })),
+    );
+
+    await expect(
+      client.closePullRequest({ pullRequestNumber: 42, expectedHeadSha: "head-sha-1" }),
+    ).rejects.toThrow(/no longer a draft/);
+  });
+
   it("merges pull requests with the expected head SHA guard", async () => {
     const calls: Array<{ pathname: string; body: unknown }> = [];
     const client = new GitHubPullRequestClient(config(), async (input, init) => {
@@ -791,6 +821,73 @@ describe("GitHubPullRequestClient", () => {
         authorization: "Bearer github-secret",
       },
     ]);
+  });
+
+  it.each([
+    {
+      name: "reviewed pull request",
+      invoke: (client: GitHubPullRequestClient) => client.getPullRequest({ pullRequestNumber: 42 }),
+      target: "pull_request",
+      action: "GitHub PR inspection",
+    },
+    {
+      name: "reviewed branch",
+      invoke: (client: GitHubPullRequestClient) => client.getBranchHeadSha({ branchName: "symphony/TEST-1" }),
+      target: "branch",
+      action: "GitHub branch head lookup",
+    },
+  ])("classifies a missing $name as permanent reviewed-state drift", async ({ invoke, target, action }) => {
+    const client = new GitHubPullRequestClient(config(), async () => jsonResponse({ message: "Not Found" }, 404));
+
+    await expect(invoke(client)).rejects.toMatchObject({
+      code: "not_found",
+      details: {
+        source: "github_http",
+        action,
+        status: 404,
+        failureKind: "not_found",
+        retryable: false,
+        target,
+      },
+    });
+  });
+
+  it.each([401, 403])("classifies GitHub HTTP %s as permanent authentication or access failure", async (status) => {
+    const client = new GitHubPullRequestClient(config(), async () =>
+      jsonResponse({ message: "Bad credentials or forbidden" }, status),
+    );
+
+    await expect(client.getPullRequest({ pullRequestNumber: 42 })).rejects.toMatchObject({
+      code: "invalid_request",
+      details: {
+        source: "github_http",
+        status,
+        failureKind: "authentication_or_access",
+        retryable: false,
+        target: "pull_request",
+      },
+    });
+  });
+
+  it.each([
+    { status: 429, headers: { "retry-after": "30" }, failureKind: "rate_limit" },
+    { status: 403, headers: { "x-ratelimit-remaining": "0" }, failureKind: "rate_limit" },
+    { status: 503, headers: {}, failureKind: "server_error" },
+  ])("keeps GitHub HTTP $status $failureKind failures transient", async ({ status, headers, failureKind }) => {
+    const client = new GitHubPullRequestClient(config(), async () =>
+      jsonResponse({ message: "Temporary GitHub failure" }, status, headers),
+    );
+
+    await expect(client.getPullRequest({ pullRequestNumber: 42 })).rejects.toMatchObject({
+      code: "tracker_error",
+      details: {
+        source: "github_http",
+        status,
+        failureKind,
+        retryable: true,
+        target: "pull_request",
+      },
+    });
   });
 
   it("checks required commit statuses and check runs by name", async () => {
@@ -1080,6 +1177,27 @@ function graphQlThreadsResponse(
       },
     },
   });
+}
+
+function pullRequestNode(input: { state: string; draft: boolean; merged: boolean; headSha: string }) {
+  return {
+    html_url: "https://github.com/octo-org/symphony/pull/42",
+    number: 42,
+    state: input.state,
+    draft: input.draft,
+    merged: input.merged,
+    mergeable: true,
+    mergeable_state: "clean",
+    merge_commit_sha: null,
+    merged_at: null,
+    merged_by: null,
+    head: {
+      ref: "symphony/TEST-1",
+      sha: input.headSha,
+      repo: { pushed_at: "2026-01-01T00:00:00Z" },
+    },
+    base: { ref: "main", sha: "base-sha-1" },
+  };
 }
 
 function config() {

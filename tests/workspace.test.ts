@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StructuredLogger } from "../src/core/logging/StructuredLogger.js";
 import { WorkspaceManager, assertPathInsideRoot, sanitizeWorkspaceKey } from "../src/core/workspace/WorkspaceManager.js";
+import type { AcceptedArtifactWorkspaceSeed } from "../src/core/types.js";
 import { issue, testConfig } from "./helpers.js";
 
 describe("WorkspaceManager", () => {
@@ -58,5 +59,33 @@ describe("WorkspaceManager", () => {
     } finally {
       await rm(outside, { recursive: true, force: true });
     }
+  });
+
+  it("rejects accepted-artifact seeds for non-worktree workspace sources", async () => {
+    const config = testConfig(root);
+    const manager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger: new StructuredLogger(() => undefined),
+    });
+    const seed: AcceptedArtifactWorkspaceSeed = {
+      version: 1,
+      kind: "accepted_artifact",
+      artifactId: "artifact-1",
+      sourceIssueId: "source-1",
+      sourceIssueIdentifier: "TEST-SOURCE",
+      repositoryFingerprint: "sha256:unused",
+      sourceBranch: "artifact/TEST-SOURCE",
+      sourceHeadSha: "a".repeat(40),
+      sourceBaseHeadSha: "b".repeat(40),
+      configuredBaseRef: "main",
+      fileManifest: [
+        { path: "tests/expected-red.test.ts", status: "added", blobSha: "c".repeat(40) },
+      ],
+    };
+
+    await expect(
+      manager.createForIssue(issue({ identifier: "TEST-SEED-NONE" }), { seed }),
+    ).rejects.toThrow(/require workspace\.source\.kind git_worktree/);
   });
 });

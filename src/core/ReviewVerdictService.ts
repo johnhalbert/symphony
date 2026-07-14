@@ -14,7 +14,11 @@ import type {
   IssueReviewVerdictSubmissionRecord,
   ReviewVerdictAcceptanceResult,
 } from "./persistence/IssueLifecycleStore.js";
-import { isSupersededLifecycleRecord, phaseForIssueState } from "./persistence/IssueLifecycleStore.js";
+import {
+  isSupersededLifecycleRecord,
+  latestCurrentCompletionReport,
+  phaseForIssueState,
+} from "./persistence/IssueLifecycleStore.js";
 import { isMergeGateVerdict } from "./merge/MergePolicyService.js";
 import { shouldSilentlyRetireMergeGate } from "./merge/MergeGateLifecycle.js";
 import type { RunTranscriptStore } from "./persistence/RunTranscriptStore.js";
@@ -22,6 +26,7 @@ import type { Issue } from "./types.js";
 import {
   planBlockedEscalationWritebacks,
   planReviewBlockedWritebacks,
+  planReviewAcceptedArtifactPassWritebacks,
   planReviewFailWritebacks,
   planReviewPassWritebacks,
 } from "./writeback/TransitionPolicy.js";
@@ -29,6 +34,8 @@ import type { NewWritebackOperation, WritebackOperation, WritebackOutboxStore } 
 
 const PASS_REQUIRES_APPROVE_MESSAGE =
   'Pass review verdict requires prior submit_pull_request_review_feedback with kind="review" and event="APPROVE" for the active reviewer run and lifecycle-bound PR.';
+const ARTIFACT_PASS_REQUIRES_COMMENT_MESSAGE =
+  'Accepted-artifact pass verdict requires prior submit_pull_request_review_feedback with kind="review" and event="COMMENT" for the active reviewer run and lifecycle-bound PR.';
 const FAIL_AFTER_APPROVE_MESSAGE =
   "Fail review verdict cannot follow APPROVE review feedback in the same reviewer run; submit a pass verdict or start a fresh review run.";
 const BLOCKED_AFTER_APPROVE_MESSAGE =
@@ -208,6 +215,10 @@ export class ReviewVerdictService {
       issueId: context.issue.id,
       issueIdentifier: context.issue.identifier,
       verdict: verdict.verdict,
+      passDisposition:
+        verdict.verdict === "pass"
+          ? reviewPassDisposition(lifecycle)
+          : null,
       acceptanceResults: normalizeAcceptanceResults(verdict.acceptanceResults),
       findings: storedFindings,
       gateFindings,
@@ -300,6 +311,12 @@ export class ReviewVerdictService {
     }
 
     const pullRequest = currentPullRequestForReview(lifecycle);
+    if (reviewPassDisposition(lifecycle) === "accepted_artifact") {
+      if (!pullRequest || !hasSameRunCommentFeedbackForPullRequest(lifecycle, verdict.runId, pullRequest)) {
+        throw new SymphonyError("invalid_request", ARTIFACT_PASS_REQUIRES_COMMENT_MESSAGE);
+      }
+      return;
+    }
     if (!pullRequest || !hasSameRunApprovalFeedbackForPullRequest(lifecycle, verdict.runId, pullRequest)) {
       throw new SymphonyError("invalid_request", PASS_REQUIRES_APPROVE_MESSAGE);
     }
@@ -313,6 +330,15 @@ export function planReviewVerdictSubmissionApplication(input: {
   submission: IssueReviewVerdictSubmissionRecord;
   appliedAt?: string;
 }): ReviewVerdictApplicationPlan {
+  if (
+    input.submission.verdict === "pass" &&
+    reviewPassDispositionForSubmission(input.submission) !== reviewPassDisposition(input.lifecycle)
+  ) {
+    throw new SymphonyError(
+      "invalid_request",
+      "Review pass disposition no longer matches the latest completion report; return the issue to implementation and submit fresh evidence.",
+    );
+  }
   const reviewRound = input.submission.verdict === "fail" ? nextReviewRound(input.lifecycle) : input.lifecycle.reviewRound;
   const maxReviewerFailures = input.config.reviewLoop.failureLimits.reviewerFailures;
   const ceilingReached = input.submission.verdict === "fail" && reviewRound >= maxReviewerFailures;
@@ -336,7 +362,7 @@ export function planReviewVerdictSubmissionApplication(input: {
         maxIncompleteTurns: input.config.reviewLoop.maxIncompleteTurns,
         reviewRound,
         maxReviewRounds: maxReviewerFailures,
-        lastCompletionReport: latestCompletionReport(input.lifecycle),
+        lastCompletionReport: latestCurrentCompletionReport(input.lifecycle),
         lastReviewVerdict: provisionalVerdict,
         requiredAction:
           "Review the requested changes, decide whether the worker should continue, and move the issue out of Blocked when it is ready for another implementation pass.",
@@ -347,6 +373,12 @@ export function planReviewVerdictSubmissionApplication(input: {
     operations = planReviewFailWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
   } else if (input.submission.verdict === "blocked") {
     operations = planReviewBlockedWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
+  } else if (reviewPassDispositionForSubmission(input.submission) === "accepted_artifact") {
+    operations = planReviewAcceptedArtifactPassWritebacks(
+      reviewWritebackContextForSubmission(input.issue, input.submission),
+      input.config,
+      writebackDetails,
+    );
   } else {
     operations = planReviewPassWritebacks(reviewWritebackContextForSubmission(input.issue, input.submission), input.config, writebackDetails);
   }
@@ -404,6 +436,7 @@ function acceptedVerdictFromSubmission(
     issueId: submission.issueId,
     issueIdentifier: submission.issueIdentifier,
     verdict: submission.verdict,
+    passDisposition: submission.passDisposition ?? null,
     acceptanceResults: submission.acceptanceResults,
     findings: submission.findings,
     gateFindings: submission.gateFindings,
@@ -426,6 +459,7 @@ function submissionFromAcceptedVerdict(verdict: IssueReviewVerdictRecord): Issue
     issueId: verdict.issueId,
     issueIdentifier: verdict.issueIdentifier,
     verdict: verdict.verdict,
+    passDisposition: verdict.passDisposition ?? null,
     acceptanceResults: verdict.acceptanceResults,
     findings: verdict.findings,
     gateFindings: verdict.gateFindings,
@@ -447,7 +481,7 @@ export function formatWorkerReviewVerdictPrompt(lifecycle: IssueLifecycleRecord)
   if (!verdict || (verdict.verdict !== "fail" && verdict.verdict !== "blocked")) return null;
   if (isMergeGateVerdict(verdict)) return null;
   const pointers = lifecycle.summaryPointers;
-  const latestReport = latestCompletionReport(lifecycle);
+  const latestReport = latestCurrentCompletionReport(lifecycle);
   if (verdict.verdict === "blocked") {
     return [
       "",
@@ -743,16 +777,21 @@ function latestReviewVerdict(lifecycle: IssueLifecycleRecord): IssueReviewVerdic
   return null;
 }
 
-function latestCompletionReport(lifecycle: IssueLifecycleRecord) {
-  if (lifecycle.lastCompletionReportId) {
-    const exact = lifecycle.completionReports.find((report) => report.id === lifecycle.lastCompletionReportId);
-    if (exact) return exact;
-  }
-  return lifecycle.completionReports[lifecycle.completionReports.length - 1] ?? null;
+function reviewPassDisposition(lifecycle: IssueLifecycleRecord): "merge" | "accepted_artifact" {
+  return latestCurrentCompletionReport(lifecycle)?.contractSnapshot?.delivery.mode === "accepted_artifact"
+    ? "accepted_artifact"
+    : "merge";
+}
+
+function reviewPassDispositionForSubmission(
+  submission: IssueReviewVerdictSubmissionRecord,
+): "merge" | "accepted_artifact" {
+  return submission.passDisposition === "accepted_artifact" ? "accepted_artifact" : "merge";
 }
 
 function currentPullRequestForReview(lifecycle: IssueLifecycleRecord): CompletionReportPullRequestRef | null {
-  const reportPullRequest = latestCompletionReport(lifecycle)?.pullRequest ?? null;
+  const reportPullRequest = latestCurrentCompletionReport(lifecycle)?.pullRequest ?? null;
+  if (reportPullRequest === null) return null;
   if (reportPullRequest?.number !== null && reportPullRequest?.number !== undefined) return reportPullRequest;
   if (lifecycle.summaryPointers.prNumber === null) return null;
   return {
@@ -779,6 +818,20 @@ function hasSameRunApprovalFeedbackForPullRequest(
       feedback.runId === runId &&
       feedback.kind === "review" &&
       feedback.event === "APPROVE" &&
+      samePullRequest(feedback.pullRequest, pullRequest),
+  );
+}
+
+function hasSameRunCommentFeedbackForPullRequest(
+  lifecycle: IssueLifecycleRecord,
+  runId: string,
+  pullRequest: CompletionReportPullRequestRef,
+): boolean {
+  return lifecycle.reviewFeedback.some(
+    (feedback) =>
+      feedback.runId === runId &&
+      feedback.kind === "review" &&
+      feedback.event === "COMMENT" &&
       samePullRequest(feedback.pullRequest, pullRequest),
   );
 }

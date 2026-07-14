@@ -176,6 +176,28 @@ describe("SqliteIssueStateStore", () => {
     ]);
   });
 
+  it("defaults accepted artifact and workspace seed for legacy current-state caches", async () => {
+    const current = currentFields();
+    const legacy = { ...current } as Partial<IssueCurrentFields>;
+    delete legacy.acceptedArtifact;
+    delete legacy.workspaceSeed;
+
+    const fileStore = new FileIssueStateStore(path.join(root, "file"));
+    await fileStore.ensureCurrent(legacy as IssueCurrentFields);
+    await expect(fileStore.getCurrent(current.issueId)).resolves.toMatchObject({
+      acceptedArtifact: null,
+      workspaceSeed: null,
+    });
+
+    const sqliteStore = new SqliteIssueStateStore(path.join(root, "sqlite"));
+    stores.push(sqliteStore);
+    await sqliteStore.ensureCurrent(legacy as IssueCurrentFields);
+    await expect(sqliteStore.getCurrent(current.issueId)).resolves.toMatchObject({
+      acceptedArtifact: null,
+      workspaceSeed: null,
+    });
+  });
+
   it("imports legacy flat-file issue state into sqlite on first open", async () => {
     const legacy = new FileIssueStateStore(root);
     const current = currentFields();
@@ -294,6 +316,61 @@ describe("SqliteIssueStateStore", () => {
             inputTokens: 10,
             outputTokens: 20,
             totalTokens: 30,
+          },
+        },
+      ],
+    });
+  });
+
+  it("flattens accepted artifact and workspace seed lifecycle evidence", async () => {
+    const store = new SqliteIssueStateStore(root);
+    stores.push(store);
+    const current = currentFields();
+    await store.ensureIssue(current);
+    const snapshot = new IssueOrchestrationEngine([
+      {
+        id: "orchestrator.evidence.lifecycle",
+        priority: 900,
+        evaluate: () => ({
+          transitionKind: "record_evidence",
+          reason: "accepted artifact checkpointed",
+          evidenceKind: "lifecycle",
+          evidenceEventType: "lifecycle_updated",
+          evidenceSourceId: "artifact-1",
+          evidencePayload: {
+            acceptedArtifact: {
+              id: "artifact-1",
+              kind: "expected_red_tests",
+              status: "completed_unmerged",
+            },
+            workspaceSeed: {
+              id: "seed-1",
+              kind: "accepted_artifact",
+              status: "prepared",
+              artifactId: "artifact-1",
+            },
+          },
+        }),
+      },
+    ]).decide(currentSnapshot(current), []);
+    expect(snapshot).not.toBeNull();
+
+    await store.appendSnapshot(
+      { id: current.issueId, identifier: current.issueIdentifier },
+      snapshot!,
+    );
+
+    await expect(store.get(current.issueIdentifier)).resolves.toMatchObject({
+      history: [
+        {
+          lifecycleAcceptedArtifact: {
+            id: "artifact-1",
+            status: "completed_unmerged",
+          },
+          lifecycleWorkspaceSeed: {
+            id: "seed-1",
+            status: "prepared",
+            artifactId: "artifact-1",
           },
         },
       ],
@@ -669,6 +746,8 @@ function currentFields(): IssueCurrentFields {
     lastMergeGateResultId: null,
     latestCompletionReport: null,
     latestApprovalPassVerdict: null,
+    acceptedArtifact: null,
+    workspaceSeed: null,
     mergeGate: null,
     mergeConflict: null,
     lifecycleSummaryCiStatus: null,

@@ -20,6 +20,7 @@ import {
   type CompletionReportPullRequestPublisher,
 } from "../src/core/CompletionReportService.js";
 import { SymphonyError } from "../src/core/errors.js";
+import { parseIssueContract } from "../src/core/IssueContractLint.js";
 import {
   FileOperatorApprovalStore,
   OPERATOR_REJECTED_PUBLICATION_ERROR,
@@ -69,6 +70,8 @@ import {
   type IssueBreakdownCreatedIssueRef,
   type IssueBreakdownPlanRecord,
   type IssueLifecyclePatch,
+  type IssueAcceptedArtifactRecord,
+  type IssueWorkspaceSeedRecord,
   type IssueMergeConflictMetadata,
   type IssueMergeGateState,
   type IssueReviewFeedbackRecord,
@@ -97,14 +100,17 @@ import {
   FileWritebackOutboxStore,
   ISSUE_BREAKDOWN_PLAN_STALE_REASON,
   ISSUE_BREAKDOWN_WRITEBACK_NOT_CURRENT_REASON,
+  SqliteWritebackOutboxStore,
   WritebackProcessor,
 } from "../src/core/writeback/WritebackOutbox.js";
 import type { NewWritebackOperation } from "../src/core/writeback/WritebackOutbox.js";
 import { WorkspaceManager } from "../src/core/workspace/WorkspaceManager.js";
 import type {
+  AcceptedArtifactWorkspaceSeed,
   Issue,
   TokenCounts,
   TrackerStateLists,
+  WorkspaceSeedBinding,
 } from "../src/core/types.js";
 import { agentEligibleIssueContract, issue, testConfig } from "./helpers.js";
 
@@ -2053,6 +2059,119 @@ describe("Orchestrator", () => {
       runKind: "implementation",
     });
   }, 10_000);
+
+  it("does not dispatch planner decomposition for accepted expected-red artifacts", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    config.issueBreakdown.planningLabels = ["planning"];
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const plannerRuleset = orchestrator
+      .registeredTransitionRulesets()
+      .find((ruleset) => ruleset.id === "orchestrator.dispatch.planner");
+    const mergeDelivery = issue({
+      state: "Todo",
+      labels: ["planning"],
+      description: agentEligibleIssueContract(),
+    });
+    const acceptedArtifact = {
+      ...mergeDelivery,
+      description: agentEligibleIssueContract({
+        issueContractDelivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+      }),
+    };
+    const base = issueCurrentSnapshotForTest(mergeDelivery, {
+      phase: "implementation",
+      candidateSource: "tick_candidates",
+      mergeQueueActiveIssueId: null,
+      mergeQueueActiveIssueIdentifier: null,
+      mergeQueueLeaseId: null,
+      mergeQueueStatus: "inactive",
+    });
+
+    expect(plannerRuleset).toBeDefined();
+    expect(plannerRuleset?.evaluate(base, [])).toMatchObject({
+      transitionKind: "dispatch_planner",
+      reason: "issue_breakdown_required",
+    });
+    expect(
+      plannerRuleset?.evaluate(
+        {
+          ...base,
+          description: acceptedArtifact.description,
+        },
+        [],
+      ),
+    ).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it("rejects explicit breakdown requests for accepted expected-red artifacts", async () => {
+    const config = testConfig(root);
+    config.issueBreakdown.enabled = true;
+    const candidate = issue({
+      state: "Todo",
+      description: agentEligibleIssueContract({
+        issueContractDelivery: {
+          mode: "accepted_artifact",
+          artifact: "expected_red_tests",
+        },
+      }),
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore: new FileIssueLifecycleStore(config.workspace.stateDir),
+    });
+
+    await expect(
+      orchestrator.requestIssueBreakdown(candidate.id),
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: "Issue is not currently eligible for planner dispatch",
+    });
+    expect(harness.runs).toHaveLength(0);
+    await orchestrator.stop();
+  });
 
   it("does not apply accepted issue breakdown plans during normal dispatch", async () => {
     const config = testConfig(root);
@@ -7055,6 +7174,1934 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
+  it("routes accepted-artifact pass reconciliation to unmerged completion instead of merge policy", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const completeAcceptedArtifactAction = vi.fn(async () => ({
+      details: { disposition: "completed_unmerged" },
+    }));
+    const processMergePolicyTransitionCandidate = vi.fn(async () => undefined);
+    const internal = orchestrator as unknown as {
+      completeAcceptedArtifactAction: typeof completeAcceptedArtifactAction;
+      processMergePolicyTransitionCandidate: typeof processMergePolicyTransitionCandidate;
+      requestMergePolicyAfterPassVerdictAction(context: unknown): Promise<unknown>;
+    };
+    internal.completeAcceptedArtifactAction = completeAcceptedArtifactAction;
+    internal.processMergePolicyTransitionCandidate =
+      processMergePolicyTransitionCandidate;
+    const verdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(),
+      verdict: "pass",
+      passDisposition: "accepted_artifact",
+      acceptanceResults: [
+        { text: "Expected-red tests express the contract", satisfied: true, evidence: "reviewed" },
+      ],
+      findings: [],
+    };
+
+    await internal.requestMergePolicyAfterPassVerdictAction({
+      issue: issue({ state: "In Review" }),
+      handoffReconciliation: { reviewVerdict: verdict },
+    });
+
+    expect(completeAcceptedArtifactAction).toHaveBeenCalledOnce();
+    expect(processMergePolicyTransitionCandidate).not.toHaveBeenCalled();
+    await orchestrator.stop();
+  });
+
+  it("selects accepted-artifact completion on a tick for a passed artifact still in review", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.mergePolicy.mode = "gated";
+    config.mergePolicy.sourceStates = ["Ready to Merge"];
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const ruleset = orchestrator
+      .registeredTransitionRulesets()
+      .find((candidate) => candidate.id === "orchestrator.complete_accepted_artifact");
+    const verdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(),
+      verdict: "pass",
+      passDisposition: "accepted_artifact",
+      acceptanceResults: [
+        { text: "Expected-red tests express the contract", satisfied: true, evidence: "reviewed" },
+      ],
+      findings: [],
+    };
+    const snapshot = mergePolicyRulesetSnapshot({
+      trackerState: "In Review",
+      phase: "passed",
+      latestCompletionReport: {
+        ...completionReportRecord(),
+        contractSnapshot: {
+          schemaVersion: 1,
+          contractVersion: "2026-07-14.1",
+          fingerprint: "accepted-artifact-contract",
+          delivery: {
+            mode: "accepted_artifact",
+            artifact: "expected_red_tests",
+          },
+        },
+      },
+      latestApprovalPassVerdict: verdict,
+      candidateSource: "tick_candidates",
+    });
+
+    expect(ruleset?.evaluate(snapshot, [])).toMatchObject({
+      transitionKind: "complete_accepted_artifact",
+      reason: "accepted_artifact_completion_reconciliation",
+      runId: verdict.id,
+    });
+    expect(
+      ruleset?.evaluate(
+        {
+          ...snapshot,
+          latestCompletionReport: completionReportRecord(),
+        },
+        [],
+      ),
+    ).toBeNull();
+    const legacyMergeState = {
+      ...snapshot,
+      trackerState: config.mergePolicy.sourceStates[0]!,
+      mergeQueueStatus: "inactive" as const,
+    };
+    expect(ruleset?.evaluate(legacyMergeState, [])).toMatchObject({
+      transitionKind: "complete_accepted_artifact",
+    });
+    const mergeQueueClaim = orchestrator
+      .registeredTransitionRulesets()
+      .find((candidate) => candidate.id === "orchestrator.merge_queue.claim");
+    expect(mergeQueueClaim?.evaluate(legacyMergeState, [])).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it("selects completed accepted-artifact lifecycle reconciliation for Done recovery and ambiguous review state", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    const logger = new StructuredLogger(() => undefined);
+    const source = issue({ state: "Done" });
+    const artifact = acceptedArtifactRecord(source, "artifact-reconcile-rule");
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const ruleset = orchestrator
+      .registeredTransitionRulesets()
+      .find(
+        (candidate) =>
+          candidate.id ===
+          "orchestrator.reconcile_completed_accepted_artifact",
+      );
+    const snapshot = mergePolicyRulesetSnapshot({
+      description: source.description,
+      trackerState: "Done",
+      phase: "passed",
+      acceptedArtifact: artifact,
+      candidateSource: "tick_candidates",
+    });
+
+    expect(ruleset?.evaluate(snapshot, [])).toMatchObject({
+      transitionKind: "reconcile_completed_accepted_artifact",
+      reason: "accepted_artifact_lifecycle_reconciliation",
+    });
+    expect(
+      ruleset?.evaluate(
+        { ...snapshot, trackerState: "In Review" },
+        [],
+      ),
+    ).toMatchObject({
+      transitionKind: "reconcile_completed_accepted_artifact",
+    });
+    expect(
+      ruleset?.evaluate({ ...snapshot, phase: "terminal" }, []),
+    ).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it("repairs terminal lifecycle state after an accepted-artifact Done writeback survives a restart", async () => {
+    const config = testConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const source = issue({ state: "Done" });
+    const artifact = acceptedArtifactRecord(source, "artifact-done-recovery");
+    await lifecycleStore.ensureIssue(source, {
+      phase: "passed",
+      acceptedArtifact: artifact,
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      reconcileCompletedAcceptedArtifactAction(context: {
+        issue: Issue;
+      }): Promise<unknown>;
+    };
+
+    await expect(
+      internal.reconcileCompletedAcceptedArtifactAction({ issue: source }),
+    ).resolves.toMatchObject({
+      details: {
+        artifactId: artifact.id,
+        disposition: "terminal_reconciled",
+        nextPhase: "terminal",
+      },
+    });
+    await expect(lifecycleStore.get(source.id)).resolves.toMatchObject({
+      phase: "terminal",
+      acceptedArtifact: {
+        id: artifact.id,
+        status: "completed_unmerged",
+      },
+    });
+    await orchestrator.stop();
+  });
+
+  it("supersedes a completed accepted artifact reopened after its durable Done writeback", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const source = issue({ state: "In Review" });
+    const artifact = acceptedArtifactRecord(source, "artifact-reopened-after-done");
+    await lifecycleStore.ensureIssue(source, {
+      phase: "passed",
+      acceptedArtifact: artifact,
+    });
+    const outbox = new SqliteWritebackOutboxStore(config.workspace.stateDir);
+    const doneOperation = await outbox.enqueueOnce({
+      idempotencyKey: artifact.doneTransitionOperationKey,
+      kind: "transition",
+      issueId: source.id,
+      payload: {
+        acceptedArtifactId: artifact.id,
+        fromStates: ["In Review"],
+        toState: "Done",
+      },
+    });
+    await outbox.markSucceeded(doneOperation);
+    await outbox.close();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      reconcileCompletedAcceptedArtifactAction(context: {
+        issue: Issue;
+      }): Promise<unknown>;
+    };
+
+    await expect(
+      internal.reconcileCompletedAcceptedArtifactAction({ issue: source }),
+    ).resolves.toMatchObject({
+      details: {
+        artifactId: artifact.id,
+        disposition: "superseded_after_reopen",
+      },
+    });
+    const lifecycle = await lifecycleStore.get(source.id);
+    expect(lifecycle?.phase).toBe("review");
+    expect(lifecycle?.acceptedArtifact).toMatchObject({
+      id: artifact.id,
+      supersededBy: "accepted_artifact_source_invalidated",
+    });
+    await orchestrator.stop();
+  });
+
+  it("resumes accepted-artifact completion instead of invalidating the normal pre-Done window", async () => {
+    const config = testConfig(root);
+    config.reviewLoop.reviewStates = ["In Review"];
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const source = issue({ state: "In Review" });
+    const artifact = acceptedArtifactRecord(source, "artifact-pre-done-window");
+    await lifecycleStore.ensureIssue(source, {
+      phase: "passed",
+      acceptedArtifact: artifact,
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const completeAcceptedArtifactAction = vi.fn(async () => ({
+      details: { disposition: "completion_resumed" },
+    }));
+    const internal = orchestrator as unknown as {
+      completeAcceptedArtifactAction: typeof completeAcceptedArtifactAction;
+      reconcileCompletedAcceptedArtifactAction(context: {
+        issue: Issue;
+      }): Promise<unknown>;
+    };
+    internal.completeAcceptedArtifactAction = completeAcceptedArtifactAction;
+
+    await expect(
+      internal.reconcileCompletedAcceptedArtifactAction({ issue: source }),
+    ).resolves.toMatchObject({
+      details: { disposition: "completion_resumed" },
+    });
+    expect(completeAcceptedArtifactAction).toHaveBeenCalledOnce();
+    expect(
+      (await lifecycleStore.get(source.id))?.acceptedArtifact?.supersededAt,
+    ).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it("plans one terminal accepted-artifact dependency and carries it into workspace creation and the worker prompt", async () => {
+    const config = testConfig(root);
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const source = issue({
+      id: "source-issue",
+      identifier: "TEST-RED",
+      state: "Done",
+      branchName: "symphony/TEST-RED",
+    });
+    const target = issue({
+      id: "target-issue",
+      identifier: "TEST-IMPLEMENT",
+      state: "Todo",
+      description: agentEligibleIssueContract(),
+      blockedBy: [{ id: source.id, identifier: source.identifier, state: "Done" }],
+    });
+    const artifact = acceptedArtifactRecord(source);
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      acceptedArtifact: artifact,
+    });
+    await lifecycleStore.ensureIssue(target, { phase: "implementation" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
+      },
+      async fetchIssueStatesByIds(ids) {
+        return ids.includes(source.id) ? [source] : [];
+      },
+    };
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      resolveDependencyArtifactSeedAction(context: unknown): Promise<{
+        status?: string;
+        details?: Record<string, unknown>;
+      }>;
+      renderWorkerPromptBundle(
+        entry: RunningEntry,
+        attempt: number | null,
+        turnNumber: number,
+      ): Promise<{ ephemeralSystemPrompt: string }>;
+      runWorker(entry: RunningEntry, attempt: number | null): Promise<void>;
+    };
+    const context = dependencyArtifactDispatchContext(target);
+
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(context),
+    ).resolves.toMatchObject({
+      details: {
+        artifactId: artifact.id,
+        sourceIssueIdentifier: source.identifier,
+        sourceHeadSha: artifact.sourceHeadSha,
+        targetBranch: "symphony/TEST-IMPLEMENT",
+        seedStatus: "planned",
+      },
+    });
+    const seed = context.dispatch.dependencyArtifactSeed;
+    expect(seed).toMatchObject({
+      kind: "accepted_artifact",
+      artifactId: artifact.id,
+      sourceIssueId: source.id,
+      sourceBranch: "symphony/TEST-RED",
+      configuredBaseRef: "origin/main",
+    });
+    const targetLifecycle = await lifecycleStore.get(target.id);
+    expect(targetLifecycle?.workspaceSeed).toMatchObject({
+      status: "planned",
+      artifactId: artifact.id,
+      targetBranch: "symphony/TEST-IMPLEMENT",
+      preparedBaseHeadSha: null,
+      preparedHeadSha: null,
+    });
+
+    const entry = shutdownTestRunningEntry(target, new AbortController());
+    entry.lifecycle = targetLifecycle;
+    entry.dependencyArtifactSeed = seed;
+    entry.dependencyArtifact = artifact;
+    const promptBundle = await internal.renderWorkerPromptBundle(entry, null, 1);
+    expect(promptBundle.ephemeralSystemPrompt).toContain(
+      "Dependency Artifact Checkpoint:",
+    );
+    expect(promptBundle.ephemeralSystemPrompt).toContain(`Artifact ID: ${artifact.id}`);
+    expect(promptBundle.ephemeralSystemPrompt).toContain(
+      `Required command: ${artifact.artifactEvidence.command}`,
+    );
+
+    const createForIssue = vi
+      .spyOn(workspaceManager, "createForIssue")
+      .mockRejectedValueOnce(new Error("captured accepted-artifact seed"));
+    await expect(internal.runWorker(entry, null)).rejects.toThrow(
+      "captured accepted-artifact seed",
+    );
+    expect(createForIssue).toHaveBeenCalledWith(target, { seed });
+    await orchestrator.stop();
+  });
+
+  it("does not seed from a stale Done blocker snapshot when Linear reports the source reopened", async () => {
+    const config = testConfig(root);
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(
+      config.workspace.stateDir,
+    );
+    const source = issue({
+      id: "reopened-source",
+      identifier: "TEST-RED-REOPENED",
+      state: "Done",
+      branchName: "symphony/TEST-RED-REOPENED",
+    });
+    const target = issue({
+      id: "reopened-target",
+      identifier: "TEST-IMPLEMENT-REOPENED",
+      state: "Todo",
+      description: agentEligibleIssueContract(),
+      blockedBy: [
+        { id: source.id, identifier: source.identifier, state: "Done" },
+      ],
+    });
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      acceptedArtifact: acceptedArtifactRecord(source, "artifact-reopened"),
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [{ ...source, state: "In Progress" }];
+        },
+      },
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      resolveDependencyArtifactSeedAction(context: unknown): Promise<{
+        status?: string;
+        stop?: boolean;
+      }>;
+    };
+    const context = dependencyArtifactDispatchContext(target);
+
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(context),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: `Waiting for fresh accepted-artifact evidence from: ${source.identifier}`,
+    });
+    expect(context.dispatch.dependencyArtifactSeed).toBeNull();
+    expect(await lifecycleStore.get(target.id)).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it("fails closed for missing, canceled, or contract-drifted artifact sources without mutating source evidence", async () => {
+    const config = testConfig(root);
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const driftedSource = issue({
+      id: "drifted-source",
+      identifier: "TEST-RED-DRIFTED",
+      state: "Done",
+    });
+    const driftedArtifact = acceptedArtifactRecord(
+      driftedSource,
+      "artifact-drifted-source",
+    );
+    driftedSource.description = agentEligibleIssueContract({
+      issueContractContractVersion: "2026-07-14.drifted-after-review",
+      issueContractDelivery: {
+        mode: "accepted_artifact",
+        artifact: "expected_red_tests",
+      },
+    });
+    const canceledSource = issue({
+      id: "canceled-source",
+      identifier: "TEST-RED-CANCELED",
+      state: "Done",
+    });
+    const canceledArtifact = acceptedArtifactRecord(
+      canceledSource,
+      "artifact-canceled-source",
+    );
+    canceledSource.state = "Canceled";
+    const missingSource = issue({
+      id: "missing-source",
+      identifier: "TEST-RED-MISSING",
+      state: "Done",
+    });
+    const targets = [driftedSource, canceledSource, missingSource].map(
+      (source) =>
+        issue({
+          id: `target-for-${source.id}`,
+          identifier: `TEST-IMPLEMENT-${source.id.toUpperCase()}`,
+          state: "Todo",
+          description: agentEligibleIssueContract(),
+          blockedBy: [
+            {
+              id: source.id,
+              identifier: source.identifier,
+              state: source.state,
+            },
+          ],
+        }),
+    );
+    await lifecycleStore.ensureIssue(driftedSource, {
+      phase: "terminal",
+      acceptedArtifact: driftedArtifact,
+    });
+    await lifecycleStore.ensureIssue(canceledSource, {
+      phase: "terminal",
+      acceptedArtifact: canceledArtifact,
+    });
+    for (const target of targets) {
+      await lifecycleStore.ensureIssue(target, { phase: "implementation" });
+    }
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds(ids) {
+          return [driftedSource, canceledSource].filter((source) =>
+            ids.includes(source.id),
+          );
+        },
+      },
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      resolveDependencyArtifactSeedAction(context: unknown): Promise<{
+        status?: string;
+        stop?: boolean;
+        message?: string;
+      }>;
+    };
+
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(
+        dependencyArtifactDispatchContext(targets[0]!),
+      ),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: expect.stringContaining(
+        "only superseded accepted-artifact evidence",
+      ),
+    });
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(
+        dependencyArtifactDispatchContext(targets[1]!),
+      ),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: expect.stringContaining(
+        "only superseded accepted-artifact evidence",
+      ),
+    });
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(
+        dependencyArtifactDispatchContext(targets[2]!),
+      ),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: expect.stringContaining(
+        "waiting for fresh Linear state",
+      ),
+    });
+    await expect(lifecycleStore.get(targets[0]!.id)).resolves.toMatchObject({
+      phase: "blocked",
+    });
+    await expect(lifecycleStore.get(targets[1]!.id)).resolves.toMatchObject({
+      phase: "blocked",
+    });
+    await expect(lifecycleStore.get(targets[2]!.id)).resolves.toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+    });
+    expect(
+      (await lifecycleStore.get(driftedSource.id))?.acceptedArtifact
+        ?.supersededAt,
+    ).toBeNull();
+    expect(
+      (await lifecycleStore.get(canceledSource.id))?.acceptedArtifact
+        ?.supersededAt,
+    ).toBeNull();
+    await orchestrator.stop();
+  });
+
+  it("retires target review evidence when a seeded source reopens before review or merge", async () => {
+    const config = testConfig(root);
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.writeback.dispatchState = "In Progress";
+    config.reviewLoop.reviewStates = ["In Review"];
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const source = issue({
+      id: "review-freshness-source",
+      identifier: "TEST-RED-REVIEW-FRESHNESS",
+      state: "Done",
+    });
+    const artifact = acceptedArtifactRecord(
+      source,
+      "artifact-review-freshness",
+    );
+    const target = issue({
+      id: "review-freshness-target",
+      identifier: "TEST-IMPLEMENT-REVIEW-FRESHNESS",
+      state: "In Review",
+      description: agentEligibleIssueContract(),
+      blockedBy: [
+        { id: source.id, identifier: source.identifier, state: "Done" },
+      ],
+    });
+    const seed = {
+      ...plannedWorkspaceSeed(target, acceptedArtifactSeed(artifact)),
+      status: "prepared" as const,
+      preparedBaseHeadSha: "4".repeat(40),
+      preparedHeadSha: "5".repeat(40),
+      preparedAt: "2026-07-14T00:05:00.000Z",
+    };
+    const report = completionReportRecord(target);
+    const verdict: IssueReviewVerdictRecord = {
+      ...reviewVerdictRecord(target),
+      verdict: "pass",
+      passDisposition: "merge",
+      acceptanceResults: [
+        { text: "Inherited tests pass", satisfied: true, evidence: "reviewed" },
+      ],
+      findings: [],
+    };
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      acceptedArtifact: artifact,
+    });
+    await lifecycleStore.ensureIssue(target, {
+      phase: "passed",
+      workspaceSeed: seed,
+      lastCompletionReportId: report.id,
+      completionReports: [report],
+      lastReviewVerdictId: verdict.id,
+      reviewVerdicts: [verdict],
+    });
+    const liveSource = { ...source, state: "In Progress" };
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds(ids) {
+        return [target, liveSource].filter((candidate) =>
+          ids.includes(candidate.id),
+        );
+      },
+    };
+    let targetState = target.state;
+    const writer = new StateChangingWriter((state) => {
+      targetState = state;
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      writeback: new WritebackProcessor(
+        new FileWritebackOutboxStore(config.workspace.stateDir),
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
+    });
+    const internal = orchestrator as unknown as {
+      validateDependencyArtifactBeforeReviewOrMerge(context: {
+        issue: Issue;
+      }): Promise<unknown>;
+    };
+
+    await expect(
+      internal.validateDependencyArtifactBeforeReviewOrMerge({ issue: target }),
+    ).resolves.toMatchObject({ status: "skipped", stop: true });
+    expect(targetState).toBe("In Progress");
+    expect(writer.transitions).toContainEqual(
+      expect.objectContaining({
+        issueId: target.id,
+        toState: "In Progress",
+      }),
+    );
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "implementation",
+      lastCompletionReportId: null,
+      lastReviewVerdictId: null,
+      workspaceSeed: {
+        artifactId: artifact.id,
+        failureReason: expect.stringContaining("not Done"),
+      },
+      completionReports: [
+        {
+          id: report.id,
+          supersededBy: "accepted_artifact_source_invalidated",
+        },
+      ],
+      reviewVerdicts: [
+        {
+          id: verdict.id,
+          supersededBy: "accepted_artifact_source_invalidated",
+        },
+      ],
+    });
+    await orchestrator.stop();
+  });
+
+  it("blocks a successor from consuming a superseded accepted-artifact checkpoint", async () => {
+    const config = testConfig(root);
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const source = issue({
+      id: "superseded-source",
+      identifier: "TEST-RED-SUPERSEDED",
+      state: "Done",
+      branchName: "symphony/TEST-RED-SUPERSEDED",
+    });
+    const target = issue({
+      id: "superseded-target",
+      identifier: "TEST-IMPLEMENT-SUPERSEDED",
+      state: "Todo",
+      description: agentEligibleIssueContract(),
+      blockedBy: [
+        { id: source.id, identifier: source.identifier, state: "Done" },
+      ],
+    });
+    const artifact: IssueAcceptedArtifactRecord = {
+      ...acceptedArtifactRecord(source, "artifact-superseded"),
+      supersededAt: "2026-07-14T01:00:00.000Z",
+      supersededBy: "source_reopened",
+      supersededReason: "The source contract changed",
+    };
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      acceptedArtifact: artifact,
+    });
+    await lifecycleStore.ensureIssue(target, { phase: "implementation" });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [source];
+        },
+      },
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      resolveDependencyArtifactSeedAction(context: unknown): Promise<{
+        status?: string;
+        stop?: boolean;
+        message?: string;
+      }>;
+    };
+
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(
+        dependencyArtifactDispatchContext(target),
+      ),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: expect.stringContaining("superseded accepted-artifact evidence"),
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: expect.stringContaining(artifact.id),
+      workspaceSeed: null,
+    });
+    await orchestrator.stop();
+  });
+
+  it("blocks accepted-artifact replay across a configured base-ref identity change", async () => {
+    const config = testConfig(root);
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/release",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const source = issue({
+      id: "base-drift-source",
+      identifier: "TEST-RED-BASE-DRIFT",
+      state: "Done",
+      branchName: "symphony/TEST-RED-BASE-DRIFT",
+    });
+    const target = issue({
+      id: "base-drift-target",
+      identifier: "TEST-IMPLEMENT-BASE-DRIFT",
+      state: "Todo",
+      description: agentEligibleIssueContract(),
+      blockedBy: [
+        { id: source.id, identifier: source.identifier, state: "Done" },
+      ],
+    });
+    const artifact = acceptedArtifactRecord(source, "artifact-base-drift");
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      acceptedArtifact: artifact,
+    });
+    await lifecycleStore.ensureIssue(target, { phase: "implementation" });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: {
+        async fetchCandidateIssues() {
+          return [];
+        },
+        async fetchIssuesByStates() {
+          return [];
+        },
+        async fetchIssueStatesByIds() {
+          return [source];
+        },
+      },
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      resolveDependencyArtifactSeedAction(context: unknown): Promise<{
+        status?: string;
+        stop?: boolean;
+        message?: string;
+      }>;
+    };
+
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(
+        dependencyArtifactDispatchContext(target),
+      ),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: expect.stringContaining(
+        "was reviewed for base ref origin/main, but Symphony is configured for origin/release",
+      ),
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "blocked",
+      blockedReason: expect.stringContaining("origin/release"),
+      workspaceSeed: null,
+    });
+    await orchestrator.stop();
+  });
+
+  it("runs a conflict-only seed turn, finalizes the rebase, and continues with normal implementation", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const source = issue({
+      id: "conflict-source",
+      identifier: "TEST-RED-CONFLICT",
+      state: "Done",
+      branchName: "symphony/TEST-RED-CONFLICT",
+    });
+    const target = issue({
+      id: "conflict-target",
+      identifier: "TEST-IMPLEMENT-CONFLICT",
+      state: "Todo",
+      description: agentEligibleIssueContract(),
+      blockedBy: [
+        { id: source.id, identifier: source.identifier, state: source.state },
+      ],
+    });
+    const artifact = acceptedArtifactRecord(source, "artifact-conflict");
+    const seed = acceptedArtifactSeed(artifact);
+    const plannedSeed = plannedWorkspaceSeed(target, seed);
+    const conflictedSeed = acceptedArtifactSeedBinding(seed, target, {
+      preparedHeadSha: null,
+      conflictedFiles: [artifact.artifactEvidence.testFiles[0]!],
+    });
+    const finalizedSeed = acceptedArtifactSeedBinding(seed, target, {
+      preparedHeadSha: "5".repeat(40),
+      conflictedFiles: [],
+    });
+    await lifecycleStore.ensureIssue(source, {
+      phase: "terminal",
+      acceptedArtifact: artifact,
+    });
+    const initialLifecycle = await lifecycleStore.ensureIssue(target, {
+      phase: "implementation",
+      workspaceSeed: plannedSeed,
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
+      },
+      async fetchIssueStatesByIds(ids) {
+        return [target, source].filter((candidate) => ids.includes(candidate.id));
+      },
+    };
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    const workspacePath = path.join(root, target.identifier);
+    const createForIssue = vi
+      .spyOn(workspaceManager, "createForIssue")
+      .mockResolvedValue({
+        path: workspacePath,
+        workspaceKey: target.identifier,
+        createdNow: true,
+        issueIdentifier: target.identifier,
+        issueId: target.id,
+        sourceKind: "git_worktree",
+        gitBranchName: conflictedSeed.targetBranch,
+        repoPath: root,
+        baseRef: seed.configuredBaseRef,
+        seed: conflictedSeed,
+      });
+    const beforeRun = vi
+      .spyOn(workspaceManager, "beforeRun")
+      .mockResolvedValue(undefined);
+    const afterRun = vi
+      .spyOn(workspaceManager, "afterRun")
+      .mockResolvedValue(undefined);
+    const finalizeSeedConflict = vi
+      .spyOn(workspaceManager, "finalizeAcceptedArtifactSeedConflict")
+      .mockImplementation(async (candidate) => {
+        expect(candidate).toEqual(target);
+        await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+          phase: "implementation",
+          blockedReason: null,
+          workspaceSeed: {
+            status: "conflicted",
+            artifactId: artifact.id,
+            preparedBaseHeadSha: conflictedSeed.preparedBaseHeadSha,
+            preparedHeadSha: null,
+            conflictedFiles: conflictedSeed.conflictedFiles,
+          },
+        });
+        return finalizedSeed;
+      });
+    const harness = new ReusedRunIdHarness("seed-conflict-continuation-run");
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const internal = orchestrator as unknown as {
+      runWorker(entry: RunningEntry, attempt: number | null): Promise<void>;
+    };
+    const entry = shutdownTestRunningEntry(target, new AbortController());
+    entry.lifecycle = initialLifecycle;
+    entry.dependencyArtifactSeed = seed;
+    entry.dependencyArtifact = artifact;
+
+    await internal.runWorker(entry, null);
+
+    expect(createForIssue).toHaveBeenCalledWith(target, { seed });
+    expect(finalizeSeedConflict).toHaveBeenCalledOnce();
+    expect(beforeRun).toHaveBeenCalledOnce();
+    expect(afterRun).toHaveBeenCalledOnce();
+    expect(harness.runs).toHaveLength(2);
+    expect(harness.runs[0]?.ctx.turnNumber).toBe(1);
+    expect(harness.runs[0]?.prompt).toContain(
+      "Resolve the service-prepared rebase conflict",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "do not submit an MCP handoff in this turn",
+    );
+    expect(harness.runs[0]?.prompt).toContain(
+      "Do not stage, commit, reset, or run any rebase command",
+    );
+    expect(harness.runs[0]?.prompt).not.toContain("rebase --continue");
+    expect(harness.runs[0]?.prompt).not.toContain("submit_completion_report");
+    expect(harness.runs[0]?.ctx.ephemeralSystemPrompt).toContain(
+      "Do not call submit_completion_report in this turn",
+    );
+    expect(harness.runs[0]?.ctx.ephemeralSystemPrompt).toContain(
+      "Symphony will stage the resolution and continue the rebase",
+    );
+    expect(harness.runs[1]?.ctx.turnNumber).toBe(2);
+    expect(harness.runs[1]?.prompt).toContain("submit_completion_report");
+    expect(harness.runs[1]?.ctx.ephemeralSystemPrompt).toContain(
+      "Dependency Artifact Checkpoint:",
+    );
+    expect(entry.dependencyArtifactSeedConflict).toBeNull();
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      incompleteTurnCount: 1,
+      workspaceSeed: {
+        status: "prepared",
+        artifactId: artifact.id,
+        preparedBaseHeadSha: finalizedSeed.preparedBaseHeadSha,
+        preparedHeadSha: finalizedSeed.preparedHeadSha,
+        conflictedFiles: [],
+        preparedAt: expect.any(String),
+        failureReason: null,
+      },
+    });
+    await expect(
+      runStore.getRun("seed-conflict-continuation-run"),
+    ).resolves.toMatchObject({ status: "succeeded" });
+    await orchestrator.stop();
+  });
+
+  it("cleanly redispatches after seed-conflict preparation when only one agent turn is available", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 1;
+    config.reviewLoop.maxIncompleteTurns = 1;
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const source = issue({
+      id: "one-turn-source",
+      identifier: "TEST-RED-ONE-TURN",
+      state: "Done",
+      branchName: "symphony/TEST-RED-ONE-TURN",
+    });
+    const target = issue({
+      id: "one-turn-target",
+      identifier: "TEST-IMPLEMENT-ONE-TURN",
+      state: "Todo",
+      description: agentEligibleIssueContract(),
+    });
+    const artifact = acceptedArtifactRecord(source, "artifact-one-turn");
+    const seed = acceptedArtifactSeed(artifact);
+    const conflictedSeed = acceptedArtifactSeedBinding(seed, target, {
+      preparedHeadSha: null,
+      conflictedFiles: [artifact.artifactEvidence.testFiles[0]!],
+    });
+    const finalizedSeed = acceptedArtifactSeedBinding(seed, target, {
+      preparedHeadSha: "6".repeat(40),
+      conflictedFiles: [],
+    });
+    const initialLifecycle = await lifecycleStore.ensureIssue(target, {
+      phase: "implementation",
+      workspaceSeed: plannedWorkspaceSeed(target, seed),
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [target];
+      },
+    };
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    vi.spyOn(workspaceManager, "createForIssue").mockResolvedValue({
+      path: path.join(root, target.identifier),
+      workspaceKey: target.identifier,
+      createdNow: true,
+      issueIdentifier: target.identifier,
+      issueId: target.id,
+      sourceKind: "git_worktree",
+      gitBranchName: conflictedSeed.targetBranch,
+      repoPath: root,
+      baseRef: seed.configuredBaseRef,
+      seed: conflictedSeed,
+    });
+    vi.spyOn(workspaceManager, "beforeRun").mockImplementation(async () => {
+      await expect(runStore.getRun("fake-one-turn-target-1")).resolves.toMatchObject({
+        status: "running",
+      });
+    });
+    vi.spyOn(workspaceManager, "afterRun").mockResolvedValue(undefined);
+    const finalize = vi
+      .spyOn(workspaceManager, "finalizeAcceptedArtifactSeedConflict")
+      .mockImplementation(async () => {
+        await expect(
+          runStore.getRun("fake-one-turn-target-1"),
+        ).resolves.toMatchObject({ status: "running" });
+        return finalizedSeed;
+      });
+    const harness = new FakeHarness();
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const internal = orchestrator as unknown as {
+      running: Map<string, RunningEntry>;
+      retryAttempts: Map<string, RetryEntry>;
+      runWorker(entry: RunningEntry, attempt: number | null): Promise<void>;
+      monitorRunExit(entry: RunningEntry, run: Promise<void>): Promise<void>;
+    };
+    const entry = shutdownTestRunningEntry(target, new AbortController());
+    entry.lifecycle = initialLifecycle;
+    entry.retryAttempt = 0;
+    entry.dependencyArtifactSeed = seed;
+    entry.dependencyArtifact = artifact;
+    internal.running.set(target.id, entry);
+
+    await internal.monitorRunExit(entry, internal.runWorker(entry, null));
+
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(harness.runs).toHaveLength(1);
+    await expect(runStore.getRun("fake-one-turn-target-1")).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(internal.retryAttempts.get(target.id)).toMatchObject({
+      attempt: 1,
+      delayMs: 1_000,
+      error: null,
+      runPhase: "implementation",
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      incompleteTurnCount: 0,
+      workspaceSeed: {
+        status: "prepared",
+        artifactId: artifact.id,
+        preparedHeadSha: finalizedSeed.preparedHeadSha,
+        failureReason: null,
+      },
+    });
+    await orchestrator.stop();
+  });
+
+  it("keeps an unresolved accepted-artifact seed finalization failure retryable instead of blocking Linear", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const source = issue({
+      id: "retry-source",
+      identifier: "TEST-RED-RETRY",
+      state: "Done",
+      branchName: "symphony/TEST-RED-RETRY",
+    });
+    const target = issue({
+      id: "retry-target",
+      identifier: "TEST-IMPLEMENT-RETRY",
+      state: "Todo",
+      description: agentEligibleIssueContract(),
+    });
+    const artifact = acceptedArtifactRecord(source, "artifact-retry");
+    const seed = acceptedArtifactSeed(artifact);
+    const conflictedSeed = acceptedArtifactSeedBinding(seed, target, {
+      preparedHeadSha: null,
+      conflictedFiles: [artifact.artifactEvidence.testFiles[0]!],
+    });
+    const initialLifecycle = await lifecycleStore.ensureIssue(target, {
+      phase: "implementation",
+      workspaceSeed: plannedWorkspaceSeed(target, seed),
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
+      },
+      async fetchIssueStatesByIds() {
+        return [target];
+      },
+    };
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    vi.spyOn(workspaceManager, "createForIssue").mockResolvedValue({
+      path: path.join(root, target.identifier),
+      workspaceKey: target.identifier,
+      createdNow: true,
+      issueIdentifier: target.identifier,
+      issueId: target.id,
+      sourceKind: "git_worktree",
+      gitBranchName: conflictedSeed.targetBranch,
+      repoPath: root,
+      baseRef: seed.configuredBaseRef,
+      seed: conflictedSeed,
+    });
+    vi.spyOn(workspaceManager, "finalizeAcceptedArtifactSeedConflict")
+      .mockRejectedValue(
+        new SymphonyError(
+          "workspace_error",
+          "git rebase still has unresolved accepted-artifact paths",
+        ),
+      );
+    vi.spyOn(workspaceManager, "removeForPlanning").mockResolvedValue(undefined);
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    let targetState = target.state;
+    const writer = new StateChangingWriter((state) => {
+      targetState = state;
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+      writeback: new WritebackProcessor(
+        outboxStore,
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
+    });
+    const internal = orchestrator as unknown as {
+      running: Map<string, RunningEntry>;
+      retryAttempts: Map<string, RetryEntry>;
+      runWorker(entry: RunningEntry, attempt: number | null): Promise<void>;
+      monitorRunExit(entry: RunningEntry, run: Promise<void>): Promise<void>;
+    };
+    const entry = shutdownTestRunningEntry(target, new AbortController());
+    entry.lifecycle = initialLifecycle;
+    entry.dependencyArtifactSeed = seed;
+    entry.dependencyArtifact = artifact;
+    internal.running.set(target.id, entry);
+
+    await internal.monitorRunExit(entry, internal.runWorker(entry, null));
+
+    expect(internal.retryAttempts.get(target.id)).toMatchObject({
+      issueId: target.id,
+      identifier: target.identifier,
+      attempt: 2,
+      runPhase: "implementation",
+      error: "git rebase still has unresolved accepted-artifact paths",
+    });
+    await expect(runStore.getRun("fake-retry-target-1")).resolves.toMatchObject({
+      status: "failed",
+      error: "git rebase still has unresolved accepted-artifact paths",
+    });
+    expect(targetState).toBe("Todo");
+    expect(writer.transitions).toEqual([]);
+    expect(entry.dependencyArtifactSeedConflict).toEqual(conflictedSeed);
+    const retryLifecycle = await lifecycleStore.get(target.id);
+    expect(retryLifecycle).toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      incompleteTurnCount: 0,
+      workspaceSeed: {
+        status: "conflicted",
+        artifactId: artifact.id,
+        preparedHeadSha: null,
+        conflictedFiles: conflictedSeed.conflictedFiles,
+        failureReason: "git rebase still has unresolved accepted-artifact paths",
+      },
+    });
+    await orchestrator.stop();
+  });
+
+  it("keeps seed-conflict failure routing active after a harness diagnostic", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const source = issue({
+      id: "diagnostic-seed-source",
+      identifier: "TEST-RED-DIAGNOSTIC",
+      state: "Done",
+      branchName: "symphony/TEST-RED-DIAGNOSTIC",
+    });
+    const target = issue({
+      id: "diagnostic-seed-target",
+      identifier: "TEST-IMPLEMENT-DIAGNOSTIC",
+      state: "Todo",
+      description: agentEligibleIssueContract(),
+    });
+    const artifact = acceptedArtifactRecord(source, "artifact-diagnostic");
+    const seed = acceptedArtifactSeed(artifact);
+    const conflictedSeed = acceptedArtifactSeedBinding(seed, target, {
+      preparedHeadSha: null,
+      conflictedFiles: [artifact.artifactEvidence.testFiles[0]!],
+    });
+    const initialLifecycle = await lifecycleStore.ensureIssue(target, {
+      phase: "implementation",
+      workspaceSeed: plannedWorkspaceSeed(target, seed),
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [target];
+      },
+    };
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    vi.spyOn(workspaceManager, "createForIssue").mockResolvedValue({
+      path: path.join(root, target.identifier),
+      workspaceKey: target.identifier,
+      createdNow: true,
+      issueIdentifier: target.identifier,
+      issueId: target.id,
+      sourceKind: "git_worktree",
+      gitBranchName: conflictedSeed.targetBranch,
+      repoPath: root,
+      baseRef: seed.configuredBaseRef,
+      seed: conflictedSeed,
+    });
+    const finalize = vi
+      .spyOn(workspaceManager, "finalizeAcceptedArtifactSeedConflict")
+      .mockResolvedValue(conflictedSeed);
+    const harness = new FakeHarness({
+      events: [
+        {
+          type: "run_diagnostic",
+          code: "hermes_gateway_protocol_error",
+          message: "Diagnostic observed before the harness failed",
+        },
+      ],
+      fail: true,
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness,
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const internal = orchestrator as unknown as {
+      running: Map<string, RunningEntry>;
+      retryAttempts: Map<string, RetryEntry>;
+      runWorker(entry: RunningEntry, attempt: number | null): Promise<void>;
+      monitorRunExit(entry: RunningEntry, run: Promise<void>): Promise<void>;
+    };
+    const entry = shutdownTestRunningEntry(target, new AbortController());
+    entry.lifecycle = initialLifecycle;
+    entry.dependencyArtifactSeed = seed;
+    entry.dependencyArtifact = artifact;
+    internal.running.set(target.id, entry);
+
+    await internal.monitorRunExit(entry, internal.runWorker(entry, null));
+
+    expect(finalize).not.toHaveBeenCalled();
+    expect(entry.failureKind).toBe("harness_diagnostic");
+    expect(internal.retryAttempts.get(target.id)).toMatchObject({
+      issueId: target.id,
+      attempt: 2,
+      error: "fake failure",
+      runPhase: "implementation",
+    });
+    await expect(
+      runStore.getRun("fake-diagnostic-seed-target-1"),
+    ).resolves.toMatchObject({
+      status: "failed",
+      error: "fake failure",
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      workspaceSeed: {
+        status: "conflicted",
+        artifactId: artifact.id,
+        conflictedFiles: conflictedSeed.conflictedFiles,
+        failureReason: "fake failure",
+      },
+    });
+    await orchestrator.stop();
+  });
+
+  it("cancels seed-conflict preparation without retrying or discarding the seed", async () => {
+    const config = testConfig(root);
+    config.agent.maxTurns = 2;
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const runStore = new FileRunTranscriptStore(config.workspace.stateDir);
+    const source = issue({
+      id: "cancel-seed-source",
+      identifier: "TEST-RED-CANCEL",
+      state: "Done",
+      branchName: "symphony/TEST-RED-CANCEL",
+    });
+    const target = issue({
+      id: "cancel-seed-target",
+      identifier: "TEST-IMPLEMENT-CANCEL",
+      state: "Todo",
+      description: agentEligibleIssueContract(),
+    });
+    const artifact = acceptedArtifactRecord(source, "artifact-cancel");
+    const seed = acceptedArtifactSeed(artifact);
+    const conflictedSeed = acceptedArtifactSeedBinding(seed, target, {
+      preparedHeadSha: null,
+      conflictedFiles: [artifact.artifactEvidence.testFiles[0]!],
+    });
+    const initialLifecycle = await lifecycleStore.ensureIssue(target, {
+      phase: "implementation",
+      workspaceSeed: plannedWorkspaceSeed(target, seed),
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [target];
+      },
+    };
+    const workspaceManager = new WorkspaceManager({
+      workspace: config.workspace,
+      hooks: config.hooks,
+      logger,
+    });
+    vi.spyOn(workspaceManager, "createForIssue").mockResolvedValue({
+      path: path.join(root, target.identifier),
+      workspaceKey: target.identifier,
+      createdNow: true,
+      issueIdentifier: target.identifier,
+      issueId: target.id,
+      sourceKind: "git_worktree",
+      gitBranchName: conflictedSeed.targetBranch,
+      repoPath: root,
+      baseRef: seed.configuredBaseRef,
+      seed: conflictedSeed,
+    });
+    const finalize = vi
+      .spyOn(workspaceManager, "finalizeAcceptedArtifactSeedConflict")
+      .mockResolvedValue(conflictedSeed);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager,
+      harness: new FakeHarness({ events: [{ type: "cancelled" }] }),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      runStore,
+    });
+    const internal = orchestrator as unknown as {
+      running: Map<string, RunningEntry>;
+      retryAttempts: Map<string, RetryEntry>;
+      claimed: Set<string>;
+      runWorker(entry: RunningEntry, attempt: number | null): Promise<void>;
+      monitorRunExit(entry: RunningEntry, run: Promise<void>): Promise<void>;
+    };
+    const entry = shutdownTestRunningEntry(target, new AbortController());
+    entry.lifecycle = initialLifecycle;
+    entry.dependencyArtifactSeed = seed;
+    entry.dependencyArtifact = artifact;
+    entry.suppressRetryOnExit = true;
+    internal.running.set(target.id, entry);
+    internal.claimed.add(target.id);
+
+    await internal.monitorRunExit(entry, internal.runWorker(entry, null));
+
+    expect(finalize).not.toHaveBeenCalled();
+    expect(internal.retryAttempts.has(target.id)).toBe(false);
+    expect(internal.claimed.has(target.id)).toBe(false);
+    await expect(runStore.getRun("fake-cancel-seed-target-1")).resolves.toMatchObject({
+      status: "cancelled",
+    });
+    await expect(lifecycleStore.get(target.id)).resolves.toMatchObject({
+      phase: "implementation",
+      blockedReason: null,
+      workspaceSeed: {
+        status: "conflicted",
+        artifactId: artifact.id,
+        preparedHeadSha: null,
+        conflictedFiles: conflictedSeed.conflictedFiles,
+      },
+    });
+    await orchestrator.stop();
+  });
+
+  it("does not treat a partially successful retry transition as a worker dispatch", async () => {
+    const config = testConfig(root);
+    const candidate = issue({
+      id: "partial-retry-dispatch",
+      identifier: "TEST-PARTIAL-RETRY",
+      state: "Todo",
+    });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates() {
+        return [];
+      },
+      async fetchIssueStatesByIds() {
+        return [candidate];
+      },
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const internal = orchestrator as unknown as {
+      retryAttempts: Map<string, RetryEntry>;
+      claimed: Set<string>;
+      onRetryTimer(issueId: string): Promise<void>;
+      processIssueTransitionCandidateEvent(input: {
+        issue: Issue;
+        candidateSource: string;
+        attempt?: number | null;
+        allowExistingClaim?: boolean;
+      }): Promise<{ transition: IssueHistorySnapshot | null; acted: boolean }>;
+    };
+    const now = "2026-07-14T00:00:00.000Z";
+    const partialTransition = {
+      actions: [
+        {
+          actionId: "action-seed",
+          actionType: "resolve_dependency_artifact_seed",
+          status: "succeeded",
+          startedAt: now,
+          completedAt: now,
+          message: null,
+          details: null,
+        },
+        {
+          actionId: "action-writeback",
+          actionType: "apply_worker_dispatch_writeback",
+          status: "failed",
+          startedAt: now,
+          completedAt: now,
+          message: "writeback failed before the monitor started",
+          details: null,
+        },
+      ],
+    } as unknown as IssueHistorySnapshot;
+    const processTransition = vi
+      .spyOn(internal, "processIssueTransitionCandidateEvent")
+      .mockResolvedValue({ transition: partialTransition, acted: true });
+    const timer = setTimeout(() => undefined, 60_000);
+    clearTimeout(timer);
+    internal.retryAttempts.set(candidate.id, {
+      issueId: candidate.id,
+      identifier: candidate.identifier,
+      attempt: 2,
+      delayMs: 1_000,
+      dueAtMs: Date.now(),
+      timer,
+      error: "retrying seed preparation",
+      runPhase: "implementation",
+    });
+    internal.claimed.add(candidate.id);
+
+    await internal.onRetryTimer(candidate.id);
+
+    expect(processTransition).toHaveBeenCalledWith({
+      issue: candidate,
+      candidateSource: "retry_timer",
+      attempt: 2,
+      allowExistingClaim: true,
+    });
+    expect(internal.retryAttempts.has(candidate.id)).toBe(false);
+    expect(internal.claimed.has(candidate.id)).toBe(false);
+    await orchestrator.stop();
+  });
+
+  it("blocks a successor that directly depends on multiple distinct accepted artifacts", async () => {
+    const config = testConfig(root);
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    config.writeback.enabled = true;
+    config.writeback.mode = "live";
+    config.reviewLoop.blockedStates = ["Blocked"];
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const firstSource = issue({
+      id: "source-one",
+      identifier: "TEST-RED-1",
+      state: "Done",
+      branchName: "symphony/TEST-RED-1",
+    });
+    const secondSource = issue({
+      id: "source-two",
+      identifier: "TEST-RED-2",
+      state: "Done",
+      branchName: "symphony/TEST-RED-2",
+    });
+    const target = issue({
+      id: "target-many",
+      identifier: "TEST-IMPLEMENT-MANY",
+      state: "Todo",
+      blockedBy: [
+        { id: firstSource.id, identifier: firstSource.identifier, state: "Done" },
+        { id: secondSource.id, identifier: secondSource.identifier, state: "Done" },
+      ],
+    });
+    const firstArtifact = acceptedArtifactRecord(firstSource, "artifact-one");
+    const secondArtifact = acceptedArtifactRecord(secondSource, "artifact-two");
+    await lifecycleStore.ensureIssue(firstSource, {
+      phase: "terminal",
+      acceptedArtifact: firstArtifact,
+    });
+    await lifecycleStore.ensureIssue(secondSource, {
+      phase: "terminal",
+      acceptedArtifact: secondArtifact,
+    });
+    await lifecycleStore.ensureIssue(target, { phase: "implementation" });
+    const sourcesById = new Map([
+      [firstSource.id, firstSource],
+      [secondSource.id, secondSource],
+    ]);
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
+      },
+      async fetchIssueStatesByIds(ids) {
+        return ids.flatMap((id) => {
+          const found = sourcesById.get(id);
+          return found ? [found] : [];
+        });
+      },
+    };
+    let targetState = target.state;
+    const outboxStore = new FileWritebackOutboxStore(config.workspace.stateDir);
+    const writer = new StateChangingWriter((state) => {
+      targetState = state;
+    });
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+      writeback: new WritebackProcessor(
+        outboxStore,
+        writer,
+        logger,
+        config.writeback.maxBackoffMs,
+      ),
+    });
+    const internal = orchestrator as unknown as {
+      resolveDependencyArtifactSeedAction(context: unknown): Promise<{
+        status?: string;
+        stop?: boolean;
+        message?: string;
+      }>;
+    };
+
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(
+        dependencyArtifactDispatchContext(target),
+      ),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      stop: true,
+      message: expect.stringContaining(
+        "multiple accepted artifacts require integration before dispatch",
+      ),
+    });
+    expect(await lifecycleStore.get(target.id)).toMatchObject({
+      phase: "blocked",
+      blockedReason: expect.stringContaining(firstArtifact.id),
+    });
+    expect((await lifecycleStore.get(target.id))?.blockedReason).toContain(
+      secondArtifact.id,
+    );
+    expect(targetState).toBe("Blocked");
+    expect(writer.transitions).toEqual([
+      expect.objectContaining({
+        issueId: target.id,
+        fromStates: expect.arrayContaining(["Todo"]),
+        toState: "Blocked",
+      }),
+    ]);
+    await orchestrator.stop();
+  });
+
+  it("does not seed a successor from an ordinary terminal dependency", async () => {
+    const config = testConfig(root);
+    config.workspace.source = {
+      kind: "git_worktree",
+      repository: "https://github.test/acme/symphony.git",
+      baseRef: "origin/main",
+    };
+    const logger = new StructuredLogger(() => undefined);
+    const lifecycleStore = new FileIssueLifecycleStore(config.workspace.stateDir);
+    const source = issue({
+      id: "ordinary-source",
+      identifier: "TEST-NORMAL",
+      state: "Done",
+    });
+    const target = issue({
+      id: "ordinary-target",
+      identifier: "TEST-AFTER-NORMAL",
+      state: "Todo",
+      blockedBy: [{ id: source.id, identifier: source.identifier, state: "Done" }],
+    });
+    await lifecycleStore.ensureIssue(source, { phase: "terminal" });
+    await lifecycleStore.ensureIssue(target, { phase: "implementation" });
+    const tracker: TrackerClient = {
+      async fetchCandidateIssues() {
+        return [];
+      },
+      async fetchIssuesByStates(states) {
+        return issuesInStates([], states);
+      },
+      async fetchIssueStatesByIds(ids) {
+        return ids.includes(source.id) ? [source] : [];
+      },
+    };
+    const orchestrator = new Orchestrator({
+      config,
+      tracker,
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+      lifecycleStore,
+    });
+    const internal = orchestrator as unknown as {
+      resolveDependencyArtifactSeedAction(context: unknown): Promise<{
+        status?: string;
+        message?: string;
+      }>;
+    };
+    const context = dependencyArtifactDispatchContext(target);
+
+    await expect(
+      internal.resolveDependencyArtifactSeedAction(context),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      message: "No completed accepted-artifact dependency applies",
+    });
+    expect(context.dispatch.dependencyArtifactSeed).toBeNull();
+    expect(context.dispatch.dependencyArtifact).toBeNull();
+    expect((await lifecycleStore.get(target.id))?.workspaceSeed).toBeNull();
+    await orchestrator.stop();
+  });
+
   it("does not dispatch normal implementation while an open merge conflict is pending", async () => {
     const config = mergePolicyOrchestratorConfig(root);
     config.tracker.activeStates = ["Todo", "In Progress"];
@@ -10693,7 +12740,7 @@ describe("Orchestrator", () => {
     expect(prompt).toContain('event "APPROVE"');
     expect(prompt).toContain('event "REQUEST_CHANGES"');
     expect(prompt).toContain(
-      "These supplemental comments do not satisfy pass approval",
+      "These supplemental comments do not satisfy either whole-PR pass feedback requirement",
     );
     expect(prompt).toContain("Never call submit_pull_request_review_feedback with {}");
     expect(prompt).toContain(
@@ -10706,7 +12753,7 @@ describe("Orchestrator", () => {
       'event "REQUEST_CHANGES", "COMMENT", or "APPROVE"',
     );
     expect(prompt).toContain(
-      "PR number, repository, token, or commit identity",
+      "PR number, repository, token, and commit identity",
     );
     expect(prompt).toContain("Symphony service-owned review feedback workflow");
     expect(prompt).toContain("Do not run gh pr review");
@@ -14660,6 +16707,151 @@ function completionReportRecord(
   };
 }
 
+function acceptedArtifactRecord(
+  sourceIssue: Issue,
+  artifactId = `accepted-artifact:${sourceIssue.id}`,
+): IssueAcceptedArtifactRecord {
+  let sourceContract = parseIssueContract(sourceIssue.description);
+  if (!sourceContract.valid) {
+    sourceIssue.description = agentEligibleIssueContract({
+      issueContractContractVersion: `2026-07-14.${sourceIssue.identifier}`,
+      issueContractDelivery: {
+        mode: "accepted_artifact",
+        artifact: "expected_red_tests",
+      },
+    });
+    sourceContract = parseIssueContract(sourceIssue.description);
+  }
+  if (!sourceContract.valid) throw new Error("Accepted artifact test contract is invalid");
+  const testFile = `tests/${sourceIssue.identifier.toLowerCase()}-expected-red.test.ts`;
+  return {
+    version: 1,
+    id: artifactId,
+    kind: "expected_red_tests",
+    status: "completed_unmerged",
+    sourceIssueId: sourceIssue.id,
+    sourceIssueIdentifier: sourceIssue.identifier,
+    contractFingerprint: sourceContract.fingerprint,
+    completionReportId: `completion-report:${sourceIssue.id}`,
+    reviewVerdictId: `review-verdict:${sourceIssue.id}`,
+    reviewFeedbackId: `review-feedback:${sourceIssue.id}`,
+    repositoryFingerprint: "github.test/acme/symphony",
+    pullRequest: {
+      url: `https://github.test/acme/symphony/pull/${sourceIssue.id}`,
+      number: 42,
+      headSha: "2".repeat(40),
+      branch: sourceIssue.branchName ?? `symphony/${sourceIssue.identifier}`,
+      draft: true,
+    },
+    sourceBaseHeadSha: "1".repeat(40),
+    sourceHeadSha: "2".repeat(40),
+    baseRef: "origin/main",
+    changedFiles: [testFile],
+    fileManifest: [
+      {
+        path: testFile,
+        status: "added",
+        blobSha: "3".repeat(40),
+      },
+    ],
+    artifactEvidence: {
+      kind: "expected_red_tests",
+      command: `npm test -- ${testFile}`,
+      testFiles: [testFile],
+      expectedFailure: "The successor implementation is not present.",
+      observedFailure: "Expected enabled behavior, received disabled behavior.",
+      exitCode: 1,
+    },
+    commentOperationKey: `comment:${artifactId}`,
+    doneTransitionOperationKey: `transition:${artifactId}:done`,
+    acceptedAt: "2026-07-14T00:00:00.000Z",
+    checkpointedAt: "2026-07-14T00:01:00.000Z",
+    prClosedAt: "2026-07-14T00:02:00.000Z",
+    completedAt: "2026-07-14T00:03:00.000Z",
+  };
+}
+
+function acceptedArtifactSeed(
+  artifact: IssueAcceptedArtifactRecord,
+): AcceptedArtifactWorkspaceSeed {
+  return {
+    version: 1,
+    kind: "accepted_artifact",
+    artifactId: artifact.id,
+    sourceIssueId: artifact.sourceIssueId,
+    sourceIssueIdentifier: artifact.sourceIssueIdentifier,
+    repositoryFingerprint: artifact.repositoryFingerprint,
+    sourceBranch:
+      artifact.pullRequest.branch ?? `symphony/${artifact.sourceIssueIdentifier}`,
+    sourceHeadSha: artifact.sourceHeadSha,
+    sourceBaseHeadSha: artifact.sourceBaseHeadSha,
+    configuredBaseRef: artifact.baseRef,
+    fileManifest: artifact.fileManifest.map((entry) => ({ ...entry })),
+  };
+}
+
+function plannedWorkspaceSeed(
+  target: Issue,
+  seed: AcceptedArtifactWorkspaceSeed,
+): IssueWorkspaceSeedRecord {
+  return {
+    version: 1,
+    id: `workspace-seed:${target.id}:${seed.artifactId}`,
+    kind: "accepted_artifact",
+    status: "planned",
+    artifactId: seed.artifactId,
+    sourceIssueId: seed.sourceIssueId,
+    sourceIssueIdentifier: seed.sourceIssueIdentifier,
+    repositoryFingerprint: seed.repositoryFingerprint,
+    sourceBranch: seed.sourceBranch,
+    sourceHeadSha: seed.sourceHeadSha,
+    sourceBaseHeadSha: seed.sourceBaseHeadSha,
+    configuredBaseRef: seed.configuredBaseRef,
+    preparedBaseHeadSha: null,
+    preparedHeadSha: null,
+    targetBranch: target.branchName ?? `symphony/${target.identifier}`,
+    conflictedFiles: [],
+    plannedAt: "2026-07-14T00:04:00.000Z",
+    preparedAt: null,
+    failureReason: null,
+  };
+}
+
+function acceptedArtifactSeedBinding(
+  seed: AcceptedArtifactWorkspaceSeed,
+  target: Issue,
+  overrides: Pick<
+    WorkspaceSeedBinding,
+    "preparedHeadSha" | "conflictedFiles"
+  >,
+): WorkspaceSeedBinding {
+  return {
+    ...seed,
+    targetBranch: target.branchName ?? `symphony/${target.identifier}`,
+    preparedBaseHeadSha: "4".repeat(40),
+    preparedHeadSha: overrides.preparedHeadSha,
+    conflictedFiles: [...overrides.conflictedFiles],
+  };
+}
+
+function dependencyArtifactDispatchContext(candidate: Issue): {
+  issue: Issue;
+  transition: { runPhase: "implementation" };
+  dispatch: {
+    dependencyArtifactSeed: AcceptedArtifactWorkspaceSeed | null;
+    dependencyArtifact: IssueAcceptedArtifactRecord | null;
+  };
+} {
+  return {
+    issue: candidate,
+    transition: { runPhase: "implementation" },
+    dispatch: {
+      dependencyArtifactSeed: null,
+      dependencyArtifact: null,
+    },
+  };
+}
+
 function openMergeConflict(candidate = issue()): IssueMergeConflictMetadata {
   return {
     id: `merge-conflict:${candidate.id}:42`,
@@ -15941,6 +18133,8 @@ function mergePolicyRulesetSnapshot(
     lastMergeGateResultId: null,
     latestCompletionReport: null,
     latestApprovalPassVerdict: null,
+    acceptedArtifact: null,
+    workspaceSeed: null,
     mergeGate: null,
     mergeConflict: null,
     lifecycleSummaryCiStatus: null,
@@ -16196,6 +18390,31 @@ class RecordingShutdownProgress {
   }
 }
 
+class ReusedRunIdHarness implements AgentHarness {
+  readonly id = "reused-run-id";
+  readonly capabilities = {
+    continuation: true,
+    mcpHandoff: true,
+    ephemeralSystemPrompt: true,
+  };
+  readonly runs: Array<{ ctx: AgentRunContext; prompt: string }> = [];
+
+  constructor(private readonly runId: string) {}
+
+  async *run(
+    ctx: AgentRunContext,
+    prompt: string,
+  ): AsyncIterable<AgentEvent> {
+    this.runs.push({ ctx, prompt });
+    yield {
+      type: "session_started",
+      sessionId: this.runId,
+      runId: this.runId,
+    };
+    yield { type: "completed", message: `turn ${ctx.turnNumber} completed` };
+  }
+}
+
 function shutdownTestRunningEntry(activeIssue: Issue, abortController: AbortController): RunningEntry {
   return {
     issue: activeIssue,
@@ -16236,6 +18455,12 @@ function shutdownTestRunningEntry(activeIssue: Issue, abortController: AbortCont
     pullRequestHandoffAccepted: false,
     reviewVerdictAccepted: false,
     reviewEvidence: null,
+    dependencyArtifactSeed: null,
+    dependencyArtifact: null,
+    dependencyArtifactSeedConflict: null,
+    acceptedArtifactSeedPreparationActive: false,
+    acceptedArtifactSeedFreshDispatch: false,
+    acceptedArtifactSeedFailureDisposition: null,
     manualDispatch: null,
     handoffRepair: null,
     hermesResume: null,
