@@ -7052,7 +7052,76 @@ describe("Orchestrator", () => {
     await orchestrator.stop();
   });
 
-  it("re-observes non-repairable base-ref blockers after operator resumes an issue to an active state", async () => {
+  it("retries transient base-ref failures inside a guarded transition chain", async () => {
+    await mkdir(path.join(root, ".git"));
+    const config = mergePolicyOrchestratorConfig(root);
+    const logger = new StructuredLogger(() => undefined);
+    const orchestrator = new Orchestrator({
+      config,
+      tracker: emptyTracker(),
+      workspaceManager: new WorkspaceManager({
+        workspace: config.workspace,
+        hooks: config.hooks,
+        logger,
+      }),
+      harness: new FakeHarness(),
+      logger,
+      promptTemplate: "Work on {{ issue.identifier }}",
+    });
+    const chainRuleset = orchestrator
+      .registeredTransitionRulesets()
+      .find((ruleset) => ruleset.id === "orchestrator.base_ref.chain");
+    const targetRequest = {
+      transitionKind: "dispatch_worker" as const,
+      reason: "worker_dispatch",
+      role: "worker" as const,
+      runPhase: "implementation" as const,
+      runKind: "implementation" as const,
+    };
+    const observation = baseRefObservationForTest({
+      classification: "local_base_mismatch",
+      operation: targetRequest.transitionKind,
+      workspacePath: root,
+      localBaseHeadShaAfterFetch: "",
+      worktreeHeadSha: "",
+      localBaseIsAncestorOfHead: null,
+      reason: "Fetched local base ref does not match GitHub live base",
+    });
+    const snapshot = mergePolicyRulesetSnapshot({
+      triggerType: "runtime.requested",
+      triggerSource: "transition",
+      transitionRequestContext: {
+        kind: "base_ref_chain",
+        requestId: "transition-request-base-ref-retry",
+        requestedAt: "2026-01-01T00:00:01.000Z",
+        parentHistorySnapshotId: "base-ref-observation-1",
+        parentTransitionKind: "base_ref_observe",
+        payload: {
+          targetTransitionKind: targetRequest.transitionKind,
+          targetRequest,
+          chainId: "base-ref-chain-1",
+          iteration: 1,
+          maxIterations: 3,
+        },
+      },
+      lastBaseRefObservation: observation,
+      lastBaseRefObservationFingerprint: observation.inputFingerprint,
+      lastBaseRefObservationClassification: observation.classification,
+      latestWorkspacePath: observation.workspacePath,
+      latestGitBranchName: observation.branchName,
+      latestBaseRef: observation.baseRef,
+    });
+
+    expect(chainRuleset?.evaluate(snapshot, [])).toMatchObject({
+      transitionKind: "base_ref_observe",
+      reason: "transient_base_ref_verification_retry",
+      baseRefTargetTransitionKind: "dispatch_worker",
+      baseRefTargetRequest: targetRequest,
+    });
+    await orchestrator.stop();
+  });
+
+  it("re-observes stale completion-handoff base-ref blockers after operator resume", async () => {
     const config = mergePolicyOrchestratorConfig(root);
     config.tracker.activeStates = ["Todo", "In Progress"];
     config.reviewLoop.blockedStates = ["Blocked"];
@@ -7079,7 +7148,7 @@ describe("Orchestrator", () => {
     );
     const observation = baseRefObservationForTest({
       classification: "base_ref_unavailable",
-      operation: "dispatch_worker",
+      operation: "reconcile_completion_report_handoff",
       localBaseIsAncestorOfHead: null,
       githubBaseHeadSha: null,
       localBaseHeadShaAfterFetch: null,

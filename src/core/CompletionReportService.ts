@@ -735,7 +735,7 @@ export class CompletionReportService {
     const handoffChecks = acceptedArtifact
       ? null
       : await this.evaluatePullRequestHandoffChecks(verifiedPullRequest);
-    if (acceptedArtifact && (!this.options.config.github.prHandoff.enabled || !verifiedPullRequest || verifiedPullRequest.draft !== true)) {
+    if (acceptedArtifact && (!verifiedPullRequest || verifiedPullRequest.draft !== true)) {
       throw new SymphonyError(
         "invalid_request",
         "Accepted expected-red artifacts require a verified draft pull request handoff",

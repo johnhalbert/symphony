@@ -184,9 +184,9 @@ describe("TransitionPolicy review-loop planners", () => {
 
   it("plans an expected-red draft PR handoff without treating its nonzero result as failed CI", () => {
     const config = reviewLoopConfig();
-    config.tracker.handoffStates = ["Human Review"];
-    config.github.prHandoff.enabled = true;
-    config.github.prHandoff.targetState = "Human Review";
+    config.reviewLoop.reviewStates = ["In Review"];
+    config.reviewLoop.blockedStates = ["Blocked"];
+    config.github.prHandoff.enabled = false;
     const operations = planAcceptedArtifactHandoffWritebacks(
       {
         issue: issue({ state: "In Progress", branchName: "symphony/TEST-1" }),
@@ -223,7 +223,7 @@ describe("TransitionPolicy review-loop planners", () => {
     expect(commentBody(operations, 0)).toContain("Intentional nonzero exit code: 1");
     expect(operations[1]).toMatchObject({
       kind: "transition",
-      payload: { fromStates: ["In Progress"], toState: "Human Review" },
+      payload: { fromStates: ["In Progress", "Blocked"], toState: "In Review" },
     });
   });
 

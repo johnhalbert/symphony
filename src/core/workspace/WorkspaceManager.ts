@@ -835,7 +835,7 @@ function runCommand(command: string, args: string[], cwd: string, timeoutMs: num
       clearTimeout(timer);
       reject(error);
     });
-    child.on("exit", (code) => {
+    child.on("close", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);

@@ -6,6 +6,7 @@ import type { ServiceConfig } from "../config/Config.js";
 import {
   BaseRefVerifier,
   baseRefBlockedReason,
+  baseRefObservationIsTransient,
   baseRefObservationInputFingerprint,
   type IssueBaseRefObservation,
 } from "../BaseRefVerification.js";
@@ -9675,6 +9676,14 @@ export class Orchestrator {
     ) {
       if (observation.classification === "ok") return targetRequest;
       const blockedReason = baseRefBlockedReason(observation);
+      if (baseRefObservationIsTransient(observation)) {
+        return {
+          transitionKind: "base_ref_observe",
+          reason: "transient_base_ref_verification_retry",
+          baseRefTargetTransitionKind: targetRequest.transitionKind,
+          baseRefTargetRequest: targetRequest,
+        };
+      }
       if (baseRefObservationCanRepairByRebase(observation)) {
         return {
           transitionKind: "base_ref_repair",
@@ -10280,6 +10289,8 @@ export class Orchestrator {
       this.baseRefObservationRefreshTransitionRequest(snapshot, observation);
     if (refreshRequest !== null) return refreshRequest;
 
+    if (baseRefObservationIsTransient(observation)) return null;
+
     if (baseRefObservationCanRepairByRebase(observation)) {
       return {
         transitionKind: "base_ref_repair",
@@ -10311,8 +10322,6 @@ export class Orchestrator {
     if (isStateIn(snapshot.trackerState, this.config.reviewLoop.blockedStates))
       return null;
     if (baseRefObservationCanRepairByRebase(observation)) return null;
-    if (observation.operation !== "dispatch_worker") return null;
-
     const targetRequest = dispatchTransitionRequest({
       role: "worker",
       runPhase: "implementation",

@@ -470,11 +470,11 @@ export function planAcceptedArtifactHandoffWritebacks(
   config: ServiceConfig,
   details: AcceptedArtifactHandoffWritebackDetails,
 ): NewWritebackOperation[] {
-  if (!config.writeback.enabled || !config.github.prHandoff.enabled) return [];
-  const handoffFromStates = pullRequestHandoffFromStates(config);
+  if (!config.writeback.enabled) return [];
+  const handoffFromStates = completionReportAcceptedFromStates(config);
   if (!isStateIn(context.issue.state, handoffFromStates)) return [];
-  const targetState = config.github.prHandoff.targetState;
-  if (targetState === null) return [];
+  const targetState = config.reviewLoop.reviewStates[0];
+  if (!targetState) return [];
   if (
     details.pullRequest.draft !== true ||
     details.artifactEvidence.kind !== "expected_red_tests" ||

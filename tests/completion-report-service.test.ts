@@ -646,7 +646,7 @@ describe("CompletionReportService", () => {
     });
   });
 
-  it("publishes accepted expected-red artifacts as draft PRs without requiring green checks", async () => {
+  it("publishes accepted expected-red artifacts as draft PRs without generic PR handoff or green checks", async () => {
     const publisher = new FakePublisher(
       {
         action: "created",
@@ -664,6 +664,7 @@ describe("CompletionReportService", () => {
     const { service, lifecycleStore, runStore } = fixture({
       publisher,
       configure(config) {
+        config.github.prHandoff.enabled = false;
         config.github.prHandoff.requiredChecks = ["Typecheck and test"];
         config.github.prHandoff.noCiAllowed = false;
         config.github.prHandoff.noCiEvidence = null;

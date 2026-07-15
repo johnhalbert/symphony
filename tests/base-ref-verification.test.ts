@@ -5,6 +5,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   BaseRefVerifier,
+  baseRefObservationIsTransient,
+  runBaseRefCommand,
   type BaseRefGitHubClient,
 } from "../src/core/BaseRefVerification.js";
 
@@ -91,6 +93,57 @@ describe("BaseRefVerifier", () => {
       githubBaseHeadSha: bogusSha,
     });
     expect(observation.localBaseHeadShaAfterFetch).not.toBe(bogusSha);
+  });
+
+  it("waits for inherited stdout pipes to close before resolving a command", async () => {
+    const delayedWriter = `setTimeout(() => process.stdout.write("late-output"), 25);`;
+    const parent = [
+      `const { spawn } = require("node:child_process");`,
+      `const child = spawn(${JSON.stringify(process.execPath)}, ["-e", ${JSON.stringify(delayedWriter)}], { detached: true, stdio: ["ignore", "inherit", "inherit"] });`,
+      "child.unref();",
+    ].join("\n");
+
+    const result = await runBaseRefCommand(
+      process.execPath,
+      ["-e", parent],
+      root,
+      2_000,
+      {},
+    );
+
+    expect(result).toMatchObject({ code: 0, stdout: "late-output" });
+  });
+
+  it("distinguishes transient remote failures from missing local metadata", () => {
+    const remoteFailure = {
+      version: 1 as const,
+      inputFingerprint: "remote",
+      classification: "base_ref_unavailable" as const,
+      operation: "dispatch_worker",
+      checkedAt: "2026-01-01T00:00:00.000Z",
+      workspacePath: "/tmp/workspace",
+      branchName: "feature",
+      baseRef: "origin/main",
+      normalizedBaseBranch: "main",
+      localBaseRef: "refs/remotes/origin/main",
+      githubBaseHeadSha: null,
+      localBaseHeadShaBeforeFetch: "abc",
+      localBaseHeadShaAfterFetch: null,
+      worktreeHeadSha: null,
+      localBaseIsAncestorOfHead: null,
+      reason: "Unable to resolve GitHub live base ref",
+      error: "fetch failed",
+    };
+
+    expect(baseRefObservationIsTransient(remoteFailure)).toBe(true);
+    expect(
+      baseRefObservationIsTransient({
+        ...remoteFailure,
+        inputFingerprint: "metadata",
+        reason: "Base ref verification requires a workspace path, branch, and base ref",
+        error: null,
+      }),
+    ).toBe(false);
   });
 
   async function createRepo(): Promise<{ workspace: string; remote: string }> {

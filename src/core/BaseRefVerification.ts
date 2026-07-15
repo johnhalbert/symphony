@@ -135,9 +135,12 @@ export class BaseRefVerifier {
     }
 
     try {
-      draft.githubBaseHeadSha = await input.client.getBranchHeadSha({
+      draft.githubBaseHeadSha = nonEmptyString(await input.client.getBranchHeadSha({
         branchName: normalizedBaseBranch,
-      });
+      }));
+      if (draft.githubBaseHeadSha === null) {
+        throw new SymphonyError("invalid_request", "GitHub returned an empty live base SHA");
+      }
     } catch (error) {
       return this.observation(input, draft, "base_ref_unavailable", "Unable to resolve GitHub live base ref", errorMessage(error));
     }
@@ -237,6 +240,22 @@ export function baseRefBlockedReason(observation: IssueBaseRefObservation): stri
   }
 }
 
+export function baseRefObservationIsTransient(
+  observation: IssueBaseRefObservation,
+): boolean {
+  if (
+    observation.classification === "local_base_mismatch" ||
+    observation.classification === "base_ref_fetch_failed" ||
+    observation.classification === "base_ref_compare_failed"
+  ) {
+    return true;
+  }
+  return (
+    observation.classification === "base_ref_unavailable" &&
+    observation.reason === "Unable to resolve GitHub live base ref"
+  );
+}
+
 export async function localRemoteBaseRefExists(input: {
   workspacePath: string | null | undefined;
   baseRef: string | null | undefined;
@@ -313,7 +332,11 @@ class BaseRefGit {
     const result = await this.git(["rev-parse", `${refName}^{commit}`], {
       allowFailure: allowMissing,
     });
-    if (result.code === 0) return result.stdout.trim();
+    if (result.code === 0) {
+      const sha = result.stdout.trim();
+      if (sha.length > 0) return sha;
+      throw new SymphonyError("invalid_request", `${refName} resolved to an empty SHA`);
+    }
     if (allowMissing) return null;
     throw new SymphonyError("invalid_request", `${refName} could not be resolved`);
   }
@@ -329,7 +352,9 @@ class BaseRefGit {
   }
 
   async headSha(): Promise<string> {
-    return (await this.git(["rev-parse", "HEAD"])).stdout.trim();
+    const sha = (await this.git(["rev-parse", "HEAD"])).stdout.trim();
+    if (sha.length > 0) return sha;
+    throw new SymphonyError("invalid_request", "HEAD resolved to an empty SHA");
   }
 
   async isAncestor(ancestorSha: string, descendant: string): Promise<boolean> {
@@ -341,24 +366,24 @@ class BaseRefGit {
     throw new SymphonyError("invalid_request", "Unable to compare local base ancestry");
   }
 
-  private git(args: string[], options: { allowFailure?: boolean } = {}): Promise<GitResult> {
-    return runCommand("git", args, this.workspacePath, DEFAULT_GIT_TIMEOUT_MS, options);
+  private git(args: string[], options: { allowFailure?: boolean } = {}): Promise<BaseRefCommandResult> {
+    return runBaseRefCommand("git", args, this.workspacePath, DEFAULT_GIT_TIMEOUT_MS, options);
   }
 }
 
-interface GitResult {
+export interface BaseRefCommandResult {
   code: number;
   stdout: string;
   stderr: string;
 }
 
-function runCommand(
+export function runBaseRefCommand(
   command: string,
   args: string[],
   cwd: string,
   timeoutMs: number,
   options: { allowFailure?: boolean },
-): Promise<GitResult> {
+): Promise<BaseRefCommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let settled = false;
@@ -383,7 +408,7 @@ function runCommand(
       clearTimeout(timer);
       reject(error);
     });
-    child.on("exit", (code) => {
+    child.on("close", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
