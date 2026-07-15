@@ -207,7 +207,7 @@ export interface PullRequestHandoffWritebackDetails {
 
 export interface AcceptedArtifactHandoffWritebackDetails {
   pullRequest: PullRequestHandoffWritebackDetails["pullRequest"];
-  report?: CompletionReportWritebackDetails | null;
+  report: CompletionReportWritebackDetails;
   artifactEvidence: ExpectedRedArtifactEvidence;
 }
 
@@ -486,7 +486,8 @@ export function planAcceptedArtifactHandoffWritebacks(
 
   const pullRequestKey = pullRequestIdempotencySegment(details.pullRequest);
   const headKey = safeKeySegment(details.pullRequest.headSha ?? "no-head-sha");
-  const eventKey = `pull-request-handoff:accepted-artifact:${pullRequestKey}:${headKey}`;
+  const reportKey = safeKeySegment(details.report.reportId);
+  const eventKey = `pull-request-handoff:accepted-artifact:${pullRequestKey}:${headKey}:report-${reportKey}`;
   return [
     {
       idempotencyKey: `comment:${context.issue.id}:${eventKey}`,
@@ -518,7 +519,7 @@ export function planAcceptedArtifactHandoffWritebacks(
           `- Observed failure: ${details.artifactEvidence.observedFailure}`,
           `- Intentional nonzero exit code: ${details.artifactEvidence.exitCode}`,
           `- Test files: ${details.artifactEvidence.testFiles.join(", ")}`,
-          ...(details.report ? formatCompletionReportForComment(details.report) : []),
+          ...formatCompletionReportForComment(details.report),
         ].join("\n"),
       },
     },

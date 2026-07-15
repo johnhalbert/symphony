@@ -196,6 +196,7 @@ describe("TransitionPolicy review-loop planners", () => {
       },
       config,
       {
+        report: acceptedArtifactHandoffReport("report-red-1", "report-red-idem-1"),
         pullRequest: {
           url: "https://github.com/acme/symphony/pull/42",
           number: 42,
@@ -216,13 +217,64 @@ describe("TransitionPolicy review-loop planners", () => {
 
     expect(operations).toHaveLength(2);
     expect(operations[0]).toMatchObject({
-      idempotencyKey: "comment:issue-1:pull-request-handoff:accepted-artifact:pr-42:abc123",
-      payload: { dedupeKey: "pull-request-handoff:accepted-artifact:pr-42:abc123" },
+      idempotencyKey: "comment:issue-1:pull-request-handoff:accepted-artifact:pr-42:abc123:report-report-red-1",
+      payload: { dedupeKey: "pull-request-handoff:accepted-artifact:pr-42:abc123:report-report-red-1" },
     });
     expect(commentBody(operations, 0)).toContain("intentionally unmerged test artifact");
     expect(commentBody(operations, 0)).toContain("Intentional nonzero exit code: 1");
     expect(operations[1]).toMatchObject({
       kind: "transition",
+      payload: { fromStates: ["In Progress", "Blocked"], toState: "In Review" },
+    });
+  });
+
+  it("distinguishes same-head accepted-artifact retries by completion report", () => {
+    const config = reviewLoopConfig();
+    const context = {
+      issue: issue({ state: "In Progress" }),
+      runId: "run-red-1",
+      sessionId: null,
+      workspacePath: "/tmp/workspace",
+    };
+    const shared = {
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "abc123",
+        branch: "symphony/TEST-1",
+        draft: true,
+      },
+      artifactEvidence: {
+        kind: "expected_red_tests" as const,
+        command: "npm test",
+        testFiles: ["tests/feature.test.ts"],
+        expectedFailure: "implementation is absent",
+        observedFailure: "expected enabled, received disabled",
+        exitCode: 1,
+      },
+    };
+
+    const first = planAcceptedArtifactHandoffWritebacks(context, config, {
+      ...shared,
+      report: acceptedArtifactHandoffReport("report-red-1", "report-red-idem-1"),
+    });
+    const replay = planAcceptedArtifactHandoffWritebacks(context, config, {
+      ...shared,
+      report: acceptedArtifactHandoffReport("report-red-1", "report-red-idem-1"),
+    });
+    const retry = planAcceptedArtifactHandoffWritebacks(context, config, {
+      ...shared,
+      report: acceptedArtifactHandoffReport("report-red-2", "report-red-idem-2"),
+    });
+
+    expect(first.map((operation) => operation.idempotencyKey)).toEqual(
+      replay.map((operation) => operation.idempotencyKey),
+    );
+    expect(retry.map((operation) => operation.idempotencyKey)).not.toEqual(
+      first.map((operation) => operation.idempotencyKey),
+    );
+    expect(retry[1]).toMatchObject({
+      idempotencyKey: "transition:issue-1:pull-request-handoff:accepted-artifact:pr-42:abc123:report-report-red-2:In Review",
       payload: { fromStates: ["In Progress", "Blocked"], toState: "In Review" },
     });
   });
@@ -862,6 +914,20 @@ function commentBody(operations: NewWritebackOperation[], index: number): string
   expect(operation?.kind).toBe("comment");
   if (operation?.kind !== "comment") throw new Error(`Expected operation ${index} to be a comment`);
   return operation.payload.body;
+}
+
+function acceptedArtifactHandoffReport(reportId: string, idempotencyKey: string) {
+  return {
+    reportId,
+    idempotencyKey,
+    summary: "Added the expected-red tests.",
+    validationEvidence: ["npm test exits with the intended assertion failure"],
+    acceptanceChecklist: [{ text: "Tests express the contract", satisfied: true, evidence: "tests/feature.test.ts" }],
+    changedFiles: ["tests/feature.test.ts"],
+    branchName: "symphony/TEST-1",
+    pullRequest: null,
+    risks: [],
+  };
 }
 
 function reviewEvidence(): PullRequestReviewEvidenceItem {

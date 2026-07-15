@@ -2079,6 +2079,7 @@ function pullRequestRefFromPublication(publication: CompletionReportPullRequestP
     number: publication.number,
     headSha: publication.headSha,
     branch: publication.headBranch,
+    ...(typeof publication.draft === "boolean" ? { draft: publication.draft } : {}),
   };
 }
 

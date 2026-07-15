@@ -684,6 +684,13 @@ describe("CompletionReportService", () => {
     expect(publisher.inputs[0]).toMatchObject({ draft: true });
     expect(publisher.checkInputs).toEqual([]);
     expect(result.report).toMatchObject({
+      pullRequest: {
+        url: "https://github.com/acme/symphony/pull/42",
+        number: 42,
+        headSha: "abc123",
+        branch: "symphony/TEST-1",
+        draft: true,
+      },
       contractSnapshot: {
         schemaVersion: 1,
         contractVersion: "2026-07-14.accepted-artifact",
@@ -696,6 +703,13 @@ describe("CompletionReportService", () => {
       phase: "review",
       completionReports: [
         {
+          pullRequest: {
+            url: "https://github.com/acme/symphony/pull/42",
+            number: 42,
+            headSha: "abc123",
+            branch: "symphony/TEST-1",
+            draft: true,
+          },
           contractSnapshot: {
             delivery: { mode: "accepted_artifact", artifact: "expected_red_tests" },
           },
