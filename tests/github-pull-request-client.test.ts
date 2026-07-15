@@ -496,25 +496,42 @@ describe("GitHubPullRequestClient", () => {
     }
   });
 
-  it("creates a service-owned empty commit when a reused pull request needs a fresh head", async () => {
+  it("re-observes a reused pull request after pushing a service-owned empty commit", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-empty-commit-"));
     try {
       const workspace = await initPublishRepo(root, { remote: true });
       const previousHead = (await git(["rev-parse", "HEAD"], workspace)).trim();
       const calls: string[] = [];
-      const client = new GitHubPullRequestClient(config(), async (input, init) => {
-        const url = new URL(String(input));
-        calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
-        if (url.pathname.endsWith("/pulls/44")) {
-          const currentHead = (await git(["rev-parse", "HEAD"], workspace)).trim();
-          return jsonResponse(
-            pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha: currentHead }),
-          );
-        }
-        return jsonResponse([
-          pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha: previousHead }),
-        ]);
-      });
+      const retryDelays: number[] = [];
+      let detailObservations = 0;
+      const client = new GitHubPullRequestClient(
+        config(),
+        async (input, init) => {
+          const url = new URL(String(input));
+          const method = init?.method ?? "GET";
+          calls.push(`${method} ${url.pathname}`);
+          if (url.pathname.endsWith("/pulls/44")) {
+            const currentHead = (await git(["rev-parse", "HEAD"], workspace)).trim();
+            detailObservations += method === "GET" ? 1 : 0;
+            return jsonResponse(
+              pullRequestNode({
+                number: 44,
+                state: "open",
+                draft: false,
+                merged: false,
+                headSha: detailObservations === 1 ? previousHead : currentHead,
+              }),
+            );
+          }
+          return jsonResponse([
+            pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha: previousHead }),
+          ]);
+        },
+        null,
+        async (delayMs) => {
+          retryDelays.push(delayMs);
+        },
+      );
 
       const result = await client.publishPullRequest({
         workspacePath: workspace,
@@ -532,8 +549,10 @@ describe("GitHubPullRequestClient", () => {
       expect(calls).toEqual([
         "GET /repos/octo-org/symphony/pulls",
         "GET /repos/octo-org/symphony/pulls/44",
+        "GET /repos/octo-org/symphony/pulls/44",
         "PATCH /repos/octo-org/symphony/pulls/44",
       ]);
+      expect(retryDelays).toEqual([100]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -595,24 +614,32 @@ describe("GitHubPullRequestClient", () => {
     }
   });
 
-  it("does not refresh reused pull request metadata after the head moves", async () => {
+  it("fails closed after bounded re-observation when the pull request head stays different", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-reuse-head-drift-"));
     try {
       const workspace = await initPublishRepo(root);
       const headSha = (await git(["rev-parse", "HEAD"], workspace)).trim();
       const calls: string[] = [];
-      const client = new GitHubPullRequestClient(config(), async (input, init) => {
-        const url = new URL(String(input));
-        calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
-        if (url.pathname.endsWith("/pulls/44")) {
-          return jsonResponse(
-            pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha: "newer-head" }),
-          );
-        }
-        return jsonResponse([
-          pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha }),
-        ]);
-      });
+      const retryDelays: number[] = [];
+      const client = new GitHubPullRequestClient(
+        config(),
+        async (input, init) => {
+          const url = new URL(String(input));
+          calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
+          if (url.pathname.endsWith("/pulls/44")) {
+            return jsonResponse(
+              pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha: "newer-head" }),
+            );
+          }
+          return jsonResponse([
+            pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha }),
+          ]);
+        },
+        null,
+        async (delayMs) => {
+          retryDelays.push(delayMs);
+        },
+      );
 
       await expect(
         client.publishPullRequest({
@@ -624,10 +651,9 @@ describe("GitHubPullRequestClient", () => {
           evidenceCursor: "idem-1",
         }),
       ).rejects.toThrow(/metadata refresh expected head/);
-      expect(calls).toEqual([
-        "GET /repos/octo-org/symphony/pulls",
-        "GET /repos/octo-org/symphony/pulls/44",
-      ]);
+      expect(calls[0]).toBe("GET /repos/octo-org/symphony/pulls");
+      expect(calls.slice(1)).toEqual(Array(6).fill("GET /repos/octo-org/symphony/pulls/44"));
+      expect(retryDelays).toEqual([100, 250, 500, 1_000, 2_000]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

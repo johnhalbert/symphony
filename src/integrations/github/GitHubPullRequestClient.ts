@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import type { GitHubConfig } from "../../core/config/Config.js";
 import { SymphonyError } from "../../core/errors.js";
 
@@ -11,6 +12,7 @@ export interface GitHubAuthTokenProvider {
 type GitHubPullRequestClientConfig = Omit<GitHubConfig, "prHandoff" | "app"> &
   Partial<Pick<GitHubConfig, "prHandoff" | "app">>;
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
+const PULL_REQUEST_HEAD_OBSERVATION_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000] as const;
 
 export interface PullRequestBranchLookup {
   branchName: string;
@@ -326,6 +328,7 @@ export class GitHubPullRequestClient {
     private readonly config: GitHubPullRequestClientConfig,
     private readonly fetchImpl: FetchLike = fetch,
     private readonly authTokenProvider: GitHubAuthTokenProvider | null = null,
+    private readonly waitForRetry: (delayMs: number) => Promise<void> = delay,
   ) {}
 
   async findOpenPullRequestByBranch(input: PullRequestBranchLookup): Promise<PullRequestMetadata | null> {
@@ -883,8 +886,11 @@ export class GitHubPullRequestClient {
     title: string;
     body: string;
   }): Promise<PullRequestDetails> {
-    const current = await this.getPullRequest({ pullRequestNumber: input.pullRequestNumber });
-    this.assertReusablePullRequest(current, input.expectedHeadSha, "metadata refresh");
+    await this.waitForReusablePullRequestHead({
+      pullRequestNumber: input.pullRequestNumber,
+      expectedHeadSha: input.expectedHeadSha,
+      action: "metadata refresh",
+    });
 
     const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}`), {
       method: "PATCH",
@@ -898,21 +904,41 @@ export class GitHubPullRequestClient {
     if (!refreshed || refreshed.number !== input.pullRequestNumber) {
       throw new SymphonyError("tracker_error", "GitHub PR metadata refresh response is invalid");
     }
-    this.assertReusablePullRequest(refreshed, input.expectedHeadSha, "metadata refresh");
-    return refreshed;
+    this.assertOpenUnmergedPullRequest(refreshed, "metadata refresh");
+    if (refreshed.headSha === input.expectedHeadSha) return refreshed;
+    return this.waitForReusablePullRequestHead({
+      pullRequestNumber: input.pullRequestNumber,
+      expectedHeadSha: input.expectedHeadSha,
+      action: "metadata refresh response",
+    });
   }
 
-  private assertReusablePullRequest(
+  private async waitForReusablePullRequestHead(input: {
+    pullRequestNumber: number;
+    expectedHeadSha: string;
+    action: string;
+  }): Promise<PullRequestDetails> {
+    let pullRequest = await this.getPullRequest({ pullRequestNumber: input.pullRequestNumber });
+    this.assertOpenUnmergedPullRequest(pullRequest, input.action);
+    if (pullRequest.headSha === input.expectedHeadSha) return pullRequest;
+
+    for (const delayMs of PULL_REQUEST_HEAD_OBSERVATION_RETRY_DELAYS_MS) {
+      await this.waitForRetry(delayMs);
+      pullRequest = await this.getPullRequest({ pullRequestNumber: input.pullRequestNumber });
+      this.assertOpenUnmergedPullRequest(pullRequest, input.action);
+      if (pullRequest.headSha === input.expectedHeadSha) return pullRequest;
+    }
+
+    throw new SymphonyError(
+      "conflict",
+      `GitHub PR ${input.action} expected head ${input.expectedHeadSha}, observed ${pullRequest.headSha ?? "unknown"}`,
+    );
+  }
+
+  private assertOpenUnmergedPullRequest(
     pullRequest: PullRequestDetails,
-    expectedHeadSha: string,
     action: string,
   ): void {
-    if (pullRequest.headSha !== expectedHeadSha) {
-      throw new SymphonyError(
-        "conflict",
-        `GitHub PR ${action} expected head ${expectedHeadSha}, observed ${pullRequest.headSha ?? "unknown"}`,
-      );
-    }
     if (pullRequest.merged === true || pullRequest.state?.toLowerCase() !== "open") {
       throw new SymphonyError("conflict", `Only an open, unmerged pull request can be used for ${action}`);
     }

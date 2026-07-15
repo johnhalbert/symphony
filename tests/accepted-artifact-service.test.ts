@@ -24,7 +24,7 @@ describe("AcceptedArtifactService", () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
 
-  it("checkpoints a reviewed expected-red artifact, closes its draft PR unmerged, and replays idempotently", async () => {
+  it("checkpoints a reviewed expected-red artifact despite GitHub's provisional merge SHA", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-accepted-artifact-"));
     roots.push(root);
     const config = testConfig(root);
@@ -325,7 +325,7 @@ class FakeAcceptedArtifactGitHubClient implements AcceptedArtifactGitHubClient {
       draft: true,
       state: this.state,
       merged: this.merged,
-      mergeCommitSha: this.merged ? "5".repeat(40) : null,
+      mergeCommitSha: "5".repeat(40),
       mergedAt: this.merged ? "2026-07-14T03:00:00.000Z" : null,
       mergedBy: null,
       mergeable: null,

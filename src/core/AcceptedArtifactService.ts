@@ -297,7 +297,7 @@ export class AcceptedArtifactService {
       } catch (error) {
         if (error instanceof SymphonyError && error.code === "conflict") {
           const raced = await this.options.client.getPullRequest({ pullRequestNumber: review.pullRequest.number });
-          if (raced.merged === true || raced.mergeCommitSha !== null || raced.mergedAt !== null) {
+          if (pullRequestWasMerged(raced)) {
             throw unexpectedMergedError();
           }
           throw new AcceptedArtifactCompletionError(
@@ -549,7 +549,7 @@ export class AcceptedArtifactService {
     ) {
       throw new SymphonyError("conflict", "Accepted-artifact draft PR no longer matches the reviewed head and branch");
     }
-    if (live.merged === true || live.mergeCommitSha !== null || live.mergedAt !== null) {
+    if (pullRequestWasMerged(live)) {
       throw unexpectedMergedError();
     }
     const state = live.state?.toLowerCase() ?? "";
@@ -614,6 +614,12 @@ function unexpectedMergedError(): AcceptedArtifactCompletionError {
     "unexpected_merged_pull_request",
     "Accepted-artifact draft PR was merged unexpectedly",
   );
+}
+
+function pullRequestWasMerged(
+  pullRequest: Pick<PullRequestDetails, "merged" | "mergedAt">,
+): boolean {
+  return pullRequest.merged === true || pullRequest.mergedAt !== null;
 }
 
 function acceptedArtifactCompletionSourceStates(config: ServiceConfig): string[] {
