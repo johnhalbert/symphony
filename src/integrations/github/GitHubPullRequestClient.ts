@@ -623,9 +623,15 @@ export class GitHubPullRequestClient {
     const headSha = await git.headSha();
 
     if (existing) {
+      const refreshed = await this.refreshPullRequestMetadata({
+        pullRequestNumber: existing.number,
+        expectedHeadSha: headSha,
+        title: input.title,
+        body: input.body,
+      });
       const prepared = input.draft === true
-        ? await this.ensurePullRequestDraft(existing.number, headSha)
-        : existing;
+        ? await this.ensurePullRequestDraft(existing.number, headSha, refreshed)
+        : refreshed;
       return {
         ...prepared,
         headSha,
@@ -871,21 +877,63 @@ export class GitHubPullRequestClient {
     return pullRequest;
   }
 
+  private async refreshPullRequestMetadata(input: {
+    pullRequestNumber: number;
+    expectedHeadSha: string;
+    title: string;
+    body: string;
+  }): Promise<PullRequestDetails> {
+    const current = await this.getPullRequest({ pullRequestNumber: input.pullRequestNumber });
+    this.assertReusablePullRequest(current, input.expectedHeadSha, "metadata refresh");
+
+    const response = await this.fetchImpl(this.repoUrl(`pulls/${input.pullRequestNumber}`), {
+      method: "PATCH",
+      headers: await this.requestHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ title: input.title, body: input.body }),
+    });
+    if (!response.ok) {
+      throw await this.githubHttpError(response, "GitHub PR metadata refresh", "pull_request");
+    }
+    const refreshed = normalizePullRequestDetails((await response.json()) as GitHubPullRequestNode);
+    if (!refreshed || refreshed.number !== input.pullRequestNumber) {
+      throw new SymphonyError("tracker_error", "GitHub PR metadata refresh response is invalid");
+    }
+    this.assertReusablePullRequest(refreshed, input.expectedHeadSha, "metadata refresh");
+    return refreshed;
+  }
+
+  private assertReusablePullRequest(
+    pullRequest: PullRequestDetails,
+    expectedHeadSha: string,
+    action: string,
+  ): void {
+    if (pullRequest.headSha !== expectedHeadSha) {
+      throw new SymphonyError(
+        "conflict",
+        `GitHub PR ${action} expected head ${expectedHeadSha}, observed ${pullRequest.headSha ?? "unknown"}`,
+      );
+    }
+    if (pullRequest.merged === true || pullRequest.state?.toLowerCase() !== "open") {
+      throw new SymphonyError("conflict", `Only an open, unmerged pull request can be used for ${action}`);
+    }
+  }
+
   private async ensurePullRequestDraft(
     pullRequestNumber: number,
     expectedHeadSha: string,
+    inspectedPullRequest?: PullRequestDetails,
   ): Promise<PullRequestMetadata> {
-    const current = await this.getPullRequest({ pullRequestNumber });
+    const current = inspectedPullRequest ?? (await this.getPullRequest({ pullRequestNumber }));
     if (current.headSha !== expectedHeadSha) {
       throw new SymphonyError(
         "conflict",
         `GitHub draft conversion expected head ${expectedHeadSha}, observed ${current.headSha ?? "unknown"}`,
       );
     }
-    if (current.draft === true) return current;
     if (current.merged === true || current.state?.toLowerCase() !== "open") {
       throw new SymphonyError("conflict", "Only an open, unmerged pull request can be converted to draft");
     }
+    if (current.draft === true) return current;
 
     const lookup = await this.fetchImpl(graphQlApiUrl(this.config.apiBaseUrl), {
       method: "POST",

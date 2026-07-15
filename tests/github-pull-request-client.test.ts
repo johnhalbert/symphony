@@ -453,17 +453,17 @@ describe("GitHubPullRequestClient", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-reuse-"));
     try {
       const workspace = await initPublishRepo(root);
-      const calls: string[] = [];
+      const headSha = (await git(["rev-parse", "HEAD"], workspace)).trim();
+      const calls: Array<{ method: string; pathname: string; body: unknown }> = [];
       const client = new GitHubPullRequestClient(config(), async (input, init) => {
         const url = new URL(String(input));
-        calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
-        return jsonResponse([
-          {
-            html_url: "https://github.com/octo-org/symphony/pull/44",
-            number: 44,
-            head: { ref: "symphony/TEST-1", sha: "remote-sha", repo: { pushed_at: "2026-01-01T00:00:00Z" } },
-          },
-        ]);
+        const method = init?.method ?? "GET";
+        const body = init?.body === undefined ? null : JSON.parse(String(init.body));
+        calls.push({ method, pathname: url.pathname, body });
+        if (url.pathname.endsWith("/pulls/44")) {
+          return jsonResponse(pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha }));
+        }
+        return jsonResponse([pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha })]);
       });
 
       const result = await client.publishPullRequest({
@@ -482,7 +482,15 @@ describe("GitHubPullRequestClient", () => {
         headBranch: "symphony/TEST-1",
         evidenceCursor: "idem-1",
       });
-      expect(calls).toEqual(["GET /repos/octo-org/symphony/pulls"]);
+      expect(calls).toEqual([
+        { method: "GET", pathname: "/repos/octo-org/symphony/pulls", body: null },
+        { method: "GET", pathname: "/repos/octo-org/symphony/pulls/44", body: null },
+        {
+          method: "PATCH",
+          pathname: "/repos/octo-org/symphony/pulls/44",
+          body: { title: "TEST-1: Work", body: "body" },
+        },
+      ]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -497,12 +505,14 @@ describe("GitHubPullRequestClient", () => {
       const client = new GitHubPullRequestClient(config(), async (input, init) => {
         const url = new URL(String(input));
         calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
+        if (url.pathname.endsWith("/pulls/44")) {
+          const currentHead = (await git(["rev-parse", "HEAD"], workspace)).trim();
+          return jsonResponse(
+            pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha: currentHead }),
+          );
+        }
         return jsonResponse([
-          {
-            html_url: "https://github.com/octo-org/symphony/pull/44",
-            number: 44,
-            head: { ref: "symphony/TEST-1", sha: previousHead, repo: { pushed_at: "2026-01-01T00:00:00Z" } },
-          },
+          pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha: previousHead }),
         ]);
       });
 
@@ -519,7 +529,105 @@ describe("GitHubPullRequestClient", () => {
       expect(result.action).toBe("reused");
       expect(result.headSha).not.toBe(previousHead);
       await expect(git(["log", "-1", "--format=%s"], workspace)).resolves.toBe("TEST-1: Re-run merge gate\n");
-      expect(calls).toEqual(["GET /repos/octo-org/symphony/pulls"]);
+      expect(calls).toEqual([
+        "GET /repos/octo-org/symphony/pulls",
+        "GET /repos/octo-org/symphony/pulls/44",
+        "PATCH /repos/octo-org/symphony/pulls/44",
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refreshes reused pull request metadata before converting it to draft", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-reuse-draft-"));
+    try {
+      const workspace = await initPublishRepo(root);
+      const headSha = (await git(["rev-parse", "HEAD"], workspace)).trim();
+      const calls: Array<{ method: string; pathname: string; body: unknown }> = [];
+      const client = new GitHubPullRequestClient(config(), async (input, init) => {
+        const url = new URL(String(input));
+        const method = init?.method ?? "GET";
+        const body = init?.body === undefined ? null : JSON.parse(String(init.body));
+        calls.push({ method, pathname: url.pathname, body });
+        if (url.pathname.endsWith("/pulls/44")) {
+          return jsonResponse(pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha }));
+        }
+        if (url.pathname === "/graphql") {
+          const query = typeof body === "object" && body !== null && "query" in body ? String(body.query) : "";
+          return query.includes("convertPullRequestToDraft")
+            ? jsonResponse({
+                data: { convertPullRequestToDraft: { pullRequest: { isDraft: true, headRefOid: headSha } } },
+              })
+            : jsonResponse({
+                data: { repository: { pullRequest: { id: "PR_node_44", isDraft: false, headRefOid: headSha } } },
+              });
+        }
+        return jsonResponse([
+          pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha }),
+        ]);
+      });
+
+      const result = await client.publishPullRequest({
+        workspacePath: workspace,
+        branchName: "symphony/TEST-1",
+        baseBranch: "main",
+        title: "TEST-1: Accepted artifact",
+        body: "Current expected-red artifact evidence",
+        evidenceCursor: "artifact-1",
+        draft: true,
+      });
+
+      expect(result).toMatchObject({ action: "reused", number: 44, headSha, draft: true });
+      expect(calls.map((call) => `${call.method} ${call.pathname}`)).toEqual([
+        "GET /repos/octo-org/symphony/pulls",
+        "GET /repos/octo-org/symphony/pulls/44",
+        "PATCH /repos/octo-org/symphony/pulls/44",
+        "POST /graphql",
+        "POST /graphql",
+      ]);
+      expect(calls[2]?.body).toEqual({
+        title: "TEST-1: Accepted artifact",
+        body: "Current expected-red artifact evidence",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not refresh reused pull request metadata after the head moves", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "symphony-pr-reuse-head-drift-"));
+    try {
+      const workspace = await initPublishRepo(root);
+      const headSha = (await git(["rev-parse", "HEAD"], workspace)).trim();
+      const calls: string[] = [];
+      const client = new GitHubPullRequestClient(config(), async (input, init) => {
+        const url = new URL(String(input));
+        calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
+        if (url.pathname.endsWith("/pulls/44")) {
+          return jsonResponse(
+            pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha: "newer-head" }),
+          );
+        }
+        return jsonResponse([
+          pullRequestNode({ number: 44, state: "open", draft: false, merged: false, headSha }),
+        ]);
+      });
+
+      await expect(
+        client.publishPullRequest({
+          workspacePath: workspace,
+          branchName: "symphony/TEST-1",
+          baseBranch: "main",
+          title: "TEST-1: Work",
+          body: "body",
+          evidenceCursor: "idem-1",
+        }),
+      ).rejects.toThrow(/metadata refresh expected head/);
+      expect(calls).toEqual([
+        "GET /repos/octo-org/symphony/pulls",
+        "GET /repos/octo-org/symphony/pulls/44",
+      ]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1179,10 +1287,11 @@ function graphQlThreadsResponse(
   });
 }
 
-function pullRequestNode(input: { state: string; draft: boolean; merged: boolean; headSha: string }) {
+function pullRequestNode(input: { number?: number; state: string; draft: boolean; merged: boolean; headSha: string }) {
+  const number = input.number ?? 42;
   return {
-    html_url: "https://github.com/octo-org/symphony/pull/42",
-    number: 42,
+    html_url: `https://github.com/octo-org/symphony/pull/${number}`,
+    number,
     state: input.state,
     draft: input.draft,
     merged: input.merged,
